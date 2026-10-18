@@ -285,17 +285,18 @@ Notes:
     sell_at) — each with every minimum of config.TAKE_PROFIT_MIN_DAYS — sell
     only while at least that many days remain before the position's last
     market stops trading (sell_min_days) — over every scenario the filter bar
-    shows, tier floors on and off, adding to held pairs or not. Like the
-    add-on family it simulates nothing during the run; each cell is simulated
-    when the dashboard reads it. Every selling run records each sale it makes
-    as a SaleCheck on SweepPoint.sales, which is how SellSweep.sold_grid
-    simulates only the (level, minimum) settings that differ: one no position
-    of the no-selling run would sell at is that run (_sale_reach), and one at
-    least as strict as a run it already simulated, when every sale of that run
-    also meets it, is that run (_sale_cover, yielded as a SameSale). The
-    sell rule's arithmetic lives in config, scanner and historical, shared
-    with live selling; _sells_at, _days_left, _ladder_average, _usable_ask and
-    _leg_quotes call it there.
+    shows that neither adds to held pairs nor trims them, tier floors on and
+    off (the bar shuts Sell while Add to held pairs or Trim to Kelly is on).
+    Like the add-on family it simulates nothing during the run; each cell is
+    simulated when the dashboard reads it. Every selling run records each
+    sale it makes as a SaleCheck on SweepPoint.sales, which is how
+    SellSweep.sold_grid simulates only the (level, minimum) settings that
+    differ: one no position of the no-selling run would sell at is that run
+    (_sale_reach), and one at least as strict as a run it already simulated,
+    when every sale of that run also meets it, is that run (_sale_cover,
+    yielded as a SameSale). The sell rule's arithmetic lives in config,
+    scanner and historical, shared with live selling; _sells_at,
+    _days_left, _ladder_average, _usable_ask and _leg_quotes call it there.
 
     With trim_sweep, it also returns the dashboard's "Trim to Kelly" family
     (BacktestSweep.trim_sweep, a TrimSweep): every scenario of the same grid
@@ -2930,7 +2931,7 @@ class SameTrim:
 @dataclass(frozen=True)
 class SellSweep:
     """
-    The dashboard's "Sell" family: every sell level and minimum of days of every scenario, simulated on demand.
+    The dashboard's "Sell" family: every sell level and minimum of days of every scenario that neither adds nor trims, simulated on demand.
 
     The backtest dashboard's Sell select offers "no selling" (the scenario as
     simulated) and each of `levels` (config.TAKE_PROFIT_LEVELS): sell a whole
@@ -2939,16 +2940,19 @@ class SellSweep:
     (_simulate_at_discount's sell_at) — and, for each of `min_days`
     (config.TAKE_PROFIT_MIN_DAYS), only while at least that many days remain
     before the position's last market stops trading (sell_min_days). It
-    covers every scenario the filter bar shows — every band, Tier floors
-    setting, k, size cap and Add to held pairs setting. Nothing is simulated
-    while the backtest runs: sweep() builds, for one level, minimum,
-    Tier floors setting and add-on setting, a CapSweep over the same entries
-    the size-cap and add-on families hold, and cell() reads one (band, k)
-    cell of it, every cap, the "all" population only (what the filter bar
-    shows). Like the add-on family it has no eager point to start from, so
-    each cell's curves end on the day its eager twin's did (end_dates /
-    off_end_dates), and each cap is simulated until one reaches the peak
-    Kelly fraction, which every larger cap shares.
+    covers every scenario the filter bar shows that neither adds to held
+    pairs nor trims them — every band, Tier floors setting, k and size cap
+    (the bar sets Sell to "no selling" and shuts it while Add to held pairs
+    or Trim to Kelly is on, so those scenarios never need a sell run).
+    Every simulation here sells; none adds to held pairs or trims. Nothing
+    is simulated while the backtest runs: sweep() builds, for one level,
+    minimum and Tier floors setting, a CapSweep over the same entries the
+    size-cap family holds, and cell() reads one (band, k) cell of it, every
+    cap, the "all" population only (what the filter bar shows). It has no
+    eager point to start from, so each cell's curves end on the day its
+    eager twin's did (end_dates / off_end_dates), and each cap is simulated
+    until one reaches the peak Kelly fraction, which every larger cap
+    shares.
 
     sold_grid() reads one (band, k) cell at every level and minimum while
     simulating as few of them as it can, and exactly: a (level, minimum) no
@@ -2958,7 +2962,7 @@ class SellSweep:
     simulated.
 
     Retention: none of its own. Its entry maps are the very objects
-    BacktestSweep's size-cap and add-on families already hold.
+    BacktestSweep's size-cap family already holds.
 
     Attributes:
         levels (tuple[float, ...]): The sell levels, ascending, distinct,
@@ -2997,10 +3001,10 @@ class SellSweep:
     off_end_dates: dict = field(repr=False)
 
     def sweep(self, level: float | None, *, min_days: int | None = None,
-              tier_floors: bool = True, add_to_held: bool = False,
+              tier_floors: bool = True,
               caps: Iterable[float] | None = None) -> CapSweep:
         """
-        The lazy size-cap sweep that sells at `level` under one minimum of days, Tier floors and add-on setting.
+        The lazy size-cap sweep that sells at `level` under one minimum of days and Tier floors setting.
 
         Args:
             level (float | None): One of self.levels, or None for the same
@@ -3011,8 +3015,6 @@ class SellSweep:
                 minimum.
             tier_floors (bool): Keyword-only. False for the tier-floors-off
                 family's binding bands.
-            add_to_held (bool): Keyword-only. Whether every simulation may
-                also add to a pair it still holds.
             caps (Iterable[float] | None): Keyword-only. The caps to simulate,
                 each one of self.caps; None (default) means every one. A cap
                 left out is not simulated, and caps at or above a point's peak
@@ -3020,7 +3022,8 @@ class SellSweep:
 
         Returns:
             CapSweep: Over the tier-on or tier-off entries, the "all"
-                population only, selling at `level` with that minimum.
+                population only, selling at `level` with that minimum and
+                neither adding to held pairs nor trimming them.
 
         Raises:
             ValueError: For a level not in self.levels, a minimum not in
@@ -3048,13 +3051,13 @@ class SellSweep:
             primary_k=self.primary_k, start_date=self.start_date,
             initial_balance=self.initial_balance, split_date=None, checks=False,
             entries_by_band=self.entries_by_band if tier_floors else self.off_entries_by_band,
-            st_entries=[], eager={}, tier_floors=tier_floors, add_to_held=add_to_held,
+            st_entries=[], eager={}, tier_floors=tier_floors,
             end_dates=self.end_dates if tier_floors else self.off_end_dates,
             sell_at=level, sell_min_days=min_days)
 
     def cell(self, level: float, band: tuple[float, float], k: float, *,
-             min_days: int | None = None, tier_floors: bool = True,
-             add_to_held: bool = False) -> dict[float, dict[str, SweepPoint]]:
+             min_days: int | None = None,
+             tier_floors: bool = True) -> dict[float, dict[str, SweepPoint]]:
         """
         One (band, k) cell, every size cap, selling at `level` with an optional minimum of days.
 
@@ -3065,7 +3068,6 @@ class SellSweep:
             min_days (int | None): Keyword-only. One of self.min_days, or None
                 (default) for no minimum.
             tier_floors (bool): Keyword-only. The Tier floors setting.
-            add_to_held (bool): Keyword-only. The Add to held pairs setting.
 
         Returns:
             dict[float, dict[str, SweepPoint]]: cap -> {"all": point}.
@@ -3074,8 +3076,7 @@ class SellSweep:
             ValueError: As sweep(); and from CapSweep, for a cell with no end day.
             KeyError: For a band the setting does not hold.
         """
-        return self.sweep(level, min_days=min_days, tier_floors=tier_floors,
-                          add_to_held=add_to_held).cell(band, k)
+        return self.sweep(level, min_days=min_days, tier_floors=tier_floors).cell(band, k)
 
     def entry_events(self) -> set[tuple[str, str]]:
         """
@@ -3121,7 +3122,7 @@ class SellSweep:
                        end_dates={}, off_end_dates=kept)
 
     def sold_grid(self, band: tuple[float, float], k: float, *, tier_floors: bool = True,
-                  add_to_held: bool = False, caps: Iterable[float] | None = None,
+                  caps: Iterable[float] | None = None,
                   stats: dict | None = None,
                   ) -> Iterator[tuple[float, int,
                                       dict[float, SweepPoint | SameSale | None]]]:
@@ -3157,7 +3158,6 @@ class SellSweep:
             band (tuple[float, float]): One of the setting's bands.
             k (float): One of self.ks.
             tier_floors (bool): Keyword-only. The Tier floors setting.
-            add_to_held (bool): Keyword-only. The Add to held pairs setting.
             caps (Iterable[float] | None): Keyword-only. The caps to cover,
                 each one of self.caps; None (default) means every one.
             stats (dict | None): Keyword-only. When given, its "simulated"
@@ -3190,7 +3190,7 @@ class SellSweep:
         def read(level: float | None, min_days: int | None, wanted) -> dict:
             """One sweep's cell at (level, min_days) over the caps wanted, counted into stats."""
             swept = self.sweep(level, min_days=min_days, tier_floors=tier_floors,
-                               add_to_held=add_to_held, caps=wanted)
+                               caps=wanted)
             cell = swept.cell(band, k)
             if stats is not None:
                 stats["simulated"] += swept.simulated
@@ -3777,7 +3777,8 @@ class BacktestSweep:
         sell_sweep (SellSweep | None): The dashboard's "Sell" family: every
             sell level (config.TAKE_PROFIT_LEVELS), each with every minimum of
             days before maturity (config.TAKE_PROFIT_MIN_DAYS), of every
-            scenario, simulated when the dashboard reads it. None unless
+            scenario that neither adds to held pairs nor trims, simulated
+            when the dashboard reads it. None unless
             run_backtest_sweep(sell_sweep=True) ran on a feasible window.
         trim_sweep (TrimSweep | None): The dashboard's "Trim to Kelly"
             family: every scenario with held pairs sold down to their Kelly
@@ -12588,7 +12589,8 @@ def _sweep_from_candidates(
     With sell_sweep, a SellSweep is returned (BacktestSweep.sell_sweep) over
     the same entries, caps, bands and k grid as the add-on family, tier floors
     on and off, with the same end-date maps, announced by one INFO line. It
-    too simulates nothing here.
+    too simulates nothing here, and none of its simulations adds to held
+    pairs or trims.
 
     With trim_sweep, a TrimSweep is returned (BacktestSweep.trim_sweep) the
     same way: the same entries, caps, bands, k grid and end-date maps,
@@ -13130,8 +13132,8 @@ def _sweep_from_candidates(
     sold = None
     if sell_sweep:
         # Every sell level and minimum of days over the same grid as the
-        # add-on family, tier floors on and off, adding to held pairs or not;
-        # nothing simulated here
+        # add-on family, tier floors on and off; every one of its simulations
+        # neither adds to held pairs nor trims; nothing simulated here
         sell_caps = caps if cap_sweep else (primary.size_cap,)
         sold = SellSweep(
             levels=_resolve_sell_levels(), min_days=_resolve_min_days_options(),
@@ -13141,8 +13143,8 @@ def _sweep_from_candidates(
             entries_by_band=entries_by_band, off_entries_by_band=tier_off_entries,
             end_dates=add_on_end_dates, off_end_dates=add_on_off_end_dates)
         logging.info("Selling early: %d level(s) x %d minimum-days option(s) x %d size cap(s) "
-                     "x %d band(s) (%d with the tier floors off) x %d k, adding to held "
-                     "pairs or not, each simulated when the dashboard reads it",
+                     "x %d band(s) (%d with the tier floors off) x %d k, each simulated "
+                     "when the dashboard reads it",
                      len(sold.levels), len(sold.min_days), len(sell_caps), len(bands),
                      len(tier_off_bands), len(grid))
 
@@ -13294,9 +13296,9 @@ def run_backtest_sweep(
     With sell_sweep, the result also carries the dashboard's "Sell" family
     (BacktestSweep.sell_sweep): every level of config.TAKE_PROFIT_LEVELS, each
     with every minimum of days before maturity of config.TAKE_PROFIT_MIN_DAYS,
-    over the same grid, tier floors on and off, adding to held pairs or not,
-    simulated only when the dashboard reads it. The run logs one setting line
-    for it and, from _sweep_from_candidates, one summary line.
+    over the same grid, tier floors on and off, with no adding to held pairs
+    and no trimming, simulated only when the dashboard reads it. The run logs
+    one setting line for it and, from _sweep_from_candidates, one summary line.
 
     With trim_sweep, the result also carries the dashboard's "Trim to Kelly"
     family (BacktestSweep.trim_sweep): every scenario of the same grid with

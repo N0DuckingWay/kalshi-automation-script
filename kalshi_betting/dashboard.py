@@ -92,9 +92,11 @@ Purpose:
     sections, the header's trade count and the save button's
     add_to_held_pairs; the k-hat figures are measured before sizing, so they
     do not change, and the Scenario Explorer and the Interval Discount
-    section never follow it (their visitors have no `add` method). A page
-    whose sweep has no such family, or whose family does not fit the grid,
-    keeps the select disabled with a short note.
+    section never follow it (their visitors have no `add` method). While it
+    is on, Sell is set to "no selling" and shut (a sell level is not
+    simulated together with adding to held pairs). A page whose sweep has no
+    such family, or whose family does not fit the grid, keeps the select
+    disabled with a short note.
 
     The bar's Trim to Kelly choice is "off" (the page as rendered) or "on
     (sell down to the Kelly size)": the same scenario re-simulated so that,
@@ -139,15 +141,17 @@ Purpose:
     every 1% from 80% to 100%), and the "Min. days to maturity" select
     beside it picks one of config.TAKE_PROFIT_MIN_DAYS (1 to 7, 14 or 21
     days; shut while Sell says "no selling"): the same scenario re-simulated
-    so each position — a pair and everything added to it — is sold whole at
+    so each position (a pair) is sold whole at
     the first weekly checkpoint where its realized profit (what selling it
     at the bids would return, after the sale's fees, less what it cost) has
     stayed at or above that share of its potential profit for
     config.TAKE_PROFIT_HOLD_DAYS days in a row, checked once a day, and at
     least that many days remain before its last market stops trading
     (backtester._simulate_at_discount's sell_at and sell_min_days). It
-    covers every scenario the bar shows: every band, Tier floors choice, k,
-    size cap and Add to held pairs choice. The run simulates none of it, and
+    covers every scenario the bar shows that neither adds to held pairs nor
+    trims them: every band, Tier floors choice, k and size cap. Sell is set
+    to "no selling" and shut while Add to held pairs or Trim to Kelly is on,
+    so no sell run adds or trims. The run simulates none of it, and
     neither does the page's walk: after the walk, _build_sell_grid reads
     every (level, minimum) of every cell the page shows through
     SellSweep.sold_grid, in worker processes (one task per spread band and
@@ -247,11 +251,11 @@ Dependencies:
     rise_grid hands back a backtester.SameTrim for a minimum price rise that
     repeats another run) by their attributes; imports backtester itself to
     read, and in a worker process install, its SAME_TITLE_SIZE_CAP,
-    SCHEDULED_RUN, TAKE_PROFIT_HOLD_DAYS and REBALANCE_MIN_DAYS_SINCE_TRADE
-    (_run_sell_task; the third also names the Sell select's rule,
-    _sell_select_title, and the fourth the Trim to Kelly select's hover
-    text, _trim_select_title), and to word a minimum price move as a run's
-    label does (_trim_rise_label) — and
+    SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS (_run_sell_task; the last also
+    names the Sell select's rule, _sell_select_title), to read its
+    REBALANCE_MIN_DAYS_SINCE_TRADE (named in the Trim to Kelly select's
+    hover text, _trim_select_title), and to word a minimum price move as a
+    run's label does (_trim_rise_label) — and
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT, DASHBOARD_FILENAME (the
     page's file name, which defaults_server opens when run on its own and
     live_dashboard serves as its Backtest tab), DASHBOARD_FILES_DIRNAME
@@ -4914,9 +4918,10 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     which Sell options show it, if any (_sell_choice_in_bar). When they trim
     to Kelly, it says so last (backtester._live_trim_note) and, where the
     page shows the rule, which Trim to Kelly and Min. price rise choices show
-    it, or why they cannot (_trim_choice_in_bar). The page never shows trimming and selling
-    together, so when the defaults do both the trim clause says so and the
-    Sell clause offers the selling alone.
+    it, or why they cannot (_trim_choice_in_bar). The page never shows selling
+    together with adding to held pairs or with trimming (Sell is shut while
+    either is on), so when the defaults sell and also add or trim, the add
+    or trim clause says so and the Sell clause offers the selling alone.
 
     Args:
         sweep (BacktestSweep | None): The run's sweep payload, or None.
@@ -5007,17 +5012,22 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     # defaults do it, with where the bar shows it only where the line shows
     # the rule at all
     add_note = _live_add_on_note(sweep)
-    if add_note and shown is not None:
-        add_note += (" — choose Add to held pairs on in the filter bar to see it"
-                     if _add_on_shown_at(bar, *shown)
-                     else " — this page has no Add to held pairs view")
-    # Selling, likewise. With trimming saved too, the Sell options show the
-    # selling alone: the page never shows the two together
     sell_note = _live_sell_note(sweep)
     trim_note = _live_trim_note(sweep)
+    if add_note and shown is not None:
+        # Sell is shut while Add to held pairs is on, so saved defaults that
+        # sell too cannot be shown together
+        if sell_note:
+            add_note += " — this page cannot show adding to held pairs together with selling"
+        else:
+            add_note += (" — choose Add to held pairs on in the filter bar to see it"
+                         if _add_on_shown_at(bar, *shown)
+                         else " — this page has no Add to held pairs view")
+    # Selling, likewise. With adding or trimming saved too, the Sell options
+    # show the selling alone: the page never shows them together
     if sell_note and shown is not None:
         choice = _sell_choice_in_bar(sweep, bar, *shown)
-        seen = "the selling alone" if trim_note else "it"
+        seen = "the selling alone" if (add_note or trim_note) else "it"
         sell_note += (f" — choose {choice} in the filter bar to see {seen}" if choice is not None
                       else " — this page cannot show that Sell level and minimum of days")
     # Trimming to Kelly, last, as on the run's log line; its choices are named
@@ -6506,7 +6516,8 @@ _ADD_ON_SELECT_TITLE = (
     "cap's share of the portfolio value (cash plus open trades at market). Live trading follows "
     "the saved live defaults, not this choice. The Scenario Explorer and Interval "
     "Discount sections always show it off. In the Risk section's Kelly chart an added "
-    "trade plots only what it added, so it sits below the 1:1 line.")
+    "trade plots only what it added, so it sits below the 1:1 line. While this is on, Sell "
+    "is set to no selling (the two are not simulated together).")
 # Appended to a scenario's summary phrase when adding is on
 _ADD_ON_PHRASE = ", adding to held pairs"
 # Added to the summary line while adding is on: the trade counts and the Kelly
@@ -6732,13 +6743,15 @@ def _sell_select_title(hold_days: int) -> str:
         live_rule = (f"has held its level for {hold_days} days in a row (read on Kalshi's "
                      "hourly candles for the days before the run)")
     return ("no selling: every position is held until its markets pay out. A level: at each "
-            "weekly checkpoint (the live run's time), a position (a pair and everything "
-            "added to it) is sold whole once its realized profit (what selling it at the "
+            "weekly checkpoint (the live run's time), a position (a pair) is sold whole "
+            "once its realized profit (what selling it at the "
             f"bids would return, after the sale's fees, less what it cost) {rule} It is sold "
             "only while at least the days the Min. days to maturity select names remain "
             "before its last market stops trading. A position sold at a checkpoint is not "
-            "bought again or added to there. Save as live defaults… saves the level and "
-            "minimum shown: a live run then sells at them, on real order books, once a "
+            "bought again there. Sell is shut (no selling) while Add to held pairs or Trim "
+            "to Kelly is on: those are not simulated together with it. Save as live "
+            "defaults… saves the level and minimum shown: a live run then sells at them, "
+            "on real order books, once a "
             f"position {live_rule}. The Scenario Explorer and Interval Discount sections "
             "always show no selling.")
 
@@ -10505,7 +10518,9 @@ def _build_filter_grid(
 # has held that share of its potential profit for TAKE_PROFIT_HOLD_DAYS days in
 # a row — and, by the Min. days to maturity choice, only while at least that
 # many days remain before its last market stops trading. It covers every
-# scenario the bar shows. Its cells are simulated after the walk, in worker
+# scenario the bar shows that neither adds to held pairs nor trims them (the
+# bar sets Sell to "no selling" and shuts it while Add to held pairs or Trim
+# to Kelly is on). Its cells are simulated after the walk, in worker
 # processes (_build_sell_grid: one task per spread band and Tier floors
 # setting), and each new trade list is written as a sidecar chunk file beside
 # the page, which the page's script loads through a <script src> element when
@@ -10541,9 +10556,9 @@ class _SellTask:
         tier_floors (bool): The band's runs as simulated (True) or with the
             deadline-gap tier floors off (False, a band they bind at).
         family: The backtester.SellSweep narrowed to this band.
-        cells (frozenset): (adds to held pairs, k index, cap index) of every
-            cell to cover: the cells at this band that the page shows
-            (its non-null chunk ids).
+        cells (frozenset): (k index, cap index) of every cell to cover: the
+            cells at this band that the page shows with no adding to held
+            pairs and no trimming (its non-null chunk ids).
         ks (tuple): The page's k axis.
         caps (tuple): The page's size-cap axis.
         axis (pd.DatetimeIndex): The page's date axis.
@@ -10562,12 +10577,8 @@ class _SellTask:
         hold_days (int): backtester.TAKE_PROFIT_HOLD_DAYS as the parent reads
             it: how many days in a row a position must stay at a level
             before it is sold.
-        rebalance_days (int): backtester.REBALANCE_MIN_DAYS_SINCE_TRADE as
-            the parent reads it: how many days a held pair must go without a
-            trade before an add-on (the Sell family's runs with Add to held
-            pairs on read it).
         install (bool): Whether the task runs in a worker process of its own,
-            which then installs those four bindings first (a spawned process
+            which then installs those three bindings first (a spawned process
             imports backtester afresh, from config). False in the parent.
     """
     index: int
@@ -10589,7 +10600,6 @@ class _SellTask:
     same_title_size_cap: float
     scheduled_run: object
     hold_days: int
-    rebalance_days: int
     install: bool = False
 
 
@@ -10607,10 +10617,10 @@ class _SellResult:
         keys (tuple[str, ...]): Every distinct list key (_list_key) the
             task's rows name, in the order the task first met each: the keys
             of the page's own chunks and of the files this task wrote.
-        rows (dict): (adds to held pairs, k index, cap index) of every cell
-            the task covered -> an array("i") with one entry per (level,
-            minimum of days), level by level and each level's minimums in
-            order (the order of the Sell blocks' rows): the index in keys of
+        rows (dict): (k index, cap index) of every cell the task covered ->
+            an array("i") with one entry per (level, minimum of days), level
+            by level and each level's minimums in order (the order of the
+            Sell blocks' rows): the index in keys of
             that sell run's list key, or -1 where that setting sells nothing
             (no position of the cell's run without selling reaches the level
             with that many days left, backtester._sale_reach), so it is the
@@ -10643,22 +10653,21 @@ class _SellGrid:
     The Sell view's data: the packed blocks the page carries, and the index its base block holds.
 
     The chunk ids of every (sell level, minimum of days) of every scenario
-    are far too many to put in the base block, which the page inflates on
-    load. They are split into one packed block per task (one spread band
-    under one Tier floors setting), which the page's script inflates only
-    when a reader first chooses a level at that band; the base block carries
-    only which block holds which band (index).
+    without adding or trimming are far too many to put in the base block,
+    which the page inflates on load. They are split into one packed block per
+    task (one spread band under one Tier floors setting), which the page's
+    script inflates only when a reader first chooses a level at that band;
+    the base block carries only which block holds which band (index).
 
     Attributes:
         blocks (list[str]): One packed <script> element per task that
             finished, in task order, its id "dash-sell-<i>" for the i-th
-            (_packed_json_script). Each holds [Add to held pairs: 0 off,
-            1 on] -> null for a view the page does not have, else [k][cap]
-            -> null for a cell not covered (the page shows no scenario
-            there), else one entry per (level, minimum of days), level by
-            level and each level's minimums in order: the chunk id of that
-            sell run, or -1 for the scenario's own chunk (it sells nothing:
-            the run without selling).
+            (_packed_json_script). Each holds [k][cap] -> null for a cell
+            not covered (the page shows no scenario there), else one entry
+            per (level, minimum of days), level by level and each level's
+            minimums in order: the chunk id of that sell run, or -1 for the
+            scenario's own chunk (it sells nothing: the run without
+            selling).
         index (list | None): [Tier floors: 0 on, 1 off][band] -> the number
             of the block holding that band's cells, or None where there is
             none (its task failed, or the page has no such view); with the
@@ -10822,10 +10831,11 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
     """
     Read every (sell level, minimum of days) of one task's cells and write each new trade list's chunk.
 
-    For each k and each Add to held pairs setting with a cell to cover, the
-    narrowed family's sold_grid (backtester.SellSweep) yields every (level,
-    minimum of days) at every cap of those cells, simulating only the runs
-    that differ: per cap, a simulated point, a SameSale naming an earlier
+    For each k with a cell to cover, the narrowed family's sold_grid
+    (backtester.SellSweep, whose runs neither add to held pairs nor trim)
+    yields every (level, minimum of days) at every cap of those cells,
+    simulating only the runs that differ: per cap, a simulated point, a
+    SameSale naming an earlier
     (level, minimum) of the same cap that is exactly the same run, or None
     where the setting sells nothing — the run without selling, so the page
     shows its own chunk there. Each point's curve is cut to the page's axis
@@ -10839,9 +10849,8 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
     dropped before the next is read.
 
     Runs in a worker process (task.install True: the parent's
-    SAME_TITLE_SIZE_CAP, SCHEDULED_RUN, TAKE_PROFIT_HOLD_DAYS and
-    REBALANCE_MIN_DAYS_SINCE_TRADE are installed first) or in the parent
-    itself.
+    SAME_TITLE_SIZE_CAP, SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS are
+    installed first) or in the parent itself.
 
     Args:
         task (_SellTask): The task.
@@ -10855,12 +10864,11 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
             and leaves the task's cells uncovered.
     """
     if task.install:
-        # A spawned process imported backtester afresh: size, checkpoint,
-        # sell and wait as the parent does
+        # A spawned process imported backtester afresh: size, checkpoint and
+        # sell as the parent does
         _backtester.SAME_TITLE_SIZE_CAP = task.same_title_size_cap
         _backtester.SCHEDULED_RUN = task.scheduled_run
         _backtester.TAKE_PROFIT_HOLD_DAYS = task.hold_days
-        _backtester.REBALANCE_MIN_DAYS_SINCE_TRADE = task.rebalance_days
     family = task.family
     band = family.bands[0] if task.tier_floors else family.off_bands[0]
     axis_end = task.axis[-1] if len(task.axis) else None
@@ -10872,55 +10880,54 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
     # Every distinct key the rows name, and each one's place in that list
     keys: list[str] = []
     key_place: dict[str, int] = {}
-    rows: dict[tuple[bool, int, int], array] = {}
+    rows: dict[tuple[int, int], array] = {}
     written: list[str] = []
     done: set[str] = set()
     # Files written whose tags the page cannot combine into a mix
     mix_gaps = 0
     for ki, k in enumerate(task.ks):
-        for add in (False, True):
-            wanted = [ci for ci in range(len(task.caps)) if (add, ki, ci) in task.cells]
-            if not wanted:
-                continue
-            # One row per cell, every setting filled in as sold_grid yields it
-            cell_rows = {ci: array("i", [-1]) * width for ci in wanted}
-            # backtester.SellSweep.sold_grid: only the runs that differ, simulated
-            grid = family.sold_grid(band, k, tier_floors=task.tier_floors, add_to_held=add,
-                                    caps=[task.caps[ci] for ci in wanted], stats=stats)
-            for level, min_days, by_cap in grid:
-                place = level_index[level] * n_days + days_index[min_days]
-                cut = _cut_to_axis({cap: {_ALL_VIEW: cell} for cap, cell in by_cap.items()
-                                    if cell is not None and not isinstance(cell, SameSale)},
-                                   axis_end)
-                # One key per trade list: caps at or above a sharing floor share one
-                listed: dict[int, str] = {}
-                for ci in wanted:
-                    cell = by_cap[task.caps[ci]]
-                    if cell is None:
-                        # Sells nothing: the run without selling
-                        continue
-                    if isinstance(cell, SameSale):
-                        # Exactly the run read at that earlier setting, same cap
-                        cell_rows[ci][place] = cell_rows[ci][
-                            level_index[cell.level] * n_days + days_index[cell.min_days]]
-                        continue
-                    point = cut[task.caps[ci]][_ALL_VIEW]
-                    key = listed.get(id(point.trades))
-                    if key is None:
-                        key = listed[id(point.trades)] = _list_key(k, point.trades)
-                    if key not in task.inline_keys and key not in done:
-                        if not _write_sell_chunk(task, key, k, point):
-                            mix_gaps += 1
-                        done.add(key)
-                        written.append(key)
-                    if key not in key_place:
-                        key_place[key] = len(keys)
-                        keys.append(key)
-                    cell_rows[ci][place] = key_place[key]
-                # Nothing of this yield is kept while the next is simulated
-                by_cap = cut = listed = cell = point = None
-            for ci, row in cell_rows.items():
-                rows[(add, ki, ci)] = row
+        wanted = [ci for ci in range(len(task.caps)) if (ki, ci) in task.cells]
+        if not wanted:
+            continue
+        # One row per cell, every setting filled in as sold_grid yields it
+        cell_rows = {ci: array("i", [-1]) * width for ci in wanted}
+        # backtester.SellSweep.sold_grid: only the runs that differ, simulated
+        grid = family.sold_grid(band, k, tier_floors=task.tier_floors,
+                                caps=[task.caps[ci] for ci in wanted], stats=stats)
+        for level, min_days, by_cap in grid:
+            place = level_index[level] * n_days + days_index[min_days]
+            cut = _cut_to_axis({cap: {_ALL_VIEW: cell} for cap, cell in by_cap.items()
+                                if cell is not None and not isinstance(cell, SameSale)},
+                               axis_end)
+            # One key per trade list: caps at or above a sharing floor share one
+            listed: dict[int, str] = {}
+            for ci in wanted:
+                cell = by_cap[task.caps[ci]]
+                if cell is None:
+                    # Sells nothing: the run without selling
+                    continue
+                if isinstance(cell, SameSale):
+                    # Exactly the run read at that earlier setting, same cap
+                    cell_rows[ci][place] = cell_rows[ci][
+                        level_index[cell.level] * n_days + days_index[cell.min_days]]
+                    continue
+                point = cut[task.caps[ci]][_ALL_VIEW]
+                key = listed.get(id(point.trades))
+                if key is None:
+                    key = listed[id(point.trades)] = _list_key(k, point.trades)
+                if key not in task.inline_keys and key not in done:
+                    if not _write_sell_chunk(task, key, k, point):
+                        mix_gaps += 1
+                    done.add(key)
+                    written.append(key)
+                if key not in key_place:
+                    key_place[key] = len(keys)
+                    keys.append(key)
+                cell_rows[ci][place] = key_place[key]
+            # Nothing of this yield is kept while the next is simulated
+            by_cap = cut = listed = cell = point = None
+        for ci, row in cell_rows.items():
+            rows[(ki, ci)] = row
     return _SellResult(task.index, tuple(keys), rows, tuple(written), stats["simulated"],
                        stats["reused"], stats["same"], stats["pruned"], mix_gaps)
 
@@ -10933,14 +10940,14 @@ def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: da
     Split the Sell select's work into one task per spread band and Tier floors setting.
 
     A band's tier-on task covers its cells the page shows with the tier floors
-    on — adding to held pairs off (the base grid) and, with the Add to held
-    pairs view, on. A band the tiers bind at gets a tier-off task too, over its
-    own tier-floors-off cells (its run with them off, and adding on in the
-    tier-off add-on grid when the page has one). A band the tiers never bind
-    at has no tier-off task: its off view is its tier-on run, so the sell
-    grid aliases those rows as the page's base grid does. A band the family
-    holds no tier-off entries for is left out with one WARNING (never in
-    production, where the family's bands are the binding bands).
+    on and no adding to held pairs or trimming (the base grid; the bar shuts
+    Sell while either is on). A band the tiers bind at gets a tier-off task
+    too, over its own tier-floors-off cells (its run with them off). A band
+    the tiers never bind at has no tier-off task: its off view is its tier-on
+    run, so the sell grid aliases those rows as the page's base grid does. A
+    band the family holds no tier-off entries for is left out with one
+    WARNING (never in production, where the family's bands are the binding
+    bands).
 
     Args:
         walked (_GridSource): The grid the walk walked; its sell is not None.
@@ -10955,21 +10962,19 @@ def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: da
         list[_SellTask]: The tasks, tier-on bands first, in band order.
     """
     sell = walked.sell
-    add_grid = chunker.add_grid() if walked.add_cell is not None else None
     off_view = walked.tier_binds is not None and chunker.off_grid() is not None
     common = {"ks": tuple(walked.ks), "caps": tuple(walked.caps), "axis": chunker.axis,
               "start_date": start_date, "initial_balance": initial_balance,
               "series_categories": series_categories, "cat_index": dict(chunker.cat_index),
               "sub_index": dict(chunker.sub_index), "risk_free": risk_free,
               "inline_keys": frozenset(chunker.seen), "out_dir": folder,
-              # The four bindings a spawned worker installs (_run_sell_task)
+              # The three bindings a spawned worker installs (_run_sell_task)
               "same_title_size_cap": _backtester.SAME_TITLE_SIZE_CAP,
               "scheduled_run": _backtester.SCHEDULED_RUN,
-              "hold_days": _backtester.TAKE_PROFIT_HOLD_DAYS,
-              "rebalance_days": _backtester.REBALANCE_MIN_DAYS_SINCE_TRADE}
+              "hold_days": _backtester.TAKE_PROFIT_HOLD_DAYS}
     tasks: list[_SellTask] = []
 
-    def add(bi: int, band, tier_floors: bool, rows: dict) -> None:
+    def add(bi: int, band, tier_floors: bool, band_rows: list) -> None:
         """
         Queue one band's task, when it has a cell to cover.
 
@@ -10977,12 +10982,11 @@ def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: da
             bi (int): The band's index.
             band: The band.
             tier_floors (bool): The Tier floors setting.
-            rows (dict): Adds to held pairs (bool) -> that grid's [k][cap]
-                rows at this band, or None without that view.
+            band_rows (list): The base grid's [k][cap] chunk ids at this band
+                under that Tier floors setting (None for a cell the page
+                shows no scenario at).
         """
-        cells = frozenset((adds, ki, ci) for adds, band_rows in rows.items()
-                          if band_rows is not None
-                          for ki, row in enumerate(band_rows)
+        cells = frozenset((ki, ci) for ki, row in enumerate(band_rows)
                           for ci, cid in enumerate(row) if cid is not None)
         if cells:
             tasks.append(_SellTask(
@@ -10991,10 +10995,8 @@ def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: da
                 family=sell.for_band(band, tier_floors=tier_floors), cells=cells, **common))
 
     for bi, band in enumerate(walked.bands):
-        add(bi, band, True, {False: chunker.grid[bi],
-                             True: add_grid[bi] if add_grid is not None else None})
+        add(bi, band, True, chunker.grid[bi])
     if off_view:
-        own_add_off = chunker.grid_add_off if add_grid is not None else None
         for bi, band in enumerate(walked.bands):
             if not walked.tier_binds[bi]:
                 continue
@@ -11003,8 +11005,7 @@ def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: da
                                 "%s; with the tier floors off, selling is not shown there",
                                 _band_label(band))
                 continue
-            add(bi, band, False, {False: chunker.grid_off[bi],
-                                  True: own_add_off[bi] if own_add_off is not None else None})
+            add(bi, band, False, chunker.grid_off[bi])
     return tasks
 
 
@@ -11015,8 +11016,7 @@ def _run_sell_tasks(tasks: list[_SellTask], workers: int) -> dict[int, _SellResu
     With one worker (or one task) every task runs here, in order. Otherwise a
     pool of spawned processes runs them (spawn, not fork: safe on macOS, and
     a fresh import in each worker, which installs the parent's
-    SAME_TITLE_SIZE_CAP, SCHEDULED_RUN, TAKE_PROFIT_HOLD_DAYS and
-    REBALANCE_MIN_DAYS_SINCE_TRADE). A task
+    SAME_TITLE_SIZE_CAP, SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS). A task
     that raises costs its own cells only: one WARNING naming its band (the
     first with its traceback), and the rest go on; a pool that cannot run at
     all fails every task the same way.
@@ -11160,12 +11160,7 @@ def _build_sell_grid(
             for n in sell.min_days]
     if not results:
         return _SellGrid(blocks=[], index=None, levels=levels, days=days, sidecars=0)
-    add_grid = chunker.add_grid() if walked.add_cell is not None else None
     off_grid = chunker.off_grid() if walked.tier_binds is not None else None
-    # Which base views the page has: (Tier floors 0 on / 1 off, adding 0 off / 1 on)
-    bases = {(0, 0): chunker.grid, (0, 1): add_grid, (1, 0): off_grid,
-             (1, 1): chunker.add_off_grid() if (off_grid is not None and add_grid is not None)
-             else None}
     index: list = [[None] * len(walked.bands), [None] * len(walked.bands)]
     blocks: list[str] = []
     for task in tasks:
@@ -11173,16 +11168,12 @@ def _build_sell_grid(
         if result is None:
             continue
         t = 0 if task.tier_floors else 1
-        data = [None if bases[(t, a)] is None
-                else [[None] * len(walked.caps) for _ in walked.ks] for a in (0, 1)]
+        data = [[None] * len(walked.caps) for _ in walked.ks]
         # Each key the task's rows name, as a chunk id
         chunk_ids = [ids[key] for key in result.keys]
-        for (adds, ki, ci), row in result.rows.items():
-            rows = data[1 if adds else 0]
-            if rows is None:
-                continue
+        for (ki, ci), row in result.rows.items():
             # -1: sells nothing, so the scenario's own chunk
-            rows[ki][ci] = [-1 if place < 0 else chunk_ids[place] for place in row]
+            data[ki][ci] = [-1 if place < 0 else chunk_ids[place] for place in row]
         index[t][task.band_index] = len(blocks)
         blocks.append(_packed_json_script(f"dash-sell-{len(blocks)}", data))
     if off_grid is not None:
@@ -12374,7 +12365,8 @@ def _filter_payload(
             the add-on view, else add_on_state), and the Sell view's:
             "sell_blocks" (null without the view, else [Tier floors 0 on / 1
             off][band] -> the number i of the packed block "dash-sell-<i>"
-            holding that band's chunk ids, or null — _SellGrid.index),
+            holding that band's chunk ids ([k][cap] -> one id per sell level
+            and minimum of days), or null — _SellGrid.index),
             "sell_levels" and "sell_days" ([{label, phrase, value}] per level
             and per minimum of days, [] without the view), "sell_state"
             ("shown", else sell_state), "inline_chunks" (how many chunks the
@@ -12806,8 +12798,9 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     (_sell_select_title, at backtester.TAKE_PROFIT_HOLD_DAYS as the page's
     sell runs read it); a payload with no Sell view ("sell_blocks" null)
     puts a grey note beside it by its "sell_state" (_SELL_NOTES), and the
-    script never enables it. The "Min. days to maturity" select after it
-    offers every minimum of days the payload names (sell_days; its value
+    script never enables it. The script also shuts it, at "no selling",
+    while Add to held pairs or Trim to Kelly is on. The "Min. days to
+    maturity" select after it offers every minimum of days the payload names (sell_days; its value
     the option's index, the first selected), its title carrying the rule
     (_SELL_DAYS_TITLE); the script enables it only while Sell names a
     level, since with no selling there is no sale to hold back.
@@ -13175,28 +13168,31 @@ def _pack_text(raw: str) -> str:
 # and neither the k-hat figures, the interval-discount section nor the
 # scenario explorer follow it (renderKhat, renderKhatCards and renderKd read
 # no part of it, and window.dashScenarioSelect still gets four arguments).
-# The Sell select, appended after it (SHOWN[7]), picks between the grids as
-# they stand and a sell level; the "Min. days to maturity" select after it
-# (SHOWN[8]) picks the fewest days before maturity a sale
-# needs, and is enabled only while Sell names a level (refreshDays). A level's
-# chunk ids are not in the base block: D.sell_blocks[tier][band] names the
-# packed block "dash-sell-<i>" holding that band's ids ([add][k][cap] -> one
-# id per (level, minimum of days), -1 for the scenario's own chunk), which
-# the script inflates the first time a level is chosen at that band and then
-# keeps (SELL, loadSell); while it inflates, chunkAt answers undefined and
-# choose() waits for it. Sell is enabled only when the base block names
-# those blocks; the level's and the minimum's phrases and the summary line's
-# note are Python's (D.sell_levels, D.sell_days, D.text.sell_note); the level
-# and the minimum shown go into the save button's address (saveHref), and, like Add
-# to held pairs, neither select reaches the k-hat figures, the
-# interval-discount section nor the scenario explorer. A Sell block that
-# cannot be inflated puts every select back, as a chunk that cannot be
-# loaded does (putBack). The Trim to Kelly select (SHOWN[9]) picks the same
-# scenario with held pairs sold down to their Kelly
-# size: D.grid_trim, D.grid_trim_add with adding to held pairs on, and their
-# tier-floors-off twins (gridAt); it is enabled only when the base block
-# carries D.grid_trim. While it is on, Sell is set to "no selling" and shut
-# (refreshSell: no sell level is built for a trimming run); the choice goes
+# The Sell select, appended after it (SHOWN[7]), picks between the base
+# grids (D.grid, D.grid_off) as they stand and a sell level; the "Min. days
+# to maturity" select after it (SHOWN[8]) picks the fewest days before
+# maturity a sale needs, and is enabled only while Sell names a level
+# (refreshDays). No sell level is built for a run that adds to held pairs or
+# trims, so while Add to held pairs or Trim to Kelly is on, Sell is set to
+# "no selling" and shut (refreshSell), and chunkAt answers null for a level
+# there. A level's chunk ids are not in the base block:
+# D.sell_blocks[tier][band] names the packed block "dash-sell-<i>" holding
+# that band's ids ([k][cap] -> one id per (level, minimum of days), -1 for
+# the scenario's own chunk), which the script inflates the first time a
+# level is chosen at that band and then keeps (SELL, loadSell); while it
+# inflates, chunkAt answers undefined and choose() waits for it. Sell is
+# enabled only when the base block names those blocks; the level's and the
+# minimum's phrases and the summary line's note are Python's (D.sell_levels,
+# D.sell_days, D.text.sell_note); the level and the minimum shown go into
+# the save button's address (saveHref), and, like Add to held pairs, neither
+# select reaches the k-hat figures, the interval-discount section nor the
+# scenario explorer. A Sell block that cannot be inflated puts every select
+# back, as a chunk that cannot be loaded does (putBack). The Trim to Kelly
+# select (SHOWN[9]) picks the same scenario with held pairs sold down to
+# their Kelly size: D.grid_trim, D.grid_trim_add with adding to held pairs
+# on, and their tier-floors-off twins (gridAt); it is enabled only when the
+# base block carries D.grid_trim. While it is on, Sell is set to "no selling" and shut
+# (refreshSell, as it is while Add to held pairs is on); the choice goes
 # into the save button's address (saveHref: trim_to_kelly); its phrase
 # and the summary line's note are Python's (D.text.trim, D.text.trim_note),
 # and it reaches neither the k-hat figures, the interval-discount section
@@ -13447,9 +13443,9 @@ _FILTER_JS = r"""
   // to held pairs choice a, Sell choice s, Min. days choice d, Trim to Kelly
   // choice r and Min. price rise choice m. Three results: an id; null for a
   // scenario the run never simulated (a whole grid missing included, and
-  // any sell level of a trimming run, which the page never builds); or
-  // undefined while a sell level's band block is not yet inflated (choose()
-  // inflates it, then asks again). In a Sell block, -1 means the setting
+  // any sell level of a run that adds to held pairs or trims, which the page
+  // never builds); or undefined while a sell level's band block is not yet
+  // inflated (choose() inflates it, then asks again). In a Sell block, -1 means the setting
   // sells nothing: the scenario's own chunk. With trimming on and a minimum
   // chosen, the id is that minimum's in the scenario's cell of riseGridAt's
   // grid (null when the page holds no such grid), or the Trim to Kelly
@@ -13467,13 +13463,14 @@ _FILTER_JS = r"""
       }
       return g[b][k][c];
     }
-    // No base view of the scenario: no sell level of it either
-    if (!g || trimOn(r)) { return null; }
+    // No base view of the scenario: no sell level of it either. Sell runs
+    // neither add nor trim, so none is built for a run that does
+    if (!g || trimOn(r) || addOn(a)) { return null; }
     var id = sellBlockId(t, b);
     if (id === null) { return null; }
     var entry = SELL[id];
     if (!entry || !entry.ready) { return undefined; }
-    var rows = Array.isArray(entry.data) ? entry.data[addOn(a) ? 1 : 0] : null;
+    var rows = Array.isArray(entry.data) ? entry.data : null;
     var cell = rows ? rows[k][c] : null;
     if (!cell) { return null; }
     var v = cell[level * D.sell_days.length + parseInt(d, 10)];
@@ -14760,15 +14757,16 @@ _FILTER_JS = r"""
   function refreshRise() {
     riseSel.disabled = !D || !D.grid_trim_rise || !trimOn(trimSel.value);
   }
-  // No sell level is built for a run that trims to Kelly: while Trim to
-  // Kelly is on, Sell is set to no level and shut, and it opens again when
-  // trimming goes off. A page without the Sell view keeps Sell shut. The
-  // Min. days and Min. price rise selects are opened or shut to match.
+  // No sell level is built for a run that adds to held pairs or trims to
+  // Kelly: while either is on, Sell is set to no level and shut, and it
+  // opens again when both go off. A page without the Sell view keeps Sell
+  // shut. The Min. days and Min. price rise selects are opened or shut to
+  // match.
   function refreshSell() {
     if (D && D.sell_blocks) {
-      var trimming = trimOn(trimSel.value);
-      if (trimming) { sellSel.value = 'none'; }
-      sellSel.disabled = trimming;
+      var shut = trimOn(trimSel.value) || addOn(addSel.value);
+      if (shut) { sellSel.value = 'none'; }
+      sellSel.disabled = shut;
     }
     refreshDays();
     refreshRise();
@@ -14799,9 +14797,9 @@ _FILTER_JS = r"""
   // says what could not be shown, in Python's words; the Tier floors, Add
   // to held pairs, Trim to Kelly, Min. price rise, Sell and Min. days
   // choices go back too, with the band options named for the first, Sell
-  // shut again while trimming is shown, the Min. price rise select shut
-  // again when it is not, and the Min. days select shut again when Sell
-  // names none
+  // shut again while adding or trimming is shown, the Min. price rise select
+  // shut again when trimming is not, and the Min. days select shut again
+  // when Sell names none
   function putBack(err) {
     var tried = scenario(), ticks = selectionName(catTicks(), tagTicks());
     bandSel.value = String(SHOWN[0]);
@@ -14940,8 +14938,8 @@ _FILTER_JS = r"""
     // A run with no tier-off (or add-on, or trim, or Sell) view keeps that
     // select disabled; the Min. days select opens only while Sell names a
     // level, the Min. price rise select only while trimming is on, and Sell
-    // is shut while a trimming scenario is chosen (refreshSell, just below,
-    // shuts what this loop opened)
+    // is shut while an adding or trimming scenario is chosen (refreshSell,
+    // just below, shuts what this loop opened)
     SELECTS.forEach(function(s) {
       s.disabled = (s === tierSel && !D.grid_off) || (s === addSel && !D.grid_add)
         || (s === trimSel && !D.grid_trim) || (s === sellSel && !D.sell_blocks);
@@ -14966,6 +14964,9 @@ _FILTER_JS = r"""
   addSel.addEventListener('change', function() {
     // Nothing to switch to without the add-on view (the select stays shut)
     if (!D || !D.grid_add) { return; }
+    // Sell goes to no level and shuts while adding is on, and opens again
+    // (unless trimming is on) when it goes off
+    refreshSell();
     choose();
   });
   trimSel.addEventListener('change', function() {
@@ -15124,12 +15125,13 @@ def generate_dashboard(
     always written). When the sweep carries the Sell family and the walked
     grid fits it (_GridSource.sell), the Sell select is built after the walk
     (_build_sell_grid: every sell level and minimum of days of every cell
-    the bar shows, in up to sell_workers spawned worker processes, each new
-    trade list written as a sidecar chunk file in a new build folder beside
-    the page, DASHBOARD_FILES_DIRNAME / <build id> in the page's folder, and
-    each band's chunk ids under each Tier floors setting as a packed block
-    written after the page's own chunks); a failure costs the Sell select alone, and a folder no chunk
-    was written to is deleted. If the filter's data
+    the bar shows with no adding to held pairs and no trimming, in up to
+    sell_workers spawned worker processes, each new trade list written as a
+    sidecar chunk file in a new build folder beside the page,
+    DASHBOARD_FILES_DIRNAME / <build id> in the page's folder, and each
+    band's chunk ids under each Tier floors setting as a packed block
+    written after the page's own chunks); a failure costs the Sell select
+    alone, and a folder no chunk was written to is deleted. If the filter's data
     cannot be built, the page is written without the bar and its script,
     with a notice in the bar's place (and in the k-hat breakdown's, which
     reads the same base block, and in the interval-discount section, which
@@ -15389,8 +15391,8 @@ def generate_dashboard(
             explorer_grid = explorer_data is not None and explorer_data.checks
             if source.sell is not None:
                 # Every sell level and minimum of days of every scenario the
-                # bar shows, in worker processes; a failure costs the Sell
-                # select alone
+                # bar shows with no adding or trimming, in worker processes;
+                # a failure costs the Sell select alone
                 try:
                     build_folder = _new_build_folder(out_path)
                     sell_grid = _build_sell_grid(

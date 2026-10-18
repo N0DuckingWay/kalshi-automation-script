@@ -197,8 +197,10 @@ Notes:
     the dashboard is built, every scenario selling a position early at each
     level of config.TAKE_PROFIT_LEVELS with each minimum of days before
     maturity of config.TAKE_PROFIT_MIN_DAYS (the dashboard's Sell and Min.
-    days to maturity selects). It simulates nothing during the run;
-    --no-sell-sweep skips it, leaving both selects disabled. Nothing here
+    days to maturity selects). None of those scenarios adds to held pairs or
+    trims them: the dashboard sets Sell to no selling and shuts it while Add
+    to held pairs or Trim to Kelly is on. It simulates nothing during the
+    run; --no-sell-sweep skips it, leaving both selects disabled. Nothing here
     reaches live trading by itself: a live run sells at its saved sell_at
     level (main.py --sell-at overrides it for one run), which the dashboard's
     Save as live defaults… can set.
