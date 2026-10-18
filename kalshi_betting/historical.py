@@ -47,7 +47,9 @@ Dependencies:
     backtester.py and main.py, series_labels()
     by backtester.py, dashboard.py, main.py and live_portfolio.py, and
     load_event_competitions() (each event's competition label, for the
-    backtest's same-title sport check, DR-79) by backtester.py. live_portfolio.py (the Live
+    backtest's same-title sport check, DR-79) and load_event_facts() (each
+    event's settlement sources and mutually_exclusive flag, for the
+    backtest's report only) by backtester.py. live_portfolio.py (the Live
     trading tab, which only reads) also reads _historical_get with
     _API_PREFIX, its only way to Kalshi, _candle_close, and _load_json_cache
     and _save_json_cache for the finalized markets' daily prices it keeps.
@@ -1021,6 +1023,181 @@ def load_event_fee_overrides(client: Any, event_tickers: Iterable[str], *,
                  "%d unknown (charged the full fee), %d with an override", len(wanted),
                  len(wanted) - len(missing), len(fresh), len(wanted) - len(found),
                  sum(1 for v in found.values() if v is not None))
+    return found
+
+
+# What the backtest's report reads of each pair market's event
+# (load_event_facts): {"facts": {event_ticker: {"settlement_sources": [names],
+# "mutually_exclusive": true | false | null}}}. Only answers Kalshi gave are
+# kept: an event whose read failed, or whose facts cannot be read, is not
+# stored, so a later run asks again.
+_EVENT_FACTS_CACHE = CACHE_DIR / "event_facts.json"
+
+
+def _event_facts(event: Any) -> dict | None:
+    """
+    Read the two report-only facts of one event object.
+
+    Args:
+        event (Any): An event object from /events/{ticker}, or a cached fact
+            dict (the same two keys).
+
+    Returns:
+        dict | None: {"settlement_sources": a sorted tuple of each source's
+            name (its url when it has no name), "mutually_exclusive": True,
+            False or None}; None when the object is not a dict or its
+            settlement_sources is there but is not a list. An event that
+            lists no sources reads as an empty tuple, and a
+            mutually_exclusive that is not a bool reads as None.
+    """
+    if not isinstance(event, dict):
+        return None
+    raw = event.get("settlement_sources")
+    if raw is None:
+        raw = []
+    if not isinstance(raw, list):
+        return None
+    names = set()
+    for source in raw:
+        if isinstance(source, str) and source.strip():
+            names.add(source.strip())
+        elif isinstance(source, dict):
+            for key in ("name", "url"):
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    names.add(value.strip())
+                    break
+    exclusive = event.get("mutually_exclusive")
+    return {"settlement_sources": tuple(sorted(names)),
+            "mutually_exclusive": exclusive if isinstance(exclusive, bool) else None}
+
+
+def _fetch_event_facts(client: Any, event_ticker: str) -> dict | None:
+    """
+    Read one event's report-only facts from /events/{ticker}, then pause.
+
+    One read-only GET through _historical_get (retried on 429/5xx), its
+    event object read by _event_facts. Each read is followed by an
+    EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS pause, as
+    _fetch_event_fee_override's are.
+
+    Args:
+        client (Any): The production live client.
+        event_ticker (str): The event to read.
+
+    Returns:
+        dict | None: The facts (see _event_facts), or None when they cannot
+            be read.
+
+    Raises:
+        ValueError: When the reply carries no event object.
+        Exception: Whatever the read itself raises once its retries are spent.
+    """
+    try:
+        data = _historical_get(client, f"{_API_PREFIX}/events/{event_ticker}")
+        event = data.get("event") if isinstance(data, dict) else None
+        if not isinstance(event, dict):
+            raise ValueError(f"/events/{event_ticker} returned no event object")
+        return _event_facts(event)
+    finally:
+        time.sleep(EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS)
+
+
+def load_event_facts(client: Any, event_tickers: Iterable[str]) -> dict[str, dict]:
+    """
+    Each event's settlement sources and mutually_exclusive flag, from the cache or one read-only GET each.
+
+    Report only: backtester._prepare_candidates counts the pairs whose two
+    events name different settlement sources, and the same-event ladders whose
+    event is a set of mutually exclusive options; nothing decides on them.
+    An event already in backtest_cache/event_facts.json costs no request; the
+    others are read on EVENT_TITLE_FALLBACK_MAX_WORKERS threads, at most
+    EVENT_COMPETITION_MAX_LOOKUPS per call, in ticker order. An event left
+    out — past the cap, a read that failed, facts that cannot be read, no
+    client — is unknown and is not stored, so a later run asks again. New
+    answers are merged into the cache (a failed save is a WARNING). One INFO
+    line counts where they came from. Never raises.
+
+    Args:
+        client (Any): The production live client, or None for the cache only.
+        event_tickers (Iterable[str]): The events wanted; blank or non-string
+            tickers are left out.
+
+    Returns:
+        dict[str, dict]: Each wanted event whose facts are known -> its facts
+            (see _event_facts). An event missing from it is unknown.
+    """
+    wanted = sorted({t for t in event_tickers if isinstance(t, str) and t})
+    if not wanted:
+        return {}
+    cached: dict[str, dict] = {}
+    cache_readable = True
+    try:
+        raw = _load_json_cache(_EVENT_FACTS_CACHE)
+        block = raw.get("facts") if isinstance(raw, dict) else None
+        if isinstance(block, dict):
+            for t, value in block.items():
+                parsed = _event_facts(value) if isinstance(t, str) else None
+                if parsed is not None:
+                    cached[t] = parsed
+    except Exception as exc:  # a folder that cannot be searched, a file nested too deeply
+        logging.warning(
+            "Event facts: could not read the cached facts (%s) — reading the wanted events "
+            "from Kalshi, and leaving the cache file as it is", _exception_summary(exc))
+        cached, cache_readable = {}, False
+
+    found = {t: cached[t] for t in wanted if t in cached}
+    missing = [t for t in wanted if t not in found]
+    to_read = [] if client is None else missing[:EVENT_COMPETITION_MAX_LOOKUPS]
+    if len(missing) > len(to_read):
+        logging.warning(
+            "Event facts: %d events are not in the cache and %s, so the report leaves "
+            "them out this run", len(missing) - len(to_read),
+            "no client was given" if client is None else
+            f"are past the cap EVENT_COMPETITION_MAX_LOOKUPS={EVENT_COMPETITION_MAX_LOOKUPS}")
+
+    def _read_one(ticker: str) -> tuple[str, Any, BaseException | None]:
+        """One event's read, with its failure kept rather than raised."""
+        try:
+            return ticker, _fetch_event_facts(client, ticker), None
+        except Exception as exc:
+            return ticker, None, exc
+
+    fresh: dict[str, dict] = {}
+    if to_read:
+        try:
+            with ThreadPoolExecutor(
+                    max_workers=min(EVENT_TITLE_FALLBACK_MAX_WORKERS, len(to_read))) as pool:
+                for ticker, value, exc in pool.map(_read_one, to_read):
+                    if exc is not None:
+                        logging.warning(
+                            "Could not read the facts of event %s: HTTP %s %s — the report "
+                            "leaves it out this run", ticker,
+                            getattr(exc, "status", "?"), _exception_summary(exc))
+                    elif value is None:
+                        logging.warning(
+                            "The facts of event %s cannot be read — the report leaves it "
+                            "out this run", ticker)
+                    else:
+                        fresh[ticker] = value
+        except Exception as exc:  # a pool that cannot start: keep what was read
+            logging.warning("Event facts: the reads stopped (%s) — the events not read are "
+                            "left out of the report", _exception_summary(exc))
+
+    if fresh and cache_readable:
+        stored = {t: {"settlement_sources": list(f["settlement_sources"]),
+                      "mutually_exclusive": f["mutually_exclusive"]}
+                  for t, f in {**cached, **fresh}.items()}
+        try:
+            _save_json_cache(_EVENT_FACTS_CACHE, {"facts": stored})
+        except Exception as exc:  # the answers are in hand: a failed write costs the cache only
+            logging.warning(
+                "Event facts: could not save the cached facts (%s) — this run still uses "
+                "the %d it read", _exception_summary(exc), len(fresh))
+    found.update(fresh)
+    logging.info("Event facts: %d events, %d from the cache, %d read from Kalshi, "
+                 "%d unknown", len(wanted), len(wanted) - len(missing), len(fresh),
+                 len(wanted) - len(found))
     return found
 
 

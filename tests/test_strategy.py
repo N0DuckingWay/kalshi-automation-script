@@ -3868,9 +3868,12 @@ class TestTimeSeriesKellyParity:
         assert callers == {("backtester", "sale_ladder"), ("backtester", "_books_for"),
                            ("backtester", "_volume_limit"),
                            ("backtester", "_volume_capped_leg")}
+        # ... and volume_ahead_at, the report-only reading a trade's
+        # volume_share is taken from (C8), which decides nothing
         assert readers["volume_ahead_checkpoints"] == {
             ("backtester", "volume_cap_at"), ("backtester", "__reduce__"),
-            ("backtester", "__eq__"), ("backtester", "_attach_leg_quotes")}
+            ("backtester", "__eq__"), ("backtester", "_attach_leg_quotes"),
+            ("backtester", "volume_ahead_at")}
         assert readers["volume_share"] == {
             ("backtester", "volume_cap_at"), ("backtester", "__init__"),
             ("backtester", "__reduce__"), ("backtester", "__eq__"),
@@ -3925,9 +3928,11 @@ class TestTimeSeriesKellyParity:
                            # ... and the gate of the walk's count-only revaluations
                            ("backtester", "_stale_unpaid_leg")}
         assert _function_calls(backtester, "_simulate_at_discount", "_stale_unpaid_leg")
+        # ... and quote_age_at, the report-only age a trade's row shows (C8)
         assert readers["moved_checkpoints"] == {("backtester", "_quote_is_fresh"),
                                                 ("backtester", "__reduce__"),
-                                                ("backtester", "__eq__")}
+                                                ("backtester", "__eq__"),
+                                                ("backtester", "quote_age_at")}
         assert readers["stale_max_age"] == {("backtester", "_quote_is_fresh"),
                                             ("backtester", "__init__"),
                                             ("backtester", "__reduce__"),

@@ -7896,3 +7896,104 @@ class TestLoadEventFeeOverrides:
                             lambda c, t: reads.append(t) or None)
         got = historical.load_event_fee_overrides(MagicMock(), ["A-1", "Z-1"], first={"Z-1"})
         assert reads == ["Z-1"] and got == {"Z-1": None}
+
+
+# The real reader, taken before conftest's session stub replaces it
+_REAL_FETCH_EVENT_FACTS = historical._fetch_event_facts
+
+
+class TestLoadEventFacts:
+    """Each pair market's event's settlement sources and mutually_exclusive
+    flag, for the backtest's report only: cached, and an event not read is
+    left out and asked again next run."""
+
+    _FACTS = {"settlement_sources": ("NHL",), "mutually_exclusive": False}
+
+    def test_reads_caches_and_leaves_unknown_out(self, monkeypatch):
+        answers = {"E-ONE": self._FACTS,
+                   "E-OPTIONS": {"settlement_sources": (), "mutually_exclusive": True},
+                   "E-ODD": None}
+        reads: list = []
+
+        def fetch(client, ticker):
+            reads.append(ticker)
+            if ticker == "E-FAIL":
+                raise RuntimeError("boom")
+            return answers[ticker]
+
+        monkeypatch.setattr(historical, "_fetch_event_facts", fetch)
+        got = historical.load_event_facts(
+            MagicMock(), ["E-ONE", "E-OPTIONS", "E-ODD", "E-FAIL", "", None])
+        assert got == {"E-ONE": self._FACTS, "E-OPTIONS": answers["E-OPTIONS"]}
+        # Only answers Kalshi gave are cached, read back as the same facts;
+        # the others are asked again
+        reads.clear()
+        got = historical.load_event_facts(MagicMock(), ["E-ONE", "E-OPTIONS", "E-ODD"])
+        assert got == {"E-ONE": self._FACTS, "E-OPTIONS": answers["E-OPTIONS"]}
+        assert reads == ["E-ODD"]
+        saved = json.loads(historical._EVENT_FACTS_CACHE.read_text())
+        assert saved == {"facts": {
+            "E-ONE": {"settlement_sources": ["NHL"], "mutually_exclusive": False},
+            "E-OPTIONS": {"settlement_sources": [], "mutually_exclusive": True}}}
+
+    def test_no_client_reads_the_cache_only(self, monkeypatch):
+        monkeypatch.setattr(historical, "_fetch_event_facts",
+                            lambda c, t: pytest.fail("no read without a client"))
+        assert historical.load_event_facts(None, ["E1"]) == {}
+        assert historical.load_event_facts(MagicMock(), []) == {}
+
+    def test_the_cap_reads_in_ticker_order(self, monkeypatch):
+        reads: list = []
+        monkeypatch.setattr(historical, "EVENT_COMPETITION_MAX_LOOKUPS", 1)
+        monkeypatch.setattr(historical, "_fetch_event_facts",
+                            lambda c, t: reads.append(t) or self._FACTS)
+        got = historical.load_event_facts(MagicMock(), ["Z-1", "A-1"])
+        assert reads == ["A-1"] and got == {"A-1": self._FACTS}
+
+    def test_an_unreadable_cache_is_left_as_it_is(self, monkeypatch, caplog):
+        historical._EVENT_FACTS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        historical._EVENT_FACTS_CACHE.write_text("not json")
+        monkeypatch.setattr(historical, "_load_json_cache",
+                            lambda path: (_ for _ in ()).throw(RecursionError("deep")))
+        monkeypatch.setattr(historical, "_fetch_event_facts", lambda c, t: self._FACTS)
+        with caplog.at_level(logging.WARNING):
+            got = historical.load_event_facts(MagicMock(), ["E1"])
+        assert got == {"E1": self._FACTS}
+        assert historical._EVENT_FACTS_CACHE.read_text() == "not json"
+        assert any("could not read the cached facts" in m for m in caplog.messages)
+
+    def test_the_one_count_line(self, monkeypatch, caplog):
+        monkeypatch.setattr(historical, "_fetch_event_facts", lambda c, t: self._FACTS)
+        with caplog.at_level(logging.INFO):
+            historical.load_event_facts(MagicMock(), ["E1", "E2"])
+        assert ("Event facts: 2 events, 0 from the cache, 2 read from Kalshi, 0 unknown"
+                in caplog.messages)
+
+    def test_the_facts_of_an_event_object(self):
+        facts = historical._event_facts
+        assert facts({"settlement_sources": [{"name": "NHL", "url": "https://nhl.com"},
+                                             {"url": "https://b.example"}, {"name": ""},
+                                             "ESPN", 7],
+                      "mutually_exclusive": True}) == {
+            "settlement_sources": ("ESPN", "NHL", "https://b.example"),
+            "mutually_exclusive": True}
+        # No sources listed is an empty tuple; a flag that is not a bool is None
+        assert facts({"mutually_exclusive": "yes"}) == {
+            "settlement_sources": (), "mutually_exclusive": None}
+        # Sources that are there but are not a list cannot be read
+        assert facts({"settlement_sources": "NHL"}) is None
+        assert facts(["not", "an", "event"]) is None
+
+    def test_the_reader_reads_a_real_event_payload(self, monkeypatch):
+        payload = json.loads((_KALSHI_PAYLOADS / "event_with_competition.json").read_text())
+        paths: list = []
+        monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS", 0)
+        monkeypatch.setattr(historical, "_historical_get",
+                            lambda client, path, **kw: paths.append(path) or payload)
+        got = _REAL_FETCH_EVENT_FACTS(MagicMock(), "KXNHLAST-26OCT17NYITOR")
+        assert got == {"settlement_sources": ("NHL",), "mutually_exclusive": False}
+        assert paths == [f"{historical._API_PREFIX}/events/KXNHLAST-26OCT17NYITOR"]
+        # A reply with no event object is an error, which the loader reports
+        monkeypatch.setattr(historical, "_historical_get", lambda client, path, **kw: {})
+        with pytest.raises(ValueError):
+            _REAL_FETCH_EVENT_FACTS(MagicMock(), "E1")

@@ -24444,7 +24444,8 @@ class TestScheduledCloseSwitchOff:
             # Every run starts from the same caches: each market's details
             # saved, no event label read yet
             for path in (historical._EVENT_COMPETITIONS_CACHE,
-                         historical._EVENT_FEE_OVERRIDES_CACHE, market_details._DETAILS_CACHE):
+                         historical._EVENT_FEE_OVERRIDES_CACHE, historical._EVENT_FACTS_CACHE,
+                         market_details._DETAILS_CACHE):
                 path.unlink(missing_ok=True)
             def details_of(m):
                 close = backtester._parse_iso_datetime(m["close_time"])
@@ -25215,7 +25216,7 @@ class TestStaleQuoteSwitch:
             # the run began (a second run in one test reads what the first saved)
             messages = [m for m in caplog.messages
                         if not m.startswith(("Peak RSS", "Event competitions:",
-                                             "Event fee overrides:", "Market details:",
+                                             "Event fee overrides:", "Event facts:", "Market details:",
                                              "Trades:"))]
         return res, messages
 
@@ -25723,3 +25724,160 @@ class TestVolumeCapKeepsEveryLazyFamilyExact(TestStaleQuoteKeepsEveryLazyFamilyE
         first = cls._SUITE._record((_LADDER_M1, _LADDER_M2, _LADDER_M3))
         return _capped_attached([first, early, other], candles, share=limit,
                                 model=_walk_model())
+
+
+class TestExtraDataReport:
+    """C8, report only: the counts of pairs whose structured fields disagree
+    with what pairing went by, the trade fields the dashboard's rows show,
+    and the proof that none of it moves a trade."""
+
+    _FULL = {"level": "full", "strike_type": "greater", "floor_strike": 88.5,
+             "rules_primary": "If the teams score more than 88.5 points by Oct 17, 2026, Yes."}
+
+    @staticmethod
+    def _m(ticker: str, event: str) -> dict:
+        return {"ticker": ticker, "event_ticker": event}
+
+    def _lines(self, caplog) -> list[str]:
+        return [m for m in caplog.messages if m.startswith("Report only — ")]
+
+    def test_each_count_fires_on_a_crafted_pair_and_not_on_an_agreeing_one(self, caplog):
+        same = [(self._m("SA", "EA"), self._m("SB", "EB"), "q", ("e", "t", "s")),
+                (self._m("SC", "EC"), self._m("SD", "ED"), "q", ("e", "t", "s"))]
+        ts = [(self._m("TA", "EL"), self._m("TB", "EL"), "q", "k"),
+              (self._m("TC", "EX"), self._m("TD", "EY"), "q", "k")]
+        details = {"SA": self._FULL, "SB": dict(self._FULL, floor_strike=89.5),
+                   "SC": self._FULL, "SD": dict(self._FULL),
+                   "TA": self._FULL,
+                   "TB": dict(self._FULL, rules_primary=self._FULL["rules_primary"].replace(
+                       "Oct 17, 2026", "Oct 24, 2026")),
+                   "TC": self._FULL,
+                   "TD": dict(self._FULL, rules_primary="If it rains in NYC by Oct 17, 2026, Yes.")}
+        facts = {"EA": {"settlement_sources": ("NFL",), "mutually_exclusive": False},
+                 "EB": {"settlement_sources": ("NCAA",), "mutually_exclusive": False},
+                 "EC": {"settlement_sources": ("NFL",), "mutually_exclusive": False},
+                 "ED": {"settlement_sources": ("NFL",), "mutually_exclusive": None},
+                 "EL": {"settlement_sources": (), "mutually_exclusive": True}}
+        with caplog.at_level(logging.INFO):
+            counts = backtester._report_pair_facts(ts, same, details, facts)
+        assert counts == {"strikes_differ": 1, "strikes_checked": 2,
+                          "sources_differ": 1, "sources_checked": 2,
+                          "rules_differ": 1, "rules_checked": 2,
+                          "option_ladders": 1, "ladders_checked": 1}
+        lines = self._lines(caplog)
+        assert lines == [
+            "Report only — same-title pairs whose strikes differ: 1 of 2 checked",
+            "Report only — same-title pairs whose events name different settlement "
+            "sources: 1 of 2 checked",
+            "Report only — time-series pairs whose rules texts differ beyond their "
+            "dates: 1 of 2 checked",
+            "Report only — same-event ladder pairs whose event is a set of mutually "
+            "exclusive options: 1 of 1 checked"]
+        # Each count names its pairs, both tickers
+        assert caplog.messages.count("  SA / SB") == 2
+        assert "  TC / TD" in caplog.messages and "  TA / TB" in caplog.messages
+        # Dates alone never make two rules texts differ: TA / TB is named
+        # once, under the option-set ladders
+        assert caplog.messages.count("  TA / TB") == 1
+        assert "  TA / TB" == caplog.messages[caplog.messages.index(lines[3]) + 1]
+
+    def test_the_four_lines_are_logged_at_zero(self, caplog):
+        with caplog.at_level(logging.INFO):
+            counts = backtester._report_pair_facts([], [], {}, {})
+        assert set(counts.values()) == {0}
+        assert len(self._lines(caplog)) == 4
+        assert all(m.endswith(": 0 of 0 checked") for m in self._lines(caplog))
+
+    def test_unknown_records_and_facts_are_not_checked(self, caplog):
+        same = [(self._m("SA", "EA"), self._m("SB", "EB"), "q", ("e", "t", "s"))]
+        ts = [(self._m("TA", "EL"), self._m("TB", "EL"), "q", "k")]
+        # A timing-only record carries no strike, a blank rules text no rules,
+        # an event with no sources and an unknown flag no comparison
+        details = {"SA": {"level": "timing"}, "SB": self._FULL,
+                   "TA": dict(self._FULL, rules_primary="  "), "TB": self._FULL}
+        facts = {"EA": {"settlement_sources": (), "mutually_exclusive": None},
+                 "EB": {"settlement_sources": ("NFL",), "mutually_exclusive": None},
+                 "EL": {"settlement_sources": (), "mutually_exclusive": None}}
+        with caplog.at_level(logging.INFO):
+            counts = backtester._report_pair_facts(ts, same, details, facts)
+        assert set(counts.values()) == {0}
+
+    def test_log_extra_data_returns_what_it_logged(self):
+        summaries = {"T": {"complete": True, "trades": 1, "contracts": 1.0, "bytes": 0,
+                           "failure": None, "failures": []}}
+        failures = {"T": (2, ["candle_range: T example"])}
+        integrity, markets, hours = backtester._log_extra_data(
+            {}, 1, summaries, failures, {"T": (3, ["candle_crossed: T"])})
+        assert [name for name, _ in integrity] == list(market_details.CHECK_NAMES)
+        assert dict(integrity)[market_details.CHECK_CANDLE_RANGE] == 1
+        assert sum(count for _, count in integrity) == 1
+        assert (markets, hours) == (1, 3)
+
+    def test_a_simulated_trade_carries_its_quote_ages_and_volume_share(self):
+        records, candles = TestStaleQuoteSkipsAMonday._ts(7_200)
+        candles = _with_after(_with_after(candles, "OA", _LADDER_M1, 50.0),
+                              "OB", _LADDER_M1, 500.0)
+        point = TestStaleQuoteSkipsAMonday()._sim(_stale_attached(records, candles, limit=None))
+        (trade,) = [t for t in point.trades if t.entry_date == _LADDER_M1]
+        # OA last moved two hours before the checkpoint (its later candle was
+        # still), OB one hour before
+        assert (trade.quote_age_hours_a, trade.quote_age_hours_b) == (2.0, 1.0)
+        assert trade.next_day_volume_share == pytest.approx(trade.n / 50.0)
+        # The realized close is the one the trade read
+        assert (trade.scheduled_close_a, trade.scheduled_close_b) == (None, None)
+
+    def test_the_report_fields_of_a_candidate(self):
+        quotes = backtester.LegQuotes(
+            "Q", _LADDER_M1, np.array([0.5]), np.array([0.5]), _LADDER_M1,
+            np.array([0.5]), np.array([0.5]), 1.0, 0.0,
+            moved_checkpoints=np.array([_ck(_LADDER_M1) - 5_400]),
+            volume_ahead_checkpoints=np.array([0.0]))
+        c = {"close_date_a": date(2026, 2, 1), "close_date_b": date(2026, 2, 3),
+             "entry_date": _LADDER_M1, "marks": (quotes, quotes)}
+        mA = {"close_time": "2026-02-01T12:00:00Z"}
+        mB = {"close_time": "2026-02-05T12:00:00Z"}
+        fields_ = backtester._trade_report_fields(c, mA, mB, 10)
+        # B read a scheduled close two days before its realized one
+        assert fields_ == {"scheduled_close_a": None, "scheduled_close_b": date(2026, 2, 3),
+                           "quote_age_hours_a": 1.5, "quote_age_hours_b": 1.5,
+                           # No volume traded ahead: no share
+                           "next_day_volume_share": None}
+        assert backtester._trade_report_fields(dict(c, marks=None), mA, mB, 10)[
+            "quote_age_hours_a"] is None
+        # A day that is not one of the quotes' checkpoints reads nothing
+        assert quotes.quote_age_at(_LADDER_M1 + timedelta(days=1)) is None
+        assert quotes.volume_ahead_at(_LADDER_M2) is None
+
+    def test_the_report_fields_are_left_out_of_equality(self):
+        report = ("scheduled_close_a", "scheduled_close_b", "quote_age_hours_a",
+                  "quote_age_hours_b", "next_day_volume_share")
+        by_name = {f.name: f for f in fields(backtester.BacktestTrade)}
+        assert [f.name for f in fields(backtester.BacktestTrade)][-5:] == list(report)
+        assert all(not by_name[name].compare and by_name[name].default is None
+                   for name in report)
+
+    def test_the_run_is_the_same_whatever_the_event_facts_say(self, monkeypatch, caplog):
+        base, base_lines = TestStaleQuoteSwitch()._run(monkeypatch, caplog)
+        report = base.extra_data_report
+        assert isinstance(report, backtester.ExtraDataReport)
+        assert report.pair_markets > 0 and report.anomaly_markets == 0
+        assert [name for name, _ in report.integrity_failures] == list(
+            market_details.CHECK_NAMES)
+        assert len([m for m in base_lines if m.startswith("Report only — ")]) == 4
+        # Every event's facts disagree: each listed under a source of its own,
+        # each a set of mutually exclusive options
+        monkeypatch.setattr(backtester, "load_event_facts", lambda client, events: {
+            e: {"settlement_sources": (e,), "mutually_exclusive": True}
+            for e in events if e})
+        other, _ = TestStaleQuoteSwitch()._run(monkeypatch, caplog)
+        TestStaleQuoteSwitch._same(other, base)
+        assert other.extra_data_report.option_ladders == other.extra_data_report.ladders_checked
+        assert (other.extra_data_report.sources_differ
+                == other.extra_data_report.sources_checked > 0)
+        assert other.extra_data_report.ladders_checked > 0
+
+    def test_the_infeasible_window_records_no_report(self, monkeypatch):
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                 start_date=date(2026, 1, 1))
+        assert res.extra_data_report is None

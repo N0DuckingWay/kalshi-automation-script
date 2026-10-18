@@ -80,7 +80,9 @@ Dependencies:
     series_labels() and load_series_categories() (the filing rule and the
     /series listing the same-title label check reads, the dashboard's own)
     and load_event_competitions() (each event's competition label, read and
-    cached for the same-title competition check), plus its
+    cached for the same-title competition check) and load_event_facts()
+    (each event's settlement sources and mutually_exclusive flag, read and
+    cached for the report only), plus its
     SettledCorpus (read by TYPE, to take the corpus's provenance) and
     CorpusProvenance (carried out on
     BacktestSweep.corpus_provenance and re-exported to dashboard.py, which
@@ -468,6 +470,7 @@ from .historical import (
     fetch_candlesticks,
     infer_category,
     load_event_competitions,
+    load_event_facts,
     load_event_fee_overrides,
     load_series_categories,
     load_series_fee_multipliers,
@@ -503,6 +506,7 @@ from .scanner import (
     leg_prices,
     leg_sides,
     listed_fee_multiplier,
+    normalize_title,
     same_event_ladder,
     stated_deadline,
     time_series_group_key,
@@ -1501,6 +1505,50 @@ class LegQuotes:
             return None
         return math.floor(round(self.volume_share * volume, 6))
 
+    def volume_ahead_at(self, day: date) -> float | None:
+        """
+        The contracts this market traded in the window after the checkpoint on `day`.
+
+        Report only (a trade's BacktestTrade.next_day_volume_share): nothing decides
+        on it, and it reads no switch.
+
+        Args:
+            day (date): A checkpoint date.
+
+        Returns:
+            float | None: The volume ahead; None when it is unreadable (NaN)
+                or the day is not one of these quotes' checkpoints.
+        """
+        offset = (day - self.first_checkpoint).days
+        if offset < 0 or offset % 7 or offset // 7 >= len(self.volume_ahead_checkpoints):
+            return None
+        volume = float(self.volume_ahead_checkpoints[offset // 7])
+        return None if volume != volume else volume
+
+    def quote_age_at(self, day: date) -> float | None:
+        """
+        How many hours before the checkpoint on `day` this market last traded or moved its quote.
+
+        Report only (a trade's BacktestTrade.quote_age_hours_a/_b): the
+        checkpoint instant less the moved_ts of the candle the checkpoint
+        reads, in hours. Nothing decides on it; the stale-quote check
+        (_quote_is_fresh) reads the same moved time on its own.
+
+        Args:
+            day (date): A checkpoint date.
+
+        Returns:
+            float | None: The age in hours; None when the candle carries no
+                moved time or the day is not one of these quotes' checkpoints.
+        """
+        offset = (day - self.first_checkpoint).days
+        if offset < 0 or offset % 7 or offset // 7 >= len(self.moved_checkpoints):
+            return None
+        moved = int(self.moved_checkpoints[offset // 7])
+        if moved < 0:
+            return None
+        return (_checkpoint_epoch(SCHEDULED_RUN, day) - moved) / 3600.0
+
     def sale_ladder(self, day: date, best_bid: float,
                     days_back: int = 0, *, volume_cap: bool = True) -> list[list[float]] | None:
         """
@@ -1755,6 +1803,19 @@ class BacktestTrade:
             1.0 (the full fee) unless config.CONFIRMED_FEE_MULTIPLIERS holds
             it. A sale or trim of that leg pays its fee at the same one.
         fee_multiplier_b (float): The same for market B's leg.
+        scheduled_close_a (date | None): Market A's close date as the trade
+            read it (close_date_a) when that is its scheduled close and
+            differs from its realized close; None otherwise. Report only.
+        scheduled_close_b (date | None): The same for market B.
+        quote_age_hours_a (float | None): Hours between the entry checkpoint
+            and the last time market A traded or moved its quote before it
+            (LegQuotes.quote_age_at); None when not known. Report only.
+        quote_age_hours_b (float | None): The same for market B.
+        next_day_volume_share (float | None): The trade's contract count over the
+            lower of its two markets' contracts traded in the day after the
+            entry checkpoint (LegQuotes.volume_ahead_at); None when either is
+            unknown or zero. Report only. The five report fields are left out
+            of equality.
     """
     pair_type: str       # "time_series" | "same_title"
     ticker_a: str
@@ -1838,6 +1899,15 @@ class BacktestTrade:
     # pays later — a sale's, a trim's — reads its own leg's
     fee_multiplier_a: float = 1.0
     fee_multiplier_b: float = 1.0
+    # Report only, shown in the dashboard's trade rows: each leg's scheduled
+    # close where it differs from its realized close, how old each leg's quote
+    # was at entry, and the share of the next day's volume the trade took.
+    # Left out of equality, so no comparison of trades reads them
+    scheduled_close_a: date | None = field(default=None, compare=False)
+    scheduled_close_b: date | None = field(default=None, compare=False)
+    quote_age_hours_a: float | None = field(default=None, compare=False)
+    quote_age_hours_b: float | None = field(default=None, compare=False)
+    next_day_volume_share: float | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -2349,6 +2419,60 @@ class OutcomeLabelCoverage:
     unknown_deadline_markets: int
 
 
+@dataclass(frozen=True)
+class ExtraDataReport:
+    """
+    What the backtest's side data says about its pairs, as counts only.
+
+    Built by _prepare_candidates once the side data is loaded and carried on
+    BacktestSweep.extra_data_report for the dashboard header. Report only:
+    no trade, size or pair reads it. Scalars and tuples only, so it holds no
+    market record alive.
+
+    Attributes:
+        strikes_differ (int): Same-title pairs whose two markets' strike
+            fields (strike_type, floor_strike, cap_strike, custom_strike)
+            differ.
+        strikes_checked (int): Same-title pairs whose two full records both
+            carry a strike_type.
+        sources_differ (int): Same-title pairs whose two events name
+            different settlement sources.
+        sources_checked (int): Same-title pairs whose two events' facts are
+            known and each names at least one source.
+        rules_differ (int): Time-series pairs whose two rules texts differ
+            once their dates are taken out (scanner.normalize_title).
+        rules_checked (int): Time-series pairs whose two records both carry
+            a rules text.
+        option_ladders (int): Same-event ladder pairs (both markets on one
+            event) whose event is mutually exclusive: a set of options, not
+            a deadline ladder.
+        ladders_checked (int): Same-event ladder pairs whose event's
+            mutually_exclusive flag is known.
+        integrity_failures (tuple[tuple[str, int], ...]): Each integrity
+            check's name (market_details.CHECK_NAMES, in order) and how many
+            pair markets fail it.
+        anomaly_markets (int): Pair markets with a crossed candle (Kalshi's
+            own data, not a failure).
+        anomaly_hours (int): The hours those candles cover.
+        pair_markets (int): How many pair markets there are.
+        scheduled_close_markets (int | None): How many of them use a
+            scheduled close; None with the scheduled close off.
+    """
+    strikes_differ: int
+    strikes_checked: int
+    sources_differ: int
+    sources_checked: int
+    rules_differ: int
+    rules_checked: int
+    option_ladders: int
+    ladders_checked: int
+    integrity_failures: tuple[tuple[str, int], ...]
+    anomaly_markets: int
+    anomaly_hours: int
+    pair_markets: int
+    scheduled_close_markets: int | None
+
+
 @dataclass
 class _Candidates:
     """
@@ -2456,6 +2580,9 @@ class _Candidates:
             (_resolve_max_volume_share: the constant or the run's override);
             None with the cap off, and on a hand-built instance. Every
             LegQuotes the entry passes attach carries it.
+        extra_data_report (ExtraDataReport | None): What the side data says
+            about the pairs, as counts (report only); None on a hand-built
+            instance.
     """
     all_pairs: list
     candles_by_ticker: dict
@@ -2472,6 +2599,7 @@ class _Candidates:
     close_rules: dict = field(default_factory=dict)
     stale_quote_max_age: float | None = None
     max_volume_share: float | None = None
+    extra_data_report: ExtraDataReport | None = None
 
 
 def _fee_multiplier_of(market: dict, fee_multipliers: dict | None) -> float:
@@ -4037,6 +4165,11 @@ class BacktestSweep:
             a sale may take (the resolved config.BACKTEST_MAX_VOLUME_SHARE,
             or backtest.py's override); False when the cap was off; None =
             not recorded (a hand-built sweep).
+        extra_data_report (ExtraDataReport | None): What the pair markets'
+            side data says against the pairing rules, the integrity checks'
+            failures, the candle anomalies and how many pair markets use a
+            scheduled close, as counts; report only. None = not recorded (a
+            hand-built sweep, or the Monday-infeasible window).
     """
     primary: SweepPoint
     points: list[SweepPoint]
@@ -4090,6 +4223,8 @@ class BacktestSweep:
     stale_quote_max_age: float | bool | None = None
     # The volume cap's share (False: the cap was off; None: not recorded)
     max_volume_share: float | bool | None = None
+    # What the side data says about the pairs, as counts (None: not recorded)
+    extra_data_report: ExtraDataReport | None = None
 
 
 def _settlement_receipt(n: int, outcome_a: str, outcome_b: str, pair_type: str) -> float:
@@ -5610,7 +5745,11 @@ def _split_trade(trade: BacktestTrade, pairs: int) -> BacktestTrade:
         return {"n": n, "total_cost": cost, "fees": fees, "actual_payoff": receipt,
                 "profit": profit, "profit_ratio": ratio,
                 "monthly_profit_ratio": ratio * 30.0 / trade.holding_days,
-                "expected_payoff": expected, "slippage": profit - expected}
+                "expected_payoff": expected, "slippage": profit - expected,
+                # Report only: the part's own count over the same volume
+                "next_day_volume_share": (
+                    None if trade.next_day_volume_share is None
+                    else trade.next_day_volume_share * n / trade.n)}
 
     part = replace(trade, **figures(pairs, part_cost, part_fees))
     # What is left keeps the rest of the cost and fees
@@ -9775,7 +9914,7 @@ def _log_extra_data(
     summaries: dict[str, dict],
     candle_failures: dict[str, tuple[int, list[str]]],
     candle_anomalies: dict[str, tuple[int, list[str]]] | None = None,
-) -> None:
+) -> tuple[tuple[tuple[str, int], ...], int, int]:
     """
     Report what the side data covers and what its integrity checks found.
 
@@ -9798,6 +9937,11 @@ def _log_extra_data(
         summaries (dict[str, dict]): _audit_pair_markets' result.
         candle_failures (dict): _fetch_candles_parallel's check_out.
         candle_anomalies (dict | None): Its anomaly_out; None reads as none.
+
+    Returns:
+        tuple: Each check's name and failing count (in CHECK_NAMES order),
+            the markets with a candle anomaly and the hours they cover; what
+            ExtraDataReport carries.
     """
     logging.info(
         "Market details: full records for %d of %d pair markets (%d from the cache)",
@@ -9839,6 +9983,80 @@ def _log_extra_data(
                      name, len(found), sum(count for count, _ in found))
         for _, examples in found[:INTEGRITY_MAX_EXAMPLES]:
             logging.info("  %s", examples[0])
+    found = [anomalies[t] for t in sorted(anomalies)]
+    return (tuple((name, len(failing[name])) for name in market_details.CHECK_NAMES),
+            len(found), sum(count for count, _ in found))
+
+
+def _report_pair_facts(ts_pairs: list, same_pairs: list, details: dict,
+                       facts: dict) -> dict[str, int]:
+    """
+    Count the pairs whose structured fields disagree with what pairing assumed, and log them.
+
+    Report only. Four counts, each logged on one INFO line whatever its value
+    (zero included) and followed by up to INTEGRITY_MAX_EXAMPLES example lines
+    naming both tickers: same-title pairs whose strikes differ, same-title
+    pairs whose events' settlement sources differ, time-series pairs whose
+    rules texts differ beyond their dates, and same-event ladder pairs whose
+    event is a set of mutually exclusive options.
+
+    Args:
+        ts_pairs (list): The time-series candidate pairs (mA, mB, canon, key).
+        same_pairs (list): The same-title candidate pairs.
+        details (dict): Ticker -> full market_details record.
+        facts (dict): Event ticker -> historical.load_event_facts' facts.
+
+    Returns:
+        dict[str, int]: The counts and how many pairs each check could read,
+            keyed by ExtraDataReport's field names.
+    """
+    strike_fields = ("strike_type", "floor_strike", "cap_strike", "custom_strike")
+    found: dict[str, list[str]] = {"strikes": [], "sources": [], "rules": [], "ladders": []}
+    checked = {"strikes": 0, "sources": 0, "rules": 0, "ladders": 0}
+    for mA, mB, _, _ in same_pairs:
+        names = f"{mA.get('ticker')} / {mB.get('ticker')}"
+        record_a, record_b = details.get(mA.get("ticker")), details.get(mB.get("ticker"))
+        if (isinstance(record_a, dict) and isinstance(record_b, dict)
+                and "strike_type" in record_a and "strike_type" in record_b):
+            checked["strikes"] += 1
+            if (tuple(record_a.get(f) for f in strike_fields)
+                    != tuple(record_b.get(f) for f in strike_fields)):
+                found["strikes"].append(names)
+        facts_a = facts.get(mA.get("event_ticker"))
+        facts_b = facts.get(mB.get("event_ticker"))
+        if (facts_a is not None and facts_b is not None
+                and facts_a["settlement_sources"] and facts_b["settlement_sources"]):
+            checked["sources"] += 1
+            if facts_a["settlement_sources"] != facts_b["settlement_sources"]:
+                found["sources"].append(names)
+    for mA, mB, _, _ in ts_pairs:
+        names = f"{mA.get('ticker')} / {mB.get('ticker')}"
+        rules = [(details.get(m.get("ticker")) or {}).get("rules_primary") for m in (mA, mB)]
+        if all(isinstance(r, str) and r.strip() for r in rules):
+            checked["rules"] += 1
+            # Cross-module: the dates taken out as the time-series key takes them out
+            if normalize_title(rules[0]) != normalize_title(rules[1]):
+                found["rules"].append(names)
+        event = mA.get("event_ticker") or ""
+        if event and event == (mB.get("event_ticker") or ""):
+            flag = (facts.get(event) or {}).get("mutually_exclusive")
+            if flag is not None:
+                checked["ladders"] += 1
+                if flag:
+                    found["ladders"].append(names)
+    lines = (("strikes", "same-title pairs whose strikes differ"),
+             ("sources", "same-title pairs whose events name different settlement sources"),
+             ("rules", "time-series pairs whose rules texts differ beyond their dates"),
+             ("ladders", "same-event ladder pairs whose event is a set of mutually "
+                         "exclusive options"))
+    for key, words in lines:
+        logging.info("Report only — %s: %d of %d checked", words, len(found[key]), checked[key])
+        for names in found[key][:INTEGRITY_MAX_EXAMPLES]:
+            logging.info("  %s", names)
+    return {"strikes_differ": len(found["strikes"]), "strikes_checked": checked["strikes"],
+            "sources_differ": len(found["sources"]), "sources_checked": checked["sources"],
+            "rules_differ": len(found["rules"]), "rules_checked": checked["rules"],
+            "option_ladders": len(found["ladders"]), "ladders_checked": checked["ladders"]}
 
 
 def _write_scheduled_close(m: dict, timing: tuple | None, rules: dict) -> int | None:
@@ -9867,7 +10085,7 @@ def _write_scheduled_close(m: dict, timing: tuple | None, rules: dict) -> int | 
 
 def _apply_scheduled_closes(needed_tickers: dict, details: dict, rules: dict | None,
                             known: dict, known_timing: dict, ts_pairs: list,
-                            ladders_on: bool) -> None:
+                            ladders_on: bool) -> int | None:
     """
     Write each pair market's scheduled close on its record (or pop it), and log what that changes.
 
@@ -9892,11 +10110,15 @@ def _apply_scheduled_closes(needed_tickers: dict, details: dict, rules: dict | N
         ts_pairs (list): The time-series candidate pairs.
         ladders_on (bool): The resolved same-event ladder switch (a ladder
             keeps its stated deadlines, so it is not counted).
+
+    Returns:
+        int | None: How many pair markets use a scheduled close; None with
+            the switch off.
     """
     if rules is None:
         for m in needed_tickers.values():
             m.pop(_SCHEDULED_CLOSE_KEY, None)
-        return
+        return None
     used = no_rule = mismatched = 0
     for ticker, m in needed_tickers.items():
         if ticker in known:
@@ -9946,6 +10168,7 @@ def _apply_scheduled_closes(needed_tickers: dict, details: dict, rules: dict | N
         logging.info(
             "Scheduled close: cross-event time-series pairs it orders differently from "
             "their realized closes: %d; whose deadline gap it changes: %d", ordered, gapped)
+    return used
 
 
 def _prepare_candidates(
@@ -10407,17 +10630,28 @@ def _prepare_candidates(
     trades_cutoff = None if hist_client is None else market_details.read_trades_cutoff(hist_client)
     trade_summaries = _audit_pair_markets(
         hist_client, needed_tickers, details, candles_by_ticker, trades_cutoff)
-    _log_extra_data(full_stats, len(needed_tickers), trade_summaries, candle_failures,
-                    candle_anomalies)
+    integrity, anomaly_markets, anomaly_hours = _log_extra_data(
+        full_stats, len(needed_tickers), trade_summaries, candle_failures, candle_anomalies)
     _log_rss("after the side-data loads")
 
     # Each pair market's scheduled close on its record, or none (switch off,
     # no rule, no usable time): what _maturity_close reads from here on
-    _apply_scheduled_closes(
+    scheduled_markets = _apply_scheduled_closes(
         needed_tickers, details, close_rules if scheduled_on else None,
         scheduled_by_ticker, st_timing, ts_pairs,
         TIME_SERIES_SAME_EVENT_LADDERS if same_event_ladders is None
         else same_event_ladders)
+
+    # Report only: what the pair markets' full records and their events say
+    # against the wording rules pairing went by. Cross-module: each event's
+    # settlement sources and mutually_exclusive flag (cached; one read-only
+    # GET per new event)
+    facts = load_event_facts(live_client, {m.get("event_ticker") for m in pair_markets})
+    extra_data_report = ExtraDataReport(
+        **_report_pair_facts(ts_pairs, same_pairs, details, facts),
+        integrity_failures=integrity, anomaly_markets=anomaly_markets,
+        anomaly_hours=anomaly_hours, pair_markets=len(needed_tickers),
+        scheduled_close_markets=scheduled_markets)
 
     # Combine both pair types in scan order — time-series first, then
     # same-title — which is the order every entry pass walks and therefore the
@@ -10444,6 +10678,7 @@ def _prepare_candidates(
         close_rules=close_rules,
         stale_quote_max_age=stale_limit,
         max_volume_share=volume_share,
+        extra_data_report=extra_data_report,
     )
 
 
@@ -11530,6 +11765,46 @@ def _lone_leg_records(open_legs: dict, active_tickers: set, market_a: dict,
            for leg in legs):
         return legs
     return None
+
+
+def _trade_report_fields(c: dict, mA: dict, mB: dict, n: int) -> dict:
+    """
+    The report-only fields of a trade the cash walk is about to record.
+
+    Read from what the candidate already carries: each leg's close date as
+    the trade reads it against its realized close, and its quotes'
+    moved time and volume ahead at the entry checkpoint. Nothing here
+    decides a trade; the fields are left out of BacktestTrade's equality.
+
+    Args:
+        c (dict): The candidate (its close dates, entry date and marks).
+        mA (dict): Market A's record.
+        mB (dict): Market B's record.
+        n (int): The contract pairs the trade buys.
+
+    Returns:
+        dict: scheduled_close_a/_b, quote_age_hours_a/_b and
+            next_day_volume_share, each None when it does not apply or is not
+            known.
+    """
+    fields: dict = {}
+    for suffix, market in (("a", mA), ("b", mB)):
+        used = c.get(f"close_date_{suffix}")
+        realized = _parse_iso_date(market.get("close_time"))
+        fields[f"scheduled_close_{suffix}"] = (
+            used if used is not None and realized is not None and used != realized else None)
+    marks = c.get("marks")
+    day = c.get("entry_date")
+    ages: tuple = (None, None)
+    share = None
+    if marks is not None and day is not None:
+        ages = (marks[0].quote_age_at(day), marks[1].quote_age_at(day))
+        volumes = [marks[0].volume_ahead_at(day), marks[1].volume_ahead_at(day)]
+        if None not in volumes and min(volumes) > 0:
+            share = n / min(volumes)
+    fields["quote_age_hours_a"], fields["quote_age_hours_b"] = ages
+    fields["next_day_volume_share"] = share
+    return fields
 
 
 def _simulate_at_discount(
@@ -12774,6 +13049,7 @@ def _simulate_at_discount(
         # this whole function.
         event_a = mA.get("event_ticker") or ""
         is_ladder = _is_ladder_pair(c["pair_type"], mA, mB)
+        report = _trade_report_fields(c, mA, mB, n)
 
         trade = BacktestTrade(
             pair_type=c["pair_type"],
@@ -12823,6 +13099,12 @@ def _simulate_at_discount(
             # the leg reads its own
             fee_multiplier_a=mult_a,
             fee_multiplier_b=mult_b,
+            # Report only, for the dashboard's trade rows (left out of equality)
+            scheduled_close_a=report["scheduled_close_a"],
+            scheduled_close_b=report["scheduled_close_b"],
+            quote_age_hours_a=report["quote_age_hours_a"],
+            quote_age_hours_b=report["quote_age_hours_b"],
+            next_day_volume_share=report["next_day_volume_share"],
         )
         trades.append(trade)
         if not walked:
@@ -14761,6 +15043,8 @@ def _sweep_from_candidates(
         # The volume cap every buy and sale was held to (False: off)
         max_volume_share=(False if candidates.max_volume_share is None
                           else candidates.max_volume_share),
+        # What the side data says about the pairs, as counts (report only)
+        extra_data_report=candidates.extra_data_report,
     )
 
 
