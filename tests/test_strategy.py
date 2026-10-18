@@ -2598,6 +2598,50 @@ class TestTimeSeriesKellyParity:
         [dev_read] = _calls_to(dev, "load_series_categories")
         assert ast.unparse(dev_read) == "load_series_categories(None)"
 
+    def test_ast_the_scheduled_close_has_one_reader_and_its_readers_are_listed(self):
+        # C5: the close a live run would have read is read only through
+        # backtester._maturity_close, by exactly these functions; where the
+        # exchange's own timing matters the realized close is kept
+        tree = ast.parse(inspect.getsource(backtester))
+        functions = {node.name: node for node in ast.walk(tree)
+                     if isinstance(node, ast.FunctionDef)}
+        readers = {name for name, node in functions.items()
+                   if name != "_maturity_close" and _calls_to(node, "_maturity_close")}
+        assert readers == {"_find_entry", "_simulate_at_discount", "_close_gate_and_labels",
+                           "_apply_scheduled_closes"}
+        for name in ("_can_ever_enter", "_checkpoint_floor", "_fetch_candles_parallel",
+                     "_candle_window_open", "_extract_pairs", "_attach_leg_quotes",
+                     "_leg_quotes", "_prepare_candidates"):
+            assert not _calls_to(functions[name], "_maturity_close"), name
+        # The private key is read by _maturity_close and written only by
+        # _write_scheduled_close (and popped with the switch off)
+        key_users = {name for name, node in functions.items()
+                     if any(isinstance(n, ast.Name) and n.id == "_SCHEDULED_CLOSE_KEY"
+                            for n in ast.walk(node))}
+        assert key_users == {"_maturity_close", "_write_scheduled_close",
+                             "_apply_scheduled_closes"}
+        # _find_entry's scan window stays on the realized closes
+        find = functions["_find_entry"]
+        [scan_end] = [n for n in ast.walk(find) if isinstance(n, ast.Assign)
+                      and any(isinstance(t, ast.Name) and t.id == "scan_end" for t in n.targets)]
+        assert ast.unparse(scan_end.value) == "min(close_a, close_b) - timedelta(days=1)"
+        reads = {ast.unparse(n.value) for n in ast.walk(find) if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id in ("close_a", "close_b")
+                         for t in n.targets) and isinstance(n.value, ast.Call)}
+        assert reads == {"_parse_iso_date(mA.get('close_time'))",
+                         "_parse_iso_date(mB.get('close_time'))"}
+        # The deferred gate runs after both extractions and before the
+        # competitions are read, and the rule is the one market_details defines
+        prepare = functions["_prepare_candidates"]
+        [gate] = _calls_to(prepare, "_close_gate_and_labels")
+        [read] = _calls_to(prepare, "load_event_competitions")
+        assert all(c.lineno < gate.lineno for c in _calls_to(prepare, "_extract_pairs"))
+        assert gate.lineno < read.lineno
+        assert _function_calls(backtester, "_close_gate_and_labels", "closes_apart")
+        assert _function_calls(backtester, "_close_gate_and_labels", "labels_differ")
+        assert _function_calls(backtester, "_write_scheduled_close", "scheduled_close")
+        assert _function_calls(backtester, "_prepare_candidates", "load_close_rules")
+
     def test_ast_the_backtest_applies_the_sport_check(self):
         # DR-79's backtest half, through the definitions the live finder uses:
         # the label half inside _extract_pairs' same-title branch, right after
@@ -2605,7 +2649,9 @@ class TestTimeSeriesKellyParity:
         tree = ast.parse(inspect.getsource(backtester))
         extract = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
                        and node.name == "_extract_pairs")
-        assert _function_calls(backtester, "_extract_pairs", "series_labels")
+        assert _function_calls(backtester, "_extract_pairs", "_series_label_filer")
+        assert _function_calls(backtester, "_series_label_filer", "series_labels")
+        assert _function_calls(backtester, "_close_gate_and_labels", "_series_label_filer")
         [labels] = _calls_to(extract, "labels_differ")
         [closes] = _calls_to(extract, "closes_apart")
         assert closes.lineno < labels.lineno

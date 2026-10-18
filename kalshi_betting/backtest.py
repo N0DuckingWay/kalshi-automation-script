@@ -7,7 +7,8 @@ Purpose:
     Command-line entry point for the Kalshi backtester. Parses CLI
     arguments (--start-date, --balance, --no-cache, --max-horizon-days,
     --interval-discount, --no-sweep, --same-event-ladders /
-    --no-same-event-ladders, --spread-min, --spread-max, --no-band-sweep,
+    --no-same-event-ladders, --scheduled-close / --no-scheduled-close,
+    --spread-min, --spread-max, --no-band-sweep,
     --no-cap-sweep, --no-add-on-sweep, --no-sell-sweep, --sell-workers,
     --no-trim-sweep, --no-trim-rise-sweep, --dashboard-only,
     --accept-changed-simulator),
@@ -117,6 +118,11 @@ Notes:
     comparable to a baseline taken without it. The switch is on by the
     operator's 2026-09-26 decision, so a default run pairs ladders and
     --no-same-event-ladders replays the rule as it stood before it.
+
+    --scheduled-close / --no-scheduled-close is the one-run override for
+    config.BACKTEST_SCHEDULED_CLOSE (on by default): whether the backtest reads
+    each settled market's scheduled close, from a rule learned per series,
+    where a live run reads its close. It never reaches a live run.
 
     That setting reaches kalshi_backtest.log (the pre-fetch echo below and
     run_backtest_sweep's resolved line) AND the HTML dashboard's own page
@@ -295,6 +301,7 @@ from ._http import api_error_summary
 from .auth import read_account_balance
 from .backtester import BacktestSweep, run_backtest_sweep
 from .config import (
+    BACKTEST_SCHEDULED_CLOSE,
     BACKTEST_SWEEP_FILENAME,
     BACKTEST_SWEEP_FORMAT,
     BACKTEST_SWEEP_HEADER_MAX_BYTES,
@@ -537,6 +544,7 @@ _RUN_ONLY_FLAGS = (
     ("max_horizon_days", "--max-horizon-days"), ("interval_discount", "--interval-discount"),
     ("no_sweep", "--no-sweep"),
     ("same_event_ladders", "--same-event-ladders / --no-same-event-ladders"),
+    ("scheduled_close", "--scheduled-close / --no-scheduled-close"),
     ("spread_min", "--spread-min"), ("spread_max", "--spread-max"),
     ("no_band_sweep", "--no-band-sweep"),
 )
@@ -1221,6 +1229,18 @@ def _build_parser() -> argparse.ArgumentParser:
              f"{'on' if TIME_SERIES_SAME_EVENT_LADDERS else 'off'}). Affects the "
              "backtest only — the live finder binds that constant at import.",
     )
+    # The same idiom for the scheduled close: None is the "no override"
+    # sentinel _prepare_candidates resolves at call time
+    parser.add_argument(
+        "--scheduled-close", action=argparse.BooleanOptionalAction, default=None,
+        help="Read each settled market's scheduled close (the close a live run "
+             "saw, from a rule learned per series from the captures under "
+             "backtest_cache/scheduled_closes/) for days to maturity, the "
+             "ranking, a cross-event pair's order, gap and horizon and the "
+             "same-title close gate; a series with no rule keeps the realized "
+             "close (default: config.BACKTEST_SCHEDULED_CLOSE, currently "
+             f"{'on' if BACKTEST_SCHEDULED_CLOSE else 'off'}). Backtest only.",
+    )
     # Each side is independently optional; the omitted one resolves from
     # config's own default band (see the validation block below), not from a
     # literal (0.0, 1.0) here — which is why the help names the constant
@@ -1330,7 +1350,8 @@ def main() -> None:
 
     Parses command-line arguments (--start-date, --balance, --no-cache,
     --max-horizon-days, --interval-discount, --no-sweep,
-    --same-event-ladders / --no-same-event-ladders, --spread-min,
+    --same-event-ladders / --no-same-event-ladders, --scheduled-close /
+    --no-scheduled-close, --spread-min,
     --spread-max, --no-band-sweep, --no-cap-sweep, --no-add-on-sweep,
     --no-sell-sweep, --no-trim-sweep, --no-trim-rise-sweep, --sell-workers,
     --dashboard-only, --accept-changed-simulator); with --dashboard-only it
@@ -1461,6 +1482,13 @@ def main() -> None:
     ladders_echo = "on" if effective_ladders else "off"
     if bool(effective_ladders) != bool(TIME_SERIES_SAME_EVENT_LADDERS):
         ladders_echo += f" (config: {'on' if TIME_SERIES_SAME_EVENT_LADDERS else 'off'})"
+    # ... and for the scheduled close, named against the config when the run
+    # departs from it
+    effective_scheduled = (BACKTEST_SCHEDULED_CLOSE if args.scheduled_close is None
+                           else args.scheduled_close)
+    scheduled_echo = "on" if effective_scheduled else "off"
+    if bool(effective_scheduled) != bool(BACKTEST_SCHEDULED_CLOSE):
+        scheduled_echo += f" (config: {'on' if BACKTEST_SCHEDULED_CLOSE else 'off'})"
     # Same pre-fetch echo, same reason, for the spread band: the VALUE is
     # resolved through the same config function run_backtest_sweep calls
     # (never a by-value copy of BACKTEST_DEFAULT_SPREAD_BAND), so it cannot
@@ -1541,11 +1569,11 @@ def main() -> None:
     depth_model = load_depth_model()
 
     logging.info(
-        "Backtest config: start=%s | balance=$%.2f | cache=%s | k=%.3f | ladders=%s "
-        "| spread band=%g-%g | band sweep=%s | cap sweep=%s | add-on sweep=%s "
-        "| sell sweep=%s | trim sweep=%s | live rule=%s | fills=%s",
-        start_date, start.dollars, "on" if use_cache else "off", effective_k,
-        ladders_echo, echo_floor, echo_ceiling,
+        "Backtest config: start=%s | balance=$%.2f | cache=%s | scheduled close=%s "
+        "| k=%.3f | ladders=%s | spread band=%g-%g | band sweep=%s | cap sweep=%s "
+        "| add-on sweep=%s | sell sweep=%s | trim sweep=%s | live rule=%s | fills=%s",
+        start_date, start.dollars, "on" if use_cache else "off", scheduled_echo,
+        effective_k, ladders_echo, echo_floor, echo_ceiling,
         "on" if band_sweep else "off", "on" if cap_sweep else "off",
         "on" if add_on_sweep else "off",
         f"on ({sell_workers} worker process{'' if sell_workers == 1 else 'es'})"
@@ -1622,6 +1650,8 @@ def main() -> None:
         interval_discount=args.interval_discount,
         sweep=not args.no_sweep,
         same_event_ladders=args.same_event_ladders,
+        # Whether a market's close is read as a live run read it (None: config)
+        scheduled_close=args.scheduled_close,
         spread_band=spread_band,
         band_sweep=band_sweep,
         # The dashboard's "Tier floors: off" view: the band sweep's

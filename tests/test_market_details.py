@@ -35,7 +35,7 @@ import inspect
 import json
 import logging
 import pkgutil
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -1019,6 +1019,235 @@ class TestCaptureScheduledCloses:
         with pytest.raises(_HttpError):
             market_details.capture_scheduled_closes(MagicMock())
         assert not market_details._CLOSES_DIR.exists()
+
+
+SAMPLE_CLOSES = Path(__file__).parent / "fixtures" / "scheduled_closes_sample.json"
+
+
+def _sample_observations():
+    """Real capture observations (scheduled-closes-v1): 30 MLB games, 30 natural-gas dailies,
+    24 Nobel Peace markets whose live closes no one field reproduces, 16 of another series."""
+    return json.loads(SAMPLE_CLOSES.read_text())["observations"]
+
+
+def _rows(observations):
+    """The observations as learn_close_rules reads them."""
+    return [r for r in (market_details._observation_times(o) for o in observations)
+            if r is not None]
+
+
+def _of(series, observations=None):
+    """The sample's observations of one series."""
+    return [o for o in (observations or _sample_observations()) if o["series"] == series]
+
+
+def _without(observations, *fields):
+    """A copy of the observations with the named fields taken off each record."""
+    return [dict(o, record={k: v for k, v in o["record"].items() if k not in fields})
+            for o in observations]
+
+
+def _two_events(observations):
+    """The observations with every other one moved to a second event of its series
+    (its ticker's date part renamed), times unchanged."""
+    out = []
+    for i, o in enumerate(observations):
+        event, strike = o["ticker"].rsplit("-", 1)
+        out.append(dict(o, ticker=f"{event}{'B' if i % 2 else ''}-{strike}"))
+    return out
+
+
+def _rule(rules, series):
+    """A rule's field and offset."""
+    return rules[series][:2]
+
+
+class TestCloseRules:
+    """learn_close_rules and scheduled_close on real observations."""
+
+    def test_a_game_series_learns_latest_expiration_time(self):
+        rules = market_details.learn_close_rules(_rows(_of("KXMLBGAME")))
+        assert set(rules) == {"KXMLBGAME"}
+        field, offset, prints, events = rules["KXMLBGAME"]
+        assert (field, offset) == ("latest_expiration_time", 0)
+        # Every game's latest expiration sits 69 h after its expected one
+        assert prints == frozenset({248_400}) and events == 15
+
+    def test_close_time_first_then_latest_then_expected(self):
+        # On these natural-gas dailies, spread over two events, all three
+        # fields reproduce the live close: close_time (the rule that changes
+        # nothing) is chosen
+        gas = _two_events(_of("KXNATGASD"))
+        rules = market_details.learn_close_rules(_rows(gas))
+        assert _rule(rules, "KXNATGASD") == ("close_time", 0)
+        # One market closed early: close_time no longer fits, latest does
+        early = [dict(o, record=dict(o["record"])) for o in gas]
+        early[3]["record"]["close_time"] = "2026-09-23T20:00:00Z"
+        assert _rule(market_details.learn_close_rules(_rows(early)), "KXNATGASD") == (
+            "latest_expiration_time", -608_400)
+        # Without close_time and latest fitting, expected is the rule — but an
+        # observation without latest cannot support it (no fingerprint)
+        no_latest = _without(early, "latest_expiration_time")
+        assert market_details.learn_close_rules(_rows(no_latest)) == {}
+
+    def test_one_event_learns_nothing(self):
+        # The sample's 30 dailies are one event: under the event floor
+        gas = _of("KXNATGASD")
+        assert len({market_details._event_of(o["ticker"]) for o in gas}) == 1
+        assert config.SCHEDULED_CLOSE_MIN_EVENTS == 2
+        assert market_details.learn_close_rules(_rows(gas)) == {}
+        assert set(market_details.learn_close_rules(_rows(_two_events(gas)))) == {"KXNATGASD"}
+
+    def test_a_series_no_field_reproduces_learns_nothing(self):
+        nobel = _of("KXNOBELPEACE")
+        assert len(nobel) >= config.SCHEDULED_CLOSE_MIN_OBSERVATIONS
+        assert market_details.learn_close_rules(_rows(nobel)) == {}
+
+    def test_one_miss_is_enough_to_learn_nothing(self):
+        moved = [dict(o) for o in _of("KXMLBGAME")]
+        moved[7]["live_close_time"] = "2026-09-28T18:35:00Z"
+        assert market_details.learn_close_rules(_rows(moved)) == {}
+
+    def test_too_few_observations_learn_nothing(self):
+        few = _of("KXNEXTLABORSEC")
+        assert len(few) < config.SCHEDULED_CLOSE_MIN_OBSERVATIONS
+        assert market_details.learn_close_rules(_rows(few)) == {}
+        games = _of("KXMLBGAME")[:config.SCHEDULED_CLOSE_MIN_OBSERVATIONS - 1]
+        assert market_details.learn_close_rules(_rows(games)) == {}
+        games = _of("KXMLBGAME")[:config.SCHEDULED_CLOSE_MIN_OBSERVATIONS]
+        assert _rule(market_details.learn_close_rules(_rows(games)), "KXMLBGAME") == (
+            "latest_expiration_time", 0)
+
+    def test_observations_without_expected_do_not_count(self):
+        games = _of("KXMLBGAME")[:config.SCHEDULED_CLOSE_MIN_OBSERVATIONS]
+        # One of the 20 has no expected expiration: 19 support the rule, under the minimum
+        stripped = [*_without(games[:1], "expected_expiration_time"), *games[1:]]
+        assert market_details.learn_close_rules(_rows(stripped)) == {}
+
+    def test_one_market_seen_twice_counts_once(self):
+        games = _of("KXMLBGAME")[:config.SCHEDULED_CLOSE_MIN_OBSERVATIONS - 1]
+        stats = {}
+        assert market_details.learn_close_rules(_rows(games + games), stats_out=stats) == {}
+        assert stats["observations"] == len(games)
+
+    def test_the_whole_sample_and_its_stats(self):
+        stats = {}
+        rules = market_details.learn_close_rules(_rows(_sample_observations()),
+                                                 stats_out=stats)
+        assert {s: _rule(rules, s) for s in rules} == {
+            "KXMLBGAME": ("latest_expiration_time", 0)}
+        assert stats == {"observations": 100, "covered": 30,
+                         "by_field": {"close_time": 0, "latest_expiration_time": 1,
+                                      "expected_expiration_time": 0}}
+
+    def test_a_game_that_closed_early_gets_its_scheduled_close(self):
+        rules = market_details.learn_close_rules(_rows(_of("KXMLBGAME")))
+        game = _of("KXMLBGAME")[16]
+        timing = market_details.timing_epochs(game["record"])
+        assert market_details.close_rule_applies(timing, rules, "KXMLBGAME")
+        answer = market_details.scheduled_close(timing, rules, "KXMLBGAME")
+        assert answer == market_details._epoch_seconds(game["live_close_time"])
+        assert answer > timing[0]
+
+    def test_a_market_of_another_convention_keeps_its_realized_close(self):
+        # An older game whose latest expiration sits 14 days after its start
+        # (Kalshi's earlier convention): the rule learned on 69 h would put its
+        # close days too late, so it is not applied
+        rules = market_details.learn_close_rules(_rows(_of("KXMLBGAME")))
+        close, latest, expected = market_details.timing_epochs(_of("KXMLBGAME")[16]["record"])
+        old = (close, expected + 14 * 86_400, expected)
+        assert not market_details.close_rule_applies(old, rules, "KXMLBGAME")
+        assert market_details.scheduled_close(old, rules, "KXMLBGAME") is None
+        # No expected expiration: no fingerprint, no rule
+        assert market_details.scheduled_close((close, latest, None), rules, "KXMLBGAME") is None
+
+    def test_a_clock_change_needs_both_gaps_seen(self):
+        # Two observations a clock change apart: latest − expected differs by an
+        # hour. Seen both, the rule takes both; a new market with a third gap
+        # keeps its realized close
+        base = datetime(2026, 10, 1, 20, tzinfo=UTC)
+
+        def obs(i, gap):
+            expected = base + timedelta(days=i)
+            latest = expected + timedelta(seconds=gap)
+            return (f"KXA-{i // 2}-{i}", "KXA", int(latest.timestamp()),
+                    (int(expected.timestamp()) - 3_600, int(latest.timestamp()),
+                     int(expected.timestamp())))
+
+        rows = [obs(i, 604_800 if i < 12 else 608_400) for i in range(24)]
+        rules = market_details.learn_close_rules(rows)
+        assert rules["KXA"][:2] == ("latest_expiration_time", 0)
+        assert rules["KXA"][2] == frozenset({604_800, 608_400})
+        for gap in (604_800, 608_400):
+            timing = obs(30, gap)[3]
+            assert market_details.scheduled_close(timing, rules, "KXA") == timing[1]
+        assert market_details.scheduled_close(obs(30, 612_000)[3], rules, "KXA") is None
+        # Learned on one side of the change only, the other side keeps its
+        # realized close
+        one_side = market_details.learn_close_rules([obs(i, 604_800) for i in range(24)])
+        assert market_details.scheduled_close(obs(30, 608_400)[3], one_side, "KXA") is None
+
+    def test_an_answer_before_the_realized_close_is_not_used(self):
+        rules = {"KXA": ("latest_expiration_time", -7200, frozenset({3600, 7200, 9000}), 2)}
+        assert market_details.scheduled_close((1_000_000, 1_003_600, 1_000_000), rules,
+                                              "KXA") is None
+        assert market_details.scheduled_close((1_000_000, 1_007_200, 1_000_000), rules,
+                                              "KXA") == 1_000_000
+        assert market_details.scheduled_close((1_000_000, 1_009_000, 1_000_000), rules,
+                                              "KXA") == 1_001_800
+
+    def test_no_rule_no_field_or_no_realized_close_is_none(self):
+        rules = {"KXA": ("expected_expiration_time", 0, frozenset({-1}), 2)}
+        assert market_details.scheduled_close((1, 2, 3), rules, "KXB") is None
+        assert market_details.scheduled_close((1, 2, None), rules, "KXA") is None
+        assert market_details.scheduled_close((None, 2, 3), rules, "KXA") is None
+        assert market_details.scheduled_close(None, rules, "KXA") is None
+        assert market_details.scheduled_close((1, 2, 3), rules, "KXA") == 3
+
+
+class TestLoadCloseRules:
+    """load_close_rules reads every capture, looking up observations with no record."""
+
+    def _write(self, name, observations, fmt=market_details.CLOSES_FORMAT):
+        market_details._CLOSES_DIR.mkdir(parents=True, exist_ok=True)
+        historical._save_gz_json_cache(market_details._CLOSES_DIR / name, {
+            "meta": {"source": "test", "taken_at": "2026-09-22", "format": fmt},
+            "observations": observations})
+
+    def test_no_capture_learns_nothing(self, caplog):
+        with caplog.at_level(logging.INFO):
+            assert market_details.load_close_rules(None) == {}
+        assert ("Scheduled close: rules for 0 series from 0 observations "
+                "(close_time 0, latest_expiration_time 0, expected_expiration_time 0)"
+                in caplog.text)
+
+    def test_it_reads_every_capture_and_logs_the_rules(self, caplog):
+        sample = _sample_observations()
+        self._write("2026-09-22.json.gz", sample[:50])
+        self._write("2026-09-23.json.gz", sample[40:])
+        self._write("bad.json.gz", sample, fmt="other")
+        with caplog.at_level(logging.INFO):
+            rules = market_details.load_close_rules(None)
+        assert {s: _rule(rules, s) for s in rules} == {
+            "KXMLBGAME": ("latest_expiration_time", 0)}
+        assert ("Scheduled close: rules for 1 series from 100 observations "
+                "(close_time 0, latest_expiration_time 1, expected_expiration_time 0)"
+                in caplog.text)
+        assert "bad.json.gz is not in the scheduled-closes-v1 format" in caplog.text
+
+    def test_a_null_record_is_looked_up_settled_only(self, exchange):
+        games = _of("KXMLBGAME")[:config.SCHEDULED_CLOSE_MIN_OBSERVATIONS]
+        open_one = dict(games[0]["record"], ticker=games[0]["ticker"], status="active")
+        for o in games:
+            exchange.markets[o["ticker"]] = dict(o["record"], ticker=o["ticker"])
+        exchange.markets[games[0]["ticker"]] = open_one
+        self._write("x.json.gz", [dict(o, record=None) for o in games])
+        # One market still open: 19 settled observations, under the minimum
+        assert market_details.load_close_rules(MagicMock()) == {}
+        exchange.markets[games[0]["ticker"]] = dict(games[0]["record"],
+                                                     ticker=games[0]["ticker"])
+        assert _rule(market_details.load_close_rules(MagicMock()), "KXMLBGAME") == (
+            "latest_expiration_time", 0)
 
 
 class TestCommands:

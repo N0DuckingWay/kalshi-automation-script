@@ -2292,6 +2292,33 @@ INTEGRITY_VOLUME_TOLERANCE = 0.005
 INTEGRITY_LIFE_SLACK_SECONDS = 3600
 INTEGRITY_MAX_EXAMPLES = 10
 
+# Whether the backtest reads each market's SCHEDULED close where a live run
+# reads its close (the backtest only; live code reads the close the exchange
+# lists, which is the scheduled one already). Once a market settles, Kalshi's
+# close_time is the moment it actually closed, which for an event decided early
+# is before the close a live run saw. With this on, the backtest works out the
+# scheduled close from a rule learned per series (market_details.learn_close_rules,
+# from the captures under backtest_cache/scheduled_closes/) and uses it for the
+# days-to-maturity rule of selling, the ranking's days to the later close, the
+# order, gap and horizon of a cross-event time-series pair and the same-title
+# close gate; everywhere the exchange's own timing matters (the candle windows,
+# the scan's last Monday, the eligibility prefilter) it keeps the realized close.
+# A series with no proven rule keeps the realized close. backtest.py
+# --scheduled-close / --no-scheduled-close set it for one run.
+BACKTEST_SCHEDULED_CLOSE = True
+
+# The fewest observations (a live close beside the same market's settled record,
+# carrying both latest_expiration_time and expected_expiration_time) a series
+# needs before its scheduled-close rule is trusted; the rule must also
+# reproduce every one of them, and is applied only to a market whose
+# latest-minus-expected gap is one of those observations' (its fingerprint).
+SCHEDULED_CLOSE_MIN_OBSERVATIONS = 20
+
+# ... and the fewest distinct events those observations must come from: one
+# event's markets share one schedule, so a rule seen on a single event (one
+# day's diesel prices, say) proves nothing about the series' next one.
+SCHEDULED_CLOSE_MIN_EVENTS = 2
+
 # The highest NO ask a candle can carry: historical.fetch_candlesticks stores a
 # candle's NO ask as 1 - its YES bid, held within [0.01, this], so an empty YES-bid
 # book reads 0.99 just as a real 1c YES bid does; a NO ask here is therefore no

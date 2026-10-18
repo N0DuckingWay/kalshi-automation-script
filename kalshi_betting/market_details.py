@@ -18,8 +18,13 @@ Purpose:
     hourly candles, the trades), the candles' open/high/low/close order, the
     trades' prices and ids, the settlement value against the result and the
     order of the timing fields. The backtest calls the loaders and logs the
-    coverage and the checks; no part of a backtest reads this data to decide a
-    trade, so every backtest result is what it was without it.
+    coverage and the checks. One use decides trades: the scheduled close.
+    learn_close_rules works out, per series, which timing field (with a fixed
+    offset) reproduces every live close the captures saw, and scheduled_close
+    applies that rule to a settled market's own timing fields; with
+    config.BACKTEST_SCHEDULED_CLOSE on, the backtest reads that close where a
+    live run reads its close (backtester._maturity_close). Nothing else here
+    decides a trade.
 
 Dependencies:
     config (the MARKET_DETAILS_* and INTEGRITY_* settings), _http (one-line
@@ -41,6 +46,11 @@ Notes:
       scheduled_closes/<UTC stamp>.json.gz  one capture of live closes
     Values are kept as Kalshi sends them (dollar and contract counts as
     strings); this module validates types and parses nothing else.
+    A scheduled-close rule is kept only when it reproduces every observation
+    of its series, on at least config.SCHEDULED_CLOSE_MIN_OBSERVATIONS
+    distinct markets from config.SCHEDULED_CLOSE_MIN_EVENTS events (the same
+    market captured twice counts once), and is applied only to a market
+    whose latest-minus-expected expiration gap is one the rule saw.
     Two commands, both read-only:
         python3 -m kalshi_betting.market_details capture-closes
         python3 -m kalshi_betting.market_details check
@@ -1096,6 +1106,258 @@ def capture_scheduled_closes(client: Any) -> Path:
         "observations": observations,
     })
     return path
+
+
+# The three fields a scheduled-close rule may read, by their place in
+# timing_epochs' tuple, and the order a rule is chosen in when several fit a
+# series: the close_time itself first (it fits only when every observation
+# closed on schedule, and then the rule changes nothing — the safe choice),
+# then the latest expiration, then the expected expiration.
+CLOSE_RULE_FIELDS: dict[str, int] = {
+    "close_time": 0,
+    "latest_expiration_time": 1,
+    "expected_expiration_time": 2,
+}
+CLOSE_RULE_PREFERENCE = ("close_time", "latest_expiration_time", "expected_expiration_time")
+
+
+def _epoch_seconds(value: Any) -> int | None:
+    """Whole Unix seconds of an ISO timestamp, or None when it cannot be read."""
+    moment = _parse_time(value)
+    if moment is None:
+        return None
+    try:
+        return int(moment.timestamp())
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _observation_times(observation: Any, timing: tuple | None = None
+                       ) -> tuple[str, str, int, tuple] | None:
+    """
+    One capture observation as (ticker, series, live close, the record's timing), or None.
+
+    Args:
+        observation (Any): One entry of a capture's "observations" list.
+        timing (tuple | None): The settled record's timing_epochs, when the
+            caller looked it up because the observation's own record is null.
+
+    Returns:
+        tuple | None: None when the ticker, the series or the live close cannot be read,
+            or when there is no settled record (a record whose status is not
+            settled or finalized is not a final answer).
+    """
+    if not isinstance(observation, dict):
+        return None
+    ticker = observation.get("ticker")
+    series = observation.get("series")
+    live = _epoch_seconds(observation.get("live_close_time"))
+    if (not isinstance(ticker, str) or not ticker or not isinstance(series, str)
+            or not series or live is None):
+        return None
+    if timing is None:
+        record = observation.get("record")
+        if not isinstance(record, dict) or record.get("status") not in SETTLED_STATUSES:
+            return None
+        timing = timing_epochs(record)
+    return ticker, series, live, timing
+
+
+def _event_of(ticker: str) -> str:
+    """A market ticker's event ticker: everything before its last hyphen (Kalshi's naming)."""
+    return ticker.rsplit("-", 1)[0]
+
+
+def learn_close_rules(observations: Iterable[tuple[str, str, int, tuple]],
+                      stats_out: dict | None = None
+                      ) -> dict[str, tuple[str, int, frozenset, int]]:
+    """
+    Per series, the field and fixed offset that reproduce every observed live close.
+
+    Each observation is one market seen open by a live run and then settled:
+    (its ticker, its series, the close_time the live run saw, in Unix
+    seconds, and the settled record's timing_epochs tuple). For every series,
+    each of the three fields of CLOSE_RULE_FIELDS is tried, in the order of
+    CLOSE_RULE_PREFERENCE, with the one offset (seconds) its first
+    observation implies (live close minus that field); the first field that
+    every observation of the series has, and that plus the offset equals
+    every live close, is the series' rule.
+
+    A rule also records the FINGERPRINT of the markets it was learned on:
+    each observation's latest_expiration_time minus its
+    expected_expiration_time. Kalshi has changed how it sets these fields
+    over time (older markets of one series, and markets across a clock
+    change, can carry another gap between them), and a rule learned on one
+    convention gives a close that is too LATE on another, which the "not
+    before the realized close" guard cannot catch. So scheduled_close applies
+    a rule only to a market whose own fingerprint is one the rule saw. Only
+    observations carrying both fields support the rule (give it a
+    fingerprint and count toward its minimums): a series needs at least
+    config.SCHEDULED_CLOSE_MIN_OBSERVATIONS of them, from at least
+    config.SCHEDULED_CLOSE_MIN_EVENTS distinct events (an event ticker is
+    the market ticker less its last hyphenated part). A series with a miss
+    on every field, or too little support, has no rule.
+
+    The same market seen twice with the same live close counts once.
+
+    Args:
+        observations (Iterable): (ticker, series, live close seconds, timing tuple).
+        stats_out (dict | None): When given, filled with "observations" (the
+            distinct ones read), "covered" (those of a series with a rule) and
+            "by_field" (series count per field).
+
+    Returns:
+        dict: Series ticker -> (field name, offset seconds, frozenset of the
+            fingerprints seen, number of distinct events supporting it).
+    """
+    by_series: dict[str, list[tuple[str, int, tuple]]] = {}
+    seen: set[tuple] = set()
+    for ticker, series, live, timing in observations:
+        # Two captures can hold one market at one live close: one fact
+        key = (ticker, live)
+        if key in seen:
+            continue
+        seen.add(key)
+        by_series.setdefault(series, []).append((ticker, live, tuple(timing)))
+    rules: dict[str, tuple[str, int, frozenset, int]] = {}
+    for series, rows in by_series.items():
+        support = [(ticker, t) for ticker, _, t in rows if t[1] is not None and t[2] is not None]
+        events = {_event_of(ticker) for ticker, _ in support}
+        if (len(support) < config.SCHEDULED_CLOSE_MIN_OBSERVATIONS
+                or len(events) < config.SCHEDULED_CLOSE_MIN_EVENTS):
+            continue
+        for name in CLOSE_RULE_PREFERENCE:
+            index = CLOSE_RULE_FIELDS[name]
+            first = rows[0][2][index]
+            if first is None:
+                continue
+            offset = rows[0][1] - first
+            if all(t[index] is not None and t[index] + offset == live for _, live, t in rows):
+                prints = frozenset(t[1] - t[2] for _, t in support)
+                rules[series] = (name, offset, prints, len(events))
+                break
+    if stats_out is not None:
+        stats_out["observations"] = sum(len(rows) for rows in by_series.values())
+        stats_out["covered"] = sum(len(by_series[s]) for s in rules)
+        stats_out["by_field"] = {name: sum(1 for rule in rules.values() if rule[0] == name)
+                                 for name in CLOSE_RULE_PREFERENCE}
+    return rules
+
+
+def close_rule_applies(timing: tuple | None, rules: dict, series: str) -> bool:
+    """
+    Whether a series' rule may be applied to this market: its fingerprint is one the rule saw.
+
+    Args:
+        timing (tuple | None): The market's timing_epochs tuple.
+        rules (dict): learn_close_rules' result.
+        series (str): The market's series ticker.
+
+    Returns:
+        bool: True when the series has a rule and the market's
+            latest_expiration_time minus expected_expiration_time (both
+            present) is among the fingerprints the rule was learned on.
+    """
+    rule = rules.get(series) if isinstance(rules, dict) else None
+    if rule is None or not isinstance(timing, tuple) or len(timing) != 3:
+        return False
+    latest, expected = timing[1], timing[2]
+    return latest is not None and expected is not None and (latest - expected) in rule[2]
+
+
+def scheduled_close(timing: tuple | None, rules: dict, series: str) -> int | None:
+    """
+    A settled market's scheduled close, in Unix seconds, by its series' rule.
+
+    Args:
+        timing (tuple | None): The market's timing_epochs tuple
+            (close_time, latest_expiration_time, expected_expiration_time).
+        rules (dict): learn_close_rules' result.
+        series (str): The market's series ticker.
+
+    Returns:
+        int | None: The rule's field plus its offset. None (use the realized
+            close) when the series has no rule, the market's fingerprint is
+            not one the rule saw (close_rule_applies), the field or the
+            realized close is not known, or the rule's answer falls before
+            the realized close (a market does not close after its schedule
+            here).
+    """
+    if not close_rule_applies(timing, rules, series):
+        return None
+    name, offset = rules[series][0], rules[series][1]
+    value = timing[CLOSE_RULE_FIELDS[name]]
+    realized = timing[0]
+    if value is None or realized is None:
+        return None
+    answer = value + offset
+    return answer if answer >= realized else None
+
+
+def load_close_rules(client: Any = None) -> dict[str, tuple[str, int, frozenset, int]]:
+    """
+    Learn the scheduled-close rules from every capture under backtest_cache/scheduled_closes/.
+
+    Reads each *.json.gz capture (scheduled-closes-v1; another format, or a
+    file that cannot be read, is one WARNING and left out). An observation
+    whose record is null is looked up through load_market_details (timing
+    only, cached; settled records only). With client None only the cache is
+    read. Never raises. Logs one INFO line naming the rules learned.
+
+    Args:
+        client (Any): An authenticated KalshiClient, or None.
+
+    Returns:
+        dict: learn_close_rules' result (series ticker -> (field, offset
+            seconds, fingerprints, events)).
+    """
+    rows: list[tuple[str, str, int, tuple]] = []
+    missing: list[dict] = []
+    folder = _CLOSES_DIR
+    paths = sorted(folder.glob("*.json.gz")) if folder.is_dir() else []
+    for path in paths:
+        try:
+            data = _read_gz_json(path)
+        except (OSError, EOFError, zlib.error, ValueError) as exc:
+            logging.warning("Scheduled close: capture %s cannot be read (%s); left out",
+                            path.name, type(exc).__name__)
+            continue
+        meta = data.get("meta") if isinstance(data, dict) else None
+        observations = data.get("observations") if isinstance(data, dict) else None
+        if (not isinstance(meta, dict) or meta.get("format") != CLOSES_FORMAT
+                or not isinstance(observations, list)):
+            logging.warning("Scheduled close: capture %s is not in the %s format; left out",
+                            path.name, CLOSES_FORMAT)
+            continue
+        for observation in observations:
+            if isinstance(observation, dict) and observation.get("record") is None:
+                missing.append(observation)
+                continue
+            row = _observation_times(observation)
+            if row is not None:
+                rows.append(row)
+    if missing:
+        # Cross-module: the settled records of the markets captured open,
+        # from the details cache (and Kalshi, with a client)
+        looked_up = load_market_details(
+            client, [o.get("ticker") for o in missing],
+            project=lambda r: (r.get("status"), timing_epochs(r)))
+        for observation in missing:
+            found = looked_up.get(observation.get("ticker"))
+            if found is None or found[0] not in SETTLED_STATUSES:
+                continue
+            row = _observation_times(observation, found[1])
+            if row is not None:
+                rows.append(row)
+    stats: dict = {}
+    rules = learn_close_rules(rows, stats_out=stats)
+    by_field = stats["by_field"]
+    logging.info(
+        "Scheduled close: rules for %d series from %d observations "
+        "(close_time %d, latest_expiration_time %d, expected_expiration_time %d)",
+        len(rules), stats["observations"], by_field["close_time"],
+        by_field["latest_expiration_time"], by_field["expected_expiration_time"])
+    return rules
 
 
 def _read_gz_json(path: Path) -> Any:

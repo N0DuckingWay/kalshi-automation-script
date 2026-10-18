@@ -35,7 +35,7 @@ import pytest
 # /historical route through its own _signed_raw_get, since the pinned SDK has
 # no historical_api module at all), so backtester.py is always importable
 # and its pure-logic functions are unit-testable offline.
-from kalshi_betting import backtester, config, depth_model, historical, scanner
+from kalshi_betting import backtester, config, depth_model, historical, market_details, scanner
 from kalshi_betting.backtester import (
     _can_ever_enter,
     _extract_pairs,
@@ -24010,3 +24010,520 @@ class TestFeeMultipliersInTheBacktest:
         listed = self._run(mult_a=0.5, mult_b=0.0)
         assert listed == full
         assert (listed.fee_multiplier_a, listed.fee_multiplier_b) == (1.0, 1.0)
+
+
+# ─── The scheduled close (C5) ─────────────────────────────────────────────────
+
+def _epoch(text: str) -> int:
+    """Whole Unix seconds of an ISO timestamp."""
+    return int(datetime.fromisoformat(text).timestamp())
+
+
+def _with_scheduled(m: dict, close: str) -> dict:
+    """The market with a scheduled close carried on its record."""
+    m[backtester._SCHEDULED_CLOSE_KEY] = _epoch(close)
+    return m
+
+
+class TestMaturityClose:
+    """_maturity_close: the scheduled close carried on a record, else the realized one."""
+
+    def test_without_the_key_it_is_the_realized_close_exactly(self):
+        for close in ("2026-02-01T00:00:00+00:00", "2026-02-01T23:30:00-05:00",
+                      "2026-02-01T09:00:00", None, "", "not a date"):
+            m = {"close_time": close}
+            assert backtester._maturity_close(m) == backtester._parse_iso_datetime(close)
+            assert (backtester._maturity_close(m, as_date=True)
+                    == backtester._parse_iso_date(close))
+
+    def test_with_the_key_it_is_the_scheduled_close(self):
+        m = _with_scheduled({"close_time": "2026-02-01T00:00:00+00:00"},
+                            "2026-02-04T18:35:00+00:00")
+        assert backtester._maturity_close(m) == datetime(2026, 2, 4, 18, 35, tzinfo=UTC)
+        assert backtester._maturity_close(m, as_date=True) == date(2026, 2, 4)
+
+    def test_a_key_that_is_no_whole_number_is_ignored(self):
+        for bad in (True, 1.5, "1700000000", 10**20):
+            m = {"close_time": "2026-02-01T00:00:00+00:00",
+                 backtester._SCHEDULED_CLOSE_KEY: bad}
+            assert backtester._maturity_close(m, as_date=True) == date(2026, 2, 1)
+
+
+class TestScheduledCloseInFindEntry:
+    """_find_entry orders, gaps and bounds a cross-event pair on the closes a live
+    run would have read; its scan window stays on the realized closes."""
+
+    @staticmethod
+    def _pair():
+        early = {"ticker": "EARLY", "event_ticker": "E1",
+                 "close_time": "2026-02-01T00:00:00+00:00"}
+        # Resolved early: its realized close falls before EARLY's
+        late = {"ticker": "LATE", "event_ticker": "E2",
+                "close_time": "2026-01-31T00:00:00+00:00"}
+        return early, late
+
+    def _entry(self, early, late, **kw):
+        return _find_entry([_candle(_MONDAY_TS, 0.30, 0.70)],
+                           [_candle(_MONDAY_TS, 0.60, 0.40)], early, late,
+                           "time_series", date(2026, 1, 1), **kw)
+
+    def test_realized_closes_inverted_are_ordered_by_the_scheduled(self):
+        early, late = self._pair()
+        # On the realized closes LATE is the earlier contract, so the pricier
+        # earlier leg is never a candidate
+        assert self._entry(early, late) is None
+        _with_scheduled(late, "2026-02-14T00:00:00+00:00")
+        entry = self._entry(early, late)
+        assert entry["mA"]["ticker"] == "EARLY" and entry["mB"]["ticker"] == "LATE"
+        assert entry["gap_days"] == 13
+        # The scan still stops the day before the realized close
+        assert entry["entry_date"] == date(2026, 1, 5)
+
+    def test_the_scan_window_keeps_the_realized_close(self):
+        early, late = self._pair()
+        _with_scheduled(late, "2026-02-14T00:00:00+00:00")
+        # A Monday after LATE's realized close is never scanned
+        entry = _find_entry([_candle(_MONDAY_TS + 28 * 86_400, 0.30, 0.70)],
+                            [_candle(_MONDAY_TS + 28 * 86_400, 0.60, 0.40)], early, late,
+                            "time_series", date(2026, 2, 2))
+        assert entry is None
+
+    def test_the_horizon_reads_the_scheduled_close(self):
+        early, late = self._pair()
+        # Monday 01-05 is 40 days before 02-14 and 41 before 02-15
+        _with_scheduled(late, "2026-02-14T00:00:00+00:00")
+        assert self._entry(early, late, max_horizon_days=40)["entry_date"] == date(2026, 1, 5)
+        _with_scheduled(late, "2026-02-15T00:00:00+00:00")
+        assert self._entry(early, late, max_horizon_days=40)["entry_date"] == date(2026, 1, 12)
+
+    def test_a_ladder_keeps_its_stated_deadlines(self):
+        a = {"ticker": "R1", "event_ticker": "EVL", "title": "Will X happen by Feb 1, 2026?",
+             "close_time": "2026-02-01T00:00:00+00:00"}
+        b = {"ticker": "R2", "event_ticker": "EVL", "title": "Will X happen by Feb 14, 2026?",
+             "close_time": "2026-02-01T00:00:00+00:00"}
+        plain = self._entry(a, b, same_event_ladders=True)
+        _with_scheduled(a, "2026-03-30T00:00:00+00:00")
+        _with_scheduled(b, "2026-02-02T00:00:00+00:00")
+        ladder = self._entry(a, b, same_event_ladders=True)
+        assert plain["mA"]["ticker"] == ladder["mA"]["ticker"] == "R1"
+        assert plain["gap_days"] == ladder["gap_days"] == 13
+
+
+class TestScheduledCloseInTheSimulation:
+    """The trades' close dates, which the sell rule's days to maturity count from,
+    and the ranking's days to the later close read the scheduled close."""
+
+    _START = TestSellMinDays._START
+    _BALANCE = TestSellMinDays._BALANCE
+    _sim = TestSellMinDays._sim
+
+    @staticmethod
+    def _records(scheduled_b=None):
+        records = TestSellMinDays._records("2026-01-14", "2026-01-15")
+        if scheduled_b is not None:
+            for rec in records:
+                entry = rec["entry"]
+                for m in (entry["mA"], entry["mB"]):
+                    if m["ticker"] == "SB":
+                        _with_scheduled(m, scheduled_b)
+        return records
+
+    def test_a_game_that_closed_early_counts_its_days_from_the_scheduled_close(self, caplog):
+        # SB closed on 01-15 (3 days after Monday 2), but was scheduled to close
+        # on 01-22: 10 days left, so a 4-day minimum still sells
+        held = self._sim(self._records(), 0.25, sell_min_days=4)
+        assert not held.trades[0].sold
+        with caplog.at_level(logging.INFO):
+            point = self._sim(self._records("2026-01-22T00:00:00+00:00"), 0.25,
+                              sell_min_days=4)
+        assert point.trades[0].sold and point.trades[0].close_date_b == date(2026, 1, 22)
+        assert [check.days_left for check in point.sales] == [10]
+        assert ("Scheduled close: trades whose days to maturity count from the scheduled "
+                "close, not the realized one" in caplog.text)
+
+    def test_without_the_key_nothing_moves_and_nothing_is_logged(self, caplog):
+        with caplog.at_level(logging.INFO):
+            point = self._sim(self._records(), 0.25, sell_min_days=4)
+        assert "Scheduled close" not in caplog.text
+        assert point.trades[0].close_date_b == date(2026, 1, 15)
+
+    def test_the_ranking_reads_the_scheduled_close(self):
+        # Two otherwise-identical pairs on one ladder (one question) on one
+        # Monday, so only the better-ranked trades (DR-76): the one whose later
+        # market is scheduled further out has more days to the later close, so
+        # a lower monthly ratio, and loses
+        def pair(tag, scheduled=None):
+            a = _ladder_market(f"{tag}A", f"EV{tag}-1", "2026-02-20")
+            b = _ladder_market(f"{tag}B", f"EV{tag}-2", "2026-02-20")
+            if scheduled:
+                _with_scheduled(b, scheduled)
+            return _ladder_record(a, b, "one question", [_LADDER_M1])
+
+        def first(records):
+            point = backtester._simulate_at_discount(
+                records, date(2026, 1, 1), 1_000.0, k=0.75, size_cap=1.0,
+                end_date=date(2026, 4, 1))
+            return [t.ticker_a for t in point.trades]
+
+        # Ties keep the raw order: X first
+        assert first([pair("X"), pair("Y")]) == ["XA"]
+        assert first([pair("X", "2026-06-30T00:00:00+00:00"), pair("Y")]) == ["YA"]
+
+
+def _iso(moment: datetime) -> str:
+    """A moment as Kalshi writes it."""
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+_RULE_GAP = 7 * 86_400   # latest − expected expiration on every captured market
+
+
+def _capture_of(series: str, n: int, *, offset: int = 0) -> list:
+    """n settled observations of one series, over two events, whose live close is
+    latest_expiration_time + offset; each closed a little earlier than that (by a
+    different amount, so close_time fits no rule), and each latest expiration sits
+    _RULE_GAP after its expected one (the rule's one fingerprint)."""
+    out = []
+    for i in range(n):
+        latest = datetime(2026, 9, 1, tzinfo=UTC) + timedelta(days=i)
+        live = latest + timedelta(seconds=offset)
+        out.append({"ticker": f"{series}-E{i % 2}-OBS{i}", "series": series,
+                    "live_close_time": _iso(live),
+                    "record": {"status": "finalized",
+                               "close_time": _iso(live - timedelta(seconds=3_600 + 60 * i)),
+                               "latest_expiration_time": _iso(latest),
+                               "expected_expiration_time": _iso(
+                                   latest - timedelta(seconds=_RULE_GAP))}})
+    return out
+
+
+def _save_capture(observations: list) -> None:
+    """Write one scheduled-closes-v1 capture under the test's own folder."""
+    market_details._CLOSES_DIR.mkdir(parents=True, exist_ok=True)
+    historical._save_gz_json_cache(market_details._CLOSES_DIR / "2026-09-22.json.gz", {
+        "meta": {"source": "test", "taken_at": "2026-09-22",
+                 "format": market_details.CLOSES_FORMAT},
+        "observations": observations})
+
+
+def _save_details(records: list) -> None:
+    """Full, settled details records in the test's own details cache."""
+    market_details._append_details(
+        market_details._DETAILS_CACHE,
+        [dict(r, status="finalized", level=market_details.LEVEL_FULL) for r in records], False)
+
+
+class TestScheduledCloseSameTitleGate:
+    """The same-title close gate on the closes a live run would have read: a pair
+    whose realized closes drifted apart but whose scheduled closes match is one
+    question, and is admitted with the switch on."""
+
+    _TITLE = "Will the album top the chart?"
+
+    def _corpus(self):
+        def rec(ticker, event, close):
+            return {"ticker": ticker, "event_ticker": event, "event_title": "",
+                    "title": self._TITLE, "subtitle": "", "result": "no",
+                    "open_time": "2026-01-01T00:00:00+00:00", "close_time": close,
+                    "settlement_ts": close}
+        # Realized closes 1.5 h apart, more than the one-hour gate
+        return [rec("KXSTA-26-X", "KXSTA-26", "2026-02-20T00:00:00+00:00"),
+                rec("KXSTB-26-X", "KXSTB-26", "2026-02-20T01:30:00+00:00")]
+
+    def _setup(self, monkeypatch):
+        corpus = self._corpus()
+        TestGroupableSubset._patch(monkeypatch, corpus)
+        _save_capture(_capture_of("KXSTA", 20) + _capture_of("KXSTB", 20))
+        _save_details([
+            {"ticker": "KXSTA-26-X", "event_ticker": "KXSTA-26",
+             "close_time": "2026-02-20T00:00:00Z",
+             "latest_expiration_time": "2026-02-27T00:00:00Z",
+             "expected_expiration_time": "2026-02-20T00:00:00Z"},
+            {"ticker": "KXSTB-26-X", "event_ticker": "KXSTB-26",
+             "close_time": "2026-02-20T01:30:00Z",
+             "latest_expiration_time": "2026-02-27T00:00:00Z",
+             "expected_expiration_time": "2026-02-20T00:00:00Z"}])
+        return corpus
+
+    def _prepare(self, monkeypatch, caplog, scheduled):
+        corpus = self._setup(monkeypatch)
+        with caplog.at_level(logging.INFO):
+            candidates = backtester._prepare_candidates(
+                MagicMock(), MagicMock(), _SS1_START, True, None,
+                scheduled_close=scheduled)
+        return corpus, candidates
+
+    def test_on_the_pair_is_admitted(self, monkeypatch, caplog):
+        corpus, candidates = self._prepare(monkeypatch, caplog, True)
+        assert [p[1] for p in candidates.all_pairs] == ["same_title"]
+        assert candidates.scheduled_close is True
+        assert {s: r[:3] for s, r in candidates.close_rules.items()} == {
+            "KXSTA": ("latest_expiration_time", 0, frozenset({_RULE_GAP})),
+            "KXSTB": ("latest_expiration_time", 0, frozenset({_RULE_GAP}))}
+        assert all(m[backtester._SCHEDULED_CLOSE_KEY] == _epoch("2026-02-27T00:00:00+00:00")
+                   for m in corpus)
+        assert ("Scheduled close: same-title candidates the close gate judged otherwise "
+                "than on their realized closes: 1 admitted, 0 refused") in caplog.messages
+        assert ("Scheduled close: 2 of 2 pair markets use it, 0 keep their realized close "
+                "(no rule for their series)") in caplog.messages
+        assert not any(m.startswith(_ST_CLOSE_GAP) for m in caplog.messages)
+
+    def test_off_it_is_refused_as_today(self, monkeypatch, caplog):
+        corpus, candidates = self._prepare(monkeypatch, caplog, False)
+        assert candidates.all_pairs == [] and candidates.scheduled_close is False
+        assert candidates.close_rules == {}
+        assert _logged_counts(caplog)[_ST_CLOSE_GAP] == 1
+        assert not any(m.startswith("Scheduled close") for m in caplog.messages)
+        assert not any(backtester._SCHEDULED_CLOSE_KEY in m for m in corpus)
+
+    def test_a_series_with_no_rule_keeps_its_realized_close(self, monkeypatch, caplog):
+        self._setup(monkeypatch)
+        _save_capture(_capture_of("KXSTA", 20))
+        with caplog.at_level(logging.INFO):
+            candidates = backtester._prepare_candidates(
+                MagicMock(), MagicMock(), _SS1_START, True, None, scheduled_close=True)
+        # KXSTB keeps its realized close, 1.5 h after KXSTA's realized one and
+        # 6.5 days before its scheduled one: refused, on the usual line
+        assert candidates.all_pairs == []
+        assert _logged_counts(caplog)[_ST_CLOSE_GAP] == 1
+
+    def test_a_market_of_another_fingerprint_keeps_its_realized_close(self, monkeypatch,
+                                                                      caplog):
+        self._setup(monkeypatch)
+        # KXSTB's own latest − expected gap is not the one its rule was learned on
+        _save_details([{"ticker": "KXSTB-26-X", "event_ticker": "KXSTB-26",
+                        "close_time": "2026-02-20T01:30:00Z",
+                        "latest_expiration_time": "2026-02-27T00:00:00Z",
+                        "expected_expiration_time": "2026-02-21T00:00:00Z"}])
+        with caplog.at_level(logging.INFO):
+            candidates = backtester._prepare_candidates(
+                MagicMock(), MagicMock(), _SS1_START, True, None, scheduled_close=True)
+        assert candidates.all_pairs == []
+        assert _logged_counts(caplog)[_ST_CLOSE_GAP] == 1
+
+    def test_none_reads_the_constant_at_call_time(self, monkeypatch, caplog):
+        monkeypatch.setattr(backtester, "BACKTEST_SCHEDULED_CLOSE", False)
+        _corpus, candidates = self._prepare(monkeypatch, caplog, None)
+        assert candidates.all_pairs == [] and candidates.scheduled_close is False
+
+
+class TestScheduledCloseSwitchOff:
+    """With the switch off nothing is read, no record carries a scheduled close, and
+    every trade, curve and log line is the run's with no rule at all (C4's)."""
+
+    @staticmethod
+    def _corpus_and_candles():
+        markets, candles = _p5_corpus(1)
+        return markets, candles
+
+    def _run(self, monkeypatch, caplog, scheduled, captures):
+        markets, candles = self._corpus_and_candles()
+        with monkeypatch.context() as mp:
+            mp.setattr(backtester, "fetch_all_settled_markets", lambda *a, **k: markets)
+            mp.setattr(backtester, "fetch_candlesticks",
+                       lambda _c, ticker, *a, **k: candles[ticker])
+            mp.setattr(market_details, "_CLOSES_DIR",
+                       market_details._CLOSES_DIR.parent / f"closes-{captures}")
+            # Every run starts from the same caches: each market's details
+            # saved, no event label read yet
+            for path in (historical._EVENT_COMPETITIONS_CACHE,
+                         historical._EVENT_FEE_OVERRIDES_CACHE, market_details._DETAILS_CACHE):
+                path.unlink(missing_ok=True)
+            def details_of(m):
+                close = backtester._parse_iso_datetime(m["close_time"])
+                return {"ticker": m["ticker"], "event_ticker": m["event_ticker"],
+                        "close_time": m["close_time"], "latest_expiration_time": _iso(close),
+                        "expected_expiration_time": _iso(close - timedelta(seconds=_RULE_GAP))}
+
+            _save_details([details_of(m) for m in markets])
+            if captures:
+                rules_obs = []
+                for series in {historical.series_ticker(m.get("event_ticker") or "")
+                               for m in markets}:
+                    rules_obs += _capture_of(series, 20, offset=86_400 * 3)
+                _save_capture(rules_obs)
+            caplog.clear()
+            with caplog.at_level(logging.INFO):
+                sweep = run_backtest_sweep(MagicMock(), MagicMock(), _P5_START, 10_000.0,
+                                           scheduled_close=scheduled)
+        return markets, sweep, list(caplog.messages)
+
+    def test_off_with_rules_on_disk_is_the_run_with_none(self, monkeypatch, caplog):
+        seen: list = []
+        real = market_details.load_close_rules
+        monkeypatch.setattr(market_details, "load_close_rules",
+                            lambda *a, **k: seen.append(a) or real(*a, **k))
+        markets, off, off_log = self._run(monkeypatch, caplog, False, True)
+        assert seen == []
+        assert not any(backtester._SCHEDULED_CLOSE_KEY in m for m in markets)
+        markets2, bare, bare_log = self._run(monkeypatch, caplog, True, False)
+        assert seen  # the run with the switch on read the (empty) captures
+        assert off.scheduled_close is False and bare.scheduled_close is True
+        assert [astuple(t) for t in off.primary.trades] == [astuple(t) for t in bare.primary.trades]
+        pd.testing.assert_frame_equal(off.primary.equity_df, bare.primary.equity_df,
+                                      check_exact=True)
+
+        def plain(log):
+            # The peak-memory lines differ from one run to the next
+            return [m for m in log if not m.startswith(("Scheduled close", "Peak RSS"))]
+
+        assert plain(off_log) == plain(bare_log)
+        assert [m for m in off_log if m.startswith("Scheduled close")] == [
+            "Scheduled close (backtest): off — every market's close is its realized close "
+            "(run-level override)"]
+
+    def test_on_with_rules_moves_the_maturity_of_trades(self, monkeypatch, caplog):
+        markets, on, on_log = self._run(monkeypatch, caplog, True, True)
+        assert on.scheduled_close is True
+        carried = [m for m in markets if backtester._SCHEDULED_CLOSE_KEY in m]
+        assert carried
+        for m in carried:
+            realized = backtester._parse_iso_datetime(m["close_time"])
+            assert m[backtester._SCHEDULED_CLOSE_KEY] == int(realized.timestamp()) + 3 * 86_400
+        # Every trade's close dates are its markets' scheduled ones
+        by_ticker = {m["ticker"]: m for m in markets}
+        assert on.primary.trades
+        for t in on.primary.trades:
+            for ticker, close in ((t.ticker_a, t.close_date_a), (t.ticker_b, t.close_date_b)):
+                assert close == backtester._maturity_close(by_ticker[ticker], as_date=True)
+                assert close != backtester._parse_iso_date(by_ticker[ticker]["close_time"])
+        assert any(m.startswith("Scheduled close: trades whose days to maturity count from")
+                   for m in on_log)
+
+
+class TestDeferredGateIsTheGate:
+    """With no scheduled close carried, the deferred same-title gate
+    (_extract_pairs(defer_close_gate=True) then _close_gate_and_labels) returns
+    the very pairs and count lines the gate inside _extract_pairs does."""
+
+    @pytest.mark.parametrize("seed", [0, 1, 2])
+    def test_same_pairs_same_lines(self, caplog, seed):
+        recs = TestOneSeriesAndSameEventCounts._fuzz(seed)
+        for k, rec in enumerate(recs):
+            if k % 17 == 5:
+                rec["close_time"] = "not a date" if k == 5 else None
+        listing = {"KXAA": ("Sports", ("Football",))}
+        st_groups = _group_by_exact_title(recs)
+        with caplog.at_level(logging.INFO):
+            direct = _extract_pairs(st_groups, series_categories=listing)
+        direct_lines = sorted(caplog.messages)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            deferred = backtester._close_gate_and_labels(
+                _extract_pairs(st_groups, series_categories=listing, defer_close_gate=True),
+                listing)
+        assert deferred == direct
+        assert sorted(caplog.messages) == direct_lines
+        counts = _logged_counts(caplog)
+        assert counts[_ST_CLOSE_GAP] and counts[_ST_LABEL] and counts[_ST_UNDATED]
+
+    @pytest.mark.parametrize("seed", [0, 1, 2])
+    def test_with_scheduled_closes_every_candidate_lands_on_one_line(self, caplog, seed):
+        recs = TestOneSeriesAndSameEventCounts._fuzz(seed)
+        rng = random.Random(seed)
+        for rec in recs:
+            close = backtester._parse_iso_datetime(rec.get("close_time"))
+            if close is not None and close.utcoffset() is not None and rng.random() < 0.5:
+                rec[backtester._SCHEDULED_CLOSE_KEY] = int(close.timestamp()) + rng.choice(
+                    (0, 1_800, 7_200, 86_400))
+        listing = {"KXAA": ("Sports", ("Football",))}
+        st_groups = _group_by_exact_title(recs)
+        candidates = sum(len(v) * (len(v) - 1) // 2 for v in st_groups.values())
+        with caplog.at_level(logging.INFO):
+            kept = backtester._close_gate_and_labels(
+                _extract_pairs(st_groups, series_categories=listing, defer_close_gate=True),
+                listing)
+        st = _logged_counts(caplog)
+        assert candidates == (len(kept) + st[_ST_SAME_EVENT] + st[_ST_SERIES]
+                              + st[_ST_UNDATED] + st[_ST_CLOSE_GAP] + st[_ST_LABEL])
+        for mA, mB, _, _ in kept:
+            assert not scanner.closes_apart(backtester._maturity_close(mA),
+                                            backtester._maturity_close(mB))
+
+    def test_the_deferred_lines_are_the_inline_lines_verbatim(self, caplog):
+        with caplog.at_level(logging.INFO):
+            backtester._log_close_gap_refusals(3)
+            backtester._log_label_refusals(2)
+        recs = TestSameTitleCloseGapBacktest._wiu()
+        caplog_lines = list(caplog.messages)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            _extract_pairs(_group_by_exact_title(recs))
+        inline = [m for m in caplog.messages if m.startswith(_ST_CLOSE_GAP)][0]
+        assert caplog_lines[0].rsplit(": ", 1)[0] == inline.rsplit(": ", 1)[0]
+        assert caplog_lines[1].startswith(_ST_LABEL)
+
+
+class TestScheduledCloseIsThreaded:
+    """The switch rides keyword-only through every entry point and is recorded on the sweep."""
+
+    def test_keyword_only_everywhere(self):
+        for func in (backtester._prepare_candidates, backtester._prepare_entries,
+                     run_backtest, run_backtest_sweep):
+            param = inspect.signature(func).parameters["scheduled_close"]
+            assert param.kind is inspect.Parameter.KEYWORD_ONLY, func.__name__
+            assert param.default is None, func.__name__
+
+    @pytest.mark.parametrize("passed, configured, recorded", [
+        (None, True, True), (None, False, False), (False, True, False), (True, False, True),
+    ])
+    def test_the_infeasible_window_records_it_too(self, monkeypatch, passed, configured,
+                                                   recorded):
+        seen: list = []
+        monkeypatch.setattr(backtester, "BACKTEST_SCHEDULED_CLOSE", configured)
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **k: seen.append(k["scheduled_close"]))
+        sweep = run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1_000.0,
+                                   scheduled_close=passed)
+        assert seen == [passed]
+        assert sweep.scheduled_close is recorded
+
+    def test_run_backtest_hands_it_on(self, monkeypatch):
+        seen: list = []
+        monkeypatch.setattr(backtester, "_prepare_entries",
+                            lambda *a, **k: (seen.append(k["scheduled_close"]), None)[1:] * 2)
+        run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
+                     start_date=date(2026, 1, 1), initial_balance=1000.0,
+                     scheduled_close=False)
+        assert seen == [False]
+
+
+class TestApplyScheduledCloses:
+    """_apply_scheduled_closes writes each pair market's scheduled close and counts the rest."""
+
+    def test_each_kind_of_market_is_counted(self, caplog):
+        rules = {"KXA": ("latest_expiration_time", 0, frozenset({_RULE_GAP}), 2)}
+        close = datetime(2026, 2, 20, tzinfo=UTC)
+
+        def market(ticker, series):
+            return {"ticker": ticker, "event_ticker": f"{series}-1", "close_time": _iso(close)}
+
+        def details(latest_days, gap):
+            latest = close + timedelta(days=latest_days)
+            return {"close_time": _iso(close), "latest_expiration_time": _iso(latest),
+                    "expected_expiration_time": _iso(latest - timedelta(seconds=gap))}
+
+        needed = {"A1": market("A1", "KXA"), "A2": market("A2", "KXA"),
+                  "A3": market("A3", "KXA"), "B1": market("B1", "KXB")}
+        needed["A2"][backtester._SCHEDULED_CLOSE_KEY] = 1   # a stale key is popped
+        info = {"A1": details(7, _RULE_GAP), "A2": details(7, _RULE_GAP + 3_600),
+                "A3": details(-1, _RULE_GAP), "B1": details(7, _RULE_GAP)}
+        with caplog.at_level(logging.INFO):
+            backtester._apply_scheduled_closes(needed, info, rules, {}, {}, [], True)
+        assert needed["A1"][backtester._SCHEDULED_CLOSE_KEY] == int(
+            (close + timedelta(days=7)).timestamp())
+        assert all(backtester._SCHEDULED_CLOSE_KEY not in needed[t] for t in ("A2", "A3", "B1"))
+        assert caplog.messages == [
+            "Scheduled close: 1 of 4 pair markets use it, 1 keep their realized close "
+            "(no rule for their series)",
+            "Scheduled close: 1 pair markets of a series with a rule keep their realized "
+            "close (their latest-minus-expected expiration gap is not one the rule was "
+            "learned on)",
+            "Scheduled close: 1 pair markets whose series' rule fits them keep their "
+            "realized close (no usable time, or the rule's answer falls before it)"]
+
+    def test_off_pops_every_key_and_logs_nothing(self, caplog):
+        needed = {"A1": {"ticker": "A1", backtester._SCHEDULED_CLOSE_KEY: 5}}
+        with caplog.at_level(logging.INFO):
+            backtester._apply_scheduled_closes(needed, {}, None, {}, {}, [], True)
+        assert needed["A1"] == {"ticker": "A1"} and caplog.messages == []

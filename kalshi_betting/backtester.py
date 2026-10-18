@@ -394,6 +394,7 @@ from .config import (
     BACKTEST_MARKETS_RAM_WARN,
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
     BACKTEST_RECORD_BYTES_ESTIMATE,
+    BACKTEST_SCHEDULED_CLOSE,
     BUDGET_FRACTION,
     CANDLE_NO_ASK_CEILING,
     CANDLESTICK_FETCH_MAX_WORKERS,
@@ -1566,8 +1567,11 @@ class BacktestTrade:
             settle identically here.
         subtitle_a (str): Market A's outcome label ("" when absent).
         subtitle_b (str): Market B's outcome label ("" when absent).
-        close_date_a (date | None): The date market A closed for trading.
-        close_date_b (date | None): The date market B closed for trading.
+        close_date_a (date | None): The date market A closed for trading:
+            its scheduled close (the close a live run saw) when the
+            scheduled close is on and its series' rule fits the market
+            (_maturity_close), else its realized close.
+        close_date_b (date | None): The same for market B.
         settled_date_a (date | None): The date market A settled.
         settled_date_b (date | None): The date market B settled. All six are
             read by the dashboard's best/worst trade tables, and the two
@@ -2305,6 +2309,13 @@ class _Candidates:
             reads 1.0). _prepare_candidates writes each pair market's on its
             record (_LISTED_FEE_KEY), where every backtest fee reads it.
             Empty on a hand-built instance.
+        scheduled_close (bool | None): Whether this run read the scheduled
+            close (the resolved switch: config.BACKTEST_SCHEDULED_CLOSE or the
+            run's override); None on a hand-built instance. Each pair market
+            carrying one has it on its record (_SCHEDULED_CLOSE_KEY).
+        close_rules (dict): Series ticker -> (field, offset seconds), the
+            rules market_details.load_close_rules learned; empty with the
+            switch off.
     """
     all_pairs: list
     candles_by_ticker: dict
@@ -2317,6 +2328,8 @@ class _Candidates:
     trade_summaries: dict = field(default_factory=dict)
     candle_failures: dict = field(default_factory=dict)
     fee_multipliers: dict = field(default_factory=dict)
+    scheduled_close: bool | None = None
+    close_rules: dict = field(default_factory=dict)
 
 
 def _fee_multiplier_of(market: dict, fee_multipliers: dict | None) -> float:
@@ -3868,6 +3881,10 @@ class BacktestSweep:
             synthetic order book came from (which snapshots, how many
             ladders, when they were taken), for the page's header; None when
             the run had none, so every trade filled at the top of the book.
+        scheduled_close (bool | None): Whether the run read each market's
+            scheduled close where a live run reads its close (the resolved
+            config.BACKTEST_SCHEDULED_CLOSE, or backtest.py's override);
+            None = not recorded (a hand-built sweep).
     """
     primary: SweepPoint
     points: list[SweepPoint]
@@ -3915,6 +3932,8 @@ class BacktestSweep:
     # The saved live defaults' trim_to_kelly and trim_min_rise
     live_trim_to_kelly: bool | None = None
     live_trim_min_rise: float | None = None
+    # Whether the run read each market's scheduled close (None: not recorded)
+    scheduled_close: bool | None = None
 
 
 def _settlement_receipt(n: int, outcome_a: str, outcome_b: str, pair_type: str) -> float:
@@ -4366,8 +4385,10 @@ def _days_left(position: list[BacktestTrade], day: date) -> int | None:
 
     A position matures when the last of its markets closes, so this is the
     latest close date among its trades' markets (BacktestTrade.close_date_a
-    and close_date_b, the dates the markets' close_time names — UTC on every
-    Kalshi timestamp) less the checkpoint's date, in whole calendar days. It
+    and close_date_b: the date of each market's scheduled close when the
+    scheduled close is on and its series' rule fits the market, else the
+    date its realized close_time names — UTC on every Kalshi timestamp;
+    _maturity_close) less the checkpoint's date, in whole calendar days. It
     is 0 when the last market closes on the checkpoint's own date, and
     negative when it closed before it (a market that has stopped trading
     but not yet paid out). The days rule (_far_enough) reads it, and every
@@ -5644,6 +5665,66 @@ def _comparable_closes_dicts(mA: dict, mB: dict) -> tuple[datetime, datetime] | 
     return ca, cb
 
 
+# The private key a pair market's record carries its scheduled close under
+# (whole Unix seconds), written by _prepare_candidates only while the
+# scheduled-close switch is on and its series' rule gives one; popped otherwise
+_SCHEDULED_CLOSE_KEY = "_scheduled_close"
+
+
+def _maturity_close(m: dict, *, as_date: bool = False) -> datetime | date | None:
+    """
+    The close a live run would have read for a market: its scheduled close, else its realized one.
+
+    Once a market settles, its close_time is the moment it actually closed,
+    which for an event decided early is before the close a live run saw.
+    _prepare_candidates writes the scheduled close (learned per series,
+    market_details.scheduled_close) on a pair market's record under
+    _SCHEDULED_CLOSE_KEY while config.BACKTEST_SCHEDULED_CLOSE (or the run's
+    override) is on, and pops it otherwise, so a record without the key reads
+    its realized close exactly as before.
+
+    Read where a live run reads its close: the sell rule's days to maturity
+    (the trades' close_date_a/_b, read by _days_left, _far_enough and
+    _sale_reach), the ranking's days to the later close (expected_days in
+    _simulate_at_discount), a cross-event time-series pair's order, gap and
+    horizon in _find_entry, and the same-title close gate
+    (_close_gate_and_labels). NOT read where the exchange's own timing
+    matters, which keep the realized close: _find_entry's scan_end (candles
+    exist only until the market really closed), _can_ever_enter and
+    SETTLED_PREFILTER_CACHE_TAG (so no corpus is orphaned), the candle windows
+    (_fetch_candles_parallel), the time-series sweep window in _extract_pairs
+    (a bound on which pairs are visited) and _leg_quotes' payout moments
+    (settlement_ts). A same-event ladder keeps its stated deadlines.
+
+    A residual of that window, recorded rather than fixed: a cross-event
+    pair whose realized closes are more than MAX_DEADLINE_GAP_DAYS + 1 days
+    apart but whose scheduled closes are within MAX_DEADLINE_GAP_DAYS is
+    never visited, so never traded. That is pessimistic (it can only miss
+    trades), and such a pair's earlier market closed far ahead of schedule,
+    the shape whose earlier leg settles YES (a winning cell) that is missed.
+
+    Args:
+        m (dict): A market record (the compact historical._market_to_dict form).
+        as_date (bool): Keyword-only. Return the UTC date (the realized
+            close's date as _parse_iso_date reads it when no scheduled close
+            is carried).
+
+    Returns:
+        datetime | date | None: The moment (or its date). None when no
+            scheduled close is carried and close_time cannot be read.
+    """
+    epoch = m.get(_SCHEDULED_CLOSE_KEY) if isinstance(m, dict) else None
+    if isinstance(epoch, int) and not isinstance(epoch, bool):
+        try:
+            moment = datetime.fromtimestamp(epoch, tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            moment = None
+        if moment is not None:
+            return moment.date() if as_date else moment
+    raw = m.get("close_time") if isinstance(m, dict) else None
+    return _parse_iso_date(raw) if as_date else _parse_iso_datetime(raw)
+
+
 def _deadline_profile_dict(m: dict) -> tuple:
     """
     Dict-world mirror of scanner._market_deadline_profile over cached records.
@@ -5954,9 +6035,132 @@ def _drop_cross_type_duplicates(candidates: list[dict]) -> list[dict]:
     return kept
 
 
+def _series_label_filer(series_categories: dict | None) -> Callable[[dict], tuple[str, str]]:
+    """
+    A function giving the (category, tag) a market's series is filed under, worked out once per series.
+
+    The one filing rule of the same-title sport check's label half (DR-79),
+    historical.series_labels over the listing: _extract_pairs and the
+    deferred gate (_close_gate_and_labels) both read it.
+
+    Args:
+        series_categories (dict | None): Kalshi's /series listing; None or {}
+            files every series by its ticker prefix, as
+            historical.series_labels does.
+
+    Returns:
+        Callable[[dict], tuple[str, str]]: market record -> (category, tag).
+    """
+    listing = series_categories or {}
+    labels_by_series: dict[str, tuple[str, str]] = {}
+
+    def _labels(m: dict) -> tuple[str, str]:
+        """The (category, tag) a market's series is filed under."""
+        event = m.get("event_ticker") or ""
+        series = series_ticker(event)
+        if series not in labels_by_series:
+            # Cross-module: the one filing rule the live run attaches to its
+            # markets (main._attach_series_labels) and the dashboard files by
+            labels_by_series[series] = series_labels(event, infer_category(event), listing)
+        return labels_by_series[series]
+
+    return _labels
+
+
+def _log_close_gap_refusals(count: int) -> None:
+    """
+    The same-title close-gap line (DR-74) for the deferred gate (silent at zero).
+
+    Word for word the line _extract_pairs and scanner.find_same_title_pairs
+    log (tests/test_backtester.py pins the three equal).
+    """
+    if count:
+        # The bound is printed through scanner.close_gap_bound_text, which
+        # reads the binding closes_apart read — this module holds no copy of
+        # the constant, so the line cannot state a bound its gate did not use.
+        logging.info(
+            "Same-title candidates refused because the two markets close more "
+            "than %s apart (two different games or instants, not one "
+            "question listed twice): %d",
+            close_gap_bound_text(), count,
+        )
+
+
+def _log_label_refusals(count: int) -> None:
+    """
+    The same-title label line (DR-79) for the deferred gate (silent at zero).
+
+    Word for word the line _extract_pairs and scanner.find_same_title_pairs
+    log (tests/test_backtester.py pins the three equal).
+    """
+    if count:
+        logging.info(
+            "Same-title candidates refused because the two series are filed under "
+            "different Kalshi categories or tags (two different sports or subjects, "
+            "not one question listed twice): %d", count,
+        )
+
+
+def _close_gate_and_labels(pairs: list, series_categories: dict | None) -> list:
+    """
+    Apply the same-title close gate on the scheduled closes, then the label check.
+
+    The deferred half of _extract_pairs' same-title branch, used while the
+    scheduled close is on and some series has a rule: _extract_pairs (with
+    defer_close_gate) hands back the candidates that passed every check up to
+    the close gate, _prepare_candidates writes their markets' scheduled
+    closes, and this applies scanner.closes_apart to the closes a live run
+    would have read (_maturity_close: the scheduled close where one is
+    carried, else the realized one), then scanner.labels_differ, in the order
+    and with the very lines _extract_pairs uses, so each refused candidate
+    still lands on one line. One more silent-at-zero line counts the pairs
+    the gate judged otherwise than it would have on the realized closes.
+
+    Args:
+        pairs (list): (market_a, market_b, canonical_title, group_key) tuples
+            from _extract_pairs(..., defer_close_gate=True), every one with
+            readable, comparable realized closes.
+        series_categories (dict | None): Kalshi's /series listing, as handed
+            to _extract_pairs.
+
+    Returns:
+        list: The pairs that pass both checks, in their order.
+    """
+    _labels = _series_label_filer(series_categories)
+    kept: list = []
+    gap_skips = label_skips = admitted = refused = 0
+    for pair in pairs:
+        mA, mB = pair[0], pair[1]
+        realized = _comparable_closes_dicts(mA, mB)
+        # The ONE definition of the gate (scanner.closes_apart). A scheduled
+        # close is an aware UTC moment; beside a naive realized close the two
+        # cannot be compared and closes_apart refuses the pair (fail closed)
+        apart = closes_apart(_maturity_close(mA), _maturity_close(mB))
+        apart_realized = realized is None or closes_apart(*realized)
+        if apart != apart_realized:
+            if apart:
+                refused += 1
+            else:
+                admitted += 1
+        if apart:
+            gap_skips += 1
+            continue
+        if labels_differ(_labels(mA), _labels(mB)):
+            label_skips += 1
+            continue
+        kept.append(pair)
+    _log_close_gap_refusals(gap_skips)
+    _log_label_refusals(label_skips)
+    if admitted or refused:
+        logging.info(
+            "Scheduled close: same-title candidates the close gate judged otherwise "
+            "than on their realized closes: %d admitted, %d refused", admitted, refused)
+    return kept
+
+
 def _extract_pairs(
     groups: dict, *, same_event_ladders: bool | None = None,
-    series_categories: dict | None = None,
+    series_categories: dict | None = None, defer_close_gate: bool = False,
 ) -> list[tuple[dict, dict, str, object]]:
     """
     Return list of (market_a, market_b, canonical_title, group_key) tuples where
@@ -6033,7 +6237,11 @@ def _extract_pairs(
     rejects any time-series pair whose close dates differ by more than
     MAX_DEADLINE_GAP_DAYS, so pairs outside that window can never produce an
     entry and are skipped without ever being materialized as a candidate
-    pair (they are counted, never enumerated — see below). The +1 day margin
+    pair (they are counted, never enumerated — see below). The window reads
+    the REALIZED close dates even with the scheduled close on, so a pair
+    whose realized closes are beyond it but whose scheduled closes sit within
+    MAX_DEADLINE_GAP_DAYS is never visited (a recorded residual; it can only
+    miss trades — see _maturity_close). The +1 day margin
     is slack only (it can never cause a pair within the true limit to be
     skipped) — _find_entry() still applies the exact
     `.days > MAX_DEADLINE_GAP_DAYS` cutoff itself. Members with a missing or
@@ -6194,6 +6402,13 @@ def _extract_pairs(
             (historical.series_labels' fallback), so nearly every pair of
             series is filed alike. Has no effect on string-keyed
             (time-series) groups.
+        defer_close_gate (bool): Keyword-only. For 3-tuple-keyed groups, stop
+            each candidate after the close-time readability check and return
+            it unjudged by the close gate and the label check, which
+            _close_gate_and_labels then applies on the closes a live run would
+            have read (_prepare_candidates does this while the scheduled close
+            is on and some series has a rule). False (the default) applies
+            both here, on the realized closes, exactly as before.
 
     Returns:
         list[tuple[dict, dict, str, object]]: One (market_a, market_b,
@@ -6210,18 +6425,7 @@ def _extract_pairs(
     # Each series' (category, tag), worked out once per series for the
     # same-title label check (DR-79); an empty listing files every series by
     # its ticker prefix, as historical.series_labels does
-    listing = series_categories or {}
-    labels_by_series: dict[str, tuple[str, str]] = {}
-
-    def _labels(m: dict) -> tuple[str, str]:
-        """The (category, tag) a market's series is filed under."""
-        event = m.get("event_ticker") or ""
-        series = series_ticker(event)
-        if series not in labels_by_series:
-            # Cross-module: the one filing rule the live run attaches to its
-            # markets (main._attach_series_labels) and the dashboard files by
-            labels_by_series[series] = series_labels(event, infer_category(event), listing)
-        return labels_by_series[series]
+    _labels = _series_label_filer(series_categories)
 
     # Resolved at CALL time, never bound as a def-time default: the constant
     # is what a test monkeypatches and what --same-event-ladders overrides for
@@ -6590,6 +6794,17 @@ def _extract_pairs(
                     if closes is None:
                         st_undated_skips += 1
                         continue
+                    # With the gate deferred, the rest (the gate on the
+                    # scheduled closes, then the label check) is
+                    # _close_gate_and_labels', after _prepare_candidates has
+                    # read the scheduled closes
+                    if defer_close_gate:
+                        pair_key = frozenset([mA["ticker"], mB["ticker"]])
+                        if pair_key in seen:
+                            continue
+                        seen.add(pair_key)
+                        pairs.append((mA, mB, canon, key))
+                        continue
                     # The ONE definition of the gate, shared with the live finder
                     # so the two paths cannot disagree on "one moment".
                     if closes_apart(*closes):
@@ -6622,6 +6837,11 @@ def _extract_pairs(
             ts_undated_members,
         )
     if ts_beyond_window:
+        # The window reads the REALIZED close dates. With the scheduled close
+        # on, a pair beyond it on its realized closes but within the cap on
+        # its scheduled ones is never visited: a recorded residual that can
+        # only miss trades (see _maturity_close). The line's words stay as
+        # they are, so the run with the switch off logs what it always did
         logging.info(
             "Time-series candidate pairs the sweep never visits because their "
             "close dates are more than %d days apart (a performance bound, no "
@@ -7401,7 +7621,12 @@ def _find_entry(
         event that resolved early can sit before the original schedule — a
         later-deadline leg that resolved early is ordered first on the
         realized gap, a recorded pre-existing residual, not something this
-        function's datetime ordering fixes (CLAUDE.md TS-06). A SAME-EVENT
+        function's datetime ordering fixes (CLAUDE.md TS-06). With the
+        scheduled close on (config.BACKTEST_SCHEDULED_CLOSE), the order, the
+        gap and the max_horizon_days check read the close a live run would
+        have read (_maturity_close: the scheduled close where the market's
+        series has a learned rule), while the scan window (scan_end) keeps the
+        realized close, since candles exist only until then. A SAME-EVENT
         DEADLINE LADDER is the one exception and is the point of DR-73: with
         same_event_ladders resolved True, two markets sharing a non-empty
         event_ticker are ordered and gapped on their STATED deadlines
@@ -7565,6 +7790,13 @@ def _find_entry(
     close_b = _parse_iso_date(mB.get("close_time"))
     if close_a is None or close_b is None:
         return None
+    # The close a live run would have read (_maturity_close: the scheduled
+    # close when _prepare_candidates found one, else the realized close, so
+    # these equal close_a/close_b whenever no scheduled close is carried).
+    # They order and gap a cross-event pair and bound the horizon below; the
+    # scan's window stays on the realized dates above.
+    maturity_a = _maturity_close(mA, as_date=True)
+    maturity_b = _maturity_close(mB, as_date=True)
 
     # Scan up to (but not including) the day the earlier market closes —
     # after that, the pair is no longer fully open for entry.
@@ -7609,8 +7841,10 @@ def _find_entry(
         # market, this reads the REALIZED close Kalshi recorded for a settled
         # one, which for an event that resolved early can sit before the
         # original schedule — a later-deadline leg that resolved early is
-        # ordered first on the realized gap. Recorded, pre-existing residual
-        # (CLAUDE.md TS-06); not fixed by this datetime ordering.
+        # ordered first on the realized gap (CLAUDE.md TS-06). With the
+        # scheduled close on, the order and the gap are read on the close a
+        # live run would have read (_maturity_close) wherever the market's
+        # series has a learned rule; a series with none keeps the realized one.
         # DR-73: a same-event deadline LADDER is the one time-series shape
         # close_time cannot order or measure, so it is ordered and gapped on
         # the two rungs' STATED deadlines instead. Gated on the resolved flag,
@@ -7644,12 +7878,14 @@ def _find_entry(
                 return None
             b_before_a, gap_days = ladder
         else:
-            dt_a = _parse_iso_datetime(mA.get("close_time"))
-            dt_b = _parse_iso_datetime(mB.get("close_time"))
+            # The close a live run would have read (the scheduled close where
+            # one is carried, else the realized one: _maturity_close)
+            dt_a = _maturity_close(mA)
+            dt_b = _maturity_close(mB)
             try:
                 b_before_a = dt_b < dt_a
             except TypeError:
-                b_before_a = close_b < close_a
+                b_before_a = maturity_b < maturity_a
             # Deadline gap is loop-invariant: a wider gap carries more genuine
             # in-between probability mass, so 16-30 day gaps demand the larger
             # tier and gaps beyond MAX_DEADLINE_GAP_DAYS are never disputed.
@@ -7674,11 +7910,12 @@ def _find_entry(
                 # can't be subtracted; fall back to the dates rather than
                 # raising, per this file's "can't parse it = unknown, not an
                 # error" convention
-                gap_days = abs(close_b - close_a).days
+                gap_days = abs(maturity_b - maturity_a).days
         if b_before_a:
             mA, mB = mB, mA
             candles_a, candles_b = candles_b, candles_a
             close_a, close_b = close_b, close_a
+            maturity_a, maturity_b = maturity_b, maturity_a
         if gap_days > MAX_DEADLINE_GAP_DAYS:
             return None
         # Tier the required price gap by deadline distance (15% for gaps
@@ -7731,9 +7968,11 @@ def _find_entry(
         # holds for every time_series pair either (in the archive 13 dated
         # same-event pairs are ordered the wrong way round by realized close,
         # and 681 have a close gap of ZERO days). The max() keeps this correct
-        # under all three; close_time is read here ON PURPOSE, because this
-        # bounds when a market is still OPEN, not when its deadline falls.
-        if max_horizon_days is not None and (max(close_a, close_b) - entry_date).days > max_horizon_days:
+        # under all three. It reads the close a live run would have read (the
+        # scheduled one where carried: a live run's horizon filter reads the
+        # listed close), not the stated deadline, because this bounds when a
+        # market is still OPEN.
+        if max_horizon_days is not None and (max(maturity_a, maturity_b) - entry_date).days > max_horizon_days:
             continue
 
         # A leg with no candle at or before this Monday has no quote to test
@@ -9042,6 +9281,113 @@ def _log_extra_data(
             logging.info("  %s", sentence)
 
 
+def _write_scheduled_close(m: dict, timing: tuple | None, rules: dict) -> int | None:
+    """
+    Write a market's scheduled close on its record, or pop the key when there is none.
+
+    Args:
+        m (dict): A pair market's record.
+        timing (tuple | None): Its timing_epochs (market_details), or None
+            when its details could not be read.
+        rules (dict): The learned close rules.
+
+    Returns:
+        int | None: The scheduled close written (Unix seconds), or None.
+    """
+    # Cross-module: the series' rule applied to the market's own times
+    epoch = market_details.scheduled_close(
+        timing, rules, series_ticker(m.get("event_ticker") or ""))
+    if epoch is None:
+        # A record reused from an earlier call never keeps a stale close
+        m.pop(_SCHEDULED_CLOSE_KEY, None)
+    else:
+        m[_SCHEDULED_CLOSE_KEY] = epoch
+    return epoch
+
+
+def _apply_scheduled_closes(needed_tickers: dict, details: dict, rules: dict | None,
+                            known: dict, known_timing: dict, ts_pairs: list,
+                            ladders_on: bool) -> None:
+    """
+    Write each pair market's scheduled close on its record (or pop it), and log what that changes.
+
+    With the switch off (rules None) every record's key is popped and nothing
+    is logged. On, a market whose close the deferred same-title gate already
+    worked out keeps that answer (so the gate and every later reader agree);
+    every other one is worked out from its full details. Logs one INFO line
+    with how many pair markets use a scheduled close and how many keep the
+    realized one for want of a rule, then, each silent at zero, those whose
+    series has a rule that their own fingerprint does not match
+    (market_details.close_rule_applies: their latest-minus-expected
+    expiration gap is not one the rule saw), those whose series has a rule
+    that matches but gave no usable time, and the cross-event
+    time-series pairs whose order or deadline gap the scheduled closes change.
+
+    Args:
+        needed_tickers (dict): Ticker -> record, every pair market.
+        details (dict): Ticker -> full market_details record.
+        rules (dict | None): The learned rules; None with the switch off.
+        known (dict): Ticker -> scheduled close already worked out.
+        known_timing (dict): Ticker -> the timing_epochs those were worked out from.
+        ts_pairs (list): The time-series candidate pairs.
+        ladders_on (bool): The resolved same-event ladder switch (a ladder
+            keeps its stated deadlines, so it is not counted).
+    """
+    if rules is None:
+        for m in needed_tickers.values():
+            m.pop(_SCHEDULED_CLOSE_KEY, None)
+        return
+    used = no_rule = mismatched = 0
+    for ticker, m in needed_tickers.items():
+        if ticker in known:
+            timing = known_timing.get(ticker)
+            epoch = known[ticker]
+        else:
+            timing = market_details.timing_epochs(details.get(ticker))
+            epoch = _write_scheduled_close(m, timing, rules)
+        series = series_ticker(m.get("event_ticker") or "")
+        if epoch is not None:
+            used += 1
+        elif series not in rules:
+            no_rule += 1
+        # Cross-module: the one test of whether a series' rule fits this market
+        elif not market_details.close_rule_applies(timing, rules, series):
+            mismatched += 1
+    logging.info(
+        "Scheduled close: %d of %d pair markets use it, %d keep their realized close "
+        "(no rule for their series)", used, len(needed_tickers), no_rule)
+    if mismatched:
+        logging.info(
+            "Scheduled close: %d pair markets of a series with a rule keep their realized "
+            "close (their latest-minus-expected expiration gap is not one the rule was "
+            "learned on)", mismatched)
+    unusable = len(needed_tickers) - used - no_rule - mismatched
+    if unusable:
+        logging.info(
+            "Scheduled close: %d pair markets whose series' rule fits them keep their "
+            "realized close (no usable time, or the rule's answer falls before it)", unusable)
+    ordered = gapped = 0
+    for mA, mB, _, _ in ts_pairs:
+        event = mA.get("event_ticker") or ""
+        if ladders_on and event and event == (mB.get("event_ticker") or ""):
+            continue
+        if _SCHEDULED_CLOSE_KEY not in mA and _SCHEDULED_CLOSE_KEY not in mB:
+            continue
+        realized = (_parse_iso_datetime(mA.get("close_time")),
+                    _parse_iso_datetime(mB.get("close_time")))
+        maturity = (_maturity_close(mA), _maturity_close(mB))
+        try:
+            ordered += (realized[1] < realized[0]) != (maturity[1] < maturity[0])
+            gapped += (abs(realized[1] - realized[0]).days
+                       != abs(maturity[1] - maturity[0]).days)
+        except TypeError:
+            continue
+    if ordered or gapped:
+        logging.info(
+            "Scheduled close: cross-event time-series pairs it orders differently from "
+            "their realized closes: %d; whose deadline gap it changes: %d", ordered, gapped)
+
+
 def _prepare_candidates(
     hist_client: Any,
     live_client,
@@ -9052,6 +9398,7 @@ def _prepare_candidates(
     *,
     series_categories: dict | None = None,
     fee_multipliers: dict | None = None,
+    scheduled_close: bool | None = None,
 ) -> _Candidates | None:
     """
     Run the half of the backtest that depends on neither the band nor k.
@@ -9111,6 +9458,17 @@ def _prepare_candidates(
             default) reads the cached copy only, with no request. Stored on
             the result, and each pair market's is written on its record
             (_LISTED_FEE_KEY), where every backtest fee reads it.
+        scheduled_close (bool | None): Keyword-only. Whether to read each
+            pair market's scheduled close (_maturity_close). None (the
+            default) resolves THIS MODULE's BACKTEST_SCHEDULED_CLOSE at call
+            time, like same_event_ladders. On, the rules are learned from the
+            captures (market_details.load_close_rules); when any series has
+            one, the same-title close gate is applied after the scheduled
+            closes of the candidates' markets are read
+            (_extract_pairs(defer_close_gate=True), then
+            _close_gate_and_labels), and every pair market whose series' rule
+            gives a close carries it on its record (_SCHEDULED_CLOSE_KEY). Off,
+            nothing is read and every record's key is popped.
 
     Returns:
         _Candidates | None: The candidate pairs (in scan order: time-series,
@@ -9340,9 +9698,40 @@ def _prepare_candidates(
     # that holds only while the name is not rebound between the halves. The
     # same-title call takes it too, for signature uniformity — 3-tuple-keyed
     # groups have no deadline concept and the flag is inert there.
+    # The scheduled-close switch, resolved at call time (None reads this
+    # module's binding of the constant, like the ladder flag). On, the rules
+    # each series' scheduled close is worked out by (cross-module: read from
+    # the captures, cached; observations with no record looked up)
+    scheduled_on = bool(BACKTEST_SCHEDULED_CLOSE if scheduled_close is None
+                        else scheduled_close)
+    close_rules = market_details.load_close_rules(hist_client) if scheduled_on else {}
+    # With a rule for some series, the same-title close gate waits for the
+    # candidates' scheduled closes (read below); with none it runs inside
+    # _extract_pairs, on the realized closes, through the very call made with
+    # the switch off (the keyword is handed only when the gate waits)
+    defer_gate = bool(close_rules)
     ts_pairs     = _extract_pairs(ts_groups, same_event_ladders=same_event_ladders)
     same_pairs   = _extract_pairs(same_groups, same_event_ladders=same_event_ladders,
-                                  series_categories=series_categories)
+                                  series_categories=series_categories,
+                                  **({"defer_close_gate": True} if defer_gate else {}))
+    # Each pair market's scheduled close (Unix seconds, or None to keep the
+    # realized close), by ticker
+    scheduled_by_ticker: dict[str, int | None] = {}
+    st_timing: dict = {}
+    if defer_gate:
+        # Cross-module: the timing of the same-title candidates' markets
+        # (full records, so the later full load reads them from the cache)
+        st_tickers = list(dict.fromkeys(m["ticker"] for pair in same_pairs for m in pair[:2]))
+        st_timing = market_details.load_market_details(
+            hist_client, st_tickers, full=frozenset(st_tickers),
+            project=market_details.timing_epochs)
+        for pair in same_pairs:
+            for m in pair[:2]:
+                scheduled_by_ticker[m["ticker"]] = _write_scheduled_close(
+                    m, st_timing.get(m["ticker"]), close_rules)
+        # The close gate on the closes a live run would have read, then the
+        # label check, each on its usual line
+        same_pairs = _close_gate_and_labels(same_pairs, series_categories)
     # The competition half of the check (DR-79). Cross-module: cached markets
     # carry no competition, so it is read from Kalshi for these pairs' events
     # only (one cached read-only GET per new event), then compared
@@ -9439,6 +9828,14 @@ def _prepare_candidates(
     _log_extra_data(full_stats, len(needed_tickers), trade_summaries, candle_failures)
     _log_rss("after the side-data loads")
 
+    # Each pair market's scheduled close on its record, or none (switch off,
+    # no rule, no usable time): what _maturity_close reads from here on
+    _apply_scheduled_closes(
+        needed_tickers, details, close_rules if scheduled_on else None,
+        scheduled_by_ticker, st_timing, ts_pairs,
+        TIME_SERIES_SAME_EVENT_LADDERS if same_event_ladders is None
+        else same_event_ladders)
+
     # Combine both pair types in scan order — time-series first, then
     # same-title — which is the order every entry pass walks and therefore the
     # order of _prepare_entries' output.
@@ -9460,6 +9857,8 @@ def _prepare_candidates(
         trade_summaries=trade_summaries,
         candle_failures=candle_failures,
         fee_multipliers=fee_multipliers,
+        scheduled_close=scheduled_on,
+        close_rules=close_rules,
     )
 
 
@@ -10092,6 +10491,7 @@ def _prepare_entries(
     depth_model: DepthModel | None = None,
     series_categories: dict | None = None,
     fee_multipliers: dict | None = None,
+    scheduled_close: bool | None = None,
 ) -> tuple[list[dict] | None, OutcomeLabelCoverage | None]:
     """
     Run the half of the backtest that does not depend on the interval discount.
@@ -10137,6 +10537,10 @@ def _prepare_entries(
         fee_multipliers (dict | None): Keyword-only. series ticker -> fee
             multiplier, handed straight to _prepare_candidates(); None
             (default) reads the cached copy there.
+        scheduled_close (bool | None): Keyword-only. Whether to read each
+            market's scheduled close where a live run reads its close, handed
+            straight to _prepare_candidates(); None (default) resolves
+            BACKTEST_SCHEDULED_CLOSE there, at call time.
 
     Returns:
         tuple[list[dict] | None, OutcomeLabelCoverage | None]: The prepared
@@ -10177,7 +10581,7 @@ def _prepare_entries(
     candidates = _prepare_candidates(
         hist_client, live_client, start_date, use_cache, max_horizon_days,
         same_event_ladders=same_event_ladders, series_categories=series_categories,
-        fee_multipliers=fee_multipliers,
+        fee_multipliers=fee_multipliers, scheduled_close=scheduled_close,
     )
     if candidates is None:
         return None, None
@@ -10868,14 +11272,21 @@ def _simulate_at_discount(
         # close_time on both legs to derive its scan window, so neither guard
         # can fire in practice — but a bare [...] index plus an unguarded
         # fromisoformat would turn any future data drift into a mid-run crash.
-        close_a_d = _parse_iso_date(mA.get("close_time"))
-        close_b_d = _parse_iso_date(mB.get("close_time"))
+        # These are the closes a live run would have read (_maturity_close:
+        # the scheduled close where one is carried, else the realized one):
+        # they set the ranking's days to the later close and the trade's close
+        # dates, which the sell rule counts its days to maturity from.
+        close_a_d = _maturity_close(mA, as_date=True)
+        close_b_d = _maturity_close(mB, as_date=True)
         if close_a_d is None or close_b_d is None:
             logging.debug(
                 "Skipping candidate %s/%s: missing or unparseable close_time",
                 mA.get("ticker"), mB.get("ticker"),
             )
             continue
+
+        maturity_moved = (close_a_d != _parse_iso_date(mA.get("close_time"))
+                          or close_b_d != _parse_iso_date(mB.get("close_time")))
 
         # Use title > subtitle > ticker as the display label for each market
         title_a = mA.get("title") or mA.get("subtitle") or mA.get("ticker", "")
@@ -10903,9 +11314,10 @@ def _simulate_at_discount(
             holding_days = max(1, (exit_date - entry_date).days)
 
             # Ranking metric: the expected return at this Monday's prices per
-            # 30 days to the later close. A paid-out market's close time is
-            # when it actually closed, which can be earlier than scheduled, so
-            # this can use something not known on that Monday.
+            # 30 days to the later close. With no scheduled close carried, a
+            # paid-out market's close time is when it actually closed, which
+            # can be earlier than scheduled, so this can use something not
+            # known on that Monday.
             expected_days = max(1, (max(close_a_d, close_b_d) - entry_date).days)
             entry_monthly_ratio = profit_ratio_entry * 30.0 / expected_days
 
@@ -10936,6 +11348,9 @@ def _simulate_at_discount(
                 "title_b": title_b,
                 # Per-leg dates for the dashboard's trade tables (reporting only)
                 "close_date_a": close_a_d, "close_date_b": close_b_d,
+                # Whether either close date is the scheduled close rather than
+                # the realized one (counted per simulation, reporting only)
+                "maturity_moved": maturity_moved,
                 "settled_date_a": exit_date_a, "settled_date_b": exit_date_b,
                 # Carried straight from _find_entry (None for same_title) so the
                 # recorded trade reports the same gap the tier was chosen from
@@ -11121,6 +11536,9 @@ def _simulate_at_discount(
     # and walked candidates the cash left could not buy one contract pair of
     markets: dict[int, Any] = {}
     top_of_book = 0
+    # Trades whose close dates are the scheduled closes, not the realized ones
+    # (silent at zero: only a market carrying a scheduled close can count)
+    maturity_moved_trades = 0
     walk_refusals: Counter = Counter()
     cash_skips = 0
 
@@ -11620,6 +12038,8 @@ def _simulate_at_discount(
         trades.append(trade)
         if not walked:
             top_of_book += 1
+        if c.get("maturity_moved"):
+            maturity_moved_trades += 1
 
         # Cash out the door: contracts plus fees; the receipt comes back at exit
         cash -= invested
@@ -11797,6 +12217,13 @@ def _simulate_at_discount(
             logging.DEBUG if quiet else logging.INFO,
             "Trades sized at the top of the book (no depth data) (%s): %d",
             run_label, top_of_book,
+        )
+    if maturity_moved_trades:
+        logging.log(
+            logging.DEBUG if quiet else logging.INFO,
+            "Scheduled close: trades whose days to maturity count from the scheduled "
+            "close, not the realized one (%s): %d",
+            run_label, maturity_moved_trades,
         )
     for reason in sorted(walk_refusals):
         logging.log(
@@ -12188,6 +12615,7 @@ def run_backtest(
     *,
     series_categories: dict | None = None,
     fee_multipliers: dict | None = None,
+    scheduled_close: bool | None = None,
 ) -> tuple[list[BacktestTrade], pd.DataFrame]:
     """
     Replay both pair strategies on all settled Kalshi markets from start_date.
@@ -12247,6 +12675,10 @@ def run_backtest(
             multiplier, handed through _prepare_entries() to
             _prepare_candidates(); None (default) reads the cached copy
             there. Carried only; no fee reads it yet.
+        scheduled_close (bool | None): Keyword-only. Whether to read each
+            market's scheduled close where a live run reads its close, handed
+            straight to _prepare_candidates(); None (default) resolves
+            BACKTEST_SCHEDULED_CLOSE there, at call time.
 
     Returns:
         tuple[list[BacktestTrade], pd.DataFrame]: (trades, equity_df).
@@ -12299,6 +12731,7 @@ def run_backtest(
     raw_entries, _ = _prepare_entries(
         hist_client, live_client, start_date, use_cache, max_horizon_days,
         series_categories=series_categories, fee_multipliers=fee_multipliers,
+        scheduled_close=scheduled_close,
     )
     if raw_entries is None:
         # Same empty-result shape the zero-trade path produces, so backtest.py
@@ -13479,6 +13912,8 @@ def _sweep_from_candidates(
         # Where every trade's synthetic book came from, for the page's header
         depth_model=depth_model,
         trim_sweep=trimmed,
+        # Whether every market's close was read as a live run reads it
+        scheduled_close=candidates.scheduled_close,
     )
 
 
@@ -13504,6 +13939,7 @@ def run_backtest_sweep(
     trim_rise_sweep: bool = False,
     series_categories: dict | None = None,
     fee_multipliers: dict | None = None,
+    scheduled_close: bool | None = None,
 ) -> BacktestSweep:
     """
     Replay both pair strategies at one interval discount, or at a grid of them —
@@ -13704,6 +14140,10 @@ def run_backtest_sweep(
             straight to _prepare_candidates(); backtest.py passes the copy it
             read with the production client. None (default) reads the cached
             copy there. Carried only; no fee reads it yet.
+        scheduled_close (bool | None): Keyword-only. Whether to read each
+            market's scheduled close where a live run reads its close, handed
+            straight to _prepare_candidates(); None (default) resolves
+            BACKTEST_SCHEDULED_CLOSE there, at call time.
 
     Returns:
         BacktestSweep: primary (the effective-discount, primary-band result),
@@ -13911,6 +14351,21 @@ def run_backtest_sweep(
         logging.info("Depth model: %d snapshot(s), %d ladders, taken %s to %s",
                      depth_model.snapshots, depth_model.ladders,
                      depth_model.first_taken or "unknown", depth_model.last_taken or "unknown")
+    # And whether each market's close is read as a live run reads it (the
+    # scheduled close, by a rule learned per series) or as it actually was.
+    # Resolved for the log and the infeasible return; _prepare_candidates
+    # takes the sentinel and resolves it itself, as it does the ladder flag
+    scheduled_on = bool(BACKTEST_SCHEDULED_CLOSE if scheduled_close is None
+                        else scheduled_close)
+    logging.info(
+        "Scheduled close (backtest): %s (%s)",
+        "on — a market's days to maturity, a cross-event pair's order and gap, the "
+        "horizon and the same-title close gate read its scheduled close where its "
+        "series has a rule" if scheduled_on else
+        "off — every market's close is its realized close",
+        "config.BACKTEST_SCHEDULED_CLOSE" if scheduled_close is None
+        else "run-level override",
+    )
     # The saved live defaults (never main.py's per-run overrides), read ONCE
     # before the fetch, so a refused file warns at the top of the run
     live = _live_settings_for_report()
@@ -13923,7 +14378,7 @@ def run_backtest_sweep(
     candidates = _prepare_candidates(
         hist_client, live_client, start_date, use_cache, max_horizon_days,
         same_event_ladders=same_event_ladders, series_categories=series_categories,
-        fee_multipliers=fee_multipliers,
+        fee_multipliers=fee_multipliers, scheduled_close=scheduled_close,
     )
     if candidates is None:
         # Nothing can be simulated at any discount or band. Build the empty
@@ -13950,6 +14405,7 @@ def run_backtest_sweep(
                                # For the dashboard header (config.ScheduledRun.label)
                                entry_checkpoint=SCHEDULED_RUN.label(),
                                depth_model=depth_model,
+                               scheduled_close=scheduled_on,
                                **_live_rule_fields(live))
     else:
         # Every entry pass and simulation. It deletes the candles and pair list

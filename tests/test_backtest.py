@@ -307,6 +307,43 @@ class TestNoSweepArgument:
         assert kwargs["use_cache"] is True
 
 
+class TestScheduledCloseArgument:
+    """--scheduled-close / --no-scheduled-close (C5): the backtest reads each
+    market's scheduled close, or its realized close, for this run."""
+
+    def test_default_is_no_override(self, cli, monkeypatch):
+        # None is resolved by _prepare_candidates at call time
+        _run(monkeypatch)
+        assert cli["sweep_kwargs"]["scheduled_close"] is None
+
+    @pytest.mark.parametrize("flag, value", [("--scheduled-close", True),
+                                             ("--no-scheduled-close", False)])
+    def test_the_flags_reach_the_sweep(self, cli, monkeypatch, flag, value):
+        _run(monkeypatch, flag)
+        assert cli["sweep_kwargs"]["scheduled_close"] is value
+
+    @pytest.mark.parametrize("flag, configured, echo", [
+        (None, True, "scheduled close=on | k="),
+        (None, False, "scheduled close=off | k="),
+        ("--no-scheduled-close", True, "scheduled close=off (config: on) | k="),
+        ("--scheduled-close", False, "scheduled close=on (config: off) | k="),
+    ])
+    def test_the_config_echo_names_it(self, cli, monkeypatch, caplog, flag, configured, echo):
+        monkeypatch.setattr(backtest, "BACKTEST_SCHEDULED_CLOSE", configured)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, *([flag] if flag else []))
+        assert f"| cache=on | {echo}" in caplog.text
+
+    @pytest.mark.parametrize("configured, word", [(True, "on"), (False, "off")])
+    def test_the_help_text_names_the_configured_value(self, cli, monkeypatch, capsys,
+                                                       configured, word):
+        monkeypatch.setattr(backtest, "BACKTEST_SCHEDULED_CLOSE", configured)
+        with pytest.raises(SystemExit):
+            _run(monkeypatch, "--help")
+        help_text = " ".join(capsys.readouterr().out.split())
+        assert f"config.BACKTEST_SCHEDULED_CLOSE, currently {word})" in help_text
+
+
 class TestSameEventLaddersArgument:
     """--same-event-ladders / --no-same-event-ladders (DR-73c)."""
 
