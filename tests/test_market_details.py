@@ -132,6 +132,8 @@ class FakeExchange:
         markets (dict): ticker -> payload served by /markets.
         archived (dict): ticker -> payload served by /historical/markets.
         trades (dict): ticker -> trade payloads (any order) served by both trades endpoints.
+        endpoint_trades (dict): endpoint suffix -> {ticker: trade payloads} for an endpoint
+            that serves its own trades instead of the shared ones.
         trade_status (dict): endpoint suffix ("historical/trades", "markets/trades") ->
             an HTTP status to fail with instead of serving.
         broken (dict): path suffix -> exception to raise.
@@ -144,6 +146,7 @@ class FakeExchange:
         self.archived = {}
         self.trades = {}
         self.trade_status = {}
+        self.endpoint_trades = {}
         self.broken = {}
         self.open_pages = []
         self.cutoff = {"trades_created_ts": "2026-08-17T00:00:00Z"}
@@ -173,7 +176,8 @@ class FakeExchange:
             if path.endswith(suffix):
                 if suffix in self.trade_status:
                     raise _HttpError(self.trade_status[suffix])
-                everything = sorted(self.trades.get(params["ticker"], []),
+                source = self.endpoint_trades.get(suffix, self.trades)
+                everything = sorted(source.get(params["ticker"], []),
                                     key=lambda t: t["created_time"], reverse=True)
                 start = int(params.get("cursor") or 0)
                 limit = params["limit"]
@@ -632,6 +636,153 @@ class TestLoadMarketTrades:
                                           volume_fp="5.00", stats_out=again)
         assert again["duplicates"] == 1
 
+    # A market that opened before the trades cutoff and settled after it: its
+    # trades 0-3 (1 + 2 + 3 + 4 = 10 contracts) are in the archive, trades 4-6
+    # (5 + 6 + 7 = 18) in the live listing; the listings share trade 3 and 4.
+    def _span(self, exchange, ticker="M", shared=True):
+        every = [_trade_payload(ticker, f"id{i}", 1_786_000_000 + i * 60, i + 1)
+                 for i in range(7)]
+        exchange.endpoint_trades = {
+            "historical/trades": {ticker: every[:5 if shared else 4]},
+            "markets/trades": {ticker: every[3:] if shared else every[4:]}}
+        return every
+
+    @pytest.mark.parametrize("before", [True, False])
+    def test_a_market_spanning_the_cutoff_merges_both_endpoints(self, exchange, before):
+        self._span(exchange)
+        stats = {}
+        trades, duplicates = market_details.load_market_trades(
+            MagicMock(), "M", settled_before_trades_cutoff=before, volume_fp=self.VOLUME,
+            spans_trades_cutoff=True, stats_out=stats)
+        assert [t[2] for t in trades] == [1, 2, 3, 4, 5, 6, 7]
+        assert [t[0] for t in trades] == sorted(t[0] for t in trades)
+        # Two ids listed by both endpoints are not a fault of either listing
+        assert duplicates == 0
+        assert stats["duplicates"] == 0
+        assert stats["endpoints"] == 2
+        assert stats["cached"] is True
+        assert len(exchange.paths("historical/trades")) == 1
+        assert len(exchange.paths("markets/trades")) == 1
+
+    def test_a_repeat_inside_one_endpoint_is_still_counted_when_merging(self, exchange):
+        every = self._span(exchange, shared=False)
+        exchange.endpoint_trades["markets/trades"]["M"].append(every[5])
+        stats = {}
+        trades, duplicates = market_details.load_market_trades(
+            MagicMock(), "M", settled_before_trades_cutoff=True, volume_fp=self.VOLUME,
+            spans_trades_cutoff=True, stats_out=stats)
+        assert [t[2] for t in trades] == [1, 2, 3, 4, 5, 6, 7]
+        assert duplicates == 1
+
+    def test_a_shared_unsound_trade_is_counted_once(self, exchange):
+        every = self._span(exchange)
+        for payload in every:
+            if payload["trade_id"] == "id3":
+                payload["no_price_dollars"] = "0.4000"
+        stats = {}
+        market_details.load_market_trades(
+            MagicMock(), "M", settled_before_trades_cutoff=True, volume_fp=self.VOLUME,
+            spans_trades_cutoff=True, stats_out=stats)
+        assert stats["price_failures"] == 1
+        assert len(stats["unsound_ms"]) == 1
+
+    def test_the_merge_is_cached_and_read_back_without_a_request(self, exchange):
+        self._span(exchange)
+        first, _ = market_details.load_market_trades(
+            MagicMock(), "M", settled_before_trades_cutoff=True, volume_fp=self.VOLUME,
+            spans_trades_cutoff=True)
+        exchange.requests.clear()
+        second, _ = market_details.load_market_trades(
+            MagicMock(), "M", settled_before_trades_cutoff=True, volume_fp=self.VOLUME)
+        assert exchange.requests == []
+        assert second == first
+
+    @pytest.mark.parametrize("spans", [False, None])
+    @pytest.mark.parametrize(("before", "asked", "not_asked"), [
+        (True, "historical/trades", "markets/trades"),
+        (False, "markets/trades", "historical/trades")])
+    def test_a_market_wholly_on_one_side_reads_one_endpoint(
+            self, exchange, spans, before, asked, not_asked):
+        self._serve(exchange)
+        market_details.load_market_trades(
+            MagicMock(), "M", settled_before_trades_cutoff=before, volume_fp=self.VOLUME,
+            spans_trades_cutoff=spans)
+        assert exchange.paths(asked) and not exchange.paths(not_asked)
+
+    def test_an_unknown_span_walks_the_other_endpoint_only_when_the_volume_is_short(
+            self, exchange):
+        self._span(exchange, shared=False)
+        stats = {}
+        trades, _ = market_details.load_market_trades(
+            MagicMock(), "M", settled_before_trades_cutoff=True, volume_fp=self.VOLUME,
+            stats_out=stats)
+        assert sum(t[2] for t in trades) == 28
+        assert stats["endpoints"] == 2
+        assert stats["cached"] is True
+
+    def test_an_unknown_span_with_no_volume_reads_one_endpoint(self, exchange):
+        self._span(exchange, shared=False)
+        trades, _ = market_details.load_market_trades(
+            MagicMock(), "M", settled_before_trades_cutoff=True)
+        assert len(trades) == 4
+        assert not exchange.paths("markets/trades")
+
+    def test_an_unknown_span_that_cannot_reach_the_other_endpoint_keeps_the_first_walk(
+            self, exchange):
+        self._span(exchange, shared=False)
+        exchange.trade_status["markets/trades"] = 500
+        stats = {}
+        trades, _ = market_details.load_market_trades(
+            MagicMock(), "M", settled_before_trades_cutoff=True, volume_fp=self.VOLUME,
+            stats_out=stats)
+        assert len(trades) == 4
+        assert stats["cached"] is False
+        assert not market_details._TRADES_DIR.exists()
+
+    def test_a_second_walk_cut_short_caches_nothing(self, exchange):
+        self._span(exchange, shared=False)
+        exchange.trade_status["markets/trades"] = 500
+        stats = {}
+        assert market_details.load_market_trades(
+            MagicMock(), "M", settled_before_trades_cutoff=True, volume_fp=self.VOLUME,
+            spans_trades_cutoff=True, stats_out=stats) is None
+        assert stats["failure"]
+        assert not market_details._TRADES_DIR.exists()
+
+    def test_a_second_walk_with_a_repeated_cursor_caches_nothing(self, exchange, monkeypatch):
+        self._span(exchange, shared=False)
+        real = exchange.__call__
+
+        def loops_on_live(client, path, **params):
+            if path.endswith("markets/trades"):
+                return {"trades": [_trade_payload("M", "x", 1_786_000_999, 1)], "cursor": "same"}
+            return real(client, path, **params)
+
+        monkeypatch.setattr(market_details, "_get", loops_on_live)
+        stats = {}
+        assert market_details.load_market_trades(
+            MagicMock(), "M", settled_before_trades_cutoff=True, volume_fp=self.VOLUME,
+            spans_trades_cutoff=True, stats_out=stats) is None
+        assert stats["failure"] == "a cursor repeated"
+        assert not market_details._TRADES_DIR.exists()
+
+    def test_a_404_from_the_second_endpoint_of_a_spanning_market_is_an_empty_listing(
+            self, exchange):
+        self._serve(exchange)
+        exchange.trade_status["markets/trades"] = 404
+        trades, _ = market_details.load_market_trades(
+            MagicMock(), "M", settled_before_trades_cutoff=True, volume_fp=self.VOLUME,
+            spans_trades_cutoff=True)
+        assert len(trades) == 7
+
+    def test_a_merge_that_still_falls_short_is_returned_but_not_cached(self, exchange):
+        self._span(exchange, shared=False)
+        trades, _ = market_details.load_market_trades(
+            MagicMock(), "M", settled_before_trades_cutoff=True, volume_fp="40.00",
+            spans_trades_cutoff=True)
+        assert len(trades) == 7
+        assert not market_details._TRADES_DIR.exists()
+
     def test_unsound_prices_are_counted(self, exchange):
         exchange.trades["M"] = [
             _trade_payload("M", "a", 1_786_000_000, 1, yes="0.4000", no="0.5000"),
@@ -903,12 +1054,32 @@ class TestCheckCandles:
         {"yes_bid_ohl": (0.40, 0.45, 0.35), "yes_bid_close": 0.50},   # bid close above the high
         {"price": (0.45, 0.55, 0.60, 0.50, 0.48, None)},   # traded low above traded high
         {"price": (0.45, 0.55, 0.40, 0.80, 0.48, None)},   # traded close outside the range
-        {"yes_bid_close": 0.55, "yes_bid_ohl": (0.55, 0.60, 0.50)},   # bid above the ask close
     ])
     def test_each_out_of_order_candle_fails(self, over):
         failed = market_details.check_candles([self._candle(**over)], ticker="T")
         assert failed
         assert all(s.startswith("candle_range: T") for s in failed)
+
+    def test_a_crossed_close_is_a_data_anomaly_not_a_failure(self):
+        crossed = self._candle(yes_bid_close=0.55, yes_bid_ohl=(0.55, 0.60, 0.50))
+        found = market_details.check_candles([crossed], ticker="T")
+        assert len(found) == 1
+        assert found[0].startswith("candle_crossed: T hour ending 1000: YES bid close 0.55 ")
+        assert found[0].endswith("(Kalshi's data, not counted as a failure)")
+        assert market_details.is_anomaly(found[0])
+        assert market_details.split_candle_findings(found) == ([], found)
+
+    def test_the_findings_split_into_failures_and_anomalies(self):
+        both = self._candle(yes_bid_close=0.55, yes_bid_ohl=(0.55, 0.60, 0.50),
+                            yes_ask_ohl=(0.60, 0.70, 0.65))
+        found = market_details.check_candles([both], ticker="T")
+        failures, anomalies = market_details.split_candle_findings(found)
+        assert {f.split(":")[0] for f in failures} == {"candle_range"}
+        assert [a.split(":")[0] for a in anomalies] == ["candle_crossed"]
+        assert not market_details.is_anomaly(failures[0])
+        # The failure checks' names are unchanged; the anomaly is not among them
+        assert "candle_crossed" not in market_details.CHECK_NAMES
+        assert market_details.ANOMALY_NAMES == ("candle_crossed",)
 
     def test_a_candle_without_the_fields_is_not_checked(self):
         bare = {"ts": 1, "yes_ask_close": 0.5, "no_ask_close": 0.5, "volume": 2.0}
@@ -1292,9 +1463,39 @@ class TestCommands:
         assert "1 trades file(s)" in out
         assert "1 candle file(s)" in out
 
-    def test_check_passes_when_there_is_no_cache(self, capsys):
+    def test_check_passes_when_there_is_no_cache(self, tmp_path, monkeypatch, capsys):
+        # Every cache the check reads is pointed at an empty folder, never the real one
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
+        monkeypatch.setattr(market_details, "_DETAILS_CACHE", tmp_path / "details.jsonl.gz")
+        monkeypatch.setattr(market_details, "_TRADES_DIR", tmp_path / "trades")
         assert market_details.main(["check"]) == 0
         assert "nothing" in capsys.readouterr().out
+
+    def test_a_crossed_close_is_named_but_does_not_fail_the_check(self, caches, capsys):
+        path = historical._CANDLES_DIR / f"{MLB}.json.gz"
+        data = _read_gz(path)
+        ask = data["candles"][5]["yes_ask_close"]
+        data["candles"][5]["yes_bid_close"] = ask + 0.01
+        data["candles"][5]["yes_bid_ohl"] = [ask + 0.01] * 3
+        historical._save_gz_json_cache(path, data)
+        assert market_details.main(["check"]) == 0
+        out = capsys.readouterr().out
+        assert "NOTE candle_crossed: 1 found (Kalshi's data, not counted as a failure)" in out
+        assert "All checks pass." in out
+        assert "FAIL" not in out
+
+    def test_a_crossed_close_does_not_hide_a_real_failure(self, caches, capsys):
+        path = historical._CANDLES_DIR / f"{MLB}.json.gz"
+        data = _read_gz(path)
+        ask = data["candles"][5]["yes_ask_close"]
+        data["candles"][5]["yes_bid_close"] = ask + 0.01
+        data["candles"][5]["yes_bid_ohl"] = [ask + 0.01] * 3
+        data["candles"][6]["yes_ask_ohl"] = [0.6, 0.7, 0.9]
+        historical._save_gz_json_cache(path, data)
+        assert market_details.main(["check"]) == 1
+        out = capsys.readouterr().out
+        assert "FAIL candle_range" in out
+        assert "NOTE candle_crossed" in out
 
     def test_check_fails_on_a_details_record_of_the_wrong_type(self, caches, capsys):
         data = _cached_details()

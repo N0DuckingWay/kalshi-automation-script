@@ -148,11 +148,18 @@ CHECK_CANDLE_RANGE = "candle_range"        # low <= open, close <= high; bid <= 
 CHECK_SETTLEMENT = "settlement_value"      # settlement_value_dollars agrees with result
 CHECK_TIMING = "timing_order"              # open_time <= close_time <= latest_expiration_time
 CHECK_UNREADABLE = "unreadable_record"     # a record so malformed a check could not run
+# A data anomaly is a finding about Kalshi's own data that no correct parse
+# could have changed (a crossed close: the YES bid above the YES ask). It is
+# counted and named beside the failures but is never itself a failure.
+CHECK_CANDLE_CROSSED = "candle_crossed"    # YES bid close above YES ask close
+ANOMALY_NOTE = "Kalshi's data, not counted as a failure"
 CHECK_NAMES = (
     CHECK_CANDLE_VOLUME, CHECK_TRADE_VOLUME, CHECK_HOUR_VOLUME, CHECK_TRADE_ID,
     CHECK_TRADE_PRICE, CHECK_CANDLE_RANGE, CHECK_SETTLEMENT, CHECK_TIMING,
     CHECK_UNREADABLE,
 )
+ANOMALY_NAMES = (CHECK_CANDLE_CROSSED,)  # not in CHECK_NAMES: the failure checks only
+
 
 
 class _WalkIncomplete(Exception):
@@ -621,7 +628,7 @@ def _parse_trade(raw: Any) -> tuple[tuple[int, float, float, str], str, bool] | 
     return (when, yes, count, side if isinstance(side, str) else ""), trade_id, sound
 
 
-def _walk_trades(client: Any, path: str, ticker: str) -> tuple[list[tuple], int, list[int]]:
+def _walk_trades(client: Any, path: str, ticker: str) -> tuple[list[tuple], int]:
     """
     Read every page of one market's trades from one endpoint.
 
@@ -634,9 +641,10 @@ def _walk_trades(client: Any, path: str, ticker: str) -> tuple[list[tuple], int,
         ticker (str): The market.
 
     Returns:
-        tuple[list[tuple], int, list[int]]: The trades oldest first, how many
-            repeated trade ids were dropped, and the times (ms) of the trades
-            whose prices were unsound.
+        tuple[list[tuple], int]: The trades as (trade, trade id, whether its
+            prices were sound) in the order the endpoint served them (newest
+            first), and how many repeated trade ids this endpoint repeated
+            (each repeat is dropped).
 
     Raises:
         _WalkIncomplete: A cursor repeated, the page cap was hit, a reply had
@@ -645,9 +653,8 @@ def _walk_trades(client: Any, path: str, ticker: str) -> tuple[list[tuple], int,
     """
     seen_ids: set[str] = set()
     seen_cursors: set[str] = set()
-    trades: list[tuple] = []
+    records: list[tuple] = []
     duplicates = 0
-    unsound: list[int] = []
     cursor: str | None = None
     for _ in range(config.SCANNER_MAX_PAGES):
         data = _get(client, path, ticker=ticker, limit=config.MARKET_DETAILS_PAGE_SIZE,
@@ -664,24 +671,50 @@ def _walk_trades(client: Any, path: str, ticker: str) -> tuple[list[tuple], int,
                 duplicates += 1
                 continue
             seen_ids.add(trade_id)
-            trades.append(trade)
-            if not sound:
-                unsound.append(trade[0])
+            records.append((trade, trade_id, sound))
         _pause()
         cursor = data.get("cursor") or None
         if cursor is None:
-            trades.reverse()
-            trades.sort(key=lambda t: t[0])
-            unsound.sort()
-            return trades, duplicates, unsound
+            return records, duplicates
         if cursor in seen_cursors:
             raise _WalkIncomplete("a cursor repeated")
         seen_cursors.add(cursor)
     raise _WalkIncomplete(f"more than {config.SCANNER_MAX_PAGES} pages")
 
 
+def _merge_walks(walks: Sequence[list[tuple]]) -> tuple[list[tuple], list[int]]:
+    """
+    Merge the walks of one market's endpoints into its trades, oldest first.
+
+    A trade id served by more than one endpoint is kept once, from the earlier
+    walk in the sequence (Kalshi may list a trade near the cutoff in both).
+
+    Args:
+        walks (Sequence[list[tuple]]): _walk_trades' records, one list per endpoint.
+
+    Returns:
+        tuple[list[tuple], list[int]]: The trades oldest first, and the times (ms)
+            of those whose prices were unsound, oldest first.
+    """
+    seen: set[str] = set()
+    trades: list[tuple] = []
+    unsound: list[int] = []
+    for records in walks:
+        for trade, trade_id, sound in records:
+            if trade_id in seen:
+                continue
+            seen.add(trade_id)
+            trades.append(trade)
+            if not sound:
+                unsound.append(trade[0])
+    trades.reverse()
+    trades.sort(key=lambda t: t[0])
+    unsound.sort()
+    return trades, unsound
+
+
 def load_market_trades(client: Any, ticker: str, *, settled_before_trades_cutoff: bool,
-                       volume_fp: Any = None,
+                       volume_fp: Any = None, spans_trades_cutoff: bool | None = None,
                        stats_out: dict | None = None) -> tuple[list[tuple], int] | None:
     """
     Every trade of one market, as (time in ms, YES price, contracts, taker side).
@@ -689,17 +722,33 @@ def load_market_trades(client: Any, ticker: str, *, settled_before_trades_cutoff
     Oldest first. A cached walk is returned as it was saved. Otherwise the
     trades are paged from /historical/trades (a market settled before Kalshi's
     trades cutoff) or /markets/trades (after it), the other endpoint when the
-    first answers 404. A repeated trade_id is dropped and counted. A walk that
-    reached its end is returned; it is cached under
-    backtest_cache/trades/<ticker>.json.gz only when, as well, the trades add
-    up to the market's volume_fp within INTEGRITY_VOLUME_TOLERANCE (with no
-    readable volume_fp nothing is cached), so a cache file is always a
-    consistent one and an off-volume market is read again next run (the
-    integrity check still reports it). A cut-short walk (a failed request, a
-    repeated cursor, the page cap, a reply or trade that cannot be read)
-    returns None and caches nothing; the reason goes to stats_out and a DEBUG
-    line, never a WARNING (the caller counts them). With client None only the
-    cache is read.
+    first answers 404. Kalshi moves the trades CREATED before the cutoff to the
+    archive, so a market that opened before the cutoff and settled after it has
+    its earlier trades only in /historical/trades and its later ones only in
+    /markets/trades; such a market needs both endpoints, merged, each trade id
+    kept once (a trade both endpoints list is kept from the first one walked).
+    spans_trades_cutoff says which case this is: True walks both endpoints,
+    False walks one, and None (the default, for a caller that does not know)
+    walks the first and, only when its trades fall short of volume_fp by more
+    than INTEGRITY_VOLUME_TOLERANCE, the other as well (a failure of that extra
+    walk keeps the first walk's trades, uncached, as a market read from one
+    endpoint always was). With spans_trades_cutoff True a 404 from one
+    endpoint means it holds nothing for the market, a failure of either walk
+    otherwise returns None.
+
+    The repeated-id count is a repeat within ONE endpoint's own listing (each
+    repeat is dropped and counted); an id the two endpoints share is expected
+    near the cutoff, is dropped silently and is not counted, so the count
+    stays a sign of a listing fault. The merged trades are returned; they are
+    cached under backtest_cache/trades/<ticker>.json.gz only when every walk
+    reached its end and, as well, they add up to the market's volume_fp within
+    INTEGRITY_VOLUME_TOLERANCE (with no readable volume_fp nothing is cached),
+    so a cache file is always a consistent one and an off-volume market is read
+    again next run (the integrity check still reports it). A cut-short walk (a
+    failed request, a repeated cursor, the page cap, a reply or trade that
+    cannot be read) returns None and caches nothing; the reason goes to
+    stats_out and a DEBUG line, never a WARNING (the caller counts them). With
+    client None only the cache is read.
 
     Args:
         client (Any): An authenticated KalshiClient, or None to read the cache only.
@@ -707,12 +756,15 @@ def load_market_trades(client: Any, ticker: str, *, settled_before_trades_cutoff
         settled_before_trades_cutoff (bool): Ask the archive endpoint first.
         volume_fp (Any): The market's volume_fp (a string as Kalshi sends it, or
             a number), from its full record; None when not known.
+        spans_trades_cutoff (bool | None): Whether the market opened before the
+            trades cutoff and settled at or after it (see above); None when not known.
         stats_out (dict | None): When given, filled with "duplicates",
             "price_failures" (trades whose YES and NO prices are not both in
             (0, 1) or do not sum to 1), "unsound_ms" (their times), "from_cache",
             "cached" (a file now holds this walk), "bytes" (the cache file's
-            size) and, when the walk did not reach its end, "failure" (one line
-            of text saying why).
+            size), "endpoints" (how many endpoints were walked to their end) and,
+            when the walk did not reach its end, "failure" (one line of text
+            saying why).
 
     Returns:
         tuple[list[tuple], int] | None: (trades, repeated ids dropped), or None
@@ -742,42 +794,103 @@ def load_market_trades(client: Any, ticker: str, *, settled_before_trades_cutoff
     prefix = historical._API_PREFIX
     archive = f"{prefix}/historical/trades"
     live = f"{prefix}/markets/trades"
-    endpoints = [archive, live] if settled_before_trades_cutoff else [live, archive]
-    for attempt, endpoint in enumerate(endpoints):
+    first, other = (archive, live) if settled_before_trades_cutoff else (live, archive)
+    total = _number(volume_fp)
+    tol = config.INTEGRITY_VOLUME_TOLERANCE
+
+    walks: list[list[tuple]] = []
+    duplicates = 0
+    try:
         try:
-            trades, duplicates, unsound = _walk_trades(client, endpoint, ticker)
-        except _WalkIncomplete as exc:
-            fail(str(exc))
-            return None
+            records, repeated = _walk_trades(client, first, ticker)
+            walks.append(records)
+            duplicates += repeated
+            asked_other = False
+        except _WalkIncomplete:
+            raise
         except Exception as exc:
-            if _status_of(exc) == 404 and attempt + 1 < len(endpoints):
-                _pause()
-                continue
-            fail(api_error_summary(exc))
-            return None
-        size = 0
-        total = _number(volume_fp)
-        consistent = total is not None and abs(
-            math.fsum(t[2] for t in trades) - total) <= config.INTEGRITY_VOLUME_TOLERANCE
-        if path is not None and consistent:
-            try:
-                historical._save_gz_json_cache(path, {
-                    "format": _TRADES_FORMAT, "ticker": ticker, "duplicates": duplicates,
-                    "price_failures": len(unsound), "unsound_ms": unsound,
-                    "trades": [list(t) for t in trades]})
-                size = path.stat().st_size
-            except OSError as exc:
-                logging.warning("Trades for %s not cached: %s", ticker, api_error_summary(exc))
-        if stats_out is not None:
-            stats_out.update(duplicates=duplicates, price_failures=len(unsound),
-                             unsound_ms=unsound, from_cache=False, cached=size > 0, bytes=size)
-        return trades, duplicates
-    return None
+            if _status_of(exc) != 404:
+                raise
+            # The first endpoint knows nothing of the market: the other holds all of it
+            _pause()
+            records, repeated = _walk_trades(client, other, ticker)
+            walks.append(records)
+            duplicates += repeated
+            asked_other = True
+        if not asked_other:
+            if spans_trades_cutoff is True:
+                try:
+                    records, repeated = _walk_trades(client, other, ticker)
+                except _WalkIncomplete:
+                    raise
+                except Exception as exc:
+                    # A 404 here means this endpoint holds none of the market's trades
+                    if _status_of(exc) != 404:
+                        raise
+                    _pause()
+                else:
+                    walks.append(records)
+                    duplicates += repeated
+            elif spans_trades_cutoff is None and total is not None:
+                so_far = math.fsum(r[0][2] for r in walks[0])
+                if total - so_far > tol:
+                    try:
+                        records, repeated = _walk_trades(client, other, ticker)
+                    except Exception as exc:  # the first walk stands, as it always did
+                        logging.debug("Trades for %s: the other endpoint was not read: %s",
+                                      ticker, api_error_summary(exc))
+                    else:
+                        walks.append(records)
+                        duplicates += repeated
+    except _WalkIncomplete as exc:
+        fail(str(exc))
+        return None
+    except Exception as exc:
+        fail(api_error_summary(exc))
+        return None
+
+    trades, unsound = _merge_walks(walks)
+    size = 0
+    consistent = total is not None and abs(
+        math.fsum(t[2] for t in trades) - total) <= tol
+    if path is not None and consistent:
+        try:
+            historical._save_gz_json_cache(path, {
+                "format": _TRADES_FORMAT, "ticker": ticker, "duplicates": duplicates,
+                "price_failures": len(unsound), "unsound_ms": unsound,
+                "trades": [list(t) for t in trades]})
+            size = path.stat().st_size
+        except OSError as exc:
+            logging.warning("Trades for %s not cached: %s", ticker, api_error_summary(exc))
+    if stats_out is not None:
+        stats_out.update(duplicates=duplicates, price_failures=len(unsound),
+                         unsound_ms=unsound, from_cache=False, cached=size > 0, bytes=size,
+                         endpoints=len(walks))
+    return trades, duplicates
 
 
 def failing_check(sentence: str) -> str:
     """The name of the check a failure sentence belongs to (the text before its first colon)."""
     return sentence.split(":", 1)[0]
+
+
+def is_anomaly(sentence: str) -> bool:
+    """Whether a finding sentence names a data anomaly (ANOMALY_NAMES) rather than a failure."""
+    return failing_check(sentence) in ANOMALY_NAMES
+
+
+def split_candle_findings(findings: Sequence[str]) -> tuple[list[str], list[str]]:
+    """
+    Split check_candles' sentences into integrity failures and data anomalies.
+
+    Args:
+        findings (Sequence[str]): check_candles' result.
+
+    Returns:
+        tuple[list[str], list[str]]: (failures, anomalies), each in the order given.
+    """
+    failures = [f for f in findings if not is_anomaly(f)]
+    return failures, [f for f in findings if is_anomaly(f)]
 
 
 def check_candles(candles: Sequence[Any], *, ticker: str = "") -> list[str]:
@@ -787,8 +900,12 @@ def check_candles(candles: Sequence[Any], *, ticker: str = "") -> list[str]:
     For each side of the book the candle carries (YES ask, YES bid), the low
     must not exceed the open or the close and the high must not fall below
     either; the traded-price block gets the same test over its open, close and
-    mean; and the YES bid at the close must not exceed the YES ask at the close.
-    A field a candle lacks is not checked. Never raises.
+    mean. Those are integrity failures: values that cannot come from a correct
+    parse. The YES bid at the close above the YES ask at the close is a crossed
+    quote in Kalshi's own data; it is reported as a data anomaly (check name
+    candle_crossed, with ANOMALY_NOTE at the end of the sentence), which
+    split_candle_findings separates from the failures. A field a candle lacks is
+    not checked. Never raises.
 
     Args:
         candles (Sequence[Any]): Full candle dicts from historical.fetch_candlesticks
@@ -797,8 +914,8 @@ def check_candles(candles: Sequence[Any], *, ticker: str = "") -> list[str]:
         ticker (str): Named in each sentence when given.
 
     Returns:
-        list[str]: One sentence per failure, each starting "candle_range: ";
-            [] when every candle holds.
+        list[str]: One sentence per finding, each starting "candle_range: "
+            (a failure) or "candle_crossed: " (an anomaly); [] when every candle holds.
     """
     out: list[str] = []
     where = f" {ticker}" if ticker else ""
@@ -840,8 +957,8 @@ def check_candles(candles: Sequence[Any], *, ticker: str = "") -> list[str]:
             bid = _number(candle.get("yes_bid_close"))
             ask = _number(candle.get("yes_ask_close"))
             if bid is not None and ask is not None and bid > ask + eps:
-                out.append(f"{CHECK_CANDLE_RANGE}:{where} hour ending {ts}: YES bid close "
-                           f"{bid} is above YES ask close {ask}")
+                out.append(f"{CHECK_CANDLE_CROSSED}:{where} hour ending {ts}: YES bid close "
+                           f"{bid} is above YES ask close {ask} ({ANOMALY_NOTE})")
         except Exception:
             continue
     return out
@@ -1002,7 +1119,8 @@ def check_market(details: dict | None, candles: Sequence[dict], trades: Sequence
 
 
 def audit_market(client: Any, ticker: str, details: dict | None, candles: Sequence[dict], *,
-                 settled_before_trades_cutoff: bool) -> dict:
+                 settled_before_trades_cutoff: bool,
+                 spans_trades_cutoff: bool | None = None) -> dict:
     """
     Load one market's trades, check it against its details and candles, and keep a summary.
 
@@ -1015,6 +1133,7 @@ def audit_market(client: Any, ticker: str, details: dict | None, candles: Sequen
         details (dict | None): Its record from load_market_details.
         candles (Sequence[dict]): Its hourly candles (ts and volume are read).
         settled_before_trades_cutoff (bool): load_market_trades' routing.
+        spans_trades_cutoff (bool | None): load_market_trades' spans_trades_cutoff.
 
     Returns:
         dict: "trades" (count), "contracts" (their total), "duplicates",
@@ -1027,6 +1146,7 @@ def audit_market(client: Any, ticker: str, details: dict | None, candles: Sequen
     loaded = load_market_trades(client, ticker,
                                 settled_before_trades_cutoff=settled_before_trades_cutoff,
                                 volume_fp=(details or {}).get("volume_fp"),
+                                spans_trades_cutoff=spans_trades_cutoff,
                                 stats_out=stats)
     trades = None if loaded is None else loaded[0]
     summary = {
@@ -1367,11 +1487,18 @@ def _read_gz_json(path: Path) -> Any:
 
 
 class _Audit:
-    """The failures one `check` run has found, by check name, with a few examples of each."""
+    """
+    The failures one `check` run has found, by check name, with a few examples of each.
+
+    Data anomalies (ANOMALY_NAMES) are kept apart in anomaly_counts and
+    anomaly_examples: they are reported but are not failures.
+    """
 
     def __init__(self) -> None:
         self.counts: dict[str, int] = {}
         self.examples: dict[str, list[str]] = {}
+        self.anomaly_counts: dict[str, int] = {}
+        self.anomaly_examples: dict[str, list[str]] = {}
         self.scanned: dict[str, int] = {}
 
     def scan(self, kind: str) -> None:
@@ -1379,9 +1506,13 @@ class _Audit:
         self.scanned[kind] = self.scanned.get(kind, 0) + 1
 
     def fail(self, name: str, sentence: str) -> None:
-        """Record one failure."""
-        self.counts[name] = self.counts.get(name, 0) + 1
-        kept = self.examples.setdefault(name, [])
+        """Record one failure (or, for a name in ANOMALY_NAMES, one data anomaly)."""
+        if name in ANOMALY_NAMES:
+            counts, examples = self.anomaly_counts, self.anomaly_examples
+        else:
+            counts, examples = self.counts, self.examples
+        counts[name] = counts.get(name, 0) + 1
+        kept = examples.setdefault(name, [])
         if len(kept) < config.INTEGRITY_MAX_EXAMPLES:
             kept.append(sentence)
 
@@ -1501,7 +1632,8 @@ def run_check(out: Any = None) -> int:
         out (Any): Where to print; stdout when None.
 
     Returns:
-        int: 1 when anything failed, else 0.
+        int: 1 when any integrity check failed, else 0. Data anomalies (a
+            crossed candle close) are printed as NOTE lines and do not count.
     """
     stream = out if out is not None else sys.stdout
     audit = _Audit()
@@ -1513,6 +1645,10 @@ def run_check(out: Any = None) -> int:
     for name, count in sorted(audit.counts.items()):
         print(f"FAIL {name}: {count} failing", file=stream)
         for sentence in audit.examples[name]:
+            print(f"    {sentence}", file=stream)
+    for name, count in sorted(audit.anomaly_counts.items()):
+        print(f"NOTE {name}: {count} found ({ANOMALY_NOTE})", file=stream)
+        for sentence in audit.anomaly_examples[name]:
             print(f"    {sentence}", file=stream)
     if not audit.counts:
         print("All checks pass.", file=stream)
