@@ -5035,8 +5035,87 @@ class TestProjectCandles:
         out = _fetch_candles_parallel(
             MagicMock(), {"M": {"ticker": "M", "close_time": "2026-02-01T00:00:00+00:00"}},
             date(2026, 1, 1), False)
-        assert out == {"M": _project_candles(series)}
-        assert [c["moved_ts"] for c in out["M"]] == [_MONDAY_TS, _MONDAY_TS + self.HOUR]
+        # The moved times are worked out from the request's window (start_date
+        # midnight UTC here, the market having no open_time): the first
+        # candle, quiet, has not moved; the second traded
+        window = int(datetime(2026, 1, 1, tzinfo=UTC).timestamp())
+        assert out == {"M": _project_candles(series, window_open=window)}
+        assert [c["moved_ts"] for c in out["M"]] == [-1, _MONDAY_TS + self.HOUR]
+
+
+class TestMovedTimesFromTheWindow:
+    """With the request's window open given, moved_ts does not depend on what
+    the candle cache held: a candle ending at or before the window open reads
+    -1, and the first candle after it counts as moved only when it traded,
+    its own range left its close on either side, or it is the market's
+    opening hour; every later candle is compared with the previous closes.
+    Every candle is kept."""
+
+    HOUR = 3600
+    WINDOW = 100 * 3600
+
+    def _moved(self, candles, market_open=None):
+        return [c["moved_ts"] for c in _project_candles(candles, window_open=self.WINDOW,
+                                                         market_open=market_open)]
+
+    def test_a_candle_at_or_before_the_window_open_reads_minus_one(self):
+        hours = [_full_candle(self.WINDOW - self.HOUR, volume=5.0),
+                 _full_candle(self.WINDOW, volume=5.0),
+                 _full_candle(self.WINDOW + self.HOUR, volume=5.0)]
+        out = _project_candles(hours, window_open=self.WINDOW)
+        # Kept, all three
+        assert [c["ts"] for c in out] == [c["ts"] for c in hours]
+        assert [c["moved_ts"] for c in out] == [-1, -1, self.WINDOW + self.HOUR]
+
+    def test_a_quiet_first_candle_has_not_moved_until_something_moves(self):
+        hours = [_full_candle(self.WINDOW + i * self.HOUR) for i in (1, 2, 3)]
+        hours.append(_full_candle(self.WINDOW + 4 * self.HOUR, ask=0.55))
+        assert self._moved(hours) == [-1, -1, -1, self.WINDOW + 4 * self.HOUR]
+
+    @pytest.mark.parametrize("candle", [
+        _full_candle(100 * 3600 + 3600, volume=1.0),
+        _full_candle(100 * 3600 + 3600, ask_ohl=(0.50, 0.53, 0.50)),
+        _full_candle(100 * 3600 + 3600, bid_ohl=(0.38, 0.40, 0.40)),
+    ])
+    def test_the_first_candle_moved_when_it_traded_or_its_range_left_its_close(self, candle):
+        assert self._moved([candle]) == [self.WINDOW + self.HOUR]
+
+    def test_the_first_candle_of_the_market_s_opening_hour_moved(self):
+        first = _full_candle(self.WINDOW + 3 * self.HOUR)
+        # Opened within the hour that candle covers: its opening hour
+        assert self._moved([first], market_open=self.WINDOW + 2 * self.HOUR + 1) == [
+            first["ts"]]
+        assert self._moved([first], market_open=self.WINDOW + 2 * self.HOUR) == [first["ts"]]
+        # Opened earlier than that: a quiet hour like any other
+        assert self._moved([first], market_open=self.WINDOW + 2 * self.HOUR - 1) == [-1]
+        assert self._moved([first]) == [-1]
+
+    def test_a_flat_market_reads_alike_from_a_fresh_fetch_and_from_a_wider_cached_file(
+            self, monkeypatch):
+        # The critic's case: start_date is a Monday, the market opened weeks
+        # earlier, its quote is flat and nothing trades. A fresh fetch starts
+        # at the window; a cached file from an earlier, longer run holds the
+        # weeks before it too. Same moved times over the window, same verdict
+        start = date(2026, 1, 5)
+        window = int(datetime(2026, 1, 5, tzinfo=UTC).timestamp())
+        before = [_full_candle(window - h * self.HOUR) for h in range(24 * 21, -1, -1)]
+        after = [_full_candle(window + h * self.HOUR) for h in range(1, 24 * 3)]
+        market = {"ticker": "M", "open_time": "2025-12-01T00:00:00Z",
+                  "close_time": "2026-02-01T00:00:00Z",
+                  "settlement_ts": "2026-02-01T12:00:00Z", "result": "yes"}
+        verdicts = []
+        for served in (after, before + after):
+            monkeypatch.setattr(backtester, "fetch_candlesticks",
+                                lambda *_a, _s=served, **_k: _s)
+            out = _fetch_candles_parallel(MagicMock(), {"M": market}, start, True)["M"]
+            in_window = [c["moved_ts"] for c in out if c["ts"] > window]
+            assert in_window == [-1] * len(after)
+            quotes, _ = backtester._leg_quotes(market, out, start, stale_max_age=_STALE_LIMIT)
+            verdicts.append(backtester._quote_is_fresh(quotes, start))
+        # Stale either way (it never moved inside the window), where the old
+        # first-candle rule read it fresh from the fresh fetch and stale from
+        # the cache
+        assert verdicts == [False, False]
 
 
 class TestFetchCandlesParallel:
@@ -5088,7 +5167,9 @@ class TestFetchCandlesParallel:
         assert peak > 1, f"candlestick fetches ran sequentially (peak {peak})"
         # Completion order is arbitrary, but the mapping must be what the old
         # sequential loop produced, each series cut to what the backtest keeps.
-        assert result == {t: _project_candles(c) for t, c in expected.items()}
+        window = int(datetime(2026, 1, 1, tzinfo=UTC).timestamp())
+        assert result == {t: _project_candles(c, window_open=window)
+                          for t, c in expected.items()}
 
     def test_window_bounds_match_sequential_formula(self, monkeypatch):
         # With no open_time (the shape of a cache record written before
@@ -20522,14 +20603,16 @@ class TestLegQuotesCarryTheBook:
         np.testing.assert_array_equal(again.volume_checkpoints, quotes.volume_checkpoints)
         assert again.book_at(_LADDER_M1, 0.60, 0.60) == quotes.book_at(_LADDER_M1, 0.60, 0.60)
         # Without the model, the checkpoint volume or the daily volume it is
-        # a different LegQuotes (the last three arguments are those, in that
-        # order: volume_checkpoints, volume_daily, depth)
+        # a different LegQuotes (the last five arguments are volume_checkpoints,
+        # volume_daily, depth, moved_checkpoints and stale_max_age, in that
+        # order; C6 appended the last two)
         cls, args = quotes.__reduce__()
-        assert cls(*args[:-1], None) != quotes
-        assert cls(*args[:-1], None).fingerprint != quotes.fingerprint
-        no_volume = cls(*args[:-3], None, args[-2], model)
+        head, (volumes, daily, _depth, moved, limit) = args[:-5], args[-5:]
+        assert cls(*head, volumes, daily, None, moved, limit) != quotes
+        assert cls(*head, volumes, daily, None, moved, limit).fingerprint != quotes.fingerprint
+        no_volume = cls(*head, None, daily, model, moved, limit)
         assert no_volume != quotes and no_volume.fingerprint != quotes.fingerprint
-        no_daily = cls(*args[:-3], args[-3], None, model)
+        no_daily = cls(*head, volumes, None, model, moved, limit)
         assert no_daily != quotes and no_daily.fingerprint != quotes.fingerprint
 
     @staticmethod
@@ -20562,7 +20645,9 @@ class TestLegQuotesCarryTheBook:
         # The daily volume goes into the comparison and the fingerprint
         cls, args = quotes.__reduce__()
         changed = list(args)
-        changed[-2] = np.where(np.arange(len(args[-2])) == index - 1, 6.0, args[-2])
+        # volume_daily is the fourth argument from the end (then depth,
+        # moved_checkpoints and stale_max_age)
+        changed[-4] = np.where(np.arange(len(args[-4])) == index - 1, 6.0, args[-4])
         other = cls(*changed)
         assert other != quotes and other.fingerprint != quotes.fingerprint
 
@@ -24527,3 +24612,639 @@ class TestApplyScheduledCloses:
         with caplog.at_level(logging.INFO):
             backtester._apply_scheduled_closes(needed, {}, None, {}, {}, [], True)
         assert needed["A1"] == {"ticker": "A1"} and caplog.messages == []
+
+
+# ─── The stale-quote check (C6): a quote must have moved within the limit ─────
+
+_STALE_LIMIT = 86_400
+_STALE_LINE = "Mondays skipped because a market's quote had not moved or traded for over 24 hours"
+
+
+def _moved(day: date, seconds_before: int, yes_ask: float, no_ask: float) -> dict:
+    """A candle ending `seconds_before` the checkpoint on `day` with contracts traded in its hour."""
+    return dict(_candle(_ck(day) - seconds_before, yes_ask, no_ask), volume=5.0)
+
+
+def _still(day: date, seconds_before: int, yes_ask: float, no_ask: float) -> dict:
+    """A candle ending `seconds_before` the checkpoint on `day`, nothing traded in its hour."""
+    return _candle(_ck(day) - seconds_before, yes_ask, no_ask)
+
+
+def _stale_attached(records: list[dict], candles: dict, limit=_STALE_LIMIT, model=None,
+                    start: date = date(2026, 1, 1)) -> list[dict]:
+    """The records given their quotes as a run gives them: each series cut to
+    the in-memory candles (_project_candles, which works out moved_ts) and the
+    run's stale-quote limit carried on every quote."""
+    projected = {t: backtester._project_candles(series) for t, series in candles.items()}
+    backtester._attach_leg_quotes(records, projected, start, model, stale_max_age=limit)
+    return records
+
+
+class TestQuoteIsFresh:
+    """_quote_is_fresh: the candle a checkpoint reads must exist, and its
+    market must have traded or moved either side's quote at most the limit
+    before the checkpoint; exactly the limit is still fresh."""
+
+    _START = date(2026, 1, 1)
+    _MARKET = {"ticker": "Q", "settlement_ts": "2026-03-20T12:00:00Z", "result": "yes"}
+
+    def _quotes(self, candles, limit=_STALE_LIMIT):
+        quotes, _ = backtester._leg_quotes(self._MARKET, backtester._project_candles(candles),
+                                           self._START, stale_max_age=limit)
+        return quotes
+
+    @pytest.mark.parametrize("age, fresh", [(_STALE_LIMIT, True), (_STALE_LIMIT + 1, False),
+                                            (_STALE_LIMIT - 1, True), (7_200, True)])
+    def test_the_limit_itself_is_fresh_and_one_second_more_is_not(self, age, fresh):
+        q = self._quotes([_moved(_LADDER_M1, age, 0.30, 0.70),
+                          _still(_LADDER_M1, 3_600, 0.30, 0.70)])
+        # The checkpoint reads the later candle, which carries the earlier move
+        assert int(q.moved_checkpoints[0]) == _ck(_LADDER_M1) - age
+        assert backtester._quote_is_fresh(q, _LADDER_M1) is fresh
+
+    def test_each_checkpoint_reads_its_own_latest_candle(self):
+        q = self._quotes([_moved(_LADDER_M1, 3_600, 0.30, 0.70),
+                          # A quote change with nothing traded is a move too
+                          _still(_LADDER_M2, 3_600, 0.35, 0.65),
+                          # Monday 3: the last move is Monday 2's, a week back
+                          _still(_LADDER_M3, 3_600, 0.35, 0.65)])
+        assert list(q.moved_checkpoints[:3]) == [_ck(_LADDER_M1) - 3_600,
+                                                  _ck(_LADDER_M2) - 3_600,
+                                                  _ck(_LADDER_M2) - 3_600]
+        assert backtester._quote_is_fresh(q, _LADDER_M1)
+        assert backtester._quote_is_fresh(q, _LADDER_M2)
+        assert not backtester._quote_is_fresh(q, _LADDER_M3)
+
+    def test_no_limit_checks_nothing_and_no_candle_or_no_moved_ts_is_stale(self):
+        candles = [_moved(_LADDER_M1, 3 * 86_400, 0.30, 0.70),
+                   _still(_LADDER_M1, 3_600, 0.30, 0.70)]
+        assert not backtester._quote_is_fresh(self._quotes(candles), _LADDER_M1)
+        # Off (and every hand-built quote): every checkpoint passes
+        off = self._quotes(candles, limit=None)
+        assert off.stale_max_age is None
+        assert backtester._quote_is_fresh(off, _LADDER_M1)
+        hand = backtester.LegQuotes("Z", date(2026, 1, 5), [0.3], [0.7], date(2026, 1, 5),
+                                    [0.3, 0.3], [0.7, 0.7], 1.0, 0.0)
+        assert list(hand.moved_checkpoints) == [-1, -1] and hand.stale_max_age is None
+        assert backtester._quote_is_fresh(hand, date(2026, 1, 12))
+        # Candles that carry no moved_ts (never projected) fail closed
+        raw, _ = backtester._leg_quotes(self._MARKET, candles, self._START,
+                                        stale_max_age=_STALE_LIMIT)
+        assert list(raw.moved_checkpoints[:1]) == [-1]
+        assert not backtester._quote_is_fresh(raw, _LADDER_M1)
+        # A day off the weekly grid, before it or past the samples: not fresh
+        q = self._quotes([_moved(_LADDER_M1, 3_600, 0.30, 0.70)])
+        for day in (_LADDER_M1 + timedelta(days=1), date(2025, 12, 29), date(2030, 1, 7)):
+            assert not backtester._quote_is_fresh(q, day)
+
+    def test_the_moved_times_and_the_limit_are_in_the_fingerprint_and_survive_pickling(self):
+        candles = [_moved(_LADDER_M1, 7_200, 0.30, 0.70), _still(_LADDER_M1, 3_600, 0.30, 0.70)]
+        q = self._quotes(candles)
+        again = pickle.loads(pickle.dumps(q))
+        assert again == q and again.fingerprint == q.fingerprint
+        np.testing.assert_array_equal(again.moved_checkpoints, q.moved_checkpoints)
+        assert again.stale_max_age == 86_400.0
+        # Another limit, or another moved time: another LegQuotes
+        for other in (self._quotes(candles, limit=3_600), self._quotes(candles, limit=None),
+                      self._quotes([_moved(_LADDER_M1, 7_201, 0.30, 0.70),
+                                    _still(_LADDER_M1, 3_600, 0.30, 0.70)])):
+            assert other != q and other.fingerprint != q.fingerprint
+        # 86_400 and 86_400.0 are one limit
+        same = self._quotes(candles, limit=86_400.0)
+        assert same == q and same.fingerprint == q.fingerprint
+        # The two new arguments are the last two of __reduce__'s
+        cls, args = q.__reduce__()
+        np.testing.assert_array_equal(args[-2], q.moved_checkpoints)
+        assert args[-1] == 86_400.0
+
+    def test_the_limit_is_resolved_and_checked(self, monkeypatch):
+        resolve = backtester._resolve_stale_quote_max_age
+        monkeypatch.setattr(backtester, "BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS", 3_600)
+        assert resolve() == 3_600.0 and resolve(None) == 3_600.0
+        assert resolve(False) is None
+        assert resolve(7_200) == 7_200.0 and resolve(np.int64(5)) == 5.0 and resolve(0.5) == 0.5
+        monkeypatch.setattr(backtester, "BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS", None)
+        assert resolve() is None
+        for bad in (True, 0, -1, float("nan"), float("inf"), "86400", Decimal("1")):
+            with pytest.raises(ValueError, match="stale-quote limit"):
+                resolve(bad)
+        monkeypatch.setattr(backtester, "BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS", 0)
+        with pytest.raises(ValueError, match="stale-quote limit"):
+            resolve()
+
+    def test_the_shipped_limit_is_a_day(self):
+        assert config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS == 86_400
+
+
+class TestStaleQuoteSkipsAMonday:
+    """Pass 1b's Kelly gate: a Monday on which either market's quote had not
+    moved or traded within the limit does not pass, never counts toward the
+    peak Kelly fraction, and is counted; the pair tries its next qualifying
+    Monday. Every simulation is handed k 0.75 and no cap."""
+
+    _START = date(2026, 1, 1)
+
+    def _sim(self, records, **kw):
+        return backtester._simulate_at_discount(records, self._START, 10_000.0, k=0.75,
+                                                 size_cap=1.0, end_date=date(2026, 4, 1), **kw)
+
+    @staticmethod
+    def _ts(age: int, mondays=None) -> tuple[list[dict], dict]:
+        """OA/OB, qualifying on Monday 1 (YES 0.20) and Monday 2 (YES 0.30, a
+        smaller Kelly fraction). OA last moved `age` seconds before Monday 1's
+        checkpoint (its later candle there is still); every other candle traded."""
+        mondays = mondays or [(_LADDER_M1, 0.20, 0.60, 0.40), (_LADDER_M2, 0.30, 0.60, 0.40)]
+        rec = _ladder_record(_ladder_market("OA", "EVO-1", "2026-03-20"),
+                             _ladder_market("OB", "EVO-2", "2026-03-20"), "o", mondays)
+        candles = {"OA": [_moved(_LADDER_M1, age, 0.20, 0.80),
+                          _still(_LADDER_M1, 3_600, 0.20, 0.80),
+                          _moved(_LADDER_M2, 3_600, 0.30, 0.70)],
+                   "OB": [_moved(_LADDER_M1, 3_600, 0.60, 0.40),
+                          _moved(_LADDER_M2, 3_600, 0.60, 0.40)]}
+        return [rec], candles
+
+    def test_a_frozen_quote_moves_the_entry_to_the_next_monday(self, caplog):
+        records, candles = self._ts(2 * 86_400)
+        off = self._sim(_stale_attached(copy.deepcopy(records), candles, limit=None))
+        with caplog.at_level(logging.INFO):
+            on = self._sim(_stale_attached(records, candles))
+        assert _traded(off) == [("OA", _LADDER_M1)]
+        assert _traded(on) == [("OA", _LADDER_M2)]
+        assert f"{_STALE_LINE} ({_label(1.0)}): 1" in caplog.text
+        # The quiet runs of a size-cap sweep log it at DEBUG
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            self._sim(records, quiet=True)
+        assert _STALE_LINE not in caplog.text
+
+    @pytest.mark.parametrize("age, monday", [(_STALE_LIMIT, _LADDER_M1),
+                                             (_STALE_LIMIT + 1, _LADDER_M2)])
+    def test_the_boundary_through_the_gate(self, age, monday, caplog):
+        records, candles = self._ts(age)
+        with caplog.at_level(logging.INFO):
+            point = self._sim(_stale_attached(records, candles))
+        assert _traded(point) == [("OA", monday)]
+        assert (_STALE_LINE in caplog.text) is (monday == _LADDER_M2)
+
+    def test_a_stale_monday_never_counts_toward_the_peak(self):
+        records, candles = self._ts(2 * 86_400)
+        on = self._sim(_stale_attached(copy.deepcopy(records), candles))
+        off = self._sim(_stale_attached(copy.deepcopy(records), candles, limit=None))
+        # The peak is the Monday that can trade, exactly as if Monday 1 were not listed
+        only_m2, _ = self._ts(2 * 86_400, mondays=[(_LADDER_M2, 0.30, 0.60, 0.40)])
+        alone = self._sim(_stale_attached(only_m2, candles))
+        assert on.peak_kelly_fraction == alone.peak_kelly_fraction
+        assert off.peak_kelly_fraction > on.peak_kelly_fraction > 0
+
+    def test_a_same_title_pair_moves_on_to_its_next_qualifying_monday(self):
+        a, b = _ladder_market("TA", "EVT-1", "2026-03-20"), _ladder_market("TB", "EVU-1",
+                                                                          "2026-03-20")
+        rec = _ladder_same_title(a, b, [_LADDER_M1, _LADDER_M2])
+        candles = {"TA": [_moved(_LADDER_M1, 3 * 86_400, 0.70, 0.30),
+                          _still(_LADDER_M1, 3_600, 0.70, 0.30),
+                          _moved(_LADDER_M2, 3_600, 0.70, 0.30)],
+                   "TB": [_moved(_LADDER_M1, 3_600, 0.40, 0.60),
+                          _moved(_LADDER_M2, 3_600, 0.40, 0.60)]}
+        off = self._sim(_stale_attached([copy.deepcopy(rec)], candles, limit=None))
+        on = self._sim(_stale_attached([rec], candles))
+        assert _traded(off) == [("TA", _LADDER_M1)]
+        assert _traded(on) == [("TA", _LADDER_M2)]
+
+    def test_a_record_without_quotes_is_not_checked(self):
+        records, _candles = self._ts(2 * 86_400)
+        assert _traded(self._sim(records)) == [("OA", _LADDER_M1)]
+
+
+class TestStaleQuoteHoldsBackASaleOrATrim:
+    """At the checkpoint, a position with a stale market still to pay out is
+    not sold, and a pair with a stale market is not trimmed; a later Monday
+    whose quotes moved sells or trims it. Paid-out legs need no quote, and
+    the sell rule's earlier daily checks are not held to the limit. The
+    fixture is TestSellAtShareOfPotentialProfit's, every candle trading in
+    its hour."""
+
+    _SUITE = TestSellAtShareOfPotentialProfit
+
+    @classmethod
+    def _candles(cls, freeze_sb_on: date | None = None) -> dict:
+        """The suite's candles, each with volume; with `freeze_sb_on`, SB's
+        candles at that Monday's checkpoint and the daily check before it
+        trade nothing, so its last move is two days before the checkpoint."""
+        out = {t: [dict(c, volume=400.0) for c in series]
+               for t, series in cls._SUITE._candles().items()}
+        if freeze_sb_on is not None:
+            frozen = {_ck(freeze_sb_on), _ck(freeze_sb_on) - 86_400}
+            out["SB"] = [_candle(c["ts"], c["yes_ask_close"], c["no_ask_close"])
+                         if c["ts"] in frozen else c for c in out["SB"]]
+        return out
+
+    def _sim(self, records, sell_at=None, **kw):
+        return self._SUITE()._sim(records, sell_at, **kw)
+
+    def test_a_sale_waits_for_the_next_monday_whose_quotes_moved(self):
+        fresh = self._sim(_stale_attached([self._SUITE._record()], self._candles()), 0.25)
+        (sold,) = fresh.trades
+        assert sold.sold and sold.exit_date == _LADDER_M2
+        frozen = self._candles(freeze_sb_on=_LADDER_M2)
+        off = self._sim(_stale_attached([self._SUITE._record()], frozen, limit=None), 0.25)
+        assert off.trades[0].exit_date == _LADDER_M2
+        (later,) = self._sim(_stale_attached([self._SUITE._record()], frozen), 0.25).trades
+        assert later.sold and later.exit_date == _LADDER_M3
+        bid_a, bid_b = self._SUITE._BIDS[_LADDER_M3]
+        assert (later.sale_price_a, later.sale_price_b) == (bid_a, bid_b)
+
+    def test_a_stale_market_still_to_pay_out_cannot_be_valued_at_the_checkpoint(self):
+        frozen = self._candles(freeze_sb_on=_LADDER_M2)
+        (held,) = self._sim(_stale_attached([self._SUITE._record()], frozen)).trades
+        qa, qb = held.marks
+        assert backtester._quote_is_fresh(qa, _LADDER_M2)
+        assert not backtester._quote_is_fresh(qb, _LADDER_M2)
+        assert backtester._position_sale_value([held], _LADDER_M2) is None
+        # The daily check a day before (its own quote, an hour old) is not held to it
+        assert backtester._position_sale_value([held], _LADDER_M2, 1) is not None
+        # With no limit the checkpoint values it
+        cls, args = qb.__reduce__()
+        unlimited = cls(*args[:-1], None)
+        assert backtester._position_sale_value(
+            [dc_replace(held, marks=(qa, unlimited))], _LADDER_M2) is not None
+
+    def test_a_paid_out_leg_needs_no_quote(self):
+        (held,) = self._sim(_stale_attached([self._SUITE._record()], self._candles())).trades
+        qa, qb = held.marks
+        cls, args = qa.__reduce__()
+        index = (_LADDER_M2 - qa.first_checkpoint).days // 7
+        never_moved = np.full(len(args[-2]), -1, dtype=np.int64)
+        # SA marked paid out by Monday 2, with no move ever recorded
+        paid = np.array(args[11], dtype=bool)
+        paid[index] = True
+        paid_stale = cls(*args[:11], paid, *args[12:-2], never_moved, _STALE_LIMIT)
+        assert not backtester._quote_is_fresh(paid_stale, _LADDER_M2)
+        sale = backtester._position_sale_value([dc_replace(held, marks=(paid_stale, qb))],
+                                               _LADDER_M2)
+        assert sale is not None and sale[0][0][2][0] is None
+        # The same market still to pay out is held back
+        unpaid_stale = cls(*args[:-2], never_moved, _STALE_LIMIT)
+        assert backtester._position_sale_value(
+            [dc_replace(held, marks=(unpaid_stale, qb))], _LADDER_M2) is None
+
+    def test_a_trim_waits_for_a_monday_whose_quotes_moved(self):
+        trim = TestTrimToKelly()
+        fresh = trim._sim(_stale_attached([self._SUITE._record()], self._candles()),
+                          trim_to_kelly=True)
+        assert [t.exit_date for t in fresh.trades if t.sold] == [_LADDER_M2, _LADDER_M3]
+        frozen = self._candles(freeze_sb_on=_LADDER_M2)
+        (held,) = self._sim(_stale_attached([self._SUITE._record()], frozen)).trades
+        assert backtester._fresh_bids(held, _LADDER_M2) is None
+        assert backtester._fresh_bids(held, _LADDER_M3) is not None
+        point = trim._sim(_stale_attached([self._SUITE._record()], frozen), trim_to_kelly=True)
+        assert [t.exit_date for t in point.trades if t.sold] == [_LADDER_M3]
+        off = trim._sim(_stale_attached([self._SUITE._record()], frozen, limit=None),
+                        trim_to_kelly=True)
+        assert [t.exit_date for t in off.trades if t.sold] == [_LADDER_M2, _LADDER_M3]
+
+
+class TestStaleQuoteHeldBackCounts:
+    """The sales and the Kelly trims a stale quote held back are counted, each
+    on a silent-at-zero line (DEBUG when quiet): a position or pair once per
+    checkpoint where it would have sold, or been trimmed, with the check
+    skipped. The counts change no figure, and with the check off nothing is
+    logged."""
+
+    _SUITE = TestSellAtShareOfPotentialProfit
+    _HOLDS = TestStaleQuoteHoldsBackASaleOrATrim
+    _SALES = ("Sales held back because a market's quote had not moved or traded for "
+              "over 24 hours")
+    _TRIMS = ("Kelly trims held back because a market's quote had not moved or traded "
+              "for over 24 hours")
+
+    def _sell(self, mondays, limit=_STALE_LIMIT, **kw):
+        records = _stale_attached([self._SUITE._record(mondays)],
+                                  self._HOLDS._candles(freeze_sb_on=_LADDER_M2), limit=limit)
+        return self._SUITE()._sim(records, 0.25, **kw)
+
+    def _trim(self, limit=_STALE_LIMIT, **kw):
+        records = _stale_attached([self._SUITE._record()],
+                                  self._HOLDS._candles(freeze_sb_on=_LADDER_M2), limit=limit)
+        return TestTrimToKelly()._sim(records, trim_to_kelly=True, **kw)
+
+    # Monday 2 with no candidate (the walk's quick test), and with one (its
+    # sale step): the position is held back once either way
+    @pytest.mark.parametrize("mondays", [(_LADDER_M1,), (_LADDER_M1, _LADDER_M2)])
+    def test_a_held_back_sale_is_counted_once(self, mondays, caplog):
+        with caplog.at_level(logging.INFO):
+            point = self._sell(mondays)
+        assert point.trades[0].exit_date == _LADDER_M3
+        label = f"{_label(1.0)}, selling at 25% of potential profit"
+        assert f"{self._SALES} ({label}): 1" in caplog.messages
+        assert self._TRIMS not in caplog.text
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            self._sell(mondays, quiet=True)
+        assert self._SALES not in caplog.text
+        with caplog.at_level(logging.DEBUG):
+            self._sell(mondays, quiet=True)
+        assert f"{self._SALES} ({label}): 1" in caplog.messages
+
+    def test_a_held_back_trim_is_counted(self, caplog):
+        with caplog.at_level(logging.INFO):
+            point = self._trim()
+        assert [t.exit_date for t in point.trades if t.sold] == [_LADDER_M3]
+        assert f"{self._TRIMS} ({_label(0.20)}, trimming to Kelly): 1" in caplog.messages
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            self._trim(quiet=True)
+        assert self._TRIMS not in caplog.text
+
+    def test_with_the_check_off_nothing_is_logged(self, caplog):
+        with caplog.at_level(logging.DEBUG):
+            self._sell((_LADDER_M1,), limit=None)
+            self._trim(limit=None)
+        assert "held back because a market's quote" not in caplog.text
+        assert _STALE_LINE not in caplog.text
+
+    def test_a_sale_or_trim_that_would_not_happen_anyway_is_not_counted(self, caplog):
+        # A level no Monday reaches: nothing is sold with or without the
+        # check, so nothing is held back
+        records = _stale_attached([self._SUITE._record()],
+                                  self._HOLDS._candles(freeze_sb_on=_LADDER_M2))
+        with caplog.at_level(logging.INFO):
+            self._SUITE()._sim(records, 0.70)
+        assert self._SALES not in caplog.text
+
+    def test_a_position_with_no_stale_leg_is_not_valued_again(self, monkeypatch):
+        # The count's extra valuations (stale_check=False) are made only for a
+        # position with a leg still to pay out whose quote reads stale there
+        checked: list[bool] = []
+        real_hold, real_trim = backtester._hold_readings, backtester._kelly_trim
+
+        def hold(position, day, *a, stale_check=True, **kw):
+            if not stale_check:
+                checked.append(backtester._stale_unpaid_leg(position, day))
+            return real_hold(position, day, *a, stale_check=stale_check, **kw)
+
+        def trim(position, day, *a, stale_check=True, **kw):
+            if not stale_check:
+                checked.append(backtester._stale_unpaid_leg(position, day))
+            return real_trim(position, day, *a, stale_check=stale_check, **kw)
+
+        monkeypatch.setattr(backtester, "_hold_readings", hold)
+        monkeypatch.setattr(backtester, "_kelly_trim", trim)
+        self._sell((_LADDER_M1,))
+        self._sell((_LADDER_M1, _LADDER_M2))
+        self._trim()
+        assert checked and all(checked)
+
+    def test_the_counts_change_no_figure(self, monkeypatch):
+        # The same runs with the counts' counterfactual valuations answered
+        # "would not sell": every trade and the curve are unchanged
+        runs = [lambda: self._sell((_LADDER_M1,)), lambda: self._sell((_LADDER_M1, _LADDER_M2)),
+                lambda: self._trim()]
+        before = [run() for run in runs]
+        real_hold, real_trim = backtester._hold_readings, backtester._kelly_trim
+
+        def hold(*a, stale_check=True, **kw):
+            return real_hold(*a, **kw) if stale_check else None
+
+        def trim(*a, stale_check=True, **kw):
+            return real_trim(*a, **kw) if stale_check else (backtester._NO_TRIM, None)
+
+        monkeypatch.setattr(backtester, "_hold_readings", hold)
+        monkeypatch.setattr(backtester, "_kelly_trim", trim)
+        for run, point in zip(runs, before, strict=True):
+            again = run()
+            assert [astuple(t) for t in again.trades] == [astuple(t) for t in point.trades]
+            pd.testing.assert_frame_equal(again.equity_df, point.equity_df, check_exact=True)
+            assert (again.peak_kelly_fraction, again.cap_free_from) == (
+                point.peak_kelly_fraction, point.cap_free_from)
+
+
+class TestStaleQuoteKeepsEveryLazyFamilyExact:
+    """The stale-quote check reads no size cap, so every lazy family stays
+    exact with it on: every cap of every kind of CapSweep (the size-cap family
+    with its split-half and excluding-top-event checks, tier floors off,
+    adding to held pairs, selling, trimming), every cell of SellSweep.sold_grid
+    and of TrimSweep.rise_grid equals a fresh simulation. The fixture is
+    TestTrimCapSweep's three pairs over walked books, every candle trading in
+    its hour but two frozen markets: PA's last move is three days before Monday
+    1 (so its pair, which qualifies only then, never enters) and SB's two days
+    before Monday 2 (so the first pair is neither bought again, sold nor
+    trimmed on Monday 2)."""
+
+    _BAND = TestTrimCapSweep._BAND
+    _START = TestTrimCapSweep._START
+    _END = TestTrimCapSweep._END
+    _KS = (0.5, 0.75)
+    _SUITE = TestSellAtShareOfPotentialProfit
+
+    @classmethod
+    def _entries(cls, limit=_STALE_LIMIT) -> list[dict]:
+        early = _ladder_record(_ladder_market("PA", "EVP-1", "2026-01-12"),
+                               _ladder_market("PB", "EVP-2", "2026-01-12"), "early",
+                               (_LADDER_M1,))
+        other = _ladder_record(_ladder_market("OA", "EVO-1", "2026-02-10"),
+                               _ladder_market("OB", "EVO-2", "2026-03-20"), "other",
+                               (_LADDER_M3,))
+        candles = dict(TestStaleQuoteHoldsBackASaleOrATrim._candles(freeze_sb_on=_LADDER_M2),
+                       PA=[_moved(_LADDER_M1, 3 * 86_400, 0.20, 0.82),
+                           _still(_LADDER_M1, 0, 0.20, 0.82)],
+                       PB=[_moved(_LADDER_M1, 0, 0.60, 0.42)],
+                       OA=[_moved(_LADDER_M3, 0, 0.20, 0.82)],
+                       OB=[_moved(_LADDER_M3, 0, 0.60, 0.42)])
+        first = cls._SUITE._record((_LADDER_M1, _LADDER_M2, _LADDER_M3))
+        return _stale_attached([first, early, other], candles, limit=limit,
+                               model=_walk_model())
+
+    def _fresh(self, entries, k, cap, pop="all", **options):
+        return backtester._simulate_at_discount(entries, self._START, 10_000.0, k=k,
+                                                 spread_band=self._BAND, population=pop,
+                                                 size_cap=cap, quiet=True, end_date=self._END,
+                                                 **options)
+
+    @staticmethod
+    def _trades(point) -> list:
+        return [astuple(t) for t in point.trades]
+
+    _FAMILIES = {"size cap, with checks": {},
+                 "tier floors off": {"tier_floors": False},
+                 "adding to held pairs": {"add_to_held": True},
+                 "selling": {"sell_at": 0.25},
+                 "trimming": {"trim_to_kelly": True}}
+
+    @pytest.mark.parametrize("family", list(_FAMILIES))
+    def test_every_cap_of_every_kind_of_cap_sweep_equals_a_fresh_simulation(self, family):
+        entries = self._entries()
+        options = self._FAMILIES[family]
+        checks = family == "size cap, with checks"
+        split = _LADDER_M2 if checks else None
+        subsets = _cap_sweep_subsets(entries)
+        pops = [pop for pop in subsets if subsets[pop]] if checks else ["all"]
+        eager, end_dates = {}, {}
+        for k in self._KS:
+            if set(options) & {"add_to_held", "sell_at", "trim_to_kelly"}:
+                end_dates.update({(self._BAND, k, pop): self._END for pop in pops})
+                continue
+            for pop in pops:
+                point = self._fresh(subsets[pop], k, 0.2, pop, **options)
+                if checks and pop in ("all", "time_series"):
+                    point.halves = backtester._half_split(
+                        backtester._split_halves(subsets[pop], split), self._START, 10_000.0,
+                        k, self._BAND, population=pop, size_cap=0.2, quiet=True,
+                        end_date=self._END)
+                    point.ex_top_event = backtester._ex_top_event(
+                        point, subsets[pop], self._START, 10_000.0, self._BAND,
+                        population=pop, quiet=True, end_date=self._END)
+                eager[(self._BAND, k, pop)] = point
+        cs = backtester.CapSweep(caps=backtester.SIZE_CAP_SWEEP, primary_cap=0.2,
+                                 bands=(self._BAND,), ks=self._KS, primary_k=self._KS[0],
+                                 start_date=self._START, initial_balance=10_000.0,
+                                 split_date=split, checks=checks,
+                                 entries_by_band={self._BAND: entries}, st_entries=[],
+                                 eager=eager, end_dates=end_dates, **options)
+        parity = TestMarketCapSweepParity()
+        unchecked = self._entries(limit=None)
+        differs = 0
+        for k in self._KS:
+            for cap, points in cs.cell(self._BAND, k).items():
+                assert sorted(points) == sorted(pops), cap
+                for pop, point in points.items():
+                    sim = {key: value for key, value in options.items()
+                           if key != "trim_to_kelly"}
+                    if "trim_to_kelly" in options:
+                        fresh = self._fresh(subsets[pop], k, cap, pop, **options)
+                        assert self._trades(point) == self._trades(fresh), (k, cap)
+                        pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df,
+                                                      check_exact=True)
+                    else:
+                        fresh = parity._fresh_parity(
+                            point, subsets[pop], self._START, k, self._BAND, pop, cap,
+                            end_date=self._END, split_date=split, checks=checks, **sim)
+                    if pop == "all":
+                        off = self._fresh(_cap_sweep_subsets(unchecked)[pop], k, cap, pop,
+                                          **options)
+                        differs += self._trades(off) != self._trades(fresh)
+        # Not vacuous: the check changes the run at some cap and k
+        assert differs > 0
+
+    def test_every_cell_of_the_sold_grid_equals_a_fresh_simulation(self):
+        entries = self._entries()
+        sell = backtester.SellSweep(
+            levels=(0.05, 0.25, 0.5, 1.0), min_days=(1, 14, 21, 30),
+            caps=backtester.SIZE_CAP_SWEEP, primary_cap=0.2, bands=(self._BAND,),
+            off_bands=(), ks=self._KS, primary_k=self._KS[0], start_date=self._START,
+            initial_balance=10_000.0, entries_by_band={self._BAND: entries},
+            off_entries_by_band={},
+            end_dates={(self._BAND, k, "all"): self._END for k in self._KS},
+            off_end_dates={})
+        kinds = TestSellSweep()._grid_parity(SimpleNamespace(start=self._START), sell=sell)
+        assert kinds["point"] > 0 and kinds["same"] + kinds["pruned, level"] > 0
+
+    @pytest.mark.parametrize("add", [False, True])
+    def test_every_cell_of_the_rise_grid_equals_a_fresh_simulation(self, add):
+        entries = self._entries()
+        grid = TestTrimRiseGrid()
+        family = grid._family(entries, grid._SHORT)
+        for k in self._KS:
+            kinds = grid._parity(family, entries, k, add)
+            assert sum(kinds.values()) > 0
+
+
+class TestStaleQuoteSwitch:
+    """config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS through run_backtest_sweep:
+    stale_quote_max_age None reads this module's binding at call time, False
+    turns the check off, a number sets it; the run logs one setting line and
+    records the limit. With the check off, the golden fixture's run is the
+    run without it in every figure and every log line run_backtest_sweep
+    writes but that one (backtest.py's pre-fetch echo, TestStaleQuoteArgument,
+    is the second INFO line that names it)."""
+
+    _SETTING = "Stale-quote check (backtest):"
+
+    def _run(self, monkeypatch, caplog, **kw):
+        golden = TestPrepareEntriesGolden()
+        with monkeypatch.context() as mp:
+            golden._patch(mp)
+            caplog.clear()
+            with caplog.at_level(logging.INFO):
+                res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                         start_date=golden._START, initial_balance=10_000.0,
+                                         same_event_ladders=True, sweep=False, **kw)
+            # The memory figure, and what the side caches already held when
+            # the run began (a second run in one test reads what the first saved)
+            messages = [m for m in caplog.messages
+                        if not m.startswith(("Peak RSS", "Event competitions:",
+                                             "Event fee overrides:", "Market details:",
+                                             "Trades:"))]
+        return res, messages
+
+    @staticmethod
+    def _same(a, b) -> None:
+        for x, y in zip([a.primary, *a.points], [b.primary, *b.points], strict=True):
+            assert [astuple(t) for t in x.trades] == [astuple(t) for t in y.trades]
+            pd.testing.assert_frame_equal(x.equity_df, y.equity_df, check_exact=True)
+            assert x.peak_kelly_fraction == y.peak_kelly_fraction
+
+    def test_off_is_the_run_without_the_check_but_for_one_setting_line(self, monkeypatch,
+                                                                        caplog):
+        # conftest turns the check off for the suite: this is the run every
+        # golden figure was pinned on
+        assert backtester.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS is None
+        base, base_lines = self._run(monkeypatch, caplog)
+        monkeypatch.setattr(backtester, "BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS", 86_400)
+        off, off_lines = self._run(monkeypatch, caplog, stale_quote_max_age=False)
+        self._same(off, base)
+        assert base.stale_quote_max_age is False and off.stale_quote_max_age is False
+        settings = [m for m in off_lines if m.startswith(self._SETTING)]
+        assert settings == [
+            "Stale-quote check (backtest): off — a quote is traded on however long it "
+            "has been unchanged (run-level override)"]
+        assert [m for m in base_lines if m.startswith(self._SETTING)] == [
+            "Stale-quote check (backtest): off — a quote is traded on however long it "
+            "has been unchanged (config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS)"]
+        assert ([m for m in off_lines if not m.startswith(self._SETTING)]
+                == [m for m in base_lines if not m.startswith(self._SETTING)])
+
+    def test_on_reads_the_binding_and_the_golden_fixture_s_stale_mondays_are_skipped(
+            self, monkeypatch, caplog):
+        base, _lines = self._run(monkeypatch, caplog)
+        monkeypatch.setattr(backtester, "BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS", 86_400)
+        on, lines = self._run(monkeypatch, caplog)
+        assert on.stale_quote_max_age == 86_400.0
+        assert [m for m in lines if m.startswith(self._SETTING)] == [
+            "Stale-quote check (backtest): on — an entry, a sale or a Kelly trim at a "
+            "checkpoint needs each of its markets to have traded, or moved its quote, "
+            "within 24 hours before it (config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS)"]
+        # The fixture's candles never trade and most sit a week before a later
+        # Monday: those Mondays are skipped, and the run moves
+        assert any(m.startswith(_STALE_LINE) for m in lines)
+        assert [astuple(t) for t in on.primary.trades] != [astuple(t)
+                                                          for t in base.primary.trades]
+        # A run-level limit is named as an override
+        hours, lines = self._run(monkeypatch, caplog, stale_quote_max_age=7 * 86_400.0)
+        assert hours.stale_quote_max_age == 7 * 86_400.0
+        assert any(m.startswith(self._SETTING) and "within 168 hours" in m
+                   and m.endswith("(run-level override)") for m in lines)
+
+    def test_a_bad_limit_is_refused_before_anything_is_fetched(self, monkeypatch):
+        def never(*_a, **_k):
+            raise AssertionError("fetched")
+
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets", never)
+        for bad in (True, 0, -5, float("nan")):
+            with pytest.raises(ValueError, match="stale-quote limit"):
+                run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                   start_date=date(2026, 1, 1), stale_quote_max_age=bad)
+
+    def test_the_infeasible_window_records_the_limit(self, monkeypatch):
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                 start_date=date(2026, 1, 1), stale_quote_max_age=3_600)
+        assert res.stale_quote_max_age == 3_600.0
+        off = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                 start_date=date(2026, 1, 1))
+        assert off.stale_quote_max_age is False
+
+    def test_every_entry_point_takes_it_keyword_only(self):
+        for func in (run_backtest_sweep, backtester.run_backtest, backtester._prepare_entries,
+                     backtester._prepare_candidates):
+            param = inspect.signature(func).parameters["stale_quote_max_age"]
+            assert param.default is None and param.kind is param.KEYWORD_ONLY

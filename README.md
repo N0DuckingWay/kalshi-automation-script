@@ -1498,6 +1498,8 @@ python3 -m kalshi_betting.backtest --no-sweep   # skip the k-grid re-simulation 
 python3 -m kalshi_betting.backtest --same-event-ladders     # force same-event deadline ladders ON for this run (the configured default)
 python3 -m kalshi_betting.backtest --no-same-event-ladders  # force them OFF for this run (the rule before the 2026-09-26 decision)
 python3 -m kalshi_betting.backtest --no-scheduled-close     # read every settled market's realized close for this run (default on: the scheduled close a live run saw, from a rule learned per series from backtest_cache/scheduled_closes/)
+python3 -m kalshi_betting.backtest --stale-quote-hours 48   # an entry, a sale or a Kelly trim needs each market to have traded or moved its quote within 48 hours of the checkpoint, for this run (default 24: config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS)
+python3 -m kalshi_betting.backtest --no-stale-quote-check   # trade on a quote however long it has been unchanged, for this run
 python3 -m kalshi_betting.backtest --spread-min 0.30 --spread-max 0.60   # primary scenario's time-series spread band (backtest only)
 python3 -m kalshi_betting.backtest --no-band-sweep           # skip the spread-band grid (and its tier-floors-off runs); the dashboard's scenario explorer has nothing to show, and its filter bar offers the primary band only, with the Tier floors select disabled
 python3 -m kalshi_betting.backtest --no-cap-sweep            # skip the per-trade size-cap sweep: the dashboard offers config.BUDGET_FRACTION only (smaller, faster page)

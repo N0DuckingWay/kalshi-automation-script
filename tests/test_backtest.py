@@ -344,6 +344,66 @@ class TestScheduledCloseArgument:
         assert f"config.BACKTEST_SCHEDULED_CLOSE, currently {word})" in help_text
 
 
+class TestStaleQuoteArgument:
+    """--stale-quote-hours N / --no-stale-quote-check (C6): how recently each
+    market of an entry, a sale or a Kelly trim must have moved, for this run."""
+
+    def test_default_is_no_override(self, cli, monkeypatch):
+        # None is resolved by backtester at call time
+        _run(monkeypatch)
+        assert cli["sweep_kwargs"]["stale_quote_max_age"] is None
+
+    @pytest.mark.parametrize("flags, value", [(["--stale-quote-hours", "48"], 48 * 3600.0),
+                                              (["--stale-quote-hours", "1.5"], 5400.0),
+                                              (["--no-stale-quote-check"], False)])
+    def test_the_flags_reach_the_sweep(self, cli, monkeypatch, flags, value):
+        _run(monkeypatch, *flags)
+        assert cli["sweep_kwargs"]["stale_quote_max_age"] == value
+        assert type(cli["sweep_kwargs"]["stale_quote_max_age"]) is type(value)
+
+    @pytest.mark.parametrize("hours", ["0", "-1", "nan", "inf"])
+    def test_a_bad_number_of_hours_is_a_usage_error(self, cli, monkeypatch, capsys, hours):
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "--stale-quote-hours", hours)
+        assert exc.value.code == 2
+        assert "--stale-quote-hours must be a positive number of hours" in capsys.readouterr().err
+
+    def test_the_two_flags_are_exclusive(self, cli, monkeypatch, capsys):
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "--stale-quote-hours", "48", "--no-stale-quote-check")
+        assert exc.value.code == 2
+
+    @pytest.mark.parametrize("flags, configured, echo", [
+        ([], 86_400, "| stale quotes=24 h | ladders="),
+        ([], None, "| stale quotes=off | ladders="),
+        (["--no-stale-quote-check"], 86_400, "| stale quotes=off (config: 24 h) | ladders="),
+        (["--stale-quote-hours", "48"], 86_400, "| stale quotes=48 h (config: 24 h) | ladders="),
+        (["--stale-quote-hours", "24"], 86_400, "| stale quotes=24 h | ladders="),
+        (["--stale-quote-hours", "6"], None, "| stale quotes=6 h (config: off) | ladders="),
+    ])
+    def test_the_config_echo_names_it(self, cli, monkeypatch, caplog, flags, configured, echo):
+        monkeypatch.setattr(backtest, "BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS", configured)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, *flags)
+        assert echo in caplog.text
+        # Between k and the ladders, so the scheduled-close echo still meets k
+        assert "| scheduled close=on | k=" in caplog.text
+
+    @pytest.mark.parametrize("configured, word", [(86_400, "24 h"), (None, "off")])
+    def test_the_help_text_names_the_configured_value(self, cli, monkeypatch, capsys,
+                                                       configured, word):
+        monkeypatch.setattr(backtest, "BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS", configured)
+        with pytest.raises(SystemExit):
+            _run(monkeypatch, "--help")
+        help_text = " ".join(capsys.readouterr().out.split())
+        assert f"config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS, currently {word})" in help_text
+
+    def test_the_shipped_binding_is_the_config_s(self):
+        from kalshi_betting import config
+        assert backtest.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS == \
+            config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS == 86_400
+
+
 class TestSameEventLaddersArgument:
     """--same-event-ladders / --no-same-event-ladders (DR-73c)."""
 

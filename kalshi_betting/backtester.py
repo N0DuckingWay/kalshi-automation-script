@@ -395,6 +395,7 @@ from .config import (
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
     BACKTEST_RECORD_BYTES_ESTIMATE,
     BACKTEST_SCHEDULED_CLOSE,
+    BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS,
     BUDGET_FRACTION,
     CANDLE_NO_ASK_CEILING,
     CANDLESTICK_FETCH_MAX_WORKERS,
@@ -907,6 +908,17 @@ class LegQuotes:
             each day's check, one per day from first_day, alike.
         depth (DepthModel | None): The depth model the synthetic books come
             from; None means every trade fills at the top of the book.
+        moved_checkpoints (np.ndarray): For each checkpoint, the "moved_ts"
+            of the candle it reads (the latest at or before it): the end of
+            the latest hour in which the market traded or either side's
+            quote changed (_project_candles). int64; -1 where there is no
+            such candle or it carries no moved_ts.
+        stale_max_age (float | None): The run's stale-quote limit, in
+            seconds (config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS or the run's
+            override): _quote_is_fresh reads a checkpoint's quote as fresh
+            only when it moved at most this long before the checkpoint. None
+            (every hand-built quote, and a run with the check off) checks
+            nothing.
         fingerprint (str): A hex digest of everything above; two LegQuotes
             that compare equal share it.
     """
@@ -915,7 +927,8 @@ class LegQuotes:
                  "yes_checkpoints", "no_checkpoints", "paid_yes", "paid_no",
                  "yes_bid_checkpoints", "no_bid_checkpoints", "paid_checkpoints",
                  "yes_bid_daily", "no_bid_daily", "paid_daily",
-                 "volume_checkpoints", "volume_daily", "depth", "fingerprint")
+                 "volume_checkpoints", "volume_daily", "depth", "moved_checkpoints",
+                 "stale_max_age", "fingerprint")
 
     def __init__(self, ticker: str, first_day: date, yes_days: np.ndarray, no_days: np.ndarray,
                  first_checkpoint: date, yes_checkpoints: np.ndarray,
@@ -928,7 +941,9 @@ class LegQuotes:
                  paid_daily: np.ndarray | None = None,
                  volume_checkpoints: np.ndarray | None = None,
                  volume_daily: np.ndarray | None = None,
-                 depth: DepthModel | None = None) -> None:
+                 depth: DepthModel | None = None,
+                 moved_checkpoints: np.ndarray | None = None,
+                 stale_max_age: float | None = None) -> None:
         """
         Store one market's samples, made read-only, and their fingerprint.
 
@@ -966,6 +981,11 @@ class LegQuotes:
                 check, one per day from first_day (NaN: none). None reads as
                 no volume data.
             depth (DepthModel | None): The depth model; None for none.
+            moved_checkpoints (np.ndarray | None): Each checkpoint's moved_ts
+                (-1: none). None (a hand-built quote) reads as none at every
+                checkpoint.
+            stale_max_age (float | None): The stale-quote limit in seconds;
+                None for no check.
         """
         self.ticker = ticker
         self.first_day = first_day
@@ -1044,6 +1064,18 @@ class LegQuotes:
         # The model's digest names its table, so equal models fingerprint alike
         self.depth = depth
         digest.update((depth.digest if depth is not None else "none").encode("utf-8"))
+        # When each checkpoint's quote last moved, and the run's limit on how
+        # long ago that may be: both decide which Mondays can trade, so two
+        # quotes differing in either never share a fingerprint
+        moved = (np.full(count, -1, dtype=np.int64) if moved_checkpoints is None
+                 else np.array(moved_checkpoints, dtype=np.int64))
+        moved.setflags(write=False)
+        self.moved_checkpoints = moved
+        digest.update(len(moved).to_bytes(8, "little"))
+        digest.update(moved.tobytes())
+        # As a float, so 86_400 and 86_400.0 (equal) fingerprint alike
+        self.stale_max_age = None if stale_max_age is None else float(stale_max_age)
+        digest.update(repr(self.stale_max_age).encode("utf-8"))
         self.fingerprint = digest.hexdigest()
 
     def __reduce__(self) -> tuple:
@@ -1051,8 +1083,8 @@ class LegQuotes:
         Rebuild from the samples when pickled (a dashboard worker process receives it so).
 
         Re-running __init__ gives the same read-only arrays and fingerprint:
-        carrying the asks forward again changes nothing, and the bids and
-        volumes are stored as given. The depth model travels with it, so a
+        carrying the asks forward again changes nothing, and the bids,
+        volumes and moved times are stored as given. The depth model travels with it, so a
         worker buys and sells through the same books.
 
         Returns:
@@ -1063,7 +1095,8 @@ class LegQuotes:
                             self.paid_yes, self.paid_no, self.yes_bid_checkpoints,
                             self.no_bid_checkpoints, self.paid_checkpoints,
                             self.yes_bid_daily, self.no_bid_daily, self.paid_daily,
-                            self.volume_checkpoints, self.volume_daily, self.depth))
+                            self.volume_checkpoints, self.volume_daily, self.depth,
+                            self.moved_checkpoints, self.stale_max_age))
 
     def __copy__(self) -> "LegQuotes":
         """Return this object: it is read-only, and trades share one per market."""
@@ -1114,6 +1147,8 @@ class LegQuotes:
                                      "volume_daily"))
                 and np.array_equal(self.paid_checkpoints, other.paid_checkpoints)
                 and np.array_equal(self.paid_daily, other.paid_daily)
+                and np.array_equal(self.moved_checkpoints, other.moved_checkpoints)
+                and self.stale_max_age == other.stale_max_age
                 and model(self) == model(other))
 
     def __hash__(self) -> int:
@@ -2316,6 +2351,11 @@ class _Candidates:
         close_rules (dict): Series ticker -> (field, offset seconds), the
             rules market_details.load_close_rules learned; empty with the
             switch off.
+        stale_quote_max_age (float | None): The stale-quote limit in seconds
+            this run trades under (_resolve_stale_quote_max_age: the
+            constant or the run's override); None with the check off, and on
+            a hand-built instance. Every LegQuotes the entry passes attach
+            carries it.
     """
     all_pairs: list
     candles_by_ticker: dict
@@ -2330,6 +2370,7 @@ class _Candidates:
     fee_multipliers: dict = field(default_factory=dict)
     scheduled_close: bool | None = None
     close_rules: dict = field(default_factory=dict)
+    stale_quote_max_age: float | None = None
 
 
 def _fee_multiplier_of(market: dict, fee_multipliers: dict | None) -> float:
@@ -3885,6 +3926,11 @@ class BacktestSweep:
             scheduled close where a live run reads its close (the resolved
             config.BACKTEST_SCHEDULED_CLOSE, or backtest.py's override);
             None = not recorded (a hand-built sweep).
+        stale_quote_max_age (float | bool | None): The stale-quote limit the
+            run traded under, in seconds (the resolved
+            config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS, or backtest.py's
+            override); False when the check was off; None = not recorded (a
+            hand-built sweep).
     """
     primary: SweepPoint
     points: list[SweepPoint]
@@ -3934,6 +3980,8 @@ class BacktestSweep:
     live_trim_min_rise: float | None = None
     # Whether the run read each market's scheduled close (None: not recorded)
     scheduled_close: bool | None = None
+    # The stale-quote limit in seconds (False: the check was off; None: not recorded)
+    stale_quote_max_age: float | bool | None = None
 
 
 def _settlement_receipt(n: int, outcome_a: str, outcome_b: str, pair_type: str) -> float:
@@ -4528,8 +4576,125 @@ def _positions(open_trades: list[BacktestTrade]) -> list[list[BacktestTrade]]:
     return list(groups.values())
 
 
+def _resolve_stale_quote_max_age(value: Any = None) -> float | None:
+    """
+    The stale-quote limit a run trades under, in seconds, or None when the check is off.
+
+    Args:
+        value (Any): None (the default) reads THIS MODULE's binding of
+            config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS at call time (itself
+            None to turn the check off); False turns it off for this run; a
+            positive, finite number of seconds sets it for this run.
+
+    Returns:
+        float | None: The limit as a float, or None for no check.
+
+    Raises:
+        ValueError: For True or another bool, a non-number, NaN, an infinity,
+            or a number at or below zero (the constant's value too).
+    """
+    if value is None:
+        value = BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS
+        if value is None:
+            return None
+    elif value is False:
+        return None
+    if (isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real)
+            or not math.isfinite(value) or value <= 0):
+        raise ValueError("the stale-quote limit must be a positive, finite number of "
+                         f"seconds, None or False, got {value!r}")
+    return float(value)
+
+
+def _stale_hours_text(limit: float | None) -> str:
+    """
+    The stale-quote limit in hours, as the log lines print it ("24", "1.5").
+
+    Args:
+        limit (float | None): The limit in seconds.
+
+    Returns:
+        str: The hours with %g, or "?" when unknown.
+    """
+    return "?" if limit is None else f"{limit / 3600:g}"
+
+
+@functools.lru_cache(maxsize=4096)
+def _checkpoint_epoch(run: ScheduledRun, d: date) -> int:
+    """
+    The Unix time of the run's moment on date `d` (cached per schedule and date).
+
+    Args:
+        run (ScheduledRun): The schedule (this module's SCHEDULED_RUN).
+        d (date): A checkpoint date.
+
+    Returns:
+        int: run.instant(d) as whole seconds.
+    """
+    return int(run.instant(d).timestamp())
+
+
+def _quote_is_fresh(quotes: LegQuotes, day: date) -> bool:
+    """
+    Whether one market's quote at the checkpoint on `day` has moved recently enough to trade on.
+
+    The stale-quote check (config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS): the
+    candle the checkpoint reads must exist and the market must have traded,
+    or changed either side's quote, at most quotes.stale_max_age seconds
+    before the checkpoint (exactly that old is still fresh). A live run
+    always reads a fresh order book; a backtest quote that has sat unchanged
+    for days may no longer be on the book. It reads nothing the size cap
+    moves, so every cap of a CapSweep sees the same verdicts. Read in three
+    places that decide: the Kelly gate of _simulate_at_discount's Pass 1b (an
+    entry Monday), _position_sale_value at the checkpoint (a sale) and
+    _fresh_bids (a Kelly trim); and by _stale_unpaid_leg, which only gates the
+    walk's counts of what the check held back.
+
+    Args:
+        quotes (LegQuotes): The market's quotes.
+        day (date): A checkpoint date.
+
+    Returns:
+        bool: True when the quotes carry no limit (the check is off, or a
+            hand-built quote) or the quote moved within it; False otherwise,
+            and for a day that is not one of these quotes' checkpoints or
+            falls outside them.
+    """
+    limit = quotes.stale_max_age
+    if limit is None:
+        return True
+    offset = (day - quotes.first_checkpoint).days
+    if offset < 0 or offset % 7 or offset // 7 >= len(quotes.moved_checkpoints):
+        return False
+    moved = int(quotes.moved_checkpoints[offset // 7])
+    if moved < 0:
+        return False
+    return _checkpoint_epoch(SCHEDULED_RUN, day) - moved <= limit
+
+
+def _stale_unpaid_leg(position: list[BacktestTrade], day: date) -> bool:
+    """
+    Whether some market of a position, still to pay out, has a stale quote at the checkpoint on `day`.
+
+    The gate of the walk's counts of the sales and trims the stale-quote check
+    held back: only such a position is valued again with the check skipped,
+    so the extra work is paid only where the check can have held something
+    back. A trade with no quotes has nothing to check.
+
+    Args:
+        position (list[BacktestTrade]): One position's open trades.
+        day (date): A checkpoint date on the legs' weekly grid.
+
+    Returns:
+        bool: True when a leg not yet paid out reads stale (_quote_is_fresh).
+    """
+    return any(not quotes.paid_at_checkpoint(day) and not _quote_is_fresh(quotes, day)
+               for trade in position if trade.marks is not None for quotes in trade.marks)
+
+
 def _position_sale_value(position: list[BacktestTrade], day: date,
-                         days_back: int = 0, *, sold: list[int] | None = None) -> tuple | None:
+                         days_back: int = 0, *, sold: list[int] | None = None,
+                         stale_check: bool = True) -> tuple | None:
     """
     What selling a position at the checkpoint on `day` would return, and what it cost and could pay.
 
@@ -4569,6 +4734,10 @@ def _position_sale_value(position: list[BacktestTrade], day: date,
             each trade are sold, in the position's order, each from 0 to the
             trade's n, with at least one contract sold on every market the
             position holds; None (the default) sells every trade whole.
+        stale_check (bool): Keyword-only. True (the default) applies the
+            stale-quote check at the checkpoint; False skips it, which only
+            the walk's counts of what the check held back ask (they change
+            nothing).
 
     Returns:
         tuple | None: (each trade's sale as (value, fees, (market A's sale
@@ -4577,7 +4746,9 @@ def _position_sale_value(position: list[BacktestTrade], day: date,
             None when a trade has no quotes, or a market still to pay out has
             no bid at this check (at the checkpoint, no fresh bid; at an
             earlier check, no quote in the 24 hours before it) or too few
-            contracts on its ladder there.
+            contracts on its ladder there, or, at the checkpoint, a quote
+            that has not moved or traded within the stale-quote limit
+            (_quote_is_fresh).
 
     Raises:
         ValueError: From LegQuotes, for a day off the legs' checkpoint grid
@@ -4606,6 +4777,11 @@ def _position_sale_value(position: list[BacktestTrade], day: date,
         if quotes.paid_at_checkpoint(day, days_back):
             prices[(ticker, side)] = None
             continue
+        if stale_check and days_back == 0 and not _quote_is_fresh(quotes, day):
+            # At the checkpoint, a market still to pay out whose quote has
+            # not moved or traded within the stale-quote limit cannot be
+            # sold (the earlier daily checks are not held to it)
+            return None
         bid = quotes.bid_at_checkpoint(day, side, days_back)
         if bid != bid:
             # No bid at this check (NaN): this market cannot be sold then
@@ -4671,7 +4847,7 @@ def _sells_at(sell_at: float, realized: float, potential: float) -> bool:
 
 
 def _hold_readings(position: list[BacktestTrade], day: date, hold_days: int, *,
-                   level: float | None = None) -> tuple | None:
+                   level: float | None = None, stale_check: bool = True) -> tuple | None:
     """
     A position's sale at the checkpoint on `day`, and its profit at each daily check the sell rule reads.
 
@@ -4697,6 +4873,9 @@ def _hold_readings(position: list[BacktestTrade], day: date, hold_days: int, *,
             walk asks about its one level, so a check after a failing one is
             never read. _sale_reach asks about every level and
             passes none.
+        stale_check (bool): Keyword-only. Handed to _position_sale_value at
+            the checkpoint; False only for the walk's count of sales the
+            stale-quote check held back.
 
     Returns:
         tuple | None: (the checkpoint's _position_sale_value, [(realized
@@ -4706,7 +4885,7 @@ def _hold_readings(position: list[BacktestTrade], day: date, hold_days: int, *,
             there or too few contracts on its ladder there) or, with level,
             a check falls below it.
     """
-    sale = _position_sale_value(position, day)
+    sale = _position_sale_value(position, day, stale_check=stale_check)
     profits = []
     for days_back in range(hold_days):
         # days_back 0 is the checkpoint itself — the day of the sale, valued
@@ -4820,7 +4999,8 @@ def _sold_copy(trade: BacktestTrade, day: date, sale: tuple) -> BacktestTrade:
 _NO_TRIM = KellyTrim(0, 0.0)
 
 
-def _fresh_bids(trade: BacktestTrade, day: date) -> tuple[float, float, float, float] | None:
+def _fresh_bids(trade: BacktestTrade, day: date, *,
+                stale_check: bool = True) -> tuple[float, float, float, float] | None:
     """
     Both markets' fresh bids at the checkpoint on `day`, or None when any is missing.
 
@@ -4833,16 +5013,24 @@ def _fresh_bids(trade: BacktestTrade, day: date) -> tuple[float, float, float, f
     Args:
         trade (BacktestTrade): An open trade.
         day (date): A checkpoint date on its legs' weekly grid.
+        stale_check (bool): Keyword-only. False skips the stale-quote check
+            (only for the walk's count of trims it held back).
 
     Returns:
         tuple[float, float, float, float] | None: (market A's YES bid, its NO
             bid, market B's YES bid, its NO bid), in dollars; None for a trade
-            with no quotes, or when a side of either market has no fresh bid.
+            with no quotes, when either market's quote has not moved or traded
+            within the stale-quote limit (_quote_is_fresh), or when a side of
+            either market has no fresh bid.
 
     Raises:
         ValueError: From LegQuotes, for a day off the legs' checkpoint grid.
     """
     if trade.marks is None:
+        return None
+    if stale_check and not all(_quote_is_fresh(quotes, day) for quotes in trade.marks):
+        # A market whose quote has not moved or traded within the
+        # stale-quote limit: no trim this Monday
         return None
     bids = [quotes.bid_at_checkpoint(day, side) for quotes in trade.marks
             for side in ("yes", "no")]
@@ -4897,7 +5085,8 @@ def _last_bought_first(position: list[BacktestTrade], pairs: int) -> list[int]:
 
 
 def _kelly_trim(position: list[BacktestTrade], day: date, portfolio_value: float,
-                k: float, cap: float, st_cap: float) -> tuple[KellyTrim, tuple | None]:
+                k: float, cap: float, st_cap: float, *,
+                stale_check: bool = True) -> tuple[KellyTrim, tuple | None]:
     """
     What the Kelly trim sells of one position at the checkpoint on `day`.
 
@@ -4924,6 +5113,9 @@ def _kelly_trim(position: list[BacktestTrade], day: date, portfolio_value: float
         k (float): The simulation's interval discount.
         cap (float): The simulation's per-trade size cap.
         st_cap (float): The extra cap on same-title pairs.
+        stale_check (bool): Keyword-only. False skips the stale-quote check
+            (_fresh_bids, _position_sale_value): only for the walk's count of
+            trims it held back, which changes nothing.
 
     Returns:
         tuple[KellyTrim, tuple | None]: (the decision; its sale as (how many
@@ -4931,7 +5123,7 @@ def _kelly_trim(position: list[BacktestTrade], day: date, portfolio_value: float
             _position_sale_value gives it), or None when nothing is sold).
     """
     first = position[0]
-    bids = _fresh_bids(first, day) if _exact_pair(position) else None
+    bids = _fresh_bids(first, day, stale_check=stale_check) if _exact_pair(position) else None
     if bids is None:
         return _NO_TRIM, None
     yes_bid_a, no_bid_a, yes_bid_b, no_bid_b = bids
@@ -4957,7 +5149,7 @@ def _kelly_trim(position: list[BacktestTrade], day: date, portfolio_value: float
     def net_sale(pairs: int) -> float | None:
         """What selling `pairs` contract pairs returns after fees; None when it cannot be sold."""
         sold = _last_bought_first(position, pairs)
-        valued = _position_sale_value(position, day, sold=sold)
+        valued = _position_sale_value(position, day, sold=sold, stale_check=stale_check)
         # None: the bids hold fewer. A leg with no sale price has paid out,
         # so there is no pair left to sell
         if valued is None or any(None in sale[2] for sale in valued[0]):
@@ -7320,8 +7512,34 @@ def _usable_ask(raw: Any, side: str) -> float:
     return usable_candle_ask(raw, side)
 
 
+def _moved_ts(candle: dict | None) -> int:
+    """
+    When a candle says its market last moved: its "moved_ts", as an int; -1 for none.
+
+    _project_candles writes every in-memory candle's moved_ts; a candle without
+    one (a hand-built list), or with one that is not a whole number of
+    seconds, counts as never having moved, so the stale-quote check fails
+    closed on it.
+
+    Args:
+        candle (dict | None): A candle, or None for no candle.
+
+    Returns:
+        int: The moved_ts, or -1.
+    """
+    if candle is None:
+        return -1
+    moved = candle.get("moved_ts")
+    if isinstance(moved, (bool, np.bool_)) or not isinstance(moved, numbers.Real):
+        return -1
+    if not math.isfinite(moved) or moved != int(moved) or moved < 0:
+        return -1
+    return int(moved)
+
+
 def _leg_quotes(market: dict, candles: list[dict], start_date: date,
-                depth_model: DepthModel | None = None) -> tuple[LegQuotes | None, int]:
+                depth_model: DepthModel | None = None, *,
+                stale_max_age: float | None = None) -> tuple[LegQuotes | None, int]:
     """
     Sample one market's candles into the prices that value an open leg in it (a LegQuotes).
 
@@ -7356,6 +7574,12 @@ def _leg_quotes(market: dict, candles: list[dict], start_date: date,
     (depth_model.volume_24h, the snapshot's own definition; NaN when
     unknown), beside the depth model itself.
 
+    And at each checkpoint, when the market last moved: the "moved_ts" of
+    the latest candle at or before it (_project_candles: the end of the
+    latest hour in which it traded or either side's quote changed; -1 when
+    there is no such candle or it carries none), beside the run's limit on
+    how old that may be, which _quote_is_fresh reads.
+
     Args:
         market (dict): The market's cached record ("ticker", "settlement_ts", "result").
         candles (list[dict]): Its hourly candles ("ts", "yes_ask_close",
@@ -7363,6 +7587,9 @@ def _leg_quotes(market: dict, candles: list[dict], start_date: date,
         start_date (date): The backtest's first trading date.
         depth_model (DepthModel | None): The depth model the quotes carry;
             None means no synthetic book.
+        stale_max_age (float | None): Keyword-only. The run's stale-quote
+            limit in seconds, carried on the quotes; None (the default)
+            checks nothing.
 
     Returns:
         tuple[LegQuotes | None, int]: The market's quotes, None when it has no
@@ -7519,15 +7746,20 @@ def _leg_quotes(market: dict, candles: list[dict], start_date: date,
                 for moment in moments]
 
     volumes, volumes_daily = volumes_at(checkpoints), volumes_at(day_checks)
+    # When the market last moved, as of the candle each checkpoint reads (the
+    # latest at or before it, the lookup the bids above use); -1 for none
+    moved = [_moved_ts(candle) for candle in _candles_at_or_before(candles, checkpoints)]
     quotes = LegQuotes(ticker, first_day, yes_days, no_days, first_checkpoint,
                        yes_checkpoints, no_checkpoints, paid_yes, paid_no,
                        yes_bids, no_bids, paid, yes_daily, no_daily, paid_daily,
-                       volumes, volumes_daily, depth_model)
+                       volumes, volumes_daily, depth_model,
+                       np.array(moved, dtype=np.int64), stale_max_age)
     return quotes, stale_days
 
 
 def _attach_leg_quotes(records: Iterable[dict], candles_by_ticker: dict,
-                       start_date: date, depth_model: DepthModel | None = None) -> None:
+                       start_date: date, depth_model: DepthModel | None = None, *,
+                       stale_max_age: float | None = None) -> None:
     """
     Give each entry record the prices that value its trades at market: the one writer of "leg_quotes".
 
@@ -7551,6 +7783,9 @@ def _attach_leg_quotes(records: Iterable[dict], candles_by_ticker: dict,
         start_date (date): The backtest's first trading date.
         depth_model (DepthModel | None): The depth model; None means every
             trade fills at the top of the book.
+        stale_max_age (float | None): Keyword-only. The run's stale-quote
+            limit in seconds (_resolve_stale_quote_max_age), carried on every
+            quote built; None (the default) checks nothing.
     """
     by_ticker: dict[str, LegQuotes | None] = {}
     by_pair: dict[tuple[str, str], dict] = {}
@@ -7564,7 +7799,8 @@ def _attach_leg_quotes(records: Iterable[dict], candles_by_ticker: dict,
                 ticker = m["ticker"]
                 if ticker not in by_ticker:
                     quotes, stale_days = _leg_quotes(m, candles_by_ticker.get(ticker) or [],
-                                                     start_date, depth_model)
+                                                     start_date, depth_model,
+                                                     stale_max_age=stale_max_age)
                     by_ticker[ticker] = quotes
                     stale_legs += 1 if stale_days else 0
             if by_ticker[tickers[0]] is None or by_ticker[tickers[1]] is None:
@@ -8264,7 +8500,8 @@ def _hour_moved(candle: dict, prev_ask: float | None, prev_bid: float | None) ->
     return False
 
 
-def _project_candles(candles: list[dict]) -> list[dict]:
+def _project_candles(candles: list[dict], *, window_open: int | None = None,
+                     market_open: int | None = None) -> list[dict]:
     """
     Keep, for each hourly candle, only what the backtest reads, plus two derived numbers.
 
@@ -8272,13 +8509,35 @@ def _project_candles(candles: list[dict]) -> list[dict]:
     ticker's full records for a run would cost far more memory than the four
     fields the backtest reads, so each candle is cut to exactly "ts",
     "yes_ask_close", "no_ask_close", "volume", "moved_ts" and "open_interest".
+    Every candle is kept, so every other reader gets exactly the candles the
+    fetch returned.
+
     "moved_ts" is the end (ts) of the latest hour, at or before this one, in
-    which contracts traded or either side's quote changed (_hour_moved); the
-    series' first hour always counts as having moved. Nothing reads the two
-    new keys yet.
+    which contracts traded or either side's quote changed (_hour_moved), or -1
+    when there is none yet. The stale-quote check reads it
+    (_quote_is_fresh). With window_open given — the start of the candle
+    request, as _fetch_candles_parallel asks for it (_candle_window_open) — it
+    is worked out from the request's own window only, so it does not depend on
+    whether the candle cache held a wider file:
+      * a candle ending at or before window_open (one a wider cached file
+        holds from before the request) gets -1;
+      * the first candle after it counts as moved only when contracts traded
+        in it, its own open, high or low differ from its close on either side,
+        or it is the market's opening hour (it ends no later than one candle
+        period after market_open); otherwise -1, until a later hour moves;
+      * every later candle is compared with the previous candle's closes.
+    So a quiet market reads as not having moved at the window's first
+    checkpoint until something moves: a slight pessimism, at the window's
+    start only. With no window_open (a caller with no request window, such as
+    a test) the series' first hour counts as having moved.
 
     Args:
         candles (list[dict]): One ticker's candles from fetch_candlesticks.
+        window_open (int | None): Keyword-only. The request's start, Unix
+            seconds; None for no window.
+        market_open (int | None): Keyword-only. The market's open_time, Unix
+            seconds; None when unknown (then no candle counts as its opening
+            hour).
 
     Returns:
         list[dict]: New dicts, ascending by "ts" (the input is sorted first,
@@ -8287,9 +8546,26 @@ def _project_candles(candles: list[dict]) -> list[dict]:
     out: list[dict] = []
     prev_ask: float | None = None
     prev_bid: float | None = None
-    moved_ts: Any = None
+    moved_ts: Any = None if window_open is None else -1
+    opening_end = (None if market_open is None
+                   else market_open + CANDLESTICK_PERIOD_INTERVAL_MINUTES * 60)
+    first_in_window = True
     for candle in sorted(candles, key=lambda c: c["ts"]):
-        if not out or _hour_moved(candle, prev_ask, prev_bid):
+        if window_open is None:
+            if not out or _hour_moved(candle, prev_ask, prev_bid):
+                moved_ts = candle["ts"]
+        elif candle["ts"] <= window_open:
+            # Before the request's window: only a wider cached file holds it
+            moved_ts = -1
+        elif first_in_window:
+            first_in_window = False
+            # Judged on itself: traded, or a range off its own closes (both
+            # sides), or the market's opening hour
+            opening = opening_end is not None and candle["ts"] <= opening_end
+            if opening or _hour_moved(candle, candle.get("yes_ask_close"),
+                                      candle.get("yes_bid_close")):
+                moved_ts = candle["ts"]
+        elif _hour_moved(candle, prev_ask, prev_bid):
             moved_ts = candle["ts"]
         out.append({
             "ts": candle["ts"],
@@ -8306,6 +8582,7 @@ def _project_candles(candles: list[dict]) -> list[dict]:
 
 def _fetch_projected_candles(hist_client: Any, ticker: str, open_ts: int, close_ts: int,
                              use_cache: bool, *, check_out: dict | None = None,
+                             market_open: int | None = None,
                              **endpoint: Any) -> list[dict]:
     """
     Fetch one ticker's candles and cut them to what the backtest keeps.
@@ -8324,17 +8601,20 @@ def _fetch_projected_candles(hist_client: Any, ticker: str, open_ts: int, close_
             low and close) before they are cut, and a ticker with failures is
             entered as check_out[ticker] = (failure count, up to
             INTEGRITY_MAX_EXAMPLES sentences). Each worker writes its own key.
+        market_open (int | None): Keyword-only. The market's open_time, Unix
+            seconds (None: unknown), for _project_candles' moved times.
         **endpoint: The series and live_first keywords for fetch_candlesticks, when any.
 
     Returns:
-        list[dict]: _project_candles of what fetch_candlesticks returned.
+        list[dict]: _project_candles of what fetch_candlesticks returned,
+            its moved times worked out from this request's window (open_ts).
     """
     full = fetch_candlesticks(hist_client, ticker, open_ts, close_ts, use_cache, **endpoint)
     if check_out is not None:
         failures = market_details.check_candles(full, ticker=ticker)
         if failures:
             check_out[ticker] = (len(failures), failures[:INTEGRITY_MAX_EXAMPLES])
-    return _project_candles(full)
+    return _project_candles(full, window_open=open_ts, market_open=market_open)
 
 
 def _fetch_candles_parallel(
@@ -8462,6 +8742,15 @@ def _fetch_candles_parallel(
         if series:
             settled = _parse_iso_datetime(m.get("settlement_ts"))
             endpoint = {"series": series, "live_first": _settled_after(settled, cutoff_ts)}
+        # The market's own open, for the moved time of its opening hour
+        opened = _parse_iso_datetime(m.get("open_time"))
+        if opened is not None and opened.tzinfo is None:
+            opened = opened.replace(tzinfo=UTC)
+        try:
+            market_open = None if opened is None else int(opened.timestamp())
+        except (OverflowError, ValueError, OSError):
+            market_open = None
+        endpoint = dict(endpoint, market_open=market_open)
         work.append((ticker, open_ts, close_ts, endpoint))
 
     if work:
@@ -9399,6 +9688,7 @@ def _prepare_candidates(
     series_categories: dict | None = None,
     fee_multipliers: dict | None = None,
     scheduled_close: bool | None = None,
+    stale_quote_max_age: Any = None,
 ) -> _Candidates | None:
     """
     Run the half of the backtest that depends on neither the band nor k.
@@ -9469,6 +9759,13 @@ def _prepare_candidates(
             _close_gate_and_labels), and every pair market whose series' rule
             gives a close carries it on its record (_SCHEDULED_CLOSE_KEY). Off,
             nothing is read and every record's key is popped.
+        stale_quote_max_age (Any): Keyword-only. The stale-quote limit in
+            seconds (_resolve_stale_quote_max_age): None (the default) reads
+            THIS MODULE's BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS at call time,
+            False turns the check off, a positive number sets it. Resolved
+            and checked before anything is fetched, and carried on the
+            result (_Candidates.stale_quote_max_age) to every quote the
+            entry passes attach.
 
     Returns:
         _Candidates | None: The candidate pairs (in scan order: time-series,
@@ -9502,8 +9799,12 @@ def _prepare_candidates(
             historical.SettledCorpusError (a RuntimeError subclass) out of
             either walk over a streamed corpus whose cache file cannot be
             read, or whose complete walk yields a different record count.
+        ValueError: Before any fetch, for a stale-quote limit that is not a
+            positive, finite number of seconds, None or False.
     """
 
+    # The stale-quote limit this run trades under, checked before any fetch
+    stale_limit = _resolve_stale_quote_max_age(stale_quote_max_age)
     # Feasibility pre-check, BEFORE any network call: if [start_date, today]
     # holds no run weekday, no trade can be entered, so skip the fetch. The
     # end is today, NOT yesterday (a market that settled early can still
@@ -9859,6 +10160,7 @@ def _prepare_candidates(
         fee_multipliers=fee_multipliers,
         scheduled_close=scheduled_on,
         close_rules=close_rules,
+        stale_quote_max_age=stale_limit,
     )
 
 
@@ -10492,6 +10794,7 @@ def _prepare_entries(
     series_categories: dict | None = None,
     fee_multipliers: dict | None = None,
     scheduled_close: bool | None = None,
+    stale_quote_max_age: Any = None,
 ) -> tuple[list[dict] | None, OutcomeLabelCoverage | None]:
     """
     Run the half of the backtest that does not depend on the interval discount.
@@ -10541,6 +10844,10 @@ def _prepare_entries(
             market's scheduled close where a live run reads its close, handed
             straight to _prepare_candidates(); None (default) resolves
             BACKTEST_SCHEDULED_CLOSE there, at call time.
+        stale_quote_max_age (Any): Keyword-only. The stale-quote limit in
+            seconds, handed straight to _prepare_candidates(); None (default)
+            resolves BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS there, False turns
+            the check off.
 
     Returns:
         tuple[list[dict] | None, OutcomeLabelCoverage | None]: The prepared
@@ -10582,6 +10889,7 @@ def _prepare_entries(
         hist_client, live_client, start_date, use_cache, max_horizon_days,
         same_event_ladders=same_event_ladders, series_categories=series_categories,
         fee_multipliers=fee_multipliers, scheduled_close=scheduled_close,
+        stale_quote_max_age=stale_quote_max_age,
     )
     if candidates is None:
         return None, None
@@ -10598,7 +10906,7 @@ def _prepare_entries(
     # from the candles before they are released with this function's locals,
     # with the depth model their synthetic books are built from
     _attach_leg_quotes(raw_entries, candidates.candles_by_ticker, candidates.start_date,
-                       depth_model)
+                       depth_model, stale_max_age=candidates.stale_quote_max_age)
 
     logging.info("Prepared %d candidate entries for sizing", len(raw_entries))
     _log_qualifying_mondays(raw_entries, None)
@@ -10876,7 +11184,10 @@ def _simulate_at_discount(
     much to bet) at the top of the book, a time-series pair's chance of paying
     read from that Monday's mid spread (config.time_series_mid_spread), as
     live sizing reads it, and a Monday whose quotes are crossed on either
-    market (a YES ask below its own YES bid) skipped and counted. It drops
+    market (a YES ask below its own YES bid) skipped and counted; so is a
+    Monday (of either pair type) where a market's quote had not moved or
+    traded within the stale-quote limit its quotes carry (_quote_is_fresh),
+    which never counts toward the peak Kelly fraction. It drops
     pairs with no usable pay-out, then walks the Mondays in date order. Each
     trade is sized by the live
     code (_size_trade): with a depth model and volume data that Monday, the
@@ -11120,6 +11431,11 @@ def _simulate_at_discount(
     # crossed (its YES ask below its own YES bid), once per pair per Monday;
     # reported once after the walk
     crossed_mondays = 0
+    # Mondays (either pair type) the Kelly gate skipped because a market's
+    # quote had not moved or traded within the stale-quote limit, once per
+    # pair per Monday, and that limit; reported once after the walk
+    stale_mondays = 0
+    stale_limit: float | None = None
     # SweepPoint.peak_kelly_fraction: the largest uncapped fraction over
     # every Monday a pair may be traded on
     peak_kelly = 0.0
@@ -11138,6 +11454,10 @@ def _simulate_at_discount(
         canon     = rec["canon"]
         group_key = rec["group_key"]
         entry     = rec["entry"]
+        # Each market's quotes (what _attach_leg_quotes wrote; None for a
+        # hand-built record), read here for the stale-quote check and below
+        # for the trade's marks
+        quotes = rec.get("leg_quotes")
 
         # The pair's qualifying Mondays with a positive Kelly fraction at this
         # k, in date order: all of them for a time-series pair, the first for
@@ -11149,6 +11469,20 @@ def _simulate_at_discount(
             mB = monday["mB"]
             pA, pB, nA, nB = monday["pA"], monday["pB"], monday["nA"], monday["nB"]
             entry_date = monday["entry_date"]
+
+            # A market whose quote has not moved or traded within the
+            # stale-quote limit (_quote_is_fresh) may no longer be on the book:
+            # the Monday cannot trade, so it never passes the gate (and never
+            # counts toward the peak Kelly fraction); a time-series pair tries
+            # its next qualifying Monday and a same-title pair moves on to its
+            # next, as for a failing Kelly fraction. Cap-independent.
+            if quotes is not None:
+                quotes_a, quotes_b = quotes[mA["ticker"]], quotes[mB["ticker"]]
+                if not (_quote_is_fresh(quotes_a, entry_date)
+                        and _quote_is_fresh(quotes_b, entry_date)):
+                    stale_mondays += 1
+                    stale_limit = quotes_a.stale_max_age
+                    continue
 
             # The two legs' top-of-the-book quotes — (nA, pB) for same_title,
             # (pA, nB) for time_series — the backtester's mirror of
@@ -11303,9 +11637,8 @@ def _simulate_at_discount(
                     same_title_ladders[id(m)] = _ladder_keys_dict(m)
             ladders_a, ladders_b = same_title_ladders[id(mA)], same_title_ladders[id(mB)]
 
-        # Each leg's prices over time (the one reader of what _attach_leg_quotes
-        # wrote), in this pair's A/B order; None values its trades at cost
-        quotes = rec.get("leg_quotes")
+        # Each leg's prices over time (the quotes read above), in this pair's
+        # A/B order; None values its trades at cost
         marks = None if quotes is None else (quotes[mA["ticker"]], quotes[mB["ticker"]])
 
         # One candidate per passing Monday, priced and ranked on that Monday
@@ -11529,6 +11862,16 @@ def _simulate_at_discount(
     # Times an exact pair was skipped for trading too recently (once per pair
     # per checkpoint)
     pairs_waiting = 0
+    # The stale-quote check's limit, as the candidates' quotes carry it (None:
+    # off, or no quoted candidate), and the sales and the Kelly trims it held
+    # back: a position (or pair) counted once per checkpoint where it would
+    # have sold (or been trimmed) with the check skipped. Counting only: the
+    # counterfactual valuations below change no state, and with the check off
+    # none is made
+    stale_on = next((c["marks"][0].stale_max_age for c in candidates
+                     if c["marks"] is not None and c["marks"][0].stale_max_age is not None),
+                    None)
+    stale_sales = stale_trims = 0
     # Selling of either kind visits every checkpoint, and needs each trade's pair
     selling = sell_level is not None or trimming
     # The live code's market objects, built once per record (_candidate_pair),
@@ -11661,6 +12004,7 @@ def _simulate_at_discount(
         nonlocal cash, positions_sold
         sold_here.clear()
         sold_ids: set[int] = set()
+        unsold: list[list[BacktestTrade]] = []
         for position in _positions(open_trades):
             if not _far_enough(position, d, min_days):
                 # Too near maturity: held to pay out, never valued
@@ -11668,6 +12012,8 @@ def _simulate_at_discount(
             # The checkpoint and the daily checks before it (_hold_readings)
             readings = _hold_readings(position, d, hold_days, level=sell_level)
             if readings is None or not _reached_every_day(sell_level, readings[1]):
+                if readings is None:
+                    unsold.append(position)
                 continue
             per_trade = readings[0][0]
             positions_sold += 1
@@ -11682,10 +12028,35 @@ def _simulate_at_discount(
                 # Free to trade again, at a later checkpoint only
                 traded_pairs.discard(pair_of[id(trade)])
                 sold_pairs.add(pair_of[id(trade)])
+        # Whether the stale-quote check alone kept any of them unsold (counting only)
+        count_stale_sales(d, unsold)
         if sold_ids:
             # A position is all the trades sharing its markets, so no open
             # trade still holds any of a sold position's
             drop(sold_ids)
+
+    def count_stale_sales(d: date, positions: list[list[BacktestTrade]]) -> None:
+        """
+        Count the positions the stale-quote check alone kept from selling at the checkpoint on `d`.
+
+        A position counts when it is not sold at `d` and would have been with
+        the check skipped (_hold_readings with stale_check=False reaching
+        sell_at at every check). Counting only; nothing else changes.
+
+        Args:
+            d (date): The checkpoint date.
+            positions (list[list[BacktestTrade]]): The positions not sold there.
+        """
+        nonlocal stale_sales
+        if stale_on is None:
+            return
+        for position in positions:
+            if not _far_enough(position, d, min_days) or not _stale_unpaid_leg(position, d):
+                continue
+            readings = _hold_readings(position, d, hold_days, level=sell_level,
+                                      stale_check=False)
+            if readings is not None and _reached_every_day(sell_level, readings[1]):
+                stale_sales += 1
 
     def planned_trims(d: date, value: float, open_now: list[BacktestTrade]) -> list:
         """
@@ -11708,7 +12079,7 @@ def _simulate_at_discount(
             list: (position, its sale) for each position that sells something
                 (_kelly_trim); empty when none does.
         """
-        nonlocal trim_floor, held_back, pairs_waiting
+        nonlocal trim_floor, held_back, pairs_waiting, stale_trims
         planned = []
         for position in _positions(open_now):
             # Skip a pair that traded too recently (config.kelly_trim_rested)
@@ -11727,6 +12098,12 @@ def _simulate_at_discount(
             # Kept for every position looked at, trimmed or not: at another
             # cap this one might have been
             trim_floor = max(trim_floor, decision.cap_free_from)
+            if (sale is None and stale_on is not None and _stale_unpaid_leg(position, d)
+                    and _kelly_trim(position, d, value, effective_k, cap, st_cap,
+                                    stale_check=False)[1] is not None):
+                # Trimmed with the stale-quote check skipped: the check held
+                # it back (counting only; the decision above stands)
+                stale_trims += 1
             if sale is not None:
                 planned.append((position, sale))
                 # One entry per trim made, since every plan is carried out.
@@ -11804,6 +12181,10 @@ def _simulate_at_discount(
             sells = sell_level is not None and any(
                 _position_sells(sell_level, position, d, hold_days, min_days)
                 for position in _positions(open_now))
+            if sell_level is not None and not sells:
+                # sell() is not called here: count what the stale-quote check
+                # alone kept from selling (counting only)
+                count_stale_sales(d, _positions(open_now))
             planned = []
             if trimming and not sells:
                 # The portfolio value a trim here is sized on: the cash after
@@ -12128,6 +12509,31 @@ def _simulate_at_discount(
         ", trimming to Kelly" if trimming else "",
         "" if min_rise is None else _trim_rise_label(min_rise),
     )
+    # Once per pair per Monday the Kelly gate skipped for a stale quote
+    # (silent at zero)
+    if stale_mondays:
+        logging.log(
+            logging.DEBUG if quiet else logging.INFO,
+            "Mondays skipped because a market's quote had not moved or traded for "
+            "over %s hours (%s): %d",
+            _stale_hours_text(stale_limit), run_label, stale_mondays,
+        )
+    # Once per position per checkpoint a stale quote held a sale back, and
+    # once per pair per checkpoint a Kelly trim (silent at zero)
+    if stale_sales:
+        logging.log(
+            logging.DEBUG if quiet else logging.INFO,
+            "Sales held back because a market's quote had not moved or traded for "
+            "over %s hours (%s): %d",
+            _stale_hours_text(stale_on), run_label, stale_sales,
+        )
+    if stale_trims:
+        logging.log(
+            logging.DEBUG if quiet else logging.INFO,
+            "Kelly trims held back because a market's quote had not moved or traded for "
+            "over %s hours (%s): %d",
+            _stale_hours_text(stale_on), run_label, stale_trims,
+        )
     # Once per pair per Monday the Kelly gate skipped for a crossed quote
     # (silent at zero)
     if crossed_mondays:
@@ -12616,6 +13022,7 @@ def run_backtest(
     series_categories: dict | None = None,
     fee_multipliers: dict | None = None,
     scheduled_close: bool | None = None,
+    stale_quote_max_age: Any = None,
 ) -> tuple[list[BacktestTrade], pd.DataFrame]:
     """
     Replay both pair strategies on all settled Kalshi markets from start_date.
@@ -12679,6 +13086,10 @@ def run_backtest(
             market's scheduled close where a live run reads its close, handed
             straight to _prepare_candidates(); None (default) resolves
             BACKTEST_SCHEDULED_CLOSE there, at call time.
+        stale_quote_max_age (Any): Keyword-only. The stale-quote limit in
+            seconds, handed through _prepare_entries() to
+            _prepare_candidates(); None (default) resolves
+            BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS there, False turns it off.
 
     Returns:
         tuple[list[BacktestTrade], pd.DataFrame]: (trades, equity_df).
@@ -12731,7 +13142,7 @@ def run_backtest(
     raw_entries, _ = _prepare_entries(
         hist_client, live_client, start_date, use_cache, max_horizon_days,
         series_categories=series_categories, fee_multipliers=fee_multipliers,
-        scheduled_close=scheduled_close,
+        scheduled_close=scheduled_close, stale_quote_max_age=stale_quote_max_age,
     )
     if raw_entries is None:
         # Same empty-result shape the zero-trade path produces, so backtest.py
@@ -13557,7 +13968,8 @@ def _sweep_from_candidates(
     _attach_leg_quotes(
         [rec for entries in (*entries_by_band.values(), *tier_off_entries.values())
          for rec in entries],
-        candidates.candles_by_ticker, candidates.start_date, depth_model)
+        candidates.candles_by_ticker, candidates.start_date, depth_model,
+        stale_max_age=candidates.stale_quote_max_age)
     # Nothing below reads a candle or the pair list. Releasing both here keeps
     # the peak at a single-band run's entry-pass peak and, like the
     # single-band path (whose pair list dies with _prepare_entries' locals),
@@ -13914,6 +14326,9 @@ def _sweep_from_candidates(
         trim_sweep=trimmed,
         # Whether every market's close was read as a live run reads it
         scheduled_close=candidates.scheduled_close,
+        # The stale-quote limit every entry, sale and trim was held to (False: off)
+        stale_quote_max_age=(False if candidates.stale_quote_max_age is None
+                             else candidates.stale_quote_max_age),
     )
 
 
@@ -13940,6 +14355,7 @@ def run_backtest_sweep(
     series_categories: dict | None = None,
     fee_multipliers: dict | None = None,
     scheduled_close: bool | None = None,
+    stale_quote_max_age: Any = None,
 ) -> BacktestSweep:
     """
     Replay both pair strategies at one interval discount, or at a grid of them —
@@ -14144,6 +14560,12 @@ def run_backtest_sweep(
             market's scheduled close where a live run reads its close, handed
             straight to _prepare_candidates(); None (default) resolves
             BACKTEST_SCHEDULED_CLOSE there, at call time.
+        stale_quote_max_age (Any): Keyword-only. The stale-quote limit in
+            seconds (_resolve_stale_quote_max_age): None (default) resolves
+            this module's BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS at call time,
+            False turns the check off, a positive number sets it. Logged on
+            one setting line and recorded on the result
+            (BacktestSweep.stale_quote_max_age).
 
     Returns:
         BacktestSweep: primary (the effective-discount, primary-band result),
@@ -14177,7 +14599,9 @@ def run_backtest_sweep(
             TAKE_PROFIT_MIN_DAYS is not a non-empty collection of distinct
             whole numbers of at least 1, if trim_rise_sweep is set and this
             module's TRIM_MIN_PRICE_RISES is not a non-empty collection of
-            distinct real numbers in (0, 1], or if
+            distinct real numbers in (0, 1], if stale_quote_max_age (or,
+            with None, this module's BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS) is
+            not a positive, finite number of seconds, None or False, or if
             spread_band is not a valid band; and,
             before any fetch, from _prepare_candidates() when SCHEDULED_RUN
             cannot place the entry checkpoints (a configuration error).
@@ -14236,6 +14660,8 @@ def run_backtest_sweep(
     # ... and, when the Kelly-trim family carries them, for the minimum price
     # rises, which the dashboard likewise reads only after the run
     trim_rises = _resolve_trim_min_rises() if trim_rise_sweep else ()
+    # ... and for the stale-quote limit (None: the check is off)
+    stale_limit = _resolve_stale_quote_max_age(stale_quote_max_age)
     # And for k: every simulation hands it to the live sizer, whose
     # LiveSettings takes only a k in (0, 1]
     if interval_discount is not None and (
@@ -14366,6 +14792,17 @@ def run_backtest_sweep(
         "config.BACKTEST_SCHEDULED_CLOSE" if scheduled_close is None
         else "run-level override",
     )
+    # And whether an entry, a sale or a Kelly trim needs each market's quote
+    # to have moved, or traded, recently (_quote_is_fresh)
+    logging.info(
+        "Stale-quote check (backtest): %s (%s)",
+        f"on — an entry, a sale or a Kelly trim at a checkpoint needs each of its "
+        f"markets to have traded, or moved its quote, within {_stale_hours_text(stale_limit)} "
+        f"hours before it" if stale_limit is not None else
+        "off — a quote is traded on however long it has been unchanged",
+        "config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS" if stale_quote_max_age is None
+        else "run-level override",
+    )
     # The saved live defaults (never main.py's per-run overrides), read ONCE
     # before the fetch, so a refused file warns at the top of the run
     live = _live_settings_for_report()
@@ -14379,6 +14816,7 @@ def run_backtest_sweep(
         hist_client, live_client, start_date, use_cache, max_horizon_days,
         same_event_ladders=same_event_ladders, series_categories=series_categories,
         fee_multipliers=fee_multipliers, scheduled_close=scheduled_close,
+        stale_quote_max_age=stale_quote_max_age,
     )
     if candidates is None:
         # Nothing can be simulated at any discount or band. Build the empty
@@ -14406,6 +14844,8 @@ def run_backtest_sweep(
                                entry_checkpoint=SCHEDULED_RUN.label(),
                                depth_model=depth_model,
                                scheduled_close=scheduled_on,
+                               stale_quote_max_age=(False if stale_limit is None
+                                                    else stale_limit),
                                **_live_rule_fields(live))
     else:
         # Every entry pass and simulation. It deletes the candles and pair list

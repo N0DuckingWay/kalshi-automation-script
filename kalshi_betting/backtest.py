@@ -8,6 +8,7 @@ Purpose:
     arguments (--start-date, --balance, --no-cache, --max-horizon-days,
     --interval-discount, --no-sweep, --same-event-ladders /
     --no-same-event-ladders, --scheduled-close / --no-scheduled-close,
+    --stale-quote-hours / --no-stale-quote-check,
     --spread-min, --spread-max, --no-band-sweep,
     --no-cap-sweep, --no-add-on-sweep, --no-sell-sweep, --sell-workers,
     --no-trim-sweep, --no-trim-rise-sweep, --dashboard-only,
@@ -123,6 +124,11 @@ Notes:
     config.BACKTEST_SCHEDULED_CLOSE (on by default): whether the backtest reads
     each settled market's scheduled close, from a rule learned per series,
     where a live run reads its close. It never reaches a live run.
+
+    --stale-quote-hours N / --no-stale-quote-check is the one-run override for
+    config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS (24 hours by default): how
+    recently each market of an entry, a sale or a Kelly trim must have traded,
+    or moved its quote, before the checkpoint. It never reaches a live run.
 
     That setting reaches kalshi_backtest.log (the pre-fetch echo below and
     run_backtest_sweep's resolved line) AND the HTML dashboard's own page
@@ -302,6 +308,7 @@ from .auth import read_account_balance
 from .backtester import BacktestSweep, run_backtest_sweep
 from .config import (
     BACKTEST_SCHEDULED_CLOSE,
+    BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS,
     BACKTEST_SWEEP_FILENAME,
     BACKTEST_SWEEP_FORMAT,
     BACKTEST_SWEEP_HEADER_MAX_BYTES,
@@ -442,6 +449,19 @@ def _account_starting_balance(client) -> StartingBalance:
     )
 
 
+def _stale_quote_text(limit: float | None) -> str:
+    """
+    A stale-quote limit as the pre-fetch echo and --help name it: "24 h", or "off".
+
+    Args:
+        limit (float | None): The limit in seconds; None for the check off.
+
+    Returns:
+        str: The hours with %g and " h", or "off".
+    """
+    return "off" if limit is None else f"{limit / 3600:g} h"
+
+
 def _fills_echo(depth_model: DepthModel | None) -> str:
     """
     Say how the run's trades will fill, for the pre-fetch config line.
@@ -545,6 +565,8 @@ _RUN_ONLY_FLAGS = (
     ("no_sweep", "--no-sweep"),
     ("same_event_ladders", "--same-event-ladders / --no-same-event-ladders"),
     ("scheduled_close", "--scheduled-close / --no-scheduled-close"),
+    ("stale_quote_hours", "--stale-quote-hours"),
+    ("no_stale_quote_check", "--no-stale-quote-check"),
     ("spread_min", "--spread-min"), ("spread_max", "--spread-max"),
     ("no_band_sweep", "--no-band-sweep"),
 )
@@ -1241,6 +1263,21 @@ def _build_parser() -> argparse.ArgumentParser:
              "close (default: config.BACKTEST_SCHEDULED_CLOSE, currently "
              f"{'on' if BACKTEST_SCHEDULED_CLOSE else 'off'}). Backtest only.",
     )
+    # The stale-quote check: a limit in hours for this run, or off; neither
+    # given reads config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS at call time
+    stale = parser.add_mutually_exclusive_group()
+    stale.add_argument(
+        "--stale-quote-hours", type=float, default=None, metavar="N",
+        help="An entry, a sale or a Kelly trim at a checkpoint needs each of its "
+             "markets to have traded, or moved its quote, within N hours before "
+             "it (default: config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS, currently "
+             f"{_stale_quote_text(BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS)}). Backtest only.",
+    )
+    stale.add_argument(
+        "--no-stale-quote-check", action="store_true",
+        help="Trade on a quote however long it has been unchanged, for this run. "
+             "Backtest only.",
+    )
     # Each side is independently optional; the omitted one resolves from
     # config's own default band (see the validation block below), not from a
     # literal (0.0, 1.0) here — which is why the help names the constant
@@ -1351,7 +1388,8 @@ def main() -> None:
     Parses command-line arguments (--start-date, --balance, --no-cache,
     --max-horizon-days, --interval-discount, --no-sweep,
     --same-event-ladders / --no-same-event-ladders, --scheduled-close /
-    --no-scheduled-close, --spread-min,
+    --no-scheduled-close, --stale-quote-hours / --no-stale-quote-check,
+    --spread-min,
     --spread-max, --no-band-sweep, --no-cap-sweep, --no-add-on-sweep,
     --no-sell-sweep, --no-trim-sweep, --no-trim-rise-sweep, --sell-workers,
     --dashboard-only, --accept-changed-simulator); with --dashboard-only it
@@ -1411,6 +1449,9 @@ def main() -> None:
         parser.error("--spread-min must be between 0 and 1")
     if args.spread_max is not None and not (0.0 <= args.spread_max <= 1.0):
         parser.error("--spread-max must be between 0 and 1")
+    if args.stale_quote_hours is not None and not (
+            math.isfinite(args.stale_quote_hours) and args.stale_quote_hours > 0):
+        parser.error("--stale-quote-hours must be a positive number of hours")
 
     # Resolved here, BEFORE logging is configured (TS-20 — see the comment
     # below). The configured default is read and validated on EVERY run,
@@ -1489,6 +1530,16 @@ def main() -> None:
     scheduled_echo = "on" if effective_scheduled else "off"
     if bool(effective_scheduled) != bool(BACKTEST_SCHEDULED_CLOSE):
         scheduled_echo += f" (config: {'on' if BACKTEST_SCHEDULED_CLOSE else 'off'})"
+    # ... and for the stale-quote check: the limit this run hands the sweep
+    # (None: the config's; False: off), echoed against the config's
+    stale_quote_max_age = (False if args.no_stale_quote_check
+                           else None if args.stale_quote_hours is None
+                           else args.stale_quote_hours * 3600.0)
+    effective_stale = (BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS if stale_quote_max_age is None
+                       else None if stale_quote_max_age is False else stale_quote_max_age)
+    stale_echo = _stale_quote_text(effective_stale)
+    if stale_echo != _stale_quote_text(BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS):
+        stale_echo += f" (config: {_stale_quote_text(BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS)})"
     # Same pre-fetch echo, same reason, for the spread band: the VALUE is
     # resolved through the same config function run_backtest_sweep calls
     # (never a by-value copy of BACKTEST_DEFAULT_SPREAD_BAND), so it cannot
@@ -1570,10 +1621,11 @@ def main() -> None:
 
     logging.info(
         "Backtest config: start=%s | balance=$%.2f | cache=%s | scheduled close=%s "
-        "| k=%.3f | ladders=%s | spread band=%g-%g | band sweep=%s | cap sweep=%s "
-        "| add-on sweep=%s | sell sweep=%s | trim sweep=%s | live rule=%s | fills=%s",
+        "| k=%.3f | stale quotes=%s | ladders=%s | spread band=%g-%g | band sweep=%s "
+        "| cap sweep=%s | add-on sweep=%s | sell sweep=%s | trim sweep=%s | live rule=%s "
+        "| fills=%s",
         start_date, start.dollars, "on" if use_cache else "off", scheduled_echo,
-        effective_k, ladders_echo, echo_floor, echo_ceiling,
+        effective_k, stale_echo, ladders_echo, echo_floor, echo_ceiling,
         "on" if band_sweep else "off", "on" if cap_sweep else "off",
         "on" if add_on_sweep else "off",
         f"on ({sell_workers} worker process{'' if sell_workers == 1 else 'es'})"
@@ -1652,6 +1704,8 @@ def main() -> None:
         same_event_ladders=args.same_event_ladders,
         # Whether a market's close is read as a live run read it (None: config)
         scheduled_close=args.scheduled_close,
+        # How recently each market's quote must have moved (None: config; False: off)
+        stale_quote_max_age=stale_quote_max_age,
         spread_band=spread_band,
         band_sweep=band_sweep,
         # The dashboard's "Tier floors: off" view: the band sweep's

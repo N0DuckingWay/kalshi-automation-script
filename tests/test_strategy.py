@@ -3835,6 +3835,64 @@ class TestTimeSeriesKellyParity:
             assert mutant != shape, name
             assert _live_held_pair_problems(mutant), name
 
+    def test_ast_the_stale_quote_check_has_one_test_and_three_readers(self):
+        # C6: a backtest entry, sale or Kelly trim needs each market's quote
+        # to have moved recently. One test, backtester._quote_is_fresh, read
+        # in exactly three places anywhere in the package: Pass 1b's Kelly
+        # gate, the checkpoint sale value and the Kelly trim's fresh bids.
+        # The moved times and the limit it reads are read nowhere else but
+        # LegQuotes itself (and the gate's skip-count line, the limit only).
+        import importlib
+        import pkgutil
+
+        import kalshi_betting
+
+        names = sorted(m.name for m in pkgutil.iter_modules(kalshi_betting.__path__))
+        callers: set = set()
+        readers: dict[str, set] = {"moved_checkpoints": set(), "stale_max_age": set()}
+        for name in names:
+            module = importlib.import_module(f"kalshi_betting.{name}")
+            tree = ast.parse(inspect.getsource(module))
+            for func in ast.walk(tree):
+                if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for sub in ast.walk(func):
+                    if isinstance(sub, ast.Call):
+                        fn = sub.func
+                        called = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
+                        if called == "_quote_is_fresh":
+                            callers.add((name, func.name))
+                    if (isinstance(sub, ast.Attribute) and sub.attr in readers
+                            and isinstance(sub.ctx, ast.Load)):
+                        readers[sub.attr].add((name, func.name))
+        assert callers == {("backtester", "_simulate_at_discount"),
+                           ("backtester", "_position_sale_value"),
+                           ("backtester", "_fresh_bids"),
+                           # ... and the gate of the walk's count-only revaluations
+                           ("backtester", "_stale_unpaid_leg")}
+        assert _function_calls(backtester, "_simulate_at_discount", "_stale_unpaid_leg")
+        assert readers["moved_checkpoints"] == {("backtester", "_quote_is_fresh"),
+                                                ("backtester", "__reduce__"),
+                                                ("backtester", "__eq__")}
+        assert readers["stale_max_age"] == {("backtester", "_quote_is_fresh"),
+                                            ("backtester", "__init__"),
+                                            ("backtester", "__reduce__"),
+                                            ("backtester", "__eq__"),
+                                            ("backtester", "_simulate_at_discount")}
+        # The quotes carry the run's limit: written by the one quote builder,
+        # from the one writer of "leg_quotes", from the run's resolved limit
+        assert _function_calls(backtester, "_leg_quotes", "_moved_ts")
+        assert _function_calls(backtester, "_prepare_candidates",
+                               "_resolve_stale_quote_max_age")
+        assert _function_calls(backtester, "run_backtest_sweep", "_resolve_stale_quote_max_age")
+        for caller in ("_prepare_entries", "_sweep_from_candidates"):
+            (value,) = _keyword_values(backtester, caller, "_attach_leg_quotes",
+                                       "stale_max_age")
+            assert ast.unparse(value) == "candidates.stale_quote_max_age", caller
+        (value,) = _keyword_values(backtester, "_attach_leg_quotes", "_leg_quotes",
+                                   "stale_max_age")
+        assert ast.unparse(value) == "stale_max_age"
+
     def test_ast_open_trades_are_valued_through_one_definition(self):
         # The backtest values an open trade at market from the quotes the one
         # writer, _attach_leg_quotes, puts on each entry record under
@@ -3920,7 +3978,10 @@ class TestTimeSeriesKellyParity:
                     if name in sale_readers:
                         sale_readers[name].add(func.name)
         assert sale_readers == {"bid_at_checkpoint": {"_position_sale_value", "_fresh_bids"},
-                                "paid_at_checkpoint": {"_position_sale_value"},
+                                # ... and the gate of the stale-quote check's
+                                # count-only revaluations (C6), which decides nothing
+                                "paid_at_checkpoint": {"_position_sale_value",
+                                                       "_stale_unpaid_leg"},
                                 "sale_ladder": {"_position_sale_value"},
                                 "_position_sale_value": {"_hold_readings", "_kelly_trim",
                                                          "net_sale"},
@@ -3955,9 +4016,15 @@ class TestTimeSeriesKellyParity:
         # sized on (the one checkpoint_value assignment)
         walk = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
                     and node.name == "_simulate_at_discount")
-        [decided] = _calls_to(walk, "_kelly_trim")
+        [decided, counted] = _calls_to(walk, "_kelly_trim")
         assert [ast.unparse(arg) for arg in decided.args] == [
             "position", "d", "value", "effective_k", "cap", "st_cap"] and not decided.keywords
+        # The second call only counts the trims the stale-quote check held
+        # back (C6): the same arguments with the check skipped, read for
+        # nothing but that count
+        assert [ast.unparse(arg) for arg in counted.args] == [
+            ast.unparse(arg) for arg in decided.args]
+        assert [ast.unparse(kw) for kw in counted.keywords] == ["stale_check=False"]
         plans = _calls_to(walk, "planned_trims")
         assert sorted(ast.unparse(call) for call in plans) == [
             "planned_trims(d, value, open_now)",
@@ -4038,7 +4105,9 @@ class TestTimeSeriesKellyParity:
                     and node.name == "planned_trims")
         [measured] = _calls_to(plan, "_price_rise")
         [tested] = _calls_to(plan, "trim_rise_reached")
-        [decided] = _calls_to(plan, "_kelly_trim")
+        # The decision; the call after it (stale_check=False) only counts
+        # the trims the stale-quote check held back
+        decided, _counted = _calls_to(plan, "_kelly_trim")
         assert measured.lineno < tested.lineno < decided.lineno
         assert [ast.unparse(arg) for arg in measured.args] == ["position", "d", "last_trim"]
         assert [ast.unparse(arg) for arg in tested.args] == ["rise", "min_rise"]
@@ -4093,7 +4162,7 @@ class TestTimeSeriesKellyParity:
         # counted on no other line and adds nothing to cap_free_from
         [measured] = _calls_to(plan, "_price_rise")
         [tested] = _calls_to(plan, "trim_rise_reached")
-        [decided] = _calls_to(plan, "_kelly_trim")
+        decided, _counted = _calls_to(plan, "_kelly_trim")
         assert gate.lineno < gate.end_lineno < measured.lineno < tested.lineno < decided.lineno
         # Only the walk asks the rule. It needs no config.trade_day: its
         # checkpoints are already dates

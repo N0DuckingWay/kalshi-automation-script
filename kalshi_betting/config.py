@@ -2319,6 +2319,18 @@ SCHEDULED_CLOSE_MIN_OBSERVATIONS = 20
 # day's diesel prices, say) proves nothing about the series' next one.
 SCHEDULED_CLOSE_MIN_EVENTS = 2
 
+# How old, at most, a market's last move may be for the backtest to trade on its
+# quote: an entry, a sale or a Kelly trim at a weekly checkpoint needs each of
+# its markets (each one still to pay out, for a sale) to have traded, or to have
+# changed either side's quote, within this many seconds before the checkpoint
+# (the backtest only; a live run always reads a fresh order book). A candle's
+# "moved_ts" is the end of the latest hour, at or before it, in which that
+# happened, and the check reads the candle the checkpoint reads; exactly this
+# old is still fresh. A quote that has sat unchanged for days may no longer be
+# on the book. None turns the check off. backtest.py --stale-quote-hours N /
+# --no-stale-quote-check set it for one run.
+BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS = 86_400
+
 # The highest NO ask a candle can carry: historical.fetch_candlesticks stores a
 # candle's NO ask as 1 - its YES bid, held within [0.01, this], so an empty YES-bid
 # book reads 0.99 just as a real 1c YES bid does; a NO ask here is therefore no
