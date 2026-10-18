@@ -1,7 +1,7 @@
 """Tests for live_dashboard.py: what the Live trading tab shows (payload), the
 tab page's server (one read of the account at a time, refusals of every
 request not from its own page), the backtest page's server (the page and its
-chunk files, and nothing outside them), the socket side, main()'s start and
+chunk files, and nothing outside them, and the Data page at /eda/), the socket side, main()'s start and
 its reuse of a running dashboard, the page's script (run under
 tests/js/live_harness.js with node or jsc, skipping without either), and the
 rules that keep the dashboard read-only and away from the order path.
@@ -593,25 +593,47 @@ class TestPageApp:
         assert f"script-src {config.LIVE_DASHBOARD_PLOTLY_URL} 'sha256-{digest}';" in csp
         assert "frame-ancestors 'none'" in csp and "connect-src 'self'" in csp
         assert f"frame-src http://127.0.0.1:{config.LIVE_BACKTEST_PORT};" in csp
-        # The backtest address and the request header are written into the script
+        # The backtest and Data addresses and the request header are written
+        # into the script; both pages are on the one origin frame-src allows
         assert json.dumps(live_dashboard.BACKTEST_URL) in script
+        assert json.dumps(live_dashboard.DATA_URL) in script
+        assert live_dashboard.DATA_URL == f"http://127.0.0.1:{config.LIVE_BACKTEST_PORT}/eda/"
         assert json.dumps(config.LIVE_DASHBOARD_REQUEST_HEADER) in script
 
     def test_the_page_has_its_tabs_buttons_and_frame(self):
         page = live_dashboard._SHELL
         assert re.search(r'id="tab-live" role="tab" aria-selected="true"', page)
         assert re.search(r'id="tab-backtest" role="tab" aria-selected="false"', page)
+        assert re.search(r'id="tab-data" role="tab" aria-selected="false" '
+                         r'aria-controls="panel-data">Data</button>', page)
+        # Three tab buttons, in order, and nothing else in the tab list
+        assert re.findall(r'role="tab"[^>]*>([^<]+)</button>', page) == [
+            "Live trading", "Backtest", "Data"]
+        assert re.search(r'<section id="panel-data" role="tabpanel" aria-labelledby="tab-data" '
+                         r'hidden>', page)
         for i, (label, _) in enumerate(config.LIVE_DASHBOARD_PERIODS):
             pressed = "true" if i == 0 else "false"
             assert f'id="period-{i}" aria-pressed="{pressed}">{label}</button>' in page
         for key, label in live_dashboard.CARD_LABELS:
             assert f'>{label}</div><div class="card-value flat" id="card-{key}">' in page
-        frame = re.search(r'<iframe id="backtest-frame" title="Backtest dashboard" '
-                          r'sandbox="([^"]+)"></iframe>', page)
-        # Scripts in its own origin, the defaults server's pages in windows of
-        # their own and a chart's picture saved; never the tab page navigated
-        assert frame.group(1).split() == ["allow-scripts", "allow-same-origin", "allow-popups",
-                                          "allow-popups-to-escape-sandbox", "allow-downloads"]
+        frames = re.findall(r'<iframe id="([^"]+)" title="([^"]+)" sandbox="([^"]+)"></iframe>',
+                            page)
+        assert [(i, t) for i, t, _ in frames] == [("backtest-frame", "Backtest dashboard"),
+                                                 ("data-frame", "Data")]
+        sandboxes = {i: sandbox.split() for i, _, sandbox in frames}
+        # The backtest page: scripts in its own origin, the defaults server's
+        # pages in windows of their own and a chart's picture saved; never the
+        # tab page navigated
+        assert sandboxes["backtest-frame"] == [
+            "allow-scripts", "allow-same-origin", "allow-popups",
+            "allow-popups-to-escape-sandbox", "allow-downloads"]
+        # The Data page opens no window: scripts, its own origin and a chart's
+        # picture saved, nothing more
+        assert sandboxes["data-frame"] == ["allow-scripts", "allow-same-origin",
+                                           "allow-downloads"]
+        # Neither frame is given an address until its tab is chosen
+        assert ' src="' not in page.split('<section id="panel-backtest"', 1)[1].split(
+            "<script>", 1)[0]
         assert "allow-top-navigation" not in page
         # The warnings come before every figure they may qualify
         assert page.index('id="live-warnings"') < page.index('id="live-stats"')
@@ -764,6 +786,7 @@ class TestPageApp:
     def test_unknown_paths(self):
         assert _get(PageApp(), "/favicon.ico").status == 404
         assert _get(PageApp(), "/backtest/").status == 404
+        assert _get(PageApp(), "/eda/").status == 404
 
     def test_a_page_app_built_without_a_reader_refuses_to_read(self):
         response = _get(PageApp(), "/api/live", headers=LIVE_HEADER)
@@ -779,6 +802,7 @@ def checkout(tmp_path, monkeypatch):
     chunks = root / config.DASHBOARD_FILES_DIRNAME / "build1"
     chunks.mkdir(parents=True)
     (root / config.DASHBOARD_FILENAME).write_text("<html>the backtest</html>", encoding="utf-8")
+    (root / config.EDA_DASHBOARD_FILENAME).write_text("<html>the data</html>", encoding="utf-8")
     (chunks / "chunk-3.js").write_text("window.__dashChunk(1);", encoding="utf-8")
     (chunks / "notes.txt").write_text("not a chunk", encoding="utf-8")
     (root / "secrets.js").write_text("outside", encoding="utf-8")
@@ -844,7 +868,9 @@ class TestBacktestApp:
         assert response.status == 404
 
     def test_other_paths_are_404(self, checkout):
-        for target in ("/", "/backtest_dashboard.html", "/backtest/secrets.js", "/api/live"):
+        for target in ("/", "/backtest_dashboard.html", "/backtest/secrets.js", "/api/live",
+                       f"/{config.EDA_DASHBOARD_FILENAME}", f"/eda/{config.EDA_DASHBOARD_FILENAME}",
+                       "/eda/x.js", "/eda/../secrets.js", "/eda//"):
             assert _backtest(target).status == 404, target
 
     def test_an_unchanged_file_is_304(self, checkout):
@@ -924,6 +950,102 @@ class TestBacktestApp:
                            {"host": BACKTEST_HOST, "sec-fetch-mode": "navigate"},
                            frozenset({"sec-fetch-site"}))
         assert BacktestApp().handle(request).status == 403
+
+
+class TestDataPageRoute:
+    """/eda/ on the backtest page's port: the Data page, under the backtest page's rules."""
+
+    def test_the_address_without_its_slash_is_sent_on(self, checkout):
+        response = _backtest("/eda")
+        assert response.status == 308
+        assert ("Location", "/eda/") in response.headers
+
+    def test_the_page(self, checkout):
+        response = _backtest("/eda/")
+        assert response.status == 200
+        assert response.body == checkout / config.EDA_DASHBOARD_FILENAME
+        assert response.content_type == "text/html; charset=utf-8"
+        # The backtest page is still its own
+        assert _backtest("/backtest/").body == checkout / config.DASHBOARD_FILENAME
+
+    def test_no_data_page_yet(self, checkout):
+        (checkout / config.EDA_DASHBOARD_FILENAME).unlink()
+        response = _backtest("/eda/")
+        assert response.status == 200
+        assert response.content_type == "text/html; charset=utf-8"
+        assert "There is no Data page yet" in response.body
+        assert "python3 -m kalshi_betting.backtest" in response.body
+        assert "python3 -m kalshi_betting.eda" in response.body
+        # Nothing on it to run
+        assert "<script" not in response.body
+
+    def test_an_unchanged_page_is_304(self, checkout):
+        page = checkout / config.EDA_DASHBOARD_FILENAME
+        os.utime(page, (1_700_000_000, 1_700_000_000))
+        first = _backtest("/eda/")
+        headers = dict(first.headers)
+        assert headers["Last-Modified"] == formatdate(1_700_000_000, usegmt=True)
+        tag = headers["ETag"]
+        again = _backtest("/eda/", headers={"If-None-Match": tag})
+        assert (again.status, again.body, dict(again.headers)["ETag"]) == (304, b"", tag)
+        since = _backtest("/eda/", headers={"If-Modified-Since": headers["Last-Modified"]})
+        assert (since.status, since.body) == (304, b"")
+        assert _backtest("/eda/", headers={"If-None-Match": '"other"'}).status == 200
+        older = _backtest("/eda/", headers={
+            "If-Modified-Since": formatdate(1_600_000_000, usegmt=True)})
+        assert older.status == 200
+
+    def test_every_answer_may_be_framed_by_the_tab_page_only(self, checkout):
+        missing = checkout / "gone"
+        for target in ("/eda/", "/eda"):
+            headers = dict(_backtest(target).headers)
+            ancestors = headers["Content-Security-Policy"].removeprefix("frame-ancestors ")
+            assert ancestors.split() == [f"http://127.0.0.1:{config.LIVE_DASHBOARD_PORT}",
+                                         f"http://localhost:{config.LIVE_DASHBOARD_PORT}"]
+            assert "X-Frame-Options" not in headers
+            assert not any(n.lower().startswith("access-control") for n in headers)
+            assert headers["Cross-Origin-Resource-Policy"] == "same-site"
+        (checkout / config.EDA_DASHBOARD_FILENAME).rename(missing)
+        headers = dict(_backtest("/eda/").headers)
+        assert headers["Content-Security-Policy"].startswith("frame-ancestors ")
+        assert headers["Cross-Origin-Resource-Policy"] == "same-site"
+
+    @pytest.mark.parametrize("host", ["evil.com", PAGE_HOST, "127.0.0.1:8765", None])
+    def test_a_wrong_host_is_refused(self, checkout, host):
+        assert _backtest("/eda/", host=host).status == 403
+        assert _backtest("/eda", host=host).status == 403
+
+    def test_only_get_and_head(self, checkout):
+        assert _backtest("/eda/", method="POST").status == 405
+        assert _backtest("/eda/", method="HEAD").status == 200
+
+    @pytest.mark.parametrize("site, mode, status", [
+        ("cross-site", "no-cors", 403),
+        ("cross-site", "cors", 403),
+        ("cross-site", None, 403),
+        ("cross-site", "navigate", 200),         # localhost:8766 framing it
+        ("same-site", "no-cors", 200),
+        ("same-origin", "no-cors", 200),
+        ("none", "navigate", 200),
+        (None, None, 200)])
+    def test_no_other_site_may_load_it(self, checkout, site, mode, status):
+        headers = {name: value for name, value in (("Sec-Fetch-Site", site),
+                                                    ("Sec-Fetch-Mode", mode)) if value}
+        assert _backtest("/eda/", headers=headers).status == status
+
+    def test_a_sec_fetch_site_given_twice_loads_nothing(self, checkout):
+        request = _Request("GET", "/eda/", BACKTEST_HOST,
+                           {"host": BACKTEST_HOST, "sec-fetch-mode": "navigate"},
+                           frozenset({"sec-fetch-site"}))
+        assert BacktestApp().handle(request).status == 403
+
+    def test_it_reads_the_project_root_when_called(self, checkout, tmp_path, monkeypatch):
+        other = tmp_path / "other"
+        other.mkdir()
+        (other / config.EDA_DASHBOARD_FILENAME).write_text("<html>other</html>",
+                                                          encoding="utf-8")
+        monkeypatch.setattr(config, "PROJECT_ROOT", other)
+        assert _backtest("/eda/").body == other / config.EDA_DASHBOARD_FILENAME
 
 
 # ---- the socket side --------------------------------------------------------------
@@ -1596,11 +1718,55 @@ class TestPageScript:
         assert backtest["el"]["panel-backtest"]["hidden"] is False
         assert backtest["el"]["tab-backtest"]["attrs"]["aria-selected"] == "true"
         assert backtest["el"]["tab-live"]["attrs"]["aria-selected"] == "false"
+        # The Data tab stays shut, and its page unloaded
+        assert backtest["el"]["tab-data"]["attrs"]["aria-selected"] == "false"
+        assert backtest["el"]["panel-data"]["hidden"] is True
+        # (an element the script never touched is not in the snapshot)
+        assert backtest["el"].get("data-frame", {"src": ""})["src"] == ""
+        assert backtest["srcSets"] == 1
         live = snaps["live"]
         assert [(p["call"], p["id"]) for p in live["plots"]] == [
             ("resize", "live-area"), ("resize", "live-groups")]
         assert live["el"]["panel-live"]["hidden"] is False
+        assert live["el"]["panel-backtest"]["hidden"] is True
+        assert live["el"]["panel-data"]["hidden"] is True
         assert snaps["again"]["srcSets"] == 1
+
+    def test_the_data_tab_loads_its_page_once(self, tmp_path):
+        data = payload(_view())
+        snaps = _run_live_script(tmp_path, [{"status": 200, "body": data}], [
+            ["settle"], ["snap", "shown"], ["click", "tab-data"], ["snap", "data"],
+            ["click", "tab-backtest"], ["snap", "backtest"], ["click", "tab-data"],
+            ["snap", "data-again"], ["click", "tab-live"], ["snap", "live"],
+            ["click", "tab-backtest"], ["click", "tab-data"], ["snap", "again"]])
+        assert snaps["shown"]["srcSets"] == 0
+
+        def tabs(snap):
+            el = snap["el"]
+            return ([el[f"tab-{t}"]["attrs"]["aria-selected"] for t in ("live", "backtest", "data")],
+                    [el[f"panel-{t}"]["hidden"] for t in ("live", "backtest", "data")])
+
+        first = snaps["data"]
+        assert tabs(first) == (["false", "false", "true"], [True, True, False])
+        assert first["el"]["data-frame"]["src"] == live_dashboard.DATA_URL
+        assert first["el"].get("backtest-frame", {"src": ""})["src"] == ""
+        assert first["srcSets"] == 1
+        # Choosing the Data tab draws and resizes no Live chart (a snapshot's
+        # plots are the calls since the one before it)
+        assert first["plots"] == []
+        backtest = snaps["backtest"]
+        assert tabs(backtest) == (["false", "true", "false"], [True, False, True])
+        assert backtest["el"]["backtest-frame"]["src"] == live_dashboard.BACKTEST_URL
+        assert backtest["srcSets"] == 2
+        assert tabs(snaps["data-again"]) == (["false", "false", "true"], [True, True, False])
+        assert snaps["data-again"]["srcSets"] == 2
+        live = snaps["live"]
+        assert tabs(live) == (["true", "false", "false"], [False, True, True])
+        assert [(p["call"], p["id"]) for p in live["plots"]] == [
+            ("resize", "live-area"), ("resize", "live-groups")]
+        # Each frame loaded once, however often its tab was chosen
+        assert snaps["again"]["srcSets"] == 2
+        assert tabs(snaps["again"]) == (["false", "false", "true"], [True, True, False])
 
     def test_an_error_shows_its_message_and_refresh_reads_again(self, tmp_path):
         data = payload(_view())
@@ -1788,5 +1954,8 @@ class TestIsolation:
         assert done.returncode == 0, done.stderr
         loaded = set(json.loads(done.stdout.strip().splitlines()[-1]))
         assert "kalshi_betting.live_dashboard" in loaded
-        for name in ("trader", "main", "scheduler", "run_lock", "defaults_server", "v2_probe"):
+        # Nor the Data page's builder, nor the backtest that runs it: the Data
+        # tab serves the page they write, from disk
+        for name in ("trader", "main", "scheduler", "run_lock", "defaults_server", "v2_probe",
+                     "eda", "backtest"):
             assert f"kalshi_betting.{name}" not in loaded, name

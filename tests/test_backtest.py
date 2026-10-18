@@ -65,7 +65,13 @@ docstrings or config the simulator does not read; and, on the backtester's
 selling golden fixture with every lazy family on, the rebuilt page and its
 sidecar files are byte for byte the run's.
 
-Fully offline: run_backtest_sweep, generate_dashboard, both client builders,
+And the Data page: after the backtest page, a run and a --dashboard-only
+rebuild each build it (eda.build_eda_page) from the run's sweep and listing,
+with at most config.EDA_MAX_WORKERS workers; --no-eda skips it on both paths;
+and one that raises, or writes nothing, is a WARNING that changes neither the
+exit code nor the backtest page.
+
+Fully offline: run_backtest_sweep, generate_dashboard, build_eda_page, both client builders,
 read_account_balance, load_risk_free_rates and load_depth_model are monkeypatched, so no network
 call, no credential read and no real backtest happen. PROJECT_ROOT is redirected at tmp_path and
 logging.basicConfig is stubbed, so the run's RotatingFileHandler can neither
@@ -161,7 +167,22 @@ def cli(monkeypatch, tmp_path):
 
     def _fake_dashboard(*args, **kwargs):
         calls["dashboard"] = (args, kwargs)
+        calls["pages"].append("backtest")
         return tmp_path / "dashboard.html"
+
+    # The Data page, never the real one (it would read the real backtest_cache):
+    # each call's keyword arguments are recorded, and "eda_result" is what it
+    # returns (an exception to raise, or a path)
+    calls["pages"] = []
+    calls["eda"] = []
+    calls["eda_result"] = tmp_path / config.EDA_DASHBOARD_FILENAME
+
+    def _fake_eda(**kwargs):
+        calls["eda"].append(kwargs)
+        calls["pages"].append("data")
+        if isinstance(calls["eda_result"], BaseException):
+            raise calls["eda_result"]
+        return calls["eda_result"]
 
     def _no_basic_config(**kwargs):
         # Never let a test install a handler on the ROOT logger: it would
@@ -192,6 +213,7 @@ def cli(monkeypatch, tmp_path):
     monkeypatch.setattr(backtest, "read_account_balance", _fake_balance_read)
     monkeypatch.setattr(backtest, "run_backtest_sweep", _fake_sweep)
     monkeypatch.setattr(backtest, "generate_dashboard", _fake_dashboard)
+    monkeypatch.setattr(backtest, "build_eda_page", _fake_eda)
     # Never read the real backtest_cache or the network for series categories
     calls["series_categories"] = {"KXTEST": ("Sports", ("Basketball",))}
     monkeypatch.setattr(backtest, "load_series_categories",
@@ -1212,6 +1234,105 @@ class TestDashboardHandoff:
         assert messages[opened + 1:] == [messages[opened + 1]]
 
 
+class TestDataPage:
+    """After the backtest page, a run (and a --dashboard-only rebuild) builds the
+    Data page from the run's sweep and listing, with at most config.EDA_MAX_WORKERS
+    workers; --no-eda skips it, and a Data page that fails is one WARNING that
+    changes neither the exit code nor the backtest page."""
+
+    def test_it_is_built_after_the_backtest_page_with_the_runs_sweep_and_listing(
+            self, cli, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, "--sell-workers", "2")
+        assert cli["pages"] == ["backtest", "data"]
+        [kwargs] = cli["eda"]
+        assert kwargs["sweep"] is cli["result"]
+        assert kwargs["series_categories"] is cli["series_categories"]
+        assert kwargs["workers"] == 2
+        messages = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        written = messages.index(
+            f"Data page written: {cli['eda_result']} (the live dashboard's Data tab)")
+        # Said before the build, so a long first build is not taken for a hang
+        building = messages.index(
+            "Building the Data page from backtest_cache/: the first build (or one after many "
+            "new day files) reads each cached day file once and can take several minutes "
+            "(about 10 on a full cache); later builds take seconds. --no-eda skips it")
+        assert building < written
+
+    def test_its_workers_never_pass_the_eda_bound(self, cli, monkeypatch):
+        _run(monkeypatch, "--sell-workers", str(config.EDA_MAX_WORKERS + 3))
+        assert cli["eda"][0]["workers"] == config.EDA_MAX_WORKERS
+        assert cli["dashboard"][1]["sell_workers"] == config.EDA_MAX_WORKERS + 3
+
+    def test_no_eda_skips_it(self, cli, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, "--no-eda")
+        assert cli["pages"] == ["backtest"]
+        assert cli["eda"] == []
+        assert not any("Data page" in r.getMessage() for r in caplog.records)
+
+    def test_a_data_page_that_raises_changes_nothing_else(self, cli, monkeypatch, caplog,
+                                                          tmp_path):
+        # A real backtest page, so its bytes can be compared with and without
+        # the Data page failing
+        def write_page(*args, **kwargs):
+            cli["pages"].append("backtest")
+            page = tmp_path / "dashboard.html"
+            page.write_text("<html>the backtest</html>", encoding="utf-8")
+            return page
+
+        monkeypatch.setattr(backtest, "generate_dashboard", write_page)
+        cli["eda_result"] = RuntimeError("the cache could not be read")
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)    # returns: exit 0
+        assert (tmp_path / "dashboard.html").read_text(encoding="utf-8") == (
+            "<html>the backtest</html>")
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert ("Data page not built (RuntimeError: the cache could not be read); the "
+                "backtest page above is unchanged") in warnings
+        # The run still closes as it always does
+        messages = [r.getMessage() for r in caplog.records]
+        assert messages[-2] == "Open the HTML file in a browser to view the interactive charts."
+
+    def test_a_data_page_that_writes_nothing_is_a_warning(self, cli, monkeypatch, caplog):
+        cli["eda_result"] = None
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        assert any(r.levelno == logging.WARNING
+                   and r.getMessage().startswith("Data page: no page could be written")
+                   for r in caplog.records)
+
+    def test_the_rebuild_builds_it_too(self, rebuild, monkeypatch):
+        rebuild["eda"].clear()
+        rebuild["pages"].clear()
+        _run(monkeypatch, "--dashboard-only", "--sell-workers", "1")
+        assert rebuild["pages"] == ["backtest", "data"]
+        [kwargs] = rebuild["eda"]
+        # The saved run's sweep and listing, read back from the file
+        assert kwargs["sweep"] is rebuild["dashboard"][1]["sweep"]
+        assert kwargs["sweep"].primary.k == rebuild["full_dashboard"][1]["sweep"].primary.k
+        assert kwargs["series_categories"] == rebuild["series_categories"]
+        assert kwargs["workers"] == 1
+
+    def test_the_rebuild_honours_no_eda(self, rebuild, monkeypatch):
+        rebuild["eda"].clear()
+        rebuild["pages"].clear()
+        _run(monkeypatch, "--dashboard-only", "--no-eda")
+        assert rebuild["pages"] == ["backtest"]
+        assert rebuild["eda"] == []
+
+    def test_a_rebuild_whose_data_page_raises_still_builds_its_backtest_page(
+            self, rebuild, monkeypatch, caplog):
+        rebuild["eda_result"] = OSError("disk full")
+        rebuild["pages"].clear()
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, "--dashboard-only")
+        assert rebuild["pages"] == ["backtest", "data"]
+        assert any(r.levelno == logging.WARNING
+                   and r.getMessage().startswith("Data page not built (OSError: disk full)")
+                   for r in caplog.records)
+
+
 class TestSummaryBlock:
     """A default run's summary block is unchanged: it reports the PRIMARY
     point, exactly as the plain run_backtest() path used to."""
@@ -1860,7 +1981,7 @@ class TestDashboardOnly:
         run_only = {dest for dest, _ in backtest._RUN_ONLY_FLAGS}
         rebuild = {"dashboard_only", "accept_changed_simulator", "sell_workers",
                    "no_cap_sweep", "no_add_on_sweep", "no_sell_sweep", "no_trim_sweep",
-                   "no_trim_rise_sweep"}
+                   "no_trim_rise_sweep", "no_eda"}
         assert run_only | rebuild == dests
         assert not run_only & rebuild
 

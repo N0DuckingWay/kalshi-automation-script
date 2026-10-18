@@ -99,7 +99,8 @@ function __snapshot() {
     var el = __elements[id];
     snap.el[id] = {
       text: el._text, className: el.className, hidden: el.hidden, title: el.title,
-      attrs: el._attrs, src: el.src, disabled: el.disabled,
+      // A copy: the attributes as they stand now, not as a later step leaves them
+      attrs: JSON.parse(JSON.stringify(el._attrs)), src: el.src, disabled: el.disabled,
       rows: el.children.map(function(child) {
         if (!child.children.length) { return {text: child._text}; }
         return {cells: child.children.map(function(cell) {

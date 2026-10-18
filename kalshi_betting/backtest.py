@@ -9,7 +9,7 @@ Purpose:
     --interval-discount, --no-sweep, --same-event-ladders /
     --no-same-event-ladders, --spread-min, --spread-max, --no-band-sweep,
     --no-cap-sweep, --no-add-on-sweep, --no-sell-sweep, --sell-workers,
-    --no-trim-sweep, --no-trim-rise-sweep, --dashboard-only,
+    --no-trim-sweep, --no-trim-rise-sweep, --no-eda, --dashboard-only,
     --accept-changed-simulator),
     configures logging to kalshi_backtest.log, constructs the necessary API
     clients, works out the starting balance (--balance, or else what the Kalshi
@@ -22,7 +22,12 @@ Purpose:
     when the sell family is on, the sidecar chunk files its Sell select loads
     (a folder beside the page, config.DASHBOARD_FILES_DIRNAME, which must be
     kept with it). With --dashboard-only it runs no backtest: it rebuilds the
-    page from the inputs the last full run saved.
+    page from the inputs the last full run saved, and then the Data page from
+    the saved sweep and listing too, unless --no-eda. A full run likewise
+    rebuilds the Data page (eda.build_eda_page, the live dashboard's Data tab)
+    after its backtest page, with its own sweep and /series listing, unless
+    --no-eda; that page is reporting only, and a failure there is one WARNING
+    that changes neither the exit code nor the backtest page.
     Prints a summary of key metrics (trade count, win rate, total return) to
     the log on completion, closed on every run by what settled-market corpus
     the run read (its assembly time, whether it was cached, and the archive
@@ -39,7 +44,9 @@ Dependencies:
     treasury.py, load_depth_model (the table every trade's modeled order book
     is built from; the backtest's fills line names it) from depth_model.py,
     read_account_balance (the account's cash and open positions,
-    the starting balance when --balance is not given) from auth.py, and
+    the starting balance when --balance is not given) from auth.py,
+    build_eda_page (the Data page, built after the backtest page; this is the
+    one module of the package that imports eda) from eda.py, and
     api_error_summary (the one-line reason a failed balance read, or a failed
     save or load of the saved sweep file, is reported with) from _http.py.
     It reads, but does not import, the source files of the simulator modules
@@ -47,7 +54,8 @@ Dependencies:
     to fingerprint the code a saved sweep was simulated with.
     Imports from config.py:
     PROJECT_ROOT, DASHBOARD_SELL_MAX_WORKERS (the --sell-workers default's
-    bound), BACKTEST_SWEEP_FILENAME, BACKTEST_SWEEP_FORMAT and
+    bound), EDA_MAX_WORKERS (the most worker processes the Data page counts
+    day files in), BACKTEST_SWEEP_FILENAME, BACKTEST_SWEEP_FORMAT and
     BACKTEST_SWEEP_HEADER_MAX_BYTES (the saved sweep file: where it goes, the
     format tag it is written in, the most of its first line a rebuild reads),
     MIN_BALANCE_CENTS (the low starting-balance WARNING),
@@ -297,6 +305,7 @@ from .config import (
     BACKTEST_SWEEP_FORMAT,
     BACKTEST_SWEEP_HEADER_MAX_BYTES,
     DASHBOARD_SELL_MAX_WORKERS,
+    EDA_MAX_WORKERS,
     MAX_DEADLINE_GAP_DAYS,
     MIN_BALANCE_CENTS,
     MIN_PRICE_DIFF_LONG_GAP,
@@ -316,6 +325,7 @@ from .config import (
 )
 from .dashboard import generate_dashboard
 from .depth_model import DepthModel, load_depth_model
+from .eda import build_eda_page
 from .historical import build_historical_client, build_prod_live_client, load_series_categories
 from .treasury import load_risk_free_rates
 
@@ -799,6 +809,59 @@ def _build_dashboard(inputs: Mapping[str, Any], *, risk_free, sell_workers: int)
                               period_end=inputs["period_end"])
 
 
+def _build_data_page(inputs: Mapping[str, Any], *, sell_workers: int) -> None:
+    """
+    Rebuild the Data page (the live dashboard's Data tab) from a run's inputs, never stopping the run.
+
+    eda.build_eda_page counts the cached day files (reusing every saved
+    summary that still matches) and takes the k view from the run's sweep.
+    It never raises; it is called inside a try anyway, so that whatever goes
+    wrong is one WARNING and the run's exit code and backtest page are
+    untouched. Reporting only: nothing the backtest computed is read back.
+
+    Args:
+        inputs (Mapping[str, Any]): _dashboard_inputs' result, or a saved copy
+            of it (its sweep and its /series listing are read).
+        sell_workers (int): The Sell select's worker count; the Data page
+            uses at most that many, and never more than config.EDA_MAX_WORKERS.
+    """
+    # Before the call, so a long first build is not taken for a hang
+    logging.info("Building the Data page from backtest_cache/: the first build (or one after "
+                 "many new day files) reads each cached day file once and can take several "
+                 "minutes (about 10 on a full cache); later builds take seconds. --no-eda "
+                 "skips it")
+    try:
+        page = build_eda_page(sweep=inputs["sweep"],
+                              series_categories=inputs["series_categories"],
+                              workers=min(sell_workers, EDA_MAX_WORKERS))
+    except Exception as e:
+        logging.warning("Data page not built (%s); the backtest page above is unchanged",
+                        api_error_summary(e), exc_info=True)
+        return
+    if page is None:
+        logging.warning("Data page: no page could be written (the WARNING above says why); "
+                        "the backtest page above is unchanged")
+    else:
+        logging.info("Data page written: %s (the live dashboard's Data tab)", page)
+
+
+def _build_pages(inputs: Mapping[str, Any], *, risk_free, sell_workers: int,
+                 data_page: bool) -> None:
+    """
+    Write the backtest page and then, unless told not to, the Data page: what a full run and a rebuild both end on.
+
+    Args:
+        inputs (Mapping[str, Any]): _dashboard_inputs' result, or a saved copy of it.
+        risk_free: treasury.load_risk_free_rates' bill yields.
+        sell_workers (int): The most worker processes the Sell select is built in.
+        data_page (bool): False (--no-eda) skips the Data page.
+    """
+    _build_dashboard(inputs, risk_free=risk_free, sell_workers=sell_workers)
+    if data_page:
+        # After the backtest page, so a Data page that fails costs nothing above
+        _build_data_page(inputs, sell_workers=sell_workers)
+
+
 def _save_dashboard_inputs(path: Path, inputs: Mapping[str, Any],
                            parts: Mapping[str, str] | None) -> None:
     """
@@ -1068,7 +1131,9 @@ def _rebuild_dashboard(parser: argparse.ArgumentParser, args: argparse.Namespace
 
     Fetches nothing and makes no Kalshi request: it loads the saved file,
     reads the T-bill yields again (treasury.load_risk_free_rates) and calls
-    generate_dashboard as the run did, with this command's --sell-workers.
+    generate_dashboard as the run did, with this command's --sell-workers,
+    then rebuilds the Data page from the saved sweep and listing unless
+    --no-eda (_build_pages, as a full run ends).
     Each --no-*-sweep flag drops its lazy family first (_without_families).
 
     The lazy families simulate their cells while the page is built, with the
@@ -1150,8 +1215,9 @@ def _rebuild_dashboard(parser: argparse.ArgumentParser, args: argparse.Namespace
         logging.info("Dashboard rebuilt without: %s", "; ".join(dropped))
     # The T-bill yields, read again: never raises (see the full run's read)
     risk_free = load_risk_free_rates()
-    _build_dashboard({**inputs, "sweep": sweep}, risk_free=risk_free,
-                     sell_workers=_sell_workers(args.sell_workers))
+    # The backtest page, then the Data page (unless --no-eda), as a full run ends
+    _build_pages({**inputs, "sweep": sweep}, risk_free=risk_free,
+                 sell_workers=_sell_workers(args.sell_workers), data_page=not args.no_eda)
     _log_how_to_open()
 
 
@@ -1299,12 +1365,21 @@ def _build_parser() -> argparse.ArgumentParser:
              "entries, so memory grows with the count",
     )
     parser.add_argument(
+        "--no-eda", action="store_true",
+        help="Skip the Data page (eda_dashboard.html, the live dashboard's Data tab). By "
+             "default it is rebuilt after the backtest page, also with --dashboard-only: the "
+             "first build (or one after many new day files) reads each cached day file once "
+             "and can take several minutes (about 10 on a full cache); later builds take "
+             "seconds. A failure there is one WARNING and changes neither the exit code nor "
+             "the backtest page",
+    )
+    parser.add_argument(
         "--dashboard-only", action="store_true",
         help="Rebuild the dashboard from the inputs the last full run saved "
              f"({BACKTEST_SWEEP_FILENAME} in the repo root) instead of running the "
-             "backtest: no fetch and no Kalshi request. --sell-workers applies, and each "
-             "--no-*-sweep flag but --no-band-sweep drops its family from the saved run "
-             "for a quicker page; the flags that shape a run are refused",
+             "backtest: no fetch and no Kalshi request. --sell-workers and --no-eda apply, "
+             "and each --no-*-sweep flag but --no-band-sweep drops its family from the "
+             "saved run for a quicker page; the flags that shape a run are refused",
     )
     parser.add_argument(
         "--accept-changed-simulator", action="store_true",
@@ -1326,7 +1401,7 @@ def main() -> None:
     --same-event-ladders / --no-same-event-ladders, --spread-min,
     --spread-max, --no-band-sweep, --no-cap-sweep, --no-add-on-sweep,
     --no-sell-sweep, --no-trim-sweep, --no-trim-rise-sweep, --sell-workers,
-    --dashboard-only, --accept-changed-simulator); with --dashboard-only it
+    --no-eda, --dashboard-only, --accept-changed-simulator); with --dashboard-only it
     hands over to _rebuild_dashboard, which rebuilds the page from the saved
     inputs and runs nothing below. Otherwise it configures
     logging, constructs historical and live
@@ -1336,7 +1411,8 @@ def main() -> None:
     fetch), runs the full backtest simulation via run_backtest_sweep(), saves
     what the dashboard is handed (_save_dashboard_inputs, for a later
     --dashboard-only), and generates
-    an interactive HTML dashboard via generate_dashboard(). Logs a summary
+    an interactive HTML dashboard via generate_dashboard(), then the Data
+    page (eda.build_eda_page) unless --no-eda. Logs a summary
     table of key metrics to
     kalshi_backtest.log on completion (this module installs only a
     RotatingFileHandler, no console handler, so nothing reaches stdout).
@@ -1698,8 +1774,10 @@ def main() -> None:
     # raises (falls back to the saved copy, then "unavailable"), but an
     # unresponsive single-address host can cost about 4 minutes first
     risk_free = load_risk_free_rates()
-    # The one call a rebuild from the saved inputs makes too
-    _build_dashboard(inputs, risk_free=risk_free, sell_workers=sell_workers)
+    # The one call a rebuild from the saved inputs makes too: the backtest
+    # page, then the Data page with this run's sweep and listing (--no-eda skips it)
+    _build_pages(inputs, risk_free=risk_free, sell_workers=sell_workers,
+                 data_page=not args.no_eda)
     _log_how_to_open()
 
 
