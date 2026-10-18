@@ -25781,6 +25781,40 @@ class TestExtraDataReport:
         assert caplog.messages.count("  TA / TB") == 1
         assert "  TA / TB" == caplog.messages[caplog.messages.index(lines[3]) + 1]
 
+    def test_a_date_in_a_custom_strike_is_not_a_different_strike(self):
+        # The weekly Brent market carries a strike_date its monthly twin does
+        # not (real records of KXBRENTW/KXBRENTMON-26MAY2917-T98.99)
+        monthly = {"strike_type": "greater", "floor_strike": 98.99, "cap_strike": None,
+                   "custom_strike": {"front_month_contract": "BRENTQ6"}}
+        weekly = dict(monthly, custom_strike={"front_month_contract": "BRENTQ6",
+                                              "strike_date": "2026-05-29T21:00:00.000Z"})
+        assert not backtester._strikes_differ(monthly, weekly)
+        assert backtester._strikes_differ(monthly, dict(weekly, floor_strike=96.99))
+        assert backtester._strikes_differ(
+            monthly, dict(monthly, custom_strike={"front_month_contract": "BRENTU6"}))
+        assert backtester._strikes_differ({"custom_strike": {"Word": "Windmill"}},
+                                          {"custom_strike": {"Word": "Wind"}})
+
+    def test_rules_texts_that_differ_only_in_their_window_compare_equal(self):
+        # Real rules of KXTRUMPSAY-25DEC15-WIND and -25DEC22-WIND
+        a = ("If Windmill, or a plural or possessive form of Windmill, is stated by Donald "
+             "Trump after 10am ET December 8th and before Dec 15, 2025, then the market "
+             "resolves to Yes.")
+        b = ("If Windmill, or a plural or possessive form of Windmill, is stated by Donald "
+             "Trump after 8am ET December 15th and before Dec 22, 2025, then the market "
+             "resolves to Yes.")
+        assert backtester._rules_skeleton(a) == backtester._rules_skeleton(b)
+        brent = ("If the close price of the 1-minute candlestick for brent crude oil using "
+                 "the BRENTQ6 contract on May 29, 2026 at 5:00 PM EDT is above 98.99 USD/Bbl, "
+                 "then the market resolves to Yes.")
+        later = brent.replace("May 29, 2026 at 5:00 PM EDT", "June 5, 2026 at 4:30 PM EDT")
+        assert backtester._rules_skeleton(brent) == backtester._rules_skeleton(later)
+        # Any other number, and any other wording, still differs
+        assert (backtester._rules_skeleton(brent)
+                != backtester._rules_skeleton(brent.replace("98.99", "96.99")))
+        assert (backtester._rules_skeleton(a)
+                != backtester._rules_skeleton(a.replace("Windmill", "Wind")))
+
     def test_the_four_lines_are_logged_at_zero(self, caplog):
         with caplog.at_level(logging.INFO):
             counts = backtester._report_pair_facts([], [], {}, {})

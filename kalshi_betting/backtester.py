@@ -376,6 +376,7 @@ import hashlib
 import logging
 import math
 import numbers
+import re
 import resource
 import statistics
 import sys
@@ -506,7 +507,6 @@ from .scanner import (
     leg_prices,
     leg_sides,
     listed_fee_multiplier,
-    normalize_title,
     same_event_ladder,
     stated_deadline,
     time_series_group_key,
@@ -2431,8 +2431,9 @@ class ExtraDataReport:
 
     Attributes:
         strikes_differ (int): Same-title pairs whose two markets' strike
-            fields (strike_type, floor_strike, cap_strike, custom_strike)
-            differ.
+            fields name different strikes (_strikes_differ: strike_type,
+            floor_strike, cap_strike, and the custom_strike keys both carry
+            but a date).
         strikes_checked (int): Same-title pairs whose two full records both
             carry a strike_type.
         sources_differ (int): Same-title pairs whose two events name
@@ -2440,7 +2441,8 @@ class ExtraDataReport:
         sources_checked (int): Same-title pairs whose two events' facts are
             known and each names at least one source.
         rules_differ (int): Time-series pairs whose two rules texts differ
-            once their dates are taken out (scanner.normalize_title).
+            once their dates, times and weekdays are taken out
+            (_rules_skeleton).
         rules_checked (int): Time-series pairs whose two records both carry
             a rules text.
         option_ladders (int): Same-event ladder pairs (both markets on one
@@ -9988,6 +9990,70 @@ def _log_extra_data(
             len(found), sum(count for count, _ in found))
 
 
+# The calendar and clock words a rules text states its window in: month names
+# (full or short, with an optional day, ordinal and year), a day before a
+# month, numeric and ISO dates, a bare 20xx year, weekdays and clock times.
+# _rules_skeleton takes them out, so two rules texts that differ only in their
+# window compare equal; every other number stays.
+_RULES_MONTH = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?"
+                r"|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?")
+_RULES_WINDOW_WORDS = re.compile("|".join((
+    rf"\b{_RULES_MONTH}(?:\s+\d{{1,2}}(?:st|nd|rd|th)?)?(?:,?\s+\d{{4}})?\b",
+    rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?{_RULES_MONTH}\b",
+    r"\b\d{4}-\d{2}-\d{2}(?:t[\d:.]+z?)?\b",
+    r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b",
+    r"\b20\d{2}\b",
+    r"\b(?:mon|tues|wednes|thurs|fri|satur|sun)day\b",
+    r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)",
+    r"\b(?:et|est|edt|ct|cst|cdt|pt|pst|pdt|utc)\b",
+)))
+
+
+def _rules_skeleton(text: str) -> str:
+    """
+    A rules text with its dates, times and weekdays taken out, for comparing two of them.
+
+    Report only (_report_pair_facts): "after 10am ET December 8th and before
+    Dec 15, 2025" and "after 8am ET December 15th and before Dec 22, 2025"
+    give the same skeleton. Letter case, commas and runs of spaces are ignored.
+
+    Args:
+        text (str): A market's rules_primary.
+
+    Returns:
+        str: The skeleton.
+    """
+    words = _RULES_WINDOW_WORDS.sub(" ", text.lower()).replace(",", " ")
+    return " ".join(words.split())
+
+
+def _strikes_differ(record_a: dict, record_b: dict) -> bool:
+    """
+    Whether two markets' strike fields name different strikes.
+
+    Report only (_report_pair_facts). strike_type, floor_strike and
+    cap_strike must be equal; custom_strike is compared on the keys both
+    records carry, leaving out any key whose name holds "date" (a weekly
+    Brent market carries a strike_date its monthly twin does not, and a date
+    is the deadline, not the strike).
+
+    Args:
+        record_a (dict): One market's full market_details record.
+        record_b (dict): The other's.
+
+    Returns:
+        bool: True when they differ.
+    """
+    for name in ("strike_type", "floor_strike", "cap_strike"):
+        if record_a.get(name) != record_b.get(name):
+            return True
+    custom_a, custom_b = record_a.get("custom_strike"), record_b.get("custom_strike")
+    if isinstance(custom_a, dict) and isinstance(custom_b, dict):
+        shared = (set(custom_a) & set(custom_b)) - {k for k in custom_a if "date" in k.lower()}
+        return any(custom_a[k] != custom_b[k] for k in shared)
+    return custom_a != custom_b
+
+
 def _report_pair_facts(ts_pairs: list, same_pairs: list, details: dict,
                        facts: dict) -> dict[str, int]:
     """
@@ -10010,7 +10076,6 @@ def _report_pair_facts(ts_pairs: list, same_pairs: list, details: dict,
         dict[str, int]: The counts and how many pairs each check could read,
             keyed by ExtraDataReport's field names.
     """
-    strike_fields = ("strike_type", "floor_strike", "cap_strike", "custom_strike")
     found: dict[str, list[str]] = {"strikes": [], "sources": [], "rules": [], "ladders": []}
     checked = {"strikes": 0, "sources": 0, "rules": 0, "ladders": 0}
     for mA, mB, _, _ in same_pairs:
@@ -10019,8 +10084,7 @@ def _report_pair_facts(ts_pairs: list, same_pairs: list, details: dict,
         if (isinstance(record_a, dict) and isinstance(record_b, dict)
                 and "strike_type" in record_a and "strike_type" in record_b):
             checked["strikes"] += 1
-            if (tuple(record_a.get(f) for f in strike_fields)
-                    != tuple(record_b.get(f) for f in strike_fields)):
+            if _strikes_differ(record_a, record_b):
                 found["strikes"].append(names)
         facts_a = facts.get(mA.get("event_ticker"))
         facts_b = facts.get(mB.get("event_ticker"))
@@ -10034,8 +10098,8 @@ def _report_pair_facts(ts_pairs: list, same_pairs: list, details: dict,
         rules = [(details.get(m.get("ticker")) or {}).get("rules_primary") for m in (mA, mB)]
         if all(isinstance(r, str) and r.strip() for r in rules):
             checked["rules"] += 1
-            # Cross-module: the dates taken out as the time-series key takes them out
-            if normalize_title(rules[0]) != normalize_title(rules[1]):
+            # Their windows taken out: dates, times and weekdays
+            if _rules_skeleton(rules[0]) != _rules_skeleton(rules[1]):
                 found["rules"].append(names)
         event = mA.get("event_ticker") or ""
         if event and event == (mB.get("event_ticker") or ""):
