@@ -4,184 +4,40 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    The counting layer of the exploratory data page: it describes the settled
-    markets kept on disk under backtest_cache/ (the archive and live day
-    slices). Each day slice is read once and boiled down to a small JSON
-    summary under backtest_cache/<config.EDA_SUMMARY_DIRNAME>/<archive|live>/
-    <day>.json; a later run reuses every summary whose slice has not changed
-    and reads only the new or changed slices. merge() then adds every summary
-    up into one dict. Reporting only: nothing that trades, sizes or
-    backtests reads any of it.
-
-    A summary counts, per settlement week (the Monday, UTC, of the week a
-    market settled in), combo or not, and series (the literal series ticker,
-    historical.series_ticker): how many markets settled, how many Yes, No or
-    otherwise; how many have no outcome label (subtitle), no event title
-    before and after the event titles saved in event_titles_v2.json are
-    joined in, or no readable open time; a lifetime histogram (close minus
-    open) and a settlement-lag histogram (settlement minus close); the tick
-    regimes (price_level_structure) and the exchange shards. For markets that
-    are not combos it also counts the deadline wording
-    (scanner.deadline_profile: cumulative, snapshot or unknown) and, for
-    cumulative ones, collects the day each one's deadline names
-    (scanner.stated_deadline) under its event, so the merge can count
-    deadline ladders (an event with two or more stated days) even when its
-    rungs sit in different slices. It also keeps, for every market that has a
-    candle file under backtest_cache/candlesticks/, its result, close and
-    settlement times, series and whether it is a combo, for the price
-    calibration a later step reads from those candles. merge() files each
-    series under its Kalshi category and first tag (historical.series_labels,
-    with infer_category as the fallback) from the listing it is handed, so a
-    new listing re-files every summary without reading a slice again.
-
-    Three more readers sit beside the day-slice counts. summarise_candles()
-    reads the hourly candle files under backtest_cache/candlesticks/ and, for
-    the markets merge() joined to a result, works out each market's YES ask
-    (and, where both sides are usable, its midpoint) 1 hour, 24 hours and 7
-    days (config.EDA_PRICE_LEADS_HOURS) before it closed; it files those prices
-    into price bins per category (the reliability chart and the
-    favourite-longshot gap), sums the Brier score per category
-    and the traded volume per category, and counts the candle files by field
-    version, empty and unreadable. inventory() lists everything at the top of
-    the cache folder: size, file count, date range, a plain description, the
-    meta line of each assembled corpus and the depth snapshot count. khat_view()
-    reduces a backtest's k-hat observations to the figures of the k view
-    (mid-spread bins against the realised in-between rate, k-hat with its 95%
-    interval by gap band and by category); save_khat() and load_khat() keep it
-    in <cache>/eda_days/khat.json so a rebuild without a backtest can show it.
-
-    build_eda_page() draws all of that as the Data page, config.EDA_DASHBOARD_FILENAME
-    under config.PROJECT_ROOT: an inventory; the market universe; price
-    calibration; deadline ladders and k; data quality; and the Terms of
-    glossary.PAGE_DATA. Charts are plotly figures embedded with no copy of
-    Plotly (the page loads it once, from config.LIVE_DASHBOARD_PLOTLY_URL with
-    its integrity hash). Every switch (Non-combo / Combo / All; the calibration's
-    lead and price) is a group of buttons whose views Python has already drawn
-    and hidden; the page's one small script only shows one view and hides the
-    others. It never raises: a failed step is one WARNING and a line on the
-    page, and the rest is still written. `python3 -m kalshi_betting.eda
-    [--workers N]` (main) rebuilds the page from the cache without a backtest.
-    Every word of the page is a constant in the Data page block, except the
-    sentences of the coverage note, which merge() (_coverage) writes and the
-    page shows as they are.
+    The Data page: an exploratory, reporting-only look at the settled markets
+    and candles cached under backtest_cache/. Each day slice is summarised once
+    into backtest_cache/<config.EDA_SUMMARY_DIRNAME>/ (reused while the slice is
+    unchanged), merge() adds the summaries up, summarise_candles() prices
+    markets 1 h, 24 h and 7 d before close for the calibration charts,
+    inventory() lists the cache, and khat_view() reduces a backtest's k-hat
+    observations. build_eda_page() writes the page to
+    config.EDA_DASHBOARD_FILENAME and never raises (a failed step is one
+    WARNING and a line on the page). `python3 -m kalshi_betting.eda
+    [--workers N]` rebuilds it without a backtest.
 
 Dependencies:
-    The standard library, config (EDA_SUMMARY_DIRNAME, EDA_SUMMARY_VERSION,
-    EDA_MAX_WORKERS, EDA_WORKER_START_TIMEOUT_SECONDS, EDA_BUILD_DEADLINE_SECONDS,
-    EDA_PROGRESS_EVERY_SLICES, EDA_LIFETIME_EDGES_HOURS, EDA_LAG_EDGES_HOURS, EDA_CALIBRATION_BIN,
-    EDA_PRICE_LEADS_HOURS, EDA_PRICE_MAX_AGE_HOURS, EDA_CANDLE_FACTS_VERSION,
-    EDA_KHAT_SPREAD_BIN, EDA_KHAT_VERSION, EDA_MAX_BOOK_WIDTH,
-    EDA_MIN_MARKETS_PER_POINT, EDA_DASHBOARD_FILENAME, PRICE_EPSILON, PROJECT_ROOT,
-    KHAT_CONFIDENCE_LEVEL, LIVE_DASHBOARD_PLOTLY_URL, LIVE_DASHBOARD_PLOTLY_SRI,
-    CANDLESTICK_CACHE_FIELDS_VERSION, DEPTH_SNAPSHOTS_DIRNAME and
-    MVE_SERIES_FAMILY_PREFIX), glossary (the Data page's Terms), historical (the slice reader _day_store_iter,
-    _SliceUnreadable, _iso_epoch, _read_title_file with _TITLE_FILE_ABSENT,
-    the file names of _EVENT_TITLES_CACHE and _CANDLES_DIR, series_labels,
-    series_ticker, infer_category, usable_candle_ask) and scanner
-    (event_series, deadline_profile, stated_deadline, DEADLINE_CUMULATIVE).
-    Imports no order-path module (trader, main, scheduler, run_lock,
-    defaults_server, v2_probe, seller), and only backtest.py imports this one,
-    to rebuild the page after each backtest; no live module does
-    (tests/test_eda.py::TestIsolation). The two exceptions to
-    "only the standard library, config, glossary, historical and scanner"
-    are khat_view(), which imports backtester and dashboard INSIDE the
-    function, and _plotly(), which imports plotly there, so the worker
-    processes that count the day slices (which import this module afresh)
-    never load pandas or plotly on their own account. A spawned worker also
-    imports its parent's main module first, so workers started from a
-    backtest (backtest.py imports backtester and dashboard) do load them.
+    The standard library, config, glossary, historical and scanner.
+    khat_view() and _plotly() import backtester, dashboard and plotly inside
+    the function, so day-slice workers stay light. No order-path module is
+    imported, and only backtest.py imports this one
+    (tests/test_eda.py::TestIsolation).
 
 Notes:
-    Which slice counts which market. The archive phase of a fetch holds only
-    markets settled BEFORE the archive cutoff (each archive slice's meta
-    cutoff_ts), and a live day only markets settled at or after it: the rule
-    historical._assembled_records applies. So an archive summary counts only
-    its records settled before its own slice's cutoff, and names how many it
-    left out (`dropped_after_cutoff`). With M the largest cutoff among the
-    readable archive summaries, a live summary is counted only when its day
-    ends after M (its day's midnight plus one day): a live day the archive
-    already covers is left out. No ticker is de-duplicated across slices.
-
-    Kalshi's cutoff is a UTC midnight (2026-08-17T00:00:00Z on the cache read
-    2026-10-17), so the two kinds meet at a day boundary. The rule above
-    covers two cases where they would not. (1) The cutoff advances and a run
-    extends the assembled cache (historical._extend_assembled_cache) or
-    fetches a window that starts after the cutoff: the live days before the
-    new cutoff are deleted, but the archive days are not fetched again, so
-    they keep the old cutoff and those markets sit in neither kind on disk. A
-    live day's summary is therefore kept, and counted, after its slice is
-    deleted, until an archive cutoff reaches the end of its day (only
-    complete days were ever saved as slices, so the summary is a complete
-    record of the day). (2) A fetch interrupted after the archive was fetched
-    again but before the old live days were deleted leaves those days in both
-    kinds; they end at or before M, so they are not counted. merge() returns
-    the archive cutoff against the first live day counted (`coverage`), so a
-    gap the summaries cannot fill (a live day deleted before it was ever
-    summarised) shows. What can still count a market twice: a record settled
-    exactly on a UTC midnight, which two adjacent live windows may both hold
-    (the fetch leaves those boundary overlaps to the assembly's ticker
-    dedup), and a cutoff that is ever not a midnight.
-
-    Reuse. A summary is reused while its key still matches: the slice's kind
-    and day, its size and modification time (st_mtime_ns), its meta cutoff_ts
-    (archive) and config.EDA_SUMMARY_VERSION. The cutoff is read from the
-    slice's first line, which costs one small read for a streamed
-    ("jsonl-v1") slice; for a legacy single-document slice that line is the
-    whole file, so there only the size and time are compared (any rewrite of
-    a slice changes its time). A slice that changes while it is read, or that
-    cannot be read, gives a summary naming it in `unreadable`, which is not
-    saved, so the next run tries it again; nothing else stops.
-
-    Residuals: what a summary takes from other files is fixed when it is
-    built. A candle file created after its slice was summarised is not joined
-    to its market until that slice is summarised again (a changed slice, or a
-    version bump); merge() counts the candle files with no joined market. And
-    blank_title_after, the deadline wording and the ladders read the event
-    titles in event_titles_v2.json as it was then.
-
-    Summaries are built in worker processes (spawn, never fork: safe on
-    macOS), each of which loads the event titles and the candle tickers once,
-    through _init_worker; the parent writes each summary to disk. A spawned
-    worker imports the caller's main module again, so a script that calls
-    load_or_build_summaries with more than one worker must do so under
-    `if __name__ == "__main__":`. Workers that do not start (that guard
-    missing, or a sandbox refusing new processes) or that die are replaced by
-    counting the remaining slices in this process, with one WARNING.
-
-    Candle files. Each is read once and its facts (the YES ask and midpoint at
-    each lead, whether that lead is stale, the traded volume, the field
-    version, whether it is empty) are kept in
-    <cache>/eda_days/candles.json under the file name, with the file's size
-    and modification time, the market close time the leads were worked out
-    from and config.EDA_CANDLE_FACTS_VERSION (its own version, so changing the
-    facts never rebuilds the day-slice summaries); a file whose key no longer
-    matches
-    is read again, and the join with a market's result and category happens
-    after that cache, so a new category listing or result needs no re-read.
-    Only markets that are not combos are calibrated or counted for volume (a
-    combo's price is not what the strategy trades), and the number left out
-    is reported. A candle's "ts" is the END of its hour. A candle price is
-    used only when historical.usable_candle_ask accepts it (an ask of 1.00,
-    or a NO ask at the 0.99 clamp, is no quote). The primary price is the YES
-    ask, what betting Yes costs. The midpoint, halfway between the YES ask and
-    the YES bid (1 minus the NO ask), is a second figure that exists only where
-    both sides are usable: a long shot's YES bid is under a cent, so its NO ask
-    sits at the clamp and it has an ask but no midpoint, which is why the
-    midpoint alone would drop most long shots. The price for a lead must come
-    from a candle that ended within config.EDA_PRICE_MAX_AGE_HOURS before
-    close minus the lead; an older last candle gives no price (counted as
-    stale). A one-sided book says little (a 99c ask with nobody bidding only
-    means nobody sold lower), so a price counts only where the book was at
-    most config.EDA_MAX_BOOK_WIDTH wide, a missing bid counting as 0 (counted
-    as wide otherwise). The close time used is the market's REALIZED close (the cache
-    records when the market actually closed), so where trading carries on after
-    the outcome is known, the 1 hour price can already reflect the outcome. The
-    candles are those the backtest priced, so they are not a random sample of
-    the markets.
-
-    The cache folder is listed with os.scandir, once for the candle folder
-    and once per top-level entry for inventory(); nothing globs or sorts the
-    candle folder. The candle files are read in this process, one at a time.
+    - A summary is counted by kind: an archive summary only for records settled
+      before its slice's cutoff, a live summary only for a day ending after the
+      largest archive cutoff. A live day's summary outlives its deleted slice
+      until the archive covers it. merge() reports any gap as `coverage`.
+    - A summary is reused while its slice's size, mtime and cutoff and
+      config.EDA_SUMMARY_VERSION match; an unreadable slice is not saved and is
+      retried next run.
+    - Workers are spawned (never forked), so a caller using more than one must
+      sit under `if __name__ == "__main__":`; if they cannot start, slices are
+      counted in-process with one WARNING.
+    - Candle facts are cached in <cache>/eda_days/candles.json under
+      config.EDA_CANDLE_FACTS_VERSION. Only non-combo markets are calibrated.
+      A price counts only from a usable candle (historical.usable_candle_ask)
+      no older than config.EDA_PRICE_MAX_AGE_HOURS and a book at most
+      config.EDA_MAX_BOOK_WIDTH wide. Market close is the REALIZED close.
 """
 import argparse
 import gzip
