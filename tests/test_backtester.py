@@ -20603,17 +20603,12 @@ class TestLegQuotesCarryTheBook:
         np.testing.assert_array_equal(again.volume_checkpoints, quotes.volume_checkpoints)
         assert again.book_at(_LADDER_M1, 0.60, 0.60) == quotes.book_at(_LADDER_M1, 0.60, 0.60)
         # Without the model, the checkpoint volume or the daily volume it is
-        # a different LegQuotes (the last five arguments are volume_checkpoints,
-        # volume_daily, depth, moved_checkpoints and stale_max_age, in that
-        # order; C6 appended the last two)
-        cls, args = quotes.__reduce__()
-        head, (volumes, daily, _depth, moved, limit) = args[:-5], args[-5:]
-        assert cls(*head, volumes, daily, None, moved, limit) != quotes
-        assert cls(*head, volumes, daily, None, moved, limit).fingerprint != quotes.fingerprint
-        no_volume = cls(*head, None, daily, model, moved, limit)
-        assert no_volume != quotes and no_volume.fingerprint != quotes.fingerprint
-        no_daily = cls(*head, volumes, None, model, moved, limit)
-        assert no_daily != quotes and no_daily.fingerprint != quotes.fingerprint
+        # a different LegQuotes (each argument changed by name: __reduce__
+        # hands back __init__'s arguments in order, and C6 and C7 appended some)
+        for change in ({"depth": None}, {"volume_checkpoints": None},
+                       {"volume_daily": None}):
+            other = _rebuilt(quotes, **change)
+            assert other != quotes and other.fingerprint != quotes.fingerprint, change
 
     @staticmethod
     def _daily_quotes(model):
@@ -20643,12 +20638,9 @@ class TestLegQuotesCarryTheBook:
         week = (_LADDER_M2 - quotes.first_checkpoint).days // 7
         assert quotes.volume_daily[index] == quotes.volume_checkpoints[week]
         # The daily volume goes into the comparison and the fingerprint
-        cls, args = quotes.__reduce__()
-        changed = list(args)
-        # volume_daily is the fourth argument from the end (then depth,
-        # moved_checkpoints and stale_max_age)
-        changed[-4] = np.where(np.arange(len(args[-4])) == index - 1, 6.0, args[-4])
-        other = cls(*changed)
+        daily = quotes.volume_daily
+        other = _rebuilt(quotes, volume_daily=np.where(np.arange(len(daily)) == index - 1,
+                                                       6.0, daily))
         assert other != quotes and other.fingerprint != quotes.fingerprint
 
     def test_a_pickle_round_trip_keeps_the_daily_volume(self):
@@ -24620,6 +24612,15 @@ _STALE_LIMIT = 86_400
 _STALE_LINE = "Mondays skipped because a market's quote had not moved or traded for over 24 hours"
 
 
+def _rebuilt(quotes, **changes):
+    """The LegQuotes rebuilt from its own __reduce__ arguments, with some changed by name."""
+    cls, args = quotes.__reduce__()
+    names = list(inspect.signature(backtester.LegQuotes.__init__).parameters)[1:]
+    by_name = dict(zip(names, args, strict=True))
+    by_name.update(changes)
+    return cls(*(by_name[name] for name in names))
+
+
 def _moved(day: date, seconds_before: int, yes_ask: float, no_ask: float) -> dict:
     """A candle ending `seconds_before` the checkpoint on `day` with contracts traded in its hour."""
     return dict(_candle(_ck(day) - seconds_before, yes_ask, no_ask), volume=5.0)
@@ -24712,10 +24713,13 @@ class TestQuoteIsFresh:
         # 86_400 and 86_400.0 are one limit
         same = self._quotes(candles, limit=86_400.0)
         assert same == q and same.fingerprint == q.fingerprint
-        # The two new arguments are the last two of __reduce__'s
+        # __reduce__ hands both back by name, and a rebuilt quote is the same
         cls, args = q.__reduce__()
-        np.testing.assert_array_equal(args[-2], q.moved_checkpoints)
-        assert args[-1] == 86_400.0
+        names = list(inspect.signature(backtester.LegQuotes.__init__).parameters)[1:]
+        by_name = dict(zip(names, args, strict=True))
+        np.testing.assert_array_equal(by_name["moved_checkpoints"], q.moved_checkpoints)
+        assert by_name["stale_max_age"] == 86_400.0
+        assert cls(*args) == q
 
     def test_the_limit_is_resolved_and_checked(self, monkeypatch):
         resolve = backtester._resolve_stale_quote_max_age
@@ -24863,27 +24867,26 @@ class TestStaleQuoteHoldsBackASaleOrATrim:
         # The daily check a day before (its own quote, an hour old) is not held to it
         assert backtester._position_sale_value([held], _LADDER_M2, 1) is not None
         # With no limit the checkpoint values it
-        cls, args = qb.__reduce__()
-        unlimited = cls(*args[:-1], None)
+        unlimited = _rebuilt(qb, stale_max_age=None)
         assert backtester._position_sale_value(
             [dc_replace(held, marks=(qa, unlimited))], _LADDER_M2) is not None
 
     def test_a_paid_out_leg_needs_no_quote(self):
         (held,) = self._sim(_stale_attached([self._SUITE._record()], self._candles())).trades
         qa, qb = held.marks
-        cls, args = qa.__reduce__()
         index = (_LADDER_M2 - qa.first_checkpoint).days // 7
-        never_moved = np.full(len(args[-2]), -1, dtype=np.int64)
+        never_moved = np.full(len(qa.moved_checkpoints), -1, dtype=np.int64)
         # SA marked paid out by Monday 2, with no move ever recorded
-        paid = np.array(args[11], dtype=bool)
+        paid = np.array(qa.paid_checkpoints, dtype=bool)
         paid[index] = True
-        paid_stale = cls(*args[:11], paid, *args[12:-2], never_moved, _STALE_LIMIT)
+        paid_stale = _rebuilt(qa, paid_checkpoints=paid, moved_checkpoints=never_moved,
+                              stale_max_age=_STALE_LIMIT)
         assert not backtester._quote_is_fresh(paid_stale, _LADDER_M2)
         sale = backtester._position_sale_value([dc_replace(held, marks=(paid_stale, qb))],
                                                _LADDER_M2)
         assert sale is not None and sale[0][0][2][0] is None
         # The same market still to pay out is held back
-        unpaid_stale = cls(*args[:-2], never_moved, _STALE_LIMIT)
+        unpaid_stale = _rebuilt(qa, moved_checkpoints=never_moved, stale_max_age=_STALE_LIMIT)
         assert backtester._position_sale_value(
             [dc_replace(held, marks=(unpaid_stale, qb))], _LADDER_M2) is None
 
@@ -25248,3 +25251,414 @@ class TestStaleQuoteSwitch:
                      backtester._prepare_candidates):
             param = inspect.signature(func).parameters["stale_quote_max_age"]
             assert param.default is None and param.kind is param.KEYWORD_ONLY
+
+
+# ─── The volume cap (C7): a fill takes at most a share of the next day's volume ─
+
+_SHARE = 0.10
+_CUT_LINE = "Fills cut to 10% of the next day's volume"
+_CAP_SALES_LINE = "Sales held back by the volume cap"
+
+
+def _with_after(candles: dict, ticker: str, day: date, volume) -> dict:
+    """The candles with one more for `ticker`, ending an hour after the
+    checkpoint on `day` at the prices of its latest candle at or before it,
+    with `volume` contracts traded: the volume ahead of that checkpoint."""
+    series = candles[ticker]
+    last = max((c for c in series if c["ts"] <= _ck(day)), key=lambda c: c["ts"])
+    extra = dict(_candle(_ck(day) + 3_600, last["yes_ask_close"], last["no_ask_close"]),
+                 volume=volume)
+    return dict(candles, **{ticker: sorted(series + [extra], key=lambda c: c["ts"])})
+
+
+def _capped_attached(records: list[dict], candles: dict, share=_SHARE, model=None,
+                     start: date = date(2026, 1, 1)) -> list[dict]:
+    """The records given their quotes as a run gives them, the volume cap's
+    share carried on every quote (None: off)."""
+    projected = {t: backtester._project_candles(series) for t, series in candles.items()}
+    backtester._attach_leg_quotes(records, projected, start, model, volume_share=share)
+    return records
+
+
+class TestVolumeAhead:
+    """LegQuotes.volume_ahead_checkpoints holds the contracts traded in the
+    window after each checkpoint (candles ending in (checkpoint, checkpoint +
+    window]); NaN when a candle there carries no readable volume. The cap is
+    floor(share x that), None when the cap is off or the volume unreadable."""
+
+    _START = date(2026, 1, 1)
+    _MARKET = {"ticker": "Q", "settlement_ts": "2026-03-20T12:00:00Z", "result": "yes"}
+
+    def _quotes(self, candles, share=_SHARE):
+        quotes, _ = backtester._leg_quotes(self._MARKET, candles, self._START,
+                                           volume_share=share)
+        return quotes
+
+    def test_the_window_is_after_the_checkpoint_and_includes_its_end(self):
+        ck = _ck(_LADDER_M1)
+        candles = [dict(_candle(ck + offset, 0.30, 0.70), volume=v)
+                   for offset, v in ((-3_600, 100.0), (0, 1.0), (1, 2.0), (86_400, 4.0),
+                                     (86_401, 8.0))]
+        q = self._quotes(candles)
+        assert q.volume_ahead_checkpoints[0] == 6.0
+        assert q.volume_cap_at(_LADDER_M1) == 0
+        # No candle at all in a later checkpoint's window: nothing traded
+        assert q.volume_ahead_checkpoints[1] == 0.0
+
+    def test_an_unreadable_volume_in_the_window_is_not_capped(self):
+        ck = _ck(_LADDER_M1)
+        candles = [dict(_candle(ck - 3_600, 0.30, 0.70), volume=None),
+                   dict(_candle(ck + 3_600, 0.30, 0.70), volume=50.0),
+                   _candle(ck + 7_200, 0.30, 0.70)]
+        q = self._quotes(candles)
+        assert math.isnan(q.volume_ahead_checkpoints[0])
+        assert q.volume_cap_at(_LADDER_M1) is None
+        # Unreadable only before the checkpoint: read
+        q = self._quotes(candles[:2])
+        assert q.volume_cap_at(_LADDER_M1) == 5
+
+    @pytest.mark.parametrize("share, volume, cap", [(0.29, 100.0, 29), (0.10, 25.0, 2),
+                                                    (0.10, 9.0, 0), (1.0, 7.0, 7)])
+    def test_the_cap_is_the_floor_of_the_share(self, share, volume, cap):
+        candles = [dict(_candle(_ck(_LADDER_M1) + 3_600, 0.3, 0.7), volume=volume)]
+        assert self._quotes(candles, share).volume_cap_at(_LADDER_M1) == cap
+
+    def test_no_share_or_another_day_caps_nothing(self):
+        candles = [dict(_candle(_ck(_LADDER_M1) + 3_600, 0.3, 0.7), volume=50.0)]
+        assert self._quotes(candles, None).volume_cap_at(_LADDER_M1) is None
+        q = self._quotes(candles)
+        for day in (_LADDER_M1 + timedelta(days=1), date(2025, 12, 29), date(2030, 1, 7)):
+            assert q.volume_cap_at(day) is None
+        hand = backtester.LegQuotes("Z", date(2026, 1, 5), [0.3], [0.7], date(2026, 1, 5),
+                                    [0.3, 0.3], [0.7, 0.7], 1.0, 0.0)
+        assert hand.volume_share is None and hand.volume_cap_at(date(2026, 1, 5)) is None
+
+    def test_the_volumes_and_the_share_are_in_the_fingerprint_and_survive_pickling(self):
+        candles = [dict(_candle(_ck(_LADDER_M1) + 3_600, 0.3, 0.7), volume=50.0)]
+        q = self._quotes(candles)
+        again = pickle.loads(pickle.dumps(q))
+        assert again == q and again.fingerprint == q.fingerprint
+        assert again.volume_cap_at(_LADDER_M1) == 5
+        for other in (_rebuilt(q, volume_share=0.2), _rebuilt(q, volume_share=None),
+                      _rebuilt(q, volume_ahead_checkpoints=q.volume_ahead_checkpoints + 1.0)):
+            assert other != q and other.fingerprint != q.fingerprint
+        assert _rebuilt(q, volume_share=0.1) == q
+
+    def test_a_cut_keeps_the_best_levels_and_walks_alike_up_to_the_cap(self):
+        levels = [[0.50, 10.0], [0.49, 20.0], [0.45, 30.0]]
+        assert backtester._cut_levels(levels, 15) == [[0.50, 10.0], [0.49, 5.0]]
+        assert backtester._cut_levels(levels, 0) == []
+        assert backtester._cut_levels(levels, 1_000) == levels
+        for n in range(1, 16):
+            assert scanner.walk_bids(backtester._cut_levels(levels, 15), n) == \
+                scanner.walk_bids(levels, n)
+        assert scanner.walk_bids(backtester._cut_levels(levels, 15), 16) is None
+
+    def test_a_sale_ladder_is_cut_at_the_checkpoint_only(self):
+        candles = [dict(_candle(_ck(_LADDER_M1) - 3_600, 0.3, 0.7), volume=400.0),
+                   dict(_candle(_ck(_LADDER_M1) + 3_600, 0.3, 0.7), volume=70.0)]
+        bare = self._quotes(candles)
+        # No modeled ladder: the one bid, holding the cap
+        assert bare.sale_ladder(_LADDER_M1, 0.30) == [[0.30, 7.0]]
+        assert bare.sale_ladder(_LADDER_M1, 0.30, volume_cap=False) is None
+        assert bare.sale_ladder(_LADDER_M1, 0.30, 1) is None
+        assert self._quotes(candles, None).sale_ladder(_LADDER_M1, 0.30) is None
+        model = _walk_model()
+        walked, _ = backtester._leg_quotes(self._MARKET, candles, self._START, model,
+                                           volume_share=_SHARE)
+        full = walked.sale_ladder(_LADDER_M1, 0.30, volume_cap=False)
+        assert sum(size for _p, size in full) > 7
+        assert walked.sale_ladder(_LADDER_M1, 0.30) == backtester._cut_levels(full, 7)
+
+    def test_the_share_is_resolved_and_checked(self, monkeypatch):
+        resolve = backtester._resolve_max_volume_share
+        monkeypatch.setattr(backtester, "BACKTEST_MAX_VOLUME_SHARE", 0.25)
+        assert resolve() == 0.25 and resolve(False) is None and resolve(1) == 1.0
+        monkeypatch.setattr(backtester, "BACKTEST_MAX_VOLUME_SHARE", None)
+        assert resolve() is None
+        for bad in (True, 0, -0.1, 1.5, float("nan"), "0.1", Decimal("0.1")):
+            with pytest.raises(ValueError, match="volume cap"):
+                resolve(bad)
+
+    def test_the_shipped_values(self):
+        assert config.BACKTEST_MAX_VOLUME_SHARE == 0.10
+        assert config.BACKTEST_VOLUME_SHARE_WINDOW_SECONDS == 86_400
+
+
+class TestVolumeCapBuys:
+    """A buy takes at most the cap's contracts from each market. With no book
+    to walk, the candidate is a one-level book at its quotes holding the
+    cap's limit, which the live sizer walks; with a modeled book, each
+    market's two sides are cut to its cap. Where the cap does not bind, the
+    trade is exactly the uncapped one. A cap of 0 makes no trade; an
+    unreadable volume caps nothing."""
+
+    _START = date(2026, 1, 1)
+
+    def _sim(self, records, **kw):
+        return backtester._simulate_at_discount(records, self._START, 10_000.0, k=0.75,
+                                                 size_cap=1.0, end_date=date(2026, 4, 1), **kw)
+
+    @staticmethod
+    def _pair(volume_a, volume_b=1e9):
+        rec, candles = TestWalkedTradeParity._ts()
+        candles = _with_after(_with_after(candles, "OA", _LADDER_M1, volume_a),
+                              "OB", _LADDER_M1, volume_b)
+        return rec, candles
+
+    def _free_n(self):
+        rec, candles = self._pair(1e9)
+        (trade,) = self._sim(_capped_attached([rec], candles, share=None)).trades
+        return trade.n
+
+    def test_a_trade_larger_than_the_cap_is_cut_to_it_over_a_one_level_book(self, caplog):
+        n = self._free_n()
+        limit = n // 2
+        rec, candles = self._pair(10 * limit)
+        records = _capped_attached([rec], candles)
+        with caplog.at_level(logging.INFO):
+            (trade,) = self._sim(records).trades
+        assert trade.n == limit and not trade.book_walked
+        assert f"{_CUT_LINE} ({_label(1.0)}): 1 trades (0 not made)" in caplog.messages
+        # The live sizer took its booked path over one level at the quotes
+        quotes = records[0]["leg_quotes"]
+        spec, why = backtester._size_trade(
+            _pass2_candidate(rec, (quotes["OA"], quotes["OB"])), _LADDER_M1, 10_000.0,
+            10_000.0, TestWalkedTradeParity._settings(0.75, 1.0), None, {})
+        assert why == backtester._VOLUME_CUT and spec.x == limit
+        assert spec.pair.depth_levels == ((0.20, 0.40, float(limit)),)
+
+    def test_a_cap_of_zero_makes_no_trade(self, caplog):
+        rec, candles = self._pair(9.0)
+        with caplog.at_level(logging.INFO):
+            point = self._sim(_capped_attached([rec], candles))
+        assert point.trades == []
+        assert f"{_CUT_LINE} ({_label(1.0)}): 1 trades (1 not made)" in caplog.messages
+        assert "Trades refused when their book was walked" not in caplog.text
+
+    @pytest.mark.parametrize("volume", [None, 1e9])
+    def test_an_unreadable_volume_or_a_cap_that_does_not_bind_is_the_uncapped_run(
+            self, volume, caplog):
+        rec, candles = self._pair(volume)
+        off = self._sim(_capped_attached([copy.deepcopy(rec)], candles, share=None))
+        with caplog.at_level(logging.INFO):
+            on = self._sim(_capped_attached([rec], candles))
+        # Every field but the quotes, which carry the share
+        assert [astuple(dc_replace(t, marks=None)) for t in on.trades] == [
+            astuple(dc_replace(t, marks=None)) for t in off.trades]
+        pd.testing.assert_frame_equal(on.equity_df, off.equity_df, check_exact=True)
+        assert _CUT_LINE not in caplog.text
+
+    def test_a_walked_book_is_cut_at_each_market_s_cap(self):
+        rec, candles = TestWalkedTradeParity._ts()
+        model = _walk_model()
+        free = self._sim(_capped_attached([copy.deepcopy(rec)],
+                                          _with_after(_with_after(candles, "OA", _LADDER_M1, 1e9),
+                                                      "OB", _LADDER_M1, 1e9),
+                                          share=None, model=model))
+        (big,) = free.trades
+        assert big.book_walked
+        limit = big.n // 3
+        capped = _capped_attached([rec], _with_after(_with_after(candles, "OA", _LADDER_M1,
+                                                                 10 * limit),
+                                                     "OB", _LADDER_M1, 1e9), model=model)
+        c = {**_pass2_candidate(capped[0], (capped[0]["leg_quotes"]["OA"],
+                                             capped[0]["leg_quotes"]["OB"]))}
+        book_a, book_b = backtester._books_for(c, _LADDER_M1)
+        assert all(sum(size for _p, size in book_a[side]) <= limit for side in ("yes", "no"))
+        assert sum(size for _p, size in book_b["no"]) > limit
+        (cut,) = self._sim(capped).trades
+        assert cut.book_walked and 0 < cut.n <= limit < big.n
+
+    def test_the_one_level_book_sizes_the_top_of_the_book_where_the_cap_does_not_bind(self):
+        # Over many random candidates and portfolios: with the cap on and not
+        # binding, _size_trade's trade is exactly the uncapped one; where it
+        # binds, the live sizer walks a one-level book at the quotes and buys
+        # at most the limit. (The one-level book is used only where the cap
+        # binds: the booked path prices a level as its prefix average, which
+        # can differ from the quote in the last bit, and once in about 7,000
+        # measured cases sized one contract fewer.)
+        rng = random.Random(11)
+        checked = binding = 0
+        for _ in range(400):
+            k = rng.choice([0.5, 0.75, 0.8])
+            settings = TestWalkedTradeParity._settings(k, rng.choice([0.1, 0.2, 1.0]))
+            pA = round(rng.uniform(0.02, 0.6), 2)
+            pB = round(rng.uniform(pA + 0.05, 0.99), 2)
+            nB = round(min(0.98, 1 - pB + rng.uniform(0, 0.05)), 2)
+            rec, candles = TestWalkedTradeParity._ts(quotes=(pA, pB, nB))
+            value = rng.choice([100.0, 1_000.0, 10_000.0, 250_000.0])
+            cash = value * rng.choice([1.0, 0.3, 0.05])
+            free_rec = _capped_attached([copy.deepcopy(rec)], candles, share=None)[0]
+            q = free_rec["leg_quotes"]
+            free, _ = backtester._size_trade(_pass2_candidate(free_rec, (q["OA"], q["OB"])),
+                                             _LADDER_M1, value, cash, settings, None, {})
+            if free is None:
+                continue
+            for limit in {max(1, free.x - 1), free.x, free.x + 1, 10 * free.x}:
+                capped = _capped_attached(
+                    [copy.deepcopy(rec)],
+                    _with_after(_with_after(candles, "OA", _LADDER_M1, 10 * limit),
+                                "OB", _LADDER_M1, 1e12))[0]
+                q = capped["leg_quotes"]
+                assert q["OA"].volume_cap_at(_LADDER_M1) == limit
+                spec, why = backtester._size_trade(
+                    _pass2_candidate(capped, (q["OA"], q["OB"])), _LADDER_M1, value, cash,
+                    settings, None, {})
+                checked += 1
+                if limit >= free.x:
+                    assert why is None and spec == free
+                else:
+                    binding += 1
+                    assert spec is None or (spec.x <= limit and why == backtester._VOLUME_CUT
+                                            and len(spec.pair.depth_levels) == 1)
+        assert checked > 500 and binding > 50
+
+
+class TestVolumeCapSalesAndTrims:
+    """A sale at a checkpoint takes at most the cap's contracts from each
+    market: a position larger than that is not sold there, and is sold at a
+    later checkpoint the cap allows; a Kelly trim sells at most the cap. The
+    fixture is TestSellAtShareOfPotentialProfit's pair, with the volume
+    ahead of each Monday set by a candle an hour after its checkpoint."""
+
+    _SUITE = TestSellAtShareOfPotentialProfit
+
+    @classmethod
+    def _candles(cls, volumes: dict) -> dict:
+        candles = cls._SUITE._candles()
+        for day in (_LADDER_M1, _LADDER_M2, _LADDER_M3, _M4):
+            for ticker in ("SA", "SB"):
+                candles = _with_after(candles, ticker, day, volumes.get(day, 1e9))
+        return candles
+
+    def _sell(self, volumes, share=_SHARE, **kw):
+        records = _capped_attached([self._SUITE._record()], self._candles(volumes), share=share)
+        return self._SUITE()._sim(records, 0.25, **kw)
+
+    def test_a_sale_larger_than_the_cap_waits_for_a_monday_it_fits(self, caplog):
+        (free,) = self._sell({}).trades
+        assert free.sold and free.exit_date == _LADDER_M2
+        # Monday 2's cap is one contract short of the position
+        small = {_LADDER_M2: 10 * (free.n - 1)}
+        with caplog.at_level(logging.INFO):
+            (later,) = self._sell(small).trades
+        assert later.sold and later.exit_date == _LADDER_M3 and later.n == free.n
+        label = f"{_label(1.0)}, selling at 25% of potential profit"
+        assert f"{_CAP_SALES_LINE} ({label}): 1" in caplog.messages
+        # Exactly the position fits: sold on Monday 2, nothing held back
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            (fits,) = self._sell({_LADDER_M2: 10 * free.n}).trades
+        assert fits.exit_date == _LADDER_M2 and _CAP_SALES_LINE not in caplog.text
+        # Off: Monday 2, whatever the volume
+        (off,) = self._sell(small, share=None).trades
+        assert off.exit_date == _LADDER_M2
+
+    def test_a_kelly_trim_sells_at_most_the_cap(self):
+        records = _capped_attached([self._SUITE._record()], self._candles({}), share=None)
+        free = TestTrimToKelly()._sim(records, trim_to_kelly=True)
+        (first,) = [t for t in free.trades if t.sold and t.exit_date == _LADDER_M2]
+        cap = first.n // 2
+        assert cap >= 1
+        records = _capped_attached([self._SUITE._record()],
+                                   self._candles({_LADDER_M2: 10 * cap}))
+        point = TestTrimToKelly()._sim(records, trim_to_kelly=True)
+        (cut,) = [t for t in point.trades if t.sold and t.exit_date == _LADDER_M2]
+        assert 0 < cut.n <= cap < first.n
+
+
+class TestVolumeCapSwitch:
+    """config.BACKTEST_MAX_VOLUME_SHARE through run_backtest_sweep, like the
+    stale-quote switch: None reads this module's binding, False turns the cap
+    off, a share sets it; one setting line, recorded on the result. Off, the
+    golden fixture's run is the run without it but for that line. On, no
+    candle of it ends in the day after a checkpoint, so nothing traded there
+    and no trade is made."""
+
+    _SETTING = "Volume cap (backtest):"
+
+    def _run(self, monkeypatch, caplog, **kw):
+        return TestStaleQuoteSwitch()._run(monkeypatch, caplog, **kw)
+
+    def test_off_changes_no_figure_and_on_reads_the_day_after(self, monkeypatch, caplog):
+        assert backtester.BACKTEST_MAX_VOLUME_SHARE is None
+        base, base_lines = self._run(monkeypatch, caplog)
+        assert base.max_volume_share is False
+        monkeypatch.setattr(backtester, "BACKTEST_MAX_VOLUME_SHARE", 0.10)
+        off, off_lines = self._run(monkeypatch, caplog, max_volume_share=False)
+        TestStaleQuoteSwitch._same(off, base)
+        assert off.max_volume_share is False
+        assert [m for m in off_lines if m.startswith(self._SETTING)] == [
+            "Volume cap (backtest): off — a trade is held only to the modeled book "
+            "(run-level override)"]
+        assert ([m for m in off_lines if not m.startswith(self._SETTING)]
+                == [m for m in base_lines if not m.startswith(self._SETTING)])
+        on, on_lines = self._run(monkeypatch, caplog)
+        assert on.max_volume_share == 0.10
+        assert [m for m in on_lines if m.startswith(self._SETTING)] == [
+            "Volume cap (backtest): on — a buy or a sale at a checkpoint may take at most "
+            "10% of the contracts that traded in each of its markets over the next 24 hours "
+            "(it reads hours a live run cannot see, and only ever makes a trade smaller) "
+            "(config.BACKTEST_MAX_VOLUME_SHARE)"]
+        # The fixture's candles all end before their Monday's checkpoint, so
+        # nothing trades in the day after any of them: a cap of 0, no trade
+        assert base.primary.trades and on.primary.trades == []
+        cut = [m for m in on_lines if m.startswith(_CUT_LINE)]
+        assert cut and all(re.search(r": (\d+) trades \(\1 not made\)$", m) for m in cut)
+        assert not any(m.startswith("Markets with no readable volume ahead") for m in on_lines)
+
+    def test_a_bad_share_is_refused_before_anything_is_fetched(self, monkeypatch):
+        def never(*_a, **_k):
+            raise AssertionError("fetched")
+
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets", never)
+        for bad in (True, 0, 1.5, float("nan")):
+            with pytest.raises(ValueError, match="volume cap"):
+                run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                   start_date=date(2026, 1, 1), max_volume_share=bad)
+
+    def test_the_infeasible_window_records_the_share(self, monkeypatch):
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                 start_date=date(2026, 1, 1), max_volume_share=0.05)
+        assert res.max_volume_share == 0.05
+
+    def test_every_entry_point_takes_it_keyword_only(self):
+        for func in (run_backtest_sweep, backtester.run_backtest, backtester._prepare_entries,
+                     backtester._prepare_candidates):
+            param = inspect.signature(func).parameters["max_volume_share"]
+            assert param.default is None and param.kind is param.KEYWORD_ONLY
+
+
+class TestVolumeCapKeepsEveryLazyFamilyExact(TestStaleQuoteKeepsEveryLazyFamilyExact):
+    """The same lazy-family parity as the stale-quote check's, with the volume
+    cap on (and the stale-quote check off): the cap reads no size cap, so
+    every cap of every kind of CapSweep, every cell of sold_grid and of
+    rise_grid equals a fresh simulation. The volume ahead binds on entries,
+    add-ons, sales and trims: the early pair may buy 2 contract pairs, the
+    first pair 30 on Monday 2 and 300 on Monday 4."""
+
+    @classmethod
+    def _entries(cls, limit=_SHARE) -> list[dict]:
+        early = _ladder_record(_ladder_market("PA", "EVP-1", "2026-01-12"),
+                               _ladder_market("PB", "EVP-2", "2026-01-12"), "early",
+                               (_LADDER_M1,))
+        other = _ladder_record(_ladder_market("OA", "EVO-1", "2026-02-10"),
+                               _ladder_market("OB", "EVO-2", "2026-03-20"), "other",
+                               (_LADDER_M3,))
+        candles = dict(TestStaleQuoteHoldsBackASaleOrATrim._candles(),
+                       PA=[_moved(_LADDER_M1, 0, 0.20, 0.82)],
+                       PB=[_moved(_LADDER_M1, 0, 0.60, 0.42)],
+                       OA=[_moved(_LADDER_M3, 0, 0.20, 0.82)],
+                       OB=[_moved(_LADDER_M3, 0, 0.60, 0.42)])
+        volumes = {("SA", _LADDER_M1): 1e9, ("SA", _LADDER_M2): 300.0,
+                   ("SA", _LADDER_M3): 1e9, ("SA", _M4): 3_000.0,
+                   ("PA", _LADDER_M1): 20.0, ("OA", _LADDER_M3): 1e9}
+        for (ticker, day), volume in volumes.items():
+            candles = _with_after(candles, ticker, day, volume)
+            partner = {"SA": "SB", "PA": "PB", "OA": "OB"}[ticker]
+            candles = _with_after(candles, partner, day, 1e9)
+        first = cls._SUITE._record((_LADDER_M1, _LADDER_M2, _LADDER_M3))
+        return _capped_attached([first, early, other], candles, share=limit,
+                                model=_walk_model())

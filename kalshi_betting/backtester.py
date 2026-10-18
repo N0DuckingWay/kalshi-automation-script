@@ -368,6 +368,7 @@ Notes:
     that nest but were ordered on an early REALIZED close, or strike-blind
     grouping on a cache without subtitles, can also produce it.
 """
+import bisect
 import functools
 import hashlib
 import logging
@@ -392,10 +393,12 @@ import pandas as pd
 from . import market_details
 from .config import (
     BACKTEST_MARKETS_RAM_WARN,
+    BACKTEST_MAX_VOLUME_SHARE,
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
     BACKTEST_RECORD_BYTES_ESTIMATE,
     BACKTEST_SCHEDULED_CLOSE,
     BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS,
+    BACKTEST_VOLUME_SHARE_WINDOW_SECONDS,
     BUDGET_FRACTION,
     CANDLE_NO_ASK_CEILING,
     CANDLESTICK_FETCH_MAX_WORKERS,
@@ -833,6 +836,34 @@ def _carried_forward(values: Any) -> np.ndarray:
     return array
 
 
+def _cut_levels(levels: list, cap: int) -> list[list[float]]:
+    """
+    One side's bids, best first, cut to hold at most `cap` contracts.
+
+    The levels are taken in order (best bid first) until `cap` contracts are
+    reached, the last one cut short; a walk of at most `cap` contracts takes
+    exactly what it took before (scanner.walk_bids). The volume cap's one
+    cut, for a sale's ladder and a synthetic book's two sides alike.
+
+    Args:
+        levels (list): [[price, contracts], ...], best (highest) first.
+        cap (int): The most contracts kept; 0 keeps none.
+
+    Returns:
+        list[list[float]]: New [price, contracts] levels.
+    """
+    out: list[list[float]] = []
+    left = float(cap)
+    for price, size in levels:
+        if left <= 0:
+            break
+        take = min(float(size), left)
+        if take > 0:
+            out.append([price, take])
+        left -= take
+    return out
+
+
 class LegQuotes:
     """
     One market's asks over the days a backtest trade in it can be open.
@@ -919,6 +950,15 @@ class LegQuotes:
             only when it moved at most this long before the checkpoint. None
             (every hand-built quote, and a run with the check off) checks
             nothing.
+        volume_ahead_checkpoints (np.ndarray): For each checkpoint, the
+            contracts traded in the market over the window after it
+            (BACKTEST_VOLUME_SHARE_WINDOW_SECONDS: candles ending in
+            (checkpoint, checkpoint + window]); NaN when a candle in that
+            window carries no readable volume (or for a hand-built quote).
+        volume_share (float | None): The run's volume cap, the share of that
+            volume a buy or a sale at the checkpoint may take
+            (config.BACKTEST_MAX_VOLUME_SHARE or the run's override); None
+            (every hand-built quote, and a run with the cap off) caps nothing.
         fingerprint (str): A hex digest of everything above; two LegQuotes
             that compare equal share it.
     """
@@ -928,7 +968,8 @@ class LegQuotes:
                  "yes_bid_checkpoints", "no_bid_checkpoints", "paid_checkpoints",
                  "yes_bid_daily", "no_bid_daily", "paid_daily",
                  "volume_checkpoints", "volume_daily", "depth", "moved_checkpoints",
-                 "stale_max_age", "fingerprint")
+                 "stale_max_age", "volume_ahead_checkpoints", "volume_share",
+                 "fingerprint")
 
     def __init__(self, ticker: str, first_day: date, yes_days: np.ndarray, no_days: np.ndarray,
                  first_checkpoint: date, yes_checkpoints: np.ndarray,
@@ -943,7 +984,9 @@ class LegQuotes:
                  volume_daily: np.ndarray | None = None,
                  depth: DepthModel | None = None,
                  moved_checkpoints: np.ndarray | None = None,
-                 stale_max_age: float | None = None) -> None:
+                 stale_max_age: float | None = None,
+                 volume_ahead_checkpoints: np.ndarray | None = None,
+                 volume_share: float | None = None) -> None:
         """
         Store one market's samples, made read-only, and their fingerprint.
 
@@ -986,6 +1029,10 @@ class LegQuotes:
                 checkpoint.
             stale_max_age (float | None): The stale-quote limit in seconds;
                 None for no check.
+            volume_ahead_checkpoints (np.ndarray | None): The volume traded
+                in the window after each checkpoint (NaN: unreadable). None
+                (a hand-built quote) reads as unreadable everywhere.
+            volume_share (float | None): The volume cap's share; None for no cap.
         """
         self.ticker = ticker
         self.first_day = first_day
@@ -1076,6 +1123,17 @@ class LegQuotes:
         # As a float, so 86_400 and 86_400.0 (equal) fingerprint alike
         self.stale_max_age = None if stale_max_age is None else float(stale_max_age)
         digest.update(repr(self.stale_max_age).encode("utf-8"))
+        # The volume traded after each checkpoint, and the share of it a buy
+        # or a sale may take: both decide what can trade
+        ahead = (np.full(count, np.nan) if volume_ahead_checkpoints is None
+                 else np.array(volume_ahead_checkpoints, dtype=float))
+        ahead.setflags(write=False)
+        self.volume_ahead_checkpoints = ahead
+        canonical = np.where(np.isnan(ahead), np.nan, ahead + 0.0)
+        digest.update(len(ahead).to_bytes(8, "little"))
+        digest.update(canonical.tobytes())
+        self.volume_share = None if volume_share is None else float(volume_share)
+        digest.update(repr(self.volume_share).encode("utf-8"))
         self.fingerprint = digest.hexdigest()
 
     def __reduce__(self) -> tuple:
@@ -1096,7 +1154,8 @@ class LegQuotes:
                             self.no_bid_checkpoints, self.paid_checkpoints,
                             self.yes_bid_daily, self.no_bid_daily, self.paid_daily,
                             self.volume_checkpoints, self.volume_daily, self.depth,
-                            self.moved_checkpoints, self.stale_max_age))
+                            self.moved_checkpoints, self.stale_max_age,
+                            self.volume_ahead_checkpoints, self.volume_share))
 
     def __copy__(self) -> "LegQuotes":
         """Return this object: it is read-only, and trades share one per market."""
@@ -1149,6 +1208,9 @@ class LegQuotes:
                 and np.array_equal(self.paid_daily, other.paid_daily)
                 and np.array_equal(self.moved_checkpoints, other.moved_checkpoints)
                 and self.stale_max_age == other.stale_max_age
+                and np.array_equal(self.volume_ahead_checkpoints,
+                                   other.volume_ahead_checkpoints, equal_nan=True)
+                and self.volume_share == other.volume_share
                 and model(self) == model(other))
 
     def __hash__(self) -> int:
@@ -1412,8 +1474,35 @@ class LegQuotes:
             return None
         return _synthetic_book(self.depth, yes_ask, yes_bid, volume)
 
+    def volume_cap_at(self, day: date) -> int | None:
+        """
+        The most contracts a buy or a sale in this market may take at the checkpoint on `day`, under the volume cap.
+
+        floor(volume_share x the contracts traded in the window after the
+        checkpoint), rounded to six decimals first so float noise never costs
+        a contract. It reads the window AFTER the checkpoint, which a live
+        run cannot see; it only ever makes a trade smaller.
+
+        Args:
+            day (date): A checkpoint date.
+
+        Returns:
+            int | None: The cap (0: no trade); None when there is no cap: the
+                cap is off, the volume ahead is unreadable (NaN), or the day
+                is not one of these quotes' checkpoints.
+        """
+        if self.volume_share is None:
+            return None
+        offset = (day - self.first_checkpoint).days
+        if offset < 0 or offset % 7 or offset // 7 >= len(self.volume_ahead_checkpoints):
+            return None
+        volume = float(self.volume_ahead_checkpoints[offset // 7])
+        if volume != volume:
+            return None
+        return math.floor(round(self.volume_share * volume, 6))
+
     def sale_ladder(self, day: date, best_bid: float,
-                    days_back: int = 0) -> list[list[float]] | None:
+                    days_back: int = 0, *, volume_cap: bool = True) -> list[list[float]] | None:
         """
         The bids a sale into this market would walk at the checkpoint on `day` (or a check before it).
 
@@ -1437,15 +1526,22 @@ class LegQuotes:
                 when the model cannot say: no model, no volume data there,
                 or a bid the model has no ladders for (below 1c or above
                 99c, depth_model.can_start_at). The sale then takes that one
-                bid, in any size.
+                bid, in any size. At the checkpoint itself (days_back 0),
+                with the volume cap (volume_cap_at), the ladder is cut to
+                that many contracts, and with no modeled ladder it is that
+                one bid holding that many: a sale larger than the cap cannot
+                be made there.
 
         Raises:
             ValueError: For a bad days_back.
         """
         volume = self._volume_at(day, days_back)
-        if volume is None or not can_start_at(best_bid):
-            return None
-        return bid_ladder(self.depth, best_bid, volume)
+        ladder = (None if volume is None or not can_start_at(best_bid)
+                  else bid_ladder(self.depth, best_bid, volume))
+        cap = self.volume_cap_at(day) if volume_cap and self._days_back(days_back) == 0 else None
+        if cap is None:
+            return ladder
+        return _cut_levels([[best_bid, math.inf]] if ladder is None else ladder, cap)
 
     def day_values(self, first: date, last: date, side: str, entry_price: float) -> np.ndarray:
         """
@@ -2356,6 +2452,10 @@ class _Candidates:
             constant or the run's override); None with the check off, and on
             a hand-built instance. Every LegQuotes the entry passes attach
             carries it.
+        max_volume_share (float | None): The volume cap this run trades under
+            (_resolve_max_volume_share: the constant or the run's override);
+            None with the cap off, and on a hand-built instance. Every
+            LegQuotes the entry passes attach carries it.
     """
     all_pairs: list
     candles_by_ticker: dict
@@ -2371,6 +2471,7 @@ class _Candidates:
     scheduled_close: bool | None = None
     close_rules: dict = field(default_factory=dict)
     stale_quote_max_age: float | None = None
+    max_volume_share: float | None = None
 
 
 def _fee_multiplier_of(market: dict, fee_multipliers: dict | None) -> float:
@@ -3931,6 +4032,11 @@ class BacktestSweep:
             config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS, or backtest.py's
             override); False when the check was off; None = not recorded (a
             hand-built sweep).
+        max_volume_share (float | bool | None): The volume cap the run traded
+            under, the share of the next window's traded contracts a buy or
+            a sale may take (the resolved config.BACKTEST_MAX_VOLUME_SHARE,
+            or backtest.py's override); False when the cap was off; None =
+            not recorded (a hand-built sweep).
     """
     primary: SweepPoint
     points: list[SweepPoint]
@@ -3982,6 +4088,8 @@ class BacktestSweep:
     scheduled_close: bool | None = None
     # The stale-quote limit in seconds (False: the check was off; None: not recorded)
     stale_quote_max_age: float | bool | None = None
+    # The volume cap's share (False: the cap was off; None: not recorded)
+    max_volume_share: float | bool | None = None
 
 
 def _settlement_receipt(n: int, outcome_a: str, outcome_b: str, pair_type: str) -> float:
@@ -4576,6 +4684,36 @@ def _positions(open_trades: list[BacktestTrade]) -> list[list[BacktestTrade]]:
     return list(groups.values())
 
 
+def _resolve_max_volume_share(value: Any = None) -> float | None:
+    """
+    The volume cap a run trades under, as a share in (0, 1], or None when the cap is off.
+
+    Args:
+        value (Any): None (the default) reads THIS MODULE's binding of
+            config.BACKTEST_MAX_VOLUME_SHARE at call time (itself None to
+            turn the cap off); False turns it off for this run; a real number
+            in (0, 1] sets it for this run.
+
+    Returns:
+        float | None: The share as a float, or None for no cap.
+
+    Raises:
+        ValueError: For True or another bool, a non-number, NaN, or a number
+            outside (0, 1] (the constant's value too).
+    """
+    if value is None:
+        value = BACKTEST_MAX_VOLUME_SHARE
+        if value is None:
+            return None
+    elif value is False:
+        return None
+    if (isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real)
+            or not math.isfinite(value) or not 0 < value <= 1):
+        raise ValueError("the volume cap must be a share in (0, 1], None or False, "
+                         f"got {value!r}")
+    return float(value)
+
+
 def _resolve_stale_quote_max_age(value: Any = None) -> float | None:
     """
     The stale-quote limit a run trades under, in seconds, or None when the check is off.
@@ -4604,6 +4742,19 @@ def _resolve_stale_quote_max_age(value: Any = None) -> float | None:
         raise ValueError("the stale-quote limit must be a positive, finite number of "
                          f"seconds, None or False, got {value!r}")
     return float(value)
+
+
+def _share_text(share: float | None) -> str:
+    """
+    The volume cap's share as the log lines print it ("10%", "2.5%").
+
+    Args:
+        share (float | None): The share in (0, 1].
+
+    Returns:
+        str: The percent with %g, or "?" when unknown.
+    """
+    return "?" if share is None else f"{share * 100:g}%"
 
 
 def _stale_hours_text(limit: float | None) -> str:
@@ -4692,9 +4843,37 @@ def _stale_unpaid_leg(position: list[BacktestTrade], day: date) -> bool:
                for trade in position if trade.marks is not None for quotes in trade.marks)
 
 
+def _volume_capped_leg(position: list[BacktestTrade], day: date) -> bool:
+    """
+    Whether the volume cap holds fewer contracts than a position sells on some market still to pay out, at the checkpoint on `day`.
+
+    The gate of the walk's count of the sales the volume cap held back: only
+    such a position is valued again with the cap skipped.
+
+    Args:
+        position (list[BacktestTrade]): One position's open trades.
+        day (date): A checkpoint date on the legs' weekly grid.
+
+    Returns:
+        bool: True when a market's contracts (totalled over the position's
+            trades) exceed its cap (LegQuotes.volume_cap_at) there.
+    """
+    held: dict[str, list] = {}
+    for trade in position:
+        if trade.marks is None:
+            continue
+        for ticker, quotes in zip((trade.ticker_a, trade.ticker_b), trade.marks, strict=True):
+            held.setdefault(ticker, [quotes, 0])[1] += trade.n
+    for quotes, contracts in held.values():
+        cap = quotes.volume_cap_at(day)
+        if cap is not None and contracts > cap and not quotes.paid_at_checkpoint(day):
+            return True
+    return False
+
+
 def _position_sale_value(position: list[BacktestTrade], day: date,
                          days_back: int = 0, *, sold: list[int] | None = None,
-                         stale_check: bool = True) -> tuple | None:
+                         stale_check: bool = True, volume_cap: bool = True) -> tuple | None:
     """
     What selling a position at the checkpoint on `day` would return, and what it cost and could pay.
 
@@ -4738,6 +4917,10 @@ def _position_sale_value(position: list[BacktestTrade], day: date,
             stale-quote check at the checkpoint; False skips it, which only
             the walk's counts of what the check held back ask (they change
             nothing).
+        volume_cap (bool): Keyword-only. True (the default) cuts each
+            market's sale at the checkpoint to the volume cap
+            (LegQuotes.sale_ladder); False skips the cut, for the walk's
+            count of sales the cap held back alone.
 
     Returns:
         tuple | None: (each trade's sale as (value, fees, (market A's sale
@@ -4786,7 +4969,7 @@ def _position_sale_value(position: list[BacktestTrade], day: date,
         if bid != bid:
             # No bid at this check (NaN): this market cannot be sold then
             return None
-        ladder = quotes.sale_ladder(day, bid, days_back)
+        ladder = quotes.sale_ladder(day, bid, days_back, volume_cap=volume_cap)
         price = bid if ladder is None else _ladder_average(ladder, contracts)
         if price is None:
             # The modeled bids hold fewer contracts than the position
@@ -4847,7 +5030,8 @@ def _sells_at(sell_at: float, realized: float, potential: float) -> bool:
 
 
 def _hold_readings(position: list[BacktestTrade], day: date, hold_days: int, *,
-                   level: float | None = None, stale_check: bool = True) -> tuple | None:
+                   level: float | None = None, stale_check: bool = True,
+                   volume_cap: bool = True) -> tuple | None:
     """
     A position's sale at the checkpoint on `day`, and its profit at each daily check the sell rule reads.
 
@@ -4876,6 +5060,8 @@ def _hold_readings(position: list[BacktestTrade], day: date, hold_days: int, *,
         stale_check (bool): Keyword-only. Handed to _position_sale_value at
             the checkpoint; False only for the walk's count of sales the
             stale-quote check held back.
+        volume_cap (bool): Keyword-only. Handed to _position_sale_value;
+            False only for the walk's count of sales the volume cap held back.
 
     Returns:
         tuple | None: (the checkpoint's _position_sale_value, [(realized
@@ -4885,7 +5071,7 @@ def _hold_readings(position: list[BacktestTrade], day: date, hold_days: int, *,
             there or too few contracts on its ladder there) or, with level,
             a check falls below it.
     """
-    sale = _position_sale_value(position, day, stale_check=stale_check)
+    sale = _position_sale_value(position, day, stale_check=stale_check, volume_cap=volume_cap)
     profits = []
     for days_back in range(hold_days):
         # days_back 0 is the checkpoint itself — the day of the sale, valued
@@ -7537,9 +7723,40 @@ def _moved_ts(candle: dict | None) -> int:
     return int(moved)
 
 
+def _volume_ahead(ordered: list[dict], moments: list[int], window: float) -> list[float]:
+    """
+    The contracts traded in the window after each moment: candles ending in (moment, moment + window].
+
+    Args:
+        ordered (list[dict]): One market's candles, ascending by "ts".
+        moments (list[int]): Unix times.
+        window (float): The window's length in seconds.
+
+    Returns:
+        list[float]: One sum per moment; NaN when a candle in its window
+            carries no readable volume (not a finite number at least 0).
+    """
+    stamps = [c["ts"] for c in ordered]
+    out: list[float] = []
+    for moment in moments:
+        lo = bisect.bisect_right(stamps, moment)
+        hi = bisect.bisect_right(stamps, moment + window)
+        total = 0.0
+        for candle in ordered[lo:hi]:
+            volume = candle.get("volume")
+            if (isinstance(volume, (bool, np.bool_)) or not isinstance(volume, numbers.Real)
+                    or not math.isfinite(volume) or volume < 0):
+                total = float("nan")
+                break
+            total += float(volume)
+        out.append(total)
+    return out
+
+
 def _leg_quotes(market: dict, candles: list[dict], start_date: date,
                 depth_model: DepthModel | None = None, *,
-                stale_max_age: float | None = None) -> tuple[LegQuotes | None, int]:
+                stale_max_age: float | None = None,
+                volume_share: float | None = None) -> tuple[LegQuotes | None, int]:
     """
     Sample one market's candles into the prices that value an open leg in it (a LegQuotes).
 
@@ -7590,6 +7807,10 @@ def _leg_quotes(market: dict, candles: list[dict], start_date: date,
         stale_max_age (float | None): Keyword-only. The run's stale-quote
             limit in seconds, carried on the quotes; None (the default)
             checks nothing.
+        volume_share (float | None): Keyword-only. The run's volume cap,
+            carried on the quotes beside the volume traded in the window
+            after each checkpoint (BACKTEST_VOLUME_SHARE_WINDOW_SECONDS, read
+            when called); None (the default) caps nothing.
 
     Returns:
         tuple[LegQuotes | None, int]: The market's quotes, None when it has no
@@ -7749,17 +7970,22 @@ def _leg_quotes(market: dict, candles: list[dict], start_date: date,
     # When the market last moved, as of the candle each checkpoint reads (the
     # latest at or before it, the lookup the bids above use); -1 for none
     moved = [_moved_ts(candle) for candle in _candles_at_or_before(candles, checkpoints)]
+    # The contracts traded in the window after each checkpoint (the volume
+    # cap's base); NaN when a candle there carries no readable volume
+    ahead = _volume_ahead(ordered, checkpoints, BACKTEST_VOLUME_SHARE_WINDOW_SECONDS)
     quotes = LegQuotes(ticker, first_day, yes_days, no_days, first_checkpoint,
                        yes_checkpoints, no_checkpoints, paid_yes, paid_no,
                        yes_bids, no_bids, paid, yes_daily, no_daily, paid_daily,
                        volumes, volumes_daily, depth_model,
-                       np.array(moved, dtype=np.int64), stale_max_age)
+                       np.array(moved, dtype=np.int64), stale_max_age,
+                       np.array(ahead, dtype=float), volume_share)
     return quotes, stale_days
 
 
 def _attach_leg_quotes(records: Iterable[dict], candles_by_ticker: dict,
                        start_date: date, depth_model: DepthModel | None = None, *,
-                       stale_max_age: float | None = None) -> None:
+                       stale_max_age: float | None = None,
+                       volume_share: float | None = None) -> None:
     """
     Give each entry record the prices that value its trades at market: the one writer of "leg_quotes".
 
@@ -7786,6 +8012,11 @@ def _attach_leg_quotes(records: Iterable[dict], candles_by_ticker: dict,
         stale_max_age (float | None): Keyword-only. The run's stale-quote
             limit in seconds (_resolve_stale_quote_max_age), carried on every
             quote built; None (the default) checks nothing.
+        volume_share (float | None): Keyword-only. The run's volume cap
+            (_resolve_max_volume_share), carried on every quote built; None
+            (the default) caps nothing. With it on, one INFO line (silent at
+            zero) counts the markets with no readable volume ahead at some
+            checkpoint, which are not capped there.
     """
     by_ticker: dict[str, LegQuotes | None] = {}
     by_pair: dict[tuple[str, str], dict] = {}
@@ -7800,7 +8031,8 @@ def _attach_leg_quotes(records: Iterable[dict], candles_by_ticker: dict,
                 if ticker not in by_ticker:
                     quotes, stale_days = _leg_quotes(m, candles_by_ticker.get(ticker) or [],
                                                      start_date, depth_model,
-                                                     stale_max_age=stale_max_age)
+                                                     stale_max_age=stale_max_age,
+                                                     volume_share=volume_share)
                     by_ticker[ticker] = quotes
                     stale_legs += 1 if stale_days else 0
             if by_ticker[tickers[0]] is None or by_ticker[tickers[1]] is None:
@@ -7808,6 +8040,13 @@ def _attach_leg_quotes(records: Iterable[dict], candles_by_ticker: dict,
             pair = by_pair[tickers] = {tickers[0]: by_ticker[tickers[0]],
                                        tickers[1]: by_ticker[tickers[1]]}
         rec["leg_quotes"] = pair
+    if volume_share is not None:
+        # Markets the volume cap cannot read at some checkpoint, so it leaves
+        # them uncapped there (silent at zero)
+        unread = sum(1 for quotes in by_ticker.values()
+                     if quotes is not None and np.isnan(quotes.volume_ahead_checkpoints).any())
+        if unread:
+            logging.info("Markets with no readable volume ahead, not capped: %d", unread)
     if stale_legs:
         # Reporting only: no quote is refused for its age
         logging.debug("Legs valued on a quote more than %d days old on some day before they "
@@ -9689,6 +9928,7 @@ def _prepare_candidates(
     fee_multipliers: dict | None = None,
     scheduled_close: bool | None = None,
     stale_quote_max_age: Any = None,
+    max_volume_share: Any = None,
 ) -> _Candidates | None:
     """
     Run the half of the backtest that depends on neither the band nor k.
@@ -9766,6 +10006,12 @@ def _prepare_candidates(
             and checked before anything is fetched, and carried on the
             result (_Candidates.stale_quote_max_age) to every quote the
             entry passes attach.
+        max_volume_share (Any): Keyword-only. The volume cap's share
+            (_resolve_max_volume_share): None (the default) reads THIS
+            MODULE's BACKTEST_MAX_VOLUME_SHARE at call time, False turns the
+            cap off, a share in (0, 1] sets it. Resolved and checked before
+            anything is fetched, and carried on the result to every quote
+            the entry passes attach.
 
     Returns:
         _Candidates | None: The candidate pairs (in scan order: time-series,
@@ -9805,6 +10051,8 @@ def _prepare_candidates(
 
     # The stale-quote limit this run trades under, checked before any fetch
     stale_limit = _resolve_stale_quote_max_age(stale_quote_max_age)
+    # ... and the volume cap
+    volume_share = _resolve_max_volume_share(max_volume_share)
     # Feasibility pre-check, BEFORE any network call: if [start_date, today]
     # holds no run weekday, no trade can be entered, so skip the fetch. The
     # end is today, NOT yesterday (a market that settled early can still
@@ -10161,6 +10409,7 @@ def _prepare_candidates(
         scheduled_close=scheduled_on,
         close_rules=close_rules,
         stale_quote_max_age=stale_limit,
+        max_volume_share=volume_share,
     )
 
 
@@ -10795,6 +11044,7 @@ def _prepare_entries(
     fee_multipliers: dict | None = None,
     scheduled_close: bool | None = None,
     stale_quote_max_age: Any = None,
+    max_volume_share: Any = None,
 ) -> tuple[list[dict] | None, OutcomeLabelCoverage | None]:
     """
     Run the half of the backtest that does not depend on the interval discount.
@@ -10889,7 +11139,7 @@ def _prepare_entries(
         hist_client, live_client, start_date, use_cache, max_horizon_days,
         same_event_ladders=same_event_ladders, series_categories=series_categories,
         fee_multipliers=fee_multipliers, scheduled_close=scheduled_close,
-        stale_quote_max_age=stale_quote_max_age,
+        stale_quote_max_age=stale_quote_max_age, max_volume_share=max_volume_share,
     )
     if candidates is None:
         return None, None
@@ -10906,7 +11156,8 @@ def _prepare_entries(
     # from the candles before they are released with this function's locals,
     # with the depth model their synthetic books are built from
     _attach_leg_quotes(raw_entries, candidates.candles_by_ticker, candidates.start_date,
-                       depth_model, stale_max_age=candidates.stale_quote_max_age)
+                       depth_model, stale_max_age=candidates.stale_quote_max_age,
+                       volume_share=candidates.max_volume_share)
 
     logging.info("Prepared %d candidate entries for sizing", len(raw_entries))
     _log_qualifying_mondays(raw_entries, None)
@@ -10918,6 +11169,56 @@ _NO_SIZE_FITS = "no size fits"
 # Why _size_trade skipped a walked candidate the cash left cannot buy one
 # contract pair of (the book did not cause it, so it is counted apart)
 _NO_CASH = "no cash for one contract pair"
+# Why _size_trade made no trade that it would have made without the volume cap
+# (counted on the volume cap's own line, never as a book's refusal)
+_VOLUME_CAP = "the volume cap allows no trade"
+# What _size_trade hands back beside a trade the volume cap made smaller
+_VOLUME_CUT = "cut by the volume cap"
+
+
+def _volume_limit(c: dict, d: date) -> int | None:
+    """
+    The most contract pairs the volume cap lets one candidate buy at the checkpoint on `d`.
+
+    The lower of its two markets' caps (LegQuotes.volume_cap_at); a market
+    the cap cannot read (no volume ahead, or the cap off) does not limit it.
+
+    Args:
+        c (dict): A Pass 2 candidate.
+        d (date): Its checkpoint date.
+
+    Returns:
+        int | None: The limit (0: no trade); None when neither market is capped.
+    """
+    marks = c["marks"]
+    if marks is None:
+        return None
+    caps = [cap for cap in (marks[0].volume_cap_at(d), marks[1].volume_cap_at(d))
+            if cap is not None]
+    return min(caps) if caps else None
+
+
+def _capped_at(pair: CandidatePair, limit: int) -> CandidatePair:
+    """
+    The pair as a one-level book at its own quotes holding `limit` contract pairs.
+
+    With no synthetic book to walk, the volume cap still bounds the trade:
+    the live sizer then takes its booked path over this one level, which, at
+    the same prices, sizes what the top of the book sizes whenever the limit
+    does not bind (tests/test_backtester.py pins that) and no more than the
+    limit when it does.
+
+    Args:
+        pair (CandidatePair): The candidate's pair at its quotes (_candidate_pair).
+        limit (int): The volume cap's limit, at least 1.
+
+    Returns:
+        CandidatePair: A copy with depth_levels ((leg price A, leg price B,
+            limit),) and max_contracts limit.
+    """
+    price_a, price_b = leg_prices(pair)
+    return replace(pair, depth_levels=((price_a, price_b, float(limit)),),
+                   max_contracts=int(limit))
 
 
 def _cents(dollars: float) -> int:
@@ -11005,16 +11306,21 @@ def _candidate_pair(c: dict, held: HeldPair | None, markets: dict) -> CandidateP
         pair_type=c["pair_type"], stated_gap_days=stated, held=held, mid_spread=mid)
 
 
-def _books_for(c: dict, d: date) -> tuple[dict, dict] | None:
+def _books_for(c: dict, d: date, *, volume_cap: bool = True) -> tuple[dict, dict] | None:
     """
     Both markets' synthetic books at the candidate's checkpoint, anchored at its quotes.
 
     Market A's book starts at its YES ask pA and YES bid 1 - nA, market B's at
-    pB and 1 - nB, so the top of each book is the candle's own prices.
+    pB and 1 - nB, so the top of each book is the candle's own prices. With
+    the volume cap (LegQuotes.volume_cap_at), each market's two sides are cut
+    to hold at most its cap's contracts (_cut_levels), so a trade cannot buy
+    more than that from it.
 
     Args:
         c (dict): A Pass 2 candidate.
         d (date): Its checkpoint date.
+        volume_cap (bool): Keyword-only. False leaves the books uncut (only
+            the walk's count of the trades the cap cut asks).
 
     Returns:
         tuple[dict, dict] | None: (market A's book, market B's), or None when
@@ -11028,12 +11334,19 @@ def _books_for(c: dict, d: date) -> tuple[dict, dict] | None:
     book_b = marks[1].book_at(d, c["pB"], 1.0 - c["nB"])
     if book_a is None or book_b is None:
         return None
-    return book_a, book_b
+    if not volume_cap:
+        return book_a, book_b
+    books = []
+    for quotes, book in ((marks[0], book_a), (marks[1], book_b)):
+        cap = quotes.volume_cap_at(d)
+        books.append(book if cap is None else
+                     {side: _cut_levels(levels, cap) for side, levels in book.items()})
+    return books[0], books[1]
 
 
 def _size_trade(c: dict, d: date, checkpoint_value: float, cash: float,
                 settings: LiveSettings, held: HeldPair | None,
-                markets: dict) -> tuple[TradeSpec | None, str | None]:
+                markets: dict, *, volume_cap: bool = True) -> tuple[TradeSpec | None, str | None]:
     """
     Size one Pass 2 candidate as the live bot would.
 
@@ -11042,7 +11355,13 @@ def _size_trade(c: dict, d: date, checkpoint_value: float, cash: float,
     (strategy.compute_trade) picks the count, on the portfolio value and the
     cash in whole cents, so a trade bets its Kelly share of the value but
     never spends more than the cash. With no book it sizes at the candle
-    prices, the top of the book.
+    prices, the top of the book. With the volume cap (_volume_limit), the
+    candidate is first sized as if there were none; that trade stands when
+    it buys no more contract pairs than the cap allows (so where the cap
+    does not bind, the result is exactly the uncapped one). Only when the
+    cap binds is it sized again, over the books cut to each market's cap
+    (_books_for) or, with no book, over a one-level book at its quotes
+    holding the limit (_capped_at); a limit of 0 makes no trade.
 
     Args:
         c (dict): A Pass 2 candidate.
@@ -11052,22 +11371,41 @@ def _size_trade(c: dict, d: date, checkpoint_value: float, cash: float,
         settings (LiveSettings): The simulation's settings.
         held (HeldPair | None): What an add-on adds to; None for a new pair.
         markets (dict): The simulation's market memo (_candidate_pair).
+        volume_cap (bool): Keyword-only. False sizes as if the volume cap
+            were off (only the walk's count of the trades it cut asks).
 
     Returns:
         tuple[TradeSpec | None, str | None]: (the spec, None); (None, why)
             when a walked book refused it (an ENRICH_* or SPREAD_* code, or
-            "no size fits"), or _NO_CASH when the cash left, not the book,
+            "no size fits"), _NO_CASH when the cash left, not the book,
             cannot buy one contract pair; (None, None) when the top of the
-            book had no size worth buying.
+            book had no size worth buying. Where the volume cap binds:
+            (the smaller spec, _VOLUME_CUT), or (None, _VOLUME_CAP) when the
+            cap leaves no trade.
     """
     pair = _candidate_pair(c, held, markets)
     value_cents, cash_cents = _cents(checkpoint_value), _cents(cash)
-    books = _books_for(c, d)
+    limit = _volume_limit(c, d) if volume_cap else None
+    if limit is not None:
+        # Sized as if there were no cap; it stands when the cap does not bind
+        free, why = _size_trade(c, d, checkpoint_value, cash, settings, held, markets,
+                                volume_cap=False)
+        if free is None or free.x <= limit:
+            return free, why
+        if limit < 1:
+            return None, _VOLUME_CAP
+    books = _books_for(c, d, volume_cap=limit is not None)
+    if books is None and limit is not None:
+        # No book to walk: the cap is a one-level book at the quotes
+        pair = _capped_at(pair, limit)
     if books is not None:
         # The live enrichment's own step, its lines at DEBUG
         pair, refusal = _enrich_pair(pair, *books, value_cents, settings=settings,
                                      cash_cents=cash_cents, log=_debug_log)
         if not pair.tradeable:
+            if limit is not None:
+                # The book cut to the cap holds no trade the uncapped book had
+                return None, _VOLUME_CAP
             # The cash left, not the book, cannot buy one contract pair (the
             # test behind enrichment's "cash binds" note): counted apart from
             # the book's refusals
@@ -11077,6 +11415,9 @@ def _size_trade(c: dict, d: date, checkpoint_value: float, cash: float,
             return None, refusal or ENRICH_UNPROFITABLE
     # The live sizer, quiet: its "Trade computed" lines at DEBUG
     spec = compute_trade(pair, value_cents, settings=settings, cash_cents=cash_cents, quiet=True)
+    if limit is not None:
+        # The cap bound: a smaller trade, or none
+        return (spec, _VOLUME_CUT) if spec is not None else (None, _VOLUME_CAP)
     if spec is None:
         return None, (_NO_SIZE_FITS if books is not None else None)
     return spec, None
@@ -11872,6 +12213,14 @@ def _simulate_at_discount(
                      if c["marks"] is not None and c["marks"][0].stale_max_age is not None),
                     None)
     stale_sales = stale_trims = 0
+    # The volume cap's share, as the candidates' quotes carry it (None: off),
+    # the trades it cut (sized smaller, or not made; _size_trade says which)
+    # and the sales it alone held back (from valuations made again with the
+    # cap skipped, only where it may have bound, which change no state)
+    volume_on = next((c["marks"][0].volume_share for c in candidates
+                      if c["marks"] is not None and c["marks"][0].volume_share is not None),
+                     None)
+    volume_cut = volume_not_made = volume_sales = 0
     # Selling of either kind visits every checkpoint, and needs each trade's pair
     selling = sell_level is not None or trimming
     # The live code's market objects, built once per record (_candidate_pair),
@@ -12037,26 +12386,36 @@ def _simulate_at_discount(
 
     def count_stale_sales(d: date, positions: list[list[BacktestTrade]]) -> None:
         """
-        Count the positions the stale-quote check alone kept from selling at the checkpoint on `d`.
+        Count the positions the stale-quote check, or the volume cap, alone kept from selling at the checkpoint on `d`.
 
         A position counts when it is not sold at `d` and would have been with
-        the check skipped (_hold_readings with stale_check=False reaching
-        sell_at at every check). Counting only; nothing else changes.
+        the check (or the cap) skipped (_hold_readings with stale_check=False,
+        or volume_cap=False, reaching sell_at at every check), asked only of a
+        position with a stale leg (_stale_unpaid_leg) or a market over its
+        cap (_volume_capped_leg). Counting only; nothing else changes.
 
         Args:
             d (date): The checkpoint date.
             positions (list[list[BacktestTrade]]): The positions not sold there.
         """
-        nonlocal stale_sales
-        if stale_on is None:
+        nonlocal stale_sales, volume_sales
+        if stale_on is None and volume_on is None:
             return
         for position in positions:
-            if not _far_enough(position, d, min_days) or not _stale_unpaid_leg(position, d):
+            if not _far_enough(position, d, min_days):
                 continue
-            readings = _hold_readings(position, d, hold_days, level=sell_level,
-                                      stale_check=False)
-            if readings is not None and _reached_every_day(sell_level, readings[1]):
-                stale_sales += 1
+            if stale_on is not None and _stale_unpaid_leg(position, d):
+                readings = _hold_readings(position, d, hold_days, level=sell_level,
+                                          stale_check=False)
+                if readings is not None and _reached_every_day(sell_level, readings[1]):
+                    stale_sales += 1
+            # ... and the volume cap: a market the position sells more of than
+            # its cap allows (the stale-quote check still applies)
+            if volume_on is not None and _volume_capped_leg(position, d):
+                readings = _hold_readings(position, d, hold_days, level=sell_level,
+                                          volume_cap=False)
+                if readings is not None and _reached_every_day(sell_level, readings[1]):
+                    volume_sales += 1
 
     def planned_trims(d: date, value: float, open_now: list[BacktestTrade]) -> list:
         """
@@ -12320,14 +12679,22 @@ def _simulate_at_discount(
         if spec is None:
             if refusal == _NO_CASH:
                 cash_skips += 1
+            elif refusal == _VOLUME_CAP:
+                # A trade the volume cap alone left unmade
+                volume_not_made += 1
             elif refusal is not None:
                 walk_refusals[refusal] += 1
             continue
+        if refusal == _VOLUME_CUT:
+            # Made smaller by the volume cap
+            volume_cut += 1
         n = spec.x
         # The average price each leg pays, the fees there and the cash spent
         # (the spec's own figures); every dollar figure below reads these
         fill_a, fill_b = leg_prices(spec.pair)
-        walked = len(spec.pair.depth_levels) > 0
+        # Whether it walked a modeled book (a one-level book the volume cap
+        # made at the quotes is the top of the book, not a walk)
+        walked = c["marks"] is not None and all(q.has_book_at(d) for q in c["marks"])
         # Each leg's fee at the multiplier the sizer priced it at (market order)
         mult_a, mult_b = spec.fee_multipliers
         fee_a = fee_leg_exact(n, fill_a, multiplier=mult_a)
@@ -12526,6 +12893,18 @@ def _simulate_at_discount(
             "Sales held back because a market's quote had not moved or traded for "
             "over %s hours (%s): %d",
             _stale_hours_text(stale_on), run_label, stale_sales,
+        )
+    if volume_cut or volume_not_made:
+        logging.log(
+            logging.DEBUG if quiet else logging.INFO,
+            "Fills cut to %s of the next day's volume (%s): %d trades (%d not made)",
+            _share_text(volume_on), run_label, volume_cut + volume_not_made, volume_not_made,
+        )
+    if volume_sales:
+        logging.log(
+            logging.DEBUG if quiet else logging.INFO,
+            "Sales held back by the volume cap (%s): %d",
+            run_label, volume_sales,
         )
     if stale_trims:
         logging.log(
@@ -13023,6 +13402,7 @@ def run_backtest(
     fee_multipliers: dict | None = None,
     scheduled_close: bool | None = None,
     stale_quote_max_age: Any = None,
+    max_volume_share: Any = None,
 ) -> tuple[list[BacktestTrade], pd.DataFrame]:
     """
     Replay both pair strategies on all settled Kalshi markets from start_date.
@@ -13143,6 +13523,7 @@ def run_backtest(
         hist_client, live_client, start_date, use_cache, max_horizon_days,
         series_categories=series_categories, fee_multipliers=fee_multipliers,
         scheduled_close=scheduled_close, stale_quote_max_age=stale_quote_max_age,
+        max_volume_share=max_volume_share,
     )
     if raw_entries is None:
         # Same empty-result shape the zero-trade path produces, so backtest.py
@@ -13969,7 +14350,8 @@ def _sweep_from_candidates(
         [rec for entries in (*entries_by_band.values(), *tier_off_entries.values())
          for rec in entries],
         candidates.candles_by_ticker, candidates.start_date, depth_model,
-        stale_max_age=candidates.stale_quote_max_age)
+        stale_max_age=candidates.stale_quote_max_age,
+        volume_share=candidates.max_volume_share)
     # Nothing below reads a candle or the pair list. Releasing both here keeps
     # the peak at a single-band run's entry-pass peak and, like the
     # single-band path (whose pair list dies with _prepare_entries' locals),
@@ -14329,6 +14711,9 @@ def _sweep_from_candidates(
         # The stale-quote limit every entry, sale and trim was held to (False: off)
         stale_quote_max_age=(False if candidates.stale_quote_max_age is None
                              else candidates.stale_quote_max_age),
+        # The volume cap every buy and sale was held to (False: off)
+        max_volume_share=(False if candidates.max_volume_share is None
+                          else candidates.max_volume_share),
     )
 
 
@@ -14356,6 +14741,7 @@ def run_backtest_sweep(
     fee_multipliers: dict | None = None,
     scheduled_close: bool | None = None,
     stale_quote_max_age: Any = None,
+    max_volume_share: Any = None,
 ) -> BacktestSweep:
     """
     Replay both pair strategies at one interval discount, or at a grid of them —
@@ -14566,6 +14952,11 @@ def run_backtest_sweep(
             False turns the check off, a positive number sets it. Logged on
             one setting line and recorded on the result
             (BacktestSweep.stale_quote_max_age).
+        max_volume_share (Any): Keyword-only. The volume cap's share
+            (_resolve_max_volume_share): None (default) resolves this
+            module's BACKTEST_MAX_VOLUME_SHARE at call time, False turns the
+            cap off, a share in (0, 1] sets it. Logged on one setting line
+            and recorded on the result (BacktestSweep.max_volume_share).
 
     Returns:
         BacktestSweep: primary (the effective-discount, primary-band result),
@@ -14601,7 +14992,10 @@ def run_backtest_sweep(
             module's TRIM_MIN_PRICE_RISES is not a non-empty collection of
             distinct real numbers in (0, 1], if stale_quote_max_age (or,
             with None, this module's BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS) is
-            not a positive, finite number of seconds, None or False, or if
+            not a positive, finite number of seconds, None or False, if
+            max_volume_share (or, with None, this module's
+            BACKTEST_MAX_VOLUME_SHARE) is not a share in (0, 1], None or
+            False, or if
             spread_band is not a valid band; and,
             before any fetch, from _prepare_candidates() when SCHEDULED_RUN
             cannot place the entry checkpoints (a configuration error).
@@ -14662,6 +15056,8 @@ def run_backtest_sweep(
     trim_rises = _resolve_trim_min_rises() if trim_rise_sweep else ()
     # ... and for the stale-quote limit (None: the check is off)
     stale_limit = _resolve_stale_quote_max_age(stale_quote_max_age)
+    # ... and for the volume cap (None: off)
+    volume_share = _resolve_max_volume_share(max_volume_share)
     # And for k: every simulation hands it to the live sizer, whose
     # LiveSettings takes only a k in (0, 1]
     if interval_discount is not None and (
@@ -14803,6 +15199,18 @@ def run_backtest_sweep(
         "config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS" if stale_quote_max_age is None
         else "run-level override",
     )
+    # And how much of a market's next-day volume a buy or a sale may take
+    logging.info(
+        "Volume cap (backtest): %s (%s)",
+        f"on — a buy or a sale at a checkpoint may take at most {_share_text(volume_share)} "
+        f"of the contracts that traded in each of its markets over the next "
+        f"{_stale_hours_text(BACKTEST_VOLUME_SHARE_WINDOW_SECONDS)} hours (it reads hours "
+        f"a live run cannot see, and only ever makes a trade smaller)"
+        if volume_share is not None else
+        "off — a trade is held only to the modeled book",
+        "config.BACKTEST_MAX_VOLUME_SHARE" if max_volume_share is None
+        else "run-level override",
+    )
     # The saved live defaults (never main.py's per-run overrides), read ONCE
     # before the fetch, so a refused file warns at the top of the run
     live = _live_settings_for_report()
@@ -14816,7 +15224,7 @@ def run_backtest_sweep(
         hist_client, live_client, start_date, use_cache, max_horizon_days,
         same_event_ladders=same_event_ladders, series_categories=series_categories,
         fee_multipliers=fee_multipliers, scheduled_close=scheduled_close,
-        stale_quote_max_age=stale_quote_max_age,
+        stale_quote_max_age=stale_quote_max_age, max_volume_share=max_volume_share,
     )
     if candidates is None:
         # Nothing can be simulated at any discount or band. Build the empty
@@ -14846,6 +15254,8 @@ def run_backtest_sweep(
                                scheduled_close=scheduled_on,
                                stale_quote_max_age=(False if stale_limit is None
                                                     else stale_limit),
+                               max_volume_share=(False if volume_share is None
+                                                 else volume_share),
                                **_live_rule_fields(live))
     else:
         # Every entry pass and simulation. It deletes the candles and pair list

@@ -374,19 +374,19 @@ class TestStaleQuoteArgument:
         assert exc.value.code == 2
 
     @pytest.mark.parametrize("flags, configured, echo", [
-        ([], 86_400, "| stale quotes=24 h | ladders="),
-        ([], None, "| stale quotes=off | ladders="),
-        (["--no-stale-quote-check"], 86_400, "| stale quotes=off (config: 24 h) | ladders="),
-        (["--stale-quote-hours", "48"], 86_400, "| stale quotes=48 h (config: 24 h) | ladders="),
-        (["--stale-quote-hours", "24"], 86_400, "| stale quotes=24 h | ladders="),
-        (["--stale-quote-hours", "6"], None, "| stale quotes=6 h (config: off) | ladders="),
+        ([], 86_400, "| stale quotes=24 h | volume cap="),
+        ([], None, "| stale quotes=off | volume cap="),
+        (["--no-stale-quote-check"], 86_400, "| stale quotes=off (config: 24 h) | volume cap="),
+        (["--stale-quote-hours", "48"], 86_400, "| stale quotes=48 h (config: 24 h) | volume cap="),
+        (["--stale-quote-hours", "24"], 86_400, "| stale quotes=24 h | volume cap="),
+        (["--stale-quote-hours", "6"], None, "| stale quotes=6 h (config: off) | volume cap="),
     ])
     def test_the_config_echo_names_it(self, cli, monkeypatch, caplog, flags, configured, echo):
         monkeypatch.setattr(backtest, "BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS", configured)
         with caplog.at_level(logging.INFO):
             _run(monkeypatch, *flags)
         assert echo in caplog.text
-        # Between k and the ladders, so the scheduled-close echo still meets k
+        # Between k and the volume cap, so the scheduled-close echo still meets k
         assert "| scheduled close=on | k=" in caplog.text
 
     @pytest.mark.parametrize("configured, word", [(86_400, "24 h"), (None, "off")])
@@ -402,6 +402,64 @@ class TestStaleQuoteArgument:
         from kalshi_betting import config
         assert backtest.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS == \
             config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS == 86_400
+
+
+class TestMaxVolumeShareArgument:
+    """--max-volume-share PCT / --no-volume-cap (C7): the most of a market's
+    next-day traded contracts a buy or a sale may take, for this run."""
+
+    def test_default_is_no_override(self, cli, monkeypatch):
+        _run(monkeypatch)
+        assert cli["sweep_kwargs"]["max_volume_share"] is None
+
+    @pytest.mark.parametrize("flags, value", [(["--max-volume-share", "10"], 0.10),
+                                              (["--max-volume-share", "2.5"], 0.025),
+                                              (["--max-volume-share", "100"], 1.0),
+                                              (["--no-volume-cap"], False)])
+    def test_the_flags_reach_the_sweep(self, cli, monkeypatch, flags, value):
+        _run(monkeypatch, *flags)
+        assert cli["sweep_kwargs"]["max_volume_share"] == value
+        assert type(cli["sweep_kwargs"]["max_volume_share"]) is type(value)
+
+    @pytest.mark.parametrize("pct", ["0", "-1", "100.5", "nan", "inf"])
+    def test_a_bad_percent_is_a_usage_error(self, cli, monkeypatch, capsys, pct):
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "--max-volume-share", pct)
+        assert exc.value.code == 2
+        assert "--max-volume-share must be a percent above 0 and at most 100" in \
+            capsys.readouterr().err
+
+    def test_the_two_flags_are_exclusive(self, cli, monkeypatch):
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "--max-volume-share", "5", "--no-volume-cap")
+        assert exc.value.code == 2
+
+    @pytest.mark.parametrize("flags, configured, echo", [
+        ([], 0.10, "| volume cap=10% | ladders="),
+        ([], None, "| volume cap=off | ladders="),
+        (["--no-volume-cap"], 0.10, "| volume cap=off (config: 10%) | ladders="),
+        (["--max-volume-share", "5"], 0.10, "| volume cap=5% (config: 10%) | ladders="),
+        (["--max-volume-share", "10"], 0.10, "| volume cap=10% | ladders="),
+    ])
+    def test_the_config_echo_names_it(self, cli, monkeypatch, caplog, flags, configured, echo):
+        monkeypatch.setattr(backtest, "BACKTEST_MAX_VOLUME_SHARE", configured)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, *flags)
+        assert echo in caplog.text
+
+    @pytest.mark.parametrize("configured, word", [(0.10, "10%"), (None, "off")])
+    def test_the_help_text_names_the_configured_value(self, cli, monkeypatch, capsys,
+                                                       configured, word):
+        monkeypatch.setattr(backtest, "BACKTEST_MAX_VOLUME_SHARE", configured)
+        with pytest.raises(SystemExit):
+            _run(monkeypatch, "--help")
+        help_text = " ".join(capsys.readouterr().out.split())
+        assert f"config.BACKTEST_MAX_VOLUME_SHARE, currently {word})" in help_text
+
+    def test_the_shipped_binding_is_the_config_s(self):
+        from kalshi_betting import config
+        assert backtest.BACKTEST_MAX_VOLUME_SHARE == config.BACKTEST_MAX_VOLUME_SHARE == 0.10
+        assert config.BACKTEST_VOLUME_SHARE_WINDOW_SECONDS == 86_400
 
 
 class TestSameEventLaddersArgument:

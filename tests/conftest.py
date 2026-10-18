@@ -4,14 +4,15 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Suite-wide pytest fixtures and two helpers. Twelve autouse guards
+    Suite-wide pytest fixtures and two helpers. Thirteen autouse guards
     (_offline_event_competitions_for_the_session,
     _isolate_event_title_accumulator, _isolate_treasury_rates,
     _fresh_order_write_pacer, _fresh_v2_mapping_disproof_state,
     _isolate_live_defaults_for_the_session, _isolate_live_defaults,
     _isolate_live_runs, _isolate_live_dashboard,
-    _offline_market_details_for_the_session, _isolate_market_details and
-    _stale_quote_check_off_for_the_session, in the order described here): one answers every event-competition read with "" (an event naming
+    _offline_market_details_for_the_session, _isolate_market_details,
+    _stale_quote_check_off_for_the_session and
+    _volume_cap_off_for_the_session, in the order described here): one answers every event-competition read with "" (an event naming
     no competition) and points the competition cache and Kalshi's cached
     /series listing at an empty session directory, in force during class
     setup too, so no test reaches Kalshi for a label and no class-scoped
@@ -47,7 +48,10 @@ Purpose:
     whole session, class setup included, since the suite's candle fixtures
     hold one candle a week and were written before the check existed; a test
     of the check turns it on itself (its monkeypatch, or the run's
-    stale_quote_max_age argument).
+    stale_quote_max_age argument); and one turns the backtest's volume cap
+    off the same way (backtester's binding of config.BACKTEST_MAX_VOLUME_SHARE
+    set to None), for the same reason: the suite's figures were pinned before
+    it existed, and a test of the cap turns it on itself.
     pre_toggle_defaults pins
     the live toggles for a test whose figures assume fixed values (they pin
     arithmetic, not config.py's policy); its helper, apply_pre_toggle_defaults,
@@ -246,6 +250,28 @@ def _stale_quote_check_off_for_the_session():
     """
     mp = pytest.MonkeyPatch()
     mp.setattr(backtester, "BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS", None)
+    yield
+    mp.undo()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _volume_cap_off_for_the_session():
+    """
+    Turn the backtest's volume cap off for the whole session.
+
+    The suite's figures were pinned before the cap existed, and many of its
+    candles trade nothing, which the cap would read as no volume ahead (no
+    trade). Session-scoped, like the stale-quote one above, because class
+    setup runs whole backtests before any function-scoped fixture. A test of
+    the cap turns it on with its own monkeypatch of
+    backtester.BACKTEST_MAX_VOLUME_SHARE (undone back to None), or hands a
+    run its max_volume_share; a hand-built LegQuotes carries no cap either way.
+
+    Yields:
+        None: The setting holds until the session ends.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setattr(backtester, "BACKTEST_MAX_VOLUME_SHARE", None)
     yield
     mp.undo()
 

@@ -9,6 +9,7 @@ Purpose:
     --interval-discount, --no-sweep, --same-event-ladders /
     --no-same-event-ladders, --scheduled-close / --no-scheduled-close,
     --stale-quote-hours / --no-stale-quote-check,
+    --max-volume-share / --no-volume-cap,
     --spread-min, --spread-max, --no-band-sweep,
     --no-cap-sweep, --no-add-on-sweep, --no-sell-sweep, --sell-workers,
     --no-trim-sweep, --no-trim-rise-sweep, --dashboard-only,
@@ -129,6 +130,12 @@ Notes:
     config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS (24 hours by default): how
     recently each market of an entry, a sale or a Kelly trim must have traded,
     or moved its quote, before the checkpoint. It never reaches a live run.
+
+    --max-volume-share PCT / --no-volume-cap is the one-run override for
+    config.BACKTEST_MAX_VOLUME_SHARE (10% by default): the most of a market's
+    next-day traded contracts a backtest buy or sale may take. It reads hours
+    a live run cannot see, only ever makes a trade smaller, and never reaches
+    a live run.
 
     That setting reaches kalshi_backtest.log (the pre-fetch echo below and
     run_backtest_sweep's resolved line) AND the HTML dashboard's own page
@@ -307,6 +314,7 @@ from ._http import api_error_summary
 from .auth import read_account_balance
 from .backtester import BacktestSweep, run_backtest_sweep
 from .config import (
+    BACKTEST_MAX_VOLUME_SHARE,
     BACKTEST_SCHEDULED_CLOSE,
     BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS,
     BACKTEST_SWEEP_FILENAME,
@@ -462,6 +470,19 @@ def _stale_quote_text(limit: float | None) -> str:
     return "off" if limit is None else f"{limit / 3600:g} h"
 
 
+def _volume_cap_text(share: float | None) -> str:
+    """
+    A volume cap as the pre-fetch echo and --help name it: "10%", or "off".
+
+    Args:
+        share (float | None): The share in (0, 1]; None for the cap off.
+
+    Returns:
+        str: The percent with %g, or "off".
+    """
+    return "off" if share is None else f"{share * 100:g}%"
+
+
 def _fills_echo(depth_model: DepthModel | None) -> str:
     """
     Say how the run's trades will fill, for the pre-fetch config line.
@@ -567,6 +588,8 @@ _RUN_ONLY_FLAGS = (
     ("scheduled_close", "--scheduled-close / --no-scheduled-close"),
     ("stale_quote_hours", "--stale-quote-hours"),
     ("no_stale_quote_check", "--no-stale-quote-check"),
+    ("max_volume_share", "--max-volume-share"),
+    ("no_volume_cap", "--no-volume-cap"),
     ("spread_min", "--spread-min"), ("spread_max", "--spread-max"),
     ("no_band_sweep", "--no-band-sweep"),
 )
@@ -1278,6 +1301,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Trade on a quote however long it has been unchanged, for this run. "
              "Backtest only.",
     )
+    # The volume cap: a percent for this run, or off; neither given reads
+    # config.BACKTEST_MAX_VOLUME_SHARE at call time
+    volume = parser.add_mutually_exclusive_group()
+    volume.add_argument(
+        "--max-volume-share", type=float, default=None, metavar="PCT",
+        help="A buy or a sale at a checkpoint may take at most PCT percent (above 0, "
+             "at most 100) of the contracts that traded in each of its markets over the "
+             "next day (default: config.BACKTEST_MAX_VOLUME_SHARE, currently "
+             # argparse formats help with %, so the percent sign is doubled
+             f"{_volume_cap_text(BACKTEST_MAX_VOLUME_SHARE).replace('%', '%%')}). It reads "
+             "hours a live run "
+             "cannot see and only ever makes a trade smaller. Backtest only.",
+    )
+    volume.add_argument(
+        "--no-volume-cap", action="store_true",
+        help="Hold a trade only to the modeled book, for this run. Backtest only.",
+    )
     # Each side is independently optional; the omitted one resolves from
     # config's own default band (see the validation block below), not from a
     # literal (0.0, 1.0) here — which is why the help names the constant
@@ -1389,7 +1429,7 @@ def main() -> None:
     --max-horizon-days, --interval-discount, --no-sweep,
     --same-event-ladders / --no-same-event-ladders, --scheduled-close /
     --no-scheduled-close, --stale-quote-hours / --no-stale-quote-check,
-    --spread-min,
+    --max-volume-share / --no-volume-cap, --spread-min,
     --spread-max, --no-band-sweep, --no-cap-sweep, --no-add-on-sweep,
     --no-sell-sweep, --no-trim-sweep, --no-trim-rise-sweep, --sell-workers,
     --dashboard-only, --accept-changed-simulator); with --dashboard-only it
@@ -1452,6 +1492,9 @@ def main() -> None:
     if args.stale_quote_hours is not None and not (
             math.isfinite(args.stale_quote_hours) and args.stale_quote_hours > 0):
         parser.error("--stale-quote-hours must be a positive number of hours")
+    if args.max_volume_share is not None and not (
+            math.isfinite(args.max_volume_share) and 0 < args.max_volume_share <= 100):
+        parser.error("--max-volume-share must be a percent above 0 and at most 100")
 
     # Resolved here, BEFORE logging is configured (TS-20 — see the comment
     # below). The configured default is read and validated on EVERY run,
@@ -1540,6 +1583,15 @@ def main() -> None:
     stale_echo = _stale_quote_text(effective_stale)
     if stale_echo != _stale_quote_text(BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS):
         stale_echo += f" (config: {_stale_quote_text(BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS)})"
+    # ... and for the volume cap (a share for the sweep; None: config; False: off)
+    max_volume_share = (False if args.no_volume_cap
+                        else None if args.max_volume_share is None
+                        else args.max_volume_share / 100.0)
+    effective_volume = (BACKTEST_MAX_VOLUME_SHARE if max_volume_share is None
+                        else None if max_volume_share is False else max_volume_share)
+    volume_echo = _volume_cap_text(effective_volume)
+    if volume_echo != _volume_cap_text(BACKTEST_MAX_VOLUME_SHARE):
+        volume_echo += f" (config: {_volume_cap_text(BACKTEST_MAX_VOLUME_SHARE)})"
     # Same pre-fetch echo, same reason, for the spread band: the VALUE is
     # resolved through the same config function run_backtest_sweep calls
     # (never a by-value copy of BACKTEST_DEFAULT_SPREAD_BAND), so it cannot
@@ -1621,11 +1673,12 @@ def main() -> None:
 
     logging.info(
         "Backtest config: start=%s | balance=$%.2f | cache=%s | scheduled close=%s "
-        "| k=%.3f | stale quotes=%s | ladders=%s | spread band=%g-%g | band sweep=%s "
+        "| k=%.3f | stale quotes=%s | volume cap=%s | ladders=%s | spread band=%g-%g "
+        "| band sweep=%s "
         "| cap sweep=%s | add-on sweep=%s | sell sweep=%s | trim sweep=%s | live rule=%s "
         "| fills=%s",
         start_date, start.dollars, "on" if use_cache else "off", scheduled_echo,
-        effective_k, stale_echo, ladders_echo, echo_floor, echo_ceiling,
+        effective_k, stale_echo, volume_echo, ladders_echo, echo_floor, echo_ceiling,
         "on" if band_sweep else "off", "on" if cap_sweep else "off",
         "on" if add_on_sweep else "off",
         f"on ({sell_workers} worker process{'' if sell_workers == 1 else 'es'})"
@@ -1706,6 +1759,8 @@ def main() -> None:
         scheduled_close=args.scheduled_close,
         # How recently each market's quote must have moved (None: config; False: off)
         stale_quote_max_age=stale_quote_max_age,
+        # The share of the next day's volume a buy or sale may take (None: config; False: off)
+        max_volume_share=max_volume_share,
         spread_band=spread_band,
         band_sweep=band_sweep,
         # The dashboard's "Tier floors: off" view: the band sweep's

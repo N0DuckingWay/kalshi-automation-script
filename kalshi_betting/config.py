@@ -2331,6 +2331,20 @@ SCHEDULED_CLOSE_MIN_EVENTS = 2
 # --no-stale-quote-check set it for one run.
 BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS = 86_400
 
+# The share of a market's real traded volume a backtest buy or sale may take:
+# at a weekly checkpoint, a trade (each leg) or a sale may take at most this
+# share of the contracts that traded in that market over the next
+# BACKTEST_VOLUME_SHARE_WINDOW_SECONDS (candles ending in that window after the
+# checkpoint). Where that is tighter than the modeled order book, it wins. It
+# reads the hours after the checkpoint, which a live run cannot see, so it only
+# ever makes a trade smaller. A market whose volume ahead cannot be read is not
+# capped. None turns the cap off. The backtest only; backtest.py
+# --max-volume-share PCT / --no-volume-cap set it for one run.
+BACKTEST_MAX_VOLUME_SHARE = 0.10
+
+# ... and the window after a checkpoint that volume is read over, in seconds
+BACKTEST_VOLUME_SHARE_WINDOW_SECONDS = 86_400
+
 # The highest NO ask a candle can carry: historical.fetch_candlesticks stores a
 # candle's NO ask as 1 - its YES bid, held within [0.01, this], so an empty YES-bid
 # book reads 0.99 just as a real 1c YES bid does; a NO ask here is therefore no

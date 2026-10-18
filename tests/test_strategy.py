@@ -1928,7 +1928,9 @@ def _backtest_sizing_problems(source: str) -> list[str]:
         problems.append(f"the trade is sized as {ast.unparse(size)}")
     if size.lineno <= walk.lineno:
         problems.append("the trade is sized before its book is walked")
-    if bound.get("pair") != ["_candidate_pair(c, held, markets)"]:
+    # The candidate's pair at its quotes; with the volume cap and no book to
+    # walk, the same pair as a one-level book holding the cap's limit (C7)
+    if bound.get("pair") != ["_candidate_pair(c, held, markets)", "_capped_at(pair, limit)"]:
         problems.append(f"the pair is {bound.get('pair')}")
     cents = _def_named(source, "_cents")
     returns = [ast.unparse(n.value) for n in ast.walk(cents) if isinstance(n, ast.Return)]
@@ -3835,6 +3837,58 @@ class TestTimeSeriesKellyParity:
             assert mutant != shape, name
             assert _live_held_pair_problems(mutant), name
 
+    def test_ast_the_volume_cap_has_one_reading_and_its_readers(self):
+        # C7: the volume ahead of each checkpoint is read only by LegQuotes
+        # itself (volume_cap_at, the one reading of the cap) and by the one
+        # writer's count of unreadable markets; the cap is asked only where a
+        # buy or a sale is sized: the buy books (_books_for), the buy limit
+        # (_volume_limit), the sale ladder and the gate of the count of the
+        # sales it held back (_volume_capped_leg)
+        import importlib
+        import pkgutil
+
+        import kalshi_betting
+
+        names = sorted(m.name for m in pkgutil.iter_modules(kalshi_betting.__path__))
+        callers: set = set()
+        readers: dict[str, set] = {"volume_ahead_checkpoints": set(), "volume_share": set()}
+        for name in names:
+            module = importlib.import_module(f"kalshi_betting.{name}")
+            tree = ast.parse(inspect.getsource(module))
+            for func in ast.walk(tree):
+                if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for sub in ast.walk(func):
+                    if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+                            and sub.func.attr == "volume_cap_at"):
+                        callers.add((name, func.name))
+                    if (isinstance(sub, ast.Attribute) and sub.attr in readers
+                            and isinstance(sub.ctx, ast.Load)):
+                        readers[sub.attr].add((name, func.name))
+        assert callers == {("backtester", "sale_ladder"), ("backtester", "_books_for"),
+                           ("backtester", "_volume_limit"),
+                           ("backtester", "_volume_capped_leg")}
+        assert readers["volume_ahead_checkpoints"] == {
+            ("backtester", "volume_cap_at"), ("backtester", "__reduce__"),
+            ("backtester", "__eq__"), ("backtester", "_attach_leg_quotes")}
+        assert readers["volume_share"] == {
+            ("backtester", "volume_cap_at"), ("backtester", "__init__"),
+            ("backtester", "__reduce__"), ("backtester", "__eq__"),
+            ("backtester", "_simulate_at_discount")}
+        # Sized by the live code where the cap binds: the one-level book only
+        # in _size_trade, and the cut only through _cut_levels
+        assert _function_calls(backtester, "_size_trade", "_capped_at")
+        assert _function_calls(backtester, "_size_trade", "_volume_limit")
+        assert _function_calls(backtester, "_books_for", "_cut_levels")
+        assert _function_calls(backtester, "sale_ladder", "_cut_levels")
+        assert _function_calls(backtester, "_leg_quotes", "_volume_ahead")
+        for caller in ("_prepare_entries", "_sweep_from_candidates"):
+            (value,) = _keyword_values(backtester, caller, "_attach_leg_quotes",
+                                       "volume_share")
+            assert ast.unparse(value) == "candidates.max_volume_share", caller
+        assert _function_calls(backtester, "_prepare_candidates", "_resolve_max_volume_share")
+        assert _function_calls(backtester, "run_backtest_sweep", "_resolve_max_volume_share")
+
     def test_ast_the_stale_quote_check_has_one_test_and_three_readers(self):
         # C6: a backtest entry, sale or Kelly trim needs each market's quote
         # to have moved recently. One test, backtester._quote_is_fresh, read
@@ -3981,7 +4035,9 @@ class TestTimeSeriesKellyParity:
                                 # ... and the gate of the stale-quote check's
                                 # count-only revaluations (C6), which decides nothing
                                 "paid_at_checkpoint": {"_position_sale_value",
-                                                       "_stale_unpaid_leg"},
+                                                       "_stale_unpaid_leg",
+                                                       # ... and the volume cap's (C7)
+                                                       "_volume_capped_leg"},
                                 "sale_ladder": {"_position_sale_value"},
                                 "_position_sale_value": {"_hold_readings", "_kelly_trim",
                                                          "net_sale"},

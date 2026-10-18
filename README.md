@@ -1500,6 +1500,8 @@ python3 -m kalshi_betting.backtest --no-same-event-ladders  # force them OFF for
 python3 -m kalshi_betting.backtest --no-scheduled-close     # read every settled market's realized close for this run (default on: the scheduled close a live run saw, from a rule learned per series from backtest_cache/scheduled_closes/)
 python3 -m kalshi_betting.backtest --stale-quote-hours 48   # an entry, a sale or a Kelly trim needs each market to have traded or moved its quote within 48 hours of the checkpoint, for this run (default 24: config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS)
 python3 -m kalshi_betting.backtest --no-stale-quote-check   # trade on a quote however long it has been unchanged, for this run
+python3 -m kalshi_betting.backtest --max-volume-share 5      # a buy or a sale takes at most 5% of the contracts each of its markets traded in the next day, for this run (default 10%: config.BACKTEST_MAX_VOLUME_SHARE; it reads hours a live run cannot see and only makes trades smaller)
+python3 -m kalshi_betting.backtest --no-volume-cap           # hold trades only to the modeled book, for this run
 python3 -m kalshi_betting.backtest --spread-min 0.30 --spread-max 0.60   # primary scenario's time-series spread band (backtest only)
 python3 -m kalshi_betting.backtest --no-band-sweep           # skip the spread-band grid (and its tier-floors-off runs); the dashboard's scenario explorer has nothing to show, and its filter bar offers the primary band only, with the Tier floors select disabled
 python3 -m kalshi_betting.backtest --no-cap-sweep            # skip the per-trade size-cap sweep: the dashboard offers config.BUDGET_FRACTION only (smaller, faster page)
