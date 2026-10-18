@@ -3,12 +3,14 @@
 # open the page on its Live trading tab.
 #
 # Two servers start from this checkout, each in the background. The live
-# dashboard (kalshi_betting.live_dashboard, read-only) serves the page's two
-# tabs: Live trading, which reads the account from Kalshi on every load, and
-# Backtest, backtest_dashboard.html as it is. It opens the page in the
-# browser. The live-defaults server (kalshi_betting.defaults_server) serves
-# the pages the Backtest tab's "Save as live defaults…" and "Trade using
-# defaults…" buttons open; it opens nothing itself, except with --seed. If
+# dashboard (kalshi_betting.live_dashboard, read-only) serves the page's three
+# tabs: Live trading, which reads the account from Kalshi on every load;
+# Backtest, backtest_dashboard.html as it is; and Data, eda_dashboard.html,
+# which each backtest rebuilds (or python3 -m kalshi_betting.eda). It opens
+# the page in the browser. The live-defaults server
+# (kalshi_betting.defaults_server) serves the pages the Backtest tab's "Save
+# as live defaults…" and "Trade using defaults…" buttons open; it opens
+# nothing itself, except with --seed. If
 # this checkout's servers are already running, the page just opens again.
 # Ctrl-C stops both, and so does a SIGTERM or SIGHUP sent to this script
 # alone; stop them when you are done. A trading run the defaults server
@@ -36,8 +38,8 @@ usage() {
   cat <<'EOF'
 usage: start_dashboard.sh [--seed] [--no-browser]
 
-Start the live dashboard (the Live trading and Backtest tabs, read-only) and the
-live-defaults server from this checkout, and open the page on its Live trading tab.
+Start the live dashboard (the Live trading, Backtest and Data tabs, read-only) and
+the live-defaults server from this checkout, and open the page on its Live trading tab.
 
   --seed        open the seed values' confirmation page instead
   --no-browser  open nothing; only log the addresses
@@ -173,7 +175,7 @@ trap 'signalled=1; exit 130' INT
 trap 'signalled=1; exit 143' TERM
 trap 'signalled=1; exit 129' HUP
 
-# The live dashboard (both tabs, read-only) opens the page itself, so the
+# The live dashboard (its three tabs, read-only) opens the page itself, so the
 # defaults server opens nothing, except with --seed, when the seed
 # confirmation page is what opens
 live_args=()

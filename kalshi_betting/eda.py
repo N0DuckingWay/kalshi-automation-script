@@ -67,8 +67,8 @@ Purpose:
 
 Dependencies:
     The standard library, config (EDA_SUMMARY_DIRNAME, EDA_SUMMARY_VERSION,
-    EDA_MAX_WORKERS, EDA_WORKER_START_TIMEOUT_SECONDS,
-    EDA_LIFETIME_EDGES_HOURS, EDA_LAG_EDGES_HOURS, EDA_CALIBRATION_BIN,
+    EDA_MAX_WORKERS, EDA_WORKER_START_TIMEOUT_SECONDS, EDA_BUILD_DEADLINE_SECONDS,
+    EDA_PROGRESS_EVERY_SLICES, EDA_LIFETIME_EDGES_HOURS, EDA_LAG_EDGES_HOURS, EDA_CALIBRATION_BIN,
     EDA_PRICE_LEADS_HOURS, EDA_PRICE_MAX_AGE_HOURS, EDA_CANDLE_FACTS_VERSION,
     EDA_KHAT_SPREAD_BIN, EDA_KHAT_VERSION, EDA_MAX_BOOK_WIDTH,
     EDA_MIN_MARKETS_PER_POINT, EDA_DASHBOARD_FILENAME, PRICE_EPSILON, PROJECT_ROOT,
@@ -80,13 +80,16 @@ Dependencies:
     series_ticker, infer_category, usable_candle_ask) and scanner
     (event_series, deadline_profile, stated_deadline, DEADLINE_CUMULATIVE).
     Imports no order-path module (trader, main, scheduler, run_lock,
-    defaults_server, v2_probe, seller), and no module of the package imports
-    this one (tests/test_eda.py::TestIsolation). The two exceptions to
+    defaults_server, v2_probe, seller), and only backtest.py imports this one,
+    to rebuild the page after each backtest; no live module does
+    (tests/test_eda.py::TestIsolation). The two exceptions to
     "only the standard library, config, glossary, historical and scanner"
     are khat_view(), which imports backtester and dashboard INSIDE the
     function, and _plotly(), which imports plotly there, so the worker
     processes that count the day slices (which import this module afresh)
-    never load pandas or plotly.
+    never load pandas or plotly on their own account. A spawned worker also
+    imports its parent's main module first, so workers started from a
+    backtest (backtest.py imports backtester and dashboard) do load them.
 
 Notes:
     Which slice counts which market. The archive phase of a fetch holds only
@@ -190,6 +193,7 @@ import math
 import multiprocessing
 import os
 import re
+import time
 import zlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
@@ -220,6 +224,13 @@ KEY_SEPARATOR = "|"
 _SEPARATOR_STAND_IN = "/"
 # The longest reason an unreadable slice is named with.
 _REASON_MAX_CHARS = 200
+# Why a slice the worker processes had not summarised by
+# config.EDA_BUILD_DEADLINE_SECONDS is named unreadable (never saved, so the
+# next build reads it again).
+NOT_SUMMARISED_IN_TIME = "not summarised in time"
+# The prefix of every Data page log line about the day-slice summaries.
+_START_LINE = ("Data page: summarising day slices: %d to read, %d reused from earlier "
+               "builds%s")
 # Read at most this many bytes of a slice's first line when looking for its
 # meta block during the reuse check: a streamed slice's meta line is a few
 # hundred bytes, and a legacy slice's first line is the whole file.
@@ -959,7 +970,14 @@ def load_or_build_summaries(cache_dir: Path, *, workers: int) -> list[dict]:
     call this under `if __name__ == "__main__":`. If the workers do not
     start within config.EDA_WORKER_START_TIMEOUT_SECONDS, or the pool cannot
     be made or breaks, its processes are killed and the remaining slices are
-    counted in this process, with one WARNING.
+    counted in this process, with one WARNING. Workers that have not
+    summarised every slice by config.EDA_BUILD_DEADLINE_SECONDS are stopped,
+    with one WARNING, and the slices left are named unreadable
+    (NOT_SUMMARISED_IN_TIME), never counted in this process and never saved.
+
+    It logs one INFO line before it reads anything (how many slices to read,
+    how many reused), one every config.EDA_PROGRESS_EVERY_SLICES slices
+    summarised, and one at the end.
 
     Args:
         cache_dir (Path): The cache folder (backtest_cache/).
@@ -982,6 +1000,12 @@ def load_or_build_summaries(cache_dir: Path, *, workers: int) -> list[dict]:
         else:
             todo.append(i)
     candle_set = candle_tickers(cache_dir) if todo else frozenset()
+    if todo:
+        # Before the reads, so a long first build is not mistaken for a hang
+        logging.info(_START_LINE, len(todo), len(slices) - len(todo),
+                     "; each is read once and summarised, which on a full cache can take "
+                     "several minutes" if len(todo) > config.EDA_PROGRESS_EVERY_SLICES else "")
+    done = [0]
 
     def finished(i: int, summary: dict) -> None:
         """
@@ -993,8 +1017,13 @@ def load_or_build_summaries(cache_dir: Path, *, workers: int) -> list[dict]:
         """
         kind, day, _ = slices[i]
         results[i] = summary
+        done[0] += 1
+        if done[0] % config.EDA_PROGRESS_EVERY_SLICES == 0:
+            logging.info("Data page: %d of %d day slices summarised", done[0], len(todo))
         if summary.get("unreadable"):
-            logging.warning("Data page: %s slice %s", kind, summary["unreadable"])
+            # A slice left at the deadline is named in the deadline's one WARNING
+            if not summary["unreadable"].endswith(NOT_SUMMARISED_IN_TIME):
+                logging.warning("Data page: %s slice %s", kind, summary["unreadable"])
             return
         try:
             _write_summary(_summary_path(cache_dir, kind, day), summary)
@@ -1075,7 +1104,12 @@ def _build_in_workers(slices, todo, pool_size, cache_dir, candle_set, finished) 
     worker died) all end the same way: the processes are killed, one
     WARNING names the cause, and the slices not yet counted are handed back
     for the caller to count in its own process. A slice whose own count
-    raises is named unreadable, as in-process.
+    raises is named unreadable, as in-process. Workers still busy
+    config.EDA_BUILD_DEADLINE_SECONDS after the pool is started are killed
+    too, with one WARNING, but the slices they had not summarised are not
+    handed back: each is named unreadable (NOT_SUMMARISED_IN_TIME), so it is
+    not saved and the next build reads it again, and nothing is counted in
+    this process after the deadline.
 
     Args:
         slices (list): _list_slices' slices.
@@ -1090,6 +1124,7 @@ def _build_in_workers(slices, todo, pool_size, cache_dir, candle_set, finished) 
     """
     remaining = list(todo)
     pool = None
+    deadline = time.monotonic() + config.EDA_BUILD_DEADLINE_SECONDS
     try:
         pool = ProcessPoolExecutor(
             max_workers=pool_size,
@@ -1100,17 +1135,34 @@ def _build_in_workers(slices, todo, pool_size, cache_dir, candle_set, finished) 
         pool.submit(_worker_ready).result(timeout=config.EDA_WORKER_START_TIMEOUT_SECONDS)
         futures = {pool.submit(_summarise_task, str(slices[i][2]), slices[i][0]): i
                    for i in todo}
-        for future in as_completed(futures):
-            i = futures[future]
-            kind, day, path = slices[i]
-            try:
-                summary = future.result()
-            except BrokenProcessPool:
-                raise
-            except Exception as exc:
-                summary = _failed(path, kind, day, exc)
-            finished(i, summary)
-            remaining.remove(i)
+        try:
+            for future in as_completed(futures,
+                                       timeout=max(0.0, deadline - time.monotonic())):
+                i = futures[future]
+                kind, day, path = slices[i]
+                try:
+                    summary = future.result()
+                except BrokenProcessPool:
+                    raise
+                except Exception as exc:
+                    summary = _failed(path, kind, day, exc)
+                finished(i, summary)
+                remaining.remove(i)
+        except TimeoutError:
+            # The deadline: stop the workers and leave the rest for the next build
+            _stop_pool(pool)
+            logging.warning(
+                "Data page: the worker processes had not summarised every day slice after "
+                "%s s (config.EDA_BUILD_DEADLINE_SECONDS); they were stopped, and the %d "
+                "slices left are named unreadable (%s) and read again by the next build",
+                config.EDA_BUILD_DEADLINE_SECONDS, len(remaining), NOT_SUMMARISED_IN_TIME)
+            for i in list(remaining):
+                kind, day, path = slices[i]
+                summary = _empty_summary(path, kind, day)
+                summary["unreadable"] = f"{path.name}: {NOT_SUMMARISED_IN_TIME}"
+                finished(i, summary)
+                remaining.remove(i)
+            return []
     except (TimeoutError, BrokenProcessPool, RuntimeError, OSError) as exc:
         logging.warning(
             "Data page: the worker processes could not be used (%s); counting the %d "

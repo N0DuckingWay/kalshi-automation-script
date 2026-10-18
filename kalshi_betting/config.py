@@ -19,7 +19,7 @@ Dependencies:
     outside the pipeline's import graph: the verification CLI (see
     CLAUDE.md's pipeline-isolation rule), defaults_server.py, the local pages
     that save the live defaults and start live trading runs with them, and
-    live_dashboard.py, the read-only local server of the dashboard's two tabs.
+    live_dashboard.py, the read-only local server of the dashboard's three tabs.
 
 Notes:
     PROJECT_ROOT is derived from __file__ so the package works correctly on any
@@ -808,10 +808,12 @@ DASHBOARD_FILES_DIRNAME = "backtest_dashboard_files"
 
 # ─── Exploratory data summaries (eda.py; reporting only) ──────────────────────
 # Nothing that trades, sizes or backtests reads any of these; eda.py reads all
-# of them.
+# of them (backtest.py reads EDA_MAX_WORKERS too, to cap the Data page's workers).
 # The exploratory Data page eda.build_eda_page writes under PROJECT_ROOT, beside
-# DASHBOARD_FILENAME (`python3 -m kalshi_betting.eda` rebuilds it from the cache
-# without a backtest). Read at call time.
+# DASHBOARD_FILENAME: each backtest rebuilds it after its own page (unless
+# --no-eda), `python3 -m kalshi_betting.eda` rebuilds it from the cache without
+# a backtest, and the live dashboard serves it at /eda/ as its Data tab. Read at
+# call time.
 EDA_DASHBOARD_FILENAME = "eda_dashboard.html"
 # The folder under backtest_cache/ where each day slice's small summary is kept
 # (<this folder>/archive/<day>.json and <this folder>/live/<day>.json), so a
@@ -820,13 +822,25 @@ EDA_SUMMARY_DIRNAME = "eda_days"
 # Bump when a summary gains or changes a field: every summary is then rebuilt.
 EDA_SUMMARY_VERSION = 2
 # The most worker processes the summaries are built in; each reads one slice
-# at a time, so memory grows with this number only by the record in hand.
+# at a time, so memory grows with this number only by the record in hand,
+# besides what each worker imports (a worker started from a backtest also
+# imports backtest.py's modules, pandas and plotly among them). A backtest
+# uses the lower of this and its own --sell-workers count.
 EDA_MAX_WORKERS = 4
 # How long to wait for the first worker process to answer before counting
 # every slice in the calling process instead (a worker that cannot start, for
 # example because the calling script lacks an `if __name__ == "__main__":`
 # guard, would otherwise be waited on for ever).
 EDA_WORKER_START_TIMEOUT_SECONDS = 120
+# The longest the worker processes may take to summarise the day slices,
+# counted from when they are started. Past it they are stopped, one WARNING
+# says so, and every slice not yet summarised is named unreadable ("not
+# summarised in time"): nothing is saved for it, so the next build reads it
+# again. Every backtest reaches this build, so it must never wait for ever.
+# A first build of a full cache took about 10 minutes.
+EDA_BUILD_DEADLINE_SECONDS = 3600
+# How many newly summarised day slices between two progress lines in the log.
+EDA_PROGRESS_EVERY_SLICES = 100
 # Bucket edges, in hours, for a market's lifetime (close minus open). A
 # lifetime falls in the first bucket below the first edge, in the last at or
 # above the last edge, and otherwise in [edge, next edge).

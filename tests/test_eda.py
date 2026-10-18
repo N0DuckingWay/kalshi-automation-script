@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from concurrent.futures import Future
 from datetime import datetime
 from html.parser import HTMLParser
@@ -521,6 +522,92 @@ class TestWorkerFallback:
         assert sum("worker processes could not be used" in r.message
                    for r in caplog.records) == 1
 
+    def test_workers_past_the_deadline_are_stopped_and_the_rest_left_for_next_time(
+            self, tmp_path, monkeypatch, caplog):
+        # Workers that start, summarise the archive slice and never finish the
+        # live one: no real process, and no real wait beyond the patched deadline
+        _standard_cache(tmp_path)
+        made = []
+
+        class Process:
+            killed = False
+
+            def kill(self):
+                self.killed = True
+
+        class StuckPool:
+            def __init__(self, **kwargs):
+                self._processes = {1: Process()}
+                self.shutdowns = []
+                made.append(self)
+
+            def submit(self, fn, *args):
+                future = Future()
+                if fn is eda._worker_ready:
+                    future.set_result(True)
+                elif args[1] == "archive":
+                    future.set_result(eda.summarise_slice(
+                        Path(args[0]), "archive", titles={}, candle_set=frozenset()))
+                return future  # the live slice never finishes
+
+            def shutdown(self, wait=True, cancel_futures=False):
+                self.shutdowns.append((wait, cancel_futures))
+
+        monkeypatch.setattr(eda, "ProcessPoolExecutor", StuckPool)
+        monkeypatch.setattr(config, "EDA_BUILD_DEADLINE_SECONDS", 0.2)
+        built = []
+        # In a thread, so a build that ignored the deadline fails the test
+        # instead of hanging it
+        with caplog.at_level(logging.INFO):
+            worker = threading.Thread(target=lambda: built.append(_build(tmp_path, workers=2)),
+                                      daemon=True)
+            worker.start()
+            worker.join(timeout=30)
+        assert not worker.is_alive(), "the build did not stop at its deadline"
+        merged = _merge(built[0])
+        (pool,) = made
+        assert pool._processes[1].killed
+        assert pool.shutdowns == [(False, True)]
+        # The live slice is named, not counted here after the deadline
+        assert merged["unreadable"] == [f"live: 2026-08-18.json.gz: {eda.NOT_SUMMARISED_IN_TIME}"]
+        assert merged["counted"] == 3
+        summaries = tmp_path / config.EDA_SUMMARY_DIRNAME
+        assert (summaries / "archive" / "2026-08-05.json").exists()
+        assert not (summaries / "live" / "2026-08-18.json").exists()
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert sum("EDA_BUILD_DEADLINE_SECONDS" in m for m in warnings) == 1
+        assert not any("worker processes could not be used" in m for m in warnings)
+        # The next build reads the slice again
+        monkeypatch.setattr(eda, "ProcessPoolExecutor", lambda **k: (_ for _ in ()).throw(
+            AssertionError("one slice to read: no pool")))
+        merged = _merge(_build(tmp_path, workers=2))
+        assert merged["counted"] == 6 and merged["unreadable"] == []
+
+
+class TestBuildLogLines:
+    def test_the_start_progress_and_end_lines(self, tmp_path, monkeypatch, caplog):
+        _standard_cache(tmp_path)
+        monkeypatch.setattr(config, "EDA_PROGRESS_EVERY_SLICES", 1)
+        with caplog.at_level(logging.INFO):
+            _build(tmp_path)
+        messages = [r.getMessage() for r in caplog.records]
+        start = messages.index("Data page: summarising day slices: 2 to read, 0 reused from "
+                               "earlier builds; each is read once and summarised, which on a "
+                               "full cache can take several minutes")
+        assert messages[start + 1:].count("Data page: 1 of 2 day slices summarised") == 1
+        assert messages[start + 1:].count("Data page: 2 of 2 day slices summarised") == 1
+        assert any(m.startswith("Data page: 2 day slice summaries: 0 reused, 2 built")
+                   for m in messages)
+        caplog.clear()
+        # A build that reuses everything reads nothing and says nothing about reading
+        with caplog.at_level(logging.INFO):
+            _build(tmp_path)
+        messages = [r.getMessage() for r in caplog.records]
+        assert not any("summarising day slices" in m or "slices summarised" in m
+                       for m in messages)
+        assert any(m.startswith("Data page: 2 day slice summaries: 2 reused, 0 built")
+                   for m in messages)
+
 
 class TestIsolation:
     _FORBIDDEN = {"trader", "main", "scheduler", "run_lock", "defaults_server",
@@ -588,12 +675,48 @@ class TestIsolation:
                     names.add(node.module or "")
         return names
 
-    def test_no_module_imports_eda(self):
+    def test_only_backtest_imports_eda(self):
+        # backtest.py rebuilds the Data page after each run; no other module,
+        # and so no live module (main, trader, live_dashboard, which only
+        # serves the file, ...), may import it
         package = Path(eda.__file__).parent
-        for path in package.glob("*.py"):
-            if path.name == "eda.py":
-                continue
-            assert "eda" not in self._imports(path), path.name
+        importers = {path.name for path in package.glob("*.py")
+                     if path.name != "eda.py"
+                     and "eda" in self._package_modules(ast.parse(path.read_text()))}
+        assert importers == {"backtest.py"}
+        # The pin itself sees each spelling of an import of eda
+        for source in ("from . import eda", "from .eda import build_eda_page",
+                       "from kalshi_betting import eda", "from kalshi_betting.eda import x",
+                       "import kalshi_betting.eda", "import kalshi_betting.eda as e",
+                       "def f():\n    from . import config, eda"):
+            assert "eda" in self._package_modules(ast.parse(source)), source
+
+    def test_no_module_imports_backtest(self):
+        # backtest.py is the CLI that builds the Data page; nothing imports it,
+        # so eda never reaches a live module through it either
+        package = Path(eda.__file__).parent
+        importers = {path.name for path in package.glob("*.py")
+                     if "backtest" in self._package_modules(ast.parse(path.read_text()))}
+        assert importers == set()
+
+    @staticmethod
+    def _package_modules(tree):
+        """The package's own modules a parsed source imports, however it spells the import."""
+        found = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.level:
+                found |= {alias.name for alias in node.names}
+                if node.module:
+                    found.add(node.module.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and node.module == "kalshi_betting":
+                found |= {alias.name for alias in node.names}
+            elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
+                    "kalshi_betting."):
+                found.add(node.module.split(".")[1])
+            elif isinstance(node, ast.Import):
+                found |= {alias.name.split(".")[1] for alias in node.names
+                          if alias.name.startswith("kalshi_betting.")}
+        return found
 
 
 @pytest.mark.parametrize("value, bucket", [(-5, 0), (0.5, 0), (1, 1), (719.9, 5), (720, 6)])
