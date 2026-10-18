@@ -954,14 +954,18 @@ class TestCheckMarket:
         assert {market_details.failing_check(s) for s in failed} == {"hourly_volume"}
         assert "hours differ" in failed[0]
 
-    def test_a_trade_on_an_hour_boundary_belongs_to_the_hour_that_ends_there(self, game):
+    def test_a_trade_on_an_hour_boundary_belongs_to_the_hour_that_starts_there(self, game):
+        # Kalshi's candle ending at T covers [T - 1 h, T): KXLUTNICKOUT-26JUL01
+        # has a 49-contract trade stamped exactly 2026-04-08 23:00:00.000, and
+        # Kalshi counts it in the candle ending at midnight, not the one ending
+        # at 23:00
         details, candles, trades = game
-        shifted = [(t[0], *t[1:]) for t in trades]
-        # Move one trade exactly onto the end of its own hour
-        for index, (when, price, count, side) in enumerate(shifted):
-            end = -(-when // 3_600_000) * 3_600_000
-            shifted[index] = (end, price, count, side)
-        assert market_details.check_market(details, candles, shifted) == []
+        at_start = [(when // 3_600_000 * 3_600_000, *rest) for when, *rest in trades]
+        assert market_details.check_market(details, candles, at_start) == []
+        when, *rest = trades[-1]
+        on_its_end = [*trades[:-1], ((when // 3_600_000 + 1) * 3_600_000, *rest)]
+        failed = market_details.check_market(details, candles, on_its_end)
+        assert {market_details.failing_check(s) for s in failed} == {"hourly_volume"}
 
     def test_trades_outside_the_candles_hours_are_not_compared(self, game):
         details, candles, trades = game

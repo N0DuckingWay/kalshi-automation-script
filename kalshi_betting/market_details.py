@@ -1030,10 +1030,12 @@ def _check_volumes(details: dict, candles: Sequence[dict], trades: Sequence[tupl
         parts: list[list[float]] = [[] for _ in hours]
         for when_ms, _price, count, _side in trades:
             seconds = when_ms / 1000.0
-            index = bisect.bisect_left(stamps, seconds)
+            # A candle ending at T covers [T - 1 h, T): Kalshi files a trade made
+            # exactly on the hour in the candle that starts then
+            index = bisect.bisect_right(stamps, seconds)
             # Only the hours the candles cover: a trade before the first candle's
             # period, or in a gap between candles, belongs to no candle
-            if index < len(stamps) and stamps[index] - _PERIOD_SECONDS < seconds <= stamps[index]:
+            if index < len(stamps) and stamps[index] - _PERIOD_SECONDS <= seconds < stamps[index]:
                 parts[index].append(count)
         for index in range(len(hours)):
             per_hour[index] = math.fsum(parts[index])
