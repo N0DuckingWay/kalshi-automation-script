@@ -57,13 +57,13 @@ Purpose:
     that has stayed at or above that share of its potential profit (what it
     pays if it wins, less its cost); see CLAUDE.md, live selling.
 
-    A production run with trim_to_kelly on also sells, before it buys, part
+    A production run with rebalance on also sells, before it buys, part
     of each exact held pair (one YES and one NO of equal size on one
     question) that has grown past its Kelly share of the portfolio value
     (seller.plan_trims, planned right after the take-profit plans and before
     any sale order is sent; never a pair the take-profit rule sells). A pair
     waits a set number of calendar days after its last trade and, with
-    trim_min_rise set, until its price has moved that far, up or down.
+    min_price_move set, until its price has moved that far, up or down.
     Nothing is trimmed when a shard's cash or Kalshi's value of the open
     positions cannot be counted (or that value is $0), when an order rests on the
     account (Kalshi counts a resting order's cash in neither the balance nor
@@ -73,7 +73,7 @@ Purpose:
     not. Either way it is neither bought nor added to that run.
 
     A production run keeps every market the account holds out of new trades,
-    except, when the run's add_to_held_pairs setting is on, the markets it
+    except, when the run's rebalance setting is on, the markets it
     may add to (scanner.held_pairs): the two markets of an exact held pair,
     which each finder lets through only as that same pair, and a lone held
     leg whose partner has paid out, which each finder lets through only
@@ -168,6 +168,7 @@ from .config import (
     V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS,
     LiveDefaultsError,
     LiveDefaultsMissing,
+    LiveDefaultsOutdated,
     LiveSettings,
     count_text,
     describe_live_settings,
@@ -179,9 +180,9 @@ from .config import (
     live_rule_warnings,
     live_settings,
     order_api_version_error,
+    rebalance_change_warnings,
     split_tag,
     trade_filter,
-    trim_change_warnings,
 )
 from .historical import infer_category, load_series_categories, series_labels
 from .reporter import (
@@ -1337,14 +1338,13 @@ _LIVE_FLAGS = (
     ("interval_discount", "--interval-discount"),
     ("size_cap", "--size-cap"),
     ("same_title_size_cap", "--same-title-size-cap"),
-    ("add_to_held_pairs", "--add-to-held-pairs/--no-add-to-held-pairs"),
+    ("rebalance", "--rebalance/--no-rebalance"),
+    ("min_price_move", "--min-price-move"),
+    ("no_min_price_move", "--no-min-price-move"),
     ("sell_at", "--sell-at"),
     ("no_sell", "--no-sell"),
     ("sell_min_days", "--sell-min-days"),
     ("no_sell_min_days", "--no-sell-min-days"),
-    ("trim_to_kelly", "--trim-to-kelly/--no-trim-to-kelly"),
-    ("trim_min_rise", "--trim-min-rise"),
-    ("no_trim_min_rise", "--no-trim-min-rise"),
     ("category", "--category"),
     ("any_category", "--any-category"),
     ("tag", "--tag"),
@@ -1391,9 +1391,12 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
     keeps the defaults' origin. --category and --tag each replace the whole
     saved list; a run that drops the category of a saved tag tied to one is
     refused, naming the remedy. --no-sell also clears the minimum of days, and
-    --no-trim-to-kelly the minimum price rise, since neither minimum is
-    allowed without its switch. Runs before logging is set up, so a refusal
-    logs nothing and sends no request.
+    --no-rebalance the minimum price move, since neither minimum is allowed
+    without its switch. A saved file an older version wrote (holding
+    add_to_held_pairs, trim_to_kelly or trim_min_rise) is refused too, with
+    the remedy: save it again through the defaults server, whose pages offer
+    its settings in their new form. Runs before logging is set up, so a
+    refusal logs nothing and sends no request.
 
     Args:
         args (argparse.Namespace): The parsed flags; a missing attribute reads
@@ -1406,7 +1409,7 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
 
     Raises:
         SystemExit: Status 2 (parser.error) when no live defaults are saved,
-            the saved file is refused, or a flag's value is invalid.
+            the saved file is refused or outdated, or a flag's value is invalid.
     """
     try:
         # The saved live defaults: the reference, and the base the flags lay over.
@@ -1414,6 +1417,12 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
         reference = live_defaults()
     except LiveDefaultsMissing as exc:
         parser.error(str(exc))
+    except LiveDefaultsOutdated as exc:
+        # Saved by an older version: never traded as its new form, but not to be
+        # deleted either, since the defaults server offers its settings for one save
+        parser.error(f"the saved live defaults are out of date, and no run trades them: "
+                     f"{exc}; do not delete the file: a Confirm and save on those pages "
+                     "replaces it")
     except LiveDefaultsError as exc:
         # The defaults server will not save over a file it refuses, so the
         # remedy is to fix the file, or to delete it before saving new ones
@@ -1435,8 +1444,18 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
         overrides["size_cap"] = args.size_cap / 100
     if getattr(args, "same_title_size_cap", None) is not None:
         overrides["same_title_size_cap"] = args.same_title_size_cap / 100
-    if getattr(args, "add_to_held_pairs", None) is not None:
-        overrides["add_to_held_pairs"] = args.add_to_held_pairs
+    # --no-rebalance clears the minimum price move too; --min-price-move then
+    # sets one (LiveSettings refuses a minimum with rebalancing off)
+    rebalance = getattr(args, "rebalance", None)
+    if rebalance is not None:
+        overrides["rebalance"] = rebalance
+        if not rebalance:
+            overrides["min_price_move"] = None
+    if getattr(args, "no_min_price_move", None):
+        overrides["min_price_move"] = None
+    if getattr(args, "min_price_move", None) is not None:
+        # The flag takes whole cents; LiveSettings holds dollars
+        overrides["min_price_move"] = args.min_price_move / 100
     # --no-sell clears the level and the minimum of days; --sell-at and
     # --sell-min-days then set one each (LiveSettings refuses a minimum with no level)
     if getattr(args, "no_sell", None):
@@ -1448,18 +1467,6 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
         overrides["sell_min_days"] = None
     if getattr(args, "sell_min_days", None) is not None:
         overrides["sell_min_days"] = args.sell_min_days
-    # --no-trim-to-kelly clears the minimum price rise too; --trim-min-rise then
-    # sets one (LiveSettings refuses a minimum with trimming off)
-    trim = getattr(args, "trim_to_kelly", None)
-    if trim is not None:
-        overrides["trim_to_kelly"] = trim
-        if not trim:
-            overrides["trim_min_rise"] = None
-    if getattr(args, "no_trim_min_rise", None):
-        overrides["trim_min_rise"] = None
-    if getattr(args, "trim_min_rise", None) is not None:
-        # The flag takes whole cents; LiveSettings holds dollars
-        overrides["trim_min_rise"] = args.trim_min_rise / 100
     # --category / --tag (repeatable) set the filter; --any-category / --any-tag
     # clear the saved one (argparse keeps each pair mutually exclusive)
     if getattr(args, "category", None) is not None:
@@ -1492,9 +1499,9 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
             sell_step = f"{SELL_AT_STEP * 100:g}"
             message += (f" (--sell-at takes a whole percent, a multiple of {sell_step} "
                         f"from {sell_step} to 100, read as that percent / 100)")
-        if any(dest == "trim_min_rise" for dest, _ in given):
-            # --trim-min-rise's unit, from its grid definition (PRICE_MOVE_STEP_CENTS)
-            message += (" (--trim-min-rise takes whole cents, a multiple of "
+        if any(dest == "min_price_move" for dest, _ in given):
+            # --min-price-move's unit, from its grid definition (PRICE_MOVE_STEP_CENTS)
+            message += (" (--min-price-move takes whole cents, a multiple of "
                         f"{PRICE_MOVE_STEP_CENTS} from {PRICE_MOVE_STEP_CENTS} to "
                         "100, read as that many cents / 100 dollars)")
         if ("categories" in overrides and "tags" not in overrides
@@ -1514,8 +1521,8 @@ def _log_live_settings(settings: LiveSettings, reference: LiveSettings, *,
     that departs from reference: "(default: X)" against the saved live
     defaults, "(config: X)" against a reference built from config.py (tests
     and direct calls only). Only a real-money run WARNs about a departure,
-    and, with the Kelly trim on, when a lower size cap or a higher k would
-    make it sell more of the held pairs (config.trim_change_warnings).
+    and, with Rebalance yes, when a lower size cap or a higher k would
+    make it sell more of the held pairs (config.rebalance_change_warnings).
     Resolves neither object itself (TestLiveSettingsReachEverySite).
 
     Args:
@@ -1542,9 +1549,9 @@ def _log_live_settings(settings: LiveSettings, reference: LiveSettings, *,
                 "\"(default: …)\" marks on the line above): its trades follow the "
                 "flags, not the saved defaults")
     if real_money:
-        # With the Kelly trim on, a lower cap or a higher k sells more of the held
+        # With Rebalance yes, a lower cap or a higher k sells more of the held
         # pairs: warn before any trim is made
-        for text in trim_change_warnings(reference, settings):
+        for text in rebalance_change_warnings(reference, settings):
             logging.warning("Live settings: %s", text)
     # A setting that empties part of the strategy or lifts one pair's stake
     for text in live_rule_warnings(settings):
@@ -1708,7 +1715,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     person, are not bought; no position picked for sale is added to; nothing
     is sold when a held market was not identified or the listing was cut short.
 
-    With settings.trim_to_kelly on and anything held, the same step also
+    With settings.rebalance on and anything held, the same step also
     trims: seller.plan_trims plans part sales of the exact held pairs grown
     past their Kelly share (never a pair the take-profit rule sells), sized on
     the cash and positions value read at the start, and trader.sell_positions
@@ -1733,7 +1740,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     value refused at the start of the run leaves the cash alone as the
     portfolio value, and the minimum-balance check is applied to it again.
 
-    With settings.add_to_held_pairs on, it may add to an exact held pair
+    With settings.rebalance on, it may also add to an exact held pair
     (scanner.held_pairs: the same two markets, the same side on each) or to a
     lone held leg whose partner has paid out (a new pair buying that market
     on its held side, beside a market not held), sized
@@ -1904,7 +1911,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     sold_tickers: set = set()
     # A dry run's estimated sale proceeds, in the cash it sizes on (0 in a live run)
     simulated_cents = 0
-    trimming = settings.trim_to_kelly and bool(held_positions)
+    trimming = settings.rebalance and bool(held_positions)
     if settings.sell_at is not None or trimming:
         if held_ladders is None or held_listing.get("complete") is not True:
             # Fails closed: a held market not identified or not listed could be on the
@@ -2046,13 +2053,13 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     # Added to the run's closing line when a sale needs a person
     sale_note         = _sale_attention_note(sales)
     # What this run may add to (exact held pairs, and lone legs whose partner
-    # has paid out): only with the setting on, and only when every held
+    # has paid out): only with rebalancing on, and only when every held
     # market was listed and identified, since an unknown one could share a
     # pair's ladder, and being alone on its ladder is what makes adding safe; and only when Kalshi's value of the open
     # positions was read and kept, since an add-on is sized on the portfolio
     # value, which would otherwise leave out what the account holds
     add_on_pairs: dict = {}
-    if settings.add_to_held_pairs:
+    if settings.rebalance:
         if held_ladders is None or held_listing.get("complete") is not True:
             logging.warning("Not adding to held pairs this run: %s",
                             "a market the account holds could not be looked up"
@@ -2338,7 +2345,7 @@ def _build_parser() -> argparse.ArgumentParser:
     live = parser.add_argument_group(
         "live trading toggles",
         "Override one live default for THIS run only, in either mode "
-        "(adding to held pairs, selling and trimming: production runs only). The live "
+        "(rebalancing and selling: production runs only). The live "
         "defaults are the ones saved through python3 -m kalshi_betting.defaults_server "
         "(live_defaults.json); a run refuses to start without them. The weekly scheduler "
         "passes none of these flags, so a scheduled run trades exactly the saved defaults.",
@@ -2358,9 +2365,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Time-series spread-band CEILING on pB - pA, 0-1 "
              "(default: the saved live defaults)",
     )
-    # Help ending for --interval-discount and both cap flags: with the Kelly trim
-    # on, a higher k or a lower cap also sells held pairs
-    trim_sells = ("With the Kelly trim on (saved, or given with --trim-to-kelly), a {} "
+    # Help ending for --interval-discount and both cap flags: with Rebalance yes,
+    # a higher k or a lower cap also sells held pairs
+    trim_sells = ("With Rebalance yes (saved, or given with --rebalance), a {} "
                   "also sells: each exact held {}pair worth more than its new Kelly size is "
                   "sold down to it before anything is bought, once its wait has passed")
     live.add_argument(
@@ -2385,13 +2392,31 @@ def _build_parser() -> argparse.ArgumentParser:
              + trim_sells.format("lower cap", "same-title "),
     )
     live.add_argument(
-        "--add-to-held-pairs", action=argparse.BooleanOptionalAction, default=None,
-        help="Let this run add to a pair the account already holds (exactly the same "
-             "two markets, the same side on each), sizing the old and new contracts "
-             "together as a share of the portfolio value (the old ones at today's "
-             "prices plus the fees paid for them). --no-add-to-held-pairs never "
-             "trades a held market. Production runs only: a dev run holds nothing "
-             "(default: the saved live defaults)",
+        "--rebalance", action=argparse.BooleanOptionalAction, default=None,
+        help="Rebalance the held pairs this run: before buying, sell part of each "
+             "exact held pair that has outgrown its Kelly size, once "
+             "config.REBALANCE_MIN_DAYS_SINCE_TRADE calendar days have passed since "
+             "the pair's last trade, and let this run add to a pair the account "
+             "already holds (exactly the same two markets, the same side on each), "
+             "sizing the old and new contracts together as a share of the portfolio "
+             "value (the old ones at today's prices plus the fees paid for them). "
+             "--no-rebalance neither trims nor adds to a held pair, and clears the "
+             "saved minimum price move too. Production runs only: a dev run holds "
+             "nothing (default: the saved live defaults)",
+    )
+    # The minimum's grid step in whole cents (PRICE_MOVE_STEP_CENTS)
+    move_step = PRICE_MOVE_STEP_CENTS
+    price_move = live.add_mutually_exclusive_group()
+    price_move.add_argument(
+        "--min-price-move", type=int, default=None, metavar="CENTS",
+        help="The least move, up or down, in whole cents, in a held pair's total price "
+             "since the last trade on it before a Kelly trim may sell part of it; a "
+             f"multiple of {move_step} from {move_step} to 100. Needs rebalancing on, "
+             "saved or given with --rebalance (default: the saved live defaults)",
+    )
+    price_move.add_argument(
+        "--no-min-price-move", action="store_true", default=None,
+        help="Set no minimum price move this run, whatever the saved live defaults say",
     )
     sell_level = live.add_mutually_exclusive_group()
     sell_level.add_argument(
@@ -2416,30 +2441,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-sell-min-days", action="store_true", default=None,
         help="Set no minimum of days to maturity this run, whatever the saved live "
              "defaults say",
-    )
-    live.add_argument(
-        "--trim-to-kelly", action=argparse.BooleanOptionalAction, default=None,
-        help="Set the Kelly trim on for this run: before buying, sell part of each "
-             "exact held pair that has outgrown its Kelly size, once "
-             "config.REBALANCE_MIN_DAYS_SINCE_TRADE calendar days have passed since "
-             "the pair's last trade. --no-trim-to-kelly sets it off and clears the "
-             "saved minimum price rise too. Production runs only: a dev run holds "
-             "nothing (default: the saved live defaults)",
-    )
-    # The minimum's grid step in whole cents (PRICE_MOVE_STEP_CENTS)
-    rise_step = PRICE_MOVE_STEP_CENTS
-    trim_rise = live.add_mutually_exclusive_group()
-    trim_rise.add_argument(
-        "--trim-min-rise", type=int, default=None, metavar="CENTS",
-        help="The least move, up or down, in whole cents, in a held pair's total price "
-             "since the last trade on it before the Kelly trim may sell part of it; a "
-             f"multiple of {rise_step} from {rise_step} to 100. Needs the Kelly trim on, "
-             "saved or given with --trim-to-kelly (default: the saved live defaults)",
-    )
-    trim_rise.add_argument(
-        "--no-trim-min-rise", action="store_true", default=None,
-        help="Set no minimum price rise for the Kelly trim this run, whatever the saved "
-             "live defaults say",
     )
     # Filed as the backtest dashboard files a trade (_filter_by_category)
     categories = live.add_mutually_exclusive_group()

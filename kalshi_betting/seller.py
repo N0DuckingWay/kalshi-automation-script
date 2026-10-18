@@ -21,7 +21,7 @@ Purpose:
     Kelly sizing would put in it), by the backtest's rule
     (config.kelly_trim_count). A pair is trimmed only after enough calendar
     days without a fill (a trade) on either market and, with
-    LiveSettings.trim_min_rise set, once its price has moved that far since,
+    LiveSettings.min_price_move set, once its price has moved that far since,
     up or down.
     A trim sells only into bids within config.KELLY_TRIM_MAX_BID_DROP of the
     best bid, never into a gap in a book.
@@ -30,7 +30,7 @@ Dependencies:
     Imports the standard library, config, scanner and historical only, never
     trader, strategy, the backtester or main (pinned by tests/test_seller.py).
     main.py alone imports it: a production run calls plan_sales before it
-    buys anything and, with trim_to_kelly on, plan_trims right after it.
+    buys anything and, with rebalance on, plan_trims right after it.
 
 Notes:
     Every request is a read-only GET. Each planner call reads for itself,
@@ -999,7 +999,7 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
                       "are valued at")
 
     move_text = ""
-    if settings.trim_min_rise is not None:
+    if settings.min_price_move is not None:
         # The pair's total price (the asks of the sides held, added) must have moved
         # that far, up or down, since its last fill
         if last_fill is None:
@@ -1025,8 +1025,8 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
         # rise and a fall of the minimum count alike)
         move = pair_price_move(then_a + then_b, now_a + now_b)
         prices = (f"price {_price_text(then_a + then_b)} then, {_price_text(now_a + now_b)} now "
-                  f"({_cents_text(move)}, minimum {settings.trim_min_rise * 100:.0f}c)")
-        if not price_move_reached(move, settings.trim_min_rise):
+                  f"({_cents_text(move)}, minimum {settings.min_price_move * 100:.0f}c)")
+        if not price_move_reached(move, settings.min_price_move):
             not_trimming("its total price has not moved by the minimum since it last "
                          f"traded: {prices}")
             return None, None
@@ -1124,7 +1124,7 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
         held_positions (dict): Ticker -> HeldPosition for every held market.
         held_labels (dict): Ticker -> ladder labels (scanner.resolve_held_ladders' labels_out).
         markets_by_ticker (dict): This run's whole market list by ticker, held markets included.
-        settings (LiveSettings): trim_to_kelly (off: trim and read nothing), trim_min_rise,
+        settings (LiveSettings): rebalance (off: trim and read nothing), min_price_move,
             k and both size caps.
         now (datetime): The run's moment, timezone-aware.
         cash_cents (float): The account's cash on every shard, in cents.
@@ -1142,7 +1142,7 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
             not a finite number at least 0, or REBALANCE_MIN_DAYS_SINCE_TRADE is
             invalid; later, when KELLY_TRIM_MAX_BID_DROP is invalid.
     """
-    if not settings.trim_to_kelly:
+    if not settings.rebalance:
         return []
     # Checked first, so a bad number stops the run before any request
     min_days = _rebalance_min_days()
@@ -1187,7 +1187,7 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
     # Today on the bot's own clock, as every fill's day is read
     now_date = _day(now)
     fills = None
-    if min_days > 0 or settings.trim_min_rise is not None:
+    if min_days > 0 or settings.min_price_move is not None:
         # Cross-module: one read of the account's fills serves the wait and the price move
         fills = get_fill_times(client)
         if fills is None:

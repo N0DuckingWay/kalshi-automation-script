@@ -181,7 +181,7 @@ class _World:
               labels: dict | None = None) -> list:
         """Run seller.plan_trims against this world, its reads stubbed and recorded.
 
-        By default trimming is on with no minimum price rise, with $50 of cash and
+        By default rebalancing is on with no minimum price move, with $50 of cash and
         $50 as Kalshi's value of the open positions."""
         def book(client, ticker):
             self.calls["book"].append(ticker)
@@ -210,9 +210,10 @@ class _World:
 
 
 def _trim_settings(*, k: float = 0.8, cap: float = 1.0, st_cap: float = 0.2,
-                   min_rise: float | None = None, on: bool = True) -> config.LiveSettings:
-    """The run's settings with the Kelly trim on (or off), and its k, caps and minimum rise."""
-    return dc_replace(config.live_settings(), trim_to_kelly=on, trim_min_rise=min_rise,
+                   min_move: float | None = None, on: bool = True) -> config.LiveSettings:
+    """The run's settings with rebalancing on (or off), so the Kelly trim with it,
+    and its k, caps and minimum price move."""
+    return dc_replace(config.live_settings(), rebalance=on, min_price_move=min_move,
                       interval_discount=k, size_cap=cap, same_title_size_cap=st_cap)
 
 
@@ -1126,10 +1127,10 @@ class _TrimCase:
         return backtester._kelly_trim([self.trade], _D, self.value(value_cents), k, cap, st_cap)
 
     def live(self, monkeypatch, value_cents: int, *, k: float = 0.8, cap: float = 1.0,
-             st_cap: float = 0.2, min_rise: float | None = None, **kwargs) -> list:
+             st_cap: float = 0.2, min_move: float | None = None, **kwargs) -> list:
         """seller.plan_trims' plans for the pair at the same portfolio value."""
         return self.world.trims(
-            monkeypatch, _trim_settings(k=k, cap=cap, st_cap=st_cap, min_rise=min_rise),
+            monkeypatch, _trim_settings(k=k, cap=cap, st_cap=st_cap, min_move=min_move),
             cash_cents=value_cents - self.positions_cents,
             positions_value_cents=self.positions_cents, **kwargs)
 
@@ -1318,12 +1319,12 @@ class TestTrimParityWithTheBacktest:
         monkeypatch.setattr(seller, "pair_price_move", spy)
         # A 20c rise meets a 20c minimum, on both paths
         assert config.price_move_reached(expected, 0.20)
-        (plan,) = case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.20)
+        (plan,) = case.live(monkeypatch, 10_000, cap=0.10, min_move=0.20)
         assert measured == [pytest.approx(expected, abs=1e-9)]
         assert plan.count == case.backtest(10_000, cap=0.10)[0].sell == 19
         # ... and falls short of a 25c one, on both paths
         assert not config.price_move_reached(expected, 0.25)
-        assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.25) == []
+        assert case.live(monkeypatch, 10_000, cap=0.10, min_move=0.25) == []
         # Each market's price then comes from its candles over the week before the last fill
         week = config.PRICE_THEN_MAX_AGE_DAYS * _DAY
         assert case.world.calls["candles"][:2] == [
@@ -1526,7 +1527,7 @@ class TestPlanTrims:
         assert plan.proceeds_dollars == pytest.approx(proceeds, abs=1e-12)
         assert plan.profits == ((pytest.approx(proceeds - plan.cost_dollars),
                                  pytest.approx(19 * 1.0 - plan.cost_dollars)),)
-        # One fills read, each book once, and no candle (no minimum price rise)
+        # One fills read, each book once, and no candle (no minimum price move)
         assert case.world.fill_reads == 1
         assert case.world.calls["book"] == [_A, _B] and case.world.calls["candles"] == []
 
@@ -1579,9 +1580,9 @@ class TestPlanTrims:
 
     def test_a_lower_cap_or_a_higher_k_sells_a_pair_the_settings_before_kept(
             self, monkeypatch):
-        # What config.trim_change_warnings warns about: with trimming on, a lower
-        # cap (20% to 10% of $200) or a higher k (0.7 to 0.8, on a $50 portfolio)
-        # sells part of a pair the old settings kept
+        # What config.rebalance_change_warnings warns about: with rebalancing on, a
+        # lower cap (20% to 10% of $200) or a higher k (0.7 to 0.8, on a $50
+        # portfolio) sells part of a pair the old settings kept
         assert _TrimCase().live(monkeypatch, 20_000, cap=0.20) == []
         (plan,) = _TrimCase().live(monkeypatch, 20_000, cap=0.10)
         assert (plan.kind, plan.count) == (config.SALE_KIND_KELLY_TRIM, 8)
@@ -1856,8 +1857,8 @@ class TestPlanTrims:
     def test_a_minimum_price_rise_never_lets_through_a_trim_the_value_guard_stops(
             self, monkeypatch, caplog):
         # The snow pair alone fetches about $36, above the $30 all open positions
-        # are valued at, so nothing trims. A minimum price rise may only hold trims
-        # back: holding the snow pair (no rise) back must not let the rain pair
+        # are valued at, so nothing trims. A minimum price move may only hold trims
+        # back: holding the snow pair (no move) back must not let the rain pair
         # (up 20c) trim on that bad value
         world = _World()
         rain = _weather_pair(world, "rain", 30)
@@ -1871,7 +1872,7 @@ class TestPlanTrims:
         assert world.trims(monkeypatch, _trim_settings(cap=0.05), **sized) == []
         caplog.clear()
         with caplog.at_level(logging.INFO):
-            assert world.trims(monkeypatch, _trim_settings(cap=0.05, min_rise=0.10),
+            assert world.trims(monkeypatch, _trim_settings(cap=0.05, min_move=0.10),
                                **sized) == []
         (warning,) = _warnings(caplog)
         assert "YES KXSNOW20-26 / NO KXSNOW25-26 alone would fetch" in warning
@@ -1879,7 +1880,7 @@ class TestPlanTrims:
         assert "Pairs to trim this run: 0 of 2" in caplog.text
         # On a value that covers both pairs, the minimum holds the snow pair back
         # and only the rain pair trims
-        plans = world.trims(monkeypatch, _trim_settings(cap=0.05, min_rise=0.10),
+        plans = world.trims(monkeypatch, _trim_settings(cap=0.05, min_move=0.10),
                             cash_cents=5_000, positions_value_cents=6_400)
         assert [plan.legs[0].ticker for plan in plans] == [rain[0]]
 
@@ -2028,7 +2029,7 @@ class TestPlanTrims:
         # The waiting pair's books were never read
         assert world.calls["book"] == [*hail, *snow]
 
-    # ── The minimum price rise ───────────────────────────────────────────────
+    # ── The minimum price move ───────────────────────────────────────────────
 
     @staticmethod
     def _risen(cents_a: int, cents_b: int = 0) -> _TrimCase:
@@ -2046,7 +2047,7 @@ class TestPlanTrims:
         # rise (10c, 11c) and a fall (-10c, -11c) alike, the sign shown on the line
         case = self._risen(cents)
         with caplog.at_level(logging.INFO):
-            plans = case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10)
+            plans = case.live(monkeypatch, 10_000, cap=0.10, min_move=0.10)
         assert bool(plans) == trims
         then = 0.97 - cents / 100
         prices = f"price ${then:.2f} then, $0.97 now ({cents:+d}c, minimum 10c)"
@@ -2069,7 +2070,7 @@ class TestPlanTrims:
             self, monkeypatch, caplog, yes_ask_then, prices):
         case = _TrimCase(a_then=(yes_ask_then, 0.58), b_then=(0.48, 0.53))
         with caplog.at_level(logging.INFO):
-            assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10) == []
+            assert case.live(monkeypatch, 10_000, cap=0.10, min_move=0.10) == []
         (line,) = [r.getMessage() for r in caplog.records
                    if "has not moved by the minimum" in r.getMessage()]
         assert "(+10c, minimum 10c)" not in line
@@ -2090,13 +2091,13 @@ class TestPlanTrims:
 
     def test_the_rise_is_the_two_markets_together(self, monkeypatch):
         # 6c on one market and 4c on the other is a 10c rise of the pair
-        assert self._risen(6, 4).live(monkeypatch, 10_000, cap=0.10, min_rise=0.10)
-        assert self._risen(6, 3).live(monkeypatch, 10_000, cap=0.10, min_rise=0.10) == []
+        assert self._risen(6, 4).live(monkeypatch, 10_000, cap=0.10, min_move=0.10)
+        assert self._risen(6, 3).live(monkeypatch, 10_000, cap=0.10, min_move=0.10) == []
         # A rise on one market is offset by a fall on the other
-        assert self._risen(15, -6).live(monkeypatch, 10_000, cap=0.10, min_rise=0.10) == []
+        assert self._risen(15, -6).live(monkeypatch, 10_000, cap=0.10, min_move=0.10) == []
         # ... and a fall of the pair as a whole counts as its rise would
-        assert self._risen(-6, -4).live(monkeypatch, 10_000, cap=0.10, min_rise=0.10)
-        assert self._risen(-6, -3).live(monkeypatch, 10_000, cap=0.10, min_rise=0.10) == []
+        assert self._risen(-6, -4).live(monkeypatch, 10_000, cap=0.10, min_move=0.10)
+        assert self._risen(-6, -3).live(monkeypatch, 10_000, cap=0.10, min_move=0.10) == []
 
     def test_the_rise_is_measured_from_the_later_of_the_two_markets_fills(self, monkeypatch):
         # The pair stood at $0.77 two weeks ago and $0.92 a week ago. B's fill a
@@ -2107,8 +2108,8 @@ class TestPlanTrims:
             _A: [_candle(earlier, 0.34, 0.68), _candle(_FIRST, 0.42, 0.60), _candle(_CK, *_A_NOW)],
             _B: [_candle(earlier, 0.58, 0.43), _candle(_FIRST, 0.51, 0.50), _candle(_CK, *_B_NOW)]}
         case.world.fills = _fills({_A: datetime.fromtimestamp(earlier, UTC), _B: _BOUGHT})
-        assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10) == []
-        assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.05)
+        assert case.live(monkeypatch, 10_000, cap=0.10, min_move=0.10) == []
+        assert case.live(monkeypatch, 10_000, cap=0.10, min_move=0.05)
         # Both markets' prices were read at that one moment
         assert {(t, end) for t, _e, _s, end in case.world.calls["candles"]} == {
             (_A, _FIRST), (_B, _FIRST)}
@@ -2123,11 +2124,11 @@ class TestPlanTrims:
             _B: [_candle(bought, 0.58, 0.43), _candle(_FIRST, 0.51, 0.50), _candle(_CK, *_B_NOW)]}
         # Kalshi lists each market's latest fill: the trim's
         case.world.fills = _fills({_A: _BOUGHT, _B: _BOUGHT})
-        assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10) == []
+        assert case.live(monkeypatch, 10_000, cap=0.10, min_move=0.10) == []
         # Had it not been trimmed, the same run would measure from the purchase
         case.world.fills = _fills({_A: datetime.fromtimestamp(bought, UTC),
                                    _B: datetime.fromtimestamp(bought, UTC)})
-        assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10)
+        assert case.live(monkeypatch, 10_000, cap=0.10, min_move=0.10)
 
     def test_no_fill_listed_is_not_trimmed_and_reads_no_candle(self, monkeypatch, caplog):
         # The pair's last fill is older than the fills list reaches: it has
@@ -2135,7 +2136,7 @@ class TestPlanTrims:
         case = self._risen(20)
         case.world.fills = _fills()
         with caplog.at_level(logging.INFO):
-            assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10) == []
+            assert case.live(monkeypatch, 10_000, cap=0.10, min_move=0.10) == []
         assert (f"Not trimming {_PAIR_TEXT}: no fill is listed on either market, so its price "
                 "when it last traded cannot be read, and a minimum price move is set"
                 in caplog.text)
@@ -2148,7 +2149,7 @@ class TestPlanTrims:
         case = self._risen(20)
         del case.world.candles[ticker]
         with caplog.at_level(logging.INFO):
-            assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10) == []
+            assert case.live(monkeypatch, 10_000, cap=0.10, min_move=0.10) == []
         assert (f"Not trimming {_PAIR_TEXT}: the {side} ask on {ticker} when the pair last "
                 "traded (2026-01-05) cannot be read (no usable quote in the 7 days before "
                 "it, or its price history could not be read), and a minimum price move is "
@@ -2161,19 +2162,19 @@ class TestPlanTrims:
         case.world.candles[_A] = [_candle(_FIRST - 8 * _DAY, 0.24, 0.78),
                                   _candle(_FIRST, 1.00, 0.58), _candle(_CK, *_A_NOW)]
         with caplog.at_level(logging.INFO):
-            assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10) == []
+            assert case.live(monkeypatch, 10_000, cap=0.10, min_move=0.10) == []
         assert f"the YES ask on {_A} when the pair last traded (2026-01-05) cannot be read" in (
             caplog.text)
         # A usable quote six days before the fill is read
         case.world.candles[_A].insert(1, _candle(_FIRST - 6 * _DAY, 0.24, 0.78))
-        assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10)
+        assert case.live(monkeypatch, 10_000, cap=0.10, min_move=0.10)
 
     def test_a_candle_after_the_last_fill_is_never_the_price_then(self, monkeypatch):
         # An hour after the fill the ask had jumped: the price then is still the
         # one at the fill, so the rise since is 20c
         case = self._risen(20)
         case.world.candles[_A].insert(1, _candle(_FIRST + 3600, 0.44, 0.58))
-        assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.20)
+        assert case.live(monkeypatch, 10_000, cap=0.10, min_move=0.20)
 
     def test_with_no_minimum_no_candle_is_read(self, monkeypatch):
         case = self._risen(-30)
@@ -2186,23 +2187,23 @@ class TestPlanTrims:
         monkeypatch.setattr(seller, "REBALANCE_MIN_DAYS_SINCE_TRADE", 0)
         case = self._risen(20)
         with caplog.at_level(logging.INFO):
-            assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10)
+            assert case.live(monkeypatch, 10_000, cap=0.10, min_move=0.10)
         assert case.world.fill_reads == 1
         assert "30 each, no wait, price $0.77 then, $0.97 now (+20c, minimum 10c), pays" in (
             caplog.text)
         # Unreadable fills: nothing is trimmed, wait or no wait
         case.world.fills = None
-        assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10) == []
+        assert case.live(monkeypatch, 10_000, cap=0.10, min_move=0.10) == []
         # An empty list is a valid read with no wait; the pair has no fill listed
         case.world.fills = _fills(oldest=None)
         caplog.clear()
         with caplog.at_level(logging.INFO):
-            assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10) == []
+            assert case.live(monkeypatch, 10_000, cap=0.10, min_move=0.10) == []
         assert "no fill is listed on either market" in caplog.text
 
     def test_each_markets_price_then_is_read_once(self, monkeypatch):
         case = self._risen(20)
-        case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10)
+        case.live(monkeypatch, 10_000, cap=0.10, min_move=0.10)
         week = config.PRICE_THEN_MAX_AGE_DAYS * _DAY
         assert case.world.calls["candles"] == [
             (_A, _EV_A, _FIRST - week - 3600, _FIRST), (_B, _EV_B, _FIRST - week - 3600, _FIRST)]
@@ -2323,7 +2324,7 @@ class TestIsolation:
         assert signature.parameters["skip"].default == frozenset()
 
     def test_a_trim_is_decided_through_the_shared_rule(self):
-        # The rule, the forecast, the wait, the price rise and the cap are config's
+        # The rule, the forecast, the wait, the price move and the cap are config's
         # own functions, the ones the backtest trims with
         for name in ("kelly_trim_count", "kelly_trim_bids", "held_pair_win_prob",
                      "rebalance_rested", "rebalance_min_days", "trade_day", "pair_price_move",
@@ -2353,7 +2354,7 @@ class TestIsolation:
         assert ast.unparse(_def("_day").body[-1]) == "return trade_day(moment, SCHEDULED_RUN)"
 
     def test_the_trims_steps_come_in_the_rules_order(self):
-        # The wait before any order book is read; the price rise measured, then
+        # The wait before any order book is read; the price move measured, then
         # tested, before the trim is sized
         (rested,) = _calls_of("_trim_one", "rebalance_rested")
         (kind,) = _calls_of("_trim_one", "held_pair_kind")
@@ -2365,7 +2366,7 @@ class TestIsolation:
         assert (rested.lineno < kind.lineno < book.lineno < measured.lineno < tested.lineno
                 < forecast.lineno < decided.lineno)
         # What the pair alone fetches, and its check against the value of all open
-        # positions, come after the books and before the price rise and the forecast
+        # positions, come after the books and before the price move and the forecast
         (valued,) = _calls_of("_trim_one", "fee_per_pair_approx")
         (guard,) = [node for node in ast.walk(_def("_trim_one")) if isinstance(node, ast.Compare)
                     and ast.unparse(node) == "count * top_value > positions_value"]
@@ -2379,7 +2380,7 @@ class TestIsolation:
         # against the run's own minimum
         assert [ast.unparse(arg) for arg in measured.args] == [
             "then_a + then_b", "now_a + now_b"]
-        assert [ast.unparse(arg) for arg in tested.args] == ["move", "settings.trim_min_rise"]
+        assert [ast.unparse(arg) for arg in tested.args] == ["move", "settings.min_price_move"]
         assert ast.unparse(rested) == "rebalance_rested(last, now_date, min_days)"
 
     def test_the_four_quotes_go_in_as_the_backtest_hands_them(self):

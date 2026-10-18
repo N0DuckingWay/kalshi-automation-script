@@ -38,7 +38,8 @@ Purpose:
     send to sell a held YES (--step yes-close): it buys 0.01 YES, sells it
     back with that ask, and PASSes only when the account reads flat and the
     sale's reply reports the 0.01 sold. See it PASS before turning live
-    selling or live trimming on.
+    selling or live rebalancing on (rebalancing sells through Kelly trims,
+    which send the same sale orders).
 
     *** REAL MONEY. *** Every step here submits live orders (or moves live
     collateral) against the PRODUCTION account. Worst-case exposure is the V2
@@ -181,7 +182,7 @@ Notes:
     flatten it by hand. Only a 0 from BOTH mapping steps (--step no-mapping
     and --step unfillable-ask) is evidence that the V2 order path may run
     unsupervised; a 0 from --step yes-close is what live selling and live
-    trimming wait for. A bad argument, or an ORDER_API_VERSION other than
+    rebalancing wait for. A bad argument, or an ORDER_API_VERSION other than
     "v2", also exits 2 before any step runs.
 """
 import argparse
@@ -256,7 +257,7 @@ _BOTH_STEPS_MUST_PASS = (
     "path should be trusted to run unsupervised."
 )
 _YES_CLOSE_MUST_PASS = (
-    "--step yes-close has to PASS before live selling or trimming is turned on."
+    "--step yes-close has to PASS before live selling or rebalancing is turned on."
 )
 _STEPS_MUST_PASS = f"{_BOTH_STEPS_MUST_PASS} {_YES_CLOSE_MUST_PASS}"
 # main()'s closing line after any step PASSes.
@@ -1808,7 +1809,7 @@ def _step_yes_close(client: Any, ticker: str, assume_yes: bool, dest_shard: int)
             f"was sold and there is nothing to flatten — but {reply_problem}. Live selling "
             "and live trimming take the number a sale sold from its reply's fill_count "
             "when they can read one (trader._sale_fill_count), and read the account only "
-            "when they cannot, so do not turn live selling or trimming on until this reply "
+            "when they cannot, so do not turn live selling or rebalancing on until this reply "
             "is understood."
         )
         return _FAIL
@@ -2043,7 +2044,7 @@ def main(argv: list | None = None) -> int:
             fill-or-kill response is a FAIL — DR-20). Only a 0 from BOTH
             no-mapping and unfillable-ask is evidence that the V2 order path
             may run unsupervised; a 0 from yes-close is what live selling and
-            live trimming wait for.
+            live rebalancing wait for.
 
     Raises:
         SystemExit: Status 2 on an invalid argument or on any
@@ -2070,7 +2071,7 @@ def main(argv: list | None = None) -> int:
         help=(
             "Which check to run. Default: no-mapping (the V2 gate itself). yes-close buys "
             "0.01 YES and sells it with the reduce-only ask live selling and live trimming "
-            "send; run it before turning selling or trimming on."
+            "send; run it before turning selling or rebalancing on."
         ),
     )
     parser.add_argument(

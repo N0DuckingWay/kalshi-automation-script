@@ -2760,15 +2760,19 @@ class TestTimeSeriesKellyParity:
         "save_live_defaults": frozenset({("defaults_server", "_App._post_confirm")}),
     }
 
-    # The saved file's path, config's private parse of it and the seed values: a
-    # walked module reaches the saved live defaults only through a
-    # _DEFAULTS_READERS reader, so it names none of these (a second read of the
-    # file through them would slip past that table)
+    # The saved file's path, config's private parse of it (with the reading of a
+    # file an older version saved in its new form) and the seed values: a walked
+    # module reaches the saved live defaults only through a _DEFAULTS_READERS
+    # reader, so it names none of these (a second read of the file through them
+    # would slip past that table)
     _SAVED_FILE_INTERNALS = frozenset({
         "LIVE_DEFAULTS_FILE",
         "LIVE_DEFAULTS_SEED",
+        "_RetiredSettings",
+        "_retired_proposal",
         "_saved_settings",
         "_settings_from_bytes",
+        "_settings_from_toggles",
     })
 
     # The one module that may name some of those internals, and which: the
@@ -2888,11 +2892,10 @@ class TestTimeSeriesKellyParity:
             "SAME_TITLE_SIZE_CAP",
             "TRADE_CATEGORIES",
             "TRADE_TAGS",
-            "ADD_TO_HELD_PAIRS",
+            "REBALANCE",
+            "MIN_PRICE_MOVE",
             "SELL_AT",
             "SELL_MIN_DAYS",
-            "TRIM_TO_KELLY",
-            "TRIM_MIN_RISE",
         } | self._SAVED_FILE_INTERNALS
         resolver = "live_settings"
         # (module, exempted name) -> references found, so no exemption outlives its use
@@ -3453,6 +3456,65 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(backtester, "_live_settings_for_report", "live_defaults")
         assert _function_calls(backtest, "main", "live_defaults")
 
+    @staticmethod
+    def _proposal_readers(sources: dict[str, str]) -> list[str]:
+        """
+        Find where a module other than the defaults server reads `.proposal`.
+
+        Args:
+            sources (dict[str, str]): Module name -> its source.
+
+        Returns:
+            list[str]: "module:line" for each read, outside config (which sets
+                it) and defaults_server (which offers it for one save).
+        """
+        found = []
+        for mod, text in sources.items():
+            if mod in ("config", "defaults_server"):
+                continue
+            for node in ast.walk(ast.parse(text)):
+                if isinstance(node, ast.Attribute) and node.attr == "proposal":
+                    found.append(f"{mod}:{node.lineno}")
+        return found
+
+    @staticmethod
+    def _package_sources() -> dict[str, str]:
+        """
+        Read every module of the package.
+
+        Returns:
+            dict[str, str]: Module name -> its source.
+        """
+        import importlib
+        import pkgutil
+
+        import kalshi_betting
+
+        names = sorted(m.name for m in pkgutil.iter_modules(kalshi_betting.__path__))
+        return {name: inspect.getsource(importlib.import_module(f"kalshi_betting.{name}"))
+                for name in names}
+
+    def test_ast_only_the_defaults_server_reads_an_outdated_file_s_proposal(self):
+        # config.LiveDefaultsOutdated.proposal is a file an older version saved,
+        # read in its new form: the defaults server offers it on a page for one
+        # Confirm and save, and no other module may read it (main, the
+        # scheduler or a report reading it would trade or report values nobody
+        # confirmed)
+        sources = self._package_sources()
+        assert {"main", "scheduler", "defaults_server", "backtester"} <= set(sources)
+        assert self._proposal_readers(sources) == []
+        # Non-vacuous: the defaults server does read it
+        assert ".proposal" in sources["defaults_server"]
+
+    def test_ast_a_proposal_read_outside_the_defaults_server_is_caught(self):
+        # control — main reading an outdated file's proposal as its reference
+        # is refused by the check above
+        sources = self._package_sources()
+        sources["main"] += ("\n\ndef _mutant(exc):\n"
+                            "    reference = exc.proposal\n"
+                            "    return reference\n")
+        assert [where.split(":")[0] for where in self._proposal_readers(sources)] == ["main"]
+
     def test_ast_every_sizer_caps_through_pair_size_cap(self):
         # config.pair_size_cap is the ONE definition of a pair's per-trade cap,
         # so the live sizer, enrichment's bound and the backtester agree
@@ -3911,7 +3973,7 @@ class TestTimeSeriesKellyParity:
     def test_ast_a_trim_waits_days_after_a_trade_through_one_definition(self):
         # The backtest trims a held pair only once enough days have passed since
         # its last trade: config.rebalance_rested (shared with live code) decides,
-        # on the day _last_trade_day finds. The price rise counts from that same day
+        # on the day _last_trade_day finds. The price move counts from that same day
         assert backtester.rebalance_rested is config.rebalance_rested
         assert backtester.rebalance_min_days is config.rebalance_min_days
         source = inspect.getsource(backtester)
@@ -3938,7 +4000,7 @@ class TestTimeSeriesKellyParity:
             f"_exact_pair(position) and not {asked}", mode="eval").body)
         assert [ast.unparse(stmt) for stmt in gate.body] == ["pairs_waiting += 1", "continue"]
         assert not gate.orelse
-        # ... before the price rise or trim size is worked out, so a waiting pair is
+        # ... before the price move or trim size is worked out, so a waiting pair is
         # counted on no other line and adds nothing to cap_free_from
         [measured] = _calls_to(plan, "_price_move")
         [tested] = _calls_to(plan, "price_move_reached")
@@ -4196,7 +4258,7 @@ class TestTimeSeriesKellyParity:
             "tier_floors": "tier_floors is not False", "spread_band": "(band_lo, band_hi)",
             "interval_discount": "effective_k", "size_cap": "cap",
             "same_title_size_cap": "st_cap", "categories": "None", "tags": "None",
-            "add_to_held_pairs": "bool(add_to_held)"}
+            "rebalance": "bool(add_to_held or trim_to_kelly)"}
         assert _bound_from(func, built) == ["settings"]
         # The cap a simulation shares from reads the live bound on the search
         assert _function_calls(backtester, "_simulate_at_discount", "max_kelly_fraction")

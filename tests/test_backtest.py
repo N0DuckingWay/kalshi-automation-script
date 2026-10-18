@@ -720,11 +720,11 @@ class TestMoveSweepArgument:
 
     def test_the_help_names_the_flag_that_sets_one_live_runs_minimum(self, cli, monkeypatch,
                                                                        capsys):
-        # The help names main.py --trim-min-rise, which sets one live run's minimum
+        # The help names main.py --min-price-move, which sets one live run's minimum
         text = _option_help(monkeypatch, capsys, "--no-move-sweep", "--sell-workers")
         assert text.startswith("Skip the dashboard's Min. price movement select")
         assert text.endswith("waits for a price move by its own saved minimum "
-                             "(main.py --trim-min-rise for one run)")
+                             "(main.py --min-price-move for one run)")
 
 
 class TestSellWorkersArgument:
@@ -910,6 +910,18 @@ class TestLiveRuleEcho:
         assert "live rule=not recorded — the saved live defaults are refused (" in text
         assert str(config.LIVE_DEFAULTS_FILE) in text
         # The run still went ahead
+        assert "sweep_kwargs" in cli
+
+    def test_a_file_an_older_version_saved_is_refused_too(self, cli, monkeypatch, caplog):
+        # A file an older version saved is a refused file here: the echo never
+        # names its values in their new form, and the run still goes ahead
+        from .test_config import _OLD_VERSION_BYTES
+        config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        text = caplog.text
+        assert "live rule=not recorded — the saved live defaults are refused (" in text
+        assert str(config.LIVE_DEFAULTS_FILE) in text
         assert "sweep_kwargs" in cli
 
 

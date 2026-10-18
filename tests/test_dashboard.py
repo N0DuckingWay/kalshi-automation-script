@@ -7405,15 +7405,13 @@ class TestSaveLiveDefaultsButton:
         assert query["source"] == data["save"]["source"]
         assert query.get("category") == category and query.get("tag") == tag
         known = {"tier_floors", "spread_min", "spread_max", "k", "size_cap",
-                 "same_title_size_cap", "source", "category", "tag", "add_to_held_pairs",
-                 "sell_at", "sell_min_days", "trim_to_kelly", "trim_min_rise"}
+                 "same_title_size_cap", "source", "category", "tag", "rebalance",
+                 "min_price_move", "sell_at", "sell_min_days"}
         assert set(query) <= known
-        # Rebalance's three fields are always sent together, adding and
-        # trimming alike: the page shows the two only together, and the
-        # server refuses a minimum with trimming off
-        rebalance = ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise")
-        assert len({name in query for name in rebalance}) == 1
-        assert query.get("add_to_held_pairs") == query.get("trim_to_kelly")
+        # Rebalance's two fields are always sent together: the server refuses
+        # a minimum with rebalancing off, and keeps a saved one a link leaves out
+        assert len({name in query for name in ("rebalance", "min_price_move")}) == 1
+        assert query.get("rebalance") != "off" or query.get("min_price_move") == "off"
 
     def test_the_button_is_rendered_disabled_with_its_words(self, monkeypatch, tmp_path):
         page = self._page(monkeypatch, tmp_path)
@@ -7735,16 +7733,15 @@ class TestSaveLiveDefaultsButton:
                           # The most categories, and tags, one address may name
                           "max_names": config.DEFAULTS_SERVER_MAX_FILTER_NAMES}
         # "live_rebalances" is True only for a run that recorded saved
-        # defaults adding to held pairs or trimming them (a minimum price
-        # rise alone is neither): Rebalance no turns off both
-        for adds, trims, rise, said in ((True, None, None, True), (None, True, None, True),
-                                        (True, True, 0.1, True), (False, True, 0.1, True),
-                                        (False, False, None, False), (None, None, None, False),
-                                        (None, None, 0.1, False)):
-            swept = dataclasses.replace(sweep, live_add_to_held_pairs=adds,
-                                        live_trim_to_kelly=trims, live_trim_min_rise=rise)
+        # defaults that rebalance (a minimum price movement alone is not):
+        # Rebalance no turns it off
+        for rebalance, move, said in ((True, None, True), (True, 0.1, True),
+                                      (False, None, False), (None, None, False),
+                                      (None, 0.1, False)):
+            swept = dataclasses.replace(sweep, live_rebalance=rebalance,
+                                        live_min_price_move=move)
             assert dashboard._save_target(swept, _FLT_START, today, _FLT_SERIES)[
-                "live_rebalances"] is said, (adds, trims, rise)
+                "live_rebalances"] is said, (rebalance, move)
         # ... and "live_sells" only for a recorded sell level (a minimum alone is no sale)
         for level, days, said in ((0.85, 3, True), (0.85, None, True), (None, None, False),
                                   (None, 3, False)):
@@ -7861,21 +7858,20 @@ class TestSaveLiveDefaultsButton:
         assert (current is not None) is saved
         app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
         pb, pk, pc = data["primary"]
-        # The page names no add-to-held-pairs choice, so the server keeps the
-        # saved one, or the seed's with none saved
-        add_on = (current.add_to_held_pairs if current is not None
-                  else config.LIVE_DEFAULTS_SEED.add_to_held_pairs)
+        # The page names no Rebalance choice, so the server keeps the saved
+        # one and its minimum, or the seed's with none saved
+        kept = current if current is not None else config.LIVE_DEFAULTS_SEED
+        rebalance = {"rebalance": kept.rebalance, "min_price_move": kept.min_price_move}
         cases = (
             ("primary", config.LiveSettings(
                 tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][pk]["value"],
-                size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5,
-                add_to_held_pairs=add_on)),
+                size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5, **rebalance)),
             ("chosen", config.LiveSettings(
                 tier_floors=False, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][0]["value"],
                 size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5,
-                categories=("Sports",), tags=("Sports · Hockey",), add_to_held_pairs=add_on)),
+                categories=("Sports",), tags=("Sports · Hockey",), **rebalance)),
         )
         for name, expected in cases:
             [opened] = snaps[name]["opened"]
@@ -7896,7 +7892,7 @@ class TestSaveLiveDefaultsButton:
 
     def test_a_page_without_the_sell_view_sends_neither_sell_field(self, monkeypatch, tmp_path):
         # The server then keeps the saved sell level and minimum of days, as it
-        # keeps the saved add-to-held choice from a page without that view
+        # keeps the saved Rebalance choice from a page without that view
         config.save_live_defaults(
             dataclasses.replace(config.live_settings(), sell_at=0.9, sell_min_days=5),
             source="")
@@ -7917,15 +7913,13 @@ class TestSaveLiveDefaultsButton:
 
     def test_a_page_without_the_rebalance_view_sends_none_of_its_fields(
             self, monkeypatch, tmp_path):
-        # With none of the three sent, the server keeps the saved adding and
-        # trim settings
+        # With neither sent, the server keeps the saved rebalance setting and
+        # its minimum
         config.save_live_defaults(
-            dataclasses.replace(config.live_settings(), add_to_held_pairs=True,
-                                trim_to_kelly=True, trim_min_rise=0.1),
+            dataclasses.replace(config.live_settings(), rebalance=True, min_price_move=0.1),
             source="")
         current = config.read_saved_live_defaults()
-        assert (current.add_to_held_pairs, current.trim_to_kelly,
-                current.trim_min_rise) == (True, True, 0.1)
+        assert (current.rebalance, current.min_price_move) == (True, 0.1)
         page = self._kc(monkeypatch, tmp_path)
         data = TestFilterPage._data(page)
         assert data["grid_rebalance"] is None
@@ -7934,12 +7928,11 @@ class TestSaveLiveDefaultsButton:
         [opened] = snap["opened"]
         query = self._query(data, opened)
         self._assert_sends(data, query, *data["primary"])
-        for name in ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise"):
+        for name in ("rebalance", "min_price_move"):
             assert name not in query, name
         settings, _ = defaults_server._proposal(
             defaults_server._params(opened["url"].partition("?")[2]), current)
-        assert (settings.add_to_held_pairs, settings.trim_to_kelly,
-                settings.trim_min_rise) == (True, True, 0.1)
+        assert (settings.rebalance, settings.min_price_move) == (True, 0.1)
 
     @pytest.mark.parametrize("saved", ["nothing", "not selling", "selling"])
     def test_the_sell_scenario_on_screen_is_what_the_defaults_server_reads(
@@ -7973,10 +7966,10 @@ class TestSaveLiveDefaultsButton:
         assert (current is not None) is (saved != "nothing")
         app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
         pb, pk, pc = data["primary"]
-        # The page names no add-to-held-pairs choice, so the server keeps the
-        # saved one, or the seed's with none saved
-        add_on = (current.add_to_held_pairs if current is not None
-                  else config.LIVE_DEFAULTS_SEED.add_to_held_pairs)
+        # The page names no Rebalance choice, so the server keeps the saved
+        # one and its minimum, or the seed's with none saved
+        kept = current if current is not None else config.LIVE_DEFAULTS_SEED
+        rebalance = {"rebalance": kept.rebalance, "min_price_move": kept.min_price_move}
         levels, days = data["sell_levels"], data["sell_days"]
         assert levels[0]["value"] == 0.25 and levels[1]["value"] == 0.5
         assert [d["value"] for d in days][:3] == [1, 2, 3]
@@ -7998,7 +7991,7 @@ class TestSaveLiveDefaultsButton:
                 tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][pk]["value"],
                 size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5,
-                add_to_held_pairs=add_on, sell_at=level, sell_min_days=minimum)
+                **rebalance, sell_at=level, sell_min_days=minimum)
             assert settings == expected, name
             for field in config.LIVE_TOGGLE_FIELDS:
                 assert getattr(settings, field) == getattr(expected, field), (name, field)
@@ -8010,17 +8003,15 @@ class TestSaveLiveDefaultsButton:
     def test_a_sell_level_from_a_page_with_the_rebalance_view_sends_rebalance_no(
             self, monkeypatch, tmp_path, saved):
         # Sell shows a level only while Rebalance is no, so from a page with
-        # both views the address at a Sell level names adding and trimming off
-        # (which turns saved rebalancing off), and with Rebalance yes it names
-        # no selling. The defaults server's own application and parser read
-        # each address back, over saved defaults that rebalance and ones that
-        # do not.
+        # both views the address at a Sell level names rebalancing off (which
+        # turns saved rebalancing off), and with Rebalance yes it names no
+        # selling. The defaults server's own application and parser read each
+        # address back, over saved defaults that rebalance and ones that do not.
         config.save_live_defaults(
-            dataclasses.replace(config.live_settings(), add_to_held_pairs=saved,
-                                trim_to_kelly=saved),
+            dataclasses.replace(config.live_settings(), rebalance=saved, min_price_move=None),
             source="")
         current = config.read_saved_live_defaults()
-        assert current.add_to_held_pairs is saved and current.trim_to_kelly is saved
+        assert current.rebalance is saved
         page = self._kc(monkeypatch, tmp_path, _kc_sweep_sell(_kc_sweep_rebalance()))
         data = TestFilterPage._data(page)
         assert data["sell_blocks"] is not None and data["grid_rebalance"] is not None
@@ -8038,9 +8029,8 @@ class TestSaveLiveDefaultsButton:
             [opened] = snaps[name]["opened"]
             query = self._query(data, opened)
             self._assert_sends(data, query, pb, pk, pc)
-            assert query["add_to_held_pairs"] == query["trim_to_kelly"] == (
-                "on" if yes else "off"), name
-            assert query["trim_min_rise"] == "off", name
+            assert query["rebalance"] == ("on" if yes else "off"), name
+            assert query["min_price_move"] == "off", name
             assert query["sell_at"] == ("off" if sell_at is None else str(sell_at)), name
             assert query["sell_min_days"] == (
                 "off" if sell_min_days is None else str(sell_min_days)), name
@@ -8049,8 +8039,8 @@ class TestSaveLiveDefaultsButton:
                                                            _SAVE_HOST))
             assert response.status == 200, response.body
             settings, _ = defaults_server._proposal(defaults_server._params(raw), current)
-            assert settings.add_to_held_pairs is yes and settings.trim_to_kelly is yes, name
-            assert settings.trim_min_rise is None, name
+            assert settings.rebalance is yes, name
+            assert settings.min_price_move is None, name
             assert (settings.sell_at, settings.sell_min_days) == (sell_at, sell_min_days), name
         # Nothing was written by showing the page
         assert config.read_saved_live_defaults() == current
@@ -12595,8 +12585,7 @@ class TestRebalanceScript:
         [opened] = snaps["bad click"]["opened"]
         query = save._query(data, opened)
         save._assert_sends(data, query, 0, 1, 1)
-        assert [query[key] for key in ("add_to_held_pairs", "trim_to_kelly",
-                                       "trim_min_rise")] == ["off", "off", "off"]
+        assert [query[key] for key in ("rebalance", "min_price_move")] == ["off", "off"]
         # Repaired, choosing it again draws it
         good = snaps["good"]
         assert good["selects"]["flt-rebalance"]["value"] == "yes"
@@ -12606,10 +12595,9 @@ class TestRebalanceScript:
 
     @pytest.mark.parametrize("sell_view", [False, True], ids=["no-sell-view", "sell-view"])
     def test_a_save_sends_the_rebalance_choice(self, monkeypatch, tmp_path, sell_view):
-        # Save sends the Rebalance choice as both of the defaults server's
-        # settings it covers (adding to held pairs and trimming to Kelly) and
-        # the minimum price movement ("off": this page has no minimums), and
-        # the server reads it back. Over saved defaults that sell, a page with
+        # Save sends the Rebalance choice as the defaults server's rebalance
+        # and the minimum price movement ("off": this page has no minimums),
+        # and the server reads it back. Over saved defaults that sell, a page with
         # the Sell view also sends no selling (Sell is shut while rebalancing);
         # one without keeps the saved level
         config.save_live_defaults(
@@ -12638,9 +12626,8 @@ class TestRebalanceScript:
             [opened] = snap["opened"]
             query = save._query(data, opened)
             save._assert_sends(data, query, 0, 1, ci)
-            assert query["add_to_held_pairs"] == query["trim_to_kelly"] == (
-                "on" if yes else "off"), name
-            assert query["trim_min_rise"] == "off", name
+            assert query["rebalance"] == ("on" if yes else "off"), name
+            assert query["min_price_move"] == "off", name
             assert {key: query[key] for key in ("sell_at", "sell_min_days")
                     if key in query} == sold, name
             raw = opened["url"].partition("?")[2]
@@ -12651,9 +12638,8 @@ class TestRebalanceScript:
             expected = config.LiveSettings(
                 tier_floors=True, spread_band=tuple(data["bands"][0]["value"]),
                 interval_discount=data["ks"][1]["value"], size_cap=data["caps"][ci]["value"],
-                same_title_size_cap=0.5, add_to_held_pairs=yes,
-                sell_at=None if sell_view else 0.9, sell_min_days=None if sell_view else 5,
-                trim_to_kelly=yes)
+                same_title_size_cap=0.5, rebalance=yes,
+                sell_at=None if sell_view else 0.9, sell_min_days=None if sell_view else 5)
             assert settings == expected, name
             for field in config.LIVE_TOGGLE_FIELDS:
                 assert getattr(settings, field) == getattr(expected, field), (name, field)
@@ -12665,7 +12651,7 @@ class TestRebalanceScript:
     def test_the_address_is_what_the_defaults_server_reads(self, monkeypatch, tmp_path, saved):
         # The clicked address, handed to the server's own application and parser:
         # the settings it read carry the choice on screen — no explicitly at
-        # the page as rendered (so the seed's adding does not leak in), yes when
+        # the page as rendered (so the seed's rebalancing does not leak in), yes when
         # chosen — whatever is saved, with the tier floors, the k and a tag too
         save = TestSaveLiveDefaultsButton()
         page = save._kc(monkeypatch, tmp_path, _kc_sweep_rebalance(_kc_sweep_tiers()))
@@ -12688,13 +12674,12 @@ class TestRebalanceScript:
                 tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][pk]["value"],
                 size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5,
-                add_to_held_pairs=False, trim_to_kelly=False)),
+                rebalance=False)),
             ("chosen", config.LiveSettings(
                 tier_floors=False, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][0]["value"],
                 size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5,
-                categories=("Sports",), tags=("Sports · Hockey",), add_to_held_pairs=True,
-                trim_to_kelly=True)),
+                categories=("Sports",), tags=("Sports · Hockey",), rebalance=True)),
         )
         for name, expected in cases:
             [opened] = snaps[name]["opened"]
@@ -13026,8 +13011,7 @@ class TestMoveScript:
         [opened] = snaps["bad click"]["opened"]
         query = save._query(data, opened)
         save._assert_sends(data, query, 0, 1, 1)
-        assert (query["add_to_held_pairs"], query["trim_to_kelly"],
-                query["trim_min_rise"]) == ("on", "on", "off")
+        assert (query["rebalance"], query["min_price_move"]) == ("on", "off")
         # 25c is that same chunk: the choice goes back to 5c, which was shown
         again = snaps["bad again"]
         assert again["selects"]["flt-move"]["value"] == "1" and again["reacts"] == []
@@ -13040,7 +13024,7 @@ class TestMoveScript:
         [opened] = snaps["again click"]["opened"]
         query = save._query(data, opened)
         save._assert_sends(data, query, 0, 1, 1)
-        assert query["trim_to_kelly"] == "on" and float(query["trim_min_rise"]) == 0.05
+        assert query["rebalance"] == "on" and float(query["min_price_move"]) == 0.05
         # Repaired, choosing it again works
         good = snaps["good"]
         assert good["selects"]["flt-move"]["value"] == "2"
@@ -13099,10 +13083,10 @@ class TestMoveScript:
     # ─── Save and Sell at a minimum ──────────────────────────────────────────
 
     def test_a_save_sends_the_minimum_shown(self, monkeypatch, tmp_path):
-        # trim_min_rise is "off" at any, else the minimum in dollars, which the
+        # min_price_move is "off" at any, else the minimum in dollars, which the
         # server reads back exactly (also at 5% cap, 25c, the plain run's
-        # chunk). With Rebalance no, all three fields are "off", though the
-        # shut select still names a minimum
+        # chunk). With Rebalance no, both fields are "off", though the shut
+        # select still names a minimum
         save = TestSaveLiveDefaultsButton()
         page = save._kc(monkeypatch, tmp_path, _kc_sweep_move())
         data = TestFilterPage._data(page)
@@ -13125,19 +13109,17 @@ class TestMoveScript:
             [opened] = snap["opened"]
             query = save._query(data, opened)
             save._assert_sends(data, query, 0, 1, ci)
-            assert query["add_to_held_pairs"] == query["trim_to_kelly"] == (
-                "on" if yes else "off"), name
+            assert query["rebalance"] == ("on" if yes else "off"), name
             if move is None:
-                assert query["trim_min_rise"] == "off", name
+                assert query["min_price_move"] == "off", name
             else:
-                assert float(query["trim_min_rise"]) == move, name
+                assert float(query["min_price_move"]) == move, name
             raw = opened["url"].partition("?")[2]
             response = app.handle(defaults_server._Request("GET", f"/confirm?{raw}",
                                                            _SAVE_HOST))
             assert response.status == 200, response.body
             settings, _ = defaults_server._proposal(defaults_server._params(raw), None)
-            assert (settings.add_to_held_pairs, settings.trim_to_kelly,
-                    settings.trim_min_rise) == (yes, yes, move), name
+            assert (settings.rebalance, settings.min_price_move) == (yes, move), name
         # Rebalance no: the shut select still names 25c, and the address none
         assert snaps["off"]["selects"]["flt-move"] == {
             **snaps["off"]["selects"]["flt-move"], "value": "3", "disabled": True}
@@ -13165,7 +13147,7 @@ class TestMoveScript:
         [opened] = back["opened"]
         query = save._query(data, opened)
         save._assert_sends(data, query, 0, 1, 1)
-        assert query["trim_to_kelly"] == "on" and float(query["trim_min_rise"]) == 0.10
+        assert query["rebalance"] == "on" and float(query["min_price_move"]) == 0.10
 
     def test_sell_stays_shut_at_a_minimum(self, monkeypatch, tmp_path):
         page = _sl_page(monkeypatch, tmp_path, _kc_sweep_move(_kc_sweep_sell()))
@@ -13468,21 +13450,19 @@ class TestRebalanceEndToEnd:
 
 
 class TestLiveRebalanceRule:
-    """The page when the saved live defaults add to held pairs or trim them:
-    a grey note by the save button on a page with the Rebalance view (saving
-    with Rebalance no turns both off), and the header line naming the choices
-    that show the rebalancing, or why the page cannot (one of the two alone,
-    no Rebalance view, or rebalancing with selling)."""
+    """The page when the saved live defaults rebalance held pairs: a grey note
+    by the save button on a page with the Rebalance view (saving with
+    Rebalance no turns it off), and the header line naming the choices that
+    show the rebalancing, or why the page cannot (no Rebalance view, a minimum
+    it cannot show, or rebalancing with selling)."""
 
-    _ADD = "; the live defaults add to held pairs, which this run's primary does not"
-    _TRIM = "; the live defaults trim to Kelly, which this run's primary does not"
-    _TRIM_10C = ("; the live defaults trim to Kelly (only after a 10c price move), which this "
-                 "run's primary does not")
+    _NOTE = "; the live defaults rebalance held pairs, which this run's primary does not"
+    _NOTE_10C = ("; the live defaults rebalance held pairs (a trim only after a 10c price "
+                 "move), which this run's primary does not")
     _SHOWN = (' — choose Rebalance yes and Min. price movement "{}" in the filter bar to '
               "see it")
     _NO_VIEW = " — this page has no Rebalance view"
     _NO_MOVE = " — this page cannot show that minimum price movement"
-    _ONE = " — this page shows adding to and trimming held pairs only together (Rebalance)"
     _MOVES = [{"label": "5c", "value": 0.05}, {"label": "10c", "value": 0.1}]
 
     @classmethod
@@ -13509,9 +13489,8 @@ class TestLiveRebalanceRule:
 
     @staticmethod
     def _both(sweep, **live) -> BacktestSweep:
-        """The sweep with saved defaults that add to held pairs and trim them."""
-        return dataclasses.replace(sweep, live_add_to_held_pairs=True, live_trim_to_kelly=True,
-                                   **live)
+        """The sweep with saved defaults that rebalance held pairs."""
+        return dataclasses.replace(sweep, live_rebalance=True, **live)
 
     # ─── The save button's note ───────────────────────────────────────────────
 
@@ -13530,15 +13509,13 @@ class TestLiveRebalanceRule:
         assert re.search(r'</button>&nbsp;<span id="flt-rebalance-save-note"[^>]*>'
                          + re.escape(html.escape(note)) + '</span>', between(page))
         assert note not in dashboard._FILTER_JS
-        # Either one saved alone is turned off by Rebalance no too
-        for saved in ({"live_add_to_held_pairs": True}, {"live_trim_to_kelly": True},
-                      {"live_trim_to_kelly": True, "live_trim_min_rise": 0.1}):
-            page = _rb_page(monkeypatch, tmp_path, dataclasses.replace(with_view, **saved))
-            assert 'id="flt-rebalance-save-note"' in page, saved
-        # No note when the saved defaults do neither (or the run recorded none) ...
+        # ... with a saved minimum too
+        page = _rb_page(monkeypatch, tmp_path, self._both(with_view, live_min_price_move=0.1))
+        assert 'id="flt-rebalance-save-note"' in page
+        # No note when the saved defaults do not rebalance (or the run recorded none) ...
         for saved in (False, None):
             page = _rb_page(monkeypatch, tmp_path, dataclasses.replace(
-                with_view, live_add_to_held_pairs=saved, live_trim_to_kelly=saved))
+                with_view, live_rebalance=saved))
             assert 'id="flt-rebalance-save-note"' not in page
         # ... nor on a page with no Rebalance view, whose Save sends no choice
         page = _rb_page(monkeypatch, tmp_path, self._both(_kc_sweep()))
@@ -13563,36 +13540,19 @@ class TestLiveRebalanceRule:
         sweep = self._both(run._sweep())
         shown = {**run._bar(), **self._view([[[7]]], [[[None]]])}
         # The rule is the page's primary and the bar has the view: with no saved
-        # minimum, "any"; with one the page offers, that option. Said once,
-        # after the later of the two notes
-        assert run()._text(sweep, shown) == (head + self._ADD + self._TRIM
-                                             + self._SHOWN.format("any"))
-        ten = dataclasses.replace(sweep, live_trim_min_rise=0.1)
-        assert run()._text(ten, shown) == (head + self._ADD + self._TRIM_10C
-                                           + self._SHOWN.format("10c"))
+        # minimum, "any"; with one the page offers, that option
+        assert run()._text(sweep, shown) == head + self._NOTE + self._SHOWN.format("any")
+        ten = dataclasses.replace(sweep, live_min_price_move=0.1)
+        assert run()._text(ten, shown) == head + self._NOTE_10C + self._SHOWN.format("10c")
         # ... a minimum written with float noise still finds its option
-        noisy = dataclasses.replace(sweep, live_trim_min_rise=0.1 + 1e-12)
+        noisy = dataclasses.replace(sweep, live_min_price_move=0.1 + 1e-12)
         assert run()._text(noisy, shown).endswith(self._SHOWN.format("10c"))
         # ... and a minimum that makes a run of its own shows it by its own chunk
         own = {**run._bar(), **self._view([[[7]]], [[[[7, 9]]]])}
         assert run()._text(ten, own).endswith(self._SHOWN.format("10c"))
         # Without a saved minimum, "any" needs the rebalancing cell alone
         alone = {**run._bar(), **self._view([[[7]]], None, moves=[])}
-        assert run()._text(sweep, alone).endswith(self._TRIM + self._SHOWN.format("any"))
-
-    def test_one_of_the_two_alone_is_said_to_need_the_other(self):
-        # The bar shows adding and trimming only together: saved defaults
-        # that do one alone are never shown, whatever the page holds
-        run = TestLiveRuleHeader
-        shown = {**run._bar(), **self._view([[[7]]], [[[None]]])}
-        adds = dataclasses.replace(run._sweep(), live_add_to_held_pairs=True)
-        assert run()._text(adds, shown).endswith(self._ADD + self._ONE)
-        trims = dataclasses.replace(run._sweep(), live_trim_to_kelly=True,
-                                    live_trim_min_rise=0.1)
-        assert run()._text(trims, shown).endswith(self._TRIM_10C + self._ONE)
-        assert self._ADD not in run()._text(trims, shown)
-        # ... and with no Rebalance view at all the same sentence stands
-        assert run()._text(adds, run._bar()).endswith(self._ADD + self._ONE)
+        assert run()._text(sweep, alone).endswith(self._NOTE + self._SHOWN.format("any"))
 
     def test_a_page_that_cannot_show_the_rebalancing_says_so(self):
         run = TestLiveRuleHeader
@@ -13601,28 +13561,26 @@ class TestLiveRebalanceRule:
         # chunk for the band
         for bar in (None, run._bar(), {**run._bar(), **self._view(None, [[[None]]])},
                     {**run._bar(), **self._view([[[None]]], [[[None]]])}):
-            assert run()._text(sweep, bar).endswith(self._TRIM + self._NO_VIEW), bar
+            assert run()._text(sweep, bar).endswith(self._NOTE + self._NO_VIEW), bar
         # A saved minimum the page cannot show: not offered, no grid of the
         # minimums, or no chunk of the band at that minimum
-        ten = dataclasses.replace(sweep, live_trim_min_rise=0.1)
+        ten = dataclasses.replace(sweep, live_min_price_move=0.1)
         for bar in ({**run._bar(), **self._view([[[7]]], [[[None]]], moves=[])},
                     {**run._bar(), **self._view([[[7]]], [[[None]]],
                                                 moves=[{"label": "15c", "value": 0.15}])},
                     {**run._bar(), **self._view([[[7]]], None)},
                     {**run._bar(), **self._view([[[7]]], [[[[3, None]]]])}):
-            assert run()._text(ten, bar).endswith(self._TRIM_10C + self._NO_MOVE), bar
+            assert run()._text(ten, bar).endswith(self._NOTE_10C + self._NO_MOVE), bar
         # A rule the page does not show: the notes alone, no promise of a view
         elsewhere = dataclasses.replace(sweep, live_spread_band=(0.3, 0.6),
                                         calibrations_by_band={(0.0, 1.0): None})
         assert run()._text(elsewhere, {**run._bar(), **self._view([[[7]]], [[[None]]])}).endswith(
-            "— not simulated by this run" + self._ADD + self._TRIM)
-        # Neither saved (or not recorded): no note at all, a minimum alone included
+            "— not simulated by this run" + self._NOTE)
+        # Not saved (or not recorded): no note at all, a minimum alone included
         for saved, move in ((False, None), (None, None), (None, 0.1)):
-            plain = dataclasses.replace(sweep, live_add_to_held_pairs=saved,
-                                        live_trim_to_kelly=saved, live_trim_min_rise=move)
+            plain = dataclasses.replace(sweep, live_rebalance=saved, live_min_price_move=move)
             text = run()._text(plain, {**run._bar(), **self._view([[[7]]], [[[None]]])})
-            assert "trim" not in text.lower() and "held pairs" not in text
-            assert "Rebalance" not in text
+            assert "rebalanc" not in text.lower() and "held pairs" not in text
 
     def test_tiers_off_at_a_binding_band_reads_the_tier_off_grids(self):
         run = TestLiveRuleHeader
@@ -13632,7 +13590,7 @@ class TestLiveRebalanceRule:
                        calibrations_by_band={(0.0, 1.0): None, band: None},
                        tier_off_calibrations_by_band={(0.0, 1.0): None, band: None},
                        tier_off_scenarios=[object()]),
-            live_trim_min_rise=0.1)
+            live_min_price_move=0.1)
         bar = {**run._bar(bands=[band, (0.0, 1.0)]),
                **self._view([[[3]], [[4]]], [[[None]], [[None]]])}
         cells = [[[None]], [[None]]]
@@ -13655,42 +13613,36 @@ class TestLiveRebalanceRule:
         sweep = self._both(run._sweep(), live_sell_at=0.85, live_sell_min_days=3)
         view = self._view([[[7]]], [[[None]]])
         bar = {**run._bar(), **TestLiveSellRule._view(), **view}
+        # The rebalancing note comes first, then the selling, as on the log line
         assert run()._text(sweep, bar) == (
-            head + self._ADD + TestLiveSellRule._NOTE + ' — choose Sell "sell at 85% of '
-            'potential profit" and Min. days to maturity "3 days" in the filter bar to see '
-            "the selling alone" + self._TRIM + together)
+            head + self._NOTE + together + TestLiveSellRule._NOTE + ' — choose Sell "sell at '
+            '85% of potential profit" and Min. days to maturity "3 days" in the filter bar '
+            "to see the selling alone")
         # A page that cannot show the level says so; the rebalance clause is the same
         assert run()._text(sweep, {**run._bar(), **view}) == (
-            head + self._ADD + TestLiveSellRule._NOTE + " — this page cannot show that Sell "
-            "level and minimum of days" + self._TRIM + together)
+            head + self._NOTE + together + TestLiveSellRule._NOTE + " — this page cannot "
+            "show that Sell level and minimum of days")
         # A page with no Rebalance view says that, never that rebalancing
         # could be shown there apart from the selling
         assert run()._text(sweep, {**run._bar(), **TestLiveSellRule._view()}) == (
-            head + self._ADD + TestLiveSellRule._NOTE + ' — choose Sell "sell at 85% of '
-            'potential profit" and Min. days to maturity "3 days" in the filter bar to see '
-            "the selling alone" + self._TRIM + self._NO_VIEW)
-        # Selling with one of the two alone: the selling alone again, and the
-        # one-alone sentence
-        adds = dataclasses.replace(sweep, live_trim_to_kelly=False)
-        assert run()._text(adds, bar) == (
-            head + self._ADD + self._ONE + TestLiveSellRule._NOTE + ' — choose Sell "sell at '
-            '85% of potential profit" and Min. days to maturity "3 days" in the filter bar '
-            "to see the selling alone")
+            head + self._NOTE + self._NO_VIEW + TestLiveSellRule._NOTE + ' — choose Sell '
+            '"sell at 85% of potential profit" and Min. days to maturity "3 days" in the '
+            "filter bar to see the selling alone")
         # Selling alone keeps its promise of the whole rule
-        sells = dataclasses.replace(sweep, live_add_to_held_pairs=False,
-                                    live_trim_to_kelly=False)
+        sells = dataclasses.replace(sweep, live_rebalance=False)
         assert run()._text(sells, bar).endswith("in the filter bar to see it")
 
     def test_the_header_of_a_whole_page_points_at_the_selects(self, monkeypatch, tmp_path):
-        sweep = self._both(_kc_sweep_move(), live_trim_min_rise=0.1, live_tier_floors=True,
+        sweep = self._both(_kc_sweep_move(), live_min_price_move=0.1, live_tier_floors=True,
                            live_spread_band=_KC_B0)
-        note = ("the live defaults trim to Kelly (only after a {}c price move), which this "
-                "run's primary does not — ")
+        note = ("the live defaults rebalance held pairs (a trim only after a {}c price move), "
+                "which this run's primary does not — ")
         page = _rb_page(monkeypatch, tmp_path, sweep)
         assert (note.format(10) + 'choose Rebalance yes and Min. price movement "10c" in the '
                 "filter bar to see it</p>") in page
         # A saved minimum the page does not offer
-        page = _rb_page(monkeypatch, tmp_path, dataclasses.replace(sweep, live_trim_min_rise=0.15))
+        page = _rb_page(monkeypatch, tmp_path,
+                        dataclasses.replace(sweep, live_min_price_move=0.15))
         assert note.format(15) + "this page cannot show that minimum price movement</p>" in page
         # No Rebalance family
         page = _rb_page(monkeypatch, tmp_path, dataclasses.replace(sweep, rebalance_sweep=None))
@@ -14493,7 +14445,7 @@ class TestLiveSellRule:
 
     def test_both_notes_follow_the_button_when_both_apply(self, monkeypatch, tmp_path):
         sweep = dataclasses.replace(_kc_sweep_sell(_kc_sweep_rebalance()),
-                                    live_add_to_held_pairs=True, live_sell_at=0.85)
+                                    live_rebalance=True, live_sell_at=0.85)
         page = _sl_page(monkeypatch, tmp_path, sweep)
         bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
         between = bar[bar.index('id="flt-save"'):bar.index('id="flt-trade"')]
@@ -14811,9 +14763,8 @@ class TestSellScript:
         for name in ("on", "off"):
             [opened] = snaps[name]["opened"]
             query = TestSaveLiveDefaultsButton._query(data, opened)
-            assert (query["add_to_held_pairs"], query["trim_to_kelly"], query["trim_min_rise"],
-                    query["sell_at"], query["sell_min_days"]) == (
-                name, name, "off", "off", "off"), name
+            assert (query["rebalance"], query["min_price_move"], query["sell_at"],
+                    query["sell_min_days"]) == (name, "off", "off", "off"), name
         level = snaps["level"]["selects"]
         assert level["flt-sell"]["value"] == "0" and level["flt-days"]["disabled"] is False
         on = snaps["on"]

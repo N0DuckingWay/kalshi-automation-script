@@ -1269,8 +1269,8 @@ def _build_parser() -> argparse.ArgumentParser:
              "to or trim a held pair only once its total price has moved a chosen "
              "number of cents, up or down, since the last trade on it); Rebalance "
              "itself is still built. Its simulations run only while the dashboard is "
-             "built. Backtest only — a live run waits for a price move by its own "
-             "saved minimum (main.py --trim-min-rise for one run)",
+             "built. Backtest only — a live run's trim waits for a price move by its "
+             "own saved minimum (main.py --min-price-move for one run)",
     )
     parser.add_argument(
         "--sell-workers", type=int, default=None, metavar="N",

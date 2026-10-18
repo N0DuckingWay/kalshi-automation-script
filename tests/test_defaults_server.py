@@ -17,7 +17,8 @@ Purpose:
     blockers, the last real-money run's attention banner and its
     acknowledgement, a nonce used twice), the saved page, the run page (each
     rule of its outcome table, read from hand-written run folders and from
-    a stand-in process), /checkout and the seed. A POST body is always built
+    a stand-in process), /checkout, the seed, and a saved file an older
+    version wrote (never traded, offered in its new form for one save). A POST body is always built
     from the hidden inputs and one button of the page the server rendered,
     never by hand, except where a test signs or crafts a request itself to
     reach a path no rendered page leads to. The process starter is a
@@ -99,16 +100,16 @@ KEY = b"k" * 32
 _REAL_POPEN = subprocess.Popen
 # A source note of the dashboard's shape
 DASHBOARD_NOTE = "backtest dashboard for 2025-09-24 to 2026-09-27"
-# The twelve rows of a comparison, in their order on the page
+# The eleven rows of a comparison, in their order on the page
 LABELS = ["tier floors", "spread band", "k", "per-trade cap", "same-title cap",
-          "categories", "tags", "add to held pairs", "sell at", "min days to maturity",
-          "trim to Kelly", "min price rise"]
+          "categories", "tags", "rebalance", "min price movement", "sell at",
+          "min days to maturity"]
 # A proposal's fields: the seed's values, spelled as the dashboard spells them
 _BASE = {"tier_floors": "off", "spread_min": "0", "spread_max": "0.5", "k": "0.8",
          "size_cap": "0.1"}
 # What _BASE proposes with nothing saved: the fields it leaves out take the
-# seed's values (20% same-title cap, adding on, no selling, no trimming)
-_BASE_SETTINGS = LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, add_to_held_pairs=True)
+# seed's values (20% same-title cap, rebalancing on with no minimum, no selling)
+_BASE_SETTINGS = LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True)
 # The ASCII digits as Arabic-Indic and as full-width digits (str.translate tables)
 _ARABIC_INDIC = str.maketrans("0123456789", "".join(chr(0x0660 + i) for i in range(10)))
 _FULL_WIDTH = str.maketrans("0123456789", "".join(chr(0xFF10 + i) for i in range(10)))
@@ -836,7 +837,7 @@ class TestConfirmPage:
         assert changed == {"tier floors", "spread band"}
         assert all(css == "same" for label, css in page.rows.items() if label not in changed)
         assert response.body.count('<span class="tag">changed</span>') == 2
-        assert "2 of 12 settings change." in response.body
+        assert "2 of 11 settings change." in response.body
         assert "Overwrite the live trading defaults?" in response.body
         assert f"This writes <code>{config.LIVE_DEFAULTS_FILE.absolute()}</code>" \
             in response.body
@@ -862,14 +863,13 @@ class TestConfirmPage:
         assert "none saved — live runs refuse to start until defaults are saved" in response.body
         assert set(page.rows.values()) == {"changed"}
         assert all(cells[1] == "—" for cells in page.cells.values())
-        assert "12 of 12 settings change." in response.body
+        assert "11 of 11 settings change." in response.body
         # The fields the link leaves out take the seed's values
         assert page.cells["same-title cap"][2] == "20%"
-        assert page.cells["add to held pairs"][2] == "on"
+        assert page.cells["rebalance"][2] == "yes"
+        assert page.cells["min price movement"][2] == "any"
         assert page.cells["sell at"][2] == "off"
         assert page.cells["min days to maturity"][2] == "any"
-        assert page.cells["trim to Kelly"][2] == "off"
-        assert page.cells["min price rise"][2] == "any"
 
     def test_the_exposure_warning_shows(self):
         response = _get(_app(), "/confirm?" + _query(k="0.4", size_cap="1"))
@@ -881,8 +881,8 @@ class TestConfirmPage:
     def test_no_warning_for_the_seed(self):
         assert 'class="warn"' not in _get(_app(), "/confirm?" + _query()).body
 
-    # Saved defaults that trim: k 0.8, 20% per-trade and same-title caps
-    _TRIM_SAVED = LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, trim_to_kelly=True)
+    # Saved defaults that rebalance: k 0.8, 20% per-trade and same-title caps
+    _REBALANCE_SAVED = LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, rebalance=True)
 
     @pytest.mark.parametrize("link, named", [
         ({"size_cap": "0.1", "same_title_size_cap": "0.2"},
@@ -893,32 +893,33 @@ class TestConfirmPage:
         ({"size_cap": "0.2", "same_title_size_cap": "0.1"},
          "the same-title size cap goes from 20% to 10%"),
     ], ids=["per-trade cap", "k", "same-title cap"])
-    def test_with_trimming_on_a_lower_cap_or_a_higher_k_is_said_to_sell(self, link, named):
+    def test_with_rebalancing_on_a_lower_cap_or_a_higher_k_is_said_to_sell(self, link, named):
         # These settings can sell more of the held pairs: the page warns in red
-        _save(self._TRIM_SAVED)
+        _save(self._REBALANCE_SAVED)
         response = _get(_app(), "/confirm?" + _query(**link))
         assert response.status == 200
         [warning] = re.findall(r'<p class="warn">(.*?)</p>', response.body)
         assert warning == (
-            "Warning: with the Kelly trim on, these settings can sell more of the held pairs: "
+            "Warning: with Rebalance yes, these settings can sell more of the held pairs: "
             f"{named}; each exact held pair worth more than its new Kelly size is sold down "
             "to it before anything is bought, once the wait since its last trade has passed.")
 
     @pytest.mark.parametrize("saved, link", [
-        # Trimming saved off, and the link leaves it off
-        (dataclasses.replace(_TRIM_SAVED, trim_to_kelly=False),
+        # Rebalancing saved off, and the link leaves it off
+        (dataclasses.replace(_REBALANCE_SAVED, rebalance=False),
          {"size_cap": "0.1", "same_title_size_cap": "0.2"}),
-        (dataclasses.replace(_TRIM_SAVED, trim_to_kelly=False),
+        (dataclasses.replace(_REBALANCE_SAVED, rebalance=False),
          {"k": "0.9", "size_cap": "0.2", "same_title_size_cap": "0.2"}),
-        (dataclasses.replace(_TRIM_SAVED, trim_to_kelly=False),
+        (dataclasses.replace(_REBALANCE_SAVED, rebalance=False),
          {"size_cap": "0.2", "same_title_size_cap": "0.1"}),
-        # Trimming turned off by the link itself
-        (_TRIM_SAVED, {"size_cap": "0.1", "same_title_size_cap": "0.2", "trim_to_kelly": "off"}),
+        # Rebalancing turned off by the link itself
+        (_REBALANCE_SAVED, {"size_cap": "0.1", "same_title_size_cap": "0.2",
+                            "rebalance": "off"}),
         # A cap raised, and k lowered: nothing more is sold
-        (_TRIM_SAVED, {"size_cap": "0.3", "same_title_size_cap": "0.2"}),
-        (_TRIM_SAVED, {"k": "0.7", "size_cap": "0.2", "same_title_size_cap": "0.2"}),
+        (_REBALANCE_SAVED, {"size_cap": "0.3", "same_title_size_cap": "0.2"}),
+        (_REBALANCE_SAVED, {"k": "0.7", "size_cap": "0.2", "same_title_size_cap": "0.2"}),
         # A lower same-title cap that is still above the per-trade cap
-        (dataclasses.replace(_TRIM_SAVED, same_title_size_cap=1.0),
+        (dataclasses.replace(_REBALANCE_SAVED, same_title_size_cap=1.0),
          {"size_cap": "0.2", "same_title_size_cap": "0.5"}),
     ], ids=["off, cap", "off, k", "off, same-title cap", "link turns it off", "cap raised",
             "k lowered", "same-title cap held below"])
@@ -934,30 +935,13 @@ class TestConfirmPage:
         assert page.rows["same-title cap"] == "same"
         assert page.cells["same-title cap"][1:3] == ["50%", "50%"]
 
-    @pytest.mark.parametrize("saved_on", [False, True])
-    def test_a_missing_add_to_held_pairs_keeps_the_saved_value(self, saved_on):
-        # A link that does not name it (the dashboard's save button, on a page
-        # that does not show the choice) leaves it as saved, either way, shown
-        # as no change
-        saved = LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, add_to_held_pairs=saved_on)
-        _save(saved)
-        page = _parse(_get(_app(), "/confirm?" + _query()).body)
-        assert page.rows["add to held pairs"] == "same"
-        word = "on" if saved_on else "off"
-        assert page.cells["add to held pairs"][1:3] == [word, word]
-        assert defaults_server._proposal(defaults_server._params(_query()),
-                                         config.read_saved_live_defaults())[0] == saved
-
     @pytest.mark.parametrize("given, saved_on", [("on", False), ("off", True)])
-    def test_a_named_add_to_held_pairs_is_proposed(self, given, saved_on):
-        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, add_to_held_pairs=saved_on))
-        page = _parse(_get(_app(), "/confirm?" + _query(add_to_held_pairs=given)).body)
-        assert page.rows["add to held pairs"] == "changed"
-        assert page.cells["add to held pairs"][1:3] == ["on" if saved_on else "off", given]
-
-    def test_a_missing_add_to_held_pairs_with_none_saved_is_the_seed_s(self):
-        settings, _ = defaults_server._proposal(defaults_server._params(_query()), None)
-        assert settings.add_to_held_pairs is config.LIVE_DEFAULTS_SEED.add_to_held_pairs
+    def test_a_named_rebalance_is_proposed(self, given, saved_on):
+        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=saved_on))
+        page = _parse(_get(_app(), "/confirm?" + _query(rebalance=given)).body)
+        assert page.rows["rebalance"] == "changed"
+        assert page.cells["rebalance"][1:3] == ["yes" if saved_on else "no",
+                                                "yes" if given == "on" else "no"]
 
     @pytest.mark.parametrize("saved", [
         {}, {"sell_at": 0.85}, {"sell_at": 0.85, "sell_min_days": 3}])
@@ -1024,93 +1008,106 @@ class TestConfirmPage:
         assert "<form" not in response.body
 
     @pytest.mark.parametrize("saved", [
-        {}, {"trim_to_kelly": True}, {"trim_to_kelly": True, "trim_min_rise": 0.25}])
-    def test_missing_trim_settings_keep_the_saved_values(self, saved):
-        # A link that names neither trim field keeps both as saved (no change)
+        {}, {"rebalance": True}, {"rebalance": True, "min_price_move": 0.25}])
+    def test_missing_rebalance_settings_keep_the_saved_values(self, saved):
+        # A link that names neither field (the dashboard's save button on a
+        # page without the Rebalance view, a hand-made link) keeps both as
+        # saved, either way, shown as no change
         _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, **saved))
         page = _parse(_get(_app(), "/confirm?" + _query()).body)
-        assert page.rows["trim to Kelly"] == page.rows["min price rise"] == "same"
-        assert page.cells["trim to Kelly"][1] == page.cells["trim to Kelly"][2] == (
-            "on" if saved.get("trim_to_kelly") else "off")
-        assert page.cells["min price rise"][1] == page.cells["min price rise"][2] == (
-            "25c" if "trim_min_rise" in saved else "any")
+        assert page.rows["rebalance"] == page.rows["min price movement"] == "same"
+        assert page.cells["rebalance"][1] == page.cells["rebalance"][2] == (
+            "yes" if saved.get("rebalance") else "no")
+        assert page.cells["min price movement"][1] == page.cells["min price movement"][2] == (
+            "25c" if "min_price_move" in saved else "any")
         proposed, _ = defaults_server._proposal(defaults_server._params(_query()),
                                                 config.read_saved_live_defaults())
-        assert (proposed.trim_to_kelly, proposed.trim_min_rise) == (
-            saved.get("trim_to_kelly", False), saved.get("trim_min_rise"))
+        assert (proposed.rebalance, proposed.min_price_move) == (
+            saved.get("rebalance", False), saved.get("min_price_move"))
 
-    def test_missing_trim_settings_with_none_saved_are_the_seed_s(self):
+    def test_missing_rebalance_settings_with_none_saved_are_the_seed_s(self):
         settings, _ = defaults_server._proposal(defaults_server._params(_query()), None)
-        assert settings.trim_to_kelly is config.LIVE_DEFAULTS_SEED.trim_to_kelly is False
-        assert settings.trim_min_rise is config.LIVE_DEFAULTS_SEED.trim_min_rise is None
+        assert settings.rebalance is config.LIVE_DEFAULTS_SEED.rebalance is True
+        assert settings.min_price_move is config.LIVE_DEFAULTS_SEED.min_price_move is None
 
     @pytest.mark.parametrize("given, expected", [
-        ({"trim_to_kelly": "on"}, (True, None)),
-        ({"trim_to_kelly": "on", "trim_min_rise": "0.1"}, (True, 0.10)),
-        ({"trim_to_kelly": "on", "trim_min_rise": "0.10"}, (True, 0.10)),
-        ({"trim_to_kelly": "on", "trim_min_rise": "0.05"}, (True, 0.05)),
-        ({"trim_to_kelly": "on", "trim_min_rise": "0.15"}, (True, 0.15)),
-        ({"trim_to_kelly": "on", "trim_min_rise": "1"}, (True, 1.0)),
-        ({"trim_to_kelly": "on", "trim_min_rise": "1e-1"}, (True, 0.10)),
-        ({"trim_to_kelly": "on", "trim_min_rise": "off"}, (True, None)),
-        ({"trim_to_kelly": "off"}, (False, None)),
-        ({"trim_to_kelly": "off", "trim_min_rise": "off"}, (False, None)),
-        ({"trim_min_rise": "off"}, (False, None)),
+        ({"rebalance": "on"}, (True, None)),
+        ({"rebalance": "on", "min_price_move": "0.1"}, (True, 0.10)),
+        ({"rebalance": "on", "min_price_move": "0.10"}, (True, 0.10)),
+        ({"rebalance": "on", "min_price_move": "0.05"}, (True, 0.05)),
+        ({"rebalance": "on", "min_price_move": "0.15"}, (True, 0.15)),
+        ({"rebalance": "on", "min_price_move": "1"}, (True, 1.0)),
+        ({"rebalance": "on", "min_price_move": "1e-1"}, (True, 0.10)),
+        ({"rebalance": "on", "min_price_move": "off"}, (True, None)),
+        ({"rebalance": "off"}, (False, None)),
+        ({"rebalance": "off", "min_price_move": "off"}, (False, None)),
+        # The switch left out takes the seed's (on)
+        ({"min_price_move": "off"}, (True, None)),
+        ({"min_price_move": "0.1"}, (True, 0.10)),
     ])
-    def test_named_trim_settings_are_proposed(self, given, expected):
-        # With nothing saved, so a field a link leaves out is the seed's (off)
+    def test_named_rebalance_settings_are_proposed(self, given, expected):
+        # With nothing saved, so a field a link leaves out is the seed's
         settings, _ = defaults_server._proposal(defaults_server._params(_query(**given)), None)
-        assert (settings.trim_to_kelly, settings.trim_min_rise) == expected
+        assert (settings.rebalance, settings.min_price_move) == expected
         page = _parse(_get(_app(), "/confirm?" + _query(**given)).body)
-        rise = "any" if expected[1] is None else f"{round(expected[1] * 100)}c"
-        assert page.cells["trim to Kelly"][1:3] == ["—", "on" if expected[0] else "off"]
-        assert page.cells["min price rise"][1:3] == ["—", rise]
+        move = "any" if expected[1] is None else f"{round(expected[1] * 100)}c"
+        assert page.cells["rebalance"][1:3] == ["—", "yes" if expected[0] else "no"]
+        assert page.cells["min price movement"][1:3] == ["—", move]
 
     def test_a_link_s_dollars_and_a_flag_s_cents_are_one_minimum(self):
         # A link's 0.1 (dollars) is the flag's 10 (cents)
         settings, _ = defaults_server._proposal(
-            defaults_server._params(_query(trim_to_kelly="on", trim_min_rise="0.1")), None)
-        assert settings.trim_min_rise == 0.10 == 10 / 100
-        assert "--trim-min-rise=10" in config.live_settings_argv(settings)
+            defaults_server._params(_query(rebalance="on", min_price_move="0.1")), None)
+        assert settings.min_price_move == 0.10 == 10 / 100
+        assert "--min-price-move=10" in config.live_settings_argv(settings)
 
-    def test_a_named_minimum_rise_over_a_saved_one_is_a_change(self):
-        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, trim_to_kelly=True,
-                           trim_min_rise=0.25))
-        page = _parse(_get(_app(), "/confirm?" + _query(trim_min_rise="0.1")).body)
-        assert page.rows["min price rise"] == "changed"
-        assert page.cells["min price rise"][1:3] == ["25c", "10c"]
+    def test_a_named_minimum_move_over_a_saved_one_is_a_change(self):
+        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True,
+                           min_price_move=0.25))
+        page = _parse(_get(_app(), "/confirm?" + _query(min_price_move="0.1")).body)
+        assert page.rows["min price movement"] == "changed"
+        assert page.cells["min price movement"][1:3] == ["25c", "10c"]
         # The switch was left out, so it stays as saved
-        assert page.rows["trim to Kelly"] == "same"
+        assert page.rows["rebalance"] == "same"
         page = _parse(_get(_app(), "/confirm?" + _query(
-            trim_to_kelly="off", trim_min_rise="off")).body)
+            rebalance="off", min_price_move="off")).body)
         assert [label for label, css in page.rows.items() if css == "changed"] == [
-            "trim to Kelly", "min price rise"]
-        assert page.cells["trim to Kelly"][1:3] == ["on", "off"]
-        assert page.cells["min price rise"][1:3] == ["25c", "any"]
+            "rebalance", "min price movement"]
+        assert page.cells["rebalance"][1:3] == ["yes", "no"]
+        assert page.cells["min price movement"][1:3] == ["25c", "any"]
 
-    def test_turning_trimming_off_but_keeping_a_saved_minimum_is_refused_with_the_reason(self):
-        # The minimum was left out, so it stays at the saved 25c with trimming off
-        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, trim_to_kelly=True,
-                           trim_min_rise=0.25))
-        response = _get(_app(), "/confirm?" + _query(trim_to_kelly="off"))
+    def test_turning_rebalancing_off_but_keeping_a_saved_minimum_is_refused_with_the_reason(
+            self):
+        # The minimum was left out, so it stays at the saved 25c with rebalancing off
+        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True,
+                           min_price_move=0.25))
+        response = _get(_app(), "/confirm?" + _query(rebalance="off"))
         assert response.status == 400
-        assert "trim_min_rise needs trim_to_kelly on" in html.unescape(response.body)
+        assert "min_price_move needs rebalance on" in html.unescape(response.body)
         assert "<form" not in response.body
 
-    @pytest.mark.parametrize("given", [
-        # None saved and the switch left out (the seed's is off), or named off
-        {"trim_min_rise": "0.1"}, {"trim_to_kelly": "off", "trim_min_rise": "0.1"}])
-    def test_a_minimum_rise_with_trimming_off_is_refused_with_the_reason(self, given):
+    @pytest.mark.parametrize("saved_off", [False, True])
+    def test_a_minimum_move_with_rebalancing_off_is_refused_with_the_reason(self, saved_off):
+        # Named off by the link, or saved off and left out by it
+        if saved_off:
+            _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2))
+            given = {"min_price_move": "0.1"}
+        else:
+            given = {"rebalance": "off", "min_price_move": "0.1"}
+        before = config.LIVE_DEFAULTS_FILE.read_bytes() if saved_off else None
         response = _get(_app(), "/confirm?" + _query(**given))
         assert response.status == 400
-        assert "trim_min_rise needs trim_to_kelly on" in html.unescape(response.body)
+        assert "min_price_move needs rebalance on" in html.unescape(response.body)
         assert "<form" not in response.body and "<button" not in response.body
-        assert config.read_saved_live_defaults() is None
+        if saved_off:
+            assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
+        else:
+            assert config.read_saved_live_defaults() is None
 
-    def test_a_minimum_rise_off_the_grid_is_refused_with_the_reason(self):
-        response = _get(_app(), "/confirm?" + _query(trim_to_kelly="on", trim_min_rise="0.07"))
+    def test_a_minimum_move_off_the_grid_is_refused_with_the_reason(self):
+        response = _get(_app(), "/confirm?" + _query(rebalance="on", min_price_move="0.07"))
         assert response.status == 400
-        assert "trim_min_rise must be a multiple of 5c from 5c to $1" in html.unescape(
+        assert "min_price_move must be a multiple of 5c from 5c to $1" in html.unescape(
             response.body)
 
     def test_a_missing_category_or_tag_proposes_any(self):
@@ -1152,7 +1149,7 @@ class TestConfirmPage:
         assert page.buttons[1] == {"type": "button", "disabled": None}
         assert html.escape(defaults_server._NOTHING_TO_SAVE) in response.body
         assert "These are already the live defaults — nothing to save." in response.body
-        assert "0 of 12 settings change." in response.body
+        assert "0 of 11 settings change." in response.body
         # With nothing to save, the page does not say it writes
         assert "This writes" not in response.body
         assert str(config.LIVE_DEFAULTS_FILE.absolute()) in response.body
@@ -1461,8 +1458,6 @@ class TestConfirmRefusals:
         _query(k=""),                                     # blank
         _query(source=""),                                # a blank source
         _query(tier_floors="maybe"),
-        _query(add_to_held_pairs="maybe"), _query(add_to_held_pairs="true"),
-        _query(add_to_held_pairs="1"), _query(add_to_held_pairs="On"),
         # A sell level: a plain decimal share on the 1% grid in (0, 1], or off
         _query(sell_at="maybe"), _query(sell_at="Off"), _query(sell_at="on"),
         _query(sell_at="0"), _query(sell_at="-0.5"), _query(sell_at="1.01"),
@@ -1480,36 +1475,41 @@ class TestConfirmRefusals:
         # A minimum with no level: none given and none saved (the seed's is off),
         # or the level named off
         _query(sell_min_days="3"), _query(sell_at="off", sell_min_days="3"),
-        # Trimming: on or off, spelled exactly so
-        _query(trim_to_kelly="maybe"), _query(trim_to_kelly="true"),
-        _query(trim_to_kelly="1"), _query(trim_to_kelly="On"), _query(trim_to_kelly="OFF"),
-        # A minimum price rise: plain dollars on the 5c grid, 5c to $1, or off
-        _query(trim_to_kelly="on", trim_min_rise="maybe"),
-        _query(trim_to_kelly="on", trim_min_rise="Off"),
-        _query(trim_to_kelly="on", trim_min_rise="on"),
-        _query(trim_to_kelly="on", trim_min_rise="0"),
-        _query(trim_to_kelly="on", trim_min_rise="-0.1"),
-        _query(trim_to_kelly="on", trim_min_rise="1.05"),
-        _query(trim_to_kelly="on", trim_min_rise="10"),
-        _query(trim_to_kelly="on", trim_min_rise="5"),
-        _query(trim_to_kelly="on", trim_min_rise="0.07"),
-        _query(trim_to_kelly="on", trim_min_rise="0.125"),
-        _query(trim_to_kelly="on", trim_min_rise="0.01"),
-        _query(trim_to_kelly="on", trim_min_rise="10c"),
-        _query(trim_to_kelly="on", trim_min_rise="nan"),
-        _query(trim_to_kelly="on", trim_min_rise="inf"),
-        _query(trim_to_kelly="on", trim_min_rise="0_1"),
-        _query(trim_to_kelly="on", trim_min_rise="０.1"),
-        _query(trim_to_kelly="on", trim_min_rise="٠.1"),
-        _query(trim_to_kelly="on", trim_min_rise=" 0.1"),
-        _query(trim_to_kelly="on", trim_min_rise="0x1"),
-        _query(trim_to_kelly="on", trim_min_rise="1e-400"),
-        _query(trim_to_kelly="on", trim_min_rise="1e400"),
-        # A minimum with trimming off: the switch left out (the seed's: off) or named off
-        _query(trim_min_rise="0.1"), _query(trim_to_kelly="off", trim_min_rise="0.1"),
-        # Either trim field given twice
-        _query(trim_to_kelly="on") + "&trim_to_kelly=on",
-        _query(trim_to_kelly="on", trim_min_rise="0.1") + "&trim_min_rise=0.1",
+        # Rebalancing: on or off, spelled exactly so
+        _query(rebalance="maybe"), _query(rebalance="true"), _query(rebalance="yes"),
+        _query(rebalance="1"), _query(rebalance="On"), _query(rebalance="OFF"),
+        # A minimum price movement: plain dollars on the 5c grid, 5c to $1, or off
+        _query(rebalance="on", min_price_move="maybe"),
+        _query(rebalance="on", min_price_move="Off"),
+        _query(rebalance="on", min_price_move="on"),
+        _query(rebalance="on", min_price_move="any"),
+        _query(rebalance="on", min_price_move="0"),
+        _query(rebalance="on", min_price_move="-0.1"),
+        _query(rebalance="on", min_price_move="1.05"),
+        _query(rebalance="on", min_price_move="10"),
+        _query(rebalance="on", min_price_move="5"),
+        _query(rebalance="on", min_price_move="0.07"),
+        _query(rebalance="on", min_price_move="0.125"),
+        _query(rebalance="on", min_price_move="0.01"),
+        _query(rebalance="on", min_price_move="10c"),
+        _query(rebalance="on", min_price_move="nan"),
+        _query(rebalance="on", min_price_move="inf"),
+        _query(rebalance="on", min_price_move="0_1"),
+        _query(rebalance="on", min_price_move="０.1"),
+        _query(rebalance="on", min_price_move="٠.1"),
+        _query(rebalance="on", min_price_move=" 0.1"),
+        _query(rebalance="on", min_price_move="0x1"),
+        _query(rebalance="on", min_price_move="1e-400"),
+        _query(rebalance="on", min_price_move="1e400"),
+        # A minimum with rebalancing named off
+        _query(rebalance="off", min_price_move="0.1"),
+        # Either rebalance field given twice
+        _query(rebalance="on") + "&rebalance=on",
+        _query(rebalance="on", min_price_move="0.1") + "&min_price_move=0.1",
+        # A field a link built before Rebalance carries, which it replaced
+        _query(add_to_held_pairs="on"), _query(trim_to_kelly="on"),
+        _query(trim_to_kelly="on", trim_min_rise="0.1"),
+        _query(rebalance="on", add_to_held_pairs="on"),
         _query(k="nan"), _query(k="inf"), _query(k="0_8"), _query(k="1e-400"),
         _query(k="1e400"), _query(k="０.8"), _query(k=" 0.8"), _query(k="0"),
         _query(k="1.5"), _query(k="0x1"),
@@ -1573,18 +1573,29 @@ class TestConfirmRefusals:
             source=config.LIVE_DEFAULTS_SEED_SOURCE, sell_at="off",
             sell_min_days="off")).status == 200
 
-    def test_the_seed_note_labels_no_trimming_settings(self):
-        # The seed trims nothing: its note on a link that trims is refused
-        for given in ({"trim_to_kelly": "on"},
-                      {"trim_to_kelly": "on", "trim_min_rise": "0.1"}):
+    def test_the_seed_note_labels_only_the_seed_s_rebalance_settings(self):
+        # The seed rebalances with no minimum: its note on a link that turns
+        # rebalancing off, or sets a minimum, is refused
+        for given in ({"rebalance": "off"},
+                      {"rebalance": "on", "min_price_move": "0.1"}):
             response = _get(_app(), "/confirm?" + _query(
                 source=config.LIVE_DEFAULTS_SEED_SOURCE, **given))
             assert response.status == 400, given
             assert "may label only the seed values" in response.body
-        # ... and a seed link that names trimming off is the seed
+        # ... and a seed link that names the seed's own settings is the seed
         assert _get(_app(), "/confirm?" + _query(
-            source=config.LIVE_DEFAULTS_SEED_SOURCE, trim_to_kelly="off",
-            trim_min_rise="off")).status == 200
+            source=config.LIVE_DEFAULTS_SEED_SOURCE, rebalance="on",
+            min_price_move="off")).status == 200
+
+    @pytest.mark.parametrize("field, value", [
+        ("add_to_held_pairs", "on"), ("trim_to_kelly", "off"), ("trim_min_rise", "0.1")])
+    def test_a_link_built_before_rebalance_says_how_to_get_a_new_one(self, field, value):
+        # The dashboard built before Rebalance sends these; the refusal says what to do
+        response = _get(_app(), "/confirm?" + _query(**{field: value}))
+        assert response.status == 400
+        assert (f"this link was built before Rebalance (it names {field}): rebuild the "
+                "backtest dashboard, or open this server&#x27;s start page") in response.body
+        assert "<form" not in response.body
 
     def test_an_invalid_proposal_is_refused_on_the_post_too(self):
         # A form carrying a proposal no page would render, signed as a page would sign it
@@ -1954,6 +1965,306 @@ class TestRefusedFile:
         assert app._start_process.calls == []
 
 
+# A file the previous version's writer wrote, in its exact layout: adding to
+# held pairs on, the Kelly trim on with a 10c minimum price rise
+_OLD_VERSION_BYTES = (
+    b'{\n'
+    b'  "format": "live-defaults-v1",\n'
+    b'  "saved_at": "2026-10-11T18:22:05Z",\n'
+    b'  "source": "backtest dashboard for 2025-10-11 to 2026-10-11",\n'
+    b'  "settings": {\n'
+    b'    "tier_floors": false,\n'
+    b'    "spread_band": [0.0, 0.8],\n'
+    b'    "interval_discount": 0.7,\n'
+    b'    "size_cap": 0.15,\n'
+    b'    "same_title_size_cap": 0.2,\n'
+    b'    "categories": null,\n'
+    b'    "tags": null,\n'
+    b'    "add_to_held_pairs": true,\n'
+    b'    "trim_to_kelly": true,\n'
+    b'    "trim_min_rise": 0.1\n'
+    b'  }\n'
+    b'}\n')
+# What it reads as now: rebalance yes with the old 10c minimum, the rest as saved
+_OLD_VERSION_READS_AS = LiveSettings(False, (0.0, 0.8), 0.7, 0.15, 0.2, rebalance=True,
+                                     min_price_move=0.10)
+# The notice the confirmation page shows above its table when it proposes them
+_OUTDATED_CONFIRM_NOTICE = (
+    "The saved live defaults were saved before Rebalance. Below: their values, read as "
+    "Rebalance yes and Min. price movement 10c. Confirm and save to replace the file.")
+
+
+def _old_version_file() -> defaults_server._Response:
+    """
+    Write the previous version's file as the saved defaults, and open the link the index offers.
+
+    Returns:
+        defaults_server._Response: The index page, which carries the link.
+    """
+    config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+    return _get(_app(), "/")
+
+
+def _outdated_link() -> str:
+    """
+    The link every page offers for the previous version's file: its values in their new form.
+
+    Returns:
+        str: /confirm? and the query naming every field, with no source note.
+    """
+    return "/confirm?" + defaults_server._settings_query(_OLD_VERSION_READS_AS)
+
+
+class TestOutdatedFile:
+    """A file the previous version saved (add_to_held_pairs, trim_to_kelly and
+    trim_min_rise) is never traded: the confirmation page counts nothing as in
+    force and offers its values in their new form (rebalance yes, the old
+    minimum) for one Confirm and save, which replaces the file; every other
+    page shows a notice linking there; and every run stays refused, or keeps
+    every blocker, until the save."""
+
+    def test_the_index_shows_the_notice_and_the_link(self):
+        response = _old_version_file()
+        assert response.status == 200
+        assert ("The saved live defaults were saved before Rebalance, so every live run "
+                "refuses them until they are saved again.") in response.body
+        assert _outdated_link() in _parse(response.body).links
+        assert "read as Rebalance yes and Min. price movement 10c" in response.body
+
+    def test_the_link_names_every_field_and_no_source_note(self):
+        params = defaults_server._params(_outdated_link().split("?", 1)[1])
+        assert "source" not in params
+        assert [name for name in defaults_server._FIELDS
+                if name not in ("category", "tag", "source")] == list(params)
+        assert params["rebalance"] == ["on"] and params["min_price_move"] == ["0.1"]
+        # It proposes exactly those values, whatever is saved
+        assert defaults_server._proposal(params, None) == (_OLD_VERSION_READS_AS, "")
+        assert defaults_server._proposal(params, config.LIVE_DEFAULTS_SEED)[0] == (
+            _OLD_VERSION_READS_AS)
+
+    def test_the_confirmation_page_shows_the_notice_and_the_new_values(self):
+        config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+        response = _get(_app(), _outdated_link())
+        assert response.status == 200
+        assert f'<p class="banner">{_OUTDATED_CONFIRM_NOTICE}</p>' in response.body
+        # The notice sits above the table
+        assert response.body.index(_OUTDATED_CONFIRM_NOTICE) < response.body.index("<table>")
+        assert "Save the live trading defaults again?" in response.body
+        assert ("Live defaults in force: none — the saved file was saved before Rebalance, "
+                "and live runs refuse it until it is saved again") in response.body
+        page = _parse(response.body)
+        assert list(page.rows) == LABELS
+        assert all(cells[1] == "—" for cells in page.cells.values())
+        assert page.cells["spread band"][2] == "0-0.8"
+        assert page.cells["k"][2] == "0.7"
+        assert page.cells["per-trade cap"][2] == "15%"
+        assert page.cells["rebalance"][2] == "yes"
+        assert page.cells["min price movement"][2] == "10c"
+        assert "11 of 11 settings change." in response.body
+
+    def test_one_confirm_and_save_replaces_the_file(self):
+        config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+        app = _app()
+        response = _get(app, _outdated_link())
+        posted = _post(app, _click(response.body, "confirm"))
+        assert posted.status == 303 and posted.location == "/saved"
+        # It now reads cleanly, as the values the page showed, with no old key
+        assert config.read_saved_live_defaults() == _OLD_VERSION_READS_AS
+        assert config.live_defaults() == _OLD_VERSION_READS_AS
+        text = config.LIVE_DEFAULTS_FILE.read_text()
+        for retired in ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise"):
+            assert retired not in text
+        assert '"rebalance": true' in text and '"min_price_move": 0.1' in text
+        # ... and every page reads it as the defaults in force
+        assert _get(app, "/saved").status == 200
+        assert _get(app, "/trade").status == 200
+        assert "saved before Rebalance" not in _get(app, "/").body
+
+    @pytest.mark.parametrize("target", ["/trade", "/saved"])
+    def test_the_trade_and_saved_pages_refuse_with_the_notice_and_the_link(self, target):
+        config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+        response = _get(_app(start_process=_Starter()), target)
+        assert response.status == 409
+        page = _parse(response.body)
+        assert _outdated_link() in page.links
+        assert page.forms == [] and page.buttons == []
+        assert ("The saved live defaults were saved before Rebalance, so every live run "
+                "refuses them until they are saved again.") in response.body
+        # Never the advice to delete it: a save replaces it
+        assert "Fix or delete" not in response.body
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _OLD_VERSION_BYTES
+
+    def test_a_dry_run_is_refused_until_it_is_saved(self):
+        # A dry run needs saved defaults: the button is a placeholder, and a
+        # POST asking for one anyway is refused, saving nothing
+        config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+        starter = _Starter()
+        app = _app(start_process=starter)
+        body = _get(app, _outdated_link()).body
+        assert "confirm-dry-run" not in [b.get("id") for b in _parse(body).buttons]
+        assert html.escape(defaults_server._SAVE_FIRST) in body
+        form = [(n, "dry_run" if n == "action" else v) for n, v in _click(body, "confirm")]
+        response = _post(app, form)
+        assert response.status == 409
+        assert "A dry run needs saved live defaults" in response.body
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _OLD_VERSION_BYTES
+        assert starter.calls == []
+
+    def test_the_trade_page_never_runs_the_old_file(self):
+        # A trade form signed as the trade page would sign one: refused with
+        # the notice, nothing started, the file as it was
+        config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+        starter = _Starter()
+        app = _app(start_process=starter)
+        for action in ("trade", "dry_run"):
+            fingerprint, nonce = defaults_server._fingerprint(None), "2" * 32
+            form = [("fingerprint", fingerprint), ("nonce", nonce),
+                    ("token", app._token("trade", fingerprint, nonce, {})),
+                    ("action", action)]
+            response = _post(app, form, target="/trade")
+            assert response.status == 409
+            assert _outdated_link() in _parse(response.body).links
+        assert starter.calls == []
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _OLD_VERSION_BYTES
+
+    def test_confirm_and_trade_keeps_the_run_lock_blocker(self, held_lock):
+        # Another live trading run holds the machine's lock: refused before any save
+        config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+        starter = _Starter()
+        app = _app(start_process=starter)
+        body = _get(app, _outdated_link()).body
+        assert "confirm-trade" not in [b.get("id") for b in _parse(body).buttons]
+        form = [(n, "trade" if n == "action" else v) for n, v in _click(body, "confirm")]
+        response = _post(app, form)
+        assert response.status == 409
+        assert "Nothing was saved or traded." in response.body
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _OLD_VERSION_BYTES
+        assert starter.calls == []
+
+    def test_confirm_and_trade_keeps_the_attention_acknowledgement(self):
+        # The last real-money run needs attention: without the box ticked,
+        # nothing is saved or traded, and the page still says the file is old
+        config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+        _attention_result()
+        starter = _Starter()
+        app = _app(start_process=starter)
+        response = _post(app, _page_form(app, _outdated_link().split("?", 1)[1],
+                                         "confirm-trade"))
+        assert response.status == 409
+        assert html.escape(defaults_server._ACK_BANNER) in response.body
+        assert _OUTDATED_CONFIRM_NOTICE in response.body
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _OLD_VERSION_BYTES
+        assert starter.calls == []
+
+    def test_confirm_and_trade_saves_first_then_runs_the_new_settings(self):
+        # The one way a run follows: the save replaces the file, and the run
+        # trades the confirmed settings as flags, never the old file
+        config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+        starter = _Starter()
+        app = _app(start_process=starter)
+        _run_id(_post(app, _page_form(app, _outdated_link().split("?", 1)[1],
+                                      "confirm-trade")))
+        assert config.read_saved_live_defaults() == _OLD_VERSION_READS_AS
+        [(argv, _)] = starter.calls
+        assert argv[5:-2] == config.live_settings_argv(_OLD_VERSION_READS_AS)
+        assert "--rebalance" in argv and "--min-price-move=10" in argv
+
+    def test_a_page_built_on_the_old_file_is_stale_once_it_is_gone(self):
+        # The old file counts as nothing in force, but not as no file: a page
+        # built on it, posted after the file was deleted, is shown again
+        config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+        app = _app()
+        form = _click(_get(app, _outdated_link()).body, "confirm")
+        config.LIVE_DEFAULTS_FILE.unlink()
+        response = _post(app, form)
+        assert response.status == 409
+        assert html.escape(defaults_server._STALE_BANNER) in response.body
+        assert config.read_saved_live_defaults() is None
+
+    def test_another_proposal_over_the_old_file_links_to_its_own_values(self):
+        # The dashboard's Save button proposes other values: the page says the
+        # save replaces the file with them, and links to the file's own
+        config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+        response = _get(_app(), "/confirm?" + _query())
+        assert response.status == 200
+        assert ("The saved live defaults were saved before Rebalance, so every live run "
+                "refuses them. Confirm and save replaces the file with the settings "
+                "below;") in response.body
+        assert _outdated_link() in _parse(response.body).links
+        assert _OUTDATED_CONFIRM_NOTICE not in response.body
+
+    def test_a_lower_cap_over_the_old_file_still_warns_it_sells_more(self):
+        # The held pairs were bought and trimmed under the old file's caps, so
+        # a save at a lower cap is compared with them (nothing counts as in
+        # force, yet the red sell-more warning still shows); the link that
+        # proposes exactly the old values shows none
+        config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+        app = _app()
+        query = _query(spread_max="0.8", k="0.7", size_cap="0.1", rebalance="on",
+                       min_price_move="0.1")
+        body = html.unescape(_get(app, "/confirm?" + query).body)
+        assert "these settings can sell more of the held pairs" in body
+        assert "the time-series size cap goes from 15% to 10%" in body
+        assert 'class="warn"' not in _get(app, _outdated_link()).body
+
+    def test_a_link_naming_some_fields_keeps_the_old_file_s_others(self):
+        # A link that leaves fields out keeps them as the old file had them
+        # (its sell rule, same-title cap, Rebalance and minimum), never the
+        # seed's, exactly as it keeps a usable saved file's: here an old file
+        # that only added to held pairs, which reads as Rebalance no
+        old = (_OLD_VERSION_BYTES
+               .replace(b'"same_title_size_cap": 0.2', b'"same_title_size_cap": 0.5')
+               .replace(b'"trim_to_kelly": true,\n    "trim_min_rise": 0.1',
+                        b'"trim_to_kelly": false,\n    "sell_at": 0.85,\n'
+                        b'    "sell_min_days": 7'))
+        config.LIVE_DEFAULTS_FILE.write_bytes(old)
+        with pytest.raises(config.LiveDefaultsOutdated) as caught:
+            config.read_saved_live_defaults()
+        assert caught.value.proposal.rebalance is False
+        app = _app()
+        query = _query(spread_max="0.8", k="0.7", size_cap="0.15")
+        response = _get(app, "/confirm?" + query)
+        page = _parse(response.body)
+        assert page.cells["rebalance"][2] == "no"
+        assert page.cells["same-title cap"][2] == "50%"
+        assert page.cells["sell at"][2] != "off"
+        posted = _post(app, _click(response.body, "confirm"))
+        assert posted.status == 303
+        saved = config.read_saved_live_defaults()
+        assert saved == caught.value.proposal
+        assert (saved.same_title_size_cap, saved.rebalance, saved.min_price_move,
+                saved.sell_at, saved.sell_min_days) == (0.5, False, None, 0.85, 7)
+
+    def test_an_old_file_whose_other_settings_are_refused_points_at_new_ones(self):
+        # The old minimum is off the 5c grid: there is no proposal, so the
+        # pages link to the seed values and say why
+        config.LIVE_DEFAULTS_FILE.write_bytes(
+            _OLD_VERSION_BYTES.replace(b'"trim_min_rise": 0.1', b'"trim_min_rise": 0.07'))
+        app = _app()
+        trade = _get(app, "/trade")
+        assert trade.status == 409
+        assert "/confirm?" + defaults_server._seed_query() in _parse(trade.body).links
+        assert "its other settings are refused too" in html.unescape(trade.body)
+        # The index shows the same notice, with the seed link
+        index = _get(app, "/")
+        assert index.status == 200
+        assert "/confirm?" + defaults_server._seed_query() in _parse(index.body).links
+        assert "its other settings are refused too" in html.unescape(index.body)
+        confirm = _get(app, "/confirm?" + _query())
+        assert confirm.status == 200
+        assert ("Confirm and save replaces the file with the settings below."
+                in html.unescape(confirm.body))
+        assert _post(app, _click(confirm.body, "confirm")).status == 303
+        assert config.read_saved_live_defaults() == _BASE_SETTINGS
+
+    def test_a_start_logs_where_to_save_it_again(self, run_main):
+        config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+        log = run_main["run"](["--no-browser"])
+        assert (f"open http://127.0.0.1:{PORT}{_outdated_link()} to review their values "
+                "(read as Rebalance yes and Min. price movement 10c) and save them; do not "
+                "delete the file") in log
+
+
 class TestSave:
     """POST /confirm with Confirm and save writes exactly what its page showed, after every check."""
 
@@ -2238,32 +2549,49 @@ class TestSeed:
         assert config.LIVE_DEFAULTS_SEED.sell_at is None
         assert config.LIVE_DEFAULTS_SEED.sell_min_days is None
 
-    def test_the_seed_query_spells_trimming_off(self):
-        pairs = dict(defaults_server._params(defaults_server._seed_query()))
-        assert pairs["trim_to_kelly"] == ["off"] and pairs["trim_min_rise"] == ["off"]
-        assert config.LIVE_DEFAULTS_SEED.trim_to_kelly is False
-        assert config.LIVE_DEFAULTS_SEED.trim_min_rise is None
+    def test_the_seed_query_spells_rebalancing_on_with_no_minimum(self):
+        params = defaults_server._params(defaults_server._seed_query())
+        assert params["rebalance"] == ["on"] and params["min_price_move"] == ["off"]
+        assert config.LIVE_DEFAULTS_SEED.rebalance is True
+        assert config.LIVE_DEFAULTS_SEED.min_price_move is None
+        # Every field the seed sets, in the server's field order, then its note
+        assert list(params) == ["tier_floors", "spread_min", "spread_max", "k", "size_cap",
+                                "same_title_size_cap", "rebalance", "min_price_move",
+                                "sell_at", "sell_min_days", "source"]
 
-    def test_the_seed_page_turns_off_trimming_that_is_saved(self):
-        # Over saved defaults that trim, the seed link turns trimming off:
-        # both rows change
-        _save(replace(config.LIVE_DEFAULTS_SEED, trim_to_kelly=True, trim_min_rise=0.25))
+    @pytest.mark.parametrize("saved, row, cells", [
+        (replace(config.LIVE_DEFAULTS_SEED, min_price_move=0.25),
+         "min price movement", ["25c", "any"]),
+        (replace(config.LIVE_DEFAULTS_SEED, rebalance=False), "rebalance", ["no", "yes"]),
+    ], ids=["a saved minimum", "rebalancing saved off"])
+    def test_the_seed_page_proposes_the_seed_s_rebalance_settings(self, saved, row, cells):
+        # Over saved defaults that differ only there, the seed link changes one row
+        _save(saved)
         response = _get(_app(), "/confirm?" + defaults_server._seed_query())
         page = _parse(response.body)
-        assert [label for label, css in page.rows.items() if css == "changed"] == [
-            "trim to Kelly", "min price rise"]
-        assert page.cells["trim to Kelly"][1:3] == ["on", "off"]
-        assert page.cells["min price rise"][1:3] == ["25c", "any"]
-        assert "2 of 12 settings change." in response.body
+        assert [label for label, css in page.rows.items() if css == "changed"] == [row]
+        assert page.cells[row][1:3] == cells
+        assert "1 of 11 settings change." in response.body
 
-    def test_a_seed_link_that_leaves_trimming_out_still_proposes_the_seed(self):
-        # Over defaults that trim, a seed link with no trim fields still
-        # proposes the seed (trimming off): it is not refused for the seed's note
-        # on other values, nor for a saved minimum kept with trimming off
-        _save(replace(config.LIVE_DEFAULTS_SEED, trim_to_kelly=True, trim_min_rise=0.25))
+    def test_a_file_with_rebalancing_off_leaves_its_key_out(self):
+        # A saved file that leaves rebalance out reads it as off; the writer
+        # leaves it out while it is off
+        _save(replace(config.LIVE_DEFAULTS_SEED, rebalance=False))
+        assert '"rebalance"' not in config.LIVE_DEFAULTS_FILE.read_text()
+        assert config.live_defaults().rebalance is False
+
+    @pytest.mark.parametrize("saved, row", [
+        (replace(config.LIVE_DEFAULTS_SEED, min_price_move=0.25), "min price movement"),
+        (replace(config.LIVE_DEFAULTS_SEED, rebalance=False), "rebalance"),
+    ], ids=["a saved minimum", "rebalancing saved off"])
+    def test_a_seed_link_that_leaves_rebalancing_out_still_proposes_the_seed(self, saved, row):
+        # A seed link with neither rebalance field still proposes the seed: it
+        # is not refused for the seed's note on other values, nor (with
+        # rebalancing kept on) for a saved minimum the seed does not set
+        _save(saved)
         stale = "&".join(part for part in defaults_server._seed_query().split("&")
-                         if not part.startswith(("trim_to_kelly=", "trim_min_rise=")))
-        assert "trim" not in stale and "source=" in stale
+                         if not part.startswith(("rebalance=", "min_price_move=")))
+        assert "rebalance" not in stale and "source=" in stale
         params = defaults_server._params(stale)
         assert defaults_server._proposal(params, config.read_saved_live_defaults()) == (
             config.LIVE_DEFAULTS_SEED, config.LIVE_DEFAULTS_SEED_SOURCE)
@@ -2271,16 +2599,13 @@ class TestSeed:
         response = _get(app, "/confirm?" + stale)
         assert response.status == 200
         page = _parse(response.body)
-        assert [label for label, css in page.rows.items() if css == "changed"] == [
-            "trim to Kelly", "min price rise"]
+        assert [label for label, css in page.rows.items() if css == "changed"] == [row]
         assert _post(app, _click(response.body, "confirm")).status == 303
         assert config.live_defaults() == config.LIVE_DEFAULTS_SEED
         # Control: the same link without the seed's note keeps what is saved
         plain = "&".join(part for part in stale.split("&") if not part.startswith("source="))
-        kept, _ = defaults_server._proposal(
-            defaults_server._params(plain),
-            replace(config.LIVE_DEFAULTS_SEED, trim_to_kelly=True, trim_min_rise=0.25))
-        assert (kept.trim_to_kelly, kept.trim_min_rise) == (True, 0.25)
+        kept, _ = defaults_server._proposal(defaults_server._params(plain), saved)
+        assert (kept.rebalance, kept.min_price_move) == (saved.rebalance, saved.min_price_move)
 
     def test_the_seed_page_turns_off_selling_that_is_saved(self):
         # The seed link names selling off, so it proposes exactly the seed over
@@ -2290,7 +2615,7 @@ class TestSeed:
         page = _parse(response.body)
         assert [label for label, css in page.rows.items() if css == "changed"] == [
             "sell at", "min days to maturity"]
-        assert "2 of 12 settings change." in response.body
+        assert "2 of 11 settings change." in response.body
 
     def test_a_seed_link_that_leaves_selling_out_still_proposes_the_seed(self):
         # A seed link from before selling existed (no sell fields), opened over
@@ -2317,47 +2642,6 @@ class TestSeed:
             defaults_server._params(plain),
             replace(config.LIVE_DEFAULTS_SEED, sell_at=0.85, sell_min_days=3))
         assert (kept.sell_at, kept.sell_min_days) == (0.85, 3)
-
-    def test_a_seven_toggle_file_is_proposed_the_seed_with_adding_on(self):
-        # A saved file that leaves the toggle out reads it as off; the seed
-        # page proposes it on, a change shown in its row
-        _save(replace(config.LIVE_DEFAULTS_SEED, add_to_held_pairs=False))
-        assert '"add_to_held_pairs"' not in config.LIVE_DEFAULTS_FILE.read_text()
-        response = _get(_app(), "/confirm?" + defaults_server._seed_query())
-        page = _parse(response.body)
-        assert [label for label, css in page.rows.items() if css == "changed"] == [
-            "add to held pairs"]
-        assert page.cells["add to held pairs"][1:3] == ["off", "on"]
-        assert "1 of 12 settings change." in response.body
-
-    def test_a_seed_link_that_leaves_out_adding_to_held_pairs_still_proposes_the_seed(self):
-        # A seed link without the add_to_held_pairs field, opened while a file
-        # with it off is saved: it proposes exactly the seed (the choice on),
-        # shown as a change, and saves it; it is never refused for putting the
-        # seed's note on other values
-        _save(replace(config.LIVE_DEFAULTS_SEED, add_to_held_pairs=False))
-        query = defaults_server._seed_query()
-        stale = "&".join(part for part in query.split("&")
-                         if not part.startswith("add_to_held_pairs="))
-        assert stale != query
-        params = defaults_server._params(stale)
-        assert defaults_server._proposal(params, config.read_saved_live_defaults()) == (
-            config.LIVE_DEFAULTS_SEED, config.LIVE_DEFAULTS_SEED_SOURCE)
-        app = _app()
-        response = _get(app, "/confirm?" + stale)
-        assert response.status == 200
-        page = _parse(response.body)
-        assert [label for label, css in page.rows.items() if css == "changed"] == [
-            "add to held pairs"]
-        assert page.cells["add to held pairs"][1:3] == ["off", "on"]
-        assert _post(app, _click(response.body, "confirm")).status == 303
-        assert config.live_defaults() == config.LIVE_DEFAULTS_SEED
-        # Control: the same link without the seed's note keeps what is saved
-        plain = "&".join(part for part in stale.split("&") if not part.startswith("source="))
-        assert defaults_server._proposal(
-            defaults_server._params(plain),
-            replace(config.LIVE_DEFAULTS_SEED, add_to_held_pairs=False),
-        )[0].add_to_held_pairs is False
 
     def test_confirming_the_seed_saves_it(self):
         app = _app()
@@ -2818,35 +3102,36 @@ class TestActions:
         assert "--no-sell" in argv and "--no-sell-min-days" in argv
         assert not any(arg.startswith(("--sell-at", "--sell-min-days")) for arg in argv)
 
-    def test_confirming_trimming_saves_it_and_a_run_is_started_with_its_flags(self):
+    def test_confirming_rebalancing_saves_it_and_a_run_is_started_with_its_flags(self):
         starter = _Starter()
         app = _app(start_process=starter)
-        form = _page_form(app, _query(trim_to_kelly="on", trim_min_rise="0.1"), "confirm-trade")
+        form = _page_form(app, _query(rebalance="on", min_price_move="0.1"), "confirm-trade")
         # The page carried both fields, as the link named them
-        assert ("trim_to_kelly", "on") in form and ("trim_min_rise", "0.1") in form
+        assert ("rebalance", "on") in form and ("min_price_move", "0.1") in form
         run_id = _run_id(_post(app, form))
         saved = config.read_saved_live_defaults()
-        assert (saved.trim_to_kelly, saved.trim_min_rise) == (True, 0.10)
-        # The two keys are the file's last, in field order
+        assert (saved.rebalance, saved.min_price_move) == (True, 0.10)
+        # With no selling, the two keys are the file's last, in field order
         text = config.LIVE_DEFAULTS_FILE.read_text()
-        assert text.rstrip().endswith('"trim_to_kelly": true,\n    "trim_min_rise": 0.1\n  }\n}')
+        assert text.rstrip().endswith('"rebalance": true,\n    "min_price_move": 0.1\n  }\n}')
         [(argv, _)] = starter.calls
         assert argv[5:-2] == config.live_settings_argv(saved)
-        assert "--trim-to-kelly" in argv and "--trim-min-rise=10" in argv
-        assert "--no-trim-to-kelly" not in argv and "--no-trim-min-rise" not in argv
+        assert "--rebalance" in argv and "--min-price-move=10" in argv
+        assert "--no-rebalance" not in argv and "--no-min-price-move" not in argv
         record = json.loads((_run_folder(run_id) / "run.json").read_text())
-        assert record["settings"].endswith("trim to Kelly on | min price rise 10c")
+        assert "rebalance yes | min price movement 10c | sell at off" in record["settings"]
 
-    def test_a_run_from_defaults_that_do_not_trim_says_so_in_its_flags(self):
+    def test_a_run_from_defaults_that_do_not_rebalance_says_so_in_its_flags(self):
         starter = _Starter()
         app = _app(start_process=starter)
-        _post(app, _page_form(app, _query(), "confirm-trade"))
+        _post(app, _page_form(app, _query(rebalance="off"), "confirm-trade"))
         [(argv, _)] = starter.calls
-        assert "--no-trim-to-kelly" in argv and "--no-trim-min-rise" in argv
-        assert "--trim-to-kelly" not in argv
-        assert not any(arg.startswith("--trim-min-rise") for arg in argv)
-        # ... and the saved file, with trimming off, names neither key
-        assert "trim" not in config.LIVE_DEFAULTS_FILE.read_text()
+        assert "--no-rebalance" in argv and "--no-min-price-move" in argv
+        assert "--rebalance" not in argv
+        assert not any(arg.startswith("--min-price-move") for arg in argv)
+        # ... and the saved file, with rebalancing off, names neither key
+        text = config.LIVE_DEFAULTS_FILE.read_text()
+        assert "rebalance" not in text and "min_price_move" not in text
 
     def test_trade_saves_then_starts_exactly_the_page_s_settings(self):
         starter = _Starter()
@@ -2854,16 +3139,16 @@ class TestActions:
         form = _page_form(app, _query(k="0.75", category="Sports"), "confirm-trade")
         run_id = _run_id(_post(app, form))
         saved = config.read_saved_live_defaults()
-        # Nothing was saved before, so adding to held pairs is the seed's (on)
+        # Nothing was saved before, so rebalancing is the seed's (on)
         assert saved == LiveSettings(False, (0.0, 0.5), 0.75, 0.1, 0.2, ("Sports",),
-                                     add_to_held_pairs=True)
+                                     rebalance=True)
         folder = _run_folder(run_id)
         [(argv, kwargs)] = starter.calls
         assert argv == [sys.executable, "-m", "kalshi_betting.main", "--mode", "prod",
                         *config.live_settings_argv(saved), "--result-file",
                         str(folder / "result.json")]
-        # Adding to held pairs is spelled out, so the saved file never decides it
-        assert "--add-to-held-pairs" in argv
+        # Rebalancing is spelled out, so the saved file never decides it
+        assert "--rebalance" in argv
         assert kwargs["cwd"] == config.PROJECT_ROOT
         assert kwargs["start_new_session"] is True
         assert kwargs["stdin"] is subprocess.DEVNULL

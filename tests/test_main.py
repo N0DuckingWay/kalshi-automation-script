@@ -361,7 +361,7 @@ class TestNoPairsMsg:
 @pytest.fixture
 def pinned_config_toggles(monkeypatch, _isolate_live_defaults):
     """
-    Pin the twelve live toggles and save them as this test's live defaults.
+    Pin the eleven live toggles and save them as this test's live defaults.
 
     Through conftest's apply_pre_toggle_defaults, the one definition of their
     values, then save_config_live_defaults into the test's own path (requested
@@ -508,11 +508,10 @@ class TestLiveSettingsFlags:
         (["--category", "Economics", "--category", " Sports "], "categories",
          ("Economics", "Sports")),
         (["--tag", "Oil & Gas"], "tags", ("Oil & Gas",)),
-        (["--add-to-held-pairs"], "add_to_held_pairs", True),
+        (["--rebalance"], "rebalance", True),
         (["--sell-at", "85"], "sell_at", 0.85),
         (["--sell-at", "1"], "sell_at", 0.01),
         (["--sell-at", "100"], "sell_at", 1.0),
-        (["--trim-to-kelly"], "trim_to_kelly", True),
     ])
     def test_each_flag_overrides_only_its_own_field(self, monkeypatch, mode, argv, field, value):
         seen = _main_with(monkeypatch, ["--mode", mode, *argv])
@@ -525,18 +524,17 @@ class TestLiveSettingsFlags:
             if other != field:
                 assert getattr(settings, other) == getattr(reference, other), other
 
-    def test_no_add_to_held_pairs_turns_a_saved_on_off_for_one_run(self, monkeypatch):
+    def test_no_rebalance_turns_a_saved_on_off_for_one_run(self, monkeypatch):
         # The --no- form departs only from defaults saved with it on
-        _save_live_defaults(add_to_held_pairs=True)
-        seen = _main_with(monkeypatch, ["--mode", "prod", "--no-add-to-held-pairs"])
-        assert seen["reference"].add_to_held_pairs is True
-        assert seen["settings"].add_to_held_pairs is False
-        assert seen["settings"] == dataclasses.replace(seen["reference"],
-                                                       add_to_held_pairs=False)
+        _save_live_defaults(rebalance=True)
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--no-rebalance"])
+        assert seen["reference"].rebalance is True
+        assert seen["settings"].rebalance is False
+        assert seen["settings"] == dataclasses.replace(seen["reference"], rebalance=False)
         line = describe_live_settings(seen["settings"], seen["reference"])
-        assert "add to held pairs off (default: on)" in line and line.count("(default:") == 1
+        assert "rebalance no (default: yes)" in line and line.count("(default:") == 1
         # No flag keeps the saved value
-        assert _main_with(monkeypatch, ["--mode", "prod"])["settings"].add_to_held_pairs is True
+        assert _main_with(monkeypatch, ["--mode", "prod"])["settings"].rebalance is True
 
     @pytest.mark.parametrize("mode", ["dev", "prod"])
     @pytest.mark.parametrize("argv, saved, expected", [
@@ -662,88 +660,88 @@ class TestLiveSettingsFlags:
     @pytest.mark.parametrize("mode", ["dev", "prod"])
     @pytest.mark.parametrize("argv, saved, expected", [
         # The switch alone, over nothing saved and over a saved on
-        (["--trim-to-kelly"], {}, {"trim_to_kelly": True}),
-        (["--trim-to-kelly"], {"trim_to_kelly": True}, {"trim_to_kelly": True}),
+        (["--rebalance"], {}, {"rebalance": True}),
+        (["--rebalance"], {"rebalance": True}, {"rebalance": True}),
         # The switch keeps a saved minimum; a minimum keeps the saved switch
-        (["--trim-to-kelly"], {"trim_to_kelly": True, "trim_min_rise": 0.25},
-         {"trim_to_kelly": True, "trim_min_rise": 0.25}),
-        (["--trim-min-rise", "10"], {"trim_to_kelly": True},
-         {"trim_to_kelly": True, "trim_min_rise": 0.10}),
-        (["--trim-min-rise", "10"], {"trim_to_kelly": True, "trim_min_rise": 0.25},
-         {"trim_to_kelly": True, "trim_min_rise": 0.10}),
+        (["--rebalance"], {"rebalance": True, "min_price_move": 0.25},
+         {"rebalance": True, "min_price_move": 0.25}),
+        (["--min-price-move", "10"], {"rebalance": True},
+         {"rebalance": True, "min_price_move": 0.10}),
+        (["--min-price-move", "10"], {"rebalance": True, "min_price_move": 0.25},
+         {"rebalance": True, "min_price_move": 0.10}),
         # Both given, over nothing saved; whole cents read as dollars
-        (["--trim-to-kelly", "--trim-min-rise", "10"], {},
-         {"trim_to_kelly": True, "trim_min_rise": 0.10}),
-        (["--trim-to-kelly", "--trim-min-rise", "5"], {},
-         {"trim_to_kelly": True, "trim_min_rise": 0.05}),
-        (["--trim-to-kelly", "--trim-min-rise", "15"], {},
-         {"trim_to_kelly": True, "trim_min_rise": 0.15}),
-        (["--trim-to-kelly", "--trim-min-rise", "100"], {},
-         {"trim_to_kelly": True, "trim_min_rise": 1.0}),
-        # --no-trim-min-rise keeps the switch; --no-trim-to-kelly clears both
-        (["--no-trim-min-rise"], {"trim_to_kelly": True, "trim_min_rise": 0.25},
-         {"trim_to_kelly": True}),
-        (["--no-trim-to-kelly"], {"trim_to_kelly": True, "trim_min_rise": 0.25}, {}),
-        (["--no-trim-to-kelly"], {"trim_to_kelly": True}, {}),
-        (["--no-trim-to-kelly", "--no-trim-min-rise"],
-         {"trim_to_kelly": True, "trim_min_rise": 0.25}, {}),
+        (["--rebalance", "--min-price-move", "10"], {},
+         {"rebalance": True, "min_price_move": 0.10}),
+        (["--rebalance", "--min-price-move", "5"], {},
+         {"rebalance": True, "min_price_move": 0.05}),
+        (["--rebalance", "--min-price-move", "15"], {},
+         {"rebalance": True, "min_price_move": 0.15}),
+        (["--rebalance", "--min-price-move", "100"], {},
+         {"rebalance": True, "min_price_move": 1.0}),
+        # --no-min-price-move keeps the switch; --no-rebalance clears both
+        (["--no-min-price-move"], {"rebalance": True, "min_price_move": 0.25},
+         {"rebalance": True}),
+        (["--no-rebalance"], {"rebalance": True, "min_price_move": 0.25}, {}),
+        (["--no-rebalance"], {"rebalance": True}, {}),
+        (["--no-rebalance", "--no-min-price-move"],
+         {"rebalance": True, "min_price_move": 0.25}, {}),
         # ... and with nothing saved they change nothing
-        (["--no-trim-to-kelly"], {}, {}),
-        (["--no-trim-min-rise"], {}, {}),
+        (["--no-rebalance"], {}, {}),
+        (["--no-min-price-move"], {}, {}),
     ])
-    def test_the_trim_flags_lay_over_the_saved_switch_and_minimum(
+    def test_the_rebalance_flags_lay_over_the_saved_switch_and_minimum(
         self, monkeypatch, mode, argv, saved, expected,
     ):
         _save_live_defaults(**saved)
         seen = _main_with(monkeypatch, ["--mode", mode, *argv])
         assert seen["code"] == EXIT_OK and seen["mode"] == mode
         settings, reference = seen["settings"], seen["reference"]
-        assert (reference.trim_to_kelly, reference.trim_min_rise) == (
-            saved.get("trim_to_kelly", False), saved.get("trim_min_rise"))
-        assert (settings.trim_to_kelly, settings.trim_min_rise) == (
-            expected.get("trim_to_kelly", False), expected.get("trim_min_rise"))
-        # Nothing but the two trim settings moved
+        assert (reference.rebalance, reference.min_price_move) == (
+            saved.get("rebalance", False), saved.get("min_price_move"))
+        assert (settings.rebalance, settings.min_price_move) == (
+            expected.get("rebalance", False), expected.get("min_price_move"))
+        # Nothing but the two rebalance settings moved
         for other in config.LIVE_TOGGLE_FIELDS:
-            if other not in ("trim_to_kelly", "trim_min_rise"):
+            if other not in ("rebalance", "min_price_move"):
                 assert getattr(settings, other) == getattr(reference, other), other
 
-    def test_no_trim_to_kelly_turns_a_saved_on_off_for_one_run_and_marks_it(self, monkeypatch):
-        _save_live_defaults(trim_to_kelly=True, trim_min_rise=0.10)
-        seen = _main_with(monkeypatch, ["--mode", "prod", "--no-trim-to-kelly"])
+    def test_no_rebalance_clears_a_saved_minimum_for_one_run_and_marks_both(self, monkeypatch):
+        _save_live_defaults(rebalance=True, min_price_move=0.10)
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--no-rebalance"])
         assert seen["settings"] == dataclasses.replace(
-            seen["reference"], trim_to_kelly=False, trim_min_rise=None)
+            seen["reference"], rebalance=False, min_price_move=None)
         line = describe_live_settings(seen["settings"], seen["reference"])
-        assert "trim to Kelly off (default: on)" in line
-        assert "min price rise any (default: 10c)" in line
+        assert "rebalance no (default: yes)" in line
+        assert "min price movement any (default: 10c)" in line
         assert line.count("(default:") == 2
         # No flag keeps the saved switch and minimum
         kept = _main_with(monkeypatch, ["--mode", "prod"])["settings"]
-        assert (kept.trim_to_kelly, kept.trim_min_rise) == (True, 0.10)
+        assert (kept.rebalance, kept.min_price_move) == (True, 0.10)
 
     @pytest.mark.parametrize("argv, saved, words", [
-        # A minimum needs trimming on: none saved, none given, or
-        # --no-trim-to-kelly turning it off
-        (["--trim-min-rise", "10"], {},
-         ["(--trim-min-rise):", "trim_min_rise needs trim_to_kelly on"]),
-        (["--no-trim-to-kelly", "--trim-min-rise", "10"], {"trim_to_kelly": True},
-         ["(--trim-to-kelly/--no-trim-to-kelly, --trim-min-rise):",
-          "trim_min_rise needs trim_to_kelly on"]),
-        (["--no-trim-to-kelly", "--trim-min-rise", "10"],
-         {"trim_to_kelly": True, "trim_min_rise": 0.25},
-         ["trim_min_rise needs trim_to_kelly on"]),
+        # A minimum needs rebalancing on: none saved, none given, or
+        # --no-rebalance turning it off
+        (["--min-price-move", "10"], {},
+         ["(--min-price-move):", "min_price_move needs rebalance on"]),
+        (["--no-rebalance", "--min-price-move", "10"], {"rebalance": True},
+         ["(--rebalance/--no-rebalance, --min-price-move):",
+          "min_price_move needs rebalance on"]),
+        (["--no-rebalance", "--min-price-move", "10"],
+         {"rebalance": True, "min_price_move": 0.25},
+         ["min_price_move needs rebalance on"]),
         # A minimum off the 5c grid, or outside 5c to $1
-        (["--trim-to-kelly", "--trim-min-rise", "7"], {},
-         ["--trim-min-rise", "trim_min_rise must be a multiple of 5c from 5c to $1"]),
-        (["--trim-to-kelly", "--trim-min-rise", "0"], {},
-         ["--trim-min-rise", "trim_min_rise must be a multiple of 5c from 5c to $1"]),
-        (["--trim-to-kelly", "--trim-min-rise", "105"], {},
-         ["--trim-min-rise", "trim_min_rise must be a multiple of 5c from 5c to $1"]),
-        (["--trim-min-rise", "-5"], {"trim_to_kelly": True},
-         ["--trim-min-rise", "trim_min_rise must be a multiple of 5c from 5c to $1"]),
-        (["--trim-min-rise", "1"], {"trim_to_kelly": True},
-         ["--trim-min-rise", "trim_min_rise must be a multiple of 5c from 5c to $1"]),
+        (["--rebalance", "--min-price-move", "7"], {},
+         ["--min-price-move", "min_price_move must be a multiple of 5c from 5c to $1"]),
+        (["--rebalance", "--min-price-move", "0"], {},
+         ["--min-price-move", "min_price_move must be a multiple of 5c from 5c to $1"]),
+        (["--rebalance", "--min-price-move", "105"], {},
+         ["--min-price-move", "min_price_move must be a multiple of 5c from 5c to $1"]),
+        (["--min-price-move", "-5"], {"rebalance": True},
+         ["--min-price-move", "min_price_move must be a multiple of 5c from 5c to $1"]),
+        (["--min-price-move", "1"], {"rebalance": True},
+         ["--min-price-move", "min_price_move must be a multiple of 5c from 5c to $1"]),
     ])
-    def test_a_trim_flag_the_settings_refuse_is_a_usage_error(
+    def test_a_rebalance_flag_the_settings_refuse_is_a_usage_error(
         self, monkeypatch, capsys, argv, saved, words,
     ):
         _save_live_defaults(**saved)
@@ -756,47 +754,47 @@ class TestLiveSettingsFlags:
         for word in words:
             assert word in err, (word, err)
 
-    def test_a_minimum_rise_flag_names_its_own_unit(self, monkeypatch, capsys):
-        seen = _main_with(monkeypatch, ["--mode", "prod", "--trim-to-kelly",
-                                        "--trim-min-rise", "7"])
+    def test_a_minimum_move_flag_names_its_own_unit(self, monkeypatch, capsys):
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--rebalance",
+                                        "--min-price-move", "7"])
         assert seen["code"] == 2
         err = " ".join(capsys.readouterr().err.split())
         step = config.PRICE_MOVE_STEP_CENTS
-        assert (f"(--trim-min-rise takes whole cents, a multiple of {step} from {step} to "
+        assert (f"(--min-price-move takes whole cents, a multiple of {step} from {step} to "
                 "100, read as that many cents / 100 dollars)") in err, err
         # Not the percent note the cap and sell-level flags carry
         assert "whole percent" not in err, err
         # Given only the switch, which takes no number, a refused run says nothing about cents
-        _save_live_defaults(trim_to_kelly=True, trim_min_rise=0.25)
-        seen = _main_with(monkeypatch, ["--mode", "prod", "--no-trim-to-kelly",
+        _save_live_defaults(rebalance=True, min_price_move=0.25)
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--no-rebalance",
                                         "--spread-max", "0"])
         assert seen["code"] == 2
         assert "whole cents" not in capsys.readouterr().err
 
     @pytest.mark.parametrize("argv", [
-        ["--trim-min-rise", "12.5"], ["--trim-min-rise", "0.1"], ["--trim-min-rise", "ten"],
-        ["--trim-min-rise", "10c"],
+        ["--min-price-move", "12.5"], ["--min-price-move", "0.1"], ["--min-price-move", "ten"],
+        ["--min-price-move", "10c"],
     ])
-    def test_a_fractional_or_non_numeric_minimum_rise_is_a_usage_error(
+    def test_a_fractional_or_non_numeric_minimum_move_is_a_usage_error(
         self, monkeypatch, capsys, argv,
     ):
         # Whole cents only (argparse's int check): a dollar figure like 0.1 is
         # refused, never read as a tenth of a cent
-        _save_live_defaults(trim_to_kelly=True)
+        _save_live_defaults(rebalance=True)
         seen = _main_with(monkeypatch, ["--mode", "prod", *argv])
         assert seen["code"] == 2
         assert not seen["logging_set_up"] and not seen["client_built"]
         assert "invalid int value" in capsys.readouterr().err
 
-    def test_a_minimum_rise_and_its_off_twin_are_mutually_exclusive(self, monkeypatch, capsys):
-        _save_live_defaults(trim_to_kelly=True)
-        seen = _main_with(monkeypatch, ["--mode", "prod", "--trim-min-rise", "10",
-                                        "--no-trim-min-rise"])
+    def test_a_minimum_move_and_its_off_twin_are_mutually_exclusive(self, monkeypatch, capsys):
+        _save_live_defaults(rebalance=True)
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--min-price-move", "10",
+                                        "--no-min-price-move"])
         assert seen["code"] == 2
         assert not seen["logging_set_up"] and not seen["client_built"]
         err = capsys.readouterr().err
         assert "not allowed with argument" in err, err
-        assert "--trim-min-rise" in err and "--no-trim-min-rise" in err
+        assert "--min-price-move" in err and "--no-min-price-move" in err
 
     def test_no_flag_hands_the_run_the_saved_defaults_themselves(self, monkeypatch):
         # The scheduler's exact argv (tests/test_scheduler.py pins it)
@@ -1089,14 +1087,16 @@ class TestLiveSettingsFlags:
         out = " ".join(capsys.readouterr().out.split())
         for flag in ("--tier-floors", "--no-tier-floors", "--spread-min", "--spread-max",
                      "--interval-discount", "--size-cap", "--same-title-size-cap",
-                     "--add-to-held-pairs", "--no-add-to-held-pairs",
+                     "--rebalance", "--no-rebalance", "--min-price-move",
+                     "--no-min-price-move",
                      "--sell-at", "--no-sell", "--sell-min-days", "--no-sell-min-days",
-                     "--trim-to-kelly", "--no-trim-to-kelly", "--trim-min-rise",
-                     "--no-trim-min-rise",
                      "--category", "--any-category", "--tag", "--any-tag"):
             assert flag in out, flag
+        # None of the flags the rebalance flags replaced is left
+        for gone in ("--add-to-held-pairs", "--trim-to-kelly", "--trim-min-rise"):
+            assert gone not in out, gone
         # Every value flag defaults to the saved live defaults, never a config.py constant
-        assert out.count("default: the saved live defaults") == 13
+        assert out.count("default: the saved live defaults") == 12
         assert out.count("whatever the saved live defaults say") == 5
         # --category and --tag each replace the whole saved list, and say so
         assert "Replaces every saved category for this run" in out
@@ -1107,7 +1107,7 @@ class TestLiveSettingsFlags:
         assert "config.TIME_SERIES" not in out and "config.TRADE" not in out
         assert "config.BUDGET_FRACTION" not in out and "config.SAME_TITLE" not in out
         assert ("Override one live default for THIS run only, in either mode "
-                "(adding to held pairs, selling and trimming: production runs only). The live "
+                "(rebalancing and selling: production runs only). The live "
                 "defaults are the ones saved through python3 -m "
                 "kalshi_betting.defaults_server (live_defaults.json); a run refuses to "
                 "start without them. The weekly scheduler passes none of these flags, so "
@@ -1115,13 +1115,15 @@ class TestLiveSettingsFlags:
         assert out.count(f"in {config.SIZE_CAP_STEP * 100:g}% steps") == 2
         assert "100 = no cap" in out
         assert "100 = no extra cap beyond --size-cap" in out
-        # The two cap flags and k's flag warn that, with the Kelly trim on, they can sell
+        # The two cap flags and k's flag warn that, with Rebalance yes, they can sell
         assert out.count("a lower cap also sells: each exact held") == 2
         assert out.count("a higher k also sells: each exact held") == 1
         assert out.count("worth more than its new Kelly size is sold down to it before "
                          "anything is bought, once its wait has passed") == 3
+        assert out.count("With Rebalance yes (saved, or given with --rebalance), a ") == 3
         assert "Production runs only: a dev run holds nothing" in out
-        assert "config.ADD_TO_HELD_PAIRS" not in out
+        # The constant itself is never named (its wait's constant is, above)
+        assert not re.search(r"config\.REBALANCE\b", out)
         # The sell flags: a whole percent from 1 to 100 (argparse %-formats help,
         # so the "%%" is pinned too), and their off twins
         assert ("Sell a held position once it has stayed at or above PCT% of its potential profit "
@@ -1130,19 +1132,21 @@ class TestLiveSettingsFlags:
         assert "Sell nothing this run, whatever the saved live defaults say" in out
         assert "Sell a position only while at least N days (1 or more) remain" in out
         assert "config.SELL_AT" not in out and "config.SELL_MIN_DAYS" not in out
-        # The trim flags. argparse may wrap a flag's name at a hyphen, so the
-        # pinned words stop short of one
-        assert ("before buying, sell part of each exact held pair that has outgrown its "
-                "Kelly size, once config.REBALANCE_MIN_DAYS_SINCE_TRADE calendar days have "
-                "passed since the pair's last trade.") in out
-        assert "sets it off and clears the saved minimum price rise too." in out
+        # The rebalance flags. argparse may wrap a flag's name at a hyphen, so
+        # the pinned words stop short of one
+        assert ("Rebalance the held pairs this run: before buying, sell part of each exact "
+                "held pair that has outgrown its Kelly size, once "
+                "config.REBALANCE_MIN_DAYS_SINCE_TRADE calendar days have passed since the "
+                "pair's last trade, and let this run add to a pair the account already "
+                "holds") in out
+        assert ("neither trims nor adds to a held pair, and clears the saved minimum price "
+                "move too.") in out
         assert "no run acts on it" not in out
         step = config.PRICE_MOVE_STEP_CENTS
-        assert (f"a multiple of {step} from {step} to 100. Needs the Kelly trim on, saved or "
+        assert (f"a multiple of {step} from {step} to 100. Needs rebalancing on, saved or "
                 "given with") in out
-        assert ("Set no minimum price rise for the Kelly trim this run, whatever the saved "
-                "live defaults say") in out
-        assert "config.TRIM_TO_KELLY" not in out and "config.TRIM_MIN_RISE" not in out
+        assert "Set no minimum price move this run, whatever the saved live defaults say" in out
+        assert "config.MIN_PRICE_MOVE" not in out
         assert "live trading toggles" in out
 
     def test_the_echo_marks_exactly_the_departing_fields(self, monkeypatch):
@@ -1212,16 +1216,16 @@ class TestLogLiveSettings:
                                 "same-title cap 15% (default: 100% (no extra cap))"),
         "categories": (["--category", "Economics"], "categories Economics (default: any)"),
         "tags": (["--tag", "Oil & Gas"], "tags Oil & Gas (default: any)"),
-        "add_to_held_pairs": (["--add-to-held-pairs"], "add to held pairs on (default: off)"),
+        "rebalance": (["--rebalance"], "rebalance yes (default: no)"),
+        "min_price_move": (["--min-price-move", "10"],
+                           "min price movement 10c (default: any)"),
         "sell_at": (["--sell-at", "85"], "sell at 85% of potential profit (default: off)"),
         "sell_min_days": (["--sell-min-days", "3"], "min days to maturity 3 (default: any)"),
-        "trim_to_kelly": (["--trim-to-kelly"], "trim to Kelly on (default: off)"),
-        "trim_min_rise": (["--trim-min-rise", "10"], "min price rise 10c (default: any)"),
     }
     # Extra saved defaults a flag needs: a minimum of days needs a sell level,
-    # a minimum price rise needs trimming on
+    # a minimum price move needs rebalancing on
     _SAVED_FOR_FIELD = {"sell_min_days": {"sell_at": 0.85},
-                        "trim_min_rise": {"trim_to_kelly": True}}
+                        "min_price_move": {"rebalance": True}}
 
     def test_every_field_has_a_departing_flag(self):
         # A new toggle needs a row, so its departure WARNING is tested
@@ -1339,16 +1343,16 @@ class TestLogLiveSettings:
         ({"interval_discount": 0.9}, "k goes from 0.8 to 0.9, which lowers a time-series "
                                      "pair's chance of paying"),
     ], ids=["per-trade cap", "same-title cap", "k"])
-    def test_with_trimming_on_a_lower_cap_or_a_higher_k_is_said_to_sell(self, caplog, change,
-                                                                        named):
+    def test_with_rebalancing_on_a_lower_cap_or_a_higher_k_is_said_to_sell(self, caplog,
+                                                                           change, named):
         # A real-money run whose flags lower a cap or raise k warns that it can sell
-        saved = LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, trim_to_kelly=True,
+        saved = LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, rebalance=True,
                              origin=self._ORIGIN)
         with caplog.at_level(logging.INFO):
             main._log_live_settings(dataclasses.replace(saved, **change), saved,
                                     real_money=True)
         assert self._trim_lines(caplog) == [
-            "Live settings: with the Kelly trim on, these settings can sell more of the held "
+            "Live settings: with Rebalance yes, these settings can sell more of the held "
             f"pairs: {named}; each exact held pair worth more than its new Kelly size is sold "
             "down to it before anything is bought, once the wait since its last trade has "
             "passed"]
@@ -1358,23 +1362,23 @@ class TestLogLiveSettings:
             i for i, w in enumerate(warnings) if "PRODUCTION run overrides" in w][0]
 
     @pytest.mark.parametrize("saved, run, real_money", [
-        # Trimming off: a lower cap only makes purchases smaller
+        # Rebalancing off: a lower cap only makes purchases smaller
         (LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2),
          LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2), True),
         # A cap raised, and k lowered: nothing more is sold
-        (LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, trim_to_kelly=True),
-         LiveSettings(False, (0.0, 0.5), 0.8, 0.3, 0.2, trim_to_kelly=True), True),
-        (LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, trim_to_kelly=True),
-         LiveSettings(False, (0.0, 0.5), 0.7, 0.2, 0.2, trim_to_kelly=True), True),
+        (LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, rebalance=True),
+         LiveSettings(False, (0.0, 0.5), 0.8, 0.3, 0.2, rebalance=True), True),
+        (LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, rebalance=True),
+         LiveSettings(False, (0.0, 0.5), 0.7, 0.2, 0.2, rebalance=True), True),
         # A lower same-title cap the per-trade cap already holds below
-        (LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 1.0, trim_to_kelly=True),
-         LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.5, trim_to_kelly=True), True),
+        (LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 1.0, rebalance=True),
+         LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.5, rebalance=True), True),
         # The seed, as saved and run
         (config.LIVE_DEFAULTS_SEED, config.LIVE_DEFAULTS_SEED, True),
         # A dry run sends no order
-        (LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, trim_to_kelly=True),
-         LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, trim_to_kelly=True), False),
-    ], ids=["trimming off", "cap raised", "k lowered", "same-title cap held below",
+        (LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, rebalance=True),
+         LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True), False),
+    ], ids=["rebalancing off", "cap raised", "k lowered", "same-title cap held below",
             "seed", "dry run"])
     def test_nothing_is_said_when_no_more_is_sold(self, caplog, saved, run, real_money):
         with caplog.at_level(logging.INFO):
@@ -1407,7 +1411,8 @@ def _saved_record(**toggles) -> str:
 
 class TestLiveDefaultsRequired:
     """A live run starts only from the saved live defaults: with none saved, or
-    a saved file refused, main() exits 2 (parser.error) in either mode, with or
+    a saved file refused (an older version's included), main() exits 2
+    (parser.error) in either mode, with or
     without a toggle flag, before logging is configured, any client is built or
     either run mode runs — and never falls back to config.py's toggles."""
 
@@ -1460,6 +1465,37 @@ class TestLiveDefaultsRequired:
         # fix it, or delete it first
         assert "fix the file, or delete it and then save new ones" in err
         assert "the server will not save over a file it refuses" in err
+
+    @pytest.mark.parametrize("mode", ["dev", "prod"])
+    @pytest.mark.parametrize("flags", [[], ["--rebalance", "--min-price-move", "10"]])
+    def test_a_file_an_older_version_saved_exits_2_with_the_remedy(
+        self, monkeypatch, capsys, mode, flags,
+    ):
+        # A file holding the settings Rebalance replaced is never traded, not
+        # even read as their new form or with every new flag given: the run
+        # stops before logging or any client, saying how to save it again, and
+        # leaves it in place for the defaults server to offer
+        record = json.loads(_saved_record())
+        for name in ("rebalance", "min_price_move"):
+            record["settings"].pop(name, None)
+        record["settings"].update(add_to_held_pairs=True, trim_to_kelly=True,
+                                  trim_min_rise=0.1)
+        text = json.dumps(record)
+        config.LIVE_DEFAULTS_FILE.write_text(text, encoding="utf-8")
+        seen = _main_with(monkeypatch, ["--mode", mode, *flags])
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "settings" not in seen
+        err = " ".join(capsys.readouterr().err.split())
+        assert "the saved live defaults are out of date, and no run trades them" in err
+        assert str(config.LIVE_DEFAULTS_FILE) in err
+        assert ('"settings" holds add_to_held_pairs, trim_to_kelly and trim_min_rise, which '
+                "rebalance and min_price_move replaced: save the live defaults again (start "
+                "./start_dashboard.sh; its pages offer them as rebalance yes, min price "
+                "movement 10c)") in err
+        assert "do not delete the file: a Confirm and save on those pages replaces it" in err
+        assert "fix the file, or delete it" not in err
+        assert config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8") == text
 
     def test_an_invalid_config_constant_does_not_stop_a_run_with_a_saved_file(
         self, monkeypatch, saved_live_defaults,
@@ -3067,7 +3103,7 @@ class TestSeriesLabelsAreAttached:
         client = _live_shape_client(monkeypatch, balance_payload=balance,
                                     include_time_series=True)
         events = self._spy(monkeypatch)
-        settings = dataclasses.replace(live_settings(), trim_to_kelly=True)
+        settings = dataclasses.replace(live_settings(), rebalance=True)
         with caplog.at_level(logging.INFO):
             main._run_prod(client, _args(dry_run=True), settings)
         # One read, with the run's own client
@@ -3511,15 +3547,14 @@ class TestLiveSettingsReachEverySite:
     twice: with config.py's toggles as the reference, and with _SETTINGS saved as the
     live defaults and resolved as main() resolves them. _SETTINGS keeps both pairs
     trading (the time-series pair's Kelly fraction sits between the 0.25 same-title
-    and 0.35 per-trade caps) and turns trimming on; both seller planners get the
-    run's settings too."""
+    and 0.35 per-trade caps) and turns rebalancing on; both seller planners get
+    the run's settings too."""
 
     _SETTINGS = LiveSettings(tier_floors=False, spread_band=(0.05, 0.9),
                              interval_discount=0.6, size_cap=0.35, same_title_size_cap=0.25,
                              categories=("economics", "POLITICS"),
-                             tags=("Inflation", "elections"), add_to_held_pairs=True,
-                             sell_at=0.85, sell_min_days=3,
-                             trim_to_kelly=True, trim_min_rise=0.10)
+                             tags=("Inflation", "elections"), rebalance=True,
+                             min_price_move=0.10, sell_at=0.85, sell_min_days=3)
 
     # The cached /series listing. Each same-title pair's two series are filed
     # alike, since the same-title sport check refuses two series filed
@@ -3696,13 +3731,13 @@ class TestLiveSettingsReachEverySite:
         # positions value is above $0, and otherwise says why not
         not_trimming = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
                         and r.getMessage().startswith("Not trimming this run")]
-        if mode == "prod" and settings.trim_to_kelly and not balance_payload["portfolio_value"]:
+        if mode == "prod" and settings.rebalance and not balance_payload["portfolio_value"]:
             assert not_trimming == [
                 "Not trimming this run: Kalshi's value of the open positions is $0.00, and "
                 "a trim sized on a value that leaves them out would sell too much"]
             assert captured["plan_trims"] == []
             client.get_fills_without_preload_content.assert_not_called()
-        elif mode == "prod" and settings.trim_to_kelly:
+        elif mode == "prod" and settings.rebalance:
             assert not_trimming == [] and len(captured["plan_trims"]) == 1
         else:
             assert not_trimming == [] and captured["plan_trims"] == []
@@ -3781,13 +3816,13 @@ class TestLiveSettingsReachEverySite:
         assert ("Time-series entry rule: "
                 + config.describe_time_series_rule(False, (0.05, 0.9))) in caplog.text
         echo = f"Live settings: {describe_live_settings(settings, reference)}"
-        assert echo in caplog.text and echo.count("(config:") == 12
+        assert echo in caplog.text and echo.count("(config:") == 11
         assert "This PRODUCTION run overrides" not in caplog.text
         assert "one time-series pair may stake up to 35%" in caplog.text
         assert "one same-title pair may stake up to 25%" in caplog.text
         # The workbook's separator row carries the same marked line
         assert captured["run_note"] == f"settings: {describe_live_settings(settings, reference)}"
-        assert captured["run_note"].count("(config:") == 12
+        assert captured["run_note"].count("(config:") == 11
 
     def test_a_dev_run_handed_its_settings_reads_them_at_every_site(self, monkeypatch, caplog):
         settings, reference, calls, captured = self._run_under_the_tripwire(
@@ -3807,7 +3842,7 @@ class TestLiveSettingsReachEverySite:
         assert ("Time-series entry rule: "
                 + config.describe_time_series_rule(False, (0.05, 0.9))) in caplog.text
         echo = f"Live settings: {describe_live_settings(settings, reference)}"
-        assert echo in caplog.text and echo.count("(config:") == 12
+        assert echo in caplog.text and echo.count("(config:") == 11
         # Dev never submits an order, so never the production WARNING
         assert "This PRODUCTION run overrides" not in caplog.text
 
@@ -3822,7 +3857,7 @@ class TestLiveSettingsReachEverySite:
         settings, _reference, calls, captured = self._run_under_the_tripwire(
             monkeypatch, caplog, mode, balance_payload=balance)
         self._assert_every_site_read_the_runs_settings(settings, calls)
-        assert (settings.trim_to_kelly, settings.trim_min_rise) == (True, 0.10)
+        assert (settings.rebalance, settings.min_price_move) == (True, 0.10)
         if mode == "dev":
             assert captured["plan_trims"] == []
             return
@@ -4226,7 +4261,7 @@ _HELD_GROUP_BOOKS = {
 
 @pytest.mark.usefixtures("pinned_config_toggles")
 class TestRunProdAddsToHeldPairs:
-    """A production run with add_to_held_pairs on may add to an exact pair the
+    """A production run with rebalance on may add to an exact pair the
     account holds (the same two markets, the same side on each), sized on the
     whole position; off, a held market is refused exactly as before. Any
     listing or lookup it cannot trust means no add-on and one WARNING naming
@@ -4247,7 +4282,7 @@ class TestRunProdAddsToHeldPairs:
             client: The live-shape client.
             monkeypatch (pytest.MonkeyPatch): pytest's per-test patcher.
             caplog (pytest.LogCaptureFixture): Captures the run's log.
-            add_on (bool): Keyword-only. The run's add_to_held_pairs.
+            add_on (bool): Keyword-only. The run's rebalance setting.
             expected_code (int): Keyword-only. The exit code the run must return.
             **changes: Other LiveSettings fields to replace for this run.
 
@@ -4285,7 +4320,7 @@ class TestRunProdAddsToHeldPairs:
         monkeypatch.setattr(main, "find_same_title_pairs", st_spy)
         monkeypatch.setattr(main, "append_to_prod_log", fake_append_to_prod_log)
         reference = live_settings()
-        settings = dataclasses.replace(reference, add_to_held_pairs=add_on, **changes)
+        settings = dataclasses.replace(reference, rebalance=add_on, **changes)
         with caplog.at_level(logging.INFO):
             code = main._run_prod(client, _args(dry_run=True), settings, reference)
         assert code == expected_code
@@ -4403,8 +4438,8 @@ class TestRunProdAddsToHeldPairs:
         assert "Open ladder exposure: 3 held market(s)" in caplog.text
 
     def test_the_no_flag_turns_saved_defaults_off_for_one_run(self, monkeypatch, caplog):
-        # Saved on, --no-add-to-held-pairs on the command line: no add-on
-        _save_live_defaults(add_to_held_pairs=True)
+        # Saved on, --no-rebalance on the command line: no add-on
+        _save_live_defaults(rebalance=True)
         client = self._client(monkeypatch)
         captured: dict = {}
 
@@ -4416,13 +4451,13 @@ class TestRunProdAddsToHeldPairs:
         monkeypatch.setattr(main, "held_pairs", lambda *a: held_pairs_calls.append(a) or {})
         with caplog.at_level(logging.INFO):
             seen = _main_with(monkeypatch, ["--mode", "prod", "--dry-run",
-                                            "--no-add-to-held-pairs"],
+                                            "--no-rebalance"],
                               _run_prod=main._run_prod, build_client=lambda mode: client,
                               append_to_prod_log=fake_append_to_prod_log)
         assert seen["code"] == EXIT_OK
         assert held_pairs_calls == []
         assert self._traded(captured["results"]) == {self._SAME_TITLE}
-        assert "add to held pairs off (default: on)" in captured["run_note"]
+        assert "rebalance no (default: yes)" in captured["run_note"]
 
     @pytest.mark.parametrize("held_rows, others", [
         # Unequal counts, as a partial unwind would leave them
@@ -4719,7 +4754,7 @@ class TestRunProdAddsToHeldPairs:
         monkeypatch.setattr(main, "find_same_title_pairs", st_spy)
         captured = _capture_dev_simulation(monkeypatch)
         reference = live_settings()
-        settings = dataclasses.replace(reference, add_to_held_pairs=True)
+        settings = dataclasses.replace(reference, rebalance=True)
         with caplog.at_level(logging.INFO):
             code = main._run_dev(self._client(monkeypatch),
                                  SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None),
@@ -4795,7 +4830,7 @@ class TestRunProdAddsToHeldPairsLive:
         Args:
             monkeypatch (pytest.MonkeyPatch): pytest's per-test patcher.
             caplog (pytest.LogCaptureFixture): Captures the run's log.
-            add_on (bool): Keyword-only. The run's add_to_held_pairs.
+            add_on (bool): Keyword-only. The run's rebalance setting.
             held (tuple[str, str] | None): Keyword-only. The ticker held YES
                 and the ticker held NO, 30 contracts each, or None for an
                 account that holds nothing. The balance reply values the
@@ -4875,7 +4910,7 @@ class TestRunProdAddsToHeldPairsLive:
 
         monkeypatch.setattr(main, "append_to_prod_log", fake_append_to_prod_log)
         reference = live_settings()
-        settings = dataclasses.replace(reference, add_to_held_pairs=add_on)
+        settings = dataclasses.replace(reference, rebalance=add_on)
         caplog.clear()
         with caplog.at_level(logging.INFO):
             code = main._run_prod(client, _args(dry_run=False), settings, reference)
@@ -5793,7 +5828,7 @@ class TestRunProdSellsInADryRun:
         exchange = _SellExchange(monkeypatch, held_rows=_SELL_ROWS + _HELD_TS_PAIR,
                                  before=self._BEFORE, include_time_series=True)
         code, seen, _report = _run_selling(exchange, monkeypatch, caplog, dry_run=True,
-                                           sell_at=0.80, add_to_held_pairs=True)
+                                           sell_at=0.80, rebalance=True)
         assert code == EXIT_OK
         assert "Held pairs picked for sale this run, not added to: 1" in _messages(caplog)
         ts_key = frozenset((_TICKER_TS_EARLY, _TICKER_TS_LATE))
@@ -5965,7 +6000,7 @@ class TestRunProdSellsLive:
         exchange = _SellExchange(monkeypatch, held_rows=_SELL_ROWS, before=self._BEFORE,
                                  after=after, fills={_TICKER_SELL_LATE: 0})
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
-                                          sell_at=0.80, add_to_held_pairs=True)
+                                          sell_at=0.80, rebalance=True)
         assert code == EXIT_TRADES_NEED_ATTENTION
         assert [(r.status, r.legs[1].sold) for r in report.sales] == [("unbalanced", 0)]
         assert exchange.ledger[_TICKER_SELL_EARLY] == 0
@@ -6041,7 +6076,7 @@ class TestRunProdSellsLive:
 
         monkeypatch.setattr(main, "get_held_positions", second_read_cut_short)
         code, seen, _report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
-                                           sell_at=0.80, add_to_held_pairs=True)
+                                           sell_at=0.80, rebalance=True)
         assert code == EXIT_OK
         assert len(reads) == 2 and reads[1] == {}
         [ladders] = seen["ladders"]
@@ -6112,7 +6147,7 @@ class TestRunProdSellsLive:
                                  after=after)
         reads, sleeps = self._lagging_listing(monkeypatch, stale_reads=2)
         code, seen, _report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
-                                           sell_at=0.80, add_to_held_pairs=True)
+                                           sell_at=0.80, rebalance=True)
         assert code == EXIT_OK, _messages(caplog)[-5:]
         assert len(reads) == 3 and len(sleeps) == 1
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
@@ -6462,13 +6497,13 @@ class TestLiveAndDryRunsAgree:
         live = _SellExchange(monkeypatch, held_rows=_SELL_ROWS, before=before,
                              fills={_TICKER_SELL_EARLY: 0})
         code, seen, report = _run_selling(live, monkeypatch, caplog, dry_run=False,
-                                          sell_at=0.80, add_to_held_pairs=True)
+                                          sell_at=0.80, rebalance=True)
         assert code == EXIT_OK
         assert [r.status for r in report.sales] == ["not_sold"]
         assert "Held pairs picked for sale this run, not added to: 1" in _messages(caplog)
         dry = _SellExchange(monkeypatch, held_rows=_SELL_ROWS, before=before)
         code2, seen2, report2 = _run_selling(dry, monkeypatch, caplog, dry_run=True,
-                                             sell_at=0.80, add_to_held_pairs=True)
+                                             sell_at=0.80, rebalance=True)
         assert code2 == EXIT_OK
         assert [r.status for r in report2.sales] == ["simulated"]
         assert "Held pairs picked for sale this run, not added to: 1" in _messages(caplog)
@@ -6505,8 +6540,7 @@ class TestLiveAndDryRunsAgree:
         # so the pair is not at its cap: only the trim rule keeps an add-on off
         # it, live and dry alike. (A 20% same-title cap keeps the buys within
         # their shard's cash, so no cash is moved.)
-        changes = {"trim_to_kelly": True, "size_cap": 1.0, "same_title_size_cap": 0.20,
-                   "add_to_held_pairs": True}
+        changes = {"rebalance": True, "size_cap": 1.0, "same_title_size_cap": 0.20}
         ts = {_TICKER_TS_EARLY, _TICKER_TS_LATE}
         live = _trim_exchange(monkeypatch, held_rows=_HELD_TS_PAIR_90, before=_TS90_BEFORE,
                               after=_AFTER_TS90_TRIM_BALANCE, include_time_series=True)
@@ -6679,7 +6713,7 @@ def _books_read(exchange: _SellExchange) -> set:
 
 @pytest.mark.usefixtures("pinned_config_toggles")
 class TestRunProdTrimsInADryRun:
-    """A production dry run with trim_to_kelly on plans its Kelly trims, sends
+    """A production dry run with rebalance on plans its Kelly trims, sends
     nothing, and sizes its buys as if the trims filled. A pair trimmed in part
     stays held: its ladder and markets stay blocked and it is not added to.
     Anything unreadable means no trim and one WARNING saying why; an account
@@ -6689,7 +6723,7 @@ class TestRunProdTrimsInADryRun:
                                                                         caplog):
         exchange = _trim_exchange(monkeypatch)
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=True,
-                                          trim_to_kelly=True)
+                                          rebalance=True)
         assert code == EXIT_OK
         messages = _messages(caplog)
         # Sized on the cash and the larger of Kalshi's value and the bids
@@ -6704,9 +6738,9 @@ class TestRunProdTrimsInADryRun:
         assert "11 NO contracts (of 30 held) on SELL-LATE" in would
         assert _trim_or_value_warnings(caplog) == []
         # Asked once, with the cash and the positions value read at the start;
-        # one fills read, no candles (no minimum price rise), nothing sent
+        # one fills read, no candles (no minimum price move), nothing sent
         [trims] = seen["plan_trims"]
-        assert trims["settings"].trim_to_kelly is True
+        assert trims["settings"].rebalance is True
         assert (trims["cash_cents"], trims["positions_value_cents"], trims["skip"]) == (
             _TRIM_CASH_CENTS, 3_000, frozenset())
         assert _fills_reads(exchange) == 1
@@ -6749,8 +6783,8 @@ class TestRunProdTrimsInADryRun:
         exchange = _trim_exchange(monkeypatch, held_rows=_HELD_TS_PAIR_90,
                                   before=_TS90_BEFORE, include_time_series=True)
         code, seen, _report = _run_selling(exchange, monkeypatch, caplog, dry_run=True,
-                                           trim_to_kelly=True, size_cap=1.0,
-                                           same_title_size_cap=0.20, add_to_held_pairs=True)
+                                           rebalance=True, size_cap=1.0,
+                                           same_title_size_cap=0.20)
         assert code == EXIT_OK
         messages = _messages(caplog)
         [check] = [m for m in messages if m.startswith("Kelly trim check: ")]
@@ -6769,7 +6803,7 @@ class TestRunProdTrimsInADryRun:
         exchange = _trim_exchange(monkeypatch, fill_rows=_trim_fills(
             _TICKER_SELL_EARLY, _TICKER_SELL_LATE, days_ago=3))
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=True,
-                                          trim_to_kelly=True)
+                                          rebalance=True)
         assert code == EXIT_OK
         messages = _messages(caplog)
         [line] = [m for m in messages if m.startswith("Not trimming YES SELL-EARLY")]
@@ -6797,7 +6831,7 @@ class TestRunProdTrimsInADryRun:
         # planned and the fills are not read
         exchange = _trim_exchange(monkeypatch, before=before)
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=True,
-                                          trim_to_kelly=True)
+                                          rebalance=True)
         assert code == EXIT_OK
         assert [w for w in _warning_lines(caplog) if w.startswith("Not trimming")] == [
             f"Not trimming this run: Kalshi's value of the open positions {why}, and a trim "
@@ -6834,7 +6868,7 @@ class TestRunProdTrimsInADryRun:
         monkeypatch.setattr(main, "find_same_title_pairs",
                             lambda markets, held, *, add_on_pairs=None: [])
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=dry_run,
-                                          trim_to_kelly=True)
+                                          rebalance=True)
         assert code == EXIT_OK
         assert [w for w in _warning_lines(caplog) if w.startswith("Not trimming")] == [
             "Not trimming this run: the balance reply had a shard entry whose cash could not "
@@ -6851,7 +6885,7 @@ class TestRunProdTrimsInADryRun:
         exchange = _trim_exchange(monkeypatch,
                                   before={**_TRIM_BEFORE, "balance_breakdown": breakdown})
         code, seen, _report = _run_selling(exchange, monkeypatch, caplog, dry_run=True,
-                                           trim_to_kelly=True)
+                                           rebalance=True)
         assert code == EXIT_OK
         assert [w for w in _warning_lines(caplog) if w.startswith("Not trimming")] == [
             "Not trimming this run: the balance reply had 2 shard entries whose cash could "
@@ -6877,7 +6911,7 @@ class TestRunProdTrimsInADryRun:
             expected = ("Not trimming any held pair this run: the account's fills list is "
                         "empty, so a trade in the last 7 day(s) cannot be ruled out")
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=True,
-                                          trim_to_kelly=True)
+                                          rebalance=True)
         assert code == EXIT_OK
         [trimming] = [w for w in _warning_lines(caplog) if w.startswith("Not trimming")]
         assert trimming.startswith("Not trimming any held pair this run: the account's fills")
@@ -6895,7 +6929,7 @@ class TestRunProdTrimsInADryRun:
             return_value=_raw_json_response({"error": "not found"}, status=404,
                                             reason="Not Found"))
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=True,
-                                          trim_to_kelly=True)
+                                          rebalance=True)
         assert code == EXIT_TIME_SERIES_SKIPPED
         warnings = _warning_lines(caplog)
         assert "Not trimming this run: a market the account holds could not be looked up" in warnings
@@ -6917,7 +6951,7 @@ class TestRunProdTrimsInADryRun:
 
         monkeypatch.setattr(main, "get_held_positions", cut_short)
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=True,
-                                          trim_to_kelly=True)
+                                          rebalance=True)
         assert code == EXIT_OK
         assert [w for w in _warning_lines(caplog) if w.startswith("Not trimming")] == [
             "Not trimming this run: the list of the account's positions was cut short"]
@@ -6932,7 +6966,7 @@ class TestRunProdTrimsInADryRun:
         exchange = _trim_exchange(monkeypatch, held_rows=_SELL_ROWS + _HELD_TS_PAIR,
                                   before=_TWO_PAIRS_BEFORE, include_time_series=True)
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=True,
-                                          sell_at=0.80, trim_to_kelly=True, size_cap=0.10)
+                                          sell_at=0.80, rebalance=True, size_cap=0.10)
         assert code == EXIT_OK
         messages = _messages(caplog)
         assert "Positions to sell this run: 1 of 2" in messages
@@ -6967,7 +7001,7 @@ class TestRunProdTrimsInADryRun:
                                  before={**_TRIM_BEFORE, "portfolio_value": 0},
                                  fill_rows=_trim_fills())
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=True,
-                                          trim_to_kelly=True)
+                                          rebalance=True)
         assert code == EXIT_OK
         assert seen["plan_trims"] == [] and _fills_reads(exchange) == 0
         assert _orders_reads(exchange) == []
@@ -6978,7 +7012,7 @@ class TestRunProdTrimsInADryRun:
 
 @pytest.mark.usefixtures("pinned_config_toggles")
 class TestRunProdTrimsLive:
-    """A live production run with trim_to_kelly on sends each trim's two
+    """A live production run with rebalance on sends each trim's two
     reduce-only orders (they can only shrink a position), sized to the part
     sold, before any buy; then it reads its positions and balance again and
     sizes its buys on what is left. The pair stays held. A trim left uneven,
@@ -6988,7 +7022,7 @@ class TestRunProdTrimsLive:
             self, monkeypatch, caplog):
         exchange = _trim_exchange(monkeypatch, after=_AFTER_TRIM_BALANCE)
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
-                                          trim_to_kelly=True)
+                                          rebalance=True)
         assert code == EXIT_OK, _messages(caplog)[-5:]
         # Two reduce-only immediate-or-cancel orders for the 11 sold: the YES
         # by an ask, the NO closed by a YES bid
@@ -7041,7 +7075,7 @@ class TestRunProdTrimsLive:
         monkeypatch.setattr(main, "find_same_title_pairs",
                             lambda markets, held, *, add_on_pairs=None: [])
         code, _seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
-                                           trim_to_kelly=True)
+                                           rebalance=True)
         assert code == EXIT_OK
         assert exchange.orders()[1] == [] and len(_sale_orders(exchange)) == 2
         path = tmp_path / "result.json"
@@ -7069,7 +7103,7 @@ class TestRunProdTrimsLive:
         monkeypatch.setattr(main, "find_same_title_pairs",
                             lambda markets, held, *, add_on_pairs=None: [])
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
-                                          trim_to_kelly=True)
+                                          rebalance=True)
         assert code == EXIT_TRADES_NEED_ATTENTION
         assert [r.status for r in report.sales] == [status]
         assert exchange.orders()[1] == []
@@ -7099,7 +7133,7 @@ class TestRunProdTrimsLive:
         exchange = _trim_exchange(
             monkeypatch, after={**_AFTER_TRIM_BALANCE, "portfolio_value": value_after})
         code, seen, _report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
-                                           trim_to_kelly=True, add_to_held_pairs=True)
+                                           rebalance=True)
         assert code == EXIT_OK
         assert _sale_orders(exchange) == [
             (_TICKER_SELL_EARLY, "ask", "11.00", "immediate_or_cancel"),
@@ -7127,7 +7161,7 @@ class TestRunProdTrimsLive:
                                   before=_TWO_PAIRS_BEFORE, after=after,
                                   include_time_series=True)
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
-                                          sell_at=0.80, trim_to_kelly=True, size_cap=0.10)
+                                          sell_at=0.80, rebalance=True, size_cap=0.10)
         assert code == EXIT_OK, _messages(caplog)[-5:]
         assert _sale_orders(exchange) == [
             (_TICKER_SELL_EARLY, "ask", "30.00", "immediate_or_cancel"),
@@ -7158,7 +7192,7 @@ class TestRunProdTrimsLive:
         monkeypatch.setattr(main, "find_same_title_pairs",
                             lambda markets, held, *, add_on_pairs=None: [])
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=dry_run,
-                                          trim_to_kelly=True)
+                                          rebalance=True)
         assert code == EXIT_OK
         assert _sale_orders(exchange) == [] and exchange.orders() == ([], [])
         assert seen["plan_trims"] == [] and report.sales == []
@@ -7180,7 +7214,7 @@ class TestRunProdTrimsLive:
         monkeypatch.setattr(main, "find_same_title_pairs",
                             lambda markets, held, *, add_on_pairs=None: [])
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
-                                          trim_to_kelly=True)
+                                          rebalance=True)
         assert code == EXIT_OK
         assert exchange.orders() == ([], [])
         assert seen["plan_trims"] == [] and report.sales == []
@@ -7195,7 +7229,7 @@ class TestRunProdTrimsLive:
 
 @pytest.mark.usefixtures("pinned_config_toggles")
 class TestRunProdTrimsAfterAPriceRise:
-    """--trim-min-rise CENTS holds back a pair's trim until its total price (the
+    """--min-price-move CENTS holds back a pair's trim until its total price (the
     ask of the side held on each market, added) has moved that far, up or down,
     since its last fill. The sellable pair is up 13c and the time-series pair
     8c; under a 10% cap of $112.00 both have outgrown their share."""
@@ -7207,12 +7241,12 @@ class TestRunProdTrimsAfterAPriceRise:
 
     def _run(self, monkeypatch, caplog, argv: list) -> tuple:
         """
-        Run main() as a production dry run with --trim-to-kelly and a 10% cap.
+        Run main() as a production dry run with --rebalance and a 10% cap.
 
         Args:
             monkeypatch (pytest.MonkeyPatch): pytest's per-test patcher.
             caplog (pytest.LogCaptureFixture): Captures the run's log.
-            argv (list): The minimum price rise's flags.
+            argv (list): The minimum price move's flags.
 
         Returns:
             tuple: (the exchange, seen, main's exit code); seen holds
@@ -7238,7 +7272,7 @@ class TestRunProdTrimsAfterAPriceRise:
             return pathlib.Path("/fake/trade_log.xlsx")
 
         with caplog.at_level(logging.INFO):
-            ran = _main_with(monkeypatch, ["--mode", "prod", "--dry-run", "--trim-to-kelly",
+            ran = _main_with(monkeypatch, ["--mode", "prod", "--dry-run", "--rebalance",
                                            "--size-cap", "10", *argv],
                              _run_prod=main._run_prod, build_client=lambda mode: exchange.client,
                              plan_sales=sales_spy, plan_trims=trims_spy,
@@ -7246,13 +7280,13 @@ class TestRunProdTrimsAfterAPriceRise:
         return exchange, seen, ran["code"]
 
     def test_only_the_pair_up_by_the_minimum_is_trimmed(self, monkeypatch, caplog):
-        exchange, seen, code = self._run(monkeypatch, caplog, ["--trim-min-rise", "10"])
+        exchange, seen, code = self._run(monkeypatch, caplog, ["--min-price-move", "10"])
         assert code == EXIT_OK
         # The flag reached the trim planner through the run's one settings object
         [settings] = seen["plan_sales"]
         [trims] = seen["plan_trims"]
         assert trims["settings"] is settings
-        assert (settings.trim_to_kelly, settings.trim_min_rise) == (True, 0.10)
+        assert (settings.rebalance, settings.min_price_move) == (True, 0.10)
         messages = _messages(caplog)
         [check] = [m for m in messages if m.startswith("Kelly trim check: ")]
         assert check.startswith("Kelly trim check: YES SELL-EARLY / NO SELL-LATE ")
@@ -7270,11 +7304,11 @@ class TestRunProdTrimsAfterAPriceRise:
             [_TICKER_SELL_EARLY, _TICKER_SELL_LATE, _TICKER_TS_EARLY, _TICKER_TS_LATE])
 
     def test_with_no_minimum_both_pairs_are_trimmed(self, monkeypatch, caplog):
-        exchange, seen, code = self._run(monkeypatch, caplog, ["--no-trim-min-rise"])
+        exchange, seen, code = self._run(monkeypatch, caplog, ["--no-min-price-move"])
         assert code == EXIT_OK
         [settings] = seen["plan_sales"]
         assert seen["plan_trims"][0]["settings"] is settings
-        assert settings.trim_min_rise is None
+        assert settings.min_price_move is None
         [sales] = [written for written in seen["log"] if written]
         assert [(s.plan.legs[0].ticker, s.plan.count) for s in sales] == [
             (_TICKER_SELL_EARLY, 19), (_TICKER_TS_EARLY, 14)]
@@ -7329,7 +7363,7 @@ class TestRunProdTrimsOnAnyDay:
             self._at(monkeypatch, exchange, datetime(2026, 10, 6 + day, 9, tzinfo=self._ZONE))
             done = len(exchange.orders()[0])
             code, _seen, _report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
-                                                trim_to_kelly=True)
+                                                rebalance=True)
             assert code == EXIT_OK, (day, _messages(caplog)[-5:])
             sent[day] = [(b["ticker"], b["count"]) for b in exchange.orders()[0][done:]]
             lines[day] = _messages(caplog)
@@ -7367,7 +7401,7 @@ class TestRunProdTrimsOnAnyDay:
         same = {_TICKER_SAME_EXP, _TICKER_SAME_CHEAP}
         self._at(monkeypatch, exchange, bought)
         code, seen, _report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
-                                           trim_to_kelly=True)
+                                           rebalance=True)
         assert code == EXIT_OK
         # Nothing was held, so nothing was looked at for a trim
         assert seen["plan_trims"] == []
@@ -7381,7 +7415,7 @@ class TestRunProdTrimsOnAnyDay:
             self._at(monkeypatch, exchange, moment)
             done = len(exchange.orders()[0])
             code, seen, _report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
-                                               trim_to_kelly=True, size_cap=0.10)
+                                               rebalance=True, size_cap=0.10)
             assert code == EXIT_OK, _messages(caplog)[-5:]
             assert len(seen["plan_trims"]) == 1
             sales = exchange.orders()[0][done:]
@@ -7397,11 +7431,14 @@ class TestRunProdTrimsOnAnyDay:
                                      "trade")
 
 
-class TestLiveTrimTextsSayWhatARunDoes:
-    """The docs and docstrings must describe what a trimming run does: a pair
-    trimmed whole is no longer held, trims are planned before any sale is
-    sent, a live run can sell with no sell level saved, and each planner does
-    its own reads. Whitespace is collapsed first, so wrapped sentences match."""
+class TestLiveRebalanceTextsSayWhatARunDoes:
+    """The docs and docstrings must describe what a rebalancing run does: one
+    setting, rebalance, both trims held pairs and adds to them; a pair trimmed
+    whole is no longer held, trims are planned before any sale is sent, a live
+    run can sell with no sell level saved, and each planner does its own reads;
+    and a file an older version saved is refused until it is saved again. The
+    texts quoted from the code are checked against the code itself.
+    Whitespace is collapsed first, so wrapped sentences match."""
 
     @staticmethod
     def _text(doc: str) -> str:
@@ -7420,6 +7457,21 @@ class TestLiveTrimTextsSayWhatARunDoes:
         """One section of README.md, from its heading to the next heading of its level."""
         return "\n".join(cls._lines("README.md")).split(heading, 1)[1].split("\n### ", 1)[0]
 
+    @staticmethod
+    def _source_text(obj) -> str:
+        """An object's source as running text: string literals continued on the
+        next line are joined, and runs of whitespace become single spaces, so a
+        message split over lines reads as one sentence."""
+        source = re.sub(r'(?<!\\)"\s*\n\s*(?:f|r|rf|fr)?"', "", inspect.getsource(obj))
+        return " ".join(source.split())
+
+    @classmethod
+    def _rebalance_steps(cls) -> str:
+        """CLAUDE.md's first-run order for rebalancing, the one line that holds it."""
+        [steps] = [line for line in cls._lines("CLAUDE.md")
+                   if line.startswith("**First-run order for rebalancing.**")]
+        return steps
+
     def test_only_a_pair_trimmed_in_part_is_said_to_stay_held(self):
         # Kelly keeps nothing once a pair's sale value reaches its chance of
         # paying, so a trim can sell all 30, and a dry run then frees the pair's
@@ -7435,7 +7487,7 @@ class TestLiveTrimTextsSayWhatARunDoes:
         assert "planned after the take-profit sales" not in " ".join(main.__doc__.split())
 
     @pytest.mark.parametrize("doc, stale", [
-        # A run with trimming on and no sell level sells part of a held pair
+        # A run with rebalancing on and no sell level sells part of a held pair
         ("README.md", "A live run sells only when a sell level is saved"),
         # A live run with a minimum set holds its trims back by the same test
         ("CLAUDE.md", "`trim_min_rise` (backtest only).**"),
@@ -7471,46 +7523,115 @@ class TestLiveTrimTextsSayWhatARunDoes:
             found = re.search(stale, self._running_text(path), re.IGNORECASE)
             assert found is None, f"{path.name} still says {found.group(0)!r}"
 
-    def test_the_run_commands_and_the_first_run_steps_cover_trimming(self):
-        # CLAUDE.md's Run Commands give a trimming dry run, with and without a
-        # minimum price rise, and the first-run order for turning trimming on;
-        # README gives the same steps in a section beside live selling's
+    @pytest.mark.parametrize("doc", ["CLAUDE.md", "README.md"])
+    def test_no_document_names_a_flag_main_py_no_longer_has(self, doc):
+        # Rebalance replaced the adding and trimming flags; a document that
+        # still gives one would send a reader to a usage error
+        flags = {action for parser_action in main._build_parser()._actions
+                 for action in parser_action.option_strings}
+        for old in ("--add-to-held-pairs", "--no-add-to-held-pairs", "--trim-to-kelly",
+                    "--no-trim-to-kelly", "--trim-min-rise", "--no-trim-min-rise"):
+            assert old not in flags
+            assert old not in self._text(doc), f"{doc} still names {old}"
+        for new in ("--rebalance", "--no-rebalance", "--min-price-move", "--no-min-price-move"):
+            assert new in flags
+
+    def test_the_run_commands_and_the_first_run_steps_cover_rebalancing(self):
+        # CLAUDE.md's Run Commands give a rebalancing dry run, with and without a
+        # minimum price movement, and one with rebalancing off; and the first-run
+        # order for turning rebalancing on, in its five steps
         claude = self._text("CLAUDE.md")
-        for command in ("python3 -m kalshi_betting.main --mode prod --dry-run --trim-to-kelly ",
-                        "python3 -m kalshi_betting.main --mode prod --dry-run --trim-to-kelly "
-                        "--trim-min-rise 10 ",
-                        "python3 -m kalshi_betting.main --mode prod --dry-run --no-trim-to-kelly "):
+        for command in ("python3 -m kalshi_betting.main --mode prod --dry-run --rebalance ",
+                        "python3 -m kalshi_betting.main --mode prod --dry-run --rebalance "
+                        "--min-price-move 10 ",
+                        "python3 -m kalshi_betting.main --mode prod --dry-run --no-rebalance "):
             assert command in claude
-        assert "**First-run order for trimming.**" in claude
-        # ... whose first step is the probe's yes-close step, since a trim sends the
-        # same order shapes live selling does, and whose last is the first live trim
-        lines = (pathlib.Path(__file__).resolve().parent.parent / "CLAUDE.md").read_text(
-            encoding="utf-8").splitlines()
-        [steps] = [line for line in lines if line.startswith("**First-run order for trimming.**")]
-        assert steps.index("(1) you run `python3 -m kalshi_betting.v2_probe") < steps.index(
-            "--step yes-close` (about one cent") < steps.index(
-            "(2) run `python3 -m kalshi_betting.main --mode prod --dry-run --trim-to-kelly "
-            "--trim-min-rise 10`") < steps.index(
-            "(3) rebuild the dashboard") < steps.index(
-            "`Live settings:` line ends `trim to Kelly on | min price rise 10c`") < steps.index(
-            "(4) after the first live trim")
+        # The first-run orders for adding and for trimming are one order now
+        assert "**First-run order for trimming.**" not in claude
+        steps = self._rebalance_steps()
+        order = [
+            "(1) save the live defaults with rebalancing off",
+            "/confirm?tier_floors=off&spread_min=0.0&spread_max=0.5&k=0.8&size_cap=0.1"
+            "&same_title_size_cap=0.2&rebalance=off`",
+            "(2) you run `python3 -m kalshi_betting.v2_probe",
+            "--step yes-close` (about one cent",
+            "(3) run `python3 -m kalshi_betting.main --mode prod --dry-run --rebalance "
+            "--min-price-move 10`",
+            "the `Sizing on portfolio value $X = cash $Y + open positions $Z` line",
+            "each `Held pair to add to: …` line's",
+            "the `Resting orders on the account: N` line",
+            "the `Fills read: …` line",
+            "each `Kelly trim check` line",
+            "(4) turn it on: `./start_dashboard.sh --seed`",
+            "`rebalance=on` in place of `rebalance=off`",
+            "`Live settings:` line reads `rebalance yes | min price movement any`",
+            "(5) after the first live trim",
+        ]
+        places = [steps.index(part) for part in order]
+        assert places == sorted(places)
+        # README gives the same steps in a section beside live selling's
         readme = self._text("README.md")
-        assert "### Turn on live trimming" in readme
-        assert ("python3 -m kalshi_betting.main --mode prod --dry-run --trim-to-kelly "
-                "--trim-min-rise 10") in readme
-        # The data-flow diagram has the trim step between the take-profit plans and the sales
+        assert "### Turn on live trimming" not in readme
+        section = self._readme_section("### Turn on live rebalancing")
+        assert ("python3 -m kalshi_betting.main --mode prod --dry-run --rebalance "
+                "--min-price-move 10") in section
+        heads = ["1. **Save the live defaults with rebalancing off.**",
+                 "2. **Verify the sale orders.**", "3. **Dry-run the rule.**",
+                 "4. **Save the setting.**", "5. **Watch the first live trim.**"]
+        places = [section.index(head) for head in heads]
+        assert places == sorted(places)
+        # The data-flow diagram has the trim step between the take-profit plans and
+        # the sales, under the one setting
         assert (readme.index("seller.plan_sales()")
-                < readme.index("seller.plan_trims()")
+                < readme.index("seller.plan_trims() — with rebalance on")
                 < readme.index("trader.sell_positions()"))
+
+    def test_the_step_texts_are_what_the_code_says(self):
+        # The "Live settings:" words the steps tell a reader to look for, and the
+        # number of settings the seed page shows changing after step (1)
+        steps = self._rebalance_steps()
+        line = config.describe_live_settings(config.LIVE_DEFAULTS_SEED)
+        assert "| rebalance yes | min price movement any |" in line
+        assert "| rebalance yes | min price movement 10c |" in config.describe_live_settings(
+            dataclasses.replace(config.LIVE_DEFAULTS_SEED, min_price_move=0.1))
+        assert "or the minimum chosen, `min price movement 10c`" in steps
+        step_one = dataclasses.replace(config.LIVE_DEFAULTS_SEED, rebalance=False)
+        rows = config.live_settings_changes(step_one, config.LIVE_DEFAULTS_SEED)
+        changed = sum(1 for *_, change in rows if change)
+        assert f"the page shows {changed} of {len(rows)} settings change" in steps
+        section = self._readme_section("### Turn on live rebalancing")
+        assert f"the page shows {changed} of {len(rows)} settings change" in section
+
+    def test_the_old_file_s_remedy_is_quoted_as_the_code_says_it(self):
+        # main.py's usage error and the confirmation page's notice, as the docs
+        # quote them, and the docs' instruction not to delete the file
+        from kalshi_betting import defaults_server
+
+        claude = self._text("CLAUDE.md")
+        remedy = "do not delete the file: a Confirm and save on those pages replaces it"
+        assert remedy in self._source_text(main._resolve_live_settings)
+        assert remedy in claude
+        assert remedy in self._text("README.md")
+        notice = ("The saved live defaults were saved before Rebalance. Below: their values, "
+                  "read as")
+        assert notice in self._source_text(defaults_server._outdated_confirm_html)
+        assert notice in claude
+        link = "this link was built before Rebalance (it names"
+        assert link in self._source_text(defaults_server._proposal)
+        assert link in claude
+        section = " ".join(self._readme_section(
+            "### Save the live defaults (do this first after upgrading)").split())
+        assert "Do not delete the file" in section
+        # A file that did only one of the two is saved as Rebalance no and turned on
+        # through the rebalancing steps from the probe, never by editing its link
+        assert "`rebalance=on` in place of `rebalance=off`" not in section
+        assert "from its step 2: the probe's `yes-close` step must PASS" in section
 
     def test_each_save_step_says_what_the_button_does_to_the_other_setting(self):
         # On a page showing both, the Save button saves the other setting off
-        # (Rebalance yes shuts Sell, and Sell needs Rebalance no); a
-        # /confirm link that leaves it out keeps it. Each save step says so.
-        # Rebalance yes also saves adding to held pairs on, which has a dry-run
-        # check of its own, so each trim save step says that too
+        # (Rebalance yes shuts Sell, and Sell needs Rebalance no); a /confirm
+        # link that leaves it out keeps it. Each save step says so
         claude = self._lines("CLAUDE.md")
-        [trim] = [x for x in claude if x.startswith("**First-run order for trimming.**")]
         [sell] = [x for x in claude
                   if x.startswith("**Measured and first-run order for selling.**")]
 
@@ -7519,44 +7640,47 @@ class TestLiveTrimTextsSayWhatARunDoes:
                       if x.startswith(start)]
             return line
 
-        for step in (trim.split("(3) ", 1)[1].split("(4) ", 1)[0],
-                     readme_step("### Turn on live trimming", "3. **Save the setting.**")):
+        for step in (self._rebalance_steps().split("(4) ", 1)[1].split("(5) ", 1)[0],
+                     readme_step("### Turn on live rebalancing", "4. **Save the setting.**")):
             assert "also sends no selling" in step
             assert "names no sell level" in step
-            assert "also saves adding to held pairs on" in step
+            assert "sends `rebalance` and `min_price_move` together" in step
         for step in (sell.split("(3) ", 1)[1],
                      readme_step("### Turn on live selling", "3. **Save the level.**")):
-            assert "also sends trimming off" in step
-            assert "names no trim setting" in step
+            assert "also sends rebalancing off" in step
+            assert "names no rebalance setting" in step
 
     def test_the_save_button_is_said_to_send_the_rebalance_choices(self):
         # From a page that simulated rebalancing the button sends the Rebalance
-        # choice and the Min. price movement, so saving a scenario with Rebalance
-        # no turns a saved live add-on and trim off
+        # choice and the Min. price movement, as the two live settings, so saving
+        # a scenario with Rebalance no turns a saved live rebalance off
         section = self._readme_section("### Dashboard buttons")
         bullet = " ".join(section.split("- **Save as live defaults…**", 1)[1]
                           .split("- **Trade using defaults…**", 1)[0].split())
         assert "rebalance and Min. price movement, Sell level" in bullet
         assert "the Rebalance choice with the Min. price movement shown" in bullet
+        assert "sent as `rebalance` and `min_price_move`" in bullet
 
     def test_the_live_tab_counts_a_trim_among_the_bots_sales(self):
-        # A run with trim_to_kelly on and no sell level sells part of held pairs
+        # A run with rebalance on and no sell level sells part of held pairs
         # before it buys, and its trim rows start "[sale: " like any sale row
         section = " ".join(self._readme_section("### Live trading tab").split())
         assert "(a run with a sell level saved sells before it buys)" not in section
         bullet = section.split("- **The bot's sales**", 1)[1].split(" - **", 1)[0]
-        assert "`trim_to_kelly`" in bullet
+        assert "`rebalance`" in bullet
 
     @pytest.mark.parametrize("doc", ["CLAUDE.md", "README.md"])
-    def test_the_config_rows_say_a_live_run_reads_the_saved_trim_settings(self, doc):
-        # The live trim reads the run's LiveSettings, never config.py's own
-        # TRIM_TO_KELLY or TRIM_MIN_RISE, and the config.py rows must say so
-        source = inspect.getsource(seller_mod)
-        assert "TRIM_TO_KELLY" not in source and "TRIM_MIN_RISE" not in source
+    def test_the_config_rows_say_a_live_run_reads_the_saved_rebalance_settings(self, doc):
+        # The live trim and add-ons read the run's LiveSettings, never config.py's
+        # own REBALANCE or MIN_PRICE_MOVE, and the config.py rows must say so
+        for module in (seller_mod, main):
+            source = inspect.getsource(module)
+            assert not re.search(r"\b(REBALANCE|MIN_PRICE_MOVE)\b", source), module.__name__
         [row] = [x for x in self._lines(doc) if x.startswith("| `config.py` |")]
-        trim = row.split("`TRIM_MIN_RISE` (whether", 1)[1].split(")", 1)[0]
-        assert "`seller.plan_trims` reads" not in trim
-        assert "`LiveSettings.trim_to_kelly`" in trim
+        part = row.split("`MIN_PRICE_MOVE` (", 1)[1].split(")", 1)[0]
+        assert "`seller.plan_trims` reads" not in part
+        assert "`LiveSettings.rebalance`" in part
+        assert "`TRIM_TO_KELLY`" not in row and "`ADD_TO_HELD_PAIRS`" not in row
 
     def test_the_historical_row_names_the_trims_read_of_recent_candles(self):
         # The trim's price then reads a held market's candles over the days before
@@ -7575,9 +7699,9 @@ class TestLiveTrimTextsSayWhatARunDoes:
         assert re.match(r"- (\d+|two|three|four|five|six|seven|eight|nine|ten) tests ",
                         line, re.IGNORECASE) is None
         named = re.findall(r"`tests/(test_\w+\.py)::(\w+)(?:::(\w+))?`", line)
-        assert ("test_main.py", "TestLiveTrimTextsSayWhatARunDoes", "") in named
+        assert ("test_main.py", type(self).__name__, "") in named
         assert ("test_v2_probe.py", "TestYesCloseDispatch",
-                "test_the_header_the_help_and_the_closing_line_name_trimming_beside_selling"
+                "test_the_header_the_help_and_the_closing_line_name_rebalancing_beside_selling"
                 ) in named
         tests = pathlib.Path(__file__).resolve().parent
         for module, cls, test in named:
@@ -7588,8 +7712,8 @@ class TestLiveTrimTextsSayWhatARunDoes:
                 f"{module} has no test {test}")
 
     def test_claude_md_names_plan_trims_among_the_live_settings_sites(self):
-        # plan_trims reads the trim settings, k and both caps off the run's one
-        # LiveSettings, so the rule's list of where the toggles reach names it
+        # plan_trims reads the rebalance settings, k and both caps off the run's
+        # one LiveSettings, so the rule's list of where the toggles reach names it
         lines = (pathlib.Path(__file__).resolve().parent.parent / "CLAUDE.md").read_text(
             encoding="utf-8").splitlines()
         [rule] = [line for line in lines
@@ -9887,7 +10011,11 @@ class TestResultFile:
 
 def _other_toggles(target: LiveSettings) -> LiveSettings:
     """
-    Build live defaults that differ from target in every one of the twelve toggles.
+    Build live defaults that differ from target in every one of the eleven toggles.
+
+    All but one case: a target that rebalances with no minimum price move
+    meets defaults that do not rebalance, and so hold no minimum either
+    (test_rebalancing_with_no_minimum_clears_a_saved_one covers clearing one).
 
     Args:
         target (LiveSettings): The settings a run should trade.
@@ -9905,17 +10033,17 @@ def _other_toggles(target: LiveSettings) -> LiveSettings:
         same_title_size_cap=0.25 if target.same_title_size_cap != 0.25 else 0.3,
         categories=None if target.categories is not None else ("Saved",),
         tags=None if target.tags is not None else ("Saved",),
-        add_to_held_pairs=not target.add_to_held_pairs,
+        # The opposite rebalance switch; a 25c minimum when rebalancing here
+        rebalance=not target.rebalance,
+        min_price_move=None if target.rebalance else 0.25,
         # Always selling, so a target that sells nothing needs --no-sell and
         # --no-sell-min-days to win over them
         sell_at=0.5 if target.sell_at != 0.5 else 0.6,
         sell_min_days=2 if target.sell_min_days != 2 else 3,
-        # The opposite trim switch; a 25c minimum when trimming here. A target
-        # that trims must name its own minimum, since these defaults then hold none
-        trim_to_kelly=not target.trim_to_kelly,
-        trim_min_rise=None if target.trim_to_kelly else 0.25,
     )
     for name in config.LIVE_TOGGLE_FIELDS:
+        if name == "min_price_move" and target.rebalance and target.min_price_move is None:
+            continue
         assert getattr(other, name) != getattr(target, name), name
     assert other.spread_band[0] != target.spread_band[0]
     assert other.spread_band[1] != target.spread_band[1]
@@ -9928,7 +10056,7 @@ _ARGV_TARGETS = {
     "k-with-many-decimals-tier-floors-on": LiveSettings(
         tier_floors=True, spread_band=(0.15, 0.85), interval_discount=0.7123456789012345,
         size_cap=0.05, same_title_size_cap=1.0, categories=("Economics",), tags=None,
-        add_to_held_pairs=True),
+        rebalance=True),
     "tier-floors-off-caps-100-and-5": LiveSettings(
         tier_floors=False, spread_band=(0.0, 1.0), interval_discount=1.0,
         size_cap=1.0, same_title_size_cap=0.05,
@@ -9958,21 +10086,20 @@ _ARGV_TARGETS = {
         size_cap=0.2, same_title_size_cap=1.0, sell_at=0.01),
     "selling-at-100-with-a-day": LiveSettings(
         tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-        size_cap=1.0, same_title_size_cap=0.2, add_to_held_pairs=True,
+        size_cap=1.0, same_title_size_cap=0.2, rebalance=True,
         sell_at=1.0, sell_min_days=1),
-    # Trimming on with a minimum price rise: the smallest step, a middle step
-    # (15c), and a whole dollar beside selling
-    "trimming-after-a-5c-rise": LiveSettings(
+    # Rebalancing on with a minimum price move: the smallest step, a middle
+    # step (15c), and a whole dollar beside selling
+    "rebalancing-after-a-5c-move": LiveSettings(
         tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-        size_cap=0.1, same_title_size_cap=0.2, trim_to_kelly=True, trim_min_rise=0.05),
-    "trimming-after-a-15c-rise": LiveSettings(
+        size_cap=0.1, same_title_size_cap=0.2, rebalance=True, min_price_move=0.05),
+    "rebalancing-after-a-15c-move": LiveSettings(
         tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
-        size_cap=0.2, same_title_size_cap=1.0, add_to_held_pairs=True,
-        trim_to_kelly=True, trim_min_rise=0.15),
-    "selling-and-trimming-after-a-dollar": LiveSettings(
+        size_cap=0.2, same_title_size_cap=1.0, rebalance=True, min_price_move=0.15),
+    "selling-and-rebalancing-after-a-dollar": LiveSettings(
         tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-        size_cap=0.1, same_title_size_cap=0.2, sell_at=0.85, sell_min_days=7,
-        trim_to_kelly=True, trim_min_rise=1.0),
+        size_cap=0.1, same_title_size_cap=0.2, rebalance=True, min_price_move=1.0,
+        sell_at=0.85, sell_min_days=7),
 }
 
 
@@ -10002,7 +10129,14 @@ class TestLiveSettingsArgv:
         assert args.size_cap is not None and args.same_title_size_cap is not None
         assert (args.category is not None) or args.any_category
         assert (args.tag is not None) or args.any_tag
-        assert args.add_to_held_pairs is target.add_to_held_pairs
+        # The rebalance settings are given either way: the switch on or off,
+        # whole cents or --no-min-price-move
+        assert args.rebalance is target.rebalance
+        if target.min_price_move is None:
+            assert args.min_price_move is None and args.no_min_price_move is True
+        else:
+            assert args.min_price_move == round(target.min_price_move * 100)
+            assert args.no_min_price_move is None
         # The sell settings are given either way: a percent or --no-sell, a
         # number of days or --no-sell-min-days
         if target.sell_at is None:
@@ -10014,61 +10148,50 @@ class TestLiveSettingsArgv:
         else:
             assert args.sell_min_days == target.sell_min_days
             assert args.no_sell_min_days is None
-        # The trim settings are given either way too: the switch on or off,
-        # whole cents or --no-trim-min-rise
-        assert args.trim_to_kelly is target.trim_to_kelly
-        if target.trim_min_rise is None:
-            assert args.trim_min_rise is None and args.no_trim_min_rise is True
-        else:
-            assert args.trim_min_rise == round(target.trim_min_rise * 100)
-            assert args.no_trim_min_rise is None
 
     def test_the_seed_is_spelled_flag_by_flag(self):
         assert config.live_settings_argv(config.LIVE_DEFAULTS_SEED) == [
             "--no-tier-floors", "--spread-min=0.0", "--spread-max=0.5",
             "--interval-discount=0.8", "--size-cap=10", "--same-title-size-cap=20",
-            "--add-to-held-pairs", "--no-sell", "--no-sell-min-days",
-            "--no-trim-to-kelly", "--no-trim-min-rise",
+            "--rebalance", "--no-min-price-move", "--no-sell", "--no-sell-min-days",
             "--any-category", "--any-tag"]
 
-    def test_trimming_is_spelled_as_a_switch_and_whole_cents(self):
-        argv = config.live_settings_argv(_ARGV_TARGETS["trimming-after-a-15c-rise"])
-        assert argv[argv.index("--no-sell-min-days"):][:3] == [
-            "--no-sell-min-days", "--trim-to-kelly", "--trim-min-rise=15"]
+    def test_rebalancing_is_spelled_as_a_switch_and_whole_cents(self):
+        argv = config.live_settings_argv(_ARGV_TARGETS["rebalancing-after-a-15c-move"])
+        assert argv[argv.index("--same-title-size-cap=100"):][:4] == [
+            "--same-title-size-cap=100", "--rebalance", "--min-price-move=15", "--no-sell"]
         # Every 5c step is spelled as exact whole cents and reads back the same
         # (0.55 * 100 is 55.00000000000001, so a plain product would not do)
         assert [c for c in range(5, 101, 5) if c / 100 * 100 != c] == [55]
         parser = main._build_parser()
         for cents in range(5, 101, 5):
-            target = dataclasses.replace(_ARGV_TARGETS["seed"], trim_to_kelly=True,
-                                         trim_min_rise=cents / 100)
+            target = dataclasses.replace(_ARGV_TARGETS["seed"], min_price_move=cents / 100)
             argv = config.live_settings_argv(target)
-            assert "--trim-to-kelly" in argv and f"--trim-min-rise={cents}" in argv
-            assert "--no-trim-to-kelly" not in argv and "--no-trim-min-rise" not in argv
+            assert "--rebalance" in argv and f"--min-price-move={cents}" in argv
+            assert "--no-rebalance" not in argv and "--no-min-price-move" not in argv
             args = parser.parse_args(["--mode", "prod", *argv])
-            assert args.trim_min_rise / 100 == target.trim_min_rise
+            assert args.min_price_move / 100 == target.min_price_move
 
-    def test_trimming_with_no_minimum_clears_a_saved_one(self):
-        # Trimming with no minimum is spelled --trim-to-kelly --no-trim-min-rise,
-        # which must clear a saved minimum. (Not in _ARGV_TARGETS: saved defaults
-        # holding a minimum must trim too, so the switch could not differ.)
-        target = dataclasses.replace(config.LIVE_DEFAULTS_SEED, trim_to_kelly=True)
+    def test_rebalancing_with_no_minimum_clears_a_saved_one(self):
+        # Rebalancing with no minimum is spelled --rebalance --no-min-price-move,
+        # which must clear a saved minimum (_other_toggles cannot hold one here:
+        # saved defaults holding a minimum must rebalance too)
+        target = config.LIVE_DEFAULTS_SEED
+        assert target.rebalance and target.min_price_move is None
         argv = config.live_settings_argv(target)
-        assert argv[argv.index("--trim-to-kelly"):][:2] == [
-            "--trim-to-kelly", "--no-trim-min-rise"]
+        assert argv[argv.index("--rebalance"):][:2] == ["--rebalance", "--no-min-price-move"]
         saved = config.save_live_defaults(
-            dataclasses.replace(config.LIVE_DEFAULTS_SEED, trim_to_kelly=True,
-                                trim_min_rise=0.25), source="")
+            dataclasses.replace(target, min_price_move=0.25), source="")
         parser = main._build_parser()
         args = parser.parse_args(["--mode", "prod", *argv])
         settings, reference = main._resolve_live_settings(args, parser)
-        assert settings == target and settings.trim_min_rise is None
-        assert reference == saved and reference.trim_min_rise == 0.25
+        assert settings == target and settings.min_price_move is None
+        assert reference == saved and reference.min_price_move == 0.25
 
     def test_selling_is_spelled_as_whole_percents_and_days(self):
         argv = config.live_settings_argv(_ARGV_TARGETS["selling-at-85-with-a-minimum"])
-        assert argv[argv.index("--no-add-to-held-pairs"):][:3] == [
-            "--no-add-to-held-pairs", "--sell-at=85", "--sell-min-days=7"]
+        assert argv[argv.index("--no-rebalance"):][:4] == [
+            "--no-rebalance", "--no-min-price-move", "--sell-at=85", "--sell-min-days=7"]
         # Every level of the grid is spelled as its exact whole percent (0.29 * 100
         # is 28.999999999999996) and reads back as the same level
         parser = main._build_parser()

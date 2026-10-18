@@ -171,13 +171,11 @@ Purpose:
     DEFAULTS_SERVER_PORT) in a new tab, for the bar's scenario on screen —
     its spread band, Tier floors choice, k, size cap, Rebalance choice and
     Min. price movement (only on a page that simulated rebalancing, sent as
-    the defaults server's add_to_held_pairs and trim_to_kelly, both from the
-    one choice, and trim_min_rise, always together, so a minimum is never
-    sent with Rebalance no), Sell level and Min. days to maturity (only on a
-    page that simulated selling) and the categories and tags ticked, with
-    this run's
-    same-title cap when the run recorded one — never
-    for the Scenario Explorer's own selects. The address names each ticked
+    the defaults server's rebalance and min_price_move, always together, so
+    a minimum is never sent with Rebalance no), Sell level and Min. days to
+    maturity (only on a page that simulated selling) and the categories and
+    tags ticked, with this run's same-title cap when the run recorded one —
+    never for the Scenario Explorer's own selects. The address names each ticked
     category once and each ticked tag once, as "Category · Tag" (the form
     the live filter ties a tag to its category by), and never shortens a
     category whose listed tags are all ticked to the category alone: the
@@ -227,8 +225,8 @@ Dependencies:
     whole off view is withheld — the family's calibration keys, never this
     test, decide which bands were simulated again), _live_rule_view() with
     its _LIVE_RULE_* verdicts, _live_rule_ladder_note(), _live_filter_text(),
-    _live_sizing_note(), _live_add_on_note(), _live_sell_note(),
-    _live_trim_note(), _LIVE_RULE_LABEL and _LIVE_RULE_NONE (the live-rule
+    _live_sizing_note(), _live_rebalance_note(), _live_sell_note(),
+    _LIVE_RULE_LABEL and _LIVE_RULE_NONE (the live-rule
     line's pieces, shared with the run's log line, which names the saved
     live defaults) — and reads
     BacktestSweep.cap_sweep and tier_off_cap_sweep (each a
@@ -572,13 +570,12 @@ from .backtester import (
     _cap_percent,
     _carry_steps,
     _exact_label,
-    _live_add_on_note,
     _live_filter_text,
+    _live_rebalance_note,
     _live_rule_ladder_note,
     _live_rule_view,
     _live_sell_note,
     _live_sizing_note,
-    _live_trim_note,
     _paid_prices,
     _tier_floors_bind,
     _value_steps,
@@ -4806,8 +4803,8 @@ def _rebalance_choice_in_bar(bar: dict | None, band_index: int | None, tier_on: 
     Say how the filter bar shows the saved defaults' rebalancing at one band, or why it cannot.
 
     Part of the live-rule line, at the band and Tier floors setting where it
-    says the bar shows the rule, for saved defaults that both add to held
-    pairs and trim them (the bar shows the two only together). It reads the
+    says the bar shows the rule, for saved defaults that rebalance (add to
+    held pairs and trim them, together, as the bar shows them). It reads the
     grids the page script reads (gridAt, moveGridAt). A minimum counts as
     shown when some k and cap of the band has a chunk for it: its own entry,
     or the rebalancing chunk where the cell is null (no minimum changes that
@@ -4868,20 +4865,16 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     defaults size at a k or caps other than this run's primary, it says so
     (backtester._live_sizing_note) and, where the page shows the rule, how
     its filter bar shows it at that sizing (_live_sizing_bar_clause). When
-    the saved defaults add to held pairs, sell, or trim to Kelly, which no
-    primary does, it says so too, in that order (backtester._live_add_on_note,
-    _live_sell_note and _live_trim_note) and, where the page shows the rule,
-    how the filter bar shows each. The bar shows adding and trimming only
-    together, as Rebalance: for saved defaults that do both, the last of the
-    two clauses names the Rebalance and Min. price movement choices that show
-    them, or why they cannot (_rebalance_choice_in_bar); for defaults that do
-    only one, it says the page shows the two only together. The Sell clause
-    names the Sell options that show the selling, if any
-    (_sell_choice_in_bar). The page never shows selling together with
-    rebalancing (Sell is shut while Rebalance is yes), so when the defaults
-    sell and also add and trim, the rebalancing clause says so (or, on a
-    page with no Rebalance view, that it has none), and whenever they sell
-    and also add or trim, the Sell clause offers the selling alone.
+    the saved defaults rebalance held pairs or sell, which no primary does,
+    it says so too, in that order (backtester._live_rebalance_note and
+    _live_sell_note) and, where the page shows the rule, how the filter bar
+    shows each: the Rebalance and Min. price movement choices that show the
+    rebalancing, or why they cannot (_rebalance_choice_in_bar), and the Sell
+    options that show the selling, if any (_sell_choice_in_bar). The page
+    never shows selling together with rebalancing (Sell is shut while
+    Rebalance is yes), so when the defaults do both, the rebalancing clause
+    says so (or, on a page with no Rebalance view, that it has none), and
+    the Sell clause offers the selling alone.
 
     Args:
         sweep (BacktestSweep | None): The run's sweep payload, or None.
@@ -4891,7 +4884,7 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     Returns:
         str: One <p>, its text escaped: the rule, any live filter, the same-title cap
             and where (or whether) the page shows the rule, plus any ladder-departure,
-            sizing, adding-to-held-pairs, selling and trimming notes; "Live rule: not
+            sizing, rebalancing and selling notes; "Live rule: not
             recorded" when sweep is None, and backtester._LIVE_RULE_NONE's words when
             the run recorded no live rule.
     """
@@ -4968,38 +4961,29 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     # The saved defaults' own sizing when it is not this run's, and where the bar shows it
     note = _live_sizing_note(sweep)
     sizing = f"{note}{_live_sizing_bar_clause(sweep, bar, shown)}" if note else ""
-    # Adding to held pairs, selling and trimming to Kelly, which no primary
-    # does: each said whenever the saved defaults do it, with where the bar
-    # shows it only where the line shows the rule at all
-    add_note = _live_add_on_note(sweep)
+    # Rebalancing and selling, which no primary does: each said whenever the
+    # saved defaults do it, with where the bar shows it only where the line
+    # shows the rule at all
+    rebalance_note = _live_rebalance_note(sweep)
     sell_note = _live_sell_note(sweep)
-    trim_note = _live_trim_note(sweep)
-    if (add_note or trim_note) and shown is not None:
-        # The bar shows adding and trimming only together (Rebalance), and
-        # never together with selling (Sell is shut while Rebalance is yes)
-        if not (add_note and trim_note):
-            clause = ("this page shows adding to and trimming held pairs only together "
-                      "(Rebalance)")
-        else:
-            clause = _rebalance_choice_in_bar(bar, *shown, sweep.live_trim_min_rise)
-            # With selling saved too, a page that holds rebalancing runs still
-            # cannot show them beside the selling; a page with none says so
-            if sell_note and clause != _NO_REBALANCE_VIEW:
-                clause = "this page cannot show rebalancing together with selling"
-        # Said once, after the later of the two notes
-        if trim_note:
-            trim_note += " — " + clause
-        else:
-            add_note += " — " + clause
-    # Selling, likewise. With adding or trimming saved too, the Sell options
-    # show the selling alone: the page never shows them together
+    if rebalance_note and shown is not None:
+        clause = _rebalance_choice_in_bar(bar, *shown, sweep.live_min_price_move)
+        # The bar never shows rebalancing together with selling (Sell is shut
+        # while Rebalance is yes): with selling saved too, a page that holds
+        # rebalancing runs still cannot show them beside it; a page with none
+        # says so
+        if sell_note and clause != _NO_REBALANCE_VIEW:
+            clause = "this page cannot show rebalancing together with selling"
+        rebalance_note += " — " + clause
+    # Selling, likewise. With rebalancing saved too, the Sell options show the
+    # selling alone
     if sell_note and shown is not None:
         choice = _sell_choice_in_bar(sweep, bar, *shown)
-        seen = "the selling alone" if (add_note or trim_note) else "it"
+        seen = "the selling alone" if rebalance_note else "it"
         sell_note += (f" — choose {choice} in the filter bar to see {seen}" if choice is not None
                       else " — this page cannot show that Sell level and minimum of days")
     text = (f"Live rule ({_LIVE_RULE_LABEL}): {rule}; {cap_clause} — {tail}{sizing}"
-            f"{add_note}{sell_note}{trim_note}")
+            f"{rebalance_note}{sell_note}")
     return f"{style}{html.escape(text, quote=False)}</p>"
 
 
@@ -6625,8 +6609,8 @@ def _move_phrase(move: float) -> str:
 
 
 # Beside the save button on a page with the Rebalance view, when the saved
-# live defaults add to held pairs or trim them: saving from the bar sends the
-# choice shown, and "no" turns both off in the defaults
+# live defaults rebalance (live_rebalance is on): saving from the bar sends the
+# choice shown, and Rebalance no turns it off in the defaults
 _REBALANCE_SAVE_NOTE = ("The live defaults rebalance; saving with Rebalance no here turns "
                         "that off.")
 
@@ -7077,10 +7061,10 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
             <start> to <today>", plus a note when the run's same-event ladder
             setting differed from config.py's, so its pairs are not the live
             bot's; None if it would not match the pattern);
-            "live_rebalances" (whether the saved live defaults add to held
-            pairs or trim them, as the run recorded them: the note beside
-            the save button on a page with the Rebalance view shows only
-            then, since saving with Rebalance no turns both off);
+            "live_rebalances" (whether the saved live defaults rebalance, as
+            the run recorded them: the note beside the save button on a page
+            with the Rebalance view shows only then, since saving with
+            Rebalance no turns it off);
             "live_sells" (whether they sell: the Sell view's save note shows only then);
             "max_names" (config.DEFAULTS_SERVER_MAX_FILTER_NAMES: the most
             categories, and the most tags, the server takes on one address).
@@ -7113,8 +7097,7 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
         "same_title_size_cap": None if sweep is None else sweep.same_title_size_cap,
         "filed_by_listing": bool(series_categories),
         "source": source,
-        "live_rebalances": (getattr(sweep, "live_add_to_held_pairs", None) is True
-                            or getattr(sweep, "live_trim_to_kelly", None) is True),
+        "live_rebalances": getattr(sweep, "live_rebalance", None) is True,
         "live_sells": getattr(sweep, "live_sell_at", None) is not None,
         "max_names": DEFAULTS_SERVER_MAX_FILTER_NAMES,
     }
@@ -12332,9 +12315,9 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     series listing (payload "save"), where a category or tag cannot be
     saved; while the ticks themselves are what cannot be saved, the script
     shows one of _SAVE_BLOCKED_TEXT's reasons in its place. On a page with
-    the Rebalance view whose saved live defaults add to held pairs or trim
-    them (save["live_rebalances"]), a grey note (_REBALANCE_SAVE_NOTE)
-    follows the button: saving with Rebalance no turns that off.
+    the Rebalance view whose saved live defaults rebalance
+    (save["live_rebalances"]), a grey note (_REBALANCE_SAVE_NOTE) follows
+    the button: saving with Rebalance no turns that off.
     _SELL_SAVE_NOTE (save["live_sells"]) does the same for selling, after
     it, in the order of their selects. Then the "Trade using defaults…"
     link
@@ -12446,8 +12429,8 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     save_filed = (payload.get("save") or {}).get("filed_by_listing", False)
     save_title = html.escape(_SAVE_TITLE + ("" if save_filed else _SAVE_TITLE_UNFILED))
     # Saving from a page with the Rebalance view sends the choice shown, so
-    # when the saved live defaults add to held pairs or trim them, leaving it
-    # "no" would turn that off; the grey note beside the button says so
+    # when the saved live defaults rebalance, leaving it at Rebalance no would
+    # turn that off; the grey note beside the button says so
     save_rebalances = (rebalance_state == "shown"
                        and (payload.get("save") or {}).get("live_rebalances") is True)
     save_note = ('&nbsp;<span id="flt-rebalance-save-note" style="color:#9E9E9E; '
@@ -12698,8 +12681,8 @@ def _pack_text(raw: str) -> str:
 # — the rebalancing chunk itself (chunkAt). Its phrase is Python's
 # (D.moves[i - 1].phrase, after D.text.rebalance). Sell stays shut at any
 # minimum; the Rebalance choice and the minimum go into the save button's
-# address (saveHref: add_to_held_pairs and trim_to_kelly both from the
-# Rebalance choice, and trim_min_rise, "off" for any or with Rebalance no),
+# address (saveHref: rebalance, from the Rebalance choice, and
+# min_price_move, "off" for any or with Rebalance no),
 # and like Rebalance it reaches neither the k-hat figures, the
 # interval-discount section nor the scenario explorer. A chunk at or past
 # D.inline_chunks is a sidecar file in D.sidecar_dir, loaded through a
@@ -12999,16 +12982,15 @@ _FILTER_JS = r"""
     }
     // Sent only by a page that simulated rebalancing: otherwise the server
     // keeps the saved values (or the seed's), as for an unrecorded same-title
-    // cap. The defaults server saves adding to held pairs and trimming to
-    // Kelly as two settings, so the one Rebalance choice is sent as both, and
-    // beside them, always, the minimum price movement shown — its dollars, or
-    // off for any and whenever Rebalance is no (a shut select can still name
-    // one), so the address never asks for a minimum without trimming, which
-    // the server refuses
+    // cap. The Rebalance choice goes as rebalance, and beside it, always, the
+    // minimum price movement shown as min_price_move — its dollars, or off
+    // for any and whenever Rebalance is no (a shut select can still name
+    // one), so the address never asks for a minimum without rebalancing,
+    // which the server refuses
     if (D.grid_rebalance) {
-      var yes = rebalanceOn(SHOWN[6]) ? 'on' : 'off', mi = moveAt(SHOWN[6], SHOWN[9]);
-      q.push(['add_to_held_pairs', yes], ['trim_to_kelly', yes],
-             ['trim_min_rise', mi > 0 ? D.moves[mi - 1].value : 'off']);
+      var mi = moveAt(SHOWN[6], SHOWN[9]);
+      q.push(['rebalance', rebalanceOn(SHOWN[6]) ? 'on' : 'off'],
+             ['min_price_move', mi > 0 ? D.moves[mi - 1].value : 'off']);
     }
     // Likewise sent only by a page with the Sell view: the level shown and the
     // minimum of days shown, or off for both when Sell shows no level (the

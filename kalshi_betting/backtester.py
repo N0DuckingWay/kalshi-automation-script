@@ -114,7 +114,7 @@ Dependencies:
     rule's report that dashboard._live_rule_html shares with this module's
     log line — _live_rule_view with its _LIVE_RULE_PRIMARY and
     _LIVE_RULE_NOT_SIMULATED verdicts, _live_rule_ladder_note,
-    _live_filter_text, _live_sizing_note, _live_add_on_note, _live_sell_note,
+    _live_filter_text, _live_sizing_note, _live_rebalance_note, _live_sell_note,
     _LIVE_RULE_LABEL and _LIVE_RULE_NONE; an
     IntervalCalibration carries the CalibrationObservations its pooled row
     was reduced from, so a report can regroup that population through
@@ -3740,20 +3740,18 @@ class BacktestSweep:
         live_same_title_size_cap (float | None): The saved live defaults'
             same-title cap, from the same read; reporting only (this run sized
             under same_title_size_cap).
-        live_add_to_held_pairs (bool | None): Whether the saved live defaults
-            add to held pairs, from the same read; reporting only (this run's
-            own points never do).
+        live_rebalance (bool | None): Whether the saved live defaults
+            rebalance held pairs (add to them and sell them down to their
+            Kelly size), from the same read; reporting only (this run's own
+            points never do).
+        live_min_price_move (float | None): Their minimum price movement,
+            up or down, before a rebalance, in dollars; None for no minimum
+            (or not recorded).
         live_sell_at (float | None): The saved live defaults' sell level, a
             share of potential profit; None if they never sell (or not recorded).
             Reporting only: this run's own points never sell.
         live_sell_min_days (int | None): Their minimum of days before
             maturity; None for no minimum (or not recorded).
-        live_trim_to_kelly (bool | None): Whether the saved live defaults
-            trim held pairs to their Kelly size, from the same read; None if
-            not recorded. Reporting only: this run's own points never trim.
-        live_trim_min_rise (float | None): Their minimum price move, up or
-            down, before a trim, in dollars; None for no minimum (or not
-            recorded).
         entry_checkpoint (str | None): SCHEDULED_RUN.label() of the schedule
             the entry checkpoints were placed by (e.g. "Monday 09:00
             America/Los_Angeles"), for the dashboard header. None = not
@@ -3804,8 +3802,9 @@ class BacktestSweep:
     live_interval_discount: float | None = None
     live_size_cap: float | None = None
     live_same_title_size_cap: float | None = None
-    # The saved live defaults' add_to_held_pairs, sell_at and sell_min_days
-    live_add_to_held_pairs: bool | None = None
+    # The saved live defaults' rebalance, min_price_move, sell_at and sell_min_days
+    live_rebalance: bool | None = None
+    live_min_price_move: float | None = None
     live_sell_at: float | None = None
     live_sell_min_days: int | None = None
     # The dashboard's "Sell" family, lazy (None unless run_backtest_sweep(sell_sweep=True))
@@ -3814,9 +3813,6 @@ class BacktestSweep:
     depth_model: DepthModel | None = None
     # The dashboard's "Rebalance" family, lazy (None unless run_backtest_sweep(rebalance_sweep=True))
     rebalance_sweep: RebalanceSweep | None = None
-    # The saved live defaults' trim_to_kelly and trim_min_rise
-    live_trim_to_kelly: bool | None = None
-    live_trim_min_rise: float | None = None
 
 
 def _settlement_receipt(n: int, outcome_a: str, outcome_b: str, pair_type: str) -> float:
@@ -5119,7 +5115,7 @@ def _move_label(min_move: float) -> str:
     run that does only one), so a run with a minimum never shares a label
     with one without, nor with a run at another minimum (_cap_percent prints
     every digit that tells two values apart). The live-rule line reads it
-    too, for the saved live defaults' minimum (_live_trim_note).
+    too, for the saved live defaults' minimum (_live_rebalance_note).
 
     Args:
         min_move (float): The minimum, in dollars, in (0, 1].
@@ -9214,14 +9210,14 @@ def _live_rule_fields(live: LiveSettings | None) -> dict:
     Name the BacktestSweep keywords that record the saved live defaults.
 
     Both production BacktestSweep constructions spread this (beside
-    same_title_size_cap), so the thirteen fields are recorded together from
+    same_title_size_cap), so the twelve fields are recorded together from
     one read or not at all.
 
     Args:
         live (LiveSettings | None): _live_settings_for_report()'s result.
 
     Returns:
-        dict: The thirteen live_* keywords from live; {} when live is None.
+        dict: The twelve live_* keywords from live; {} when live is None.
     """
     if live is None:
         return {}
@@ -9230,10 +9226,8 @@ def _live_rule_fields(live: LiveSettings | None) -> dict:
             "live_origin": live.origin, "live_interval_discount": live.interval_discount,
             "live_size_cap": live.size_cap,
             "live_same_title_size_cap": live.same_title_size_cap,
-            "live_add_to_held_pairs": live.add_to_held_pairs,
-            "live_sell_at": live.sell_at, "live_sell_min_days": live.sell_min_days,
-            "live_trim_to_kelly": live.trim_to_kelly,
-            "live_trim_min_rise": live.trim_min_rise}
+            "live_rebalance": live.rebalance, "live_min_price_move": live.min_price_move,
+            "live_sell_at": live.sell_at, "live_sell_min_days": live.sell_min_days}
 
 
 # The label a recorded live rule is named with, in the log line and page header
@@ -9291,28 +9285,35 @@ def _live_sizing_note(sweep: BacktestSweep) -> str:
             f"at {sizing(*run)}")
 
 
-def _live_add_on_note(sweep: BacktestSweep) -> str:
+def _live_rebalance_note(sweep: BacktestSweep) -> str:
     """
-    Say when the saved live defaults add to held pairs and this run's headline figures do not.
+    Say when the saved live defaults rebalance held pairs and this run's headline figures do not.
 
-    The backtest's own simulations (its primary scenario and every scenario
-    it runs) never add to held pairs. Only the dashboard's Rebalance view
-    does, always together with trimming, simulated when the page is built.
-    So when the saved live defaults add to held pairs, the live-rule line
-    ends with this clause, saying the primary differs from live there.
-    _live_rule_line and dashboard._live_rule_html add it to the line.
+    Rebalancing adds to the pairs the account holds and sells part of one
+    grown past its Kelly size (a Kelly trim). The backtest's own simulations
+    (its primary scenario and every scenario it runs) do neither; only the
+    dashboard's Rebalance view does, simulated when the page is built. So
+    when the saved live defaults rebalance, the live-rule line ends with
+    this clause, saying the primary differs from live there. A live run
+    applies the saved minimum price movement to its Kelly trims only (a live
+    add-on waits for no minimum), so the clause says the minimum holds back
+    a trim. _live_rule_line and dashboard._live_rule_html add it to the line.
 
     Args:
         sweep (BacktestSweep): The run's sweep.
 
     Returns:
-        str: "; the live defaults add to held pairs, which this run's primary
-            does not" when live_add_to_held_pairs is True, else "" (off, or
-            not recorded).
+        str: "; the live defaults rebalance held pairs (a trim only after a
+            10c price move), which this run's primary does not" (the
+            parenthesis only with a minimum price movement), or "" when
+            live_rebalance is not True (off, or not recorded).
     """
-    if sweep.live_add_to_held_pairs is not True:
+    if sweep.live_rebalance is not True:
         return ""
-    return "; the live defaults add to held pairs, which this run's primary does not"
+    move = sweep.live_min_price_move
+    after = "" if move is None else f" (a trim{_move_label(move)})"
+    return (f"; the live defaults rebalance held pairs{after}, which this run's primary "
+            "does not")
 
 
 def _live_sell_note(sweep: BacktestSweep) -> str:
@@ -9337,30 +9338,6 @@ def _live_sell_note(sweep: BacktestSweep) -> str:
              f" (at least {days} day{'' if days == 1 else 's'} before maturity)")
     return (f"; the live defaults sell at {_cap_percent(level)}% of potential profit{after}, "
             "which this run's primary does not")
-
-
-def _live_trim_note(sweep: BacktestSweep) -> str:
-    """
-    Say when the saved live defaults trim held pairs to Kelly and this run's headline figures do not.
-
-    The run's own scenarios never trim; only the dashboard's Rebalance
-    view does. _live_rule_line and dashboard._live_rule_html add it to the
-    live-rule line.
-
-    Args:
-        sweep (BacktestSweep): The run's sweep.
-
-    Returns:
-        str: "; the live defaults trim to Kelly (only after a 10c price
-            move), which this run's primary does not" (the parenthesis only
-            with a minimum price move), or "" when live_trim_to_kelly is not
-            True.
-    """
-    if sweep.live_trim_to_kelly is not True:
-        return ""
-    move = sweep.live_trim_min_rise
-    after = "" if move is None else f" ({_move_label(move).strip()})"
-    return f"; the live defaults trim to Kelly{after}, which this run's primary does not"
 
 
 def _live_filter_text(categories: tuple[str, ...] | None,
@@ -9465,8 +9442,8 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
     Always a line, so a report never silently omits the live rule: with none
     recorded it says so (_LIVE_RULE_NONE). A recorded rule's line ends with
     _live_sizing_note when the saved defaults size differently from this
-    run's primary, then _live_add_on_note, _live_sell_note and
-    _live_trim_note when they add to held pairs, sell or trim to Kelly.
+    run's primary, then _live_rebalance_note and _live_sell_note when they
+    rebalance held pairs or sell.
 
     Args:
         sweep (BacktestSweep): The run's sweep.
@@ -9485,7 +9462,7 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
         rule += f"; category/tag filter ({_live_filter_text(categories, tags)})"
     if view.where == _LIVE_RULE_NOT_SIMULATED:
         return (f"{prefix}{rule} — not simulated by this run{_live_sizing_note(sweep)}"
-                f"{_live_add_on_note(sweep)}{_live_sell_note(sweep)}{_live_trim_note(sweep)}")
+                f"{_live_rebalance_note(sweep)}{_live_sell_note(sweep)}")
     # Tier floors off at a band no tier binds at: the tier-on cell holds it
     never_binds = ("" if sweep.live_tier_floors or not view.tier_floors else
                    " (no tier floor binds at this band, so off and on are one rule)")
@@ -9507,8 +9484,7 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
                  f"{subject} when its Category and Tag menus tick the categories and tags "
                  "the filter lists (each offered where this run filed a pair under it)")
     return (f"{prefix}{rule} — {tail}{_live_rule_ladder_note(sweep)}"
-            f"{_live_sizing_note(sweep)}{_live_add_on_note(sweep)}{_live_sell_note(sweep)}"
-            f"{_live_trim_note(sweep)}")
+            f"{_live_sizing_note(sweep)}{_live_rebalance_note(sweep)}{_live_sell_note(sweep)}")
 
 
 def _tier_floors_bind(band: tuple[float, float]) -> bool:
@@ -10360,13 +10336,14 @@ def _simulate_at_discount(
     # Days a pair must go without a trade before an add-on or a trim (read
     # only on a run that does either)
     wait_days = _resolve_rebalance_min_days() if (add_to_held or trim_to_kelly) else 0
-    # The live code's settings for this simulation: its k and caps, and the
-    # band and tier setting the entries were found under (validated here,
-    # before any entry is scored)
+    # The live code's settings for this simulation: its k and caps, the band
+    # and tier setting the entries were found under, and whether it
+    # rebalances held pairs (adds to them or trims them, as a live run with
+    # rebalance on does both); validated here, before any entry is scored
     settings = LiveSettings(
         tier_floors=tier_floors is not False, spread_band=(band_lo, band_hi),
         interval_discount=effective_k, size_cap=cap, same_title_size_cap=st_cap,
-        categories=None, tags=None, add_to_held_pairs=bool(add_to_held))
+        categories=None, tags=None, rebalance=bool(add_to_held or trim_to_kelly))
 
     # ── Pass 1b: score the prepared entries and keep the tradeable ones ──
     candidates = []
@@ -12651,7 +12628,7 @@ def _sweep_from_candidates(
             (carried from candidates), config_same_event_ladders (the
             configured switch, read beside same_event_ladders's
             resolution), tier_off_scenarios, tier_off_calibrations_by_band,
-            cap_sweep, tier_off_cap_sweep, same_title_size_cap, the thirteen
+            cap_sweep, tier_off_cap_sweep, same_title_size_cap, the twelve
             live_* fields, entry_checkpoint, sell_sweep, depth_model and
             rebalance_sweep — see BacktestSweep.
 

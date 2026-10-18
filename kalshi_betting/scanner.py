@@ -66,9 +66,9 @@ Dependencies:
     cost (get_held_tickers() is its tickers), and held_pairs() finds what a
     run may add to (HeldPosition, HeldPair, pair_held): exact held pairs, and
     lone legs whose partner has paid out. main._run_prod passes them as each
-    finder's keyword-only add_on_pairs when the run's add_to_held_pairs
-    setting is on, which lets such a pair through, and only with the side
-    already held on each held market.
+    finder's keyword-only add_on_pairs when the run's rebalance setting is
+    on, which lets such a pair through, and only with the side already held
+    on each held market.
     historical.py imports event_series too, so the backtest's event-title
     lookup budget tells a combo ticker from any other exactly as the
     one-series rule does (DR-51).
@@ -3318,7 +3318,7 @@ def get_fill_times(client: Any) -> FillTimes | None:
     Walks every page of the account's fills (retried, read-only GETs with no
     time filter) and keeps each market's newest fill time and the list's
     oldest. seller.plan_trims reads it for its wait after a pair's last trade
-    and its minimum price rise.
+    and its minimum price movement.
 
     Fails closed: returns None, with one WARNING, when a page cannot be read,
     a cursor repeats, SCANNER_MAX_PAGES cuts the list short, or any one fill's
