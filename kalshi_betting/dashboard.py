@@ -30,6 +30,9 @@ Purpose:
     scatter, capital deployment), and benchmark comparison (S&P 500 via
     yfinance) — into a single HTML file with embedded Plotly charts. The file
     is written to PROJECT_ROOT and can be opened directly in any browser.
+    A small Terms link under the title jumps to a Terms section after the
+    last of them: the backtest page's share of the dictionary of scores in
+    glossary.py (the Data page will render its own share of the same text).
 
     A sticky filter bar at the top of the page — Spread band, Tier floors, k,
     Size cap, Rebalance, Min. price movement, Sell, Min. days to maturity,
@@ -202,7 +205,8 @@ Purpose:
     one built before these buttons.
 
 Dependencies:
-    Imports BacktestSweep, BacktestTrade, CorpusProvenance (historical.py's,
+    Imports PAGE_BACKTEST, terms_link_html and terms_section_html from
+    glossary.py (the Terms link and section), BacktestSweep, BacktestTrade, CorpusProvenance (historical.py's,
     re-exported by backtester.py), IntervalCalibration, OutcomeLabelCoverage
     and SweepPoint from backtester.py, plus its _calibration_bucket() (the one
     definition of the k-hat arithmetic, which the k-hat breakdown runs over
@@ -610,6 +614,7 @@ from .config import (
     time_series_profit_prob,
     trade_filter_for,
 )
+from .glossary import PAGE_BACKTEST, terms_link_html, terms_section_html
 from .historical import series_labels as _series_labels
 from .scanner import leg_sides
 from .treasury import SOURCE_CACHE, RiskFreeRates, day_numbers
@@ -14987,6 +14992,8 @@ def generate_dashboard(
         # The run's trades, on whose open capital the strategy row is charged
         lambda: _section_benchmark(equity_df, start_date, initial_balance,
                                    risk_free=risk_free, trades=trades),
+        # Last, so the header's Terms link jumps to the bottom of the page
+        lambda: terms_section_html(PAGE_BACKTEST),
     )
 
     # Named head (not `html`) so it can't shadow the `html` module used by
@@ -15004,6 +15011,7 @@ def generate_dashboard(
 </head>
 <body>
 <h1>Kalshi Arbitrage Backtest</h1>
+<p style="margin:0 0 8px 0;">{terms_link_html(PAGE_BACKTEST)}</p>
 <p style="color:#616161; font-size:14px;">
   Period: {start_date} → {today} &nbsp;|&nbsp;
   Starting balance: {_starting_balance_text(initial_balance, balance_source)} &nbsp;|&nbsp;

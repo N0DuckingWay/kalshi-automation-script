@@ -18459,3 +18459,31 @@ class TestMixedSelection:
                           "roundTo(x, 2), roundTo(x, 4)]; })")
         for x, drawn in zip(points, rounded, strict=True):
             assert drawn == [float(np.round(x, digits)) for digits in (0, 2, 4)], x
+
+
+class TestTermsLinkAndSection:
+    """The page header links to a Terms dictionary (glossary.py) that is the
+    last section of the page."""
+
+    def test_the_link_is_in_the_header_and_the_section_comes_last(
+        self, monkeypatch, tmp_path,
+    ):
+        from kalshi_betting import glossary
+        page = TestRunSettingsHeader._page(monkeypatch, tmp_path)
+        link = f'href="#{glossary.TERMS_ANCHOR}"'
+        section = f'id="{glossary.TERMS_ANCHOR}"'
+        assert page.count(link) == 1
+        assert page.count(section) == 1
+        # Under the title, before the Period line and every section
+        assert (page.index("<h1>") < page.index(link) < page.index("Period:")
+                < page.index("Portfolio Performance"))
+        # After every other section, and every term is on the page
+        assert page.index("Benchmark Comparison") < page.index(section)
+        assert page.index(section) < page.index("</body>")
+        tail = page[page.index(section):]
+        for term, _, _ in glossary.terms_for(glossary.PAGE_BACKTEST):
+            assert html.escape(term) in tail
+        # Only the backtest page's own terms, and the heading clears the
+        # sticky filter bar
+        assert "Favourite\u2013longshot gap" not in tail
+        assert "scroll-margin-top" in page[page.index(section):][:400]
