@@ -5810,7 +5810,9 @@ class TestFilterSummary:
                          "D.text.unavailable", "D.text.khat_sized_at", "T.sell_note",
                          "D.text.sidecar_missing", "D.text.sidecar_empty",
                          "D.sell_levels[level].phrase", "D.sell_days[parseInt(d, 10)].phrase",
-                         # The menus' and a mix's words
+                         # The menus' and a mix's words, and the save button's
+                         # reason while a category or tag is ticked
+                         "D.text.save_filtered",
                          "T.mix_note", "D.text.mix_unavailable", "D.text.names_join",
                          "D.text.names_more", "T.menu_cat_all", "T.menu_cat_n",
                          "T.menu_tag_all", "T.menu_tag_n", "T.cal_title", "T.cal_title_none",
@@ -7277,9 +7279,11 @@ class TestSaveLiveDefaultsButton:
     enabled by the script only while the bar's scenario on screen can become
     the live settings, and opening the defaults server's confirmation page for
     exactly that scenario — never the selects' choice while a chunk loads, and
-    never the Scenario Explorer's own selects. The address it opens is checked
-    against the server's own parser. Its script tests are skipped without a
-    JavaScript runtime; its render and _save_target tests are not."""
+    never the Scenario Explorer's own selects. The address names no category
+    or tag, and the button stays disabled while either menu has a tick. The
+    address it opens is checked against the server's own parser. Its script
+    tests are skipped without a JavaScript runtime; its render and
+    _save_target tests are not."""
 
     @staticmethod
     def _page(monkeypatch, tmp_path, sweep=None, series=_FLT_SERIES, *,
@@ -7372,16 +7376,16 @@ class TestSaveLiveDefaultsButton:
                 "k": data["ks"][ki]["value"], "size_cap": data["caps"][ci]["value"]}
 
     def _assert_sends(self, data: dict, query: dict, bi: int, ki: int, ci: int,
-                      tier: str = "on", *, category: str | None = None,
-                      tag: str | None = None) -> None:
+                      tier: str = "on") -> None:
         """
         Check that a query names scenario [bi, ki, ci] exactly, and nothing else.
 
         Each number must read back as the base block's own value, and the
-        query must carry the run's same-title cap, the source note and the
-        category and tag given, and no other field. The adding, selling and
-        trimming fields may also be present (pages with those views send
-        them); the caller checks their values.
+        query must carry the run's same-title cap and the source note, no
+        category or tag (the button saves no category or tag filter), and no
+        other field. The adding, selling and trimming fields may also be
+        present (pages with those views send them); the caller checks their
+        values.
 
         Args:
             data (dict): The page's base block.
@@ -7390,12 +7394,10 @@ class TestSaveLiveDefaultsButton:
             ki (int): The k's index.
             ci (int): The size cap's index.
             tier (str): The Tier floors choice on screen, "on" or "off".
-            category (str | None): Keyword-only. The category sent, or None
-                for none.
-            tag (str | None): Keyword-only. The tag sent, or None for none.
 
         Raises:
-            AssertionError: If a field differs, or an unknown field is sent.
+            AssertionError: If a field differs, a category or tag is sent, or
+                an unknown field is sent.
         """
         expected = self._expected(data, bi, ki, ci, tier)
         assert query["tier_floors"] == expected.pop("tier_floors")
@@ -7403,9 +7405,9 @@ class TestSaveLiveDefaultsButton:
             assert float(query[name]) == value, name
         assert float(query["same_title_size_cap"]) == data["save"]["same_title_size_cap"]
         assert query["source"] == data["save"]["source"]
-        assert query.get("category") == category and query.get("tag") == tag
+        assert "category" not in query and "tag" not in query
         known = {"tier_floors", "spread_min", "spread_max", "k", "size_cap",
-                 "same_title_size_cap", "source", "category", "tag", "add_to_held_pairs",
+                 "same_title_size_cap", "source", "add_to_held_pairs",
                  "sell_at", "sell_min_days", "trim_to_kelly", "trim_min_rise"}
         assert set(query) <= known
         # The two trim fields are always sent together: a minimum sent alone is
@@ -7433,7 +7435,8 @@ class TestSaveLiveDefaultsButton:
         assert save["source"].startswith(f"backtest dashboard for {_FLT_START.isoformat()} to ")
         # Every word about the button is Python's: the script writes none
         for words in (dashboard._SAVE_LABEL, dashboard._SAVE_TITLE,
-                      dashboard._SAVE_TITLE_UNFILED, dashboard._SAVE_NOTE):
+                      dashboard._SAVE_TITLE_UNFILED, dashboard._SAVE_NOTE,
+                      dashboard._SAVE_BLOCKED_TEXT["save_filtered"]):
             assert words not in dashboard._FILTER_JS
         # ... and the address comes from config, never spelled on the page's side
         assert config.DEFAULTS_SERVER_HOST not in dashboard._FILTER_JS
@@ -7473,29 +7476,46 @@ class TestSaveLiveDefaultsButton:
         [opened] = snaps["cap"]["opened"]
         assert float(self._query(data, opened)["size_cap"]) == 1.0
 
-    def test_it_follows_a_category_and_a_tag_with_its_category(self, monkeypatch, tmp_path):
+    def test_a_tick_shuts_it_and_nothing_ticked_opens_it_again(self, monkeypatch, tmp_path):
+        # The button saves no category or tag filter: a ticked category, or a
+        # ticked tag (which ticks its category), keeps it disabled with the
+        # reason as its hover text, and a click opens nothing. Every category
+        # ticked with no tag reads as nothing ticked, so it saves the scenario
+        # again, naming no category or tag — and so it does once every box
+        # is unticked
         page = self._page(monkeypatch, tmp_path)
         data = TestFilterPage._data(page)
         sports = data["categories"].index("Sports")
-        basketball = str(data["subcats"].index([sports, "Basketball"]))
+        basketball = data["subcats"].index([sports, "Basketball"])
         snaps = _run_script(tmp_path, page, [
             ["wait"],
-            _tick_category(str(sports)), ["settle"],
+            _tick_category(sports), ["settle"],
             ["click", "flt-save"], ["snap", "category"],
             *_clear_menus(), ["settle"],
-            # A "Category · Tag" chosen with nothing ticked sets its category too
+            # A "Category · Tag" ticked with nothing ticked ticks its category too
             _tick_tag(basketball), ["settle"],
             ["click", "flt-save"], ["snap", "tag"],
             _tick_category(""), ["settle"],
-            ["click", "flt-save"], ["snap", "all"]], strict=True)
-        primary = data["primary"]
-        [opened] = snaps["category"]["opened"]
-        self._assert_sends(data, self._query(data, opened), *primary, category="Sports")
-        [opened] = snaps["tag"]["opened"]
-        self._assert_sends(data, self._query(data, opened), *primary, category="Sports",
-                           tag="Sports · Basketball")
-        [opened] = snaps["all"]["opened"]
-        self._assert_sends(data, self._query(data, opened), *primary)
+            ["click", "flt-save"], ["snap", "all"],
+            _tick_category(sports), ["settle"], *_clear_menus(), ["settle"],
+            ["click", "flt-save"], ["snap", "none"]], strict=True)
+        why = data["text"]["save_filtered"]
+        assert snaps["category"]["menus"]["flt-cat"]["ticked"] == [sports]
+        assert snaps["tag"]["menus"]["flt-cat"]["ticked"] == [sports]
+        assert snaps["tag"]["menus"]["flt-tag"]["ticked"] == [basketball]
+        for name in ("category", "tag"):
+            snap = snaps[name]
+            # Drawn, and shut through it
+            assert snap["reacts"], name
+            assert snap["buttons"]["flt-save"] is True and snap["opened"] == [], name
+            assert snap["titles"]["flt-save"] == why, name
+        assert snaps["all"]["menus"]["flt-cat"]["ticked"] == list(range(len(data["categories"])))
+        for name in ("all", "none"):
+            snap = snaps[name]
+            assert snap["buttons"]["flt-save"] is False, name
+            assert snap["titles"]["flt-save"] == dashboard._SAVE_TITLE, name
+            [opened] = snap["opened"]
+            self._assert_sends(data, self._query(data, opened), *data["primary"])
 
     def test_it_follows_the_tier_floors_choice(self, monkeypatch, tmp_path):
         page = self._kc(monkeypatch, tmp_path, _kc_sweep_tiers())
@@ -7579,29 +7599,88 @@ class TestSaveLiveDefaultsButton:
         assert snap["buttons"]["flt-save"] is True and snap["opened"] == []
 
     def test_without_a_series_listing_no_category_or_tag_is_saved(self, monkeypatch, tmp_path):
-        # Trades filed by ticker prefix: the live category filter files by
-        # Kalshi's listing, so a slice of this page is not one it can trade
+        # Trades filed by ticker prefix: the button saves no category or tag
+        # from any page, so this one has the same hover text as a page filed
+        # by Kalshi's listing, saves the scenario with nothing ticked, and
+        # shuts for a tick, saying why
         page = self._page(monkeypatch, tmp_path, series=None)
         data = TestFilterPage._data(page)
-        assert data["save"]["filed_by_listing"] is False and data["categories"]
+        assert data["categories"]
         title = re.search(r'<button id="flt-save"[^>]*title="([^"]*)"', page).group(1)
-        assert html.unescape(title) == dashboard._SAVE_TITLE + dashboard._SAVE_TITLE_UNFILED
+        assert html.unescape(title) == dashboard._SAVE_TITLE
         snaps = _run_script(tmp_path, page, [
             ["wait"], ["click", "flt-save"], ["snap", "all"],
             _tick_category("0"), ["settle"],
             ["click", "flt-save"], ["snap", "category"],
-            _tick_category(""), ["settle"], ["snap", "back"]],
+            _tick_category(""), ["settle"], ["click", "flt-save"], ["snap", "back"]],
             strict=True)
         [opened] = snaps["all"]["opened"]
         self._assert_sends(data, self._query(data, opened), *data["primary"])
         assert snaps["category"]["buttons"]["flt-save"] is True
         assert snaps["category"]["opened"] == []
-        assert snaps["back"]["buttons"]["flt-save"] is False
+        assert snaps["category"]["titles"]["flt-save"] == data["text"]["save_filtered"]
+        # Every category ticked and no tag counts as nothing ticked: the
+        # scenario is saved again, with no category or tag
+        back = snaps["back"]
+        assert back["buttons"]["flt-save"] is False
+        assert back["titles"]["flt-save"] == dashboard._SAVE_TITLE
+        [opened] = back["opened"]
+        self._assert_sends(data, self._query(data, opened), *data["primary"])
 
     def test_a_listing_page_s_title_has_no_unfiled_sentence(self, monkeypatch, tmp_path):
         page = self._page(monkeypatch, tmp_path)
         title = re.search(r'<button id="flt-save"[^>]*title="([^"]*)"', page).group(1)
         assert html.unescape(title) == dashboard._SAVE_TITLE
+
+    @pytest.mark.parametrize("cats, tags, shown", [
+        (("Sports",), None, True), (None, ("Hockey",), True),
+        (("Sports",), ("Sports · Hockey",), True), (None, None, False)])
+    def test_a_note_says_when_saving_clears_a_saved_category_or_tag_filter(
+            self, monkeypatch, tmp_path, cats, tags, shown):
+        # The button sends no category or tag, so over saved live defaults
+        # that filter by one, a grey note after it says saving clears that
+        # filter; with no filter saved there is no note
+        sweep = dataclasses.replace(_flt_sweep(), live_categories=cats, live_tags=tags)
+        page = self._page(monkeypatch, tmp_path, sweep)
+        assert TestFilterPage._data(page)["save"]["live_filters"] is shown
+        note = (f'<span id="flt-filter-save-note" style="color:#9E9E9E; font-size:13px;">'
+                f"{html.escape(dashboard._FILTER_SAVE_NOTE)}</span>")
+        assert (note in page) is shown
+        assert ('id="flt-filter-save-note"' in page) is shown
+        if shown:
+            # After the button, before the trade link
+            assert page.index('id="flt-save"') < page.index(note) < page.index('id="flt-trade"')
+        # Python's words: the script writes none of them
+        assert dashboard._FILTER_SAVE_NOTE not in dashboard._FILTER_JS
+
+    def test_a_save_clears_a_saved_category_and_tag_filter(self, monkeypatch, tmp_path):
+        # Saved live defaults that trade only Sports, narrowed to Hockey: the
+        # page with nothing ticked saves its scenario naming no category or
+        # tag, which the defaults server reads as any category and tag
+        config.save_live_defaults(dataclasses.replace(
+            config.live_settings(), categories=("Sports",), tags=("Sports · Hockey",)),
+            source="")
+        current = config.read_saved_live_defaults()
+        assert current.categories == ("Sports",) and current.tags == ("Sports · Hockey",)
+        sweep = dataclasses.replace(_flt_sweep(), live_categories=current.categories,
+                                    live_tags=current.tags)
+        page = self._page(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        assert data["save"]["live_filters"] is True
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["click", "flt-save"], ["snap", "s"]], strict=True)["s"]
+        assert snap["buttons"]["flt-save"] is False
+        assert snap["titles"]["flt-save"] == dashboard._SAVE_TITLE
+        [opened] = snap["opened"]
+        self._assert_sends(data, self._query(data, opened), *data["primary"])
+        query = opened["url"].partition("?")[2]
+        response = defaults_server._App(config.DEFAULTS_SERVER_PORT).handle(
+            defaults_server._Request("GET", f"/confirm?{query}", _SAVE_HOST))
+        assert response.status == 200, response.body
+        settings, _ = defaults_server._proposal(defaults_server._params(query), current)
+        assert settings.categories is None and settings.tags is None
+        # Nothing was written by showing the page
+        assert config.read_saved_live_defaults() == current
 
     def test_a_k_that_is_not_positive_cannot_be_saved(self, monkeypatch, tmp_path):
         # The live settings need k in (0, 1]: a run's k of 0.0 is not one
@@ -7666,8 +7745,8 @@ class TestSaveLiveDefaultsButton:
     def test_a_band_the_run_did_not_record_cannot_be_saved(self, monkeypatch, tmp_path):
         # A sweep whose primary records no band but does record its k and
         # cap: the band alone is what keeps the button disabled, on load and
-        # on every redraw (a category change redraws at once, its chunk
-        # being the one on screen)
+        # after a category is ticked and unticked again (a category change
+        # redraws at once, its chunk being the one on screen)
         base = _flt_sweep()
         primary = dataclasses.replace(base.primary, spread_band=None)
         sweep = dataclasses.replace(base, primary=primary, points=[primary], scenarios=[])
@@ -7681,19 +7760,27 @@ class TestSaveLiveDefaultsButton:
         snaps = _run_script(tmp_path, page, [
             ["wait"], ["click", "flt-save"], ["snap", "ready"],
             _tick_category(sports), ["settle"],
-            ["click", "flt-save"], ["snap", "category"]], strict=True)
-        ready, category = snaps["ready"], snaps["category"]
+            ["click", "flt-save"], ["snap", "category"],
+            _tick_category(sports), ["settle"],
+            ["click", "flt-save"], ["snap", "back"]], strict=True)
+        ready, category, back = snaps["ready"], snaps["category"], snaps["back"]
         assert not ready["selects"]["flt-band"]["disabled"]
         assert ready["buttons"]["flt-save"] is True and ready["opened"] == []
-        # The category was drawn, and the button stayed disabled through it
+        # The category was drawn, and the button stayed disabled through it,
+        # its hover text naming the tick
         assert category["selects"]["flt-cat"]["value"] == sports and category["reacts"]
         assert category["buttons"]["flt-save"] is True and category["opened"] == []
+        assert category["titles"]["flt-save"] == data["text"]["save_filtered"]
+        # Unticked and drawn again: the band alone keeps it shut
+        assert back["selects"]["flt-cat"]["value"] == "" and back["reacts"]
+        assert back["buttons"]["flt-save"] is True and back["opened"] == []
+        assert back["titles"]["flt-save"] == dashboard._SAVE_TITLE
 
     def test_a_size_cap_the_run_did_not_record_cannot_be_saved(self, monkeypatch, tmp_path):
         # A sweep whose points record their band and k but no size cap: the
-        # cap alone is what keeps the button disabled, on load and on every
-        # redraw (the server would refuse a size_cap of null, so the page
-        # must not offer it)
+        # cap alone is what keeps the button disabled, on load and after a
+        # category is ticked and unticked again (the server would refuse a
+        # size_cap of null, so the page must not offer it)
         page = self._page(monkeypatch, tmp_path, _flt_sweep(size_cap=None))
         data = TestFilterPage._data(page)
         pb, pk, pc = data["primary"]
@@ -7704,13 +7791,21 @@ class TestSaveLiveDefaultsButton:
         snaps = _run_script(tmp_path, page, [
             ["wait"], ["click", "flt-save"], ["snap", "ready"],
             _tick_category(sports), ["settle"],
-            ["click", "flt-save"], ["snap", "category"]], strict=True)
-        ready, category = snaps["ready"], snaps["category"]
+            ["click", "flt-save"], ["snap", "category"],
+            _tick_category(sports), ["settle"],
+            ["click", "flt-save"], ["snap", "back"]], strict=True)
+        ready, category, back = snaps["ready"], snaps["category"], snaps["back"]
         assert not ready["selects"]["flt-band"]["disabled"]
         assert ready["buttons"]["flt-save"] is True and ready["opened"] == []
-        # The category was drawn, and the button stayed disabled through it
+        # The category was drawn, and the button stayed disabled through it,
+        # its hover text naming the tick
         assert category["selects"]["flt-cat"]["value"] == sports and category["reacts"]
         assert category["buttons"]["flt-save"] is True and category["opened"] == []
+        assert category["titles"]["flt-save"] == data["text"]["save_filtered"]
+        # Unticked and drawn again: the size cap alone keeps it shut
+        assert back["selects"]["flt-cat"]["value"] == "" and back["reacts"]
+        assert back["buttons"]["flt-save"] is True and back["opened"] == []
+        assert back["titles"]["flt-save"] == dashboard._SAVE_TITLE
 
     def test_a_ladder_setting_that_departs_is_named_in_the_source(self, monkeypatch, tmp_path):
         sweep = dataclasses.replace(_flt_sweep(), same_event_ladders=False,
@@ -7729,7 +7824,7 @@ class TestSaveLiveDefaultsButton:
                           "filed_by_listing": True,
                           "source": "backtest dashboard for 2026-01-05 to 2026-09-28",
                           "live_adds_to_held_pairs": False, "live_sells": False,
-                          "live_trims": False,
+                          "live_trims": False, "live_filters": False,
                           # The most categories, and tags, one address may name
                           "max_names": config.DEFAULTS_SERVER_MAX_FILTER_NAMES}
         # ... which is True only for a run that recorded saved defaults adding
@@ -7750,6 +7845,13 @@ class TestSaveLiveDefaultsButton:
             swept = dataclasses.replace(sweep, live_trim_to_kelly=trims, live_trim_min_rise=rise)
             assert dashboard._save_target(swept, _FLT_START, today, _FLT_SERIES)[
                 "live_trims"] is said
+        # ... and "live_filters" only for saved defaults with a category or tag
+        # filter (either alone is a filter)
+        for cats, tags, said in ((("Sports",), None, True), (None, ("Hockey",), True),
+                                 (("Sports",), ("Sports · Hockey",), True), (None, None, False)):
+            swept = dataclasses.replace(sweep, live_categories=cats, live_tags=tags)
+            assert dashboard._save_target(swept, _FLT_START, today, _FLT_SERIES)[
+                "live_filters"] is said
         # Only a recorded setting that differs from a recorded switch is named
         for ladders, configured in ((True, True), (False, None), (None, True)):
             swept = dataclasses.replace(sweep, same_event_ladders=ladders,
@@ -7843,16 +7945,13 @@ class TestSaveLiveDefaultsButton:
         # The clicked address, handed to the server's own application as a
         # browser would send it: it answers with the confirmation page, and its
         # parser reads exactly the scenario on screen — tier floors off, k
-        # 0.60, a 20% cap, Sports · Hockey, the run's 0.5 same-title cap
+        # 0.60, a 20% cap, no category or tag (any), the run's 0.5 same-title cap
         page = self._kc(monkeypatch, tmp_path, _kc_sweep_tiers())
         data = TestFilterPage._data(page)
-        sports = data["categories"].index("Sports")
-        hockey = str(data["subcats"].index([sports, "Hockey"]))
         snaps = _run_script(tmp_path, page, [
             ["wait"], ["click", "flt-save"], ["snap", "primary"],
             ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"],
             ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"],
-            _tick_tag(hockey), ["settle"],
             ["click", "flt-save"], ["snap", "chosen"]], strict=True)
         if saved:
             save_config_live_defaults()
@@ -7874,7 +7973,7 @@ class TestSaveLiveDefaultsButton:
                 tier_floors=False, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][0]["value"],
                 size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5,
-                categories=("Sports",), tags=("Sports · Hockey",), add_to_held_pairs=add_on)),
+                add_to_held_pairs=add_on)),
         )
         for name, expected in cases:
             [opened] = snaps[name]["opened"]
@@ -12758,18 +12857,16 @@ class TestAddOnScript:
         # The clicked address, handed to the server's own application and parser:
         # the settings it reads carry the choice on screen — off explicitly at
         # the page as rendered (so the seed's "on" does not leak in), on when
-        # chosen — whatever is saved
+        # chosen — whatever is saved, and no category or tag, which the button
+        # never sends
         save = TestSaveLiveDefaultsButton()
         page = save._kc(monkeypatch, tmp_path, _kc_sweep_add_on(_kc_sweep_tiers()))
         data = TestFilterPage._data(page)
-        sports = data["categories"].index("Sports")
-        hockey = str(data["subcats"].index([sports, "Hockey"]))
         snaps = self._run(tmp_path, page, [
             ["wait"], ["click", "flt-save"], ["snap", "primary"],
             ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"],
             ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"],
             ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"],
-            _tick_tag(hockey), ["settle"],
             ["click", "flt-save"], ["snap", "chosen"]], strict=True)
         if saved:
             save_config_live_defaults()
@@ -12786,7 +12883,7 @@ class TestAddOnScript:
                 tier_floors=False, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][0]["value"],
                 size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5,
-                categories=("Sports",), tags=("Sports · Hockey",), add_to_held_pairs=True)),
+                add_to_held_pairs=True)),
         )
         for name, expected in cases:
             [opened] = snaps[name]["opened"]
@@ -18035,10 +18132,12 @@ def _mix_names(cats: list[int], tags: list[int],
 
 
 def _mix_kept(cats: list[int], tags: list[int], series: dict = _MIX_SERIES):
-    """The live filter's own test for a set of ticks saved as the page saves
-    them: config.trade_filter of the ticked categories and tied tags."""
+    """The live filter's own test for a set of ticks: config.trade_filter of
+    settings listing the ticked categories and each ticked tag tied to its
+    category (the save button sends neither; this is the live rule the
+    menus' ticks follow)."""
     categories, tied, _ = _mix_names(cats, tags, series)
-    # The live rule itself, on settings holding exactly the page's ticks
+    # The live rule itself, on settings holding exactly these ticks
     return config.trade_filter(dataclasses.replace(
         config.live_settings(), categories=tuple(categories) or None, tags=tuple(tied) or None))
 
@@ -18269,8 +18368,9 @@ class TestMixedSelection:
     trades with quotes valued at market, pages with T-bill rates, pages whose
     every month holds trades, and one whose tags mostly tie on P&L — and
     pin the menus' behaviour (tags that differ only in letter case move
-    together), the address the save button opens and why it will not open
-    one, the k-hat figures of a mix and how many mixes a list remembers.
+    together), the save button staying shut while a particular category or
+    tag is ticked, the k-hat figures of a mix and how many mixes a list
+    remembers.
     Skipped without a JavaScript runtime.
     """
 
@@ -18725,17 +18825,20 @@ class TestMixedSelection:
         assert refused["menus"]["flt-cat"]["ticked"] == [1]
         assert refused["menus"]["flt-cat"]["label"] == "Cat1"
         assert refused["text"]["hdr-trades"] == str(views["c1"]["n"])
-        assert not refused["buttons"]["flt-save"]
+        # Cat1 is still ticked, so the button stays shut and says why
+        assert refused["buttons"]["flt-save"]
+        assert refused["titles"]["flt-save"] == data["text"]["save_filtered"]
         assert snaps["tag"]["text"]["hdr-trades"] == str(views[f"s{cat1[0]}"]["n"])
         assert snaps["tag"]["menus"]["flt-tag"]["ticked"] == [cat1[0]]
 
-    def test_the_saved_filter_keeps_exactly_what_the_page_shows(self, monkeypatch, tmp_path):
-        # The clicked address, read by the defaults server's own parser, gives
-        # live settings whose filter (config.trade_filter) keeps exactly the
-        # category · tag pairs the ticks cover on the page — over every pair
-        # the page lists — for seeded sets of ticks
-        save_config_live_defaults()
-        current = config.read_saved_live_defaults()
+    def test_the_page_shows_exactly_what_the_live_filter_keeps(self, monkeypatch, tmp_path):
+        # The ticks follow the live filter's rule (config.trade_filter): for
+        # seeded sets of ticks, the trades the page draws are exactly those of
+        # the category · tag pairs a live filter of the same categories and
+        # tied tags keeps, over every pair the page lists. The save button
+        # sends no category or tag, so it stays shut, saying why, while
+        # anything is ticked; every category ticked with no tag reads as
+        # nothing ticked, so the scenario is saved
         trades = _mix_trades(51, n=44)
         page = _mix_page(monkeypatch, tmp_path, trades)
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
@@ -18748,114 +18851,55 @@ class TestMixedSelection:
             steps += _mix_tick_steps(cats, tags, f"drawn{i}")[:-1]
             steps += [["click", "flt-save"], ["snap", f"set{i}"]]
         snaps = _run_script(tmp_path, page, steps, strict=True)
-        narrowed = 0
+        narrowed = blocked = 0
         for i, (cats, tags) in enumerate(sets):
             snap = snaps[f"set{i}"]
-            [opened] = snap["opened"]
-            query = opened["url"].partition("?")[2]
-            sent = parse_qs(query, strict_parsing=True)
-            categories, tied, _ = _mix_names(cats, tags)
-            # Every category ticked and no tag is "All categories": no filter
-            if len(cats) == len(_MIX_CATEGORIES) and not tags:
-                categories = []
-            # One category per ticked category, one tied tag per ticked tag
-            assert sent.get("category", []) == categories
-            assert sent.get("tag", []) == tied
-            settings, _ = defaults_server._proposal(defaults_server._params(query), current)
-            assert settings.categories == (tuple(categories) or None)
-            assert settings.tags == (tuple(tied) or None)
-            keeps = config.trade_filter(settings)
+            # The live rule itself, on settings holding exactly these ticks
+            keeps = _mix_kept(cats, tags)
             kept = [si for si, pair in enumerate(pairs) if keeps(*pair)]
             # The page's own resolution of the ticks: per ticked category its
             # ticked tags, or every one of its tags
-            covered = [si for si, (name, _) in enumerate(pairs)
-                       if _MIX_CATEGORIES.index(name) in cats
-                       and (si in tags or not any(pairs[t][0] == name for t in tags))]
-            assert kept == covered
+            assert kept == _mix_covered(cats, tags)
             # ... which is what the page drew
             assert snap["text"]["hdr-trades"] == str(
-                sum(views[f"s{si}"]["n"] for si in covered if f"s{si}" in views))
-            narrowed += bool(tags) and len(covered) < len(pairs)
-        assert narrowed
+                sum(views[f"s{si}"]["n"] for si in kept if f"s{si}" in views))
+            narrowed += bool(tags) and len(kept) < len(pairs)
+            if len(cats) == len(_MIX_CATEGORIES) and not tags:
+                # "All categories": nothing ticked, so the scenario is saved
+                # with no category or tag
+                assert not snap["buttons"]["flt-save"]
+                [opened] = snap["opened"]
+                sent = parse_qs(opened["url"].partition("?")[2], strict_parsing=True)
+                assert "category" not in sent and "tag" not in sent
+            else:
+                blocked += 1
+                assert snap["buttons"]["flt-save"] and snap["opened"] == []
+                assert snap["titles"]["flt-save"] == data["text"]["save_filtered"]
+        assert narrowed and blocked
 
-    def test_every_ticked_tag_is_sent_even_when_they_are_all_of_a_categorys(
+    def test_a_great_many_ticks_shut_it_with_the_same_hover_text(
             self, monkeypatch, tmp_path):
-        # The page lists only the tags this backtest saw, so a category whose
-        # listed tags are all ticked is still saved tag by tag: naming it
-        # alone would let a live run trade tags nobody ticked. Commodities
-        # has one listed tag, Sports two.
-        save_config_live_defaults()
-        current = config.read_saved_live_defaults()
-        page = TestSaveLiveDefaultsButton._page(monkeypatch, tmp_path)
-        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        views = chunks[data["grid"][data["primary"][0]][data["primary"][1]][
-            data["primary"][2]]]["list"]["views"]
-        commodities = data["categories"].index("Commodities")
-        sports = data["categories"].index("Sports")
-        oil = data["subcats"].index([commodities, "Oil & Gas"])
-        sports_tags = [i for i, (c, _) in enumerate(data["subcats"]) if c == sports]
-        assert [c for c, _ in data["subcats"]].count(commodities) == 1
-        assert len(sports_tags) == 2
-        snaps = _run_script(tmp_path, page, [
-            ["wait"], _tick_tag(oil), ["settle"], ["click", "flt-save"], ["snap", "one_tag"],
-            *_clear_menus(), *(_tick_tag(t) for t in sports_tags), ["settle"],
-            ["click", "flt-save"], ["snap", "both_tags"],
-            _tick_tag(""), ["settle"], ["click", "flt-save"], ["snap", "whole"]], strict=True)
-        expected = {
-            "one_tag": (["Commodities"], ["Commodities · Oil & Gas"], f"c{commodities}"),
-            "both_tags": (["Sports"], ["Sports · Basketball", "Sports · Hockey"],
-                          f"c{sports}"),
-            "whole": (["Sports"], [], f"c{sports}"),
-        }
-        for name, (categories, tied, view) in expected.items():
-            [opened] = snaps[name]["opened"]
-            query = opened["url"].partition("?")[2]
-            sent = parse_qs(query, strict_parsing=True)
-            assert sent["category"] == categories and sent.get("tag", []) == tied, name
-            settings, _ = defaults_server._proposal(defaults_server._params(query), current)
-            assert settings.categories == tuple(categories)
-            assert settings.tags == (tuple(tied) or None)
-            # The figures are the category's own view either way: the same trades
-            assert snaps[name]["text"]["hdr-trades"] == str(views[view]["n"]), name
-        # A tag the page never listed is kept only by the whole category
-        tagged = config.trade_filter(defaults_server._proposal(defaults_server._params(
-            snaps["both_tags"]["opened"][0]["url"].partition("?")[2]), current)[0])
-        whole = config.trade_filter(defaults_server._proposal(defaults_server._params(
-            snaps["whole"]["opened"][0]["url"].partition("?")[2]), current)[0])
-        assert tagged("Sports", "Hockey") and not tagged("Sports", "Tennis")
-        assert whole("Sports", "Tennis")
-
-    def test_more_names_than_the_server_takes_cannot_be_saved(self, monkeypatch, tmp_path):
-        # The page carries the server's own limit; past it the button is shut
-        # (One under the limit's least: every category ticked reads as "All
-        # categories", which names none)
-        monkeypatch.setattr(dashboard, "DEFAULTS_SERVER_MAX_FILTER_NAMES", 2)
-        page = _mix_page(monkeypatch, tmp_path, _mix_trades(52, n=44))
+        # More names than the confirmation page takes
+        # (config.DEFAULTS_SERVER_MAX_FILTER_NAMES) are ticks like any other:
+        # the button stays shut with the same reason, not a reason of their own
+        most = config.DEFAULTS_SERVER_MAX_FILTER_NAMES
+        series = {f"KXN{i:02d}": (f"Area{i:02d}", ("Main",)) for i in range(most + 2)}
+        trades = []
+        for i, ticker in enumerate(sorted(series)):
+            entry = _MIX_START + timedelta(days=i % 40)
+            trades.append(dataclasses.replace(
+                _typed_trade("time_series", False, entry, entry + timedelta(days=2), 1.0),
+                event_ticker=f"{ticker}-{i}", ticker_a=f"{ticker}-{i}A",
+                ticker_b=f"{ticker}-{i}B", title_a=f"Question {i}?", category="Other"))
+        trades.sort(key=lambda t: t.entry_date)
+        page = _mix_page(monkeypatch, tmp_path, trades, series=series)
         data = TestFilterPage._data(page)
-        assert data["save"]["max_names"] == 2
-        cat0 = [i for i, (name, _) in enumerate(_MIX_SUBCATS) if name == "Cat0"]
-        snaps = _run_script(tmp_path, page, [
-            ["wait"], _tick_category(0), _tick_category(1), ["settle"], ["snap", "two"],
-            _tick_category(2), _tick_tag(cat0[0]), ["settle"], ["click", "flt-save"],
-            ["snap", "three"],
-            _tick_tag(cat0[0]), _tick_category(2), _tick_category(1),
-            *(_tick_tag(t) for t in cat0), ["settle"],
-            ["click", "flt-save"], ["snap", "three_tags"],
-            _tick_tag(cat0[0]), ["settle"], ["snap", "two_tags"]], strict=True)
-        assert not snaps["two"]["buttons"]["flt-save"]
-        assert snaps["three"]["buttons"]["flt-save"] and snaps["three"]["opened"] == []
-        assert snaps["three_tags"]["buttons"]["flt-save"]
-        assert snaps["three_tags"]["opened"] == []
-        assert not snaps["two_tags"]["buttons"]["flt-save"]
-        # While the ticks are too many the button's hover text says so, in
-        # Python's words; otherwise it reads as Python rendered it
-        too_many = "Cannot save: more than 2 categories, or more than 2 tags, are ticked. " \
-                   "Untick some."
-        assert data["text"]["save_too_many"].format(n=2) == too_many
-        assert snaps["three"]["titles"]["flt-save"] == too_many
-        assert snaps["three_tags"]["titles"]["flt-save"] == too_many
-        assert snaps["two"]["titles"]["flt-save"] == dashboard._SAVE_TITLE
-        assert snaps["two_tags"]["titles"]["flt-save"] == dashboard._SAVE_TITLE
+        snap = _run_script(tmp_path, page, [
+            ["wait"], *(_tick_category(i) for i in range(most + 1)), ["settle"],
+            ["click", "flt-save"], ["snap", "s"]], strict=True)["s"]
+        assert snap["menus"]["flt-cat"]["ticked"] == list(range(most + 1))
+        assert snap["buttons"]["flt-save"] and snap["opened"] == []
+        assert snap["titles"]["flt-save"] == data["text"]["save_filtered"]
 
     def test_the_khat_figures_of_a_mix_are_its_groups_pooled(self, monkeypatch, tmp_path):
         observations = _mix_observations(61)
@@ -18936,15 +18980,13 @@ class TestMixedSelection:
             " · ".join(_MIX_SUBCATS[i]) for i in [cat0[0], *cat2]
             if f"s{i}" in data["khat"][0]["groups"]]
 
-    def test_tags_that_differ_only_in_letter_case_are_ticked_and_saved_as_one(
+    def test_tags_that_differ_only_in_letter_case_are_ticked_and_unticked_as_one(
             self, monkeypatch, tmp_path):
         # The live filter reads "Health · COVID" and "Health · Covid" as one
         # tag, so the page ticks and unticks them together: whatever a reader
-        # clicks, the tags the page shows are exactly the ones the saved
-        # filter keeps. Tag i holds 2**i trades, so the trade count on the
-        # page names the exact set of tags shown.
-        save_config_live_defaults()
-        current = config.read_saved_live_defaults()
+        # clicks, the tags the page shows are exactly the ones a live filter
+        # of the same ticks keeps. Tag i holds 2**i trades, so the trade
+        # count on the page names the exact set of tags shown.
         categories, pairs = _mix_axes(_TWIN_SERIES)
         page = _mix_page(monkeypatch, tmp_path, _counted_trades(_TWIN_SERIES),
                          series=_TWIN_SERIES)
@@ -18998,7 +19040,7 @@ class TestMixedSelection:
         steps, expected = [["wait"]], []
         for i, boxes in enumerate(cases):
             ticks, cats, tags = clicked(boxes)
-            steps += [*ticks, ["settle"], ["click", "flt-save"], ["snap", f"case{i}"]]
+            steps += [*ticks, ["settle"], ["snap", f"case{i}"]]
             expected.append((sorted(cats), sorted(tags)))
         snaps = _run_script(tmp_path, page, steps, strict=True)
         seen = set()
@@ -19006,17 +19048,9 @@ class TestMixedSelection:
             snap = snaps[f"case{i}"]
             assert snap["menus"]["flt-cat"]["ticked"] == cats, cases[i]
             assert snap["menus"]["flt-tag"]["ticked"] == tags, cases[i]
-            [opened] = snap["opened"]
-            query = opened["url"].partition("?")[2]
-            sent = parse_qs(query, strict_parsing=True)
-            # Every ticked name is sent, both spellings of a twin included —
-            # but every category ticked with no tag is "All categories"
-            names = [] if len(cats) == len(categories) and not tags else cats
-            assert sent.get("category", []) == [categories[c] for c in names]
-            assert sent.get("tag", []) == [config.TAG_SCOPE_SEPARATOR.join(pairs[t])
-                                           for t in tags]
-            settings, _ = defaults_server._proposal(defaults_server._params(query), current)
-            keeps = config.trade_filter(settings)
+            # The live rule itself, on settings holding exactly these ticks
+            # (both spellings of a twin included)
+            keeps = _mix_kept(cats, tags, _TWIN_SERIES)
             kept = {si for si, pair in enumerate(pairs) if keeps(*pair)}
             # The tags on the page, read off its trade count (2**i per tag)
             count = int(snap["text"]["hdr-trades"])
@@ -19030,10 +19064,6 @@ class TestMixedSelection:
             assert snaps[f"case{i}"]["menus"]["flt-tag"]["label"] == "2 tags"
             assert snaps[f"case{i}"]["text"]["hdr-trades"] == str(2 ** upper + 2 ** lower)
         assert expected[2] == ([health], [])
-        # The server keeps the first spelling and drops the case-only repeat
-        saved, _ = defaults_server._proposal(defaults_server._params(
-            snaps["case0"]["opened"][0]["url"].partition("?")[2]), current)
-        assert saved.tags == ("Health · COVID",)
         # Sports' own Covid is another category's tag: no twin of Health's
         assert expected[4] == ([categories.index("Sports")], [other])
         assert len(seen) >= 8
@@ -19120,41 +19150,57 @@ class TestMixedSelection:
         assert refused["text"]["flt-summary"] == (
             f"Not available: Cat1, Cat2 cannot be shown together for {tried} (the page's "
             f"build log says why). The page still shows Cat1, Cat2 at {still}.")
-        assert not refused["buttons"]["flt-save"]
+        # Two categories are still ticked: the button stays shut and says why
+        assert refused["buttons"]["flt-save"]
+        assert refused["titles"]["flt-save"] == data["text"]["save_filtered"]
 
-    def test_the_save_button_says_why_the_ticks_cannot_be_saved(self, monkeypatch, tmp_path):
-        # "Health" and "health" are one category to the live filter, which
-        # would keep both where the page shows one; a category whose name
-        # holds the mark that ties a tag to its category cannot be told from
-        # a tied tag. A tick on either cannot be saved, and the button's
-        # hover text says why, in Python's words
+    def test_any_tick_shuts_the_save_button_and_says_why(self, monkeypatch, tmp_path):
+        # The button sends no category or tag, so whatever is ticked — one
+        # category, one tag (which ticks its category), a mix, a category with
+        # a namesake in other letter case, one whose name holds the mark that
+        # ties a tag to its category — it stays shut, its hover text saying
+        # why in Python's words, and a click opens nothing. Every category
+        # ticked with no tag reads as nothing ticked, and so does unticking
+        # every box: then it saves the scenario, naming no category or tag
         series = {"KXD0": ("Health", ("Flu",)), "KXD1": ("health", ("Flu",)),
-                  "KXD2": ("Arts · Crafts", ("Glue",)), "KXD3": ("Sports", ("Golf",))}
-        categories, _ = _mix_axes(series)
+                  "KXD2": ("Arts · Crafts", ("Glue",)), "KXD3": ("Sports", ("Golf",)),
+                  "KXD4": ("Sports", ("Tennis",))}
+        categories, pairs = _mix_axes(series)
         assert categories == ["Arts · Crafts", "Health", "Sports", "health"]
         page = _mix_page(monkeypatch, tmp_path, _counted_trades(series), series=series)
         data = TestFilterPage._data(page)
-        assert data["category_twins"] == [[1, 3]] and data["tag_twins"] == []
-        snaps = _run_script(tmp_path, page, [
-            ["snap", "loaded"], ["wait"], ["snap", "ready"],
-            _tick_category(2), ["settle"], ["snap", "sports"],
-            _tick_category(1), ["settle"], ["click", "flt-save"], ["snap", "twin"],
-            _tick_category(1), ["settle"], ["snap", "sports_again"],
-            _tick_category(0), ["settle"], ["click", "flt-save"], ["snap", "separator"],
-            *_clear_menus(), _tick_category(3), ["settle"], ["click", "flt-save"],
-            ["snap", "other_twin"]], strict=True)
-        usual = dashboard._SAVE_TITLE
-        for name in ("loaded", "ready", "sports", "sports_again"):
-            assert snaps[name]["titles"]["flt-save"] == usual, name
-        for name in ("ready", "sports", "sports_again"):
-            assert not snaps[name]["buttons"]["flt-save"], name
-        for name, why in (("twin", "save_case_twin"), ("separator", "save_separator"),
-                          ("other_twin", "save_case_twin")):
-            assert snaps[name]["buttons"]["flt-save"], name
-            assert snaps[name]["opened"] == [], name
-            assert snaps[name]["titles"]["flt-save"] == data["text"][why], name
-        assert data["text"]["save_case_twin"].startswith("Cannot save: a ticked category has")
-        assert data["text"]["save_separator"].startswith("Cannot save: a ticked category's")
+        golf, tennis = pairs.index(("Sports", "Golf")), pairs.index(("Sports", "Tennis"))
+        cases = {"category": ([2], []), "tag": ([], [golf]), "mix": ([1, 2], [tennis]),
+                 "twin": ([3], []), "separator": ([0], [])}
+        steps = [["snap", "loaded"], ["wait"], ["snap", "ready"]]
+        for name, (cats, tags) in cases.items():
+            steps += [*_mix_tick_steps(cats, tags, name)[:-1], ["click", "flt-save"],
+                      ["snap", name]]
+        steps += [*_clear_menus(), _tick_category(""), ["settle"], ["click", "flt-save"],
+                  ["snap", "every"],
+                  _tick_category(2), ["settle"], *_clear_menus(), ["settle"],
+                  ["click", "flt-save"], ["snap", "cleared"]]
+        snaps = _run_script(tmp_path, page, steps, strict=True)
+        why = data["text"]["save_filtered"]
+        assert why.startswith("Cannot save while a category or tag is chosen.")
+        for name in ("loaded", "ready"):
+            assert snaps[name]["titles"]["flt-save"] == dashboard._SAVE_TITLE, name
+        assert not snaps["ready"]["buttons"]["flt-save"]
+        assert snaps["tag"]["menus"]["flt-cat"]["ticked"] == [2]
+        for name in cases:
+            snap = snaps[name]
+            # Drawn, and shut through it
+            assert snap["reacts"], name
+            assert snap["buttons"]["flt-save"] and snap["opened"] == [], name
+            assert snap["titles"]["flt-save"] == why, name
+        assert snaps["every"]["menus"]["flt-cat"]["ticked"] == list(range(len(categories)))
+        for name in ("every", "cleared"):
+            snap = snaps[name]
+            assert not snap["buttons"]["flt-save"], name
+            assert snap["titles"]["flt-save"] == dashboard._SAVE_TITLE, name
+            [opened] = snap["opened"]
+            sent = parse_qs(opened["url"].partition("?")[2], strict_parsing=True)
+            assert "category" not in sent and "tag" not in sent, name
 
     def test_only_the_last_few_mixes_of_a_list_are_kept(self, monkeypatch, tmp_path):
         # Twenty different mixes of one list (and the mixes each passes

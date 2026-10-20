@@ -186,28 +186,28 @@ Purpose:
     its spread band, Tier floors choice, k, size cap, Add to held pairs
     choice, Sell level and Min. days to maturity, Trim to Kelly choice and
     Min. price rise (each only on a page that simulated it; the last two
-    always together, so a minimum is never sent with trimming off) and the
-    categories and tags ticked, with this run's
-    same-title cap when the run recorded one — never
-    for the Scenario Explorer's own selects. The address names each ticked
-    category once and each ticked tag once, as "Category · Tag" (the form
-    the live filter ties a tag to its category by), and never shortens a
-    category whose listed tags are all ticked to the category alone: the
-    page lists only the tags this backtest traded, so the category alone
-    would let a live run trade tags nobody ticked. That page compares the
+    always together, so a minimum is never sent with trimming off), with
+    this run's same-title cap when the run recorded one — never for the
+    Scenario Explorer's own selects. The address names no category or tag,
+    which the server reads as any category and tag, so a save made from it
+    clears a saved category or tag filter. The live filter can only list
+    the categories to trade, and a list built from this page's menus would
+    leave out any category the backtest never saw, so the page saves no
+    category or tag filter for now: while a particular category or tag is
+    ticked (All categories, which ticks every category and no tag, counts as
+    nothing ticked) the button stays disabled and its hover text says why;
+    a grey note beside it says when saving clears a saved filter. A live
+    filter is set on the confirmation page's address or with main.py
+    --category / --tag. That page compares the
     proposal with the live defaults in force and acts only when one of its
     buttons is pressed: Confirm and save saves it, Confirm and trade saves
     it and then runs the live bot with it, and Dry run runs the bot with it
     without placing orders; this page writes nothing. The button is
     rendered disabled; the script enables it only while the scenario on
     screen can become live settings (it was simulated, its band was
-    recorded, and its k and size cap were recorded and are above zero),
-    keeps it disabled while another scenario's
-    chunk loads, with more categories and tags ticked than the confirmation
-    page accepts (config.DEFAULTS_SERVER_MAX_FILTER_NAMES), and, on a page
-    that files trades by ticker prefix rather than by Kalshi's series
-    listing (which the live category and tag filter reads), keeps it
-    disabled for a category or tag. Beside it, a plain
+    recorded, its k and size cap were recorded and are above zero, and no
+    particular category or tag is ticked), and keeps it disabled while
+    another scenario's chunk loads. Beside it, a plain
     "Trade using defaults…" link opens the server's trade page (the saved
     defaults, with Dry run and Confirm and trade) in a new tab; it needs no
     script. A page whose filter bar could not be built has no save button,
@@ -7015,32 +7015,45 @@ _SAVE_LABEL = "Save as live defaults…"
 _SAVE_TITLE = ("Open a confirmation page, in a new tab, that compares the filter bar's "
                "scenario on screen — its spread band, tier floors, k, size cap, its Add to "
                "held pairs choice (when this page simulated it), its Sell level and Min. "
-               "days to maturity (when this page simulated selling), its Trim to Kelly "
-               "choice and Min. price rise (when this page simulated trimming) and the "
-               "categories and tags ticked (each ticked tag is saved under its own "
-               "category), with this run's same-title cap when the run recorded one; "
-               "not the Scenario Explorer's own selects — with the live trading defaults. "
+               "days to maturity (when this page simulated selling) and its Trim to Kelly "
+               "choice and Min. price rise (when this page simulated trimming), with this "
+               "run's same-title cap when the run recorded one; not the Scenario "
+               "Explorer's own selects — with the live trading defaults. It names no "
+               "category or tag, so saving it leaves live runs trading every category and "
+               "tag, replacing any category or tag filter saved before. "
                "Nothing is saved until you press a button there: Confirm and save saves "
                "it; Confirm and trade saves it and then runs the live bot with it, placing "
                "real orders; Dry run runs the live bot with it without placing orders and "
-               "saves nothing. It stays unavailable "
-               "while a scenario loads, and for a scenario the run never simulated, "
-               "whose band, k or size cap the run did not record, whose k or size "
-               "cap is not above zero, or with more categories and tags ticked than the "
-               "confirmation page takes.")
-# Added to the hover text on a page that filed trades by ticker prefix, not by
-# Kalshi's series listing (which the live category and tag filter reads)
+               "saves nothing. It stays unavailable while a particular category or tag is "
+               "ticked (All categories, which ticks every category and no tag, counts as "
+               "nothing ticked), while a scenario loads, and for a scenario the run never "
+               "simulated, whose band, k or size cap the run did not record, or whose k or "
+               "size cap is not above zero.")
+# Was added to the hover text on a page that filed trades by ticker prefix,
+# not by Kalshi's series listing; no longer shown, since the button saves no
+# category or tag from any page
 _SAVE_TITLE_UNFILED = (" A category or tag can be saved only from a page built with "
                        "Kalshi's series listing; this one files trades by ticker prefix.")
 _SAVE_NOTE = "(needs ./start_dashboard.sh running)"
-# The button's hover text while the ticks themselves are what cannot be
-# saved (the script swaps it in, and Python's own title back): more names
-# ticked than the confirmation page takes ({n} of each), a ticked category
-# whose name holds the separator a saved filter ties a tag to its category
-# with, or a ticked category another one on the page repeats in other letter
-# case (the live filter reads names without regard to case, so it would keep
-# both where the page shows one)
+# Beside the save button when the saved live defaults filter by category or
+# tag: the button sends no category or tag, which the server reads as any
+_FILTER_SAVE_NOTE = ("Saving from this page clears the saved category and tag filter: live "
+                     "runs then trade every category and tag.")
+# The button's hover text while the ticks themselves are what stop a save
+# (the script swaps it in, and Python's own title back). save_filtered is
+# shown while a particular category or tag is ticked, since the button saves
+# no category or tag filter; the other three — more names ticked than the
+# confirmation page takes ({n} of each), a ticked category whose name holds
+# the separator a saved filter ties a tag to its category with, or a ticked
+# category another one on the page repeats in other letter case — were
+# written for when ticks could be saved, and are no longer shown
 _SAVE_BLOCKED_TEXT = {
+    "save_filtered": ("Cannot save while a category or tag is chosen. Saved live defaults "
+                      "can only list the categories to trade, and this page knows only the "
+                      "categories this backtest saw, so it cannot save a category or tag "
+                      "filter. Click All categories (or untick what you ticked) to save "
+                      "this scenario for every category and tag. To filter one live run, "
+                      "use main.py --category / --tag."),
     "save_too_many": ("Cannot save: more than {n} categories, or more than {n} tags, are "
                       "ticked. Untick some."),
     "save_separator": ("Cannot save: a ticked category's name holds the mark that joins a "
@@ -7113,7 +7126,7 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
     The button opens the defaults server's confirmation page with the bar's
     scenario in the address (its spread band, Tier floors choice, k, size
     cap, Add to held pairs choice, Sell level, Min. days to maturity, Trim
-    to Kelly choice, Min. price rise and any category or tag); this is the
+    to Kelly choice and Min. price rise; never a category or tag); this is the
     rest of that address, fixed when the page is built. The server accepts
     no source note but one of the shapes
     config.LIVE_DEFAULTS_SOURCE_PATTERN allows, so the note is checked
@@ -7138,7 +7151,8 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
             and the server keeps the saved same-title cap, or the seed's
             when none is saved); "filed_by_listing" (whether this page files trades by
             Kalshi's series listing, the rule the live category and tag
-            filter reads, so only then may a category or tag slice be saved);
+            filter reads; unread while the save button saves no category or
+            tag);
             "source" (the note the saved file keeps: "backtest dashboard for
             <start> to <today>", plus a note when the run's same-event ladder
             setting differed from config.py's, so its pairs are not the live
@@ -7149,8 +7163,11 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
             "live_sells" (whether they sell: the Sell view's save note shows only then);
             "live_trims" (whether they trim: the Trim to Kelly view's save
             note shows only then);
+            "live_filters" (whether they filter by category or tag: the note
+            that saving clears that filter shows only then);
             "max_names" (config.DEFAULTS_SERVER_MAX_FILTER_NAMES: the most
-            categories, and the most tags, the server takes on one address).
+            categories, and the most tags, the server takes on one address;
+            unread for the same reason).
     """
 
     def day(value: date) -> str:
@@ -7183,6 +7200,8 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
         "live_adds_to_held_pairs": getattr(sweep, "live_add_to_held_pairs", None) is True,
         "live_sells": getattr(sweep, "live_sell_at", None) is not None,
         "live_trims": getattr(sweep, "live_trim_to_kelly", None) is True,
+        "live_filters": (getattr(sweep, "live_categories", None) is not None
+                         or getattr(sweep, "live_tags", None) is not None),
         "max_names": DEFAULTS_SERVER_MAX_FILTER_NAMES,
     }
 
@@ -12175,7 +12194,7 @@ def _mix_base(axis: pd.DatetimeIndex, initial_balance: float,
             (the order of a view's "row" cells, _MIX_ROW_CELLS); "none" (what
             an undefined figure reads as); "sep"
             (config.TAG_SCOPE_SEPARATOR, between a category and its tag in a
-            name and in a saved filter); and "names"
+            name, as the live filter ties a tag to its category); and "names"
             (_SELECTION_NAMES_SHOWN: how many ticked names the summary line
             spells out).
     """
@@ -12336,8 +12355,9 @@ def _filter_payload(
             ...], sorted), "tag_twins" and "category_twins" (_case_twins: the
             indexes of tags of one category, and of categories, whose names
             differ only in letter case — one name to the live filter — so
-            the script ticks such tags together and saves no tick on such a
-            category), "empty" (the view of a selection with no trade — a
+            the script ticks such tags together; category_twins is no
+            longer read, since a tick of any category shuts the save
+            button), "empty" (the view of a selection with no trade — a
             flat curve, referencing no string), "mix" (_mix_base: what the
             script works a mix of categories and tags out with), "text" (the templates:
             _SUMMARY_TEMPLATES — its "unfiltered" sentence chosen by kd,
@@ -12456,8 +12476,8 @@ def _filter_payload(
         "categories": chunks.categories,
         "subcats": [[chunks.cat_index[c], tag] for c, tag in chunks.subcats],
         # Names the live filter reads as one (it ignores letter case): tags
-        # of one category the script ticks together, and categories it will
-        # not save a tick on
+        # of one category the script ticks together, and categories (no
+        # longer read: any tick shuts the save button)
         "tag_twins": _case_twins([(c, tag.casefold()) for c, tag in chunks.subcats]),
         "category_twins": _case_twins([c.casefold() for c in chunks.categories]),
         "empty": empty,
@@ -12813,17 +12833,19 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     not show. After the Tag menu comes the save button, rendered disabled
     too: the script enables it whenever the scenario on screen can become
     the live defaults, and a click opens the defaults server's confirmation
-    page for that scenario in a new tab. Its hover text (_SAVE_TITLE) gains
-    _SAVE_TITLE_UNFILED on a page that does not file trades by Kalshi's
-    series listing (payload "save"), where a category or tag cannot be
-    saved; while the ticks themselves are what cannot be saved, the script
-    shows one of _SAVE_BLOCKED_TEXT's reasons in its place. On a page with the add-on view whose saved live defaults add to
-    held pairs (save["live_adds_to_held_pairs"]), a grey note
-    (_ADD_ON_SAVE_NOTE) follows the button: saving with the Add to held
-    pairs choice off turns that off. _TRIM_SAVE_NOTE (save["live_trims"])
-    and _SELL_SAVE_NOTE (save["live_sells"]) do the same for trimming and
-    selling, in the order of their selects. Then the "Trade using
-    defaults…" link
+    page for that scenario in a new tab, naming no category or tag. Its
+    hover text is _SAVE_TITLE on every page; while a particular category
+    or tag is ticked (All categories, which ticks every category and no
+    tag, counts as nothing ticked) the button stays disabled and the script
+    shows _SAVE_BLOCKED_TEXT["save_filtered"] in its place. On a page with
+    the add-on view whose saved live defaults add to held pairs
+    (save["live_adds_to_held_pairs"]), a grey note (_ADD_ON_SAVE_NOTE)
+    follows the button: saving with the Add to held pairs choice off turns
+    that off. _TRIM_SAVE_NOTE (save["live_trims"]) and _SELL_SAVE_NOTE
+    (save["live_sells"]) do the same for trimming and selling, in the order
+    of their selects, and _FILTER_SAVE_NOTE (save["live_filters"]) says
+    that saving clears a saved category or tag filter. Then the "Trade
+    using defaults…" link
     (_trade_link_html), which the script never touches, and the note that
     both need the defaults server running.
 
@@ -12934,10 +12956,9 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
         f'{html.escape(entry["label"])}</option>'
         for i, entry in enumerate(payload.get("sell_days") or []))
     days_title = html.escape(_SELL_DAYS_TITLE)
-    # The save button's hover text: a page filed by ticker prefix says why a
-    # category or tag cannot be saved from it
-    save_filed = (payload.get("save") or {}).get("filed_by_listing", False)
-    save_title = html.escape(_SAVE_TITLE + ("" if save_filed else _SAVE_TITLE_UNFILED))
+    # The save button's hover text, the same on every page: it saves no
+    # category or tag, so how the page files trades does not change it
+    save_title = html.escape(_SAVE_TITLE)
     # Saving from a page with the add-on view sends the choice shown, so when
     # the saved live defaults add to held pairs, leaving it "off" would turn
     # that off; the grey note beside the button says so
@@ -12955,6 +12976,12 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
                   and (payload.get("save") or {}).get("live_sells") is True)
     save_note += ('&nbsp;<span id="flt-sell-save-note" style="color:#9E9E9E; font-size:13px;">'
                   f"{html.escape(_SELL_SAVE_NOTE)}</span>" if save_sells else "")
+    # The button sends no category or tag, so when the saved live defaults
+    # filter by one, saving clears that filter
+    save_filters = (payload.get("save") or {}).get("live_filters") is True
+    save_note += ('&nbsp;<span id="flt-filter-save-note" style="color:#9E9E9E; '
+                  f'font-size:13px;">{html.escape(_FILTER_SAVE_NOTE)}</span>'
+                  if save_filters else "")
 
     # The two check-box menus: every category, and every category's tags
     # named "Category · Tag" (the script shortens a tag's name while exactly
@@ -13220,7 +13247,8 @@ def _pack_text(raw: str) -> str:
 # regard to letter case, so tags of one category that differ only in case
 # (Kalshi spells a few both ways) are one tag to it: their boxes are ticked
 # and unticked together (TWINS, from the groups Python folds, D.tag_twins),
-# and the page shows what a saved filter keeps. Where the ticks cover exactly the
+# and the page shows what a live filter of the same ticks would keep. Where the
+# ticks cover exactly the
 # trades of one of Python's views — everything, one category, one tag — that
 # view is drawn as it stands. Any other set of ticks is a MIX, which has no
 # view of its own (the combinations are far too many to ship): the script
@@ -13259,11 +13287,11 @@ def _pack_text(raw: str) -> str:
 # new tab (saveHref: D.save's address and the axes' values, plus each of the
 # Add to held pairs choice, the Sell level and minimum ("off" for both under
 # no selling) and the Trim to Kelly choice with its minimum price rise, on a
-# page with that view; the button's words are Python's — its hover text too,
-# which reads as Python rendered it except while the ticks themselves cannot
-# be saved: too many names, a category whose name holds the separator, or one
-# that another category repeats in other letter case (ticksBlocked,
-# D.text.save_*)). On load it inflates the base block and the primary
+# page with that view, but never a category or tag). The button stays
+# disabled while a particular category or tag is ticked (saveBlockedByTicks);
+# its words are Python's, its hover text too, which reads as Python rendered
+# it except while a tick is what stops a save (D.text.save_filtered). On load
+# it inflates the base block and the primary
 # scenario's chunk, sets the bar back to the view Python rendered and enables
 # it — it redraws nothing until a <select> changes. A chunk is inflated when a
 # scenario needs it and kept while among the last KEEP drawn (the primary's
@@ -13341,7 +13369,8 @@ _FILTER_JS = r"""
   // other letter case, every tag of that group (D.tag_twins) — one name to
   // the live filter, so their boxes are ticked and unticked together.
   // NO_SAVE: the categories another category repeats in other letter case
-  // (D.category_twins), on which no tick can be saved. SAVE_TITLE: the save
+  // (D.category_twins); no longer read, since any tick shuts the save button
+  // (saveBlockedByTicks). SAVE_TITLE: the save
   // button's hover text as Python rendered it.
   var TWINS = {}, NO_SAVE = {}, SAVE_TITLE = null;
   // PICK: the menus' ticks as last asked for (pickKey), so a click that
@@ -13481,23 +13510,13 @@ _FILTER_JS = r"""
   // nothing drawn yet, no save target on the page (D.save), a scenario the
   // run never simulated (an Add to held pairs choice, a Sell level, a Trim
   // to Kelly choice or a minimum price rise the page holds no chunk for
-  // included), a band
-  // the run did not record, a k or size cap the
-  // run did not record or that is not above zero, a category or tag on a
-  // page that does not file trades by Kalshi's series listing, or ticks
-  // that cannot be saved as they stand (ticksBlocked). The address names
-  // every ticked category, and every
-  // ticked tag tied to its category ("Category · Tag", joined by D.mix.sep):
-  // the live filter then keeps a ticked category in full unless some of its
-  // tags are ticked, and then only those — the rule the page shows
-  // (atomsOf). Tags of one category that differ only in letter case are
-  // always ticked together (TWINS), so each spelling is sent and the server
-  // keeps the first. A category whose listed tags are ALL ticked still sends each
-  // of them: the page lists only the tags this backtest saw, so naming the
-  // category alone would let a live run trade tags nobody ticked. The server
-  // refuses, with its reason, any other value the live settings reject. Each
-  // number is written by String(), whose shortest form reads back as the
-  // same number.
+  // included), a band the run did not record, a k or size cap the run did
+  // not record or that is not above zero, or a particular category or tag
+  // ticked (saveBlockedByTicks). The address names no category or tag,
+  // which the server reads as any category and tag, so the scenario it
+  // saves is the one shown with nothing ticked. The server refuses, with its reason, any
+  // other value the live settings reject. Each number is written by
+  // String(), whose shortest form reads back as the same number.
   function saveHref() {
     if (!D || !D.save || !SHOWN || C === null) { return null; }
     // null: never simulated; undefined: a sell level's block not inflated (a
@@ -13507,9 +13526,7 @@ _FILTER_JS = r"""
     if (shownId === null || shownId === undefined) { return null; }
     var band = D.bands[SHOWN[0]].value, k = D.ks[SHOWN[1]].value, cap = D.caps[SHOWN[2]].value;
     if (!band || !(k > 0) || !(cap > 0)) { return null; }
-    var cats = SHOWN[3], tags = SHOWN[4];
-    if (cats.length && !D.save.filed_by_listing) { return null; }
-    if (ticksBlocked(cats, tags) !== null) { return null; }
+    if (saveBlockedByTicks() !== null) { return null; }
     var q =[['tier_floors', offAt(SHOWN[5]) ? 'off' : 'on'], ['spread_min', band[0]],
              ['spread_max', band[1]], ['k', k], ['size_cap', cap]];
     // Left out when the run recorded none: the server then keeps the saved
@@ -13539,8 +13556,6 @@ _FILTER_JS = r"""
       q.push(['trim_to_kelly', trimOn(SHOWN[9]) ? 'on' : 'off'],
              ['trim_min_rise', ri > 0 ? D.trim_rises[ri - 1].value : 'off']);
     }
-    cats.forEach(function(c) { q.push(['category', D.categories[c]]); });
-    tags.forEach(function(t) { q.push(['tag', subName(t, true)]); });
     if (typeof D.save.source === 'string' && D.save.source !== '') {
       q.push(['source', D.save.source]);
     }
@@ -13548,13 +13563,22 @@ _FILTER_JS = r"""
       return encodeURIComponent(p[0]) + '=' + encodeURIComponent(String(p[1]));
     }).join('&');
   }
+  // The reason the save button gives while a particular category or tag is
+  // ticked, in Python's words (D.text.save_filtered), or null when nothing
+  // is ticked: the address names no category or tag, so a narrowed view is
+  // not what a save would make live. Every category ticked with no tag
+  // counts as nothing ticked (catTicks).
+  function saveBlockedByTicks() {
+    return (SHOWN[3].length || SHOWN[4].length) ? D.text.save_filtered : null;
+  }
   // Why the ticks themselves cannot be saved, as the save button's hover
   // text in Python's words (D.text.save_*), or null when they can: more
   // categories, or more tags, than the server takes on one address
   // (D.save.max_names — each ticked spelling counts, as the server counts
   // them); a category whose own name holds the separator, which could not
   // be told from a tied tag's category; or a category another one repeats
-  // in other letter case, which the live filter would keep too
+  // in other letter case, which the live filter would keep too. Not called
+  // now: any tick shuts the button first (saveBlockedByTicks).
   function ticksBlocked(cats, tags) {
     var most = D.save.max_names;
     if (typeof most === 'number' && (cats.length > most || tags.length > most)) {
@@ -13567,12 +13591,13 @@ _FILTER_JS = r"""
     return null;
   }
   // The button is enabled exactly when the scenario on screen can be saved;
-  // while the ticks are what stops it, its hover text says why, and
-  // otherwise it reads as Python rendered it
+  // while a tick in the Category or Tag menu is what stops it, its hover
+  // text says why (saveBlockedByTicks), and otherwise it reads as Python
+  // rendered it
   function refreshSave() {
     if (!saveBtn) { return; }
     saveBtn.disabled = saveHref() === null;
-    var why = (D && D.save && SHOWN) ? ticksBlocked(SHOWN[3], SHOWN[4]) : null;
+    var why = (D && D.save && SHOWN) ? saveBlockedByTicks() : null;
     if (SAVE_TITLE !== null) { saveBtn.title = why === null ? SAVE_TITLE : why; }
   }
   function isPrimaryCell() {
