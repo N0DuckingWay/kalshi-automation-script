@@ -7430,12 +7430,11 @@ class TestSaveLiveDefaultsButton:
         assert [b["value"] for b in data["bands"]] == [[0.0, 1.0], [0.3, 0.6], [0.3, 1.0]]
         save = data["save"]
         assert save["url"] == _SAVE_URL
-        assert save["same_title_size_cap"] == 0.5 and save["filed_by_listing"] is True
+        assert save["same_title_size_cap"] == 0.5
         assert re.fullmatch(config.LIVE_DEFAULTS_SOURCE_PATTERN, save["source"], re.ASCII)
         assert save["source"].startswith(f"backtest dashboard for {_FLT_START.isoformat()} to ")
         # Every word about the button is Python's: the script writes none
-        for words in (dashboard._SAVE_LABEL, dashboard._SAVE_TITLE,
-                      dashboard._SAVE_TITLE_UNFILED, dashboard._SAVE_NOTE,
+        for words in (dashboard._SAVE_LABEL, dashboard._SAVE_TITLE, dashboard._SAVE_NOTE,
                       dashboard._SAVE_BLOCKED_TEXT["save_filtered"]):
             assert words not in dashboard._FILTER_JS
         # ... and the address comes from config, never spelled on the page's side
@@ -7627,11 +7626,6 @@ class TestSaveLiveDefaultsButton:
         [opened] = back["opened"]
         self._assert_sends(data, self._query(data, opened), *data["primary"])
 
-    def test_a_listing_page_s_title_has_no_unfiled_sentence(self, monkeypatch, tmp_path):
-        page = self._page(monkeypatch, tmp_path)
-        title = re.search(r'<button id="flt-save"[^>]*title="([^"]*)"', page).group(1)
-        assert html.unescape(title) == dashboard._SAVE_TITLE
-
     @pytest.mark.parametrize("cats, tags, shown", [
         (("Sports",), None, True), (None, ("Hockey",), True),
         (("Sports",), ("Sports · Hockey",), True), (None, None, False)])
@@ -7819,60 +7813,54 @@ class TestSaveLiveDefaultsButton:
     def test_the_save_target_s_source_note(self):
         today = date(2026, 9, 28)
         sweep = _flt_sweep()
-        target = dashboard._save_target(sweep, _FLT_START, today, _FLT_SERIES)
+        target = dashboard._save_target(sweep, _FLT_START, today)
         assert target == {"url": _SAVE_URL, "same_title_size_cap": None,
-                          "filed_by_listing": True,
                           "source": "backtest dashboard for 2026-01-05 to 2026-09-28",
                           "live_adds_to_held_pairs": False, "live_sells": False,
-                          "live_trims": False, "live_filters": False,
-                          # The most categories, and tags, one address may name
-                          "max_names": config.DEFAULTS_SERVER_MAX_FILTER_NAMES}
+                          "live_trims": False, "live_filters": False}
         # ... which is True only for a run that recorded saved defaults adding
         for saved, said in ((True, True), (False, False), (None, False)):
             swept = dataclasses.replace(sweep, live_add_to_held_pairs=saved)
-            assert dashboard._save_target(swept, _FLT_START, today, _FLT_SERIES)[
+            assert dashboard._save_target(swept, _FLT_START, today)[
                 "live_adds_to_held_pairs"] is said
         # ... and "live_sells" only for a recorded sell level (a minimum alone is no sale)
         for level, days, said in ((0.85, 3, True), (0.85, None, True), (None, None, False),
                                   (None, 3, False)):
             swept = dataclasses.replace(sweep, live_sell_at=level, live_sell_min_days=days)
-            assert dashboard._save_target(swept, _FLT_START, today, _FLT_SERIES)[
-                "live_sells"] is said
+            assert dashboard._save_target(swept, _FLT_START, today)["live_sells"] is said
         # ... and "live_trims" only for saved defaults that trim to Kelly (a
         # minimum price rise alone is no trim)
         for trims, rise, said in ((True, None, True), (True, 0.1, True), (False, None, False),
                                   (None, None, False), (None, 0.1, False)):
             swept = dataclasses.replace(sweep, live_trim_to_kelly=trims, live_trim_min_rise=rise)
-            assert dashboard._save_target(swept, _FLT_START, today, _FLT_SERIES)[
-                "live_trims"] is said
+            assert dashboard._save_target(swept, _FLT_START, today)["live_trims"] is said
         # ... and "live_filters" only for saved defaults with a category or tag
         # filter (either alone is a filter)
         for cats, tags, said in ((("Sports",), None, True), (None, ("Hockey",), True),
                                  (("Sports",), ("Sports · Hockey",), True), (None, None, False)):
             swept = dataclasses.replace(sweep, live_categories=cats, live_tags=tags)
-            assert dashboard._save_target(swept, _FLT_START, today, _FLT_SERIES)[
-                "live_filters"] is said
+            assert dashboard._save_target(swept, _FLT_START, today)["live_filters"] is said
         # Only a recorded setting that differs from a recorded switch is named
         for ladders, configured in ((True, True), (False, None), (None, True)):
             swept = dataclasses.replace(sweep, same_event_ladders=ladders,
                                         config_same_event_ladders=configured)
-            assert dashboard._save_target(swept, _FLT_START, today, None)["source"] == \
+            assert dashboard._save_target(swept, _FLT_START, today)["source"] == \
                 "backtest dashboard for 2026-01-05 to 2026-09-28"
         swept = dataclasses.replace(sweep, same_event_ladders=True,
                                     config_same_event_ladders=False)
-        assert dashboard._save_target(swept, _FLT_START, today, {})["source"].endswith(
+        assert dashboard._save_target(swept, _FLT_START, today)["source"].endswith(
             " (same-event ladders on, config.py off: its pairs are not the live bot's)")
-        # No sweep: nothing recorded; an empty listing files by ticker prefix
-        bare = dashboard._save_target(None, datetime(2026, 1, 5, 12, tzinfo=UTC), today, {})
-        assert bare["same_title_size_cap"] is None and bare["filed_by_listing"] is False
+        # No sweep: nothing recorded
+        bare = dashboard._save_target(None, datetime(2026, 1, 5, 12, tzinfo=UTC), today)
+        assert bare["same_title_size_cap"] is None
         assert bare["source"] == "backtest dashboard for 2026-01-05 to 2026-09-28"
 
     def test_a_note_the_server_would_refuse_is_left_out(self, monkeypatch, tmp_path):
         # Should the note ever not fit the server's pattern, the button sends
         # none (the save then keeps no note) rather than a refused one
         monkeypatch.setattr(dashboard, "LIVE_DEFAULTS_SOURCE_PATTERN", "seed only")
-        assert dashboard._save_target(_flt_sweep(), _FLT_START, date(2026, 9, 28),
-                                      _FLT_SERIES)["source"] is None
+        assert dashboard._save_target(_flt_sweep(), _FLT_START,
+                                      date(2026, 9, 28))["source"] is None
         page = self._page(monkeypatch, tmp_path)
         data = TestFilterPage._data(page)
         snap = _run_script(tmp_path, page, [
@@ -19169,6 +19157,8 @@ class TestMixedSelection:
         assert categories == ["Arts · Crafts", "Health", "Sports", "health"]
         page = _mix_page(monkeypatch, tmp_path, _counted_trades(series), series=series)
         data = TestFilterPage._data(page)
+        # The page ships the case-twin categories it lists (no longer read for saving)
+        assert data["category_twins"] == [[categories.index("Health"), categories.index("health")]]
         golf, tennis = pairs.index(("Sports", "Golf")), pairs.index(("Sports", "Tennis"))
         cases = {"category": ([2], []), "tag": ([], [golf]), "mix": ([1, 2], [tennis]),
                  "twin": ([3], []), "separator": ([0], [])}
