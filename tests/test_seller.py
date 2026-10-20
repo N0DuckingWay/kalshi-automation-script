@@ -32,7 +32,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from kalshi_betting import backtester, config, depth_model, seller
+from kalshi_betting import backtester, config, depth_model, historical, seller
 from kalshi_betting import scanner as scanner_mod
 from kalshi_betting.config import fee_leg_exact
 from kalshi_betting.scanner import (
@@ -1309,7 +1309,7 @@ class TestTrimParityWithTheBacktest:
         with pytest.raises(ValueError, match="KELLY_TRIM_MAX_BID_DROP"):
             case.live(monkeypatch, 10_000, cap=0.10)
 
-    def test_the_live_price_rise_is_the_backtests(self, monkeypatch):
+    def test_the_live_price_move_is_the_backtests(self, monkeypatch):
         # The pair's total price (YES ask on A plus NO ask on B) was 0.77 when
         # bought and is 0.97 now. The backtest reads both from candles; live
         # reads "then" from the candle at the last fill and "now" from the books
@@ -1861,7 +1861,7 @@ class TestPlanTrims:
         assert len(world.trims(monkeypatch, settings, cash_cents=5_000,
                                positions_value_cents=6_400)) == 2
 
-    def test_a_minimum_price_rise_never_lets_through_a_trim_the_value_guard_stops(
+    def test_a_minimum_price_move_never_lets_through_a_trim_the_value_guard_stops(
             self, monkeypatch, caplog):
         # The snow pair alone fetches about $36, above the $30 all open positions
         # are valued at, so nothing trims. A minimum price move may only hold trims
@@ -2723,6 +2723,106 @@ class TestPlanAddOns:
             "ago -> may add",
             "Held pairs that may be added to this run: 1 of 2"]
         assert case.world.fill_reads == 1
+
+
+def _raw_candle(yes_ask, yes_bid) -> dict:
+    """One raw hourly candle as Kalshi sends it, ending at the pair's last fill
+    (the previous Monday's run), with its YES ask and YES bid closes."""
+    return {"end_period_ts": _FIRST, "yes_ask": {"close": yes_ask},
+            "yes_bid": {"close": yes_bid}}
+
+
+# Each market's raw candle at the pair's last fill, with the prices it has now:
+# YES ask 0.44 on A and NO ask 0.53 on B (1 minus B's YES bid of 0.47), so the
+# pair's price has not moved
+_FLAT_PAGES = {_A: [_raw_candle("0.44", "0.42")], _B: [_raw_candle("0.48", "0.47")]}
+
+
+class TestRawCandlesThatCannotBeReadAreNoPrice:
+    """The price then that a minimum price movement compares with is read from
+    raw candle pages through the real historical.recent_candles, not from parsed
+    stand-ins. A held NO's ask then is 1 minus the candle's YES bid, so a YES bid
+    that is not a price (1.5, infinity, or a whole-cent close such as 47 read as
+    dollars) must read as no quote. Read as a 1c ask it would make the pair look
+    as if its price had moved by nearly its whole price, letting an add-on or a
+    Kelly trim through on a price nobody quoted."""
+
+    @pytest.fixture(autouse=True)
+    def _pages(self, monkeypatch):
+        """Serve each market's raw candle page to recent_candles, recording each request."""
+        self.pages = {ticker: list(page) for ticker, page in _FLAT_PAGES.items()}
+        self.asked: list[str] = []
+
+        def get(client, path, **params):
+            ticker = path.split("/markets/")[1].split("/")[0]
+            self.asked.append(ticker)
+            return {"candlesticks": self.pages.get(ticker, [])}
+
+        monkeypatch.setattr(historical, "_historical_get", get)
+        monkeypatch.setattr(historical, "RECENT_CANDLES_RATE_LIMIT_SLEEP_SECONDS", 0.0)
+
+    def _add_ons(self, case: _TrimCase, monkeypatch) -> dict:
+        """seller.plan_add_ons with a 10c minimum, the candles read for real."""
+        monkeypatch.setattr(seller, "get_fill_times", lambda client: case.world.fills)
+        world = case.world
+        pairs = held_pairs(dict(world.positions), world.labels(), dict(world.markets),
+                           log=False)
+        return seller.plan_add_ons(MagicMock(), pairs, dict(world.markets),
+                                   settings=_trim_settings(min_move=0.10), now=_NOW)
+
+    def _trims(self, case: _TrimCase, monkeypatch) -> list:
+        """seller.plan_trims of a pair past a 10% cap, with a 10c minimum, the
+        candles read for real."""
+        world = case.world
+        monkeypatch.setattr(seller, "get_fill_times", lambda client: world.fills)
+        monkeypatch.setattr(seller, "_fetch_orderbook",
+                            lambda client, ticker: world.books.get(ticker))
+        return seller.plan_trims(
+            MagicMock(), dict(world.positions), world.labels(), dict(world.markets),
+            settings=_trim_settings(cap=0.10, min_move=0.10), now=_NOW,
+            cash_cents=10_000 - case.positions_cents,
+            positions_value_cents=case.positions_cents)
+
+    def test_with_true_candles_the_flat_pair_is_held_back(self, monkeypatch, caplog):
+        # The control: read through the real parse, the price then is $0.97, as now
+        with caplog.at_level(logging.INFO):
+            assert self._add_ons(_add_on_case(), monkeypatch) == {}
+            assert self._trims(_add_on_case(), monkeypatch) == []
+        assert (f"Not adding to {_PAIR_TEXT}: its total price has not moved by the minimum "
+                "since it last traded: price $0.97 then, $0.97 now (+0c, minimum 10c)"
+                in caplog.text)
+        assert f"Not trimming {_PAIR_TEXT}: its total price has not moved" in caplog.text
+        assert set(self.asked) == {_A, _B}
+
+    @pytest.mark.parametrize("yes_bid", ["1.5", "inf", 47])
+    def test_a_yes_bid_that_is_not_a_price_holds_an_add_on_back(self, monkeypatch, caplog,
+                                                                yes_bid):
+        self.pages[_B] = [_raw_candle("0.48", yes_bid)]
+        with caplog.at_level(logging.INFO):
+            assert self._add_ons(_add_on_case(), monkeypatch) == {}
+        assert (f"Not adding to {_PAIR_TEXT}: the NO ask on {_B} when it last traded "
+                "(2026-01-05) cannot be read" in caplog.text)
+        assert "may add" not in caplog.text
+
+    @pytest.mark.parametrize("yes_bid", ["1.5", "inf", 47])
+    def test_a_yes_bid_that_is_not_a_price_holds_a_trim_back(self, monkeypatch, caplog,
+                                                             yes_bid):
+        self.pages[_B] = [_raw_candle("0.48", yes_bid)]
+        with caplog.at_level(logging.INFO):
+            assert self._trims(_add_on_case(), monkeypatch) == []
+        assert (f"Not trimming {_PAIR_TEXT}: the NO ask on {_B} when the pair last traded "
+                "(2026-01-05) cannot be read" in caplog.text)
+        assert "-> sell" not in caplog.text
+
+    def test_a_lone_no_leg_with_whole_cent_candles_is_not_added_to(self, monkeypatch, caplog):
+        # Market A has paid out, so B alone is held; its candle carries whole-cent
+        # closes with no dollar strings, the shape the pinned SDK models
+        self.pages[_B] = [_raw_candle(48, 47)]
+        with caplog.at_level(logging.INFO):
+            assert self._add_ons(_lone(_add_on_case()), monkeypatch) == {}
+        assert (f"Not adding to {_LONE_TEXT}: the NO ask on {_B} when it last traded "
+                "(2026-01-05) cannot be read" in caplog.text)
+        assert self.asked == [_B]
 
 
 class TestAddOnParityWithTheBacktest:

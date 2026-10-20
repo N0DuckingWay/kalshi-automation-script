@@ -21282,7 +21282,7 @@ class TestTrimToKelly:
         assert seen == [True, True, True, False, False]
 
 
-class TestTrimMinRise:
+class TestTrimMinMove:
     """With trim_to_kelly and a min_move, a held pair is looked at for
     trimming only once its total price — the ask of the side held on each of
     its two markets, added — is at least that many dollars above or below
@@ -21757,7 +21757,7 @@ class TestTrimCapSweep:
         assert cs.simulated + cs.reused == len(cs.ks) * len(cs.caps)
 
     @pytest.mark.parametrize("add", [False, True])
-    def test_every_cap_with_a_minimum_price_rise_equals_a_fresh_simulation(self, add):
+    def test_every_cap_with_a_minimum_price_move_equals_a_fresh_simulation(self, add):
         # A sweep that trims only after a 10c price move: the minimum reaches
         # every simulation, and a simulation is still shared only by the caps
         # that make the same run
@@ -21790,7 +21790,7 @@ class TestTrimCapSweep:
         assert trimmed > 0 and held_back > 0 and cs.reused > 0
         assert cs.simulated + cs.reused == len(cs.ks) * len(cs.caps)
 
-    def test_a_minimum_price_rise_needs_a_sweep_that_trims(self):
+    def test_a_minimum_price_move_needs_a_sweep_that_adds_or_trims(self):
         entries = self._entries()
         with pytest.raises(ValueError, match="min_move needs add_to_held or trim_to_kelly"):
             self._sweep(entries, (0.75,), trim_to_kelly=False, min_move=0.1)
@@ -21865,7 +21865,7 @@ class TestMoveGrid:
     Three fixtures. TestTrimCapSweep's three pairs, whose first pair is
     trimmed after rises of 25c and 8c at the low caps, 33c at the middle
     ones and not at all at the high ones (it is never added to, so adding
-    changes nothing there). TestTrimMinRise's
+    changes nothing there). TestTrimMinMove's
     add-on pair, added to on Monday 2 after a 10c fall, which a minimum above
     10c holds back, so its runs differ there by the add-on alone. And its
     pair whose price fell 3c before a trim (moves 33c, then -3c), which a
@@ -22451,7 +22451,7 @@ class TestTrimWait:
         # A plain date, which is all config.rebalance_rested accepts
         assert type(last(self._position(bought, added), {pair: trimmed})) is date
 
-    def test_the_price_rise_is_measured_from_that_same_day(self):
+    def test_the_price_move_is_measured_from_that_same_day(self):
         # _price_move compares the pair's price on _last_trade_day with its price on `day`
         (held,) = backtester._simulate_at_discount(
             self._records(), self._START, 10_000.0, k=0.75, size_cap=0.10,
@@ -22656,7 +22656,7 @@ class TestTrimWait:
         assert line.endswith(", rebalancing): 2")
 
     @pytest.mark.parametrize("wait, waited, held_back", [(7, 0, 10), (8, 1, 9), (15, 2, 8)])
-    def test_a_waiting_pair_is_not_counted_on_the_price_rise_line(
+    def test_a_waiting_pair_is_not_counted_on_the_price_move_line(
             self, monkeypatch, caplog, wait, waited, held_back):
         # A 95c minimum never trims: each of the ten checkpoints from Monday 2 to the
         # pay-out is counted on one line or the other, never both
@@ -22669,14 +22669,14 @@ class TestTrimWait:
         messages = [r.getMessage() for r in caplog.records]
         assert self._waiting(caplog) == (
             [f"{_TRIM_WAIT_LINE} {wait} days before ({label}): {waited}"] if waited else [])
-        assert (f"{TestTrimMinRise._HELD_BACK} 95c either way since its last trade ({label}): "
+        assert (f"{TestTrimMinMove._HELD_BACK} 95c either way since its last trade ({label}): "
                 f"{held_back}") in messages
         # The wait is asked first, so its line comes first
         if waited:
             assert messages.index(self._waiting(caplog)[0]) < next(
-                i for i, m in enumerate(messages) if m.startswith(TestTrimMinRise._HELD_BACK))
+                i for i, m in enumerate(messages) if m.startswith(TestTrimMinMove._HELD_BACK))
 
-    def test_with_a_minimum_price_rise_too_each_trim_needs_both(self, monkeypatch, caplog):
+    def test_with_a_minimum_price_move_too_each_trim_needs_both(self, monkeypatch, caplog):
         records = self._records()
         # With no wait and a 15c minimum: Monday 3 (+16c since the purchase),
         # then Monday 6 (+18c since that trim)
@@ -22695,7 +22695,7 @@ class TestTrimWait:
         # short of the minimum (Monday 5, +12c) and four looked at and kept
         # (from 02-23, SA paid out, the price is far below Monday 6's trim)
         assert f"{_TRIM_WAIT_LINE} 8 days before ({label}): 3" in messages
-        assert (f"{TestTrimMinRise._HELD_BACK} 15c either way since its last trade "
+        assert (f"{TestTrimMinMove._HELD_BACK} 15c either way since its last trade "
                 f"({label}): 1") in messages
         # At 15 days Monday 3 is too soon: Monday 4 trims (+22c since the purchase)
         self._wait(monkeypatch, 15)
@@ -22915,8 +22915,8 @@ class TestTrimWaitOfAWeekChangesNoTrimToKellyRun(_AlsoWithNoWait, TestTrimToKell
     """Every TestTrimToKelly test again, each trimming run checked against no wait."""
 
 
-class TestTrimWaitOfAWeekChangesNoTrimMinRiseRun(_AlsoWithNoWait, TestTrimMinRise):
-    """Every TestTrimMinRise test again, each trimming run checked against no wait."""
+class TestTrimWaitOfAWeekChangesNoTrimMinMoveRun(_AlsoWithNoWait, TestTrimMinMove):
+    """Every TestTrimMinMove test again, each trimming run checked against no wait."""
 
 
 class TestTrimWaitOfAWeekChangesNoTrimCapSweepRun(_AlsoWithNoWait, TestTrimCapSweep):

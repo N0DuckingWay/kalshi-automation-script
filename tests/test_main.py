@@ -50,7 +50,7 @@ Purpose:
 
     On the Kelly trim (selling part of a held pair that has grown bigger than
     Kelly bet sizing allows): TestRunProdTrimsInADryRun, TestRunProdTrimsLive,
-    TestRunProdTrimsAfterAPriceRise and TestRunProdTrimsOnAnyDay run
+    TestRunProdTrimsAfterAPriceMove and TestRunProdTrimsOnAnyDay run
     _SellExchange, which also lists the account's fills. Such a pair is sold
     down before any buy, stays held and is not added to; anything unreadable
     means no trim and a WARNING; of runs on the eight days after a purchase,
@@ -7434,7 +7434,7 @@ class TestRunProdTrimsLive:
 
 
 @pytest.mark.usefixtures("pinned_config_toggles")
-class TestRunProdTrimsAfterAPriceRise:
+class TestRunProdTrimsAfterAPriceMove:
     """--min-price-move CENTS holds back a pair's trim until its total price (the
     ask of the side held on each market, added) has moved that far, up or down,
     since its last fill. The sellable pair is up 13c and the time-series pair

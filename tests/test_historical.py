@@ -7007,6 +7007,63 @@ class TestUsableCandleAsk:
         assert math.isnan(historical.usable_candle_ask(out[0]["no_ask_close"], "no"))
 
 
+class TestAYesBidThatIsNotAPrice:
+    """A candle's NO ask is stored as 1 minus its YES bid. A YES bid that is
+    not a price of at least 0 and below $1 (not finite, too large, or a
+    whole-cent close such as 47 read as dollars) must be stored at the
+    ceiling, which usable_candle_ask reads as no quote, never at the 0.01
+    floor, which reads as a real 1c ask: a 1c price then would let the
+    minimum price movement gate of live add-ons and trims, and the backtest's
+    valuation, read a price nobody quoted. The candle itself is kept, with
+    its YES ask and volume, and is not counted as dropped."""
+
+    @pytest.mark.parametrize("yes_bid", ["1.5", "inf", "45", 47, "1.00", "1e999", "nan",
+                                         "-0.20"])
+    def test_it_is_stored_as_no_quote(self, tmp_path, monkeypatch, caplog, yes_bid):
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
+        _patch_candle_fetch(monkeypatch, 1_700_000_000, yes_bid=yes_bid, volume="3.00")
+        with caplog.at_level(logging.WARNING):
+            out = historical.fetch_candlesticks(
+                MagicMock(), "T1", open_ts=0, close_ts=2, use_cache=False,
+                rate_limit_sleep=0.0)
+        assert out == [{"ts": 1_700_000_000, "yes_ask_close": 0.55,
+                        "no_ask_close": historical.CANDLE_NO_ASK_CEILING, "volume": 3.0}]
+        assert "malformed" not in caplog.text
+        assert math.isnan(historical.usable_candle_ask(out[0]["no_ask_close"], "no"))
+        # Neither the price then of a held NO, nor a YES bid to sell at, is read
+        assert math.isnan(historical.ask_before(out, 1_700_000_000, "no", window=86_400))
+        assert math.isnan(historical.candle_sale_bids(out[0])[0])
+        # The YES side is still read
+        assert historical.ask_before(out, 1_700_000_000, "yes", window=86_400) == 0.55
+
+    @pytest.mark.parametrize("yes_bid, no_ask", [("0.9999", 0.01), ("0.99", 0.01),
+                                                 ("0.53", 0.47), ("0", 0.99)])
+    def test_a_real_bid_is_read_as_before(self, tmp_path, monkeypatch, yes_bid, no_ask):
+        # A bid from 0 up to $0.9999 still gives 1 minus it, held to 0.01..0.99
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
+        _patch_candle_fetch(monkeypatch, 1_700_000_000, yes_bid=yes_bid)
+        out = historical.fetch_candlesticks(
+            MagicMock(), "T1", open_ts=0, close_ts=2, use_cache=False, rate_limit_sleep=0.0)
+        assert out[0]["no_ask_close"] == pytest.approx(no_ask)
+
+    def test_a_live_runs_candles_read_it_the_same_way(self, monkeypatch):
+        # recent_candles, which live add-ons, trims and sales read, parses the
+        # page with the same code
+        payload = {"candlesticks": [
+            {"end_period_ts": 1_700_000_000, "yes_ask": {"close": 48},
+             "yes_bid": {"close": 47}},
+            {"end_period_ts": 1_700_003_600, "yes_ask": {"close": "0.48"},
+             "yes_bid": {"close": "1.5"}},
+        ]}
+        monkeypatch.setattr(historical, "_signed_raw_get",
+                            MagicMock(return_value=_raw_resp(payload)))
+        candles = historical.recent_candles(MagicMock(), "T1", "KXSERIES-26OCT08",
+                                            1_699_999_200, 1_700_007_200)
+        assert [c["no_ask_close"] for c in candles] == [historical.CANDLE_NO_ASK_CEILING] * 2
+        assert math.isnan(historical.ask_before(candles, 1_700_003_600, "no",
+                                                window=86_400))
+
+
 class TestCandleSaleBids:
     """candle_sale_bids: a candle's YES bid is 1 - its usable NO ask and its
     NO bid 1 - its usable YES ask, to six decimals; an unusable ask leaves no

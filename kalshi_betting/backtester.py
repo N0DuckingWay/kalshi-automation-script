@@ -3302,10 +3302,10 @@ class RebalanceSweep:
             point's curve ended. Not in repr.
         off_end_dates (dict): The same for the tier-off family. Not in repr.
         min_moves (tuple[float, ...]): The minimum price movements the
-            family covers, in dollars, ascending, distinct, each in (0, 1]
-            (_resolve_min_moves). Empty (default) on a family built without
-            them: sweep() then takes no minimum and move_grid() yields
-            nothing.
+            family covers, in dollars, ascending, distinct, each from the
+            finest price step (MIN_ACTIVE_PRICE_DOLLARS) to 1 (_checked_min_move).
+            Empty (default) on a family built without them: sweep() then
+            takes no minimum and move_grid() yields nothing.
     """
     caps: tuple[float, ...]
     primary_cap: float

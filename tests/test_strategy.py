@@ -3922,7 +3922,7 @@ class TestTimeSeriesKellyParity:
         for func in ("_far_enough", "_sale_reach"):
             assert _function_calls(backtester, func, "_days_left"), func
 
-    def test_ast_a_trim_waits_for_a_price_rise_through_one_definition(self):
+    def test_ast_a_trim_waits_for_a_price_move_through_one_definition(self):
         # With a minimum price move (min_move), the walk asks one
         # question before it sizes a trim: has the pair's total price moved
         # far enough, up or down, since the last trade on it? The answer comes

@@ -2156,6 +2156,86 @@ class TestOutdatedFile:
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == _OLD_VERSION_BYTES
         assert starter.calls == []
 
+    def _refused_while_a_run_goes(self, app, starter) -> None:
+        """
+        Check that the outdated file's page, opened while one of this server's
+        runs is still going, offers neither run and refuses both POSTs
+        before anything is saved: the trade by the run in progress, and the
+        dry run by it too, ahead of its own need for saved defaults.
+
+        Args:
+            app (defaults_server._App): The application, with a run going.
+            starter (_Starter): Its process starter.
+        """
+        body = _get(app, _outdated_link()).body
+        buttons = [b.get("id") for b in _parse(body).buttons]
+        assert "confirm-trade" not in buttons and "confirm-dry-run" not in buttons
+        assert "A run started from this page is still going" in body
+        form = _click(body, "confirm")
+        for action in ("trade", "dry_run"):
+            response = _post(app, [(n, action if n == "action" else v) for n, v in form])
+            assert response.status == 409
+            assert ("A run started from this page is still going "
+                    "(/runs/") in html.unescape(response.body)
+            assert "Nothing was saved or traded." in response.body
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _OLD_VERSION_BYTES
+        assert starter.calls == []
+
+    def test_confirm_and_trade_keeps_the_own_run_blocker(self):
+        # A run this server started is still going: neither run starts, and
+        # the old file is not replaced
+        config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+        starter = _Starter()
+        app = _app(start_process=starter)
+        _memory_run(app, returncode=None)
+        self._refused_while_a_run_goes(app, starter)
+
+    def test_confirm_and_trade_keeps_the_blocker_of_a_run_from_before_a_restart(self):
+        # A fresh server finds a run still going by the lock its process holds
+        # on output.log, and refuses both runs the same way
+        config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+        folder = _disk_run(output="half way\n")
+        starter = _Starter()
+        app = _app(start_process=starter)
+        with (folder / "output.log").open("rb") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+            self._refused_while_a_run_goes(app, starter)
+            response = _post(app, _click(_get(app, _outdated_link()).body, "confirm"))
+        # Confirm and save is no run, so it still replaces the file
+        assert response.status == 303
+        assert config.read_saved_live_defaults() == _OLD_VERSION_READS_AS
+
+    def test_a_page_built_on_a_usable_file_is_stale_once_an_old_file_replaces_it(self):
+        # Pages built on a usable file, posted after a file an older version
+        # saved has replaced it (a server still running older code, say): each
+        # confirmation form is shown again against what is now saved, every
+        # trade form is refused with the old file's notice, and nothing is
+        # saved or started
+        saved = _save(_BASE_SETTINGS)
+        starter = _Starter()
+        app = _app(start_process=starter)
+        confirm_forms = [_page_form(app, _query(k="0.75"), button)
+                         for button in ("confirm", "confirm-trade", "confirm-dry-run")]
+        trade_forms = [_trade_form(app, button)
+                       for button in ("confirm-trade", "confirm-dry-run")]
+        config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+        for form in confirm_forms:
+            response = _post(app, form)
+            assert response.status == 409
+            assert html.escape(defaults_server._STALE_BANNER) in response.body
+        for form in trade_forms:
+            response = _post(app, form, target="/trade")
+            assert response.status == 409
+            assert _outdated_link() in _parse(response.body).links
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _OLD_VERSION_BYTES
+        assert starter.calls == []
+        # The old file's fingerprint is neither a usable file's nor no file's
+        with pytest.raises(config.LiveDefaultsOutdated) as caught:
+            config.read_saved_live_defaults()
+        outdated = defaults_server._fingerprint(None, caught.value)
+        assert outdated != defaults_server._fingerprint(None)
+        assert outdated != defaults_server._fingerprint(saved)
+
     def test_confirm_and_trade_saves_first_then_runs_the_new_settings(self):
         # The one way a run follows: the save replaces the file, and the run
         # trades the confirmed settings as flags, never the old file

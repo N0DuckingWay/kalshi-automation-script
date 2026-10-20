@@ -32,7 +32,7 @@ Purpose:
     is written to PROJECT_ROOT and can be opened directly in any browser.
     A small Terms link under the title jumps to a Terms section after the
     last of them: the backtest page's share of the dictionary of scores in
-    glossary.py (the Data page will render its own share of the same text).
+    glossary.py (the Data page renders its own share of the same text).
 
     A sticky filter bar at the top of the page — Spread band, Tier floors, k,
     Size cap, Rebalance, Min. price movement, Sell, Min. days to maturity,
