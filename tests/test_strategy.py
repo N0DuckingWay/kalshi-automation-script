@@ -4503,7 +4503,8 @@ class TestTimeSeriesKellyParity:
         # main._run_prod plans and sends its sales before either finder runs
         # and before it looks for held pairs to add to, as the backtest sells
         # before it buys; a dry run sends no sale order; the markets it sold
-        # stay blocked from both finders
+        # stay blocked from both finders; and the held pairs it may add to
+        # pass seller.plan_add_ons (the wait and the price move) first
         [plan] = _call_nodes(main, "_run_prod", "plan_sales")
         [sell] = _call_nodes(main, "_run_prod", "sell_positions")
         [settings_value] = [k.value for k in plan.keywords if k.arg == "settings"]
@@ -4556,6 +4557,37 @@ class TestTimeSeriesKellyParity:
                              for t in n.targets)]
         assert "sold_tickers" in {n.id for n in ast.walk(blocked.value)
                                   if isinstance(n, ast.Name)}
+        # The held pairs a run may add to wait as a trim does: asked once, after
+        # held_pairs found them and before either finder, with the run's own
+        # settings and moment, its result the add_on_pairs every later step reads
+        [add_ons] = _call_nodes(main, "_run_prod", "plan_add_ons")
+        finders = (_call_nodes(main, "_run_prod", "find_time_series_pairs")
+                   + _call_nodes(main, "_run_prod", "find_same_title_pairs"))
+        assert len(finders) == 2
+        assert pairs.lineno < add_ons.lineno < min(call.lineno for call in finders)
+        # ... and after the pairs already at their size cap, and those picked for a
+        # sale or a trim, are taken out, so it reads and logs only pairs the run may
+        # still add to
+        drops = [n for n in ast.walk(func) if isinstance(n, ast.Assign)
+                 and [ast.unparse(t) for t in n.targets] == ["add_on_pairs"]
+                 and isinstance(n.value, ast.DictComp)]
+        assert {"full", "picked"} <= {name.id for drop in drops
+                                      for name in ast.walk(drop.value)
+                                      if isinstance(name, ast.Name)}
+        assert all(drop.lineno < add_ons.lineno for drop in drops)
+        assert [ast.unparse(arg) for arg in add_ons.args] == [
+            "client", "add_on_pairs", "markets_by_ticker"]
+        add_on_keywords = {k.arg: ast.unparse(k.value) for k in add_ons.keywords}
+        assert add_on_keywords == {"settings": "settings", "now": "datetime.now(UTC)"}
+        [assigned] = [n for n in ast.walk(func) if isinstance(n, ast.Assign)
+                      and isinstance(n.value, ast.Call)
+                      and getattr(n.value.func, "id", None) == "plan_add_ons"]
+        assert [ast.unparse(t) for t in assigned.targets] == ["add_on_pairs"]
+        # ... so add_on_tickers, built only from add_on_pairs, comes after it
+        [tickers] = [n for n in ast.walk(func) if isinstance(n, ast.Assign)
+                     and any(isinstance(t, ast.Name) and t.id == "add_on_tickers"
+                             for t in n.targets)]
+        assert add_ons.lineno < tickers.lineno < blocked.lineno
 
     def test_ast_the_backtest_reads_ladders_through_the_one_definition(self):
         # The backtest's one-open-trade-per-ladder rule labels each market

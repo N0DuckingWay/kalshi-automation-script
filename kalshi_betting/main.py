@@ -79,7 +79,11 @@ Purpose:
     leg whose partner has paid out, which each finder lets through only
     beside a market the account does not hold (add_on_pairs). It adds to
     none when Kalshi's value of the open positions was not read or was
-    refused, since an add-on is sized on the portfolio value.
+    refused, since an add-on is sized on the portfolio value. An add-on
+    waits as a trim does (seller.plan_add_ons): the same number of calendar
+    days after the last fill on the pair's markets and, with min_price_move
+    set, until its price has moved that far, up or down; a pair held back
+    stays blocked like any other held market.
 
 Dependencies:
     Imports auth.py (the client, and the one balance read, which also checks
@@ -90,9 +94,9 @@ Dependencies:
     reporter.py (Excel output and the run summary), _http.py (a one-line
     description of an error), scanner.py (finding markets and pairs, and
     pricing them from the order book), seller.py (which held positions to
-    sell, and which held pairs to trim), strategy.py (sizing and choosing
-    trades), trader.py (sending orders) and run_lock.py (the
-    one-real-money-run-at-a-time lock). Run as
+    sell, which held pairs to trim, and which to add to), strategy.py
+    (sizing and choosing trades), trader.py (sending orders) and run_lock.py
+    (the one-real-money-run-at-a-time lock). Run as
     `python3 -m kalshi_betting.main`.
 
     To add to held pairs it also reads scanner.get_held_positions,
@@ -212,7 +216,7 @@ from .scanner import (
     pair_held,
     resolve_held_ladders,
 )
-from .seller import plan_sales, plan_trims
+from .seller import plan_add_ons, plan_sales, plan_trims
 from .strategy import compute_trade, select_portfolio
 from .trader import (
     ensure_shard_collateral,
@@ -1748,7 +1752,12 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     positions listing was read to its end, every held market was identified
     and Kalshi's value of the open positions was read and kept, and never to
     a pair whose stake (its worth at today's prices plus the fees paid for
-    it) already fills its per-trade cap of the portfolio value.
+    it) already fills its per-trade cap of the portfolio value. Like a trim,
+    an add-on waits (seller.plan_add_ons): enough calendar days since the
+    last fill on the pair's markets and, with min_price_move, a price move
+    of that much, up or down, since that fill; a pair held back, or one
+    whose fills or prices cannot be read, is not added to and its markets
+    stay blocked.
 
     Every run reads Kalshi's /series listing once, right after the market
     fetch (a cached copy, refreshed once a week): it files each market under
@@ -2109,6 +2118,12 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
                                      "to: %d", len(for_trim))
                     add_on_pairs = {key: pair for key, pair in add_on_pairs.items()
                                     if key not in picked}
+            # Cross-module: an add-on waits as a trim does (enough days since the last
+            # fill on its markets) and, with min_price_move, for its price to move that
+            # far, up or down (read-only requests: the fills list and hourly candles).
+            # A pair held back stays out of add_on_pairs, so its markets stay blocked
+            add_on_pairs = plan_add_ons(client, add_on_pairs, markets_by_ticker,
+                                        settings=settings, now=datetime.now(UTC))
     # The markets of those pairs and lone legs stay in (a pair's market pairs
     # only with its own partner, a lone leg only with a market not held);
     # every other held market is dropped
@@ -2397,8 +2412,9 @@ def _build_parser() -> argparse.ArgumentParser:
              "exact held pair that has outgrown its Kelly size, once "
              "config.REBALANCE_MIN_DAYS_SINCE_TRADE calendar days have passed since "
              "the pair's last trade, and let this run add to a pair the account "
-             "already holds (exactly the same two markets, the same side on each), "
-             "sizing the old and new contracts together as a share of the portfolio "
+             "already holds (exactly the same two markets, the same side on each) "
+             "after the same wait, sizing the old and new contracts together as a "
+             "share of the portfolio "
              "value (the old ones at today's prices plus the fees paid for them). "
              "--no-rebalance neither trims nor adds to a held pair, and clears the "
              "saved minimum price move too. Production runs only: a dev run holds "
@@ -2410,7 +2426,8 @@ def _build_parser() -> argparse.ArgumentParser:
     price_move.add_argument(
         "--min-price-move", type=int, default=None, metavar="CENTS",
         help="The least move, up or down, in whole cents, in a held pair's total price "
-             "since the last trade on it before a Kelly trim may sell part of it; a "
+             "since the last trade on it before a Kelly trim may sell part of it or an "
+             "add-on may buy more of it; a "
              f"multiple of {move_step} from {move_step} to 100. Needs rebalancing on, "
              "saved or given with --rebalance (default: the saved live defaults)",
     )

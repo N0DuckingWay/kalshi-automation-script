@@ -2509,7 +2509,7 @@ _BAD_TRIM_DAYS = r"REBALANCE_MIN_DAYS_SINCE_TRADE must be a whole number from 0 
 class TestRebalanceRested:
     """config.rebalance_rested and config.rebalance_min_days: the calendar
     days a held pair must go without a trade before a rebalance (a Kelly trim
-    or, in the backtest, an add-on; 7 as shipped).
+    or an add-on, live and in the backtest; 7 as shipped).
 
     The rule compares two plain dates with a checked number of days and reads
     no clock or schedule, so it holds however often runs happen. A missing

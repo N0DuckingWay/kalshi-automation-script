@@ -720,11 +720,13 @@ class TestMoveSweepArgument:
 
     def test_the_help_names_the_flag_that_sets_one_live_runs_minimum(self, cli, monkeypatch,
                                                                        capsys):
-        # The help names main.py --min-price-move, which sets one live run's minimum
+        # The help names main.py --min-price-move, which sets one live run's minimum,
+        # and says the minimum holds back a live run's add-ons and trims alike
         text = _option_help(monkeypatch, capsys, "--no-move-sweep", "--sell-workers")
         assert text.startswith("Skip the dashboard's Min. price movement select")
-        assert text.endswith("waits for a price move by its own saved minimum "
-                             "(main.py --min-price-move for one run)")
+        assert text.endswith("a live run's rebalancing (add-ons and trims) waits for a price "
+                             "move by its own saved min_price_move (main.py --min-price-move "
+                             "for one run)")
 
 
 class TestSellWorkersArgument:

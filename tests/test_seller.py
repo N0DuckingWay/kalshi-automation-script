@@ -13,12 +13,17 @@ seller.plan_trims (selling part of a held pair that has outgrown the size the
 Kelly rule allows) is checked the same way: one pair, live and in the
 backtest, must sell the count backtester._kelly_trim sells. Its 7-day wait
 after a trade is tested on each of the 8 days after a purchase.
+
+seller.plan_add_ons (which held pairs a run may add to) waits as the trim
+does, and its price move must equal the backtest's (backtester._held_pair_move
+for an exact pair, _lone_leg_move for a lone leg) on the same quotes.
 """
 import ast
 import dataclasses
 import inspect
 import logging
 import math
+import re
 import sys
 from dataclasses import replace as dc_replace
 from datetime import UTC, date, datetime, timedelta
@@ -28,12 +33,14 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from kalshi_betting import backtester, config, depth_model, seller
+from kalshi_betting import scanner as scanner_mod
 from kalshi_betting.config import fee_leg_exact
 from kalshi_betting.scanner import (
     ApiMarket,
     FillTimes,
     HeldPosition,
     Settlement,
+    held_pairs,
     leg_sides,
     market_ladder_keys,
 )
@@ -2211,6 +2218,612 @@ class TestPlanTrims:
                    for value in call[2:])
 
 
+# ─── Adding to a held pair: the wait and the price move ───────────────────────
+
+_PAIR_KEY = frozenset((_A, _B))
+_LONE_KEY = frozenset((_B,))
+_LONE_TEXT = f"NO {_B}"
+
+
+def _add_on_case(pair_type: str = "time_series", *, a_then: tuple | None = None,
+                 b_then: tuple | None = None, a_now: tuple = _A_NOW,
+                 b_now: tuple = _B_NOW) -> _TrimCase:
+    """The standard pair (_TrimCase: YES on A and NO on B, 30 each, last traded at
+    the previous Monday's run), with this run's market list showing each market's
+    (YES ask, NO ask) now: its last candle's, as the backtest reads them at its
+    checkpoint. So the pair's price now is $0.97 (0.44 on A plus 0.53 on B)."""
+    case = _TrimCase(pair_type, a_now, b_now, a_then=a_then, b_then=b_then)
+    for ticker, (yes_ask, no_ask) in ((_A, a_now), (_B, b_now)):
+        market = case.world.markets[ticker]
+        market.yes_ask_dollars, market.no_ask_dollars = repr(yes_ask), repr(no_ask)
+    return case
+
+
+def _moved(cents_a: int, cents_b: int = 0) -> _TrimCase:
+    """The standard pair with each held side's ask that many cents lower when it
+    last traded (a negative number: higher), so its price has moved that far since."""
+    return _add_on_case(a_then=(round(0.44 - cents_a / 100, 2), 0.58),
+                        b_then=(0.48, round(0.53 - cents_b / 100, 2)))
+
+
+def _lone(case: _TrimCase) -> _TrimCase:
+    """The same account with market A paid out: B alone is held, a lone leg."""
+    del case.world.positions[_A]
+    return case
+
+
+def _add_ons(case: _TrimCase, monkeypatch, *, min_move: float | None = None, on: bool = True,
+             now: datetime = _NOW, pairs: dict | None = None) -> dict:
+    """
+    seller.plan_add_ons' verdict on what the case's account holds, its reads stubbed and recorded.
+
+    Args:
+        case (_TrimCase): The account and exchange.
+        monkeypatch (pytest.MonkeyPatch): pytest's per-test patcher.
+        min_move (float | None): Keyword-only. The run's minimum price movement.
+        on (bool): Keyword-only. The run's rebalance setting.
+        now (datetime): Keyword-only. The run's moment.
+        pairs (dict | None): Keyword-only. What to judge; None is what
+            scanner.held_pairs finds the account may add to.
+
+    Returns:
+        dict: The pairs (and lone legs) the run may add to.
+    """
+    world = case.world
+
+    def candles(client, ticker, event_ticker, start, end):
+        world.calls["candles"].append((ticker, event_ticker, start, end))
+        return world.candles.get(ticker)
+
+    def fills(client):
+        world.fill_reads += 1
+        return world.fills
+
+    monkeypatch.setattr(seller, "recent_candles", candles)
+    monkeypatch.setattr(seller, "get_fill_times", fills)
+    if pairs is None:
+        pairs = held_pairs(dict(world.positions), world.labels(), dict(world.markets),
+                           log=False)
+    client = MagicMock()
+    kept = seller.plan_add_ons(client, pairs, dict(world.markets),
+                               settings=_trim_settings(min_move=min_move, on=on), now=now)
+    # Every read went through a stub: the client itself is never touched
+    assert client.mock_calls == []
+    return kept
+
+
+def _add_ons_at(case: _TrimCase, monkeypatch, now: datetime) -> dict:
+    """The run's add-ons at `now`, with no minimum price movement."""
+    return _add_ons(case, monkeypatch, now=now)
+
+
+def _waiting_add_on_case(*fills_at: datetime, only: str | None = None) -> _TrimCase:
+    """The standard pair, last traded at the latest of `fills_at`: on both markets,
+    or on `only` that one (the other then at the earliest)."""
+    case = _add_on_case()
+    first, last = min(fills_at), max(fills_at)
+    latest = {_A: last, _B: last}
+    if only is not None:
+        latest = {_A: first, _B: first, only: last}
+    case.world.fills = _fills(latest, oldest=first - timedelta(days=30))
+    return case
+
+
+class TestPlanAddOns:
+    """seller.plan_add_ons keeps a held pair (or lone leg) a run may add to only once
+    REBALANCE_MIN_DAYS_SINCE_TRADE calendar days have passed since the last fill on
+    its markets (a lone leg's also on any market of its ladder in the run's list, so
+    a partner sold by hand is not bought back within the wait) and, with a minimum
+    price movement, once its price has moved that far, up or down, since that fill:
+    the rules the Kelly trim follows. Anything it cannot read keeps the pair out
+    (fails closed), never "no minimum"."""
+
+    def test_a_rested_pair_may_be_added_to(self, monkeypatch, caplog):
+        case = _add_on_case()
+        with caplog.at_level(logging.INFO):
+            kept = _add_ons(case, monkeypatch)
+        # The same HeldPair, under the same key
+        (pair,) = kept.values()
+        assert set(kept) == {_PAIR_KEY} and pair.sides == ((_A, "yes"), (_B, "no"))
+        lines = [r.getMessage() for r in caplog.records]
+        assert lines == [
+            f"Add-on check: {_PAIR_TEXT}, 30 contracts each, last traded 2026-01-05, 7 day(s) "
+            "ago -> may add",
+            "Held pairs that may be added to this run: 1 of 1"]
+        # One fills read; no minimum, so no candle
+        assert case.world.fill_reads == 1 and case.world.calls["candles"] == []
+
+    @pytest.mark.parametrize("cents, adds", [(9, False), (10, True), (11, True), (-5, False),
+                                             (0, False), (-9, False), (-10, True),
+                                             (-11, True)])
+    def test_a_move_under_at_and_over_the_minimum_either_way(self, monkeypatch, caplog, cents,
+                                                              adds):
+        # A move of the minimum lets an add-on through whichever way the price
+        # went: a rise (10c, 11c) and a fall (-10c, -11c) alike, the sign on the line
+        case = _moved(cents)
+        with caplog.at_level(logging.INFO):
+            kept = _add_ons(case, monkeypatch, min_move=0.10)
+        assert bool(kept) == adds
+        then = 0.97 - cents / 100
+        prices = f"price ${then:.2f} then, $0.97 now ({cents:+d}c, minimum 10c)"
+        if adds:
+            assert (f"Add-on check: {_PAIR_TEXT}, 30 contracts each, last traded 2026-01-05, "
+                    f"7 day(s) ago, {prices} -> may add") in caplog.text
+        else:
+            assert (f"Not adding to {_PAIR_TEXT}: its total price has not moved by the "
+                    f"minimum since it last traded: {prices}") in caplog.text
+        assert f"Held pairs that may be added to this run: {int(adds)} of 1" in caplog.text
+
+    def test_the_move_is_the_two_markets_together(self, monkeypatch):
+        # 6c on one market and 4c on the other is a 10c move of the pair
+        assert _add_ons(_moved(6, 4), monkeypatch, min_move=0.10)
+        assert _add_ons(_moved(6, 3), monkeypatch, min_move=0.10) == {}
+        # A rise on one market is offset by a fall on the other
+        assert _add_ons(_moved(15, -6), monkeypatch, min_move=0.10) == {}
+        # ... and a fall of the pair as a whole counts as its rise would
+        assert _add_ons(_moved(-6, -4), monkeypatch, min_move=0.10)
+        assert _add_ons(_moved(-6, -3), monkeypatch, min_move=0.10) == {}
+
+    def test_the_move_is_measured_from_the_later_of_the_two_markets_fills(self, monkeypatch):
+        # The pair stood at $0.77 two weeks ago and $0.92 a week ago. B's fill a
+        # week ago is the later one, so the move is 5c, not 20c
+        case = _add_on_case()
+        earlier = _FIRST - 7 * _DAY
+        case.world.candles = {
+            _A: [_candle(earlier, 0.34, 0.68), _candle(_FIRST, 0.42, 0.60), _candle(_CK, *_A_NOW)],
+            _B: [_candle(earlier, 0.58, 0.43), _candle(_FIRST, 0.51, 0.50), _candle(_CK, *_B_NOW)]}
+        case.world.fills = _fills({_A: datetime.fromtimestamp(earlier, UTC), _B: _BOUGHT})
+        assert _add_ons(case, monkeypatch, min_move=0.10) == {}
+        assert _add_ons(case, monkeypatch, min_move=0.05)
+        # Both markets' prices were read at that one moment
+        assert {(t, end) for t, _e, _s, end in case.world.calls["candles"]} == {
+            (_A, _FIRST), (_B, _FIRST)}
+
+    def test_after_a_trim_the_move_is_measured_from_the_trim(self, monkeypatch):
+        # Bought at $0.77; a trim on January 5 sold part of it at $0.92. A run
+        # two weeks after the purchase measures from the trim: 5c, not 20c
+        case = _add_on_case()
+        bought = _FIRST - 7 * _DAY
+        case.world.candles = {
+            _A: [_candle(bought, 0.34, 0.68), _candle(_FIRST, 0.42, 0.60), _candle(_CK, *_A_NOW)],
+            _B: [_candle(bought, 0.58, 0.43), _candle(_FIRST, 0.51, 0.50), _candle(_CK, *_B_NOW)]}
+        # Kalshi lists each market's latest fill: the trim's
+        case.world.fills = _fills({_A: _BOUGHT, _B: _BOUGHT})
+        assert _add_ons(case, monkeypatch, min_move=0.10) == {}
+        # Had it not been trimmed, the same run would measure from the purchase
+        case.world.fills = _fills({_A: datetime.fromtimestamp(bought, UTC),
+                                   _B: datetime.fromtimestamp(bought, UTC)})
+        assert _add_ons(case, monkeypatch, min_move=0.10)
+
+    def test_a_fill_by_hand_starts_the_wait_and_the_move_again(self, monkeypatch, caplog):
+        # Bought two weeks ago at $0.77. A trade by hand on market A alone a week
+        # ago, when the pair stood at $0.92, is its last trade: the move is 5c
+        case = _add_on_case()
+        bought = _FIRST - 7 * _DAY
+        case.world.candles = {
+            _A: [_candle(bought, 0.34, 0.68), _candle(_FIRST, 0.42, 0.60), _candle(_CK, *_A_NOW)],
+            _B: [_candle(bought, 0.58, 0.43), _candle(_FIRST, 0.51, 0.50), _candle(_CK, *_B_NOW)]}
+        case.world.fills = _fills({_A: _BOUGHT, _B: datetime.fromtimestamp(bought, UTC)})
+        assert _add_ons(case, monkeypatch, min_move=0.10) == {}
+        assert _add_ons(case, monkeypatch, min_move=0.05)
+        # The same trade three days ago holds the add-on back, before any price is read
+        case.world.calls["candles"].clear()
+        case.world.fills = _fills({_A: _NOW - timedelta(days=3),
+                                   _B: datetime.fromtimestamp(bought, UTC)})
+        with caplog.at_level(logging.INFO):
+            assert _add_ons(case, monkeypatch, min_move=0.05) == {}
+        assert (f"Not adding to {_PAIR_TEXT}: it last traded 2026-01-09, 3 day(s) ago, and an "
+                "add-on waits until 7 day(s) have passed since a pair's last trade"
+                in caplog.text)
+        assert case.world.calls["candles"] == []
+
+    def test_a_lone_leg_is_judged_on_its_own_markets_price(self, monkeypatch, caplog):
+        # A's YES ask fell 10c and B's NO ask rose 10c: the pair's total price
+        # has not moved, so the exact pair is not added to at a 10c minimum
+        case = _add_on_case(a_then=(0.54, 0.48), b_then=(0.58, 0.43))
+        assert _add_ons(case, monkeypatch, min_move=0.10) == {}
+        # With A paid out, B alone is held: its own price rose 10c
+        lone = _lone(_add_on_case(a_then=(0.54, 0.48), b_then=(0.58, 0.43)))
+        with caplog.at_level(logging.INFO):
+            kept = _add_ons(lone, monkeypatch, min_move=0.10)
+        assert set(kept) == {_LONE_KEY} and kept[_LONE_KEY].lone
+        assert (f"Add-on check: {_LONE_TEXT}, 30 contracts, last traded 2026-01-05, 7 day(s) "
+                "ago, price $0.43 then, $0.53 now (+10c, minimum 10c) -> may add"
+                in caplog.text)
+        # Only its own market's price was read
+        assert [call[0] for call in lone.world.calls["candles"]] == [_B]
+        # ... and a smaller move of its own holds it back
+        held_back = _lone(_add_on_case(a_then=(0.34, 0.68), b_then=(0.48, 0.49)))
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert _add_ons(held_back, monkeypatch, min_move=0.10) == {}
+        assert (f"Not adding to {_LONE_TEXT}: its price has not moved by the minimum since it "
+                "last traded: price $0.49 then, $0.53 now (+4c, minimum 10c)") in caplog.text
+
+    def test_a_lone_leg_with_no_fill_listed_is_not_added_to_with_a_minimum(self, monkeypatch,
+                                                                         caplog):
+        lone = _lone(_moved(0, 20))
+        lone.world.fills = _fills()
+        with caplog.at_level(logging.INFO):
+            assert _add_ons(lone, monkeypatch, min_move=0.10) == {}
+        assert (f"Not adding to {_LONE_TEXT}: no fill is listed on its market, so its price "
+                "when it last traded cannot be read, and a minimum price movement is set"
+                in caplog.text)
+
+    def test_a_lone_leg_whose_partner_was_sold_by_hand_yesterday_waits(self, monkeypatch,
+                                                                      caplog):
+        # Sold by hand, A leaves the positions listing just as a paid-out partner does,
+        # so B reads as a lone leg. The finders may pair B with A again (A is on B's own
+        # ladder), so A's fill yesterday restarts the wait: the bot does not buy A back
+        # the day after it was sold
+        case = _lone(_add_on_case())
+        case.world.fills = _fills({_A: _NOW - timedelta(days=1),
+                                   _B: _BOUGHT - timedelta(days=3)})
+        with caplog.at_level(logging.INFO):
+            assert _add_ons(case, monkeypatch) == {}
+        assert (f"Not adding to {_LONE_TEXT}: it last traded 2026-01-11, 1 day(s) ago, and an "
+                "add-on waits until 7 day(s) have passed since a pair's last trade"
+                in caplog.text)
+
+    def test_only_a_listed_market_of_its_own_ladder_restarts_a_lone_legs_wait(self, monkeypatch,
+                                                                             caplog):
+        # B last traded 10 days ago. A fill yesterday on a market of another question,
+        # or on A once it is no longer in this run's market list (paid out, so no finder
+        # can pair B with it), does not hold B back
+        def case_with(recent: str, *, drop_a: bool = False) -> _TrimCase:
+            """B alone held, every market last traded 10 days ago but `recent`, yesterday."""
+            case = _lone(_add_on_case())
+            other = _rung("KXRAIN-26-JAN30", "KXRAIN-26", "Jan 30, 2026", _B_CLOSE,
+                          title="Will it rain in Paris?")
+            case.world.list(other)
+            if drop_a:
+                del case.world.markets[_A]
+            old = _BOUGHT - timedelta(days=3)
+            latest = {_A: old, _B: old, other.ticker: old}
+            latest[recent] = _NOW - timedelta(days=1)
+            case.world.fills = _fills(latest)
+            return case
+
+        for case in (case_with("KXRAIN-26-JAN30"), case_with(_A, drop_a=True)):
+            caplog.clear()
+            with caplog.at_level(logging.INFO):
+                assert set(_add_ons(case, monkeypatch)) == {_LONE_KEY}
+            assert (f"Add-on check: {_LONE_TEXT}, 30 contracts, last traded 2026-01-02, "
+                    "10 day(s) ago -> may add" in caplog.text)
+
+    # ── The wait, however often the bot runs ────────────────────────────────
+
+    @pytest.mark.parametrize("days_after", range(1, 9))
+    def test_a_run_on_each_of_the_eight_days_after_a_fill(self, monkeypatch, caplog,
+                                                          days_after):
+        # Bought Tuesday January 6 at 10:00; a run at 09:00 on each later day
+        case = _waiting_add_on_case(_pacific(1, 6, 10))
+        with caplog.at_level(logging.INFO):
+            kept = _add_ons_at(case, monkeypatch, _pacific(1, 6 + days_after, 9))
+        # Days 1 to 6: not added to. Day 7 (the next Tuesday) and day 8: added to
+        assert bool(kept) == (days_after >= 7)
+        if kept:
+            assert f"last traded 2026-01-06, {days_after} day(s) ago -> may add" in caplog.text
+        else:
+            assert (f"Not adding to {_PAIR_TEXT}: it last traded 2026-01-06, {days_after} "
+                    "day(s) ago, and an add-on waits until 7 day(s) have passed since a "
+                    "pair's last trade") in caplog.text
+
+    @pytest.mark.parametrize("only", [None, _A, _B], ids=["both", "market A", "market B"])
+    def test_any_fill_on_day_three_moves_the_first_add_on_to_day_ten(self, monkeypatch, only):
+        # Bought on January 6; on January 9 (day 3) the pair trades again, on
+        # both markets or by hand on one alone
+        case = _waiting_add_on_case(_pacific(1, 6, 10), _pacific(1, 9, 14), only=only)
+        for day, adds in ((13, False), (15, False), (16, True), (17, True)):
+            assert bool(_add_ons_at(case, monkeypatch, _pacific(1, day, 9))) == adds, day
+
+    def test_late_evening_to_just_after_midnight_counts_calendar_days(self, monkeypatch):
+        # A fill at 11:50pm on January 5; a run at 12:10am seven dates later is
+        # allowed (a little under 7 x 24 hours), six dates later is not
+        case = _waiting_add_on_case(_pacific(1, 5, 23, 50))
+        assert _add_ons_at(case, monkeypatch, _pacific(1, 11, 0, 10)) == {}
+        assert _add_ons_at(case, monkeypatch, _pacific(1, 12, 0, 10))
+
+    def test_an_evening_fill_belongs_to_its_pacific_day(self, monkeypatch):
+        # A fill at 6pm Pacific on Monday January 5 is already Tuesday in UTC;
+        # the run at 9am the next Monday still finds seven days gone
+        bought = _pacific(1, 5, 18)
+        assert bought.astimezone(UTC).date() == date(2026, 1, 6)
+        case = _waiting_add_on_case(bought)
+        assert _add_ons_at(case, monkeypatch, _pacific(1, 12, 9))
+        # On a clock set to UTC the same fill is a Tuesday, so that Monday is day six
+        monkeypatch.setattr(seller, "SCHEDULED_RUN",
+                            config.ScheduledRun(weekday=0, hour=9, minute=0, timezone="UTC"))
+        assert _add_ons_at(case, monkeypatch, _pacific(1, 12, 9)) == {}
+
+    def test_a_wait_of_eight_days_holds_back_a_fill_seven_days_old(self, monkeypatch):
+        case = _add_on_case()
+        assert _add_ons(case, monkeypatch)
+        monkeypatch.setattr(seller, "REBALANCE_MIN_DAYS_SINCE_TRADE", 8)
+        assert _add_ons(case, monkeypatch) == {}
+
+    # ── What it cannot read ─────────────────────────────────────────────────
+
+    @pytest.mark.parametrize("fills, problem", [
+        (None, "the account's fills could not be read, so when each pair last traded is not "
+               "known"),
+        (_fills(oldest=None), "the account's fills list is empty, so a trade in the last 7 "
+                              "day(s) cannot be ruled out"),
+        (_fills({_A: _NOW - timedelta(days=3), _B: _NOW - timedelta(days=3)},
+                oldest=_NOW - timedelta(days=3)),
+         "the account's fills list starts 2026-01-09 on the bot's own clock, fewer than 7 "
+         "day(s) ago, so a trade in the last 7 day(s) cannot be ruled out"),
+    ], ids=["unreadable", "empty", "too short"])
+    def test_fills_that_cannot_rule_out_a_recent_trade_add_to_nothing(self, monkeypatch, caplog,
+                                                                     fills, problem):
+        case = _moved(20)
+        case.world.fills = fills
+        with caplog.at_level(logging.INFO):
+            assert _add_ons(case, monkeypatch, min_move=0.10) == {}
+        assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [
+            f"Not adding to held pairs this run: {problem}"]
+        assert "Held pairs that may be added to this run: 0 of 1" in caplog.text
+        # Read once, and no price is read
+        assert case.world.fill_reads == 1 and case.world.calls["candles"] == []
+
+    def test_no_fill_listed_is_not_added_to_with_a_minimum_and_reads_no_candle(
+            self, monkeypatch, caplog):
+        # The pair's last fill is older than the fills list reaches: it has
+        # rested, but its price then cannot be read
+        case = _moved(20)
+        case.world.fills = _fills()
+        with caplog.at_level(logging.INFO):
+            assert _add_ons(case, monkeypatch, min_move=0.10) == {}
+        assert (f"Not adding to {_PAIR_TEXT}: no fill is listed on either market, so its price "
+                "when it last traded cannot be read, and a minimum price movement is set"
+                in caplog.text)
+        assert case.world.calls["candles"] == []
+        # With no minimum the same pair may be added to: it rested since the list began
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert _add_ons(case, monkeypatch)
+        assert (f"Add-on check: {_PAIR_TEXT}, 30 contracts each, no fill listed (the fills "
+                "list starts 2025-12-13) -> may add") in caplog.text
+
+    @pytest.mark.parametrize("ticker, side", [(_A, "YES"), (_B, "NO")])
+    def test_candles_that_cannot_be_read_are_not_a_move(self, monkeypatch, caplog, ticker,
+                                                        side):
+        case = _moved(20)
+        del case.world.candles[ticker]
+        with caplog.at_level(logging.INFO):
+            assert _add_ons(case, monkeypatch, min_move=0.10) == {}
+        assert (f"Not adding to {_PAIR_TEXT}: the {side} ask on {ticker} when it last traded "
+                "(2026-01-05) cannot be read (no usable quote in the 7 days before it, or its "
+                "price history could not be read), and a minimum price movement is set"
+                in caplog.text)
+
+    def test_no_usable_quote_in_the_week_before_is_not_a_move(self, monkeypatch, caplog):
+        # Market A's only candle before the pair's last fill ended eight days
+        # before it, and the one at the fill itself has an empty YES ask book
+        case = _moved(20)
+        case.world.candles[_A] = [_candle(_FIRST - 8 * _DAY, 0.24, 0.78),
+                                  _candle(_FIRST, 1.00, 0.58), _candle(_CK, *_A_NOW)]
+        with caplog.at_level(logging.INFO):
+            assert _add_ons(case, monkeypatch, min_move=0.10) == {}
+        assert f"the YES ask on {_A} when it last traded (2026-01-05) cannot be read" in (
+            caplog.text)
+        # A usable quote six days before the fill is read
+        case.world.candles[_A].insert(1, _candle(_FIRST - 6 * _DAY, 0.24, 0.78))
+        assert _add_ons(case, monkeypatch, min_move=0.10)
+
+    @pytest.mark.parametrize("ticker, field, raw", [
+        (_A, "yes_ask_dollars", None), (_A, "yes_ask_dollars", "0"),
+        (_A, "yes_ask_dollars", "1.00"), (_A, "yes_ask_dollars", "nan"),
+        (_A, "yes_ask_dollars", "abc"), (_A, "yes_ask_dollars", True),
+        (_B, "no_ask_dollars", None), (_B, "no_ask_dollars", "0.0000"),
+        (_B, "no_ask_dollars", 1),
+    ])
+    def test_an_ask_now_the_market_list_cannot_give_is_not_a_move(self, monkeypatch, caplog,
+                                                                  ticker, field, raw):
+        # The price now is the ask of the side held on this run's market list,
+        # usable only strictly between 0 and 1, as a held pair is valued
+        case = _moved(20)
+        setattr(case.world.markets[ticker], field, raw)
+        side = "YES" if field.startswith("yes") else "NO"
+        with caplog.at_level(logging.INFO):
+            assert _add_ons(case, monkeypatch, min_move=0.10) == {}
+        assert (f"Not adding to {_PAIR_TEXT}: the {side} ask on {ticker} is not in this run's "
+                "market list or not a price strictly between 0 and 1, and a minimum price "
+                "movement is set") in caplog.text
+        # Read before the price then: no candle is asked for
+        assert case.world.calls["candles"] == []
+
+    def test_a_market_missing_from_the_market_list_is_not_a_move(self, monkeypatch, caplog):
+        case = _moved(20)
+        pairs = held_pairs(dict(case.world.positions), case.world.labels(),
+                           dict(case.world.markets), log=False)
+        del case.world.markets[_B]
+        with caplog.at_level(logging.INFO):
+            assert _add_ons(case, monkeypatch, min_move=0.10, pairs=pairs) == {}
+        assert f"the NO ask on {_B} is not in this run's market list" in caplog.text
+        assert case.world.calls["candles"] == []
+        # With no minimum the price now is not needed
+        assert _add_ons(case, monkeypatch, pairs=pairs)
+
+    # ── What it reads, and when ─────────────────────────────────────────────
+
+    def test_nothing_to_add_to_reads_nothing(self, monkeypatch, caplog):
+        case = _add_on_case()
+        with caplog.at_level(logging.INFO):
+            assert _add_ons(case, monkeypatch, min_move=0.10, pairs={}) == {}
+        assert case.world.fill_reads == 0 and caplog.records == []
+
+    def test_no_wait_and_no_minimum_reads_nothing(self, monkeypatch, caplog):
+        monkeypatch.setattr(seller, "REBALANCE_MIN_DAYS_SINCE_TRADE", 0)
+        # A fill an hour ago: with no wait it holds nothing back
+        case = _waiting_add_on_case(_NOW - timedelta(hours=1))
+        with caplog.at_level(logging.INFO):
+            kept = _add_ons(case, monkeypatch)
+        assert set(kept) == {_PAIR_KEY}
+        assert case.world.fill_reads == 0 and case.world.calls["candles"] == []
+        assert [r.getMessage() for r in caplog.records] == [
+            "Held pairs that may be added to this run: 1 of 1"]
+
+    def test_a_minimum_with_no_wait_still_reads_the_fills(self, monkeypatch, caplog):
+        monkeypatch.setattr(seller, "REBALANCE_MIN_DAYS_SINCE_TRADE", 0)
+        case = _moved(20)
+        with caplog.at_level(logging.INFO):
+            assert _add_ons(case, monkeypatch, min_move=0.10)
+        assert case.world.fill_reads == 1
+        assert (f"Add-on check: {_PAIR_TEXT}, 30 contracts each, no wait, price $0.77 then, "
+                "$0.97 now (+20c, minimum 10c) -> may add") in caplog.text
+        # Unreadable fills: nothing is added to, wait or no wait
+        case.world.fills = None
+        assert _add_ons(case, monkeypatch, min_move=0.10) == {}
+
+    def test_off_keeps_nothing_and_reads_nothing(self, monkeypatch, caplog):
+        case = _add_on_case()
+        with caplog.at_level(logging.INFO):
+            assert _add_ons(case, monkeypatch, on=False) == {}
+        assert case.world.fill_reads == 0 and caplog.records == []
+
+    @pytest.mark.parametrize("days", [True, 7.0, -1, 31, None])
+    def test_a_bad_number_of_days_stops_the_run_before_any_request(self, monkeypatch, days):
+        monkeypatch.setattr(seller, "REBALANCE_MIN_DAYS_SINCE_TRADE", days)
+        case = _add_on_case()
+        with pytest.raises(ValueError, match="REBALANCE_MIN_DAYS_SINCE_TRADE"):
+            _add_ons(case, monkeypatch)
+        # ... even with nothing to add to
+        with pytest.raises(ValueError, match="REBALANCE_MIN_DAYS_SINCE_TRADE"):
+            _add_ons(case, monkeypatch, pairs={})
+        assert case.world.fill_reads == 0
+
+    def test_now_must_carry_a_time_zone(self, monkeypatch):
+        with pytest.raises(ValueError, match="timezone-aware"):
+            _add_ons(_add_on_case(), monkeypatch, now=datetime(2026, 1, 12, 9))
+
+    def test_each_markets_price_then_is_read_once(self, monkeypatch):
+        case = _moved(20)
+        assert _add_ons(case, monkeypatch, min_move=0.10)
+        week = config.PRICE_THEN_MAX_AGE_DAYS * _DAY
+        assert case.world.calls["candles"] == [
+            (_A, _EV_A, _FIRST - week - 3600, _FIRST), (_B, _EV_B, _FIRST - week - 3600, _FIRST)]
+
+    def test_pairs_are_judged_in_ticker_order_each_on_its_own(self, monkeypatch, caplog):
+        # A second held pair (HAIL) traded two days ago waits; the standard pair
+        # rested and is kept; the summary counts both
+        case = _add_on_case()
+        hail = _weather_pair(case.world, "hail", 10)
+        case.world.fills = _fills({_A: _BOUGHT, _B: _BOUGHT,
+                                   hail[0]: _NOW - timedelta(days=2),
+                                   hail[1]: _NOW - timedelta(days=2)})
+        with caplog.at_level(logging.INFO):
+            kept = _add_ons(case, monkeypatch)
+        assert set(kept) == {_PAIR_KEY}
+        lines = [r.getMessage() for r in caplog.records]
+        assert lines == [
+            f"Not adding to YES {hail[0]} / NO {hail[1]}: it last traded 2026-01-10, 2 day(s) "
+            "ago, and an add-on waits until 7 day(s) have passed since a pair's last trade",
+            f"Add-on check: {_PAIR_TEXT}, 30 contracts each, last traded 2026-01-05, 7 day(s) "
+            "ago -> may add",
+            "Held pairs that may be added to this run: 1 of 2"]
+        assert case.world.fill_reads == 1
+
+
+class TestAddOnParityWithTheBacktest:
+    """A live add-on's price move equals the backtest's on the same pair's quotes:
+    backtester._held_pair_move for an exact pair, _lone_leg_move for a lone leg,
+    each from the day of the last trade, so a minimum holds back the same add-ons
+    on both paths."""
+
+    @staticmethod
+    def _spied(monkeypatch) -> list:
+        """Every move seller.pair_price_move measures this test."""
+        measured = []
+        real = seller.pair_price_move
+
+        def spy(then, now):
+            measured.append(real(then, now))
+            return measured[-1]
+
+        monkeypatch.setattr(seller, "pair_price_move", spy)
+        return measured
+
+    @pytest.mark.parametrize("a_then, b_then, expected", [
+        # A rise: $0.77 when bought, $0.97 now
+        ((0.34, 0.68), (0.58, 0.43), 0.20),
+        # A fall: $1.17 when bought
+        ((0.54, 0.48), (0.48, 0.63), -0.20),
+    ], ids=["rise", "fall"])
+    def test_an_exact_pairs_move_is_the_backtests(self, monkeypatch, a_then, b_then, expected):
+        case = _add_on_case(a_then=a_then, b_then=b_then)
+        last_day, move = backtester._held_pair_move([case.trade], _D, {})
+        assert last_day == _BOUGHT.date() == date(2026, 1, 5)
+        assert move == pytest.approx(expected, abs=1e-9)
+        measured = self._spied(monkeypatch)
+        # A 20c move meets a 20c minimum, on both paths
+        assert config.price_move_reached(move, 0.20)
+        assert set(_add_ons(case, monkeypatch, min_move=0.20)) == {_PAIR_KEY}
+        assert measured == [pytest.approx(move, abs=1e-9)]
+        # ... and falls short of a 25c one, on both paths
+        assert not config.price_move_reached(move, 0.25)
+        assert _add_ons(case, monkeypatch, min_move=0.25) == {}
+
+    def test_a_lone_legs_move_is_the_backtests(self, monkeypatch):
+        # B's NO ask was 0.43 when bought and is 0.53 now; A's own move (-10c)
+        # is no part of the lone leg's
+        case = _lone(_add_on_case(a_then=(0.54, 0.48), b_then=(0.58, 0.43)))
+        last_day, move = backtester._lone_leg_move([{"trade": case.trade, "ticker": _B}], _D,
+                                                   {})
+        assert last_day == date(2026, 1, 5)
+        assert move == pytest.approx(0.10, abs=1e-9)
+        measured = self._spied(monkeypatch)
+        assert set(_add_ons(case, monkeypatch, min_move=0.10)) == {_LONE_KEY}
+        assert measured == [pytest.approx(move, abs=1e-9)]
+        assert _add_ons(case, monkeypatch, min_move=0.15) == {}
+        assert not config.price_move_reached(move, 0.15)
+
+    def test_both_wait_the_same_days_after_the_last_trade(self, monkeypatch):
+        # The backtest's last trade (the purchase on January 5) is the live
+        # pair's last fill, and seven days on both paths are enough
+        case = _add_on_case()
+        last_day, _move = backtester._held_pair_move([case.trade], _D, {})
+        assert config.rebalance_rested(last_day, _D, backtester._resolve_rebalance_min_days())
+        assert _add_ons(case, monkeypatch)
+        # ... and six are not, on either
+        early = _NOW - timedelta(days=1)
+        assert not config.rebalance_rested(last_day, seller._day(early),
+                                           seller._rebalance_min_days())
+        assert _add_ons(case, monkeypatch, now=early) == {}
+
+    @pytest.mark.parametrize("wait", [7, 8, 30])
+    @pytest.mark.parametrize("fills_at", ["purchase", "by hand on A", "by hand on B",
+                                          "none listed"])
+    def test_the_trim_and_the_add_on_name_one_last_trade(self, monkeypatch, caplog, wait,
+                                                         fills_at):
+        # The Kelly trim and the add-on each work out an exact pair's last trade, and
+        # the wait from it, for themselves: on one pair, one fills list and one wait
+        # they name the same day, so the live path has one last-trade day
+        case = _add_on_case()
+        three_days_ago = _NOW - timedelta(days=3)
+        case.world.fills = _fills({
+            "purchase": {_A: _BOUGHT, _B: _BOUGHT},
+            "by hand on A": {_A: three_days_ago, _B: _BOUGHT},
+            "by hand on B": {_A: _BOUGHT, _B: three_days_ago},
+            "none listed": {}}[fills_at])
+        monkeypatch.setattr(seller, "REBALANCE_MIN_DAYS_SINCE_TRADE", wait)
+        # Both planners' words for the day, on a check line or a held-back line
+        pattern = re.compile(r"last traded \S+, -?\d+ day\(s\) ago"
+                             r"|no fill listed \(the fills list starts \S+\)")
+
+        def named(run) -> list:
+            """The last-trade words one planner logs."""
+            caplog.clear()
+            with caplog.at_level(logging.INFO):
+                run()
+            return [found.group(0) for record in caplog.records
+                    if (found := pattern.search(record.getMessage()))]
+
+        trim = named(lambda: case.live(monkeypatch, 10_000, cap=0.10))
+        add_on = named(lambda: _add_ons(case, monkeypatch))
+        assert len(trim) == 1 and trim == add_on
+
+
 # ─── The module's shape ───────────────────────────────────────────────────────
 
 def _tree():
@@ -2382,6 +2995,53 @@ class TestIsolation:
             "then_a + then_b", "now_a + now_b"]
         assert [ast.unparse(arg) for arg in tested.args] == ["move", "settings.min_price_move"]
         assert ast.unparse(rested) == "rebalance_rested(last, now_date, min_days)"
+
+    def test_plan_add_ons_requires_the_runs_settings_and_its_moment(self):
+        # What an add-on waits for has no default: the run's settings and its moment
+        signature = inspect.signature(seller.plan_add_ons)
+        assert list(signature.parameters) == [
+            "client", "add_on_pairs", "markets_by_ticker", "settings", "now"]
+        for name in ("settings", "now"):
+            parameter = signature.parameters[name]
+            assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, name
+            assert parameter.default is inspect.Parameter.empty, name
+
+    def test_an_add_on_waits_through_the_shared_rule(self):
+        # The wait and the price move are config's own functions, the ones the
+        # Kelly trim and the backtest's add-ons wait with, and the price now is
+        # the one reading of a held market's listed ask
+        assert seller.listed_ask is scanner_mod.listed_ask
+        add_on_one = _calls("_add_on_one")
+        assert {"rebalance_rested", "pair_price_move", "price_move_reached", "listed_ask",
+                "ask_then", "_day"} <= add_on_one
+        # It reads no candle or fills list itself, and turns a time into a day
+        # only through _day
+        assert not {"recent_candles", "ask_before", "get_fill_times", "trade_day"} & add_on_one
+        plan = _calls("plan_add_ons")
+        assert {"get_fill_times", "_rebalance_min_days", "rebalance_rested", "_day",
+                "_add_on_one"} <= plan
+        # Once per run: one fills read, one read of the wait's number of days,
+        # the number checked before the fills are read
+        for callee in ("get_fill_times", "_rebalance_min_days"):
+            assert len(_calls_of("plan_add_ons", callee)) == 1, callee
+        (days,) = _calls_of("plan_add_ons", "_rebalance_min_days")
+        (fills,) = _calls_of("plan_add_ons", "get_fill_times")
+        assert days.lineno < fills.lineno
+        # The minimum is the run's own
+        assigned = [ast.unparse(node) for node in ast.walk(_def("plan_add_ons"))
+                    if isinstance(node, ast.Assign)]
+        assert "min_move = settings.min_price_move" in assigned
+        # The wait first, then the price now, the price then, the move and its test
+        (rested,) = _calls_of("_add_on_one", "rebalance_rested")
+        (ask_now,) = _calls_of("_add_on_one", "listed_ask")
+        (ask_then,) = _calls_of("_add_on_one", "ask_then")
+        (measured,) = _calls_of("_add_on_one", "pair_price_move")
+        (tested,) = _calls_of("_add_on_one", "price_move_reached")
+        assert (rested.lineno < ask_now.lineno < ask_then.lineno < measured.lineno
+                < tested.lineno)
+        assert ast.unparse(rested) == "rebalance_rested(last, now_date, min_days)"
+        assert [ast.unparse(arg) for arg in measured.args] == ["then_total", "now_total"]
+        assert [ast.unparse(arg) for arg in tested.args] == ["move", "min_move"]
 
     def test_the_four_quotes_go_in_as_the_backtest_hands_them(self):
         # Each market's YES ask, then its NO ask (an ask is 1 minus the other

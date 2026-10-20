@@ -15257,8 +15257,9 @@ class TestLiveRuleLine:
 
     # ── Rebalancing ─────────────────────────────────────────────────────────
 
-    # A live run applies the minimum to its trims only, which the clause says
-    _REBALANCE_NOTE = ("; the live defaults rebalance held pairs (a trim only after a 10c "
+    # A live run holds back its add-ons and its trims alike until the minimum
+    # is reached, so the clause names the minimum for both
+    _REBALANCE_NOTE = ("; the live defaults rebalance held pairs (only after a 10c "
                        "price move), which this run's primary does not")
     _REBALANCE_NOTE_NO_MINIMUM = ("; the live defaults rebalance held pairs, which this "
                                   "run's primary does not")

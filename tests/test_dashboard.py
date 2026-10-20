@@ -12100,11 +12100,11 @@ class TestRebalanceSelect:
         assert ("sold down to it when it has grown past it, however recently it was last "
                 "traded and, with a Min. price movement,") in title(0)
         assert "days have passed" not in title(0) and "Weekly runs" not in title(0)
-        # How a live trim counts the wait (a live add-on does not wait): said
-        # only when there is a wait
-        live = ("A live run waits this way before a trim only, counting calendar days on the "
-                "bot's own clock from the last fill of any sort on either market, a trade by "
-                "hand included. While yes,")
+        # How a live run counts the wait before an add-on or a trim: said only
+        # when there is a wait
+        live = ("A live run waits this way before an add-on or a trim, counting calendar "
+                "days on the bot's own clock from the last fill of any sort on the pair's "
+                "markets, a trade by hand included. While yes,")
         for days in (1, 7, 14):
             assert live in title(days)
         assert "A live run" not in title(0)
@@ -12240,14 +12240,14 @@ class TestMoveSelect:
                       "YES on the earlier market plus NO on the later one",
                       "10c is 10% of a $1 payout", "any: no minimum"):
             assert words in dashboard._MOVE_TITLE
-        # ... and ends with what Save saves, and which pairs a live run cannot
-        # measure a move for
+        # ... and ends with what Save saves, and which pairs a live run neither
+        # trims nor adds to, since it cannot measure their move
         assert dashboard._MOVE_TITLE.endswith(
             " From a page that simulated rebalancing, Save as live defaults saves the minimum "
             "shown (any, or Rebalance no, saves none); from any other page it keeps the saved "
             "one. A live run reads the price at the pair's last fill on Kalshi, so with a "
-            "minimum set it does not trim a pair whose last fill is older than Kalshi's list "
-            "of the account's fills reaches.")
+            "minimum set it neither trims nor adds to a pair whose last fill is older than "
+            "Kalshi's list of the account's fills reaches.")
         # A page with the view has no note beside either select
         assert 'id="flt-move-note"' not in page and 'id="flt-rebalance-note"' not in page
 
@@ -13457,7 +13457,7 @@ class TestLiveRebalanceRule:
     it cannot show, or rebalancing with selling)."""
 
     _NOTE = "; the live defaults rebalance held pairs, which this run's primary does not"
-    _NOTE_10C = ("; the live defaults rebalance held pairs (a trim only after a 10c price "
+    _NOTE_10C = ("; the live defaults rebalance held pairs (only after a 10c price "
                  "move), which this run's primary does not")
     _SHOWN = (' — choose Rebalance yes and Min. price movement "{}" in the filter bar to '
               "see it")
@@ -13635,7 +13635,7 @@ class TestLiveRebalanceRule:
     def test_the_header_of_a_whole_page_points_at_the_selects(self, monkeypatch, tmp_path):
         sweep = self._both(_kc_sweep_move(), live_min_price_move=0.1, live_tier_floors=True,
                            live_spread_band=_KC_B0)
-        note = ("the live defaults rebalance held pairs (a trim only after a {}c price move), "
+        note = ("the live defaults rebalance held pairs (only after a {}c price move), "
                 "which this run's primary does not — ")
         page = _rb_page(monkeypatch, tmp_path, sweep)
         assert (note.format(10) + 'choose Rebalance yes and Min. price movement "10c" in the '

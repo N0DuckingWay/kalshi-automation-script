@@ -2435,6 +2435,7 @@ def _live_shape_client(
     extra_events: tuple = (),
     extra_held: tuple = (),
     held_rows: tuple = (),
+    fill_rows: tuple | None = None,
 ):
     """Build a MagicMock KalshiClient wired end-to-end with current-generation
     payload shapes over the fixed 4-group market set described above.
@@ -2484,6 +2485,10 @@ def _live_shape_client(
         held_rows (tuple): More positions-listing rows, each a dict as the
             listing sends it (ticker, position_fp, market_exposure_dollars,
             fees_paid_dollars), after the rest.
+        fill_rows (tuple | None): The account's fills listing (_fill_row
+            records), served newest first on one page; None leaves it
+            unwired, so a read of it fails (scanner.get_fill_times logs a
+            WARNING and returns None), as for a client that was never asked.
     """
     if mve_bailout:
         monkeypatch.setattr(scanner_mod, "INCLUDE_MVE_MARKETS", True)
@@ -2543,6 +2548,12 @@ def _live_shape_client(
     client.get_orders_without_preload_content = MagicMock(
         return_value=_raw_json_response({"orders": [], "cursor": None})
     )
+
+    # The account's fills, read by a run that trims or adds to a held pair
+    if fill_rows is not None:
+        rows = sorted(fill_rows, key=lambda row: row["created_time"], reverse=True)
+        client.get_fills_without_preload_content = MagicMock(
+            return_value=_raw_json_response({"fills": rows, "cursor": None}))
 
     # Never called: every order goes through signed_request_json
     client.create_order_without_preload_content = MagicMock()
@@ -3587,7 +3598,10 @@ class TestLiveSettingsReachEverySite:
         The account holds HELD-A (3 YES, no cost listed). On the default
         balance Kalshi values the open positions at $0, so a production run
         that trims logs one "Not trimming this run" WARNING and never asks
-        seller.plan_trims; with a value above $0 it asks once.
+        seller.plan_trims; with a value above $0 it asks once. HELD-A is no
+        pair (no cost), so a production run that rebalances asks
+        seller.plan_add_ons once with nothing to add to, and the account's
+        fills, read only for a held pair to trim or add to, are never read.
 
         Args:
             monkeypatch (pytest.MonkeyPatch): pytest's per-test patcher.
@@ -3606,8 +3620,9 @@ class TestLiveSettingsReachEverySite:
             tuple: (settings, reference, calls, captured) — calls maps (module
                 short name, function name) to each call's (args, kwargs);
                 captured holds "results", "filter", "enriched", "client",
-                "plan_trims" (each trim planner call's keywords) and, in prod,
-                "run_note".
+                "plan_trims" (each trim planner call's keywords),
+                "plan_add_ons" (each add-on planner call's pairs and keywords)
+                and, in prod, "run_note".
         """
         settings = self._SETTINGS if settings is None else settings
         balance_payload = _LIVE_BALANCE_PAYLOAD if balance_payload is None else balance_payload
@@ -3620,7 +3635,7 @@ class TestLiveSettingsReachEverySite:
         client = _live_shape_client(
             monkeypatch, balance_payload=balance_payload, include_time_series=True,
         )
-        captured: dict = {"client": client, "plan_trims": []}
+        captured: dict = {"client": client, "plan_trims": [], "plan_add_ons": []}
         # A fresh cached listing, so a prod run makes no request for it
         _seed_series_listing(self._LISTING)
         real_filter = main._filter_by_category
@@ -3680,6 +3695,14 @@ class TestLiveSettingsReachEverySite:
             return real_plan_trims(client_, positions, labels, by_ticker, **kwargs)
 
         monkeypatch.setattr(main, "plan_trims", plan_trims_spy)
+        # ... and the add-on planner, with what the run may add to
+        real_plan_add_ons = main.plan_add_ons
+
+        def plan_add_ons_spy(client_, pairs, by_ticker, **kwargs):
+            captured["plan_add_ons"].append((dict(pairs), kwargs))
+            return real_plan_add_ons(client_, pairs, by_ticker, **kwargs)
+
+        monkeypatch.setattr(main, "plan_add_ons", plan_add_ons_spy)
 
         # The tripwire: no module may resolve config.py's settings, or read the
         # saved defaults, this run
@@ -3742,6 +3765,14 @@ class TestLiveSettingsReachEverySite:
         else:
             assert not_trimming == [] and captured["plan_trims"] == []
             client.get_fills_without_preload_content.assert_not_called()
+        # A production run that rebalances asks the add-on planner once, with the
+        # run's own settings; HELD-A is no pair, so there is nothing to add to and
+        # nothing is read for it
+        if mode == "prod" and settings.rebalance:
+            [(pairs_to_add, add_on_keywords)] = captured["plan_add_ons"]
+            assert pairs_to_add == {} and add_on_keywords["settings"] is settings
+        else:
+            assert captured["plan_add_ons"] == []
         # The filter ran once, on the run's settings, keeping both pairs and only them
         ((pairs, filter_settings, listing_client, kept),) = captured["filter"]
         assert filter_settings is settings
@@ -3867,7 +3898,8 @@ class TestLiveSettingsReachEverySite:
         # No take-profit plan, so no pair is left out of the trim
         assert call["skip"] == frozenset()
         # HELD-A, held alone with no cost listed, is no pair: nothing is trimmed
-        # and the fills are not read
+        # or added to, and the fills (read only for a held pair to trim or add
+        # to) are not read
         assert "Pairs to trim this run: 0 of 0" in caplog.text
         captured["client"].get_fills_without_preload_content.assert_not_called()
 
@@ -4290,9 +4322,10 @@ class TestRunProdAddsToHeldPairs:
             tuple[list, dict]: The simulated results, and what the run handed
                 on: "held_pairs" (each call's positions), "markets" (the
                 tickers of each call's market map), "ts" and "st" (the
-                add_on_pairs each finder was handed, per call).
+                add_on_pairs each finder was handed, per call), and "blocked"
+                (each finder call's blocked tickers and market tickers).
         """
-        seen: dict = {"held_pairs": [], "markets": [], "ts": [], "st": []}
+        seen: dict = {"held_pairs": [], "markets": [], "ts": [], "st": [], "blocked": []}
         real_held_pairs = main.held_pairs
         real_ts, real_st = main.find_time_series_pairs, main.find_same_title_pairs
 
@@ -4303,10 +4336,14 @@ class TestRunProdAddsToHeldPairs:
 
         def ts_spy(*args, add_on_pairs=None, **kwargs):
             seen["ts"].append(add_on_pairs)
+            # (client, blocked tickers, markets)
+            seen["blocked"].append((set(args[1]), {m.ticker for m in args[2]}))
             return real_ts(*args, add_on_pairs=add_on_pairs, **kwargs)
 
         def st_spy(*args, add_on_pairs=None, **kwargs):
             seen["st"].append(add_on_pairs)
+            # (markets, blocked tickers)
+            seen["blocked"].append((set(args[1]), {m.ticker for m in args[0]}))
             return real_st(*args, add_on_pairs=add_on_pairs, **kwargs)
 
         captured: dict = {}
@@ -4349,7 +4386,9 @@ class TestRunProdAddsToHeldPairs:
         worth at the fixture's asks: 3 YES on HELD-A at 0.50, 30 YES on
         TS-EARLY at 0.30 and 30 NO on TS-LATE at 0.40. The 63 contracts held
         back it (a contract pays at most $1), so the run counts it and sizes
-        on the cash plus it.
+        on the cash plus it. By default every held market last traded ten
+        days ago and the fills list reaches back thirty, so a held pair has
+        waited out the wait before an add-on.
 
         Args:
             monkeypatch (pytest.MonkeyPatch): pytest's per-test patcher.
@@ -4361,6 +4400,10 @@ class TestRunProdAddsToHeldPairs:
             MagicMock: The client.
         """
         kwargs.setdefault("held_rows", _HELD_TS_PAIR)
+        held = ([row["ticker"] for row in kwargs["held_rows"]]
+                + list(kwargs.get("extra_held", ()))
+                + ([_TICKER_HELD_A] if kwargs.get("include_held_position", True) else []))
+        kwargs.setdefault("fill_rows", _trim_fills(*held))
         payload = {**_LIVE_BALANCE_PAYLOAD, "portfolio_value": positions_value}
         if positions_value is None:
             del payload["portfolio_value"]
@@ -4422,6 +4465,133 @@ class TestRunProdAddsToHeldPairs:
         assert "Time-series pairs that add to a held pair: 1" in caplog.text
         assert "adds to 30 held" in caplog.text
         assert self._warned(caplog) == []
+
+    def test_a_pair_that_traded_three_days_ago_waits_and_stays_blocked(self, monkeypatch,
+                                                                       caplog):
+        """
+        Pins that a held pair whose markets last traded three days ago is not
+        added to: an add-on waits, as a trim does, until 7 calendar days have
+        passed since the last fill on its markets. Neither finder is handed
+        it, its two markets stay blocked from both, and the same-title pair
+        still trades. Rested ten days, the same pair is added to.
+        """
+        held = (_TICKER_HELD_A, _TICKER_TS_EARLY, _TICKER_TS_LATE)
+        client = self._client(monkeypatch, fill_rows=_trim_fills(*held, days_ago=3))
+        results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True)
+        assert self._traded(results) == {self._SAME_TITLE}
+        assert seen["ts"] == seen["st"] == [{}]
+        ts = {_TICKER_TS_EARLY, _TICKER_TS_LATE}
+        assert len(seen["blocked"]) == 2
+        for blocked, markets in seen["blocked"]:
+            assert ts <= blocked and not markets & ts
+        [line] = [r.getMessage() for r in caplog.records
+                  if r.getMessage().startswith("Not adding to YES TS-EARLY / NO TS-LATE: ")]
+        assert line.endswith("day(s) ago, and an add-on waits until 7 day(s) have passed "
+                             "since a pair's last trade")
+        assert "Held pairs that may be added to this run: 0 of 1" in caplog.text
+        assert "adds to" not in caplog.text
+        assert self._warned(caplog) == []
+        # Control: rested ten days, the pair is handed to both finders and added to
+        caplog.clear()
+        results, seen = self._dry_run(self._client(monkeypatch), monkeypatch, caplog,
+                                      add_on=True)
+        key = frozenset(ts)
+        assert [set(pairs) for pairs in seen["ts"]] == [{key}]
+        assert ("time_series", _TICKER_TS_EARLY, _TICKER_TS_LATE) in self._traded(results)
+        assert ("Add-on check: YES TS-EARLY / NO TS-LATE, 30 contracts each, last traded "
+                in caplog.text)
+
+    @staticmethod
+    def _candles(quotes: dict):
+        """
+        A stand-in for client.rest_client.request that serves hourly candles.
+
+        Args:
+            quotes (dict): Ticker -> (YES ask, YES bid) closing every hour of
+                the window asked for; a ticker not named has none.
+
+        Returns:
+            Callable: The request function (a dry run sends no order, so every
+                request is a GET for candles).
+        """
+        def request(verb, url, headers=None, body=None):
+            assert verb == "GET", "a dry run sends no order"
+            ticker = re.search(r"/markets/([^/?]+)/candlesticks", url).group(1)
+            query = parse_qs(urlparse(url).query)
+            start, end = int(query["start_ts"][0]), int(query["end_ts"][0])
+            closes = quotes.get(ticker)
+            candles = [] if closes is None else [
+                {"end_period_ts": ts, "yes_ask": {"close_dollars": closes[0]},
+                 "yes_bid": {"close_dollars": closes[1]}, "volume": 1}
+                for ts in range(start - start % 3600 + 3600, end + 1, 3600)]
+            return _raw_json_response({"candlesticks": candles})
+
+        return request
+
+    @pytest.mark.parametrize("minimum, adds", [(0.10, True), (0.15, False)])
+    def test_with_a_minimum_the_pair_is_added_to_only_once_its_price_has_moved(
+            self, monkeypatch, caplog, minimum, adds):
+        """
+        Pins that with a minimum price movement a rested held pair is added to
+        only once its total price has moved that far, up or down, since its
+        last fill. When it last traded the pair stood at $0.60 (YES ask 0.20 on
+        TS-EARLY, NO ask 0.40 on TS-LATE, from hourly candles) and it is at
+        $0.70 now (the market list's 0.30 and 0.40): the 10c move lets the
+        add-on through at a 10c minimum and holds it back at 15c, its markets
+        then blocked from both finders.
+        """
+        client = self._client(monkeypatch)
+        client.rest_client.request = MagicMock(side_effect=self._candles({
+            _TICKER_TS_EARLY: ("0.20", "0.18"), _TICKER_TS_LATE: ("0.62", "0.60")}))
+        results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True,
+                                      min_price_move=minimum)
+        ts = {_TICKER_TS_EARLY, _TICKER_TS_LATE}
+        prices = f"price $0.60 then, $0.70 now (+10c, minimum {minimum * 100:.0f}c)"
+        if adds:
+            assert [set(pairs) for pairs in seen["ts"]] == [{frozenset(ts)}]
+            assert ("time_series", _TICKER_TS_EARLY, _TICKER_TS_LATE) in self._traded(results)
+            [line] = [r.getMessage() for r in caplog.records
+                      if r.getMessage().startswith("Add-on check: ")]
+            assert line.endswith(f"{prices} -> may add")
+        else:
+            assert seen["ts"] == seen["st"] == [{}]
+            for blocked, markets in seen["blocked"]:
+                assert ts <= blocked and not markets & ts
+            assert self._traded(results) == {self._SAME_TITLE}
+            assert ("Not adding to YES TS-EARLY / NO TS-LATE: its total price has not moved "
+                    f"by the minimum since it last traded: {prices}") in caplog.text
+        assert f"Held pairs that may be added to this run: {int(adds)} of 1" in caplog.text
+        assert self._warned(caplog) == []
+
+    def test_with_a_minimum_unreadable_candles_mean_no_add_on(self, monkeypatch, caplog):
+        """
+        Pins that a minimum price movement whose price then cannot be read
+        (no hourly candles before the pair's last fill) means no add-on, never
+        "no minimum": the pair's markets stay blocked.
+        """
+        client = self._client(monkeypatch)
+        client.rest_client.request = MagicMock(side_effect=self._candles({}))
+        results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True,
+                                      min_price_move=0.10)
+        assert seen["ts"] == seen["st"] == [{}]
+        assert self._traded(results) == {self._SAME_TITLE}
+        assert ("Not adding to YES TS-EARLY / NO TS-LATE: the YES ask on TS-EARLY when it "
+                "last traded (") in caplog.text
+        assert "Held pairs that may be added to this run: 0 of 1" in caplog.text
+
+    def test_fills_that_cannot_be_read_mean_no_add_on(self, monkeypatch, caplog):
+        """
+        Pins that a run whose fills list cannot be read adds to no held pair,
+        with one WARNING: when the pair last traded is not known.
+        """
+        client = self._client(monkeypatch, fill_rows=None)
+        del client.get_fills_without_preload_content
+        results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True)
+        assert seen["ts"] == seen["st"] == [{}]
+        assert self._traded(results) == {self._SAME_TITLE}
+        assert self._warned(caplog) == [
+            "Not adding to held pairs this run: the account's fills could not be read, so "
+            "when each pair last traded is not known"]
 
     def test_with_it_off_a_held_pair_is_refused_as_before(self, monkeypatch, caplog):
         results, seen = self._dry_run(self._client(monkeypatch), monkeypatch, caplog,
@@ -4817,7 +4987,7 @@ class TestRunProdAddsToHeldPairsLive:
     @staticmethod
     def _run(monkeypatch, caplog, *, add_on: bool, held, killed=frozenset(),
              mapping_confirmed: bool = True, same_title: bool = True,
-             lone_no: str | None = None):
+             lone_no: str | None = None, fills_days_ago: float = 10):
         """
         Run one live production run against a stand-in exchange that keeps a ledger.
 
@@ -4845,6 +5015,9 @@ class TestRunProdAddsToHeldPairsLive:
             lone_no (str | None): Keyword-only. With held None, a ticker held
                 NO alone (30 contracts; its partner has paid out), valued by
                 the balance reply at $18.00.
+            fills_days_ago (float): Keyword-only. How many days ago each held
+                market last traded (the fills list reaches back thirty); at
+                7 or more a held pair has waited out the wait before an add-on.
 
         Returns:
             tuple[int, list, list, dict]: The exit code, the run's results,
@@ -4893,7 +5066,9 @@ class TestRunProdAddsToHeldPairsLive:
                                                  else 1_800 if lone_no is not None else 0)},
             include_held_position=False, extra_events=_LADDER_EVENTS,
             held_rows=held_rows, order_side_effect=orders,
-            position_lookup_responses={t: reader(t) for t in positions})
+            position_lookup_responses={t: reader(t) for t in positions},
+            fill_rows=_trim_fills(*(row["ticker"] for row in held_rows),
+                                  days_ago=fills_days_ago))
         books = {**_ORDERBOOK_PAYLOADS, **_LADDER_BOOKS}
         client.get_market_orderbook_without_preload_content = MagicMock(
             side_effect=lambda ticker: _raw_json_response(books.get(
@@ -4953,6 +5128,33 @@ class TestRunProdAddsToHeldPairsLive:
         _code, results, sent, _positions = self._run(
             monkeypatch, caplog, add_on=False, held=None, lone_no=l20, same_title=False)
         assert self._ladder_orders(sent) == []
+
+    def test_a_pair_that_traded_three_days_ago_sends_no_order_on_its_markets(
+            self, monkeypatch, caplog):
+        """
+        YES held on Dec 13 and NO on Dec 20, last traded three days ago: an
+        add-on waits 7 calendar days after the pair's last fill, so a live run
+        with rebalancing on sends no order on the ladder (the held markets stay
+        blocked, and Dec 27 shares their ladder), while the same-title pair
+        still trades. Rested ten days, the same run adds to the pair.
+        """
+        l13, l20, l27 = _LADDER_TICKERS
+        code, results, sent, positions = self._run(monkeypatch, caplog, add_on=True,
+                                                   held=(l13, l20), fills_days_ago=3)
+        assert code == EXIT_OK
+        assert self._ladder_orders(sent) == [] and self._ladder(results) == []
+        assert (positions[l13], positions[l20], positions[l27]) == (30, -30, 0)
+        [line] = [r.getMessage() for r in caplog.records
+                  if r.getMessage().startswith(f"Not adding to YES {l13} / NO {l20}: ")]
+        assert line.endswith("and an add-on waits until 7 day(s) have passed since a pair's "
+                             "last trade")
+        assert "Held pairs that may be added to this run: 0 of 1" in caplog.text
+        assert {b["ticker"] for b in sent} == {_TICKER_SAME_EXP, _TICKER_SAME_CHEAP}
+        # Control: rested ten days, the pair is added to
+        code, results, sent, _positions = self._run(monkeypatch, caplog, add_on=True,
+                                                    held=(l13, l20))
+        assert code == EXIT_OK
+        assert self._ladder_orders(sent) == [(l20, "ask", False), (l13, "bid", False)]
 
     def test_on_trades_only_yes_13_and_no_20(self, monkeypatch, caplog):
         """
@@ -5825,8 +6027,12 @@ class TestRunProdSellsInADryRun:
                                   "(level 80%), 35 days left, fees=$1.04] ")
 
     def test_a_pair_sold_is_not_added_to(self, monkeypatch, caplog):
-        exchange = _SellExchange(monkeypatch, held_rows=_SELL_ROWS + _HELD_TS_PAIR,
-                                 before=self._BEFORE, include_time_series=True)
+        # Every held market last traded ten days ago, so the held pair below its
+        # level has waited out the wait before an add-on
+        held = _SELL_ROWS + _HELD_TS_PAIR
+        exchange = _SellExchange(monkeypatch, held_rows=held, before=self._BEFORE,
+                                 include_time_series=True,
+                                 fill_rows=_trim_fills(*(row["ticker"] for row in held)))
         code, seen, _report = _run_selling(exchange, monkeypatch, caplog, dry_run=True,
                                            sell_at=0.80, rebalance=True)
         assert code == EXIT_OK
@@ -7559,6 +7765,9 @@ class TestLiveRebalanceTextsSayWhatARunDoes:
             "--min-price-move 10`",
             "the `Sizing on portfolio value $X = cash $Y + open positions $Z` line",
             "each `Held pair to add to: …` line's",
+            "each `Add-on check: … -> may add` line",
+            "each `Not adding to …: <reason>` line",
+            "then `Held pairs that may be added to this run: N of M`",
             "the `Resting orders on the account: N` line",
             "the `Fills read: …` line",
             "each `Kelly trim check` line",
@@ -7585,6 +7794,10 @@ class TestLiveRebalanceTextsSayWhatARunDoes:
         assert (readme.index("seller.plan_sales()")
                 < readme.index("seller.plan_trims() — with rebalance on")
                 < readme.index("trader.sell_positions()"))
+        # ... and the add-on step after the held pairs are found, before either finder
+        assert (readme.index("scanner.held_pairs() — with rebalance on")
+                < readme.index("seller.plan_add_ons() — with rebalance on")
+                < readme.index("scanner.find_time_series_pairs()"))
 
     def test_the_step_texts_are_what_the_code_says(self):
         # The "Live settings:" words the steps tell a reader to look for, and the
@@ -7601,6 +7814,11 @@ class TestLiveRebalanceTextsSayWhatARunDoes:
         assert f"the page shows {changed} of {len(rows)} settings change" in steps
         section = self._readme_section("### Turn on live rebalancing")
         assert f"the page shows {changed} of {len(rows)} settings change" in section
+        # The add-on lines step (3) names, as seller logs them
+        assert '"Add-on check: %s' in self._source_text(seller_mod._add_on_one)
+        assert '"Not adding to %s: %s"' in self._source_text(seller_mod._add_on_one)
+        assert ('"Held pairs that may be added to this run: %d of %d"'
+                in self._source_text(seller_mod._log_add_on_summary))
 
     def test_the_old_file_s_remedy_is_quoted_as_the_code_says_it(self):
         # main.py's usage error and the confirmation page's notice, as the docs
@@ -7711,14 +7929,16 @@ class TestLiveRebalanceTextsSayWhatARunDoes:
             assert not test or re.search(rf"^\s+def {test}\(", text, re.M), (
                 f"{module} has no test {test}")
 
-    def test_claude_md_names_plan_trims_among_the_live_settings_sites(self):
+    def test_claude_md_names_the_planners_among_the_live_settings_sites(self):
         # plan_trims reads the rebalance settings, k and both caps off the run's
-        # one LiveSettings, so the rule's list of where the toggles reach names it
+        # one LiveSettings, and plan_add_ons the rebalance settings, so the rule's
+        # list of where the toggles reach names both
         lines = (pathlib.Path(__file__).resolve().parent.parent / "CLAUDE.md").read_text(
             encoding="utf-8").splitlines()
         [rule] = [line for line in lines
                   if line.startswith("- **Do not read a live toggle anywhere but through")]
-        assert "plan_trims" in rule.split("Never read")[0]
+        sites = rule.split("Never read")[0]
+        assert "plan_trims" in sites and "plan_add_ons" in sites
 
     def test_seller_says_each_planner_reads_for_itself(self):
         # A run that sells and trims makes one _Reads per planner, and reads the

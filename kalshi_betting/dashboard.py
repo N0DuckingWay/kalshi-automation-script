@@ -6476,9 +6476,10 @@ def _rebalance_select_title(days) -> str:
     Returns:
         str: The rule in plain words: the wait (at a week or less, that it
             never holds anything back here) and, when there is one, how a
-            live trim counts it; the Min. price movement it can also wait
-            for; that Sell is shut while it is yes; what Save as live
-            defaults saves; and the sections that always show it as no.
+            live run counts it before an add-on or a trim; the Min. price
+            movement it can also wait for; that Sell is shut while it is yes;
+            what Save as live defaults saves; and the sections that always
+            show it as no.
     """
     try:
         # No wait, a one-day wait, and whether the week between runs covers it
@@ -6496,11 +6497,11 @@ def _rebalance_select_title(days) -> str:
         passed = "day has" if one else "days have"
         wait = (f"once at least {days} {passed} passed since its last trade (its purchase, "
                 "an add-on or a trim)")
-        # A live trim reads its trades from Kalshi's list of the account's
-        # fills; a live add-on does not wait, so the sentence names trims only
-        live = ("A live run waits this way before a trim only, counting calendar days on "
-                "the bot's own clock from the last fill of any sort on either market, a "
-                "trade by hand included. ")
+        # A live run reads a pair's trades from Kalshi's list of the account's
+        # fills, before an add-on and before a trim alike
+        live = ("A live run waits this way before an add-on or a trim, counting calendar "
+                "days on the bot's own clock from the last fill of any sort on the pair's "
+                "markets, a trade by hand included. ")
     weekly = (f" Weekly runs are {_DAYS_BETWEEN_WEEKLY_RUNS} days apart, so the wait never "
               "holds anything back here." if covered and not none else "")
     return ("no: a pair is bought once and held as it is. yes: at each weekly run a held "
@@ -6555,8 +6556,8 @@ _MOVE_TITLE = (
     "payout. any: no minimum. From a page that simulated rebalancing, Save as live "
     "defaults saves the minimum shown (any, or Rebalance no, saves none); from any other "
     "page it keeps the saved one. A live run reads the price at the pair's last fill on "
-    "Kalshi, so with a minimum set it does not trim a pair whose last fill is older than "
-    "Kalshi's list of the account's fills reaches.")
+    "Kalshi, so with a minimum set it neither trims nor adds to a pair whose last fill is "
+    "older than Kalshi's list of the account's fills reaches.")
 _MOVE_NOTES = {
     "not simulated": "(not simulated in this backtest)",
     "unavailable": "(not available on this page; see the log)",

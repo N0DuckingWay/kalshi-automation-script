@@ -42,9 +42,10 @@ Notes:
     add-on to a held pair, or a trim of one) must pass first: that the
     pair's price has moved far enough, up or down, since its last trade
     (pair_price_move, price_move_reached), and that enough days have passed
-    since that trade (rebalance_min_days, rebalance_rested). The backtest
-    and seller.plan_trims (live trims) both call them; trade_day and
-    kelly_trim_bids are for live trims only. A live run's switch and minimum
+    since that trade (rebalance_min_days, rebalance_rested). The backtest,
+    seller.plan_trims (live trims) and seller.plan_add_ons (live add-ons)
+    call them; trade_day is for live rebalancing only, and kelly_trim_bids
+    for live trims only. A live run's switch and minimum
     are LiveSettings.rebalance and min_price_move: with rebalance on, a
     production run both trims held pairs and may add to them.
     A saved file written by an older version, which held add_to_held_pairs,
@@ -544,8 +545,8 @@ MIN_PRICE_MOVES = tuple(
 
 # Calendar days that must pass after the last trade of any sort on a held
 # pair (on either of its markets) before it may be rebalanced: before a Kelly
-# trim may sell part of it, and, in the backtest, before an add-on may buy
-# more of it. Days are counted on the bot's own clock (trade_day) and
+# trim may sell part of it, and before an add-on may buy more of it, live and
+# in the backtest alike. Days are counted on the bot's own clock (trade_day) and
 # rebalance_rested reads no schedule, so a pair traded on a Tuesday may be
 # rebalanced from the next Tuesday on, however often the bot runs. A whole
 # number from 0 (no wait) to the maximum below. Each module that applies the
@@ -559,10 +560,11 @@ REBALANCE_MIN_DAYS_SINCE_TRADE = 7
 REBALANCE_MIN_DAYS_SINCE_TRADE_MAX = 30
 
 # With a minimum price move set, the oldest (in days) a quote may be for
-# seller.plan_trims to read a held market's price at its pair's last trade
-# (historical.ask_before: the latest usable ask of the side held on an
-# hourly candle that ended at or before then). With no usable quote in that
-# window the price is unknown and the pair is not trimmed.
+# seller.plan_trims and seller.plan_add_ons to read a held market's price at
+# its pair's last trade (historical.ask_before: the latest usable ask of the
+# side held on an hourly candle that ended at or before then). With no usable
+# quote in that window the price is unknown and the pair is neither trimmed
+# nor added to.
 PRICE_THEN_MAX_AGE_DAYS = 7
 
 # How far below a held side's best bid, in dollars, a live Kelly trim may
@@ -648,14 +650,18 @@ TAG_SCOPE_SEPARATOR = " · "
 # fees paid for it) and the add-on together stake at most min(f*, the pair's
 # cap) of the portfolio value (cash plus open positions), and the new stake
 # is never more than a new pair would stake (held_pair_fraction) nor more
-# than the cash. Off: a held pair is neither added to (DR-76) nor trimmed.
+# than the cash. A trim and an add-on each wait REBALANCE_MIN_DAYS_SINCE_TRADE
+# days after the pair's last fill and, with MIN_PRICE_MOVE, for its price to
+# move that far (seller.plan_trims, seller.plan_add_ons).
+# Off: a held pair is neither added to (DR-76) nor trimmed.
 # A live run reads the saved live defaults' rebalance instead (a saved file
 # that leaves the key out reads it as off), which main.py --rebalance /
 # --no-rebalance overrides for one run. The backtest never reads this constant.
 REBALANCE = True
 
 # The least move, in dollars, up or down, in a held pair's total price since
-# its last trade before a live Kelly trim may sell part of it: on the 5c grid
+# its last trade before a live run rebalances it (a Kelly trim sells part of
+# it, or an add-on buys more of it): on the 5c grid
 # from 5c to $1, or None for no minimum. Only with REBALANCE on. A live run
 # reads the saved live defaults' min_price_move instead (main.py
 # --min-price-move CENTS / --no-min-price-move for one run).
@@ -2972,9 +2978,10 @@ class LiveSettings:
             Default False, which is also what a saved file that leaves it out
             reads as.
         min_price_move (float | None): The least move, up or down, in a held
-            pair's total price since its last trade before a Kelly trim, in
-            dollars on the 5c grid from 5c to $1 (0.1 for 10c); None
-            (default) is no minimum. Refused with rebalance off.
+            pair's total price (a lone leg's: its one market's price) since
+            its last trade before it is rebalanced (a Kelly trim, or an
+            add-on), in dollars on the 5c grid from 5c to $1 (0.1 for 10c);
+            None (default) is no minimum. Refused with rebalance off.
         sell_at (float | None): The share of its potential profit at which a
             held position is sold, in (0, 1] on the 1% grid (0.85 for 85%); None
             (default) never sells.
@@ -4029,7 +4036,7 @@ def days_to_maturity(close_dates, day: date) -> int | None:
 #   bid (the backtest's modeled ladder already ends there);
 # - pair_price_move and price_move_reached ask whether the pair's price has
 #   moved far enough, up or down, since its last trade for a rebalance (a
-#   trim, or in the backtest an add-on) to be considered;
+#   trim or an add-on) to be considered;
 # - rebalance_rested asks whether enough calendar days have passed since
 #   that trade (rebalance_min_days checks the number of days; trade_day,
 #   live only, turns a time into a day on the bot's clock). It compares two
@@ -4326,7 +4333,7 @@ def rebalance_min_days(days) -> int:
     """
     Check the days a held pair must go without a trade before a rebalance, and return them.
 
-    The wait applies to Kelly trims and, in the backtest, to add-ons. Each
+    The wait applies to Kelly trims and to add-ons alike. Each
     module that applies it checks its own copy of
     REBALANCE_MIN_DAYS_SINCE_TRADE here, so a mistyped constant stops the
     run instead of shortening the wait; rebalance_rested checks it too.
@@ -4390,7 +4397,7 @@ def rebalance_rested(last_trade: date, day: date, min_days: int) -> bool:
     """
     Return whether a held pair has gone enough days without a trade for a rebalance.
 
-    A rebalance is a Kelly trim or, in the backtest, an add-on. With 7, a pair
+    A rebalance is a Kelly trim or an add-on. With 7, a pair
     last traded on a Tuesday may be rebalanced from the next Tuesday on. It
     reads only the two dates, so it holds however often runs happen. A last
     trade dated after `day` never counts as rested. Both dates must be on

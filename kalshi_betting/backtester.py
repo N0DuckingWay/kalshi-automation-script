@@ -9295,23 +9295,24 @@ def _live_rebalance_note(sweep: BacktestSweep) -> str:
     dashboard's Rebalance view does, simulated when the page is built. So
     when the saved live defaults rebalance, the live-rule line ends with
     this clause, saying the primary differs from live there. A live run
-    applies the saved minimum price movement to its Kelly trims only (a live
-    add-on waits for no minimum), so the clause says the minimum holds back
-    a trim. _live_rule_line and dashboard._live_rule_html add it to the line.
+    holds back its add-ons and its Kelly trims alike until the saved minimum
+    price movement is reached, so the clause names the minimum for both.
+    _live_rule_line and dashboard._live_rule_html add it to the line.
 
     Args:
         sweep (BacktestSweep): The run's sweep.
 
     Returns:
-        str: "; the live defaults rebalance held pairs (a trim only after a
-            10c price move), which this run's primary does not" (the
+        str: "; the live defaults rebalance held pairs (only after a 10c
+            price move), which this run's primary does not" (the
             parenthesis only with a minimum price movement), or "" when
             live_rebalance is not True (off, or not recorded).
     """
     if sweep.live_rebalance is not True:
         return ""
     move = sweep.live_min_price_move
-    after = "" if move is None else f" (a trim{_move_label(move)})"
+    # _move_label reads " only after a 10c price move"
+    after = "" if move is None else f" ({_move_label(move).strip()})"
     return (f"; the live defaults rebalance held pairs{after}, which this run's primary "
             "does not")
 

@@ -59,8 +59,8 @@ Dependencies:
     Also exports the candle bid rule a sale reads: usable_candle_ask and candle_sale_bids
     (read by backtester.py, and by bid_before) and bid_before (seller.py only), plus
     recent_candles, seller.py's never-cached candle fetch. For seller.plan_trims:
-    ask_before (a side's price at a past moment) and candle_reads_bid (whether a
-    candle could show a given best bid).
+    ask_before (a side's price at a past moment, which seller.plan_add_ons reads
+    too) and candle_reads_bid (whether a candle could show a given best bid).
 
 Notes:
     Historical market data only exists on the production API — the sandbox does
@@ -6318,8 +6318,9 @@ def recent_candles(client: Any, ticker: str, event_ticker: str, start_ts: int,
     """
     Fetch one market's hourly candles over [start_ts, end_ts] for a live run, never cached.
 
-    Read by seller.plan_sales (through bid_before, for the days before a sale) and
-    seller.plan_trims (through ask_before, for a held market's price when its pair last traded).
+    Read by seller.plan_sales (through bid_before, for the days before a sale), and by
+    seller.plan_trims and seller.plan_add_ons (through ask_before, for a held market's
+    price when its pair last traded).
     Fetched and parsed as fetch_candlesticks does (read-only GETs), but never cached:
     a live sale gets the latest candles and touches nothing in backtest_cache/.
 

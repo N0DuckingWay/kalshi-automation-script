@@ -26,16 +26,24 @@ Purpose:
     A trim sells only into bids within config.KELLY_TRIM_MAX_BID_DROP of the
     best bid, never into a gap in a book.
 
+    And it decides which held pairs a run may add to (plan_add_ons): an
+    add-on is the other half of a rebalance, so it waits as a trim does,
+    the same number of calendar days after the last fill on the pair's
+    markets and, with a minimum price move, until the pair's price has moved
+    that far since, up or down. It sends nothing and sizes nothing: the
+    finders and the sizer do the rest.
+
 Dependencies:
     Imports the standard library, config, scanner and historical only, never
     trader, strategy, the backtester or main (pinned by tests/test_seller.py).
     main.py alone imports it: a production run calls plan_sales before it
-    buys anything and, with rebalance on, plan_trims right after it.
+    buys anything and, with rebalance on, plan_trims right after it and
+    plan_add_ons once it has found the held pairs it may add to.
 
 Notes:
     Every request is a read-only GET. Each planner call reads for itself,
     each thing at most once. Fails closed: anything unknown or unreadable
-    means no sale and no trim, with a log line.
+    means no sale, no trim and no add-on, with a log line.
 """
 import logging
 import math
@@ -92,6 +100,7 @@ from .scanner import (
     held_pairs,
     held_positions_bid_value,
     leg_sides,
+    listed_ask,
     market_for_labels,
     market_ladder_keys,
     walk_bids,
@@ -198,7 +207,7 @@ def _hold_days() -> int:
 
 def _rebalance_min_days() -> int:
     """
-    Check how many days a held pair must go without a trade before a rebalance (here, a Kelly trim).
+    Check how many days a held pair must go without a trade before a rebalance: a Kelly trim or an add-on.
 
     Reads seller.REBALANCE_MIN_DAYS_SINCE_TRADE when called: a test patches it
     here, never config's.
@@ -217,9 +226,9 @@ def _day(moment: datetime) -> date:
     """
     The calendar day a moment falls on, on the bot's own clock (its schedule's time zone).
 
-    The Kelly trim's wait is counted between days read here: today's and a
-    fill's. Reads seller.SCHEDULED_RUN when called: a test patches it here,
-    never config's.
+    A rebalance's wait (a Kelly trim's, and an add-on's) is counted between
+    days read here: today's and a fill's. Reads seller.SCHEDULED_RUN when
+    called: a test patches it here, never config's.
 
     Args:
         moment (datetime): A time that carries its zone.
@@ -347,11 +356,12 @@ class _Reads:
 
     Attributes:
         client (Any): The authenticated Kalshi client.
-        held_positions (dict): Ticker -> HeldPosition for every held market.
+        held_positions (dict): Ticker -> HeldPosition for every held market (empty
+            for plan_add_ons, which reads no position).
         markets_by_ticker (dict): This run's whole market list by ticker.
         now_ts (float): The run's moment, in Unix seconds.
-        hold_days (int): How many daily checks there are (0 for a Kelly trim, which
-            makes none).
+        hold_days (int): How many daily checks there are (0 for a Kelly trim or an
+            add-on, which make none).
         lookups (int): Label lookups from the exchange so far (SALE_PARTNER_MAX_LOOKUPS at most).
     """
 
@@ -395,8 +405,9 @@ class _Reads:
         """
         One side's ask (its buy price) on a market at a past moment, from hourly candles.
 
-        The Kelly trim's minimum price move compares a pair's price now with its
-        price at its last fill; this reads one market's part of the price then.
+        A rebalance's minimum price move (a Kelly trim's, and an add-on's)
+        compares a pair's price now with its price at its last fill; this
+        reads one market's part of the price then.
         The candles cover the config.PRICE_THEN_MAX_AGE_DAYS days before the
         moment and are fetched once.
 
@@ -1267,3 +1278,241 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
         return []
     _log_trim_summary(len(plans), len(pairs))
     return plans
+
+
+# ─── Adding to a held pair: the wait and the price move ───────────────────────
+
+def _log_add_on_summary(kept: int, considered: int) -> None:
+    """
+    Log how many held pairs (and lone legs) a run may add to.
+
+    Args:
+        kept (int): Those that passed the wait and, with a minimum, the price move.
+        considered (int): Those handed in.
+    """
+    logging.info("Held pairs that may be added to this run: %d of %d", kept, considered)
+
+
+def _add_on_one(pair: HeldPair, reads: _Reads, fills: FillTimes, *,
+                min_move: float | None, min_days: int, now_date: date) -> bool:
+    """
+    Judge one held pair (or lone leg) for an add-on, and log the verdict.
+
+    It stops at the first step that fails, with one "Not adding to" line:
+
+      1. The wait: enough calendar days since the last fill on its markets
+         (both of an exact pair's; for a lone leg, its own market and any
+         market of its ladder in this run's list, since the finders pair a
+         lone leg only with one of those, so a partner sold by hand restarts
+         the wait). With no fill listed, it last traded no later than the
+         fills list's oldest fill.
+      2. With a minimum price move set: a fill is listed, so its price when it
+         last traded can be read.
+      3. Its price now: the ask of the side held on each market, from this
+         run's market list (scanner.listed_ask, no request). Read before the
+         price then, so a market the list lacks costs no candle read.
+      4. Its price then: each held side's ask at its last fill, from hourly
+         candles (_Reads.ask_then, as the Kelly trim reads it).
+      5. The move: the price now less the price then, up or down, at least
+         the minimum (config.pair_price_move, price_move_reached, the rule
+         the backtest's add-ons and every trim share).
+
+    An exact pair's price is the two held sides' asks, added; a lone leg's
+    is its one market's ask.
+
+    Args:
+        pair (HeldPair): An exact held pair or a lone leg, from scanner.held_pairs.
+        reads (_Reads): This planner call's reads (only the candles and this
+            run's market list are used).
+        fills (FillTimes): When each market last traded (plan_add_ons reads it
+            once, and calls this only when it was read).
+        min_move (float | None): The minimum price move in dollars; None for none.
+        min_days (int): Days a pair must go without a trade (_rebalance_min_days).
+        now_date (date): Today on the bot's own clock (_day).
+
+    Returns:
+        bool: True when the run may add to it.
+    """
+    text = _sides_text(pair.sides)
+
+    def not_adding(reason: str) -> None:
+        """Log why this pair is not added to."""
+        logging.info("Not adding to %s: %s", text, reason)
+
+    # config.count_text: a contract count written exactly
+    count = f"{count_text(pair.count)} contracts" + ("" if pair.lone else " each")
+    where = "its market" if pair.lone else "either market"
+    # The last trade: the latest fill on its markets (None when none is listed).
+    # The wait and the price move both count from it
+    listed = [fills.latest[ticker] for ticker, _side in pair.sides if ticker in fills.latest]
+    if pair.lone:
+        # A lone leg is added to beside a market the account does not hold, and the
+        # finders pair it only with a market on its own ladder. A partner sold by hand
+        # leaves the positions listing just as a paid-out one does, so a fill on any
+        # market of that ladder in this run's list counts too: buying such a market
+        # back waits like any other rebalance
+        held = {ticker for ticker, _side in pair.sides}
+        # Cross-module: scanner's one reading of a market's ladder labels
+        listed += [when for ticker, when in fills.latest.items()
+                   if ticker not in held and ticker in reads.markets_by_ticker
+                   and market_ladder_keys(reads.markets_by_ticker[ticker]) & pair.labels]
+    last_fill = max(listed) if listed else None
+    if min_days == 0:
+        waited = "no wait"
+    else:
+        # No fill listed: its last trade is no later than the list's oldest fill
+        since = last_fill if listed else fills.oldest
+        if since is None:
+            not_adding("when it last traded is not known")
+            return False
+        last = _day(since)
+        days = (now_date - last).days
+        # Cross-module: config's one test of the wait, the trim's too
+        if not rebalance_rested(last, now_date, min_days):
+            ago = (f"{days} day(s) ago" if days >= 0
+                   else f"after today ({now_date}) on the bot's own clock")
+            not_adding(f"it last traded {last}, {ago}, and an add-on waits until {min_days} "
+                       "day(s) have passed since a pair's last trade")
+            return False
+        waited = (f"last traded {last}, {days} day(s) ago" if listed
+                  else f"no fill listed (the fills list starts {last})")
+
+    prices = ""
+    if min_move is not None:
+        if last_fill is None:
+            not_adding(f"no fill is listed on {where}, so its price when it last traded "
+                       "cannot be read, and a minimum price movement is set")
+            return False
+        # Its price now: the ask of each side held, as this run's market list shows it
+        now_total = 0.0
+        for ticker, side in pair.sides:
+            # Cross-module: the one reading of a held market's ask now
+            ask = listed_ask(reads.markets_by_ticker.get(ticker), side)
+            if ask is None:
+                not_adding(f"the {side.upper()} ask on {ticker} is not in this run's market "
+                           "list or not a price strictly between 0 and 1, and a minimum "
+                           "price movement is set")
+                return False
+            now_total += ask
+        # Its price then: each side's ask at the last fill, from hourly candles
+        moment = math.floor(last_fill.timestamp())
+        then_total = 0.0
+        for ticker, side in pair.sides:
+            then = reads.ask_then(reads.markets_by_ticker[ticker], side, moment)
+            # NaN (never equal to itself): no usable quote, or unreadable candles
+            if then != then:
+                not_adding(f"the {side.upper()} ask on {ticker} when it last traded "
+                           f"({_day(last_fill)}) cannot be read (no usable quote in the "
+                           f"{PRICE_THEN_MAX_AGE_DAYS} days before it, or its price history "
+                           "could not be read), and a minimum price movement is set")
+                return False
+            then_total += then
+        # Cross-module: the move and its test, both shared with the backtest and the
+        # trim (a rise and a fall of the minimum count alike)
+        move = pair_price_move(then_total, now_total)
+        prices = (f"price {_price_text(then_total)} then, {_price_text(now_total)} now "
+                  f"({_cents_text(move)}, minimum {min_move * 100:.0f}c)")
+        if not price_move_reached(move, min_move):
+            total = "price" if pair.lone else "total price"
+            not_adding(f"its {total} has not moved by the minimum since it last traded: "
+                       f"{prices}")
+            return False
+        prices = ", " + prices
+    logging.info("Add-on check: %s, %s, %s%s -> may add", text, count, waited, prices)
+    return True
+
+
+def plan_add_ons(client: Any, add_on_pairs: dict, markets_by_ticker: dict, *,
+                 settings: LiveSettings, now: datetime) -> dict:
+    """
+    Keep the held pairs and lone legs this run may add to: rested and, with a minimum, moved.
+
+    An add-on is a rebalance, so it follows the Kelly trim's two rules
+    (plan_trims): at least REBALANCE_MIN_DAYS_SINCE_TRADE calendar days since
+    the last fill on any of its markets, by the bot or by hand
+    (config.rebalance_rested, on the bot's own clock; for a lone leg, also on
+    any market of its ladder in this run's list, the one kind of market the
+    finders pair it with, so a partner sold by hand is not bought back the
+    next day), and, with
+    settings.min_price_move, a move of at least that many dollars, up or
+    down, since that fill (config.pair_price_move, price_move_reached). An
+    exact pair's price is the asks of the sides held on its two markets,
+    added; a lone leg's is its one market's. The price then comes from
+    hourly candles at the last fill (_Reads.ask_then, as the trim reads it);
+    the price now from this run's market list (scanner.listed_ask). Each pair
+    is judged by _add_on_one.
+
+    Fails closed: a pair whose wait, price then or price now cannot be read
+    is left out, and when the account's fills cannot be read, or (with a
+    wait) the list does not reach back that many days, none is kept, with
+    one WARNING. The account's fills are read once, and only when there is
+    something to add to and a wait or a minimum is set.
+
+    Args:
+        client (Any): The authenticated production Kalshi client, only read from.
+        add_on_pairs (dict): frozenset of tickers -> HeldPair, what scanner.held_pairs
+            found the run may add to (less any pair at its cap or picked for a sale).
+        markets_by_ticker (dict): This run's whole market list by ticker, held markets included.
+        settings (LiveSettings): rebalance (off: keep nothing, read nothing) and
+            min_price_move.
+        now (datetime): The run's moment, timezone-aware.
+
+    Returns:
+        dict: The entries of add_on_pairs the run may add to, the same HeldPair
+            objects under the same keys; empty when none.
+
+    Raises:
+        ValueError: Before any request, when REBALANCE_MIN_DAYS_SINCE_TRADE is
+            invalid or now is not timezone-aware.
+    """
+    if not settings.rebalance:
+        return {}
+    # Checked first, so a bad number stops the run before any request
+    min_days = _rebalance_min_days()
+    if not isinstance(now, datetime) or now.utcoffset() is None:
+        raise ValueError(f"now must be a timezone-aware datetime, got {now!r}")
+    if not add_on_pairs:
+        return {}
+    min_move = settings.min_price_move
+    if min_days == 0 and min_move is None:
+        # Nothing to wait for, so nothing is read
+        _log_add_on_summary(len(add_on_pairs), len(add_on_pairs))
+        return dict(add_on_pairs)
+
+    # Today on the bot's own clock, as every fill's day is read
+    now_date = _day(now)
+    # Cross-module: one read of the account's fills serves the wait and the price move
+    fills = get_fill_times(client)
+    if fills is None:
+        logging.warning(
+            "Not adding to held pairs this run: the account's fills could not be read, so "
+            "when each pair last traded is not known")
+        _log_add_on_summary(0, len(add_on_pairs))
+        return {}
+    if min_days > 0:
+        # The list must reach back past the wait: a pair with no fill listed is dated
+        # by the list's oldest fill
+        problem = None
+        if fills.oldest is None:
+            problem = "the account's fills list is empty"
+        # Cross-module: config's one test of the wait, asked of the list's oldest day
+        elif not rebalance_rested(_day(fills.oldest), now_date, min_days):
+            problem = (f"the account's fills list starts {_day(fills.oldest)} on the bot's "
+                       f"own clock, fewer than {min_days} day(s) ago")
+        if problem is not None:
+            logging.warning(
+                "Not adding to held pairs this run: %s, so a trade in the last %d day(s) "
+                "cannot be ruled out", problem, min_days)
+            _log_add_on_summary(0, len(add_on_pairs))
+            return {}
+
+    # 0 daily checks: an add-on reads only each market's price at its pair's last fill;
+    # no position is read
+    reads = _Reads(client, {}, markets_by_ticker, now.timestamp(), 0)
+    kept: dict = {}
+    for key in sorted(add_on_pairs, key=sorted):
+        if _add_on_one(add_on_pairs[key], reads, fills, min_move=min_move,
+                       min_days=min_days, now_date=now_date):
+            kept[key] = add_on_pairs[key]
+    _log_add_on_summary(len(kept), len(add_on_pairs))
+    return kept
