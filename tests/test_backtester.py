@@ -10745,6 +10745,9 @@ def _same_title_record(rows, group_key=("", "Will it rain by March 1, 2026?", ""
 
 _RAIN = "Will it rain by March 1, 2026?"
 _ADD_ON_LINE = "Trades that added to a held pair ("
+# The add-on gate's two hold-back lines: the wait after a trade, and the minimum price move
+_ADD_ON_WAIT_LINE = "Adds skipped because the held pair traded fewer than"
+_ADD_ON_MOVE_LINE = "Adds skipped because the held pair's price had not moved"
 _ADD_ON_CAP_LINE = "Adds skipped because the held pair is already at its target size ("
 _ADD_ON_LADDER_LINE = ("Adds skipped because another open trade is on the same ladder, or the "
                        "two markets share no ladder (")
@@ -14376,8 +14379,8 @@ class TestSizeCap:
             "size_cap": 0.35, "quiet": True, "tier_floors": False}
 
     def test_sim_options_forwards_add_to_held_only_when_true(self):
-        # The add-on family's one forwarded keyword: every other call (the
-        # default, and an explicit False) carries none, so a fixed-signature
+        # The add_to_held switch is forwarded only when True: every other call
+        # (the default, and an explicit False) carries none, so a fixed-signature
         # stand-in for _simulate_at_discount never meets it
         day = date(2026, 9, 26)
         assert backtester._sim_options(None, False) == {}
@@ -15211,405 +15214,6 @@ class TestCapSweepLogging:
         assert not [r for r in caplog.records if r.levelno >= logging.INFO]
 
 
-@pytest.fixture(scope="class")
-def add_on_run():
-    """The golden band sweep with the add-on family beside the size-cap sweeps,
-    over cap_sweep_run's NARROWED grid — floors (0, 0.35) x ceilings (0.5, 1.0)
-    x k (0.5, 1.0) plus the primary 0.75, so the two floor-0 bands bind at the
-    tiers: 4 bands x 3 k for the tier-on add-on sweep and 2 x 3 for the
-    tier-floors-off one. Beside it: the same run with the flag off and with
-    it left out, a run without the size-cap sweep, one without the tier-floors-off
-    family and one without the band sweep. Every simulation DURING the runs
-    goes through a spy that records its keywords, and every run's INFO log is
-    kept; the spy is undone before any cell is read, so the cells run the real
-    function. The clock is frozen while the runs go, so every equity frame the
-    tests compare across runs ends on one day. Pins apply_pre_toggle_defaults
-    on its own MonkeyPatch, as cap_sweep_run does."""
-    toggles = pytest.MonkeyPatch()
-    mp = pytest.MonkeyPatch()
-    try:
-        apply_pre_toggle_defaults(toggles)
-        golden = TestPrepareEntriesGolden()
-        golden._patch(mp)
-        mp.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.35))
-        mp.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.5, 1.0))
-        mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5, 1.0))
-        mp.setattr(backtester, "datetime", type(
-            "Clock", (TestCapSweepEndDate._Clock,),
-            {"moment": datetime(2026, 9, 26, 12, 0, tzinfo=UTC)}))
-        sims: list = []
-        real = backtester._simulate_at_discount
-
-        def simulate_spy(raw_entries, start_date, initial_balance, k=None,
-                         spread_band=None, population="all", **kw):
-            sims.append((spread_band, k, population, len(raw_entries), tuple(sorted(kw))))
-            return real(raw_entries, start_date, initial_balance, k=k,
-                        spread_band=spread_band, population=population, **kw)
-
-        mp.setattr(backtester, "_simulate_at_discount", simulate_spy)
-
-        def run(**kw):
-            sims.clear()
-            handler = _LogCapture()
-            root = logging.getLogger()
-            old_level = root.level
-            root.setLevel(logging.INFO)
-            root.addHandler(handler)
-            try:
-                res = run_backtest_sweep(
-                    hist_client=MagicMock(), live_client=MagicMock(),
-                    start_date=golden._START, initial_balance=10_000.0,
-                    same_event_ladders=True, **kw)
-            finally:
-                root.removeHandler(handler)
-                root.setLevel(old_level)
-            return res, list(sims), list(handler.messages)
-
-        every = {"band_sweep": True, "tier_off_sweep": True, "cap_sweep": True}
-        on, sims_on, msgs_on = run(add_on_sweep=True, **every)
-        off, sims_off, msgs_off = run(add_on_sweep=False, **every)
-        default, sims_default, _ = run(**every)
-        no_cap, _, msgs_no_cap = run(band_sweep=True, tier_off_sweep=True, add_on_sweep=True)
-        no_off, _, msgs_no_off = run(band_sweep=True, cap_sweep=True, add_on_sweep=True)
-        single, _, msgs_single = run(band_sweep=False, add_on_sweep=True)
-        mp.undo()
-        # How many cells the two sweeps had simulated once the run was over,
-        # before any test reads one (a read simulates each cap, with no memo)
-        built = (on.add_on_cap_sweep.simulated, on.add_on_tier_off_cap_sweep.simulated)
-        yield SimpleNamespace(
-            on=on, off=off, default=default, no_cap=no_cap, no_off=no_off, single=single,
-            built=built, sims_on=sims_on, sims_off=sims_off, sims_default=sims_default,
-            msgs_on=msgs_on, msgs_off=msgs_off, msgs_no_cap=msgs_no_cap,
-            msgs_no_off=msgs_no_off, msgs_single=msgs_single, start=golden._START)
-    finally:
-        mp.undo()
-        toggles.undo()
-
-
-@pytest.mark.usefixtures("add_on_run")
-class TestAddOnSweep:
-    """run_backtest_sweep(add_on_sweep=True): the dashboard's "Add to held
-    pairs" family — two lazy CapSweeps (tier floors on, and off at the bands
-    they bind at) whose every simulation adds to held pairs, the "all"
-    population only. The run itself simulates nothing extra: its points, its
-    simulations and its INFO log are those of a run without the flag, but for
-    the setting line and the two summary lines. Each cell ends its curves on
-    the day its eager twin's ended."""
-
-    _ADDING = "Adding to held pairs"
-
-    @staticmethod
-    def _eager(points) -> dict:
-        """(band, k, population) -> point of a run's eager scenarios."""
-        return {(p.spread_band, p.k, p.population): p for p in points}
-
-    @staticmethod
-    def _trades(point) -> list:
-        """A point's trades as plain tuples, for comparing two runs."""
-        return [astuple(t) for t in point.trades]
-
-    @classmethod
-    def _others(cls, messages) -> list:
-        """A run's INFO lines but for the add-on ones and the two that report
-        the process's peak memory, which differ from one run to the next."""
-        return [m for m in messages
-                if not m.startswith((cls._ADDING, "Peak RSS"))]
-
-    def test_off_is_the_default_and_builds_nothing(self, add_on_run):
-        assert inspect.signature(run_backtest_sweep).parameters[
-            "add_on_sweep"].default is False
-        for res in (add_on_run.off, add_on_run.default):
-            assert res.add_on_cap_sweep is None
-            assert res.add_on_tier_off_cap_sweep is None
-
-    def test_on_adds_no_simulation_and_no_run_figure(self, add_on_run):
-        # The same simulations, in the same order and with the same keywords
-        assert add_on_run.sims_on == add_on_run.sims_off == add_on_run.sims_default
-        on, off = add_on_run.on, add_on_run.off
-        assert self._trades(on.primary) == self._trades(off.primary)
-        pd.testing.assert_frame_equal(on.primary.equity_df, off.primary.equity_df)
-        for mine, theirs in ((on.points, off.points), (on.scenarios, off.scenarios),
-                             (on.tier_off_scenarios, off.tier_off_scenarios)):
-            assert len(mine) == len(theirs) > 0
-            for a, b in zip(mine, theirs, strict=True):
-                assert (a.k, a.spread_band, a.population) == (b.k, b.spread_band, b.population)
-                assert self._trades(a) == self._trades(b)
-                assert a.add_to_held is False
-        # Nothing was simulated by building the two sweeps
-        assert add_on_run.built == (0, 0)
-
-    def test_on_adds_no_info_line_but_its_own(self, add_on_run):
-        # Every line but the setting line and the two summary lines is the
-        # flag-off run's, in the same order — no completion line among them
-        adding = [m for m in add_on_run.msgs_on if m.startswith(self._ADDING)]
-        assert len(adding) == 3
-        assert self._others(add_on_run.msgs_on) == self._others(add_on_run.msgs_off)
-        assert len(self._others(add_on_run.msgs_on)) > 20
-        assert [m for m in add_on_run.msgs_off if m.startswith(self._ADDING)] == [
-            f"{self._ADDING} (backtest): off — the dashboard's Add to held pairs select "
-            "stays disabled"]
-
-    def test_the_sweeps_axes_are_the_grids(self, add_on_run):
-        on = add_on_run.on
-        cs, off_cs = on.add_on_cap_sweep, on.add_on_tier_off_cap_sweep
-        # The tier-on family: the size-cap sweep's caps, bands and k grid
-        assert cs.caps == on.cap_sweep.caps and len(cs.caps) == 20
-        assert cs.bands == on.cap_sweep.bands
-        assert len(cs.bands) == 4 and cs.ks == on.cap_sweep.ks == (0.5, 0.75, 1.0)
-        assert cs.primary_cap == on.primary.size_cap and cs.primary_k == on.primary.k
-        assert (cs.tier_floors, cs.add_to_held, cs.checks) == (True, True, False)
-        assert cs.split_date is None and cs.st_entries == []
-        assert cs.eager == {} and cs.same_title_eager is None
-        # ... over the very entries the size-cap sweep keeps (one retention)
-        assert cs.entries_by_band is on.cap_sweep.entries_by_band
-        # The tier-floors-off family: the binding bands, likewise
-        binding = tuple(b for b in cs.bands if backtester._tier_floors_bind(b))
-        assert len(binding) == 2
-        assert off_cs.bands == on.tier_off_cap_sweep.bands == binding
-        assert off_cs.caps == cs.caps and off_cs.ks == cs.ks
-        assert (off_cs.tier_floors, off_cs.add_to_held, off_cs.checks) == (False, True, False)
-        assert off_cs.eager == {} and off_cs.same_title_eager is None
-        assert off_cs.entries_by_band is on.tier_off_cap_sweep.entries_by_band
-
-    def test_without_the_size_cap_sweep_the_run_s_own_cap_is_the_axis(self, add_on_run):
-        res = add_on_run.no_cap
-        assert res.cap_sweep is None
-        assert res.add_on_cap_sweep.caps == (res.primary.size_cap,)
-        assert res.add_on_tier_off_cap_sweep.caps == (res.primary.size_cap,)
-        assert res.add_on_cap_sweep.bands == tuple(sorted(
-            {(0.0, 0.5), (0.0, 1.0), (0.35, 0.5), (0.35, 1.0)}))
-
-    def test_without_the_tier_floors_off_family_there_is_only_the_tier_on_sweep(
-        self, add_on_run,
-    ):
-        assert add_on_run.no_off.add_on_cap_sweep is not None
-        assert add_on_run.no_off.add_on_tier_off_cap_sweep is None
-        assert not [m for m in add_on_run.msgs_no_off if m.startswith(
-            f"{self._ADDING}, tier floors off")]
-
-    def test_a_single_band_run_has_one_band_and_no_tier_off_sweep(self, add_on_run):
-        res = add_on_run.single
-        cs = res.add_on_cap_sweep
-        assert cs.bands == (BACKTEST_DEFAULT_SPREAD_BAND,) and cs.checks is False
-        assert res.add_on_tier_off_cap_sweep is None
-        assert cs.ks == tuple(p.k for p in res.points)
-
-    def test_each_cell_has_the_day_its_eager_twin_ended_on(self, add_on_run):
-        on = add_on_run.on
-        for cs, scenarios in ((on.add_on_cap_sweep, on.scenarios),
-                              (on.add_on_tier_off_cap_sweep, on.tier_off_scenarios)):
-            eager = self._eager(scenarios)
-            # One day per (band, k) cell, keyed by the exact objects it is read with
-            assert set(cs.end_dates) == {(b, k, "all") for b in cs.bands for k in cs.ks}
-            for (band, k, pop), day in cs.end_dates.items():
-                assert day == backtester._curve_end_date(eager[(band, k, pop)])
-                assert type(day) is date
-
-    def test_every_cell_is_an_all_point_stamped_add_to_held(self, add_on_run):
-        on = add_on_run.on
-        for cs, scenarios, tier_floors in ((on.add_on_cap_sweep, on.scenarios, True),
-                                           (on.add_on_tier_off_cap_sweep,
-                                            on.tier_off_scenarios, False)):
-            eager = self._eager(scenarios)
-            add_ons = 0
-            for band in cs.bands:
-                for k in cs.ks:
-                    cell = cs.cell(band, k)
-                    day = backtester._curve_end_date(eager[(band, k, "all")])
-                    assert tuple(cell) == cs.caps
-                    for cap, by_pop in cell.items():
-                        assert set(by_pop) == {"all"}
-                        point = by_pop["all"]
-                        assert (point.k, point.spread_band, point.size_cap) == (k, band, cap)
-                        assert point.population == "all"
-                        assert point.add_to_held is True
-                        assert point.tier_floors is tier_floors
-                        # No checks: the bar reads the "all" point alone
-                        assert point.halves is None and point.ex_top_event is None
-                        # The eager twin's last day, and so its row count
-                        assert point.equity_df["date"].iloc[-1] == day
-                        assert len(point.equity_df) == len(
-                            eager[(band, k, "all")].equity_df)
-                        add_ons += sum(t.add_on for t in point.trades)
-            # Not vacuous: the golden pairs add on in this family
-            assert add_ons > 0 and cs.simulated > 0
-
-    def test_a_cell_is_a_fresh_add_on_simulation(self, add_on_run):
-        # One cell, every cap, against the simulator called as the sweep does
-        cs = add_on_run.on.add_on_cap_sweep
-        band, k = (0.0, 1.0), 0.5
-        cell = cs.cell(band, k)
-        day = cs.end_dates[(band, k, "all")]
-        for cap in cs.caps:
-            fresh = backtester._simulate_at_discount(
-                cs.entries_by_band[band], cs.start_date, cs.initial_balance, k=k,
-                spread_band=band, population="all", size_cap=cap, quiet=True,
-                end_date=day, add_to_held=True)
-            got = cell[cap]["all"]
-            assert self._trades(got) == self._trades(fresh), cap
-            pd.testing.assert_frame_equal(got.equity_df, fresh.equity_df)
-        # ... and the family differs from a run that never adds, somewhere in it
-        plain = add_on_run.on.cap_sweep.cell(band, k)
-        assert any(self._trades(cell[cap]["all"]) != self._trades(plain[cap]["all"])
-                   for cap in cs.caps)
-
-    @pytest.mark.usefixtures("pre_toggle_defaults")
-    def test_a_cell_read_after_utc_midnight_ends_every_cap_on_the_eager_day(
-        self, monkeypatch,
-    ):
-        golden = TestPrepareEntriesGolden()
-        golden._patch(monkeypatch)
-        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
-        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
-        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (1.0,))
-        clock = type("Clock", (TestCapSweepEndDate._Clock,),
-                     {"moment": datetime(2026, 9, 26, 23, 58, tzinfo=UTC)})
-        monkeypatch.setattr(backtester, "datetime", clock)
-        run = run_backtest_sweep(MagicMock(), MagicMock(), golden._START, 10_000.0,
-                                 same_event_ladders=True, band_sweep=True, cap_sweep=True,
-                                 tier_off_sweep=True, add_on_sweep=True)
-        band, k = (0.0, 1.0), run.primary.k
-        # The report reads the cells four minutes later, on the next UTC day
-        clock.moment = datetime(2026, 9, 27, 0, 2, tzinfo=UTC)
-        for cs, eager in ((run.add_on_cap_sweep, run.primary),
-                          (run.add_on_tier_off_cap_sweep,
-                           self._eager(run.tier_off_scenarios)[(band, k, "all")])):
-            before = cs.simulated
-            cell = cs.cell(band, k)
-            # Not vacuous: caps were simulated after midnight
-            assert cs.simulated > before
-            assert eager.equity_df["date"].iloc[-1] == date(2026, 9, 26)
-            for cap, by_pop in cell.items():
-                point = by_pop["all"]
-                assert point.equity_df["date"].iloc[-1] == date(2026, 9, 26), cap
-                assert len(point.equity_df) == len(eager.equity_df), cap
-        # ... while the clock really did move: an unpinned simulation now runs
-        # one day further
-        fresh = backtester._simulate_at_discount(
-            run.add_on_cap_sweep.entries_by_band[band], golden._START, 10_000.0, k=k,
-            size_cap=0.05, quiet=True, add_to_held=True)
-        assert fresh.equity_df["date"].iloc[-1] == date(2026, 9, 27)
-
-    class _DailyClock(TestCapSweepEndDate._Clock):
-        """A clock one day later on every now() call, so each eager point
-        ends its curve on a day of its own."""
-
-        calls = 0
-
-        @classmethod
-        def now(cls, tz=None):
-            cls.calls += 1
-            moment = cls.moment + timedelta(days=cls.calls)
-            return moment if tz is None else moment.astimezone(tz)
-
-    @pytest.mark.usefixtures("pre_toggle_defaults")
-    def test_every_cap_of_every_cell_ends_on_its_own_twin_s_day(self, monkeypatch):
-        """With a clock that moves on every read, each eager "all" point of
-        both families ends on a different day. Every cap of every cell must
-        still end on the day of its own (band, k) twin in ITS family: a cell
-        given the primary's day, or a tier-off cell the tier-on twin's, is
-        caught here. Reading cells never reads the clock."""
-        golden = TestPrepareEntriesGolden()
-        golden._patch(monkeypatch)
-        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.35))
-        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.5, 1.0))
-        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5, 1.0))
-        clock = type("Clock", (self._DailyClock,),
-                     {"moment": datetime(2026, 9, 26, 12, 0, tzinfo=UTC), "calls": 0})
-        monkeypatch.setattr(backtester, "datetime", clock)
-        run = run_backtest_sweep(MagicMock(), MagicMock(), golden._START, 10_000.0,
-                                 same_event_ladders=True, band_sweep=True, cap_sweep=True,
-                                 tier_off_sweep=True, add_on_sweep=True)
-        calls_after_the_run = clock.calls
-        families = []
-        for cs, scenarios in ((run.add_on_cap_sweep, run.scenarios),
-                              (run.add_on_tier_off_cap_sweep, run.tier_off_scenarios)):
-            twins = {key: point for key, point in self._eager(scenarios).items()
-                     if key[2] == "all"}
-            families.append((cs, twins, {key: backtester._curve_end_date(point)
-                                         for key, point in twins.items()}))
-        # Not vacuous: no two eager "all" points, tier-off twins included, end
-        # on the same day
-        every_day = [day for _cs, _twins, days in families for day in days.values()]
-        assert len(every_day) == len(set(every_day)) > 6
-        for cs, twins, days in families:
-            assert set(cs.end_dates) == {(b, k, "all") for b in cs.bands for k in cs.ks}
-            for band in cs.bands:
-                for k in cs.ks:
-                    assert cs.end_dates[(band, k, "all")] == days[(band, k, "all")]
-                    for cap, by_pop in cs.cell(band, k).items():
-                        point = by_pop["all"]
-                        assert point.equity_df["date"].iloc[-1] == days[(band, k, "all")], (
-                            band, k, cap)
-                        assert len(point.equity_df) == len(twins[(band, k, "all")].equity_df)
-            assert cs.simulated > 0
-        assert clock.calls == calls_after_the_run
-
-    @pytest.mark.usefixtures("pre_toggle_defaults")
-    def test_the_summary_lines_name_the_grid(self, monkeypatch, caplog):
-        golden = TestPrepareEntriesGolden()
-        golden._patch(monkeypatch)
-        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.35))
-        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.5, 1.0))
-        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5, 1.0))
-        with caplog.at_level(logging.INFO):
-            run_backtest_sweep(MagicMock(), MagicMock(), golden._START, 10_000.0,
-                               same_event_ladders=True, band_sweep=True, cap_sweep=True,
-                               tier_off_sweep=True, add_on_sweep=True)
-        adding = [r.getMessage() for r in caplog.records
-                  if r.getMessage().startswith("Adding to held pairs")]
-        assert adding == [
-            "Adding to held pairs (backtest): on — the dashboard's Add to held pairs select "
-            "is simulated when the dashboard is built",
-            "Adding to held pairs: 20 size cap(s) x 4 band(s) x 3 k, all trades together, "
-            "each simulated when the dashboard reads it",
-            "Adding to held pairs, tier floors off: 20 size cap(s) x 2 band(s) the tiers "
-            "bind at x 3 k, each simulated when the dashboard reads it"]
-
-    @pytest.mark.usefixtures("pre_toggle_defaults")
-    def test_the_setting_line_follows_the_checkpoint_line_and_the_cap_line_still_precedes_it(
-        self, monkeypatch, caplog,
-    ):
-        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
-        for flag in (True, False):
-            caplog.clear()
-            with caplog.at_level(logging.INFO):
-                run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
-                                   add_on_sweep=flag)
-            messages = [r.getMessage() for r in caplog.records]
-            cap = next(i for i, m in enumerate(messages)
-                       if m.startswith("Per-trade size cap"))
-            assert messages[cap + 1].startswith("Entry checkpoint (backtest):")
-            assert messages[cap + 2] == (
-                "Adding to held pairs (backtest): "
-                + ("on — the dashboard's Add to held pairs select is simulated when the "
-                   "dashboard is built" if flag else
-                   "off — the dashboard's Add to held pairs select stays disabled"))
-
-    @pytest.mark.usefixtures("pre_toggle_defaults")
-    def test_the_infeasible_window_records_no_sweep(self, monkeypatch, caplog):
-        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
-        with caplog.at_level(logging.INFO):
-            res = run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
-                                     band_sweep=True, tier_off_sweep=True, cap_sweep=True,
-                                     add_on_sweep=True)
-        assert res.add_on_cap_sweep is None and res.add_on_tier_off_cap_sweep is None
-        assert res.cap_sweep is None
-        # No summary line is logged for a sweep that was not built
-        assert not [r for r in caplog.records
-                    if r.getMessage().startswith("Adding to held pairs:")]
-
-    @pytest.mark.usefixtures("pre_toggle_defaults")
-    def test_the_infeasible_window_records_what_the_saved_defaults_say(self, monkeypatch):
-        from kalshi_betting import config
-        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
-        for saved in (True, False):
-            config.save_live_defaults(
-                dc_replace(config.LIVE_DEFAULTS_SEED, add_to_held_pairs=saved), source="")
-            res = run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0)
-            assert res.live_add_to_held_pairs is saved
-
-
 class TestLiveRuleLine:
     """"Live time-series rule (saved live defaults): ..." — the saved live
     defaults' rule and filter, read once before the fetch, recorded on
@@ -15635,21 +15239,19 @@ class TestLiveRuleLine:
 
     @staticmethod
     def _live(monkeypatch, tier_floors, band, categories=None, tags=None, *,
-              add_to_held=False, sell_at=None, sell_min_days=None,
-              trim_to_kelly=False, trim_min_rise=None):
+              rebalance=False, min_price_move=None, sell_at=None, sell_min_days=None):
         """Save config.py's toggles with this rule and filter as the live
-        defaults. Adding, selling and trimming stay off unless asked for, so
-        their notes appear only in the tests that name them."""
+        defaults. Rebalancing and selling stay off unless asked for, so their
+        notes appear only in the tests that name them."""
         from kalshi_betting import config
         monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", tier_floors)
         monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", band)
         monkeypatch.setattr(config, "TRADE_CATEGORIES", categories)
         monkeypatch.setattr(config, "TRADE_TAGS", tags)
-        monkeypatch.setattr(config, "ADD_TO_HELD_PAIRS", add_to_held)
+        monkeypatch.setattr(config, "REBALANCE", rebalance)
+        monkeypatch.setattr(config, "MIN_PRICE_MOVE", min_price_move)
         monkeypatch.setattr(config, "SELL_AT", sell_at)
         monkeypatch.setattr(config, "SELL_MIN_DAYS", sell_min_days)
-        monkeypatch.setattr(config, "TRIM_TO_KELLY", trim_to_kelly)
-        monkeypatch.setattr(config, "TRIM_MIN_RISE", trim_min_rise)
         save_config_live_defaults()
         return config.describe_time_series_rule(tier_floors, band)
 
@@ -15691,11 +15293,11 @@ class TestLiveRuleLine:
         assert messages[-1].startswith(self._PREFIX)
         assert any(m.startswith("Size-cap sweep:") for m in messages[:-1])
 
-    # The thirteen fields a saved-defaults read records, all or none
+    # The twelve fields a saved-defaults read records, all or none
     _LIVE_FIELDS = ("live_tier_floors", "live_spread_band", "live_categories", "live_tags",
                     "live_origin", "live_interval_discount", "live_size_cap",
-                    "live_same_title_size_cap", "live_add_to_held_pairs", "live_sell_at",
-                    "live_sell_min_days", "live_trim_to_kelly", "live_trim_min_rise")
+                    "live_same_title_size_cap", "live_rebalance", "live_min_price_move",
+                    "live_sell_at", "live_sell_min_days")
 
     @pytest.mark.parametrize("feasible", [False, True])
     def test_a_refused_file_records_none_and_warns_once(self, monkeypatch, caplog, feasible):
@@ -15716,6 +15318,24 @@ class TestLiveRuleLine:
         # The run itself went ahead: a feasible one simulated its band
         assert bool(res.calibrations_by_band) is feasible
 
+    def test_a_file_an_older_version_saved_is_refused_and_records_none(self, monkeypatch,
+                                                                         caplog):
+        # A file an older version saved (LiveDefaultsOutdated, a LiveDefaultsError)
+        # is a refused file here too: its values are never read in their new form,
+        # so the report records no live rule
+        from kalshi_betting import config
+
+        from .test_config import _OLD_VERSION_BYTES
+        config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+        with pytest.raises(config.LiveDefaultsOutdated):
+            config.read_saved_live_defaults()
+        res = self._infeasible(monkeypatch, caplog)
+        assert all(getattr(res, name) is None for name in self._LIVE_FIELDS)
+        warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+                  and "saved live defaults are refused" in r.getMessage()]
+        assert len(warned) == 1 and str(config.LIVE_DEFAULTS_FILE) in warned[0]
+        assert self._line(caplog) == f"Live time-series rule: {backtester._LIVE_RULE_NONE}"
+
     @pytest.mark.parametrize("feasible", [False, True])
     def test_no_saved_file_records_none_with_one_info_line(self, monkeypatch, caplog, feasible):
         from kalshi_betting import config
@@ -15732,12 +15352,12 @@ class TestLiveRuleLine:
             "when this run started, and live runs refuse to start without them")
         assert bool(res.calibrations_by_band) is feasible
 
-    def test_the_thirteen_fields_are_recorded_from_one_read(self, monkeypatch, caplog):
+    def test_the_twelve_fields_are_recorded_from_one_read(self, monkeypatch, caplog):
         from kalshi_betting import config
         saved = config.save_live_defaults(
             config.LiveSettings(False, (0.1, 0.8), 0.6, 0.35, 0.25, ("Economics",), ("Fed",),
-                                sell_at=0.85, sell_min_days=3,
-                                trim_to_kelly=True, trim_min_rise=0.10),
+                                rebalance=True, min_price_move=0.10,
+                                sell_at=0.85, sell_min_days=3),
             source="a note")
         reads: list = []
         real = config.read_saved_live_defaults
@@ -15761,23 +15381,26 @@ class TestLiveRuleLine:
             "live_categories": ("Economics",), "live_tags": ("Fed",),
             "live_origin": saved.origin, "live_interval_discount": 0.6,
             "live_size_cap": 0.35, "live_same_title_size_cap": 0.25,
-            "live_add_to_held_pairs": False, "live_sell_at": 0.85, "live_sell_min_days": 3,
-            "live_trim_to_kelly": True, "live_trim_min_rise": 0.10}
+            "live_rebalance": True, "live_min_price_move": 0.10,
+            "live_sell_at": 0.85, "live_sell_min_days": 3}
 
-    def test_the_live_rule_fields_are_thirteen_keys_or_none(self):
+    def test_the_live_rule_fields_are_twelve_keys_or_none(self):
         from kalshi_betting import config
         assert backtester._live_rule_fields(None) == {}
         fields = backtester._live_rule_fields(config.LIVE_DEFAULTS_SEED)
-        assert tuple(fields) == self._LIVE_FIELDS and len(fields) == 13
+        assert tuple(fields) == self._LIVE_FIELDS and len(fields) == 12
         # Each is a BacktestSweep field, so it can be passed straight to the sweep
         assert set(fields) <= set(backtester.BacktestSweep.__dataclass_fields__)
         assert fields["live_origin"] == config.LIVE_DEFAULTS_SEED.origin
         assert fields["live_size_cap"] == 0.10
-        # The seed proposes adding to held pairs on, and the field says so
-        assert fields["live_add_to_held_pairs"] is True
+        # The seed proposes rebalancing on with no minimum, and the fields say so
+        assert (fields["live_rebalance"], fields["live_min_price_move"]) == (True, None)
         off = backtester._live_rule_fields(dc_replace(config.LIVE_DEFAULTS_SEED,
-                                                      add_to_held_pairs=False))
-        assert off["live_add_to_held_pairs"] is False
+                                                      rebalance=False))
+        assert (off["live_rebalance"], off["live_min_price_move"]) == (False, None)
+        moved = backtester._live_rule_fields(dc_replace(config.LIVE_DEFAULTS_SEED,
+                                                        min_price_move=0.10))
+        assert (moved["live_rebalance"], moved["live_min_price_move"]) == (True, 0.10)
         # The seed sells nothing; defaults that do record the level and the minimum
         assert fields["live_sell_at"] is None and fields["live_sell_min_days"] is None
         selling = backtester._live_rule_fields(dc_replace(
@@ -15786,15 +15409,6 @@ class TestLiveRuleLine:
         level_only = backtester._live_rule_fields(dc_replace(
             config.LIVE_DEFAULTS_SEED, sell_at=0.85))
         assert (level_only["live_sell_at"], level_only["live_sell_min_days"]) == (0.85, None)
-        # The seed trims nothing; defaults that do record the switch and the minimum
-        assert fields["live_trim_to_kelly"] is False and fields["live_trim_min_rise"] is None
-        trimming = backtester._live_rule_fields(dc_replace(
-            config.LIVE_DEFAULTS_SEED, trim_to_kelly=True, trim_min_rise=0.10))
-        assert (trimming["live_trim_to_kelly"], trimming["live_trim_min_rise"]) == (True, 0.10)
-        switch_only = backtester._live_rule_fields(dc_replace(
-            config.LIVE_DEFAULTS_SEED, trim_to_kelly=True))
-        assert (switch_only["live_trim_to_kelly"],
-                switch_only["live_trim_min_rise"]) == (True, None)
 
     def test_claude_md_spells_every_backtest_sweep_field(self):
         # CLAUDE.md lists BacktestSweep's fields in order, so a new field must be added there
@@ -15988,11 +15602,11 @@ class TestLiveRuleLine:
         run = (f"k {config._exact_number(res.primary.k)}, per-trade cap "
                f"{config._cap_text(res.primary.size_cap, 'no cap')} and same-title cap "
                f"{config._cap_text(res.same_title_size_cap, 'no extra cap')}")
-        # The seed also adds to held pairs, so its note follows the sizing note
+        # The seed also rebalances, so its note follows the sizing note
         assert self._line(caplog).endswith(
             "; the live defaults size at k 0.8, per-trade cap 10% and same-title cap 20%, "
             f"where this run's primary sized at {run}"
-            "; the live defaults add to held pairs, which this run's primary does not")
+            "; the live defaults rebalance held pairs, which this run's primary does not")
 
     def test_no_sizing_note_when_the_saved_sizing_is_the_runs(self, monkeypatch, caplog):
         # _live saves config.py's own k and caps, which this run sized at too
@@ -16015,51 +15629,85 @@ class TestLiveRuleLine:
                         {"primary": dc_replace(point, size_cap=None)}):
             assert backtester._live_sizing_note(dc_replace(sweep, **changes)) == ""
 
-    # ── Adding to held pairs ────────────────────────────────────────────────
+    # ── Rebalancing ─────────────────────────────────────────────────────────
 
-    _ADD_ON_NOTE = "; the live defaults add to held pairs, which this run's primary does not"
+    # A live run holds back its add-ons and its trims alike until the minimum
+    # is reached, so the clause names the minimum for both
+    _REBALANCE_NOTE = ("; the live defaults rebalance held pairs (only after a 10c "
+                       "price move), which this run's primary does not")
+    _REBALANCE_NOTE_NO_MINIMUM = ("; the live defaults rebalance held pairs, which this "
+                                  "run's primary does not")
 
-    def test_the_add_on_note_is_named_when_the_saved_defaults_add_to_held_pairs(
-        self, monkeypatch, caplog,
-    ):
-        rule = self._live(monkeypatch, True, (0.0, 1.0), add_to_held=True)
+    def test_the_rebalance_note_is_named_when_the_saved_defaults_rebalance(
+            self, monkeypatch, caplog):
+        rule = self._live(monkeypatch, True, (0.0, 1.0), rebalance=True, min_price_move=0.10)
         res = self._infeasible(monkeypatch, caplog)
-        assert res.live_add_to_held_pairs is True
+        assert (res.live_rebalance, res.live_min_price_move) == (True, 0.10)
         assert self._line(caplog) == (
             f"Live time-series rule (saved live defaults): {rule} — this run's primary "
-            f"scenario applies it{self._ADD_ON_NOTE}")
+            f"scenario applies it{self._REBALANCE_NOTE}")
         # ... on the line that says the rule was not simulated too
-        rule = self._live(monkeypatch, True, (0.35, 0.5), add_to_held=True)
+        rule = self._live(monkeypatch, True, (0.35, 0.5), rebalance=True, min_price_move=0.10)
         self._feasible(monkeypatch, caplog, band_sweep=False)
         assert self._line(caplog) == (
             f"Live time-series rule (saved live defaults): {rule} — not simulated by this "
-            f"run{self._ADD_ON_NOTE}")
+            f"run{self._REBALANCE_NOTE}")
 
-    def test_no_add_on_note_when_the_saved_defaults_do_not_add(self, monkeypatch, caplog):
+    def test_the_rebalance_note_words_the_minimum_price_movement(self, monkeypatch, caplog):
+        # No minimum: the setting alone; a minimum in cents, as the dashboard shows it
+        for move, note in ((None, self._REBALANCE_NOTE_NO_MINIMUM),
+                           (0.10, self._REBALANCE_NOTE),
+                           (0.05, self._REBALANCE_NOTE.replace("10c", "5c")),
+                           (0.15, self._REBALANCE_NOTE.replace("10c", "15c")),
+                           (1.0, self._REBALANCE_NOTE.replace("10c", "100c"))):
+            self._live(monkeypatch, True, (0.0, 1.0), rebalance=True, min_price_move=move)
+            self._infeasible(monkeypatch, caplog)
+            assert self._line(caplog).endswith(f"scenario applies it{note}"), move
+
+    def test_no_rebalance_note_when_the_saved_defaults_do_not_rebalance(
+            self, monkeypatch, caplog):
         self._live(monkeypatch, True, (0.0, 1.0))
         res = self._infeasible(monkeypatch, caplog)
-        assert res.live_add_to_held_pairs is False
-        assert "held" not in self._line(caplog)
+        assert (res.live_rebalance, res.live_min_price_move) == (False, None)
+        assert "rebalanc" not in self._line(caplog) and "held" not in self._line(caplog)
 
-    def test_the_add_on_note_comes_last(self, monkeypatch, caplog):
+    def test_the_rebalance_note_follows_the_sizing_and_ladder_notes(self, monkeypatch, caplog):
         # After the ladder departure's clause and after the sizing clause
-        rule = self._live(monkeypatch, True, (0.0, 1.0), add_to_held=True)
+        rule = self._live(monkeypatch, True, (0.0, 1.0), rebalance=True)
         configured = backtester.TIME_SERIES_SAME_EVENT_LADDERS
         res = self._infeasible(monkeypatch, caplog, same_event_ladders=not configured)
         assert self._line(caplog) == (
             f"Live time-series rule (saved live defaults): {rule} — this run's primary "
             f"scenario applies it; this run's same-event ladders are "
             f"{'off' if configured else 'on'} and config.py's {'on' if configured else 'off'}, "
-            f"so its pairs are not the live bot's{self._ADD_ON_NOTE}")
-        assert res.live_add_to_held_pairs is True
+            f"so its pairs are not the live bot's{self._REBALANCE_NOTE_NO_MINIMUM}")
+        assert res.live_rebalance is True
 
-    def test_the_add_on_note_needs_a_recorded_true(self):
+    def test_the_rebalance_note_needs_a_recorded_true(self):
         point = backtester._simulate_at_discount([], date(2026, 1, 5), 1000.0)
         sweep = backtester.BacktestSweep(primary=point, points=[point], calibration=None)
-        assert sweep.live_add_to_held_pairs is None
-        for recorded, note in ((None, ""), (False, ""), (True, self._ADD_ON_NOTE)):
-            changed = dc_replace(sweep, live_add_to_held_pairs=recorded)
-            assert backtester._live_add_on_note(changed) == note, recorded
+        assert (sweep.live_rebalance, sweep.live_min_price_move) == (None, None)
+        for recorded, note in ((None, ""), (False, ""),
+                               (True, self._REBALANCE_NOTE_NO_MINIMUM)):
+            changed = dc_replace(sweep, live_rebalance=recorded)
+            assert backtester._live_rebalance_note(changed) == note, recorded
+        # A minimum alone is no rebalance (LiveSettings refuses one with rebalancing off)
+        assert backtester._live_rebalance_note(dc_replace(sweep, live_min_price_move=0.10)) == ""
+        assert backtester._live_rebalance_note(dc_replace(
+            sweep, live_rebalance=True, live_min_price_move=0.10)) == self._REBALANCE_NOTE
+
+    def test_a_feasible_run_records_the_saved_rebalance_setting(self, monkeypatch, caplog):
+        from kalshi_betting import config
+        self._live(monkeypatch, True, (0.0, 1.0), rebalance=True, min_price_move=0.25)
+        res = self._feasible(monkeypatch, caplog)
+        assert (res.live_rebalance, res.live_min_price_move) == (True, 0.25)
+        assert self._line(caplog).endswith(self._REBALANCE_NOTE.replace("10c", "25c"))
+        # A later save without rebalancing is recorded as such, with no note
+        config.save_live_defaults(dc_replace(config.live_settings(), rebalance=False,
+                                             min_price_move=None), source="")
+        res = self._infeasible(monkeypatch, caplog)
+        assert (res.live_rebalance, res.live_min_price_move) == (False, None)
+        assert "rebalanc" not in self._line(caplog)
 
     # ── Selling ─────────────────────────────────────────────────────────────
 
@@ -16099,18 +15747,18 @@ class TestLiveRuleLine:
         assert (res.live_sell_at, res.live_sell_min_days) == (None, None)
         assert "sell" not in self._line(caplog)
 
-    def test_the_sell_note_comes_after_the_add_on_note(self, monkeypatch, caplog):
-        # After the ladder departure's clause, the sizing clause and the add-on clause
-        rule = self._live(monkeypatch, True, (0.0, 1.0), add_to_held=True, sell_at=0.85,
-                          sell_min_days=3)
+    def test_the_sell_note_comes_last(self, monkeypatch, caplog):
+        # After the ladder departure's clause, the sizing clause and the rebalance clause
+        rule = self._live(monkeypatch, True, (0.0, 1.0), rebalance=True, min_price_move=0.10,
+                          sell_at=0.85, sell_min_days=3)
         configured = backtester.TIME_SERIES_SAME_EVENT_LADDERS
         res = self._infeasible(monkeypatch, caplog, same_event_ladders=not configured)
         assert self._line(caplog) == (
             f"Live time-series rule (saved live defaults): {rule} — this run's primary "
             f"scenario applies it; this run's same-event ladders are "
             f"{'off' if configured else 'on'} and config.py's {'on' if configured else 'off'}, "
-            f"so its pairs are not the live bot's{self._ADD_ON_NOTE}{self._SELL_NOTE}")
-        assert (res.live_add_to_held_pairs, res.live_sell_at) == (True, 0.85)
+            f"so its pairs are not the live bot's{self._REBALANCE_NOTE}{self._SELL_NOTE}")
+        assert (res.live_rebalance, res.live_sell_at) == (True, 0.85)
 
     def test_the_sell_note_needs_a_recorded_level(self):
         point = backtester._simulate_at_discount([], date(2026, 1, 5), 1000.0)
@@ -16138,86 +15786,6 @@ class TestLiveRuleLine:
         res = self._feasible(monkeypatch, caplog)
         assert (res.live_sell_at, res.live_sell_min_days) == (0.85, 3)
         assert self._line(caplog).endswith(self._SELL_NOTE)
-
-    # ── Trimming to Kelly ───────────────────────────────────────────────────
-
-    _TRIM_NOTE = ("; the live defaults trim to Kelly (only after a 10c price rise), which "
-                  "this run's primary does not")
-    _TRIM_NOTE_NO_MINIMUM = ("; the live defaults trim to Kelly, which this run's primary "
-                             "does not")
-
-    def test_the_trim_note_is_named_when_the_saved_defaults_trim(self, monkeypatch, caplog):
-        rule = self._live(monkeypatch, True, (0.0, 1.0), trim_to_kelly=True,
-                          trim_min_rise=0.10)
-        res = self._infeasible(monkeypatch, caplog)
-        assert (res.live_trim_to_kelly, res.live_trim_min_rise) == (True, 0.10)
-        assert self._line(caplog) == (
-            f"Live time-series rule (saved live defaults): {rule} — this run's primary "
-            f"scenario applies it{self._TRIM_NOTE}")
-        # ... on the line that says the rule was not simulated too
-        rule = self._live(monkeypatch, True, (0.35, 0.5), trim_to_kelly=True,
-                          trim_min_rise=0.10)
-        self._feasible(monkeypatch, caplog, band_sweep=False)
-        assert self._line(caplog) == (
-            f"Live time-series rule (saved live defaults): {rule} — not simulated by this "
-            f"run{self._TRIM_NOTE}")
-
-    def test_the_trim_note_words_the_minimum_price_rise(self, monkeypatch, caplog):
-        # No minimum: the switch alone; a minimum in cents, as the dashboard shows it
-        for rise, note in ((None, self._TRIM_NOTE_NO_MINIMUM),
-                           (0.10, self._TRIM_NOTE),
-                           (0.05, self._TRIM_NOTE.replace("10c", "5c")),
-                           (0.15, self._TRIM_NOTE.replace("10c", "15c")),
-                           (1.0, self._TRIM_NOTE.replace("10c", "100c"))):
-            self._live(monkeypatch, True, (0.0, 1.0), trim_to_kelly=True, trim_min_rise=rise)
-            self._infeasible(monkeypatch, caplog)
-            assert self._line(caplog).endswith(f"scenario applies it{note}"), rise
-
-    def test_no_trim_note_when_the_saved_defaults_do_not_trim(self, monkeypatch, caplog):
-        self._live(monkeypatch, True, (0.0, 1.0))
-        res = self._infeasible(monkeypatch, caplog)
-        assert (res.live_trim_to_kelly, res.live_trim_min_rise) == (False, None)
-        assert "trim" not in self._line(caplog)
-
-    def test_the_trim_note_comes_last(self, monkeypatch, caplog):
-        # After the ladder departure's clause, the add-on clause and the sell clause
-        rule = self._live(monkeypatch, True, (0.0, 1.0), add_to_held=True, sell_at=0.85,
-                          sell_min_days=3, trim_to_kelly=True, trim_min_rise=0.10)
-        configured = backtester.TIME_SERIES_SAME_EVENT_LADDERS
-        res = self._infeasible(monkeypatch, caplog, same_event_ladders=not configured)
-        assert self._line(caplog) == (
-            f"Live time-series rule (saved live defaults): {rule} — this run's primary "
-            f"scenario applies it; this run's same-event ladders are "
-            f"{'off' if configured else 'on'} and config.py's {'on' if configured else 'off'}, "
-            f"so its pairs are not the live bot's{self._ADD_ON_NOTE}{self._SELL_NOTE}"
-            f"{self._TRIM_NOTE}")
-        assert (res.live_add_to_held_pairs, res.live_sell_at, res.live_trim_to_kelly) == (
-            True, 0.85, True)
-
-    def test_the_trim_note_needs_a_recorded_true(self):
-        point = backtester._simulate_at_discount([], date(2026, 1, 5), 1000.0)
-        sweep = backtester.BacktestSweep(primary=point, points=[point], calibration=None)
-        assert (sweep.live_trim_to_kelly, sweep.live_trim_min_rise) == (None, None)
-        for recorded, note in ((None, ""), (False, ""), (True, self._TRIM_NOTE_NO_MINIMUM)):
-            changed = dc_replace(sweep, live_trim_to_kelly=recorded)
-            assert backtester._live_trim_note(changed) == note, recorded
-        # A minimum alone is no trim (LiveSettings refuses one with trimming off)
-        assert backtester._live_trim_note(dc_replace(sweep, live_trim_min_rise=0.10)) == ""
-        assert backtester._live_trim_note(dc_replace(
-            sweep, live_trim_to_kelly=True, live_trim_min_rise=0.10)) == self._TRIM_NOTE
-
-    def test_a_feasible_run_records_the_saved_trim_setting(self, monkeypatch, caplog):
-        from kalshi_betting import config
-        self._live(monkeypatch, True, (0.0, 1.0), trim_to_kelly=True, trim_min_rise=0.25)
-        res = self._feasible(monkeypatch, caplog)
-        assert (res.live_trim_to_kelly, res.live_trim_min_rise) == (True, 0.25)
-        assert self._line(caplog).endswith(self._TRIM_NOTE.replace("10c", "25c"))
-        # A later save without trimming is recorded as such, with no note
-        config.save_live_defaults(dc_replace(config.live_settings(), trim_to_kelly=False,
-                                             trim_min_rise=None), source="")
-        res = self._infeasible(monkeypatch, caplog)
-        assert (res.live_trim_to_kelly, res.live_trim_min_rise) == (False, None)
-        assert "trim" not in self._line(caplog)
 
     # ── The category/tag filter ─────────────────────────────────────────────
 
@@ -16294,6 +15862,17 @@ class TestLiveRuleLine:
             "live bot's")
         self._infeasible(monkeypatch, caplog, same_event_ladders=configured)
         assert self._line(caplog).endswith("applies it")
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_the_infeasible_window_records_whether_the_saved_defaults_rebalance(
+            self, monkeypatch):
+        from kalshi_betting import config
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        for saved in (True, False):
+            config.save_live_defaults(
+                dc_replace(config.LIVE_DEFAULTS_SEED, rebalance=saved), source="")
+            res = run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0)
+            assert res.live_rebalance is saved
 
 
 class TestEntryCheckpointLogging:
@@ -17961,8 +17540,8 @@ class _MovingGolden(TestPrepareEntriesGolden):
 @pytest.fixture(scope="class")
 def market_sweep_run():
     """The moving-price golden fixture through run_backtest_sweep with every
-    family (band sweep, tier floors off, size caps, add to held pairs) on a
-    narrowed grid: band (0, 1) x k (0.5, 0.75)."""
+    family (band sweep, tier floors off, size caps, Rebalance) on a narrowed
+    grid: band (0, 1) x k (0.5, 0.75)."""
     toggles = pytest.MonkeyPatch()
     mp = pytest.MonkeyPatch()
     try:
@@ -17975,7 +17554,7 @@ def market_sweep_run():
         res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
                                  start_date=golden._START, initial_balance=10_000.0,
                                  same_event_ladders=True, band_sweep=True, cap_sweep=True,
-                                 tier_off_sweep=True, add_on_sweep=True)
+                                 tier_off_sweep=True, rebalance_sweep=True)
         mp.undo()
         yield SimpleNamespace(res=res, start=golden._START)
     finally:
@@ -17986,19 +17565,19 @@ def market_sweep_run():
 @pytest.mark.usefixtures("market_sweep_run")
 class TestMarketCapSweepParity:
     """With prices that move after entry, every cap of every lazy family
-    (size cap, tier floors off, add to held pairs) still equals a fresh
-    simulation of the same quoted entries — the quotes depend on no cap, k,
+    (size cap, tier floors off, Rebalance) still equals a fresh simulation of
+    the same quoted entries — the quotes depend on no cap, k,
     band, tier setting or population — and the halves and the
     excluding-top-event check equal fresh re-simulations too. Not vacuous:
     the same entries without quotes size or mark differently."""
 
     def _fresh_parity(self, point, subset, start, k, band, pop, cap, *, end_date,
                       tier_floors=True, add_to_held=False, split_date=None, checks=False,
-                      sell_at=None):
+                      sell_at=None, trim_to_kelly=False):
         fresh = backtester._simulate_at_discount(
             subset, start, 10_000.0, k=k, spread_band=band, population=pop, size_cap=cap,
             quiet=True, end_date=end_date, tier_floors=tier_floors, add_to_held=add_to_held,
-            sell_at=sell_at)
+            sell_at=sell_at, trim_to_kelly=trim_to_kelly)
         assert [astuple(t) for t in point.trades] == [astuple(t) for t in fresh.trades], \
             (band, k, pop, cap)
         pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df, check_exact=True)
@@ -18028,8 +17607,8 @@ class TestMarketCapSweepParity:
                                                end_date=end, tier_floors=tier_floors,
                                                split_date=res.split_date, checks=True)
                             checked += 1
-        for cs, tier_floors in ((res.add_on_cap_sweep, True),
-                                (res.add_on_tier_off_cap_sweep, False)):
+        for tier_floors in (True, False):
+            cs = res.rebalance_sweep.sweep(tier_floors=tier_floors)
             for band in cs.bands:
                 entries = cs.entries_by_band[band]
                 for k in cs.ks:
@@ -18037,7 +17616,8 @@ class TestMarketCapSweepParity:
                         point = pops["all"]
                         self._fresh_parity(point, entries, start, k, band, "all", cap,
                                            end_date=cs.end_dates[(band, k, "all")],
-                                           tier_floors=tier_floors, add_to_held=True)
+                                           tier_floors=tier_floors, add_to_held=True,
+                                           trim_to_kelly=True)
                         checked += 1
         assert checked > 300
 
@@ -19130,7 +18710,7 @@ class TestSalesComeBeforePurchases:
         settings = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0),
                                 interval_discount=cls._K, size_cap=1.0,
                                 same_title_size_cap=backtester.SAME_TITLE_SIZE_CAP,
-                                add_to_held_pairs=add_to_held)
+                                rebalance=add_to_held)
         return compute_trade(pair, backtester._cents(value), settings=settings,
                              cash_cents=backtester._cents(cash))
 
@@ -19539,7 +19119,7 @@ def sell_run():
                     start_date=golden._START, initial_balance=10_000.0,
                     same_event_ladders=True,
                     **{"band_sweep": True, "tier_off_sweep": True, "cap_sweep": True,
-                       "add_on_sweep": True, **kw})
+                       "rebalance_sweep": True, **kw})
             finally:
                 root.removeHandler(handler)
                 root.setLevel(old_level)
@@ -19561,8 +19141,9 @@ def sell_run():
 class TestSellSweep:
     """run_backtest_sweep(sell_sweep=True): the dashboard's "Sell" family, a
     lazy SellSweep over every sell level and every minimum of days before
-    maturity, tier floors on and off, adding to held pairs or not, the "all"
-    population only. The run simulates nothing extra; every cell is
+    maturity, tier floors on and off, the "all" population only, with no
+    adding to held pairs and no trimming (the dashboard shuts Sell while
+    Rebalance is yes). The run simulates nothing extra; every cell is
     simulated when read, and every cap of it equals a fresh simulation
     selling at that level. sold_grid reads a cell at every level and minimum
     while simulating only the runs that differ, and every cell it yields —
@@ -19600,8 +19181,8 @@ class TestSellSweep:
             "above a level for 3 days in a row (config.TAKE_PROFIT_HOLD_DAYS); the "
             "dashboard's Sell select is simulated when the dashboard is built",
             "Selling early: 4 level(s) x 4 minimum-days option(s) x 20 size cap(s) x 1 "
-            "band(s) (1 with the tier floors off) x 2 k, adding to held pairs or not, each "
-            "simulated when the dashboard reads it"]
+            "band(s) (1 with the tier floors off) x 2 k, each simulated when the "
+            "dashboard reads it"]
         others = [m for m in sell_run.msgs_on
                   if not m.startswith((self._SELLING, "Peak RSS"))]
         assert others == [m for m in sell_run.msgs_off
@@ -19609,22 +19190,23 @@ class TestSellSweep:
         assert [m for m in sell_run.msgs_off if m.startswith(self._SELLING)] == [
             "Selling early (backtest): off — the dashboard's Sell select stays disabled"]
 
-    def test_the_axes_are_the_add_on_family_s(self, sell_run):
+    def test_the_axes_are_the_rebalance_family_s(self, sell_run):
         on = sell_run.on
         sell = on.sell_sweep
         assert sell.levels == (0.05, 0.25, 0.5, 1.0)
         # The patched options, ascending
         assert sell.min_days == (1, 14, 21, 30)
         assert sell_run.no_cap.sell_sweep.min_days == (1, 14, 21, 30)
-        assert sell.caps == on.add_on_cap_sweep.caps and len(sell.caps) == 20
-        assert sell.bands == on.add_on_cap_sweep.bands
-        assert sell.off_bands == on.add_on_tier_off_cap_sweep.bands
-        assert sell.ks == on.add_on_cap_sweep.ks
-        # The very entries and end days the add-on family holds
-        assert sell.entries_by_band is on.add_on_cap_sweep.entries_by_band
-        assert sell.off_entries_by_band is on.add_on_tier_off_cap_sweep.entries_by_band
-        assert sell.end_dates == on.add_on_cap_sweep.end_dates
-        assert sell.off_end_dates == on.add_on_tier_off_cap_sweep.end_dates
+        family = on.rebalance_sweep
+        assert sell.caps == family.caps and len(sell.caps) == 20
+        assert sell.bands == family.bands
+        assert sell.off_bands == family.off_bands
+        assert sell.ks == family.ks
+        # The very entries and end days the Rebalance family holds
+        assert sell.entries_by_band is family.entries_by_band
+        assert sell.off_entries_by_band is family.off_entries_by_band
+        assert sell.end_dates is family.end_dates
+        assert sell.off_end_dates is family.off_end_dates
         # Without the size-cap sweep, the run's own cap alone
         assert sell_run.no_cap.sell_sweep.caps == (sell_run.no_cap.primary.size_cap,)
 
@@ -19635,33 +19217,46 @@ class TestSellSweep:
             for band in bands:
                 entries = entries_by_band[band]
                 for k in sell.ks:
-                    for add_to_held in (False, True):
-                        for level in sell.levels:
-                            cell = sell.cell(level, band, k, tier_floors=tier_floors,
-                                             add_to_held=add_to_held)
-                            assert tuple(cell) == sell.caps
-                            for cap, by_pop in cell.items():
-                                assert set(by_pop) == {"all"}
-                                point = by_pop["all"]
-                                assert (point.sell_at, point.add_to_held, point.tier_floors,
-                                        point.size_cap) == (level, add_to_held, tier_floors,
-                                                            cap)
-                                fresh = backtester._simulate_at_discount(
-                                    entries, start, 10_000.0, k=k, spread_band=band,
-                                    size_cap=cap, quiet=True,
-                                    end_date=end_dates[(band, k, "all")],
-                                    tier_floors=tier_floors, add_to_held=add_to_held,
-                                    sell_at=level)
-                                assert ([astuple(t) for t in point.trades]
-                                        == [astuple(t) for t in fresh.trades])
-                                pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df,
-                                                              check_exact=True)
-                                assert point.peak_kelly_fraction == fresh.peak_kelly_fraction
-                                checked += 1
-                                sold += sum(t.sold for t in point.trades)
-        assert checked == 2 * 2 * 4 * 20 * 2
+                    for level in sell.levels:
+                        cell = sell.cell(level, band, k, tier_floors=tier_floors)
+                        assert tuple(cell) == sell.caps
+                        for cap, by_pop in cell.items():
+                            assert set(by_pop) == {"all"}
+                            point = by_pop["all"]
+                            # A sell run neither adds to held pairs nor trims
+                            assert (point.sell_at, point.add_to_held, point.trim_to_kelly,
+                                    point.tier_floors, point.size_cap) == (
+                                level, False, False, tier_floors, cap)
+                            fresh = backtester._simulate_at_discount(
+                                entries, start, 10_000.0, k=k, spread_band=band,
+                                size_cap=cap, quiet=True,
+                                end_date=end_dates[(band, k, "all")],
+                                tier_floors=tier_floors, sell_at=level)
+                            assert ([astuple(t) for t in point.trades]
+                                    == [astuple(t) for t in fresh.trades])
+                            pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df,
+                                                          check_exact=True)
+                            assert point.peak_kelly_fraction == fresh.peak_kelly_fraction
+                            checked += 1
+                            sold += sum(t.sold for t in point.trades)
+        assert checked == 2 * 2 * 4 * 20
         # Not vacuous: positions sell
         assert sold > 0
+
+    def test_a_sell_run_never_adds_to_held_pairs_or_trims(self, sell_run):
+        # The dashboard shuts Sell while Rebalance is yes, so the family has
+        # no setting for adding or trimming: not a parameter of
+        # sweep(), cell() or sold_grid(), and the CapSweep it builds neither
+        # adds nor trims
+        for method in (backtester.SellSweep.sweep, backtester.SellSweep.cell,
+                       backtester.SellSweep.sold_grid):
+            assert "add_to_held" not in inspect.signature(method).parameters
+        sell = sell_run.on.sell_sweep
+        for tier_floors in (True, False):
+            swept = sell.sweep(0.5, min_days=14, tier_floors=tier_floors)
+            assert (swept.add_to_held, swept.trim_to_kelly, swept.tier_floors) == (
+                False, False, tier_floors)
+            assert swept.sell_at == 0.5
 
     def test_a_level_or_setting_it_does_not_hold_is_refused(self, sell_run):
         sell = sell_run.on.sell_sweep
@@ -19691,10 +19286,10 @@ class TestSellSweep:
         that simulation; a SameSale names an EARLIER cell of the same cap that
         was yielded as a point, and the fresh run equals that point; None is
         the no-selling run, and the fresh run there makes no sale. `only`
-        keeps the (tier_floors, k, add_to_held) settings it names (None:
-        every one), `caps` is handed to sold_grid, and `sell` replaces the
-        run's SellSweep (None: the run's own). Returns how many cells of
-        each kind were read."""
+        keeps the (tier_floors, k) settings it names (None: every one),
+        `caps` is handed to sold_grid, and `sell` replaces the run's
+        SellSweep (None: the run's own). Returns how many cells of each kind
+        were read."""
         sell = sell_run.on.sell_sweep if sell is None else sell
         start = sell_run.start
         kinds: Counter = Counter()
@@ -19702,66 +19297,65 @@ class TestSellSweep:
             for band in bands:
                 entries = entries_by_band[band]
                 for k in sell.ks:
-                    for add_to_held in (False, True):
-                        if only is not None and (tier_floors, k, add_to_held) not in only:
-                            continue
-                        options = {"k": k, "spread_band": band, "quiet": True,
-                                   "end_date": end_dates[(band, k, "all")],
-                                   "tier_floors": tier_floors, "add_to_held": add_to_held}
-                        chosen = sell.caps if caps is None else tuple(caps)
-                        bases = {cap: backtester._simulate_at_discount(
-                            entries, start, 10_000.0, size_cap=cap, **options)
-                            for cap in chosen}
-                        reach = {cap: backtester._sale_reach(bases[cap], sell.levels)
-                                 for cap in chosen}
-                        points: dict = {}
-                        trades: dict = {}
-                        order = []
-                        for level, min_days, by_cap in sell.sold_grid(
-                                band, k, tier_floors=tier_floors, add_to_held=add_to_held,
-                                caps=caps):
-                            order.append((level, min_days))
-                            assert tuple(by_cap) == chosen
-                            for cap, cell in by_cap.items():
-                                fresh = backtester._simulate_at_discount(
-                                    entries, start, 10_000.0, size_cap=cap, sell_at=level,
-                                    sell_min_days=min_days, **options)
-                                if cell is None:
-                                    assert fresh.sales == ()
-                                    self._same_run(fresh, bases[cap])
-                                    top = reach[cap].get(level)
-                                    kinds["pruned, level" if top is None
-                                          else "pruned, days"] += 1
-                                elif isinstance(cell, backtester.SameSale):
-                                    # An earlier cell of this cap, simulated
-                                    named = points[(cell.level, cell.min_days, cap)]
-                                    assert (cell.level, cell.min_days) != (level, min_days)
-                                    self._same_run(fresh, named)
-                                    assert fresh.sales == named.sales
-                                    kinds["same"] += 1
-                                else:
-                                    assert (cell.sell_at, cell.sell_min_days, cell.size_cap,
-                                            cell.add_to_held, cell.tier_floors) == (
-                                        level, min_days, cap, add_to_held, tier_floors)
-                                    self._same_run(fresh, cell)
-                                    assert cell.sales and cell.sales == fresh.sales
-                                    points[(level, min_days, cap)] = cell
-                                    kinds["point"] += 1
-                                trades[(level, min_days, cap)] = [astuple(t)
-                                                                  for t in fresh.trades]
-                                if (isinstance(cell, backtester.SweepPoint) and min_days > 1
-                                        and trades[(level, min_days, cap)]
-                                        != trades[(level, sell.min_days[0], cap)]):
-                                    kinds["point differing from the fewest days"] += 1
-                        # Every level, ascending, and each level's minimums, ascending
-                        assert order == [(level, min_days) for level in sell.levels
-                                         for min_days in sell.min_days]
+                    if only is not None and (tier_floors, k) not in only:
+                        continue
+                    options = {"k": k, "spread_band": band, "quiet": True,
+                               "end_date": end_dates[(band, k, "all")],
+                               "tier_floors": tier_floors}
+                    chosen = sell.caps if caps is None else tuple(caps)
+                    bases = {cap: backtester._simulate_at_discount(
+                        entries, start, 10_000.0, size_cap=cap, **options)
+                        for cap in chosen}
+                    reach = {cap: backtester._sale_reach(bases[cap], sell.levels)
+                             for cap in chosen}
+                    points: dict = {}
+                    trades: dict = {}
+                    order = []
+                    for level, min_days, by_cap in sell.sold_grid(
+                            band, k, tier_floors=tier_floors, caps=caps):
+                        order.append((level, min_days))
+                        assert tuple(by_cap) == chosen
+                        for cap, cell in by_cap.items():
+                            fresh = backtester._simulate_at_discount(
+                                entries, start, 10_000.0, size_cap=cap, sell_at=level,
+                                sell_min_days=min_days, **options)
+                            if cell is None:
+                                assert fresh.sales == ()
+                                self._same_run(fresh, bases[cap])
+                                top = reach[cap].get(level)
+                                kinds["pruned, level" if top is None
+                                      else "pruned, days"] += 1
+                            elif isinstance(cell, backtester.SameSale):
+                                # An earlier cell of this cap, simulated
+                                named = points[(cell.level, cell.min_days, cap)]
+                                assert (cell.level, cell.min_days) != (level, min_days)
+                                self._same_run(fresh, named)
+                                assert fresh.sales == named.sales
+                                kinds["same"] += 1
+                            else:
+                                assert (cell.sell_at, cell.sell_min_days, cell.size_cap,
+                                        cell.add_to_held, cell.trim_to_kelly,
+                                        cell.tier_floors) == (
+                                    level, min_days, cap, False, False, tier_floors)
+                                self._same_run(fresh, cell)
+                                assert cell.sales and cell.sales == fresh.sales
+                                points[(level, min_days, cap)] = cell
+                                kinds["point"] += 1
+                            trades[(level, min_days, cap)] = [astuple(t)
+                                                              for t in fresh.trades]
+                            if (isinstance(cell, backtester.SweepPoint) and min_days > 1
+                                    and trades[(level, min_days, cap)]
+                                    != trades[(level, sell.min_days[0], cap)]):
+                                kinds["point differing from the fewest days"] += 1
+                    # Every level, ascending, and each level's minimums, ascending
+                    assert order == [(level, min_days) for level in sell.levels
+                                     for min_days in sell.min_days]
         return kinds
 
     def test_every_cell_of_the_sold_grid_equals_a_fresh_simulation(self, sell_run):
         sell = sell_run.on.sell_sweep
         kinds = self._grid_parity(sell_run)
-        cells = 2 * 2 * 2 * len(sell.levels) * len(sell.min_days) * len(sell.caps)
+        cells = 2 * 2 * len(sell.levels) * len(sell.min_days) * len(sell.caps)
         assert sum(kinds[kind] for kind in ("point", "same", "pruned, level",
                                             "pruned, days")) == cells
         # Not vacuous: every kind of cell occurs — a run reused through a
@@ -19789,9 +19383,9 @@ class TestSellSweep:
         with monkeypatch.context() as mp:
             mp.setattr(backtester, "_sale_cover", wrong)
             with pytest.raises(AssertionError):
-                self._grid_parity(sell_run, only={(True, 0.75, False)}, caps=(0.5, 1.0))
+                self._grid_parity(sell_run, only={(True, 0.75)}, caps=(0.5, 1.0))
         # The same narrow check passes with the real cover
-        kinds = self._grid_parity(sell_run, only={(True, 0.75, False)}, caps=(0.5, 1.0))
+        kinds = self._grid_parity(sell_run, only={(True, 0.75)}, caps=(0.5, 1.0))
         assert kinds["same"] > 0
 
     # Every minimum of days from 1 to one past the fixture's farthest reach
@@ -19853,38 +19447,36 @@ class TestSellSweep:
         for tier_floors, bands, _entries, _days in self._settings(sell):
             for band in bands:
                 for k in sell.ks:
-                    for add_to_held in (False, True):
-                        calls.clear()
-                        stats: dict = {}
-                        with monkeypatch.context() as mp:
-                            mp.setattr(backtester, "_simulate_at_discount", spy)
-                            grid = list(sell.sold_grid(band, k, tier_floors=tier_floors,
-                                                       add_to_held=add_to_held, caps=caps,
-                                                       stats=stats))
-                        points = {(level, min_days, cap)
-                                  for level, min_days, by_cap in grid
-                                  for cap, cell in by_cap.items()
-                                  if isinstance(cell, backtester.SweepPoint)}
-                        same = sum(isinstance(cell, backtester.SameSale)
-                                   for _l, _d, by_cap in grid for cell in by_cap.values())
-                        pruned = sum(cell is None
-                                     for _l, _d, by_cap in grid for cell in by_cap.values())
-                        # The no-selling run, then only cells yielded as points
-                        assert any(level is None for level, _days, _cap in calls)
-                        assert all(min_days is None for level, min_days, _cap in calls
-                                   if level is None)
-                        selling = [call for call in calls if call[0] is not None]
-                        assert set(selling) <= points
-                        # Caps at or above a peak share one simulation, so a
-                        # point's (level, minimum) was simulated at some cap
-                        assert {(level, min_days) for level, min_days, _cap in points} \
-                            == {(level, min_days) for level, min_days, _cap in selling}
-                        # The counts a report logs
-                        assert stats["simulated"] == len(calls)
-                        assert stats["simulated"] + stats["reused"] == len(caps) + len(points)
-                        assert (stats["same"], stats["pruned"]) == (same, pruned)
-                        assert len(points) + same + pruned == (
-                            len(sell.levels) * len(sell.min_days) * len(caps))
+                    calls.clear()
+                    stats: dict = {}
+                    with monkeypatch.context() as mp:
+                        mp.setattr(backtester, "_simulate_at_discount", spy)
+                        grid = list(sell.sold_grid(band, k, tier_floors=tier_floors,
+                                                   caps=caps, stats=stats))
+                    points = {(level, min_days, cap)
+                              for level, min_days, by_cap in grid
+                              for cap, cell in by_cap.items()
+                              if isinstance(cell, backtester.SweepPoint)}
+                    same = sum(isinstance(cell, backtester.SameSale)
+                               for _l, _d, by_cap in grid for cell in by_cap.values())
+                    pruned = sum(cell is None
+                                 for _l, _d, by_cap in grid for cell in by_cap.values())
+                    # The no-selling run, then only cells yielded as points
+                    assert any(level is None for level, _days, _cap in calls)
+                    assert all(min_days is None for level, min_days, _cap in calls
+                               if level is None)
+                    selling = [call for call in calls if call[0] is not None]
+                    assert set(selling) <= points
+                    # Caps at or above a peak share one simulation, so a
+                    # point's (level, minimum) was simulated at some cap
+                    assert {(level, min_days) for level, min_days, _cap in points} \
+                        == {(level, min_days) for level, min_days, _cap in selling}
+                    # The counts a report logs
+                    assert stats["simulated"] == len(calls)
+                    assert stats["simulated"] + stats["reused"] == len(caps) + len(points)
+                    assert (stats["same"], stats["pruned"]) == (same, pruned)
+                    assert len(points) + same + pruned == (
+                        len(sell.levels) * len(sell.min_days) * len(caps))
 
     def test_a_band_s_copy_reads_the_same_grid_after_pickling(self, sell_run):
         sell = sell_run.on.sell_sweep
@@ -19902,10 +19494,8 @@ class TestSellSweep:
             narrow = pickle.loads(pickle.dumps(narrow))
             assert (narrow.levels, narrow.min_days) == (sell.levels, sell.min_days)
             for k in sell.ks:
-                ours = list(narrow.sold_grid(band, k, tier_floors=tier_floors,
-                                             add_to_held=True, caps=caps))
-                theirs = list(sell.sold_grid(band, k, tier_floors=tier_floors,
-                                             add_to_held=True, caps=caps))
+                ours = list(narrow.sold_grid(band, k, tier_floors=tier_floors, caps=caps))
+                theirs = list(sell.sold_grid(band, k, tier_floors=tier_floors, caps=caps))
                 assert [(level, days) for level, days, _ in ours] == [
                     (level, days) for level, days, _ in theirs]
                 for (_l, _d, a), (_l2, _d2, b) in zip(ours, theirs, strict=True):
@@ -19992,8 +19582,7 @@ class TestSellSweep:
         for tier_floors, bands, _entries, _days in self._settings(sell):
             for band in bands:
                 for level in sell.levels:
-                    cell = sell.cell(level, band, sell.ks[0], tier_floors=tier_floors,
-                                     add_to_held=True)
+                    cell = sell.cell(level, band, sell.ks[0], tier_floors=tier_floors)
                     for pops in cell.values():
                         assert {(t.event_ticker, t.category)
                                 for t in pops["all"].trades} <= events
@@ -20097,8 +19686,8 @@ class TestCapSweepSells:
             assert all(kw.get("sell_min_days") == min_days for _pop, _level, kw in seen)
 
     def test_every_cap_with_a_minimum_equals_a_fresh_simulation(self, sell_run):
-        # The selling golden fixture, both Tier floors settings, both k,
-        # adding to held pairs or not: every cap of a CapSweep with a minimum
+        # The selling golden fixture, both Tier floors settings, both k: every
+        # cap of a CapSweep (a sell run neither adds nor trims) with a minimum
         # of days before maturity equals a fresh simulation at that cap,
         # level and minimum. At 50% (with a 3-day minimum) every sale comes
         # 53 days before maturity, so none is held back; at 25% some come 13
@@ -20111,36 +19700,34 @@ class TestCapSweepSells:
             for tier_floors, bands, entries_by_band, end_dates in settings:
                 for band in bands:
                     for k in sell.ks:
-                        for add_to_held in (False, True):
-                            plain = sell.sweep(level, tier_floors=tier_floors,
-                                               add_to_held=add_to_held)
-                            sweep = dc_replace(plain, sell_min_days=min_days)
-                            without = plain.cell(band, k)
-                            for cap, by_pop in sweep.cell(band, k).items():
-                                point = by_pop["all"]
-                                assert (point.sell_at, point.sell_min_days, point.size_cap) \
-                                    == (level, min_days, cap)
-                                fresh = backtester._simulate_at_discount(
-                                    entries_by_band[band], start, 10_000.0, k=k,
-                                    spread_band=band, size_cap=cap, quiet=True,
-                                    end_date=end_dates[(band, k, "all")],
-                                    tier_floors=tier_floors, add_to_held=add_to_held,
-                                    sell_at=level, sell_min_days=min_days)
-                                assert ([astuple(t) for t in point.trades]
-                                        == [astuple(t) for t in fresh.trades])
-                                pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df,
-                                                              check_exact=True)
-                                assert point.peak_kelly_fraction == fresh.peak_kelly_fraction
-                                assert point.sales == fresh.sales
-                                assert all(check.days_left >= min_days
-                                           for check in point.sales)
-                                checked += 1
-                                sold += len(point.sales)
-                                if ([astuple(t) for t in point.trades]
-                                        != [astuple(t) for t in without[cap]["all"].trades]):
-                                    held_back += 1
-                                    assert (level, min_days) == (0.25, 21)
-        assert checked == 2 * 2 * len(sell.ks) * 2 * len(sell.caps)
+                        plain = sell.sweep(level, tier_floors=tier_floors)
+                        sweep = dc_replace(plain, sell_min_days=min_days)
+                        without = plain.cell(band, k)
+                        for cap, by_pop in sweep.cell(band, k).items():
+                            point = by_pop["all"]
+                            assert (point.sell_at, point.sell_min_days, point.size_cap) \
+                                == (level, min_days, cap)
+                            fresh = backtester._simulate_at_discount(
+                                entries_by_band[band], start, 10_000.0, k=k,
+                                spread_band=band, size_cap=cap, quiet=True,
+                                end_date=end_dates[(band, k, "all")],
+                                tier_floors=tier_floors, sell_at=level,
+                                sell_min_days=min_days)
+                            assert ([astuple(t) for t in point.trades]
+                                    == [astuple(t) for t in fresh.trades])
+                            pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df,
+                                                          check_exact=True)
+                            assert point.peak_kelly_fraction == fresh.peak_kelly_fraction
+                            assert point.sales == fresh.sales
+                            assert all(check.days_left >= min_days
+                                       for check in point.sales)
+                            checked += 1
+                            sold += len(point.sales)
+                            if ([astuple(t) for t in point.trades]
+                                    != [astuple(t) for t in without[cap]["all"].trades]):
+                                held_back += 1
+                                assert (level, min_days) == (0.25, 21)
+        assert checked == 2 * 2 * len(sell.ks) * len(sell.caps)
         # Not vacuous: positions sell, and the 21-day minimum holds some back
         assert sold > 0 and held_back > 0
 
@@ -20236,7 +19823,7 @@ class TestWalkedTradeParity:
     def _settings(k: float = 0.75, cap: float = 0.2, add: bool = False) -> LiveSettings:
         return LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=k,
                             size_cap=cap, same_title_size_cap=backtester.SAME_TITLE_SIZE_CAP,
-                            add_to_held_pairs=add)
+                            rebalance=add)
 
     @staticmethod
     def _ts(quotes=(0.20, 0.60, 0.40)) -> tuple[dict, dict]:
@@ -20716,8 +20303,8 @@ class _WalkedGolden(_MovingGolden):
 @pytest.fixture(scope="class")
 def walk_sweep_run():
     """The walked golden fixture through run_backtest_sweep with a depth model
-    and every family (band sweep, tier floors off, size caps, add to held
-    pairs, selling) on a narrowed grid: bands (0, 0.5) and (0, 1) x k (0.5,
+    and every family (band sweep, tier floors off, size caps, Rebalance,
+    selling) on a narrowed grid: bands (0, 0.5) and (0, 1) x k (0.5,
     0.75), and the sell levels 5%, 50% and 100%, which span what this
     fixture's walked positions reach."""
     toggles = pytest.MonkeyPatch()
@@ -20733,7 +20320,7 @@ def walk_sweep_run():
         res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
                                  start_date=golden._START, initial_balance=10_000.0,
                                  same_event_ladders=True, band_sweep=True, cap_sweep=True,
-                                 tier_off_sweep=True, add_on_sweep=True, sell_sweep=True,
+                                 tier_off_sweep=True, rebalance_sweep=True, sell_sweep=True,
                                  depth_model=_walk_model())
         mp.undo()
         yield SimpleNamespace(res=res, start=golden._START)
@@ -20745,7 +20332,7 @@ def walk_sweep_run():
 @pytest.mark.usefixtures("walk_sweep_run")
 class TestWalkedCapSweepParity:
     """With walked books every cap of every lazy family (size cap, tier floors
-    off, add to held pairs, selling) still equals a fresh simulation of the
+    off, Rebalance, selling) still equals a fresh simulation of the
     same entries: a walked simulation shares only from its cap_free_from, the
     cap above which the live search's bound stops moving."""
 
@@ -20764,15 +20351,16 @@ class TestWalkedCapSweepParity:
                                                  end_date=end, tier_floors=tier_floors,
                                                  split_date=res.split_date, checks=True)
                             checked += 1
-        for cs, tier_floors in ((res.add_on_cap_sweep, True),
-                                (res.add_on_tier_off_cap_sweep, False)):
+        for tier_floors in (True, False):
+            cs = res.rebalance_sweep.sweep(tier_floors=tier_floors)
             for band in cs.bands:
                 for k in cs.ks:
                     for cap, pops in cs.cell(band, k).items():
                         parity._fresh_parity(pops["all"], cs.entries_by_band[band], start, k,
                                              band, "all", cap,
                                              end_date=cs.end_dates[(band, k, "all")],
-                                             tier_floors=tier_floors, add_to_held=True)
+                                             tier_floors=tier_floors, add_to_held=True,
+                                             trim_to_kelly=True)
                         checked += 1
         assert checked > 300
 
@@ -20786,20 +20374,18 @@ class TestWalkedCapSweepParity:
                 (False, sold.off_bands, sold.off_entries_by_band, sold.off_end_dates)):
             for band in bands:
                 for k in sold.ks:
-                    for add in (False, True):
-                        cell = sold.cell(level, band, k, tier_floors=tier_floors,
-                                         add_to_held=add)
-                        for cap, pops in cell.items():
-                            fresh = backtester._simulate_at_discount(
-                                entries_by_band[band], start, 10_000.0, k=k, spread_band=band,
-                                size_cap=cap, quiet=True, end_date=end_dates[(band, k, "all")],
-                                tier_floors=tier_floors, add_to_held=add, sell_at=level)
-                            point = pops["all"]
-                            assert [astuple(t) for t in point.trades] == [
-                                astuple(t) for t in fresh.trades], (band, k, cap, add)
-                            pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df,
-                                                          check_exact=True)
-                            sales += sum(t.sold for t in point.trades)
+                    cell = sold.cell(level, band, k, tier_floors=tier_floors)
+                    for cap, pops in cell.items():
+                        fresh = backtester._simulate_at_discount(
+                            entries_by_band[band], start, 10_000.0, k=k, spread_band=band,
+                            size_cap=cap, quiet=True, end_date=end_dates[(band, k, "all")],
+                            tier_floors=tier_floors, sell_at=level)
+                        point = pops["all"]
+                        assert [astuple(t) for t in point.trades] == [
+                            astuple(t) for t in fresh.trades], (band, k, cap)
+                        pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df,
+                                                      check_exact=True)
+                        sales += sum(t.sold for t in point.trades)
         # Not vacuous: at 5% some walked position sells. At higher levels a
         # position here is often larger than its modeled bid ladder holds, so
         # it is not sold, and none reaches 100% of its potential before it pays out
@@ -20866,15 +20452,16 @@ class TestCapSweepSharesFromCapFreeFrom:
     """With a walked book the cap sets how deep the live sizer searches, so a
     cap above a point's peak can still buy a different trade: CapSweep shares
     one simulation only from cap_free_from. Every cap against a fresh
-    simulation, in every kind of CapSweep: the size-cap family, tier floors
-    off, adding to held pairs, selling, and with the split-half and
+    simulation, in every kind of CapSweep a backtest builds: the size-cap
+    family, tier floors off, rebalancing (adding to and trimming held pairs
+    together, the Rebalance family's), selling, and with the split-half and
     excluding-top-event checks."""
 
     _BAND = (0.0, 1.0)
     _START, _END = date(2026, 1, 1), date(2026, 4, 1)
     # What each kind of CapSweep sets ("checks" sets checks=True instead)
     _FAMILIES = {"tier floors off": {"tier_floors": False},
-                 "adding to held pairs": {"add_to_held": True},
+                 "rebalancing": {"add_to_held": True, "trim_to_kelly": True},
                  "selling": {"sell_at": 0.5},
                  "checks": {}}
 
@@ -21088,11 +20675,12 @@ class TestBandReachesEveryResimulation:
         res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
                                  start_date=golden._START, initial_balance=10_000.0,
                                  same_event_ladders=True, band_sweep=True, cap_sweep=True,
-                                 tier_off_sweep=True, add_on_sweep=True, sell_sweep=True,
+                                 tier_off_sweep=True, rebalance_sweep=True, sell_sweep=True,
                                  depth_model=_walk_model())
         eager = len(calls)
-        for cs in (res.cap_sweep, res.tier_off_cap_sweep, res.add_on_cap_sweep,
-                   res.add_on_tier_off_cap_sweep):
+        for cs in (res.cap_sweep, res.tier_off_cap_sweep,
+                   res.rebalance_sweep.sweep(tier_floors=True),
+                   res.rebalance_sweep.sweep(tier_floors=False)):
             for band in cs.bands:
                 cs.cell(band, cs.ks[0])
         for tier_floors, bands in ((True, res.sell_sweep.bands), (False, res.sell_sweep.off_bands)):
@@ -22068,25 +21656,26 @@ class TestTrimToKelly:
         assert seen == [True, True, True, False, False]
 
 
-class TestTrimMinRise:
-    """With trim_to_kelly and a trim_min_rise, a held pair is looked at for
+class TestTrimMinMove:
+    """With trim_to_kelly and a min_move, a held pair is looked at for
     trimming only once its total price — the ask of the side held on each of
-    its two markets, added — is at least that many dollars above where it
-    stood at the checkpoint of the last trade on the pair: its latest
-    purchase or add-on, or a later trim. A fall never counts. Only trims are
-    held back, and None is the run with no minimum.
+    its two markets, added — is at least that many dollars above or below
+    where it stood at the checkpoint of the last trade on the pair: its
+    latest purchase or add-on, or a later trim. A rise and a fall count
+    alike, and None is the run with no minimum. (With add_to_held as well,
+    the same minimum holds back add-ons: TestAddOnWaitsForAMove.)
 
     The fixture is TestTrimToKelly's pair: YES on SA and NO on SB, bought on
     Monday 1. Its total ask is 0.62 there, 0.87 on Monday 2, 0.95 on Monday 3
-    and 0.77 on Monday 4, and with no minimum it is trimmed on Mondays 2 and
-    3. Every simulation is handed k 0.75, and a 20% cap unless it names
-    another."""
+    and 0.77 on Monday 4, and 0.52 once SA pays out (02-10); with no minimum
+    it is trimmed on Mondays 2 and 3. Every simulation is handed k 0.75, and
+    a 20% cap unless it names another."""
 
     _TRIM = TestTrimToKelly
     _PAIR = ("SA", "SB")
     _ASKS = {_LADDER_M1: 0.62, _LADDER_M2: 0.87, _LADDER_M3: 0.95, _M4: 0.77}
     _HELD_BACK = ("Held pairs not checked for a trim, a pair counted each week its "
-                  "price had not risen")
+                  "price had not moved")
 
     def _records(self, *args, **kw):
         return self._TRIM()._records(*args, **kw)
@@ -22122,19 +21711,19 @@ class TestTrimMinRise:
         assert backtester._pair_price(held, date(2026, 2, 16)) == pytest.approx(0.52, abs=1e-12)
 
     def test_no_minimum_is_the_default_and_the_run_without_the_keyword(self, caplog):
-        default = inspect.signature(backtester._simulate_at_discount).parameters["trim_min_rise"]
+        default = inspect.signature(backtester._simulate_at_discount).parameters["min_move"]
         assert default.default is None and default.kind is default.KEYWORD_ONLY
         records = self._records()
         with caplog.at_level(logging.DEBUG):
             base = self._sim(records)
             lines = [r.getMessage() for r in caplog.records]
             caplog.clear()
-            none = self._sim(records, trim_min_rise=None)
+            none = self._sim(records, min_move=None)
         self._TRIM._same(none, base)
         assert [r.getMessage() for r in caplog.records] == lines
         assert not any(self._HELD_BACK in line for line in lines)
-        assert base.trim_min_rise is None and none.trim_min_rise is None
-        assert none.trim_rises == base.trim_rises
+        assert base.min_move is None and none.min_move is None
+        assert none.moves == base.moves
         assert none.cap_free_from == base.cap_free_from
 
     def test_a_run_that_trims_records_the_rise_behind_each_trim(self, caplog):
@@ -22143,59 +21732,68 @@ class TestTrimMinRise:
             point = self._sim(records)
         assert self._sold_on(point) == [_LADDER_M2, _LADDER_M3]
         # Monday 2 is measured from the purchase, Monday 3 from Monday 2's trim
-        assert point.trim_rises == pytest.approx((0.87 - 0.62, 0.95 - 0.87), abs=1e-12)
-        assert type(point.trim_rises) is tuple
+        assert point.moves == pytest.approx((0.87 - 0.62, 0.95 - 0.87), abs=1e-12)
+        assert type(point.moves) is tuple
         # One figure per position trimmed
         assert f"{self._TRIM._LINE} ({_label(0.20)}, trimming to Kelly): 2 " in caplog.text
         # A run that could trim and trimmed nothing; a run that cannot trim;
         # a point built by hand
-        assert self._sim(records, cap=1.0).trim_rises == ()
+        assert self._sim(records, cap=1.0).moves == ()
         plain = self._plain(records)
-        assert plain.trim_rises is None and plain.trim_min_rise is None
+        assert plain.moves is None and plain.min_move is None
         bare = backtester.SweepPoint(0.75, [], pd.DataFrame())
-        assert bare.trim_rises is None and bare.trim_min_rise is None
+        assert bare.moves is None and bare.min_move is None
         # Like sales: how the trades came about, so not shown and not compared
-        rises = next(f for f in fields(backtester.SweepPoint) if f.name == "trim_rises")
+        rises = next(f for f in fields(backtester.SweepPoint) if f.name == "moves")
         assert rises.repr is False and rises.compare is False
 
-    @pytest.mark.parametrize("min_rise, trimmed_on, rises", [
-        (0.05, [_LADDER_M2, _LADDER_M3], (0.25, 0.08)),
-        (0.10, [_LADDER_M2], (0.25,)),
-        # Monday 2's rise is exactly 25c, float noise aside (0.87 - 0.62)
-        (0.25, [_LADDER_M2], (0.25,)),
-        (0.30, [_LADDER_M3], (0.33,)),
-        (0.35, [], ()),
+    @pytest.mark.parametrize("min_move, trimmed_on, rises, held_back", [
+        # Every move from Monday 4 on is at least 18c below Monday 3's trim
+        (0.05, [_LADDER_M2, _LADDER_M3], (0.25, 0.08), 0),
+        # Monday 3 is 8c above Monday 2's trim; from Monday 4 on the price is
+        # 10c or more below it, and the pair is looked at (and kept)
+        (0.10, [_LADDER_M2], (0.25,), 1),
+        # Monday 2's rise is exactly 25c, float noise aside (0.87 - 0.62).
+        # Held back on Mondays 3 to 6 (+8c, then -10c); from 02-16, with SA
+        # paid out, the price is 35c below the trim
+        (0.25, [_LADDER_M2], (0.25,), 4),
+        # Monday 2 (+25c) held back; Monday 3 trims (+33c); Mondays 4 to 6
+        # are 18c below that trim, 02-16 on 43c below
+        (0.30, [_LADDER_M3], (0.33,), 4),
+        # No checkpoint is 35c from the purchase, up or down
+        (0.35, [], (), 10),
     ])
-    def test_a_pair_is_trimmed_only_after_its_price_has_risen_the_minimum(
-            self, caplog, min_rise, trimmed_on, rises):
+    def test_a_pair_is_trimmed_only_after_its_price_has_moved_the_minimum(
+            self, caplog, min_move, trimmed_on, rises, held_back):
         records = self._records()
         with caplog.at_level(logging.INFO):
-            point = self._sim(records, trim_min_rise=min_rise)
-        assert point.trim_min_rise == min_rise and point.trim_to_kelly is True
+            point = self._sim(records, min_move=min_move)
+        assert point.min_move == min_move and point.trim_to_kelly is True
         assert self._sold_on(point) == trimmed_on
-        assert point.trim_rises == pytest.approx(rises, abs=1e-12)
+        assert point.moves == pytest.approx(rises, abs=1e-12)
         # The walk looks at the pair on every checkpoint from Monday 2 to its
-        # pay-out on 03-20 (ten of them), and holds it back wherever it is
-        # not trimmed: from Monday 4 on its price is below the last trade's
+        # pay-out on 03-20 (ten of them), and holds it back wherever its
+        # price has moved less than the minimum, either way, since its last trade
         checkpoints = backtester._sale_checkpoints(_LADDER_M2, date(2026, 3, 20))
         assert len(checkpoints) == 10 and checkpoints[:3] == [_LADDER_M2, _LADDER_M3, _M4]
-        cents = backtester._cap_percent(min_rise)
-        label = f"{_label(0.20)}, trimming to Kelly only after a {cents}c price rise"
-        assert (f"{self._HELD_BACK} {cents}c since its last trade ({label}): "
-                f"{len(checkpoints) - len(trimmed_on)}") in [
-            r.getMessage() for r in caplog.records]
+        cents = backtester._cap_percent(min_move)
+        label = f"{_label(0.20)}, trimming to Kelly only after a {cents}c price move"
+        held = [r.getMessage() for r in caplog.records
+                if r.getMessage().startswith(self._HELD_BACK)]
+        assert held == ([f"{self._HELD_BACK} {cents}c either way since its last trade "
+                         f"({label}): {held_back}"] if held_back else [])
 
     def test_a_low_minimum_changes_nothing_and_a_high_one_never_trims(self):
         records = self._records()
         base, plain = self._sim(records), self._plain(records)
         # Both trims came after more than 5c: the same run
-        low = self._sim(records, trim_min_rise=0.05)
+        low = self._sim(records, min_move=0.05)
         self._TRIM._same(low, base)
         assert low.cap_free_from == base.cap_free_from
         # No Monday is 35c above the purchase: the run that cannot trim.
         # A pair held back is asked for no decision, so the cap the run stops
         # depending on is the purchases' own, below the trimming run's
-        high = self._sim(records, trim_min_rise=0.35)
+        high = self._sim(records, min_move=0.35)
         self._TRIM._same(high, plain)
         assert high.cap_free_from == plain.cap_free_from < base.cap_free_from
 
@@ -22205,16 +21803,16 @@ class TestTrimMinRise:
         _kept, first, second = base.trades
         # At 10c, Monday 2 trims as it does with no minimum. Monday 3 is 33c
         # above the purchase but only 8c above Monday 2's trim: held back
-        point = self._sim(records, trim_min_rise=0.10)
+        point = self._sim(records, min_move=0.10)
         kept, part = point.trades
         assert part.sold and part.exit_date == _LADDER_M2 and part.n == first.n
         assert (part.sale_price_a, part.sale_price_b) == (0.28, 0.55)
         assert not kept.sold and kept.n == _kept.n + second.n
-        rise = backtester._price_rise
+        rise = backtester._price_move
         assert rise([kept], _LADDER_M3, {}) == pytest.approx(0.33, abs=1e-12)
         assert rise([kept], _LADDER_M3, {self._PAIR: _LADDER_M2}) == pytest.approx(
             0.08, abs=1e-12)
-        assert not config.trim_rise_reached(rise([kept], _LADDER_M3, {self._PAIR: _LADDER_M2}),
+        assert not config.price_move_reached(rise([kept], _LADDER_M3, {self._PAIR: _LADDER_M2}),
                                             0.10)
 
     def test_a_monday_it_was_held_back_on_does_not_move_that_price(self):
@@ -22222,7 +21820,7 @@ class TestTrimMinRise:
         (held,) = self._plain(records).trades
         # At 30c, Monday 2 (+25c) is held back. Monday 3 is still measured
         # from the purchase (+33c) and trims, on the whole purchase
-        point = self._sim(records, trim_min_rise=0.30)
+        point = self._sim(records, min_move=0.30)
         kept, part = point.trades
         assert part.sold and part.exit_date == _LADDER_M3
         assert (part.sale_price_a, part.sale_price_b) == (0.29, 0.62)
@@ -22236,17 +21834,18 @@ class TestTrimMinRise:
             held.n, value, win, 0.20, top,
             lambda pairs: _sale_value(pairs, ("bid", 0.29), ("bid", 0.62))).sell
 
-    def test_a_fall_never_opens_a_trim(self):
+    def test_a_fall_of_the_minimum_opens_a_trim(self):
         records = self._records()
         base = self._sim(records)
         kept = base.trades[0]
-        # Monday 4 is 18c below Monday 3's trim. With no minimum the pair is
-        # looked at there and not trimmed (it is back within its size); with
-        # one it is not looked at
-        fall = backtester._price_rise([kept], _M4, {self._PAIR: _LADDER_M3})
+        # Monday 4 is 18c below Monday 3's trim. A minimum up to 18c lets the
+        # pair be looked at there, as with no minimum; it is not trimmed (it
+        # is back within its size). A larger minimum holds it back
+        fall = backtester._price_move([kept], _M4, {self._PAIR: _LADDER_M3})
         assert fall == pytest.approx(0.77 - 0.95, abs=1e-12)
-        assert not any(config.trim_rise_reached(fall, minimum) for minimum in (1e-9, 0.05, 1.0))
-        assert config.trim_rise_reached(fall, None)
+        assert all(config.price_move_reached(fall, minimum) for minimum in (1e-9, 0.05, 0.18))
+        assert not any(config.price_move_reached(fall, minimum) for minimum in (0.19, 1.0))
+        assert config.price_move_reached(fall, None)
         assert _M4 not in self._sold_on(base)
 
         # A pair past its size cap whose price fell: on Monday 3 its quotes
@@ -22258,18 +21857,23 @@ class TestTrimMinRise:
                    "SB": [_candle(_ck(_LADDER_M1), 0.60, 0.42), *_held(_LADDER_M2, 0.45, 0.61),
                           *_held(_LADDER_M3, 0.40, 0.61)]}
         any_rise = self._sim(self._records(candles=candles))
-        # With no minimum it is trimmed on both Mondays, the second after a fall
+        # With no minimum it is trimmed on both Mondays, the second after a 3c fall
         assert self._sold_on(any_rise) == [_LADDER_M2, _LADDER_M3]
-        assert any_rise.trim_rises == pytest.approx((0.95 - 0.62, 0.92 - 0.95), abs=1e-12)
-        assert any_rise.trim_rises[1] < 0
-        for minimum in (0.01, 0.05, 0.30):
-            point = self._sim(self._records(candles=candles), trim_min_rise=minimum)
-            # Monday 2's trim, and nothing after the fall
+        assert any_rise.moves == pytest.approx((0.95 - 0.62, 0.92 - 0.95), abs=1e-12)
+        assert any_rise.moves[1] < 0
+        # A minimum of up to 3c lets the fall through: the same two trims
+        for minimum in (0.01, 0.03):
+            point = self._sim(self._records(candles=candles), min_move=minimum)
+            self._TRIM._same(point, any_rise)
+            assert point.moves == pytest.approx(any_rise.moves, abs=1e-12)
+        # A larger one holds it back: Monday 2's trim, and nothing after the fall
+        for minimum in (0.05, 0.30):
+            point = self._sim(self._records(candles=candles), min_move=minimum)
             assert self._sold_on(point) == [_LADDER_M2]
-            assert point.trim_rises == pytest.approx((0.33,), abs=1e-12)
+            assert point.moves == pytest.approx((0.33,), abs=1e-12)
             assert point.trades[1].n == any_rise.trades[1].n
 
-    def test_an_add_on_moves_the_price_the_next_rise_is_measured_from(self):
+    def test_an_add_on_moves_the_price_the_next_move_is_measured_from(self):
         # TestTrimToKelly's add-on fixture: bought on Monday 1 (total ask
         # 0.62), added to on Monday 2 when its price falls (0.52), then up on
         # Monday 3 (0.96) and Monday 4 (1.00)
@@ -22287,33 +21891,34 @@ class TestTrimMinRise:
         prices = [backtester._pair_price(bought, day)
                   for day in (_LADDER_M1, _LADDER_M2, _LADDER_M3, _M4)]
         assert prices == pytest.approx([0.62, 0.52, 0.96, 1.00], abs=1e-12)
-        # With no minimum: trimmed on Monday 3 (44c above the add-on) and
-        # again on Monday 4 (4c above that trim)
+        # With no minimum: the add-on on Monday 2 (10c below the purchase),
+        # then trims on Monday 3 (44c above the add-on) and Monday 4 (4c above
+        # that trim). The record holds the add-on's move first, then the trims'
         base = run()
         assert self._sold_on(base) == [_LADDER_M3, _LADDER_M3, _M4]
-        assert base.trim_rises == pytest.approx((0.96 - 0.52, 1.00 - 0.96), abs=1e-12)
-        # At 40c Monday 3 still trims: 44c above the add-on, where it is only
-        # 34c above the first purchase. Monday 4 (+4c) is held back
-        at_40 = run(trim_min_rise=0.40)
-        assert self._sold_on(at_40) == [_LADDER_M3, _LADDER_M3]
-        assert at_40.trim_rises == pytest.approx((0.44,), abs=1e-12)
-        # At 45c Monday 3 (+44c) is held back and Monday 4 trims, 48c above
-        # the add-on (38c above the first purchase)
-        at_45 = run(trim_min_rise=0.45)
-        assert self._sold_on(at_45) == [_M4, _M4]
-        assert at_45.trim_rises == pytest.approx((0.48,), abs=1e-12)
-        # Buying is not held back: on Monday 2, below the minimum either
-        # way, the add-on is bought exactly as the run that cannot trim buys it
-        for point in (base, at_40, at_45):
-            add_on = next(t for t in point.trades if t.add_on)
-            assert (add_on.n, add_on.entry_date, add_on.total_cost, add_on.fees) == (
-                added.n, added.entry_date, added.total_cost, added.fees)
+        assert base.moves == pytest.approx(
+            (0.52 - 0.62, 0.96 - 0.52, 1.00 - 0.96), abs=1e-12)
+        # At 10c the add-on (a 10c fall) is bought, and Monday 3's trim reads
+        # 44c, measured from the add-on (from the purchase it would read 34c).
+        # Monday 4 (+4c since that trim) is held back
+        at_10 = run(min_move=0.10)
+        assert self._sold_on(at_10) == [_LADDER_M3, _LADDER_M3]
+        assert at_10.moves == pytest.approx((-0.10, 0.44), abs=1e-12)
+        add_on = next(t for t in at_10.trades if t.add_on)
+        assert (add_on.n, add_on.entry_date, add_on.total_cost, add_on.fees) == (
+            added.n, added.entry_date, added.total_cost, added.fees)
+        # At 40c the add-on is held back too (the same minimum gates it), so
+        # the pair is measured from its purchase: 34c on Monday 3 and 38c on
+        # Monday 4, never trimmed
+        at_40 = run(min_move=0.40)
+        assert [(t.entry_date, t.n) for t in at_40.trades] == [(bought.entry_date, bought.n)]
+        assert self._sold_on(at_40) == [] and at_40.moves == ()
 
     def test_the_rise_is_measured_from_the_latest_purchase_add_on_or_trim(self):
         (held,) = self._plain(self._records()).trades
-        rise = backtester._price_rise
+        rise = backtester._price_move
         # From the purchase, through config's own measure
-        assert rise([held], _LADDER_M2, {}) == config.pair_price_rise(
+        assert rise([held], _LADDER_M2, {}) == config.pair_price_move(
             backtester._pair_price(held, _LADDER_M1), backtester._pair_price(held, _LADDER_M2))
         assert rise([held], _LADDER_M2, {}) == pytest.approx(0.25, abs=1e-12)
         assert rise([held], _M4, {}) == pytest.approx(0.15, abs=1e-12)
@@ -22333,7 +21938,7 @@ class TestTrimMinRise:
 
     def test_a_position_the_trim_leaves_alone_has_no_rise(self):
         (held,) = self._plain(self._records()).trades
-        rise = backtester._price_rise
+        rise = backtester._price_move
         # No quotes, or not one exact pair (a third market; another way round)
         assert rise([dc_replace(held, marks=None)], _LADDER_M2, {}) is None
         assert rise([held, dc_replace(held, ticker_b="SC")], _LADDER_M2, {}) is None
@@ -22342,102 +21947,107 @@ class TestTrimMinRise:
         # ... so the minimum never holds one back, and it is asked as before:
         # a trade with no quotes under a minimum is the run that cannot trim
         bare = [self._TRIM._SUITE._record()]
-        point = self._sim(bare, cap=0.05, trim_min_rise=0.05)
+        point = self._sim(bare, cap=0.05, min_move=0.05)
         self._TRIM._same(point, self._plain(bare, cap=0.05))
-        assert point.trim_rises == ()
+        assert point.moves == ()
 
-    def test_a_minimum_needs_a_run_that_trims(self):
+    def test_a_minimum_needs_a_run_that_adds_or_trims(self):
         # [{}] raises KeyError the moment Pass 1b scores it (checked last),
         # so a ValueError here was raised before any entry was scored
-        for off in ({}, {"trim_to_kelly": False}):
-            with pytest.raises(ValueError, match="trim_min_rise needs trim_to_kelly"):
-                self._plain([{}], trim_min_rise=0.10, **off)
+        for off in ({}, {"trim_to_kelly": False}, {"add_to_held": False}):
+            with pytest.raises(ValueError,
+                               match="min_move needs add_to_held or trim_to_kelly"):
+                self._plain([{}], min_move=0.10, **off)
+        # A run that trims, or one that only adds to held pairs, takes it
         with pytest.raises(KeyError):
-            self._sim([{}], trim_min_rise=0.10)
+            self._sim([{}], min_move=0.10)
+        with pytest.raises(KeyError):
+            self._plain([{}], min_move=0.10, add_to_held=True)
 
     @pytest.mark.parametrize("bad", [0, 0.0, -0.05, 1.5, True, np.bool_(True), float("nan"),
                                      "0.1", Decimal("0.1")])
     def test_a_bad_minimum_is_refused_before_any_entry_is_scored(self, bad):
         with pytest.raises(ValueError,
-                           match=r"trim_min_rise must be (a real number )?in \(0, 1\]"):
-            self._sim([{}], trim_min_rise=bad)
+                           match=r"min_move must be (a real number )?in \(0, 1\]"):
+            self._sim([{}], min_move=bad)
 
     @pytest.mark.parametrize("tiny", [1e-9, 5e-7, 0.00009])
     def test_a_minimum_under_one_price_step_is_refused(self, tiny):
         # Under the float slack the rule allows, a flat price would read as a
-        # rise: config.trim_rise_reached(0.0, 1e-9) is true
-        with pytest.raises(ValueError, match=r"trim_min_rise must be at least 0\.0001 dollars"):
-            self._sim([{}], trim_min_rise=tiny)
+        # rise: config.price_move_reached(0.0, 1e-9) is true
+        with pytest.raises(ValueError, match=r"min_move must be at least 0\.0001 dollars"):
+            self._sim([{}], min_move=tiny)
 
     def test_the_finest_price_step_is_a_minimum_and_a_flat_price_does_not_pass_it(self):
         step = config.MIN_ACTIVE_PRICE_DOLLARS
-        point = self._sim(self._records(), trim_min_rise=step)
-        assert point.trim_min_rise == step
-        assert not config.trim_rise_reached(0.0, step)
-        assert not config.trim_rise_reached(-step, step)
-        # So under any minimum a run accepts, no trim follows a fall
-        assert all(rise > 0 for rise in point.trim_rises)
+        point = self._sim(self._records(), min_move=step)
+        assert point.min_move == step
+        # A flat price is no move; one step either way is
+        assert not config.price_move_reached(0.0, step)
+        assert config.price_move_reached(-step, step) and config.price_move_reached(step, step)
+        # So under any minimum a run accepts, no trim follows a flat price
+        assert all(abs(rise) >= step for rise in point.moves)
 
     def test_a_numpy_number_and_a_whole_dollar_are_minimums(self):
         records = self._records()
-        point = self._sim(records, trim_min_rise=np.float64(0.10))
-        assert point.trim_min_rise == 0.10 and type(point.trim_min_rise) is float
-        self._TRIM._same(point, self._sim(records, trim_min_rise=0.10))
+        point = self._sim(records, min_move=np.float64(0.10))
+        assert point.min_move == 0.10 and type(point.min_move) is float
+        self._TRIM._same(point, self._sim(records, min_move=0.10))
         # A whole dollar is the top of the range: no pair's price rises that far
-        assert self._sim(records, trim_min_rise=1.0).trim_rises == ()
-        assert self._sim(records, trim_min_rise=1).trim_min_rise == 1.0
+        assert self._sim(records, min_move=1.0).moves == ()
+        assert self._sim(records, min_move=1).min_move == 1.0
 
     def test_the_label_names_the_minimum(self, caplog):
         records = self._records()
         with caplog.at_level(logging.INFO):
-            point = self._sim(records, trim_min_rise=0.10)
+            point = self._sim(records, min_move=0.10)
         _kept, part = point.trades
-        label = f"{_label(0.20)}, trimming to Kelly only after a 10c price rise"
+        label = f"{_label(0.20)}, trimming to Kelly only after a 10c price move"
         assert _completion_lines(caplog) == [
             f"Backtest complete at {label}: 2 trades, 2 profitable"]
         lines = {r.getMessage(): r.levelno for r in caplog.records}
         assert lines[f"{self._TRIM._LINE} ({label}): 1 "
                      f"(contract pairs sold: {part.n})"] == logging.INFO
-        held_back = f"{self._HELD_BACK} 10c since its last trade ({label}): 9"
+        held_back = f"{self._HELD_BACK} 10c either way since its last trade ({label}): 1"
         assert lines[held_back] == logging.INFO
         # A quiet run (a lazy size-cap cell) logs the same lines at DEBUG
         caplog.clear()
         with caplog.at_level(logging.DEBUG):
-            self._sim(records, trim_min_rise=0.10, quiet=True)
+            self._sim(records, min_move=0.10, quiet=True)
         quiet = {r.getMessage(): r.levelno for r in caplog.records}
         assert quiet[held_back] == logging.DEBUG
         assert quiet[f"Backtest complete at {label}: 2 trades, 2 profitable"] == logging.DEBUG
         # The words, on their own: cents, with every digit that tells two minimums apart
-        assert backtester._trim_rise_label(0.05) == " only after a 5c price rise"
-        assert backtester._trim_rise_label(0.125) == " only after a 12.5c price rise"
-        assert backtester._trim_rise_label(1.0) == " only after a 100c price rise"
+        assert backtester._move_label(0.05) == " only after a 5c price move"
+        assert backtester._move_label(0.125) == " only after a 12.5c price move"
+        assert backtester._move_label(1.0) == " only after a 100c price move"
 
     def test_sim_options_forwards_it_only_when_set(self):
-        assert backtester._sim_options(None, False, trim_min_rise=None) == {}
-        assert backtester._sim_options(None, False, trim_to_kelly=True, trim_min_rise=None) == {
+        assert backtester._sim_options(None, False, min_move=None) == {}
+        assert backtester._sim_options(None, False, trim_to_kelly=True, min_move=None) == {
             "trim_to_kelly": True}
-        assert backtester._sim_options(None, False, trim_to_kelly=True, trim_min_rise=0.10) == {
-            "trim_to_kelly": True, "trim_min_rise": 0.10}
+        assert backtester._sim_options(None, False, trim_to_kelly=True, min_move=0.10) == {
+            "trim_to_kelly": True, "min_move": 0.10}
         assert backtester._sim_options(0.35, True, add_to_held=True, trim_to_kelly=True,
-                                       trim_min_rise=0.05) == {
+                                       min_move=0.05) == {
             "size_cap": 0.35, "quiet": True, "add_to_held": True, "trim_to_kelly": True,
-            "trim_min_rise": 0.05}
+            "min_move": 0.05}
 
     def test_the_checks_re_simulate_at_the_point_s_minimum(self, monkeypatch):
         records = self._records()
-        point = self._sim(records, trim_min_rise=0.10)
+        point = self._sim(records, min_move=0.10)
         seen = []
         real = backtester._simulate_at_discount
 
         def spy(*args, **kwargs):
             seen.append((kwargs.get("trim_to_kelly", False),
-                         kwargs.get("trim_min_rise", "not forwarded")))
+                         kwargs.get("min_move", "not forwarded")))
             return real(*args, **kwargs)
         monkeypatch.setattr(backtester, "_simulate_at_discount", spy)
         start, balance = self._TRIM._START, self._TRIM._BALANCE
         backtester._ex_top_event(point, records, start, balance, (0.0, 1.0))
         backtester._half_split((records, []), start, balance, 0.75, (0.0, 1.0),
-                               size_cap=0.20, trim_to_kelly=True, trim_min_rise=0.10)
+                               size_cap=0.20, trim_to_kelly=True, min_move=0.10)
         backtester._half_split((records, []), start, balance, 0.75, (0.0, 1.0),
                                size_cap=0.20, trim_to_kelly=True)
         assert seen == [(True, 0.10), (True, 0.10), (True, 0.10),
@@ -22521,13 +22131,13 @@ class TestTrimCapSweep:
         assert cs.simulated + cs.reused == len(cs.ks) * len(cs.caps)
 
     @pytest.mark.parametrize("add", [False, True])
-    def test_every_cap_with_a_minimum_price_rise_equals_a_fresh_simulation(self, add):
-        # A sweep that trims only after a 10c price rise: the minimum reaches
+    def test_every_cap_with_a_minimum_price_move_equals_a_fresh_simulation(self, add):
+        # A sweep that trims only after a 10c price move: the minimum reaches
         # every simulation, and a simulation is still shared only by the caps
         # that make the same run
         entries = self._entries()
-        cs = self._sweep(entries, (0.5, 0.75), add=add, trim_min_rise=0.10)
-        assert cs.trim_min_rise == 0.10
+        cs = self._sweep(entries, (0.5, 0.75), add=add, min_move=0.10)
+        assert cs.min_move == 0.10
         trimmed = held_back = 0
         for k in cs.ks:
             cell = cs.cell(self._BAND, k)
@@ -22536,15 +22146,15 @@ class TestTrimCapSweep:
                 fresh = backtester._simulate_at_discount(
                     entries, self._START, 10_000.0, k=k, spread_band=self._BAND, size_cap=cap,
                     quiet=True, end_date=self._END, add_to_held=add, trim_to_kelly=True,
-                    trim_min_rise=0.10)
-                assert (point.size_cap, point.trim_to_kelly, point.trim_min_rise,
+                    min_move=0.10)
+                assert (point.size_cap, point.trim_to_kelly, point.min_move,
                         point.add_to_held) == (cap, True, 0.10, add)
                 assert [astuple(t) for t in point.trades] == [
                     astuple(t) for t in fresh.trades], (k, cap)
                 pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df)
                 # A shared copy carries the rises of the run it shares
-                assert point.trim_rises == fresh.trim_rises
-                trimmed += bool(point.trim_rises)
+                assert point.moves == fresh.moves
+                trimmed += bool(point.moves)
                 # Where the minimum holds a trim back, the run is not the
                 # no-minimum run's
                 held_back += [astuple(t) for t in point.trades] != [
@@ -22554,16 +22164,24 @@ class TestTrimCapSweep:
         assert trimmed > 0 and held_back > 0 and cs.reused > 0
         assert cs.simulated + cs.reused == len(cs.ks) * len(cs.caps)
 
-    def test_a_minimum_price_rise_needs_a_sweep_that_trims(self):
+    def test_a_minimum_price_move_needs_a_sweep_that_adds_or_trims(self):
         entries = self._entries()
-        with pytest.raises(ValueError, match="trim_min_rise needs trim_to_kelly"):
-            self._sweep(entries, (0.75,), trim_to_kelly=False, trim_min_rise=0.1)
+        with pytest.raises(ValueError, match="min_move needs add_to_held or trim_to_kelly"):
+            self._sweep(entries, (0.75,), trim_to_kelly=False, min_move=0.1)
+        # A sweep that only adds to held pairs takes one: its add-ons wait for it
+        assert self._sweep(entries, (0.75,), add=True, trim_to_kelly=False,
+                           min_move=0.1).min_move == 0.1
+        # ... but only an actual True adds (_sim_options forwards nothing
+        # else), so a truthy stand-in is refused when the sweep is built,
+        # never at its first cell
+        with pytest.raises(ValueError, match="min_move needs add_to_held or trim_to_kelly"):
+            self._sweep(entries, (0.75,), add=1, trim_to_kelly=False, min_move=0.1)
         # ... and is checked as one simulation's is, before any cell is read
         for bad in (0, 1.5, True, float("nan"), "0.1"):
-            with pytest.raises(ValueError, match="trim_min_rise must be"):
-                self._sweep(entries, (0.75,), trim_min_rise=bad)
+            with pytest.raises(ValueError, match="min_move must be"):
+                self._sweep(entries, (0.75,), min_move=bad)
         # No minimum is the sweep it was
-        assert self._sweep(entries, (0.75,)).trim_min_rise is None
+        assert self._sweep(entries, (0.75,)).min_move is None
 
     def test_the_cells_are_the_trimming_runs_not_the_plain_ones(self):
         entries = self._entries()
@@ -22607,22 +22225,25 @@ class TestTrimCapSweep:
             sells.cell(self._BAND, 0.75)
 
 
-class TestTrimRiseGrid:
-    """TrimSweep.rise_grid reads one (band, k) cell at every minimum price
-    rise while simulating only the runs that differ. A minimum that still
-    lets through every trim a run at a smaller minimum (or at none) made is
-    that run, yielded as a SameTrim naming it; every other one is simulated
-    and yielded as a point. The gate: every (minimum, cap, add on/off) equals
-    a fresh _simulate_at_discount(..., trim_to_kelly=True, trim_min_rise=T,
-    size_cap=cap, add_to_held=add) on trades and equity, a SameTrim through
-    the earlier run it names.
+class TestMoveGrid:
+    """RebalanceSweep.move_grid reads one (band, k) cell at every minimum price
+    movement while simulating only the runs that differ. Every run it reads
+    rebalances: it adds to and trims held pairs together. A minimum that still
+    lets through every add-on and every trim a run at a smaller minimum (or
+    at none) made is that run, yielded as a SameMove naming it; every other
+    one is simulated and yielded as a point. The gate: every (minimum, cap)
+    equals a fresh _simulate_at_discount(..., add_to_held=True,
+    trim_to_kelly=True, min_move=T, size_cap=cap) on trades and equity, a
+    SameMove through the earlier run it names.
 
     Three fixtures. TestTrimCapSweep's three pairs, whose first pair is
     trimmed after rises of 25c and 8c at the low caps, 33c at the middle
-    ones and not at all at the high ones. TestTrimMinRise's add-on pair,
-    added to on Monday 2, so its rises are measured from the add-on. And its
-    pair whose price fell before a trim (rises 33c, then -3c), which only a
-    run with no minimum makes."""
+    ones and not at all at the high ones (it is never added to, so adding
+    changes nothing there). TestTrimMinMove's
+    add-on pair, added to on Monday 2 after a 10c fall, which a minimum above
+    10c holds back, so its runs differ there by the add-on alone. And its
+    pair whose price fell 3c before a trim (moves 33c, then -3c), which a
+    minimum of up to 3c still lets through."""
 
     _CAPS = TestTrimCapSweep
     _BAND = TestTrimCapSweep._BAND
@@ -22630,14 +22251,15 @@ class TestTrimRiseGrid:
     _END = TestTrimCapSweep._END
     _KS = (0.5, 0.75)
     _SHORT = (0.05, 0.10, 0.25, 0.30, 0.35)
-    # What the cover asks of every trim a run made, in rise_grid's source
-    _COVER = "if all(trim_rise_reached(rise, min_rise) for rise in rises):"
+    # What the cover asks of every add-on and trim a run made, in move_grid's source
+    _COVER = "if all(price_move_reached(move, min_move) for move in moves):"
     _COVER_MUTANTS = {
         "always the same run": "if True:",
         "never the same run": "if False:",
-        "a fall counted as a rise": (
-            "if all(trim_rise_reached(abs(rise), min_rise) for rise in rises):"),
+        "a fall never counted": "if all(move >= min_move - PRICE_EPSILON for move in moves):",
     }
+    # Where the walk records an add-on's move beside the trims', in its source
+    _ADD_ON_RECORD = "                moves.append(0.0 if add_move is None else add_move)"
 
     def _entries(self) -> list[dict]:
         return self._CAPS()._entries()
@@ -22663,20 +22285,21 @@ class TestTrimRiseGrid:
                           *_held(_LADDER_M3, 0.40, 0.61)]}
         return TestTrimToKelly()._records(candles=candles)
 
-    def _family(self, entries, min_rises, *, caps=backtester.SIZE_CAP_SWEEP):
-        return backtester.TrimSweep(
+    def _family(self, entries, min_moves, *, caps=backtester.SIZE_CAP_SWEEP):
+        return backtester.RebalanceSweep(
             caps=tuple(caps), primary_cap=0.20, bands=(self._BAND,), off_bands=(),
             ks=self._KS, primary_k=self._KS[0], start_date=self._START,
             initial_balance=10_000.0, entries_by_band={self._BAND: entries},
             off_entries_by_band={},
             end_dates={(self._BAND, k, "all"): self._END for k in self._KS},
-            off_end_dates={}, min_rises=tuple(min_rises))
+            off_end_dates={}, min_moves=tuple(min_moves))
 
-    def _fresh(self, entries, k, cap, add, min_rise):
+    def _fresh(self, entries, k, cap, min_move):
+        """A fresh rebalancing simulation: adding and trimming, as every grid run does."""
         return backtester._simulate_at_discount(
             entries, self._START, 10_000.0, k=k, spread_band=self._BAND, size_cap=cap,
-            quiet=True, end_date=self._END, add_to_held=add, trim_to_kelly=True,
-            trim_min_rise=min_rise)
+            quiet=True, end_date=self._END, add_to_held=True, trim_to_kelly=True,
+            min_move=min_move)
 
     @staticmethod
     def _trades(point) -> list:
@@ -22688,58 +22311,56 @@ class TestTrimRiseGrid:
         assert cls._trades(point) == cls._trades(other)
         pd.testing.assert_frame_equal(point.equity_df, other.equity_df, check_exact=True)
 
-    def _parity(self, family, entries, k, add, *, caps=None, start=None) -> Counter:
-        """Read every (minimum, cap) of rise_grid and check each cell against
+    def _parity(self, family, entries, k, *, caps=None, start=None) -> Counter:
+        """Read every (minimum, cap) of move_grid and check each cell against
         a fresh simulation at that minimum and cap. A point is that
         simulation, and differs from the run it replaces (so it had to be
-        simulated). A SameTrim names the run in hand for its cap — the run
+        simulated). A SameMove names the run in hand for its cap — the run
         with no minimum, or the last cell of that cap yielded as a point —
         and the fresh run equals that run. Once a run has trimmed nothing,
-        every later minimum of its cap is a SameTrim. Returns how many cells
+        every later minimum of its cap is a SameMove. Returns how many cells
         of each kind were read."""
         chosen = family.caps if caps is None else tuple(sorted(caps))
         # Per cap, the run in hand and the minimum it was simulated at
-        hand = {cap: (None, self._fresh(entries, k, cap, add, None)) for cap in chosen}
+        hand = {cap: (None, self._fresh(entries, k, cap, None)) for cap in chosen}
         kinds: Counter = Counter()
         order = []
-        for min_rise, by_cap in family.rise_grid(self._BAND, k, add_to_held=add, caps=caps,
-                                                 start=start):
-            order.append(min_rise)
+        for min_move, by_cap in family.move_grid(self._BAND, k, caps=caps, start=start):
+            order.append(min_move)
             assert tuple(by_cap) == chosen
             for cap, cell in by_cap.items():
                 at, run = hand[cap]
-                fresh = self._fresh(entries, k, cap, add, min_rise)
-                if isinstance(cell, backtester.SameTrim):
-                    assert cell.min_rise == at
+                fresh = self._fresh(entries, k, cap, min_move)
+                if isinstance(cell, backtester.SameMove):
+                    assert cell.min_move == at
                     self._same_run(fresh, run)
-                    assert fresh.trim_rises == run.trim_rises
+                    assert fresh.moves == run.moves
                     kinds["same as no minimum" if at is None
                           else "same as a smaller minimum"] += 1
                 else:
                     assert isinstance(cell, backtester.SweepPoint)
-                    assert (cell.trim_min_rise, cell.size_cap, cell.add_to_held,
-                            cell.trim_to_kelly) == (min_rise, cap, add, True)
+                    assert (cell.min_move, cell.size_cap, cell.add_to_held,
+                            cell.trim_to_kelly) == (min_move, cap, True, True)
                     self._same_run(fresh, cell)
-                    assert cell.trim_rises == fresh.trim_rises
+                    assert cell.moves == fresh.moves
                     # Simulated only because it is another run: the minimum
-                    # held back a trim the run in hand made
-                    assert run.trim_rises, (min_rise, cap)
-                    assert self._trades(cell) != self._trades(run), (min_rise, cap)
-                    hand[cap] = (min_rise, cell)
+                    # held back an add-on or a trim the run in hand made
+                    assert run.moves, (min_move, cap)
+                    assert self._trades(cell) != self._trades(run), (min_move, cap)
+                    hand[cap] = (min_move, cell)
                     kinds["point"] += 1
-                    kinds["point that trims" if cell.trim_rises
+                    kinds["point that trims" if cell.moves
                           else "point that trims nothing"] += 1
         # Every minimum, ascending
-        assert order == list(family.min_rises)
+        assert order == list(family.min_moves)
         return kinds
 
-    @pytest.mark.parametrize("add", [False, True])
-    def test_every_minimum_and_cap_equals_a_fresh_simulation(self, add):
+    def test_every_minimum_and_cap_equals_a_fresh_simulation(self):
         entries = self._entries()
         family = self._family(entries, self._SHORT)
         kinds: Counter = Counter()
         for k in self._KS:
-            kinds += self._parity(family, entries, k, add)
+            kinds += self._parity(family, entries, k)
         assert (kinds["point"] + kinds["same as no minimum"]
                 + kinds["same as a smaller minimum"]) == (
             len(self._KS) * len(self._SHORT) * len(family.caps))
@@ -22752,77 +22373,121 @@ class TestTrimRiseGrid:
 
     def test_every_minimum_of_the_config_grid_equals_a_fresh_simulation(self):
         entries = self._entries()
-        family = self._family(entries, config.TRIM_MIN_PRICE_RISES)
-        assert len(family.min_rises) == 19
+        family = self._family(entries, config.MIN_PRICE_MOVES)
+        assert len(family.min_moves) == 19
         kinds: Counter = Counter()
         for k in self._KS:
-            for add in (False, True):
-                kinds += self._parity(family, entries, k, add)
-        cells = len(self._KS) * 2 * 19 * len(family.caps)
+            kinds += self._parity(family, entries, k)
+        cells = len(self._KS) * 19 * len(family.caps)
         assert (kinds["point"] + kinds["same as no minimum"]
                 + kinds["same as a smaller minimum"]) == cells
         # Most of the grid is a run already in hand
         assert 0 < kinds["point"] < cells // 10
 
-    def test_rises_measured_from_an_add_on_equal_a_fresh_simulation(self):
-        # With no minimum the pair is trimmed 44c above its add-on and again
-        # 4c above that trim; at 45c it is trimmed 48c above the add-on instead
+    def test_add_on_moves_decide_which_runs_are_one_and_equal_a_fresh_simulation(self):
+        # With no minimum the pair is added to on Monday 2 after a 10c fall,
+        # trimmed 44c above that add-on and again 4c above that trim: the
+        # record holds the add-on's move first. At 5c the second trim is held
+        # back; 10c lets through all that the 5c run made (the add-on's 10c
+        # fall too); 40c holds the add-on back as well, though both of the 5c
+        # run's trims would pass it, so it is another run, which trims nothing
         entries = self._add_on_entries()
-        family = self._family(entries, (0.05, 0.40, 0.45, 0.50), caps=(0.10, 0.20))
-        base = self._fresh(entries, 0.75, 0.10, True, None)
-        assert base.trim_rises == pytest.approx((0.44, 0.04), abs=1e-12)
+        family = self._family(entries, (0.05, 0.10, 0.40, 0.45, 0.50), caps=(0.10, 0.20))
+        base = self._fresh(entries, 0.75, 0.10, None)
+        assert base.moves == pytest.approx((-0.10, 0.44, 0.04), abs=1e-12)
         assert any(t.add_on for t in base.trades)
-        grid = dict(family.rise_grid(self._BAND, 0.75, add_to_held=True))
-        cells = [grid[minimum][0.10] for minimum in family.min_rises]
+        grid = dict(family.move_grid(self._BAND, 0.75))
+        cells = [grid[minimum][0.10] for minimum in family.min_moves]
         assert [type(cell).__name__ for cell in cells] == [
-            "SweepPoint", "SameTrim", "SweepPoint", "SweepPoint"]
-        assert cells[1] == backtester.SameTrim(0.05)
-        assert [cell.trim_rises for cell in cells if isinstance(cell, backtester.SweepPoint)] \
-            == [pytest.approx((0.44,), abs=1e-12), pytest.approx((0.48,), abs=1e-12), ()]
-        kinds = self._parity(family, entries, 0.75, True)
-        assert kinds["point"] >= 3 and kinds["same as a smaller minimum"] >= 1
+            "SweepPoint", "SameMove", "SweepPoint", "SameMove", "SameMove"]
+        assert cells[1] == backtester.SameMove(0.05)
+        assert cells[3] == cells[4] == backtester.SameMove(0.40)
+        assert [cell.moves for cell in cells if isinstance(cell, backtester.SweepPoint)] \
+            == [pytest.approx((-0.10, 0.44), abs=1e-12), ()]
+        assert not any(t.add_on for t in cells[2].trades)
+        kinds = self._parity(family, entries, 0.75)
+        assert kinds["point"] >= 2 and kinds["same as a smaller minimum"] >= 3
 
-    def test_a_run_that_trimmed_after_a_fall_stands_for_no_minimum(self):
+    def test_every_minimum_and_cap_of_a_pair_added_to_twice_equals_a_fresh_simulation(self):
+        # TestAddOnWaitsForAMove's pair, added to after a 25c fall and again 15c
+        # lower: some minimums hold one add-on back, some both, at every cap
+        entries = TestAddOnWaitsForAMove._pair(TestAddOnWaitsForAMove._MONDAYS)
+        family = dc_replace(self._family(entries, self._SHORT), ks=(0.85,), primary_k=0.85,
+                            end_dates={(self._BAND, 0.85, "all"): self._END})
+        kinds = self._parity(family, entries, 0.85)
+        assert kinds["point"] > 0
+        assert kinds["same as no minimum"] + kinds["same as a smaller minimum"] > 0
+        assert sum(kinds[kind] for kind in ("point", "same as no minimum",
+                                            "same as a smaller minimum")) == (
+            len(self._SHORT) * len(family.caps))
+
+    def test_the_parity_check_catches_a_walk_that_does_not_record_add_on_moves(
+            self, monkeypatch):
+        # The walk's own source without the line that records an add-on's move,
+        # compiled in backtester's namespace: its runs record their trims
+        # alone, so the grid takes the 5c run (trims 44c) for the 40c run,
+        # which holds that run's add-on (a 10c fall) back. The parity check
+        # must fail on it
+        source = textwrap.dedent(inspect.getsource(backtester._simulate_at_discount))
+        assert source.count(self._ADD_ON_RECORD) == 1
+        namespace = dict(vars(backtester))
+        exec(compile(source.replace(self._ADD_ON_RECORD, "                pass"),
+                     "<_simulate_at_discount mutant>", "exec"), namespace)
+        entries = self._add_on_entries()
+        family = self._family(entries, (0.05, 0.40), caps=(0.10,))
+        with monkeypatch.context() as mp:
+            mp.setattr(backtester, "_simulate_at_discount", namespace["_simulate_at_discount"])
+            with pytest.raises(AssertionError):
+                self._parity(family, entries, 0.75)
+        # The same narrow check passes with the real walk
+        assert self._parity(family, entries, 0.75)["point"] == 2
+
+    def test_a_run_that_trimmed_after_a_fall_stands_for_a_minimum_the_fall_meets(self):
         entries = self._fall_entries()
-        base = self._fresh(entries, 0.75, 0.20, False, None)
-        assert base.trim_rises == pytest.approx((0.33, -0.03), abs=1e-12)
-        # A 1c and a 2c minimum are both below the 3c the price fell by
-        family = self._family(entries, (0.01, 0.02, 0.05, 0.30, 0.35), caps=(0.10, 0.20))
-        for cap in family.caps:
-            assert min(self._fresh(entries, 0.75, cap, False, None).trim_rises) < 0
-        grid = list(family.rise_grid(self._BAND, 0.75))
-        # The lowest minimum is simulated at every cap, and no minimum is
-        # ever the run with no minimum
-        assert all(isinstance(cell, backtester.SweepPoint) for cell in grid[0][1].values())
-        assert not any(cell == backtester.SameTrim(None)
-                       for _minimum, by_cap in grid for cell in by_cap.values())
-        # ... while the minimums after it are the lowest one's run
-        assert grid[1][1] == dict.fromkeys(family.caps, backtester.SameTrim(0.01))
-        kinds = self._parity(family, entries, 0.75, False)
-        assert kinds["same as no minimum"] == 0 and kinds["same as a smaller minimum"] > 0
+        base = self._fresh(entries, 0.75, 0.20, None)
+        assert base.moves == pytest.approx((0.33, -0.03), abs=1e-12)
+        # A 1c, 2c and 3c minimum all let through the 3c fall, as they let
+        # through the 33c rise: each is the run with no minimum. 5c holds the
+        # fall's trim back, so it is another run
+        family = self._family(entries, (0.01, 0.02, 0.03, 0.05, 0.30, 0.35),
+                              caps=(0.10, 0.20))
+        grid = list(family.move_grid(self._BAND, 0.75))
+        for _minimum, by_cap in grid[:3]:
+            assert by_cap[0.20] == backtester.SameMove(None)
+        fifth = grid[3][1][0.20]
+        assert isinstance(fifth, backtester.SweepPoint)
+        assert fifth.moves == pytest.approx((0.33,), abs=1e-12)
+        kinds = self._parity(family, entries, 0.75)
+        assert kinds["same as no minimum"] > 0 and kinds["point"] > 0
 
-    def test_a_start_with_a_fall_is_never_stood_in_for(self):
-        # Told that every cap's run with no minimum trimmed after a 50c
-        # fall, the grid simulates the lowest minimum at every cap, however
-        # small that minimum is beside the fall
+    def test_a_start_with_too_small_a_move_is_never_stood_in_for(self):
+        # Told that every cap's run with no minimum traded after a 2c move,
+        # the grid simulates the lowest minimum (5c) at every cap, and never
+        # names the run with no minimum
         entries = self._entries()
         family = self._family(entries, self._SHORT, caps=(0.05, 0.30, 1.0))
-        grid = list(family.rise_grid(self._BAND, 0.75,
-                                     start=dict.fromkeys(family.caps, (0.30, -0.50))))
+        grid = list(family.move_grid(self._BAND, 0.75,
+                                     start=dict.fromkeys(family.caps, (0.30, -0.02))))
         assert all(isinstance(cell, backtester.SweepPoint) for cell in grid[0][1].values())
-        assert not any(cell == backtester.SameTrim(None)
+        assert not any(cell == backtester.SameMove(None)
                        for _minimum, by_cap in grid for cell in by_cap.values())
+        # Told it traded after a 30c rise and a 50c fall instead, every minimum up
+        # to 30c is that run, since a fall counts as a rise of the same size
+        grid = list(family.move_grid(self._BAND, 0.75,
+                                     start=dict.fromkeys(family.caps, (0.30, -0.50))))
+        for minimum, by_cap in grid:
+            assert (by_cap == dict.fromkeys(family.caps, backtester.SameMove(None))) is (
+                minimum <= 0.30)
 
-    @pytest.mark.parametrize("add", [False, True])
-    def test_only_the_cells_yielded_as_points_are_simulated(self, monkeypatch, add):
+    def test_only_the_cells_yielded_as_points_are_simulated(self, monkeypatch):
         entries = self._entries()
         family = self._family(entries, self._SHORT)
         real = backtester._simulate_at_discount
         calls: list = []
 
         def spy(raw_entries, start_date, initial_balance, **kw):
-            assert kw["trim_to_kelly"] is True
-            calls.append((kw.get("trim_min_rise"), kw["size_cap"]))
+            assert kw["trim_to_kelly"] is True and kw["add_to_held"] is True
+            calls.append((kw.get("min_move"), kw["size_cap"]))
             return real(raw_entries, start_date, initial_balance, **kw)
 
         for k in self._KS:
@@ -22832,12 +22497,11 @@ class TestTrimRiseGrid:
                 stats: dict = {}
                 with monkeypatch.context() as mp:
                     mp.setattr(backtester, "_simulate_at_discount", spy)
-                    grid = list(family.rise_grid(self._BAND, k, add_to_held=add, caps=caps,
-                                                 stats=stats))
+                    grid = list(family.move_grid(self._BAND, k, caps=caps, stats=stats))
                 points = {(minimum, cap) for minimum, by_cap in grid
                           for cap, cell in by_cap.items()
                           if isinstance(cell, backtester.SweepPoint)}
-                same = sum(isinstance(cell, backtester.SameTrim)
+                same = sum(isinstance(cell, backtester.SameMove)
                            for _minimum, by_cap in grid for cell in by_cap.values())
                 # The run with no minimum, then only cells yielded as points
                 assert any(minimum is None for minimum, _cap in calls)
@@ -22853,28 +22517,25 @@ class TestTrimRiseGrid:
                 assert stats["same"] == same > 0 and points
                 assert len(points) + same == len(self._SHORT) * len(chosen)
 
-    @pytest.mark.parametrize("add", [False, True])
-    def test_with_a_start_the_run_with_no_minimum_is_not_simulated_again(self, monkeypatch,
-                                                                         add):
+    def test_with_a_start_the_run_with_no_minimum_is_not_simulated_again(self, monkeypatch):
         entries = self._entries()
         family = self._family(entries, self._SHORT)
         real = backtester._simulate_at_discount
         calls: list = []
 
         def spy(raw_entries, start_date, initial_balance, **kw):
-            calls.append((kw.get("trim_min_rise"), kw["size_cap"]))
+            calls.append((kw.get("min_move"), kw["size_cap"]))
             return real(raw_entries, start_date, initial_balance, **kw)
 
         for k in self._KS:
-            base = family.sweep(add_to_held=add).cell(self._BAND, k)
-            start = {cap: base[cap]["all"].trim_rises for cap in family.caps}
-            alone = list(family.rise_grid(self._BAND, k, add_to_held=add))
+            base = family.sweep().cell(self._BAND, k)
+            start = {cap: base[cap]["all"].moves for cap in family.caps}
+            alone = list(family.move_grid(self._BAND, k))
             calls.clear()
             stats: dict = {}
             with monkeypatch.context() as mp:
                 mp.setattr(backtester, "_simulate_at_discount", spy)
-                given = list(family.rise_grid(self._BAND, k, add_to_held=add, start=start,
-                                              stats=stats))
+                given = list(family.move_grid(self._BAND, k, start=start, stats=stats))
             # No simulation without a minimum, and the same grid
             assert calls and all(minimum is not None for minimum, _cap in calls)
             assert [minimum for minimum, _ in given] == [minimum for minimum, _ in alone]
@@ -22890,92 +22551,93 @@ class TestTrimRiseGrid:
             assert stats["simulated"] == len(calls)
             assert stats["simulated"] + stats["reused"] == points > 0
             # ... and it is checked against a fresh simulation like any other
-            self._parity(family, entries, k, add, start=start)
+            self._parity(family, entries, k, start=start)
 
     @pytest.mark.parametrize("mutant", sorted(_COVER_MUTANTS))
     def test_the_parity_check_catches_a_wrong_cover(self, monkeypatch, mutant):
-        # rise_grid's own source with the cover's test changed, compiled in
+        # move_grid's own source with the cover's test changed, compiled in
         # backtester's namespace. A cover that always answers "the same run"
         # names runs that are not; one that never does simulates a run it
-        # already has; one that reads a fall as a rise lets the run with no
-        # minimum stand for a minimum that would have held its trim back.
-        # The parity check must fail on each
-        source = textwrap.dedent(inspect.getsource(backtester.TrimSweep.rise_grid))
+        # already has; one that never lets a fall through simulates the 1c
+        # run, which is the run with no minimum (its trim after a 3c fall is
+        # let through by a 1c minimum). The parity check must fail on each
+        source = textwrap.dedent(inspect.getsource(backtester.RebalanceSweep.move_grid))
         assert source.count(self._COVER) == 1
         namespace = dict(vars(backtester))
         exec(compile(source.replace(self._COVER, self._COVER_MUTANTS[mutant]),
-                     "<rise_grid mutant>", "exec"), namespace)
-        if mutant == "a fall counted as a rise":
+                     "<move_grid mutant>", "exec"), namespace)
+        if mutant == "a fall never counted":
             entries, rises, caps = self._fall_entries(), (0.01, 0.02, 0.05), (0.20,)
         else:
             entries, rises, caps = self._entries(), self._SHORT, (0.05, 0.30, 1.0)
         family = self._family(entries, rises, caps=caps)
         with monkeypatch.context() as mp:
-            mp.setattr(backtester.TrimSweep, "rise_grid", namespace["rise_grid"])
+            mp.setattr(backtester.RebalanceSweep, "move_grid", namespace["move_grid"])
             with pytest.raises(AssertionError):
-                self._parity(family, entries, 0.75, False)
+                self._parity(family, entries, 0.75)
         # The same narrow check passes with the real cover
-        assert self._parity(family, entries, 0.75, False)["point"] > 0
+        assert self._parity(family, entries, 0.75)["point"] > 0
 
-    def test_the_cover_asks_the_walk_s_own_test_about_every_trim_of_the_run_in_hand(
+    def test_the_cover_asks_the_walk_s_own_test_about_every_trade_of_the_run_in_hand(
             self, monkeypatch):
-        # The walk holds a trim back with config.trim_rise_reached, and the
-        # cover asks that same function whether each trim would still be made
-        assert backtester.trim_rise_reached is config.trim_rise_reached
+        # The walk holds an add-on or a trim back with config.price_move_reached,
+        # and the cover asks that same function whether each would still be made
+        assert backtester.price_move_reached is config.price_move_reached
         entries = self._entries()
         family = self._family(entries, self._SHORT, caps=(0.05, 1.0))
         base = family.sweep().cell(self._BAND, 0.75)
-        start = {cap: base[cap]["all"].trim_rises for cap in family.caps}
+        start = {cap: base[cap]["all"].moves for cap in family.caps}
         assert len(start[0.05]) == 2 and start[1.0] == ()
         seen: list = []
-        real = backtester.trim_rise_reached
+        real = backtester.price_move_reached
 
-        def spy(rise, min_rise):
-            seen.append((rise, min_rise))
-            return real(rise, min_rise)
+        def spy(move, min_move):
+            seen.append((move, min_move))
+            return real(move, min_move)
 
         with monkeypatch.context() as mp:
-            mp.setattr(backtester, "trim_rise_reached", spy)
+            mp.setattr(backtester, "price_move_reached", spy)
             # The lowest minimum lets both trims through, so nothing is
             # simulated and every call seen is the cover's
             mp.setattr(backtester, "_simulate_at_discount",
                        lambda *a, **k: pytest.fail("simulated"))
-            minimum, by_cap = next(family.rise_grid(self._BAND, 0.75, start=start))
-        assert seen == [(rise, minimum) for rise in start[0.05]]
-        assert by_cap == dict.fromkeys(family.caps, backtester.SameTrim(None))
+            minimum, by_cap = next(family.move_grid(self._BAND, 0.75, start=start))
+        assert seen == [(move, minimum) for move in start[0.05]]
+        assert by_cap == dict.fromkeys(family.caps, backtester.SameMove(None))
 
     def test_a_family_without_minimums_yields_nothing_and_simulates_nothing(self, monkeypatch):
         entries = self._entries()
         family = self._family(entries, ())
-        assert family.min_rises == ()
+        assert family.min_moves == ()
         monkeypatch.setattr(backtester, "_simulate_at_discount",
                             lambda *a, **k: pytest.fail("simulated"))
         stats: dict = {}
-        assert list(family.rise_grid(self._BAND, 0.75, stats=stats)) == []
+        assert list(family.move_grid(self._BAND, 0.75, stats=stats)) == []
         assert stats == {"simulated": 0, "reused": 0, "same": 0}
 
     def test_sweep_takes_one_of_the_family_s_minimums_and_caps(self):
         entries = self._entries()
         family = self._family(entries, self._SHORT)
-        # With neither keyword it is the sweep with no minimum, at every cap
+        # With neither keyword it is the sweep with no minimum, at every cap,
+        # adding and trimming together
         plain = family.sweep()
-        assert (plain.trim_to_kelly, plain.trim_min_rise, plain.caps) == (
-            True, None, family.caps)
-        swept = family.sweep(add_to_held=True, min_rise=0.10, caps=(1.0, 0.05, 0.05))
-        assert (swept.trim_min_rise, swept.caps, swept.add_to_held, swept.trim_to_kelly) == (
+        assert (plain.add_to_held, plain.trim_to_kelly, plain.min_move, plain.caps) == (
+            True, True, None, family.caps)
+        swept = family.sweep(min_move=0.10, caps=(1.0, 0.05, 0.05))
+        assert (swept.min_move, swept.caps, swept.add_to_held, swept.trim_to_kelly) == (
             0.10, (0.05, 1.0), True, True)
         point = swept.cell(self._BAND, 0.75)[0.05]["all"]
-        self._same_run(point, self._fresh(entries, 0.75, 0.05, True, 0.10))
+        self._same_run(point, self._fresh(entries, 0.75, 0.05, 0.10))
         for bad in (0.15, 0.5, 0.0, "0.10"):
-            with pytest.raises(ValueError, match="minimum price rise .* is not one of"):
-                family.sweep(min_rise=bad)
+            with pytest.raises(ValueError, match="minimum price move .* is not one of"):
+                family.sweep(min_move=bad)
         with pytest.raises(ValueError, match="size caps .* are not all among"):
             family.sweep(caps=(0.05, 0.07))
-        with pytest.raises(ValueError, match="no tier-floors-off family to trim in"):
-            family.sweep(tier_floors=False, min_rise=0.10)
+        with pytest.raises(ValueError, match="no tier-floors-off family to rebalance in"):
+            family.sweep(tier_floors=False, min_move=0.10)
         # A family built without minimums takes none
         with pytest.raises(ValueError, match="is not one of"):
-            self._family(entries, ()).sweep(min_rise=0.10)
+            self._family(entries, ()).sweep(min_move=0.10)
 
     def test_a_grid_it_cannot_read_is_refused_on_the_first_step(self, monkeypatch):
         entries = self._entries()
@@ -22983,52 +22645,53 @@ class TestTrimRiseGrid:
         # Refused before anything is simulated, even with every run given
         monkeypatch.setattr(backtester, "_simulate_at_discount",
                             lambda *a, **k: pytest.fail("simulated"))
-        rises = {0.05: (0.25, 0.08), 0.30: (), 1.0: ()}
+        moves = {0.05: (0.25, 0.08), 0.30: (), 1.0: ()}
         with pytest.raises(ValueError, match="size caps .* are not all among"):
-            next(family.rise_grid(self._BAND, 0.75, caps=(0.05, 0.07), start=rises))
-        with pytest.raises(ValueError, match="no tier-floors-off family to trim in"):
-            next(family.rise_grid(self._BAND, 0.75, tier_floors=False, start=rises))
+            next(family.move_grid(self._BAND, 0.75, caps=(0.05, 0.07), start=moves))
+        with pytest.raises(ValueError, match="no tier-floors-off family to rebalance in"):
+            next(family.move_grid(self._BAND, 0.75, tier_floors=False, start=moves))
         with pytest.raises(KeyError):
-            next(family.rise_grid((0.2, 0.9), 0.75, start=rises))
+            next(family.move_grid((0.2, 0.9), 0.75, start=moves))
         # A start that lacks a cap covered, or holds the None of a run that
-        # does not trim
-        with pytest.raises(ValueError, match=r"start has no trim rises for size cap\(s\) "
+        # does not rebalance
+        with pytest.raises(ValueError, match=r"start has no moves for size cap\(s\) "
                                              r"\[0\.3, 1\.0\]"):
-            next(family.rise_grid(self._BAND, 0.75, start={0.05: (0.25, 0.08)}))
-        with pytest.raises(ValueError, match=r"start has no trim rises for size cap\(s\) "
+            next(family.move_grid(self._BAND, 0.75, start={0.05: (0.25, 0.08)}))
+        with pytest.raises(ValueError, match=r"start has no moves for size cap\(s\) "
                                              r"\[1\.0\]"):
-            next(family.rise_grid(self._BAND, 0.75, start=dict(rises) | {1.0: None}))
+            next(family.move_grid(self._BAND, 0.75, start=dict(moves) | {1.0: None}))
         # A k the family does not hold, though with this start no run would
         # ever be simulated to find it out
         with pytest.raises(ValueError, match=r"k 0\.6 is not one of"):
-            next(family.rise_grid(self._BAND, 0.6, start={0.05: (), 0.30: (), 1.0: ()}))
+            next(family.move_grid(self._BAND, 0.6, start={0.05: (), 0.30: (), 1.0: ()}))
         # A cap the caller does not cover needs no start
-        (first, by_cap), *_rest = family.rise_grid(self._BAND, 0.75, caps=(0.30, 1.0),
+        (first, by_cap), *_rest = family.move_grid(self._BAND, 0.75, caps=(0.30, 1.0),
                                                    start={0.30: (), 1.0: ()})
         assert first == self._SHORT[0]
-        assert by_cap == {0.30: backtester.SameTrim(None), 1.0: backtester.SameTrim(None)}
+        assert by_cap == {0.30: backtester.SameMove(None), 1.0: backtester.SameMove(None)}
 
     @pytest.mark.parametrize("bad", [(0.10, 0.05), (0.05, 0.05), (0.0, 0.05), (0.05, 1.5),
                                      (True,), (float("nan"),), ("0.05",), (1e-9, 0.05)])
     def test_a_family_s_minimums_are_ascending_amounts(self, bad):
-        with pytest.raises(ValueError, match="min_rises"):
+        with pytest.raises(ValueError, match="min_moves"):
             self._family(self._entries(), bad)
 
-    def test_a_same_trim_names_the_minimum_it_repeats(self):
-        assert backtester.SameTrim(0.05) == backtester.SameTrim(0.05)
-        assert backtester.SameTrim(None) != backtester.SameTrim(0.05)
-        assert backtester.SameTrim(None).min_rise is None
+    def test_a_same_move_names_the_minimum_it_repeats(self):
+        assert backtester.SameMove(0.05) == backtester.SameMove(0.05)
+        assert backtester.SameMove(None) != backtester.SameMove(0.05)
+        assert backtester.SameMove(None).min_move is None
         with pytest.raises(AttributeError):
-            backtester.SameTrim(0.05).min_rise = 0.10
+            backtester.SameMove(0.05).min_move = 0.10
 
 
 _TRIM_WAIT_LINE = "Exact pairs the Kelly trim left alone because they traded fewer than"
-_BAD_TRIM_WAIT = r"KELLY_TRIM_MIN_DAYS_SINCE_TRADE must be a whole number from 0 to 30, got "
+_BAD_TRIM_WAIT = r"REBALANCE_MIN_DAYS_SINCE_TRADE must be a whole number from 0 to 30, got "
 
 
 class TestTrimWait:
-    """The backtest trims a held pair only once KELLY_TRIM_MIN_DAYS_SINCE_TRADE
-    days (7) have passed since its last purchase, add-on or trim. Only trims wait.
+    """The backtest trims a held pair only once REBALANCE_MIN_DAYS_SINCE_TRADE
+    days (7) have passed since its last purchase, add-on or trim. An add-on
+    waits the same way (TestAddOnWaitsForAMove); buying a new pair never does.
 
     Checkpoints are a week apart, so a wait of 7 days or fewer holds nothing
     back; these tests set 8, 14, 15 days and more. The main pair (YES on SA,
@@ -23052,11 +22715,18 @@ class TestTrimWait:
             _M[5]: ((0.36, 0.66), (0.41, 0.61))}
     # The pair passes again on Monday 2 at the dip's quotes (pA, pB, nB)
     _DIP_MONDAYS = (_M[0], (_M[1], 0.15, 0.65, 0.35))
+    # The same dip a week later, on Monday 3 (0.72 on Monday 2, 0.52 on Monday 3,
+    # then 0.82 and up 5c a week): an add-on there comes 14 days after the
+    # purchase, so a wait of 8 days does not hold it back
+    _DIP3 = {_M[1]: ((0.24, 0.78), (0.54, 0.48)), _M[2]: ((0.15, 0.87), (0.65, 0.37)),
+             _M[3]: ((0.30, 0.72), (0.50, 0.52)), _M[4]: ((0.32, 0.70), (0.47, 0.55)),
+             _M[5]: ((0.34, 0.68), (0.44, 0.58))}
+    _DIP3_MONDAYS = (_M[0], (_M[2], 0.15, 0.65, 0.35))
 
     @staticmethod
     def _wait(monkeypatch, days) -> None:
         """Set the wait the backtester reads (its own binding, never config's)."""
-        monkeypatch.setattr(backtester, "KELLY_TRIM_MIN_DAYS_SINCE_TRADE", days)
+        monkeypatch.setattr(backtester, "REBALANCE_MIN_DAYS_SINCE_TRADE", days)
 
     @classmethod
     def _candles(cls, path=None) -> dict:
@@ -23108,7 +22778,7 @@ class TestTrimWait:
     def _same(point, other) -> None:
         assert [astuple(t) for t in point.trades] == [astuple(t) for t in other.trades]
         pd.testing.assert_frame_equal(point.equity_df, other.equity_df, check_exact=True)
-        assert point.trim_rises == other.trim_rises
+        assert point.moves == other.moves
 
     @staticmethod
     def _position(*entry_days) -> list:
@@ -23122,19 +22792,19 @@ class TestTrimWait:
 
     def test_the_wait_is_config_s_seven_days_read_from_this_module_when_called(
             self, monkeypatch):
-        assert backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE == 7
-        assert backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE is config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE
-        assert backtester._resolve_trim_min_days() == 7
+        assert backtester.REBALANCE_MIN_DAYS_SINCE_TRADE == 7
+        assert backtester.REBALANCE_MIN_DAYS_SINCE_TRADE is config.REBALANCE_MIN_DAYS_SINCE_TRADE
+        assert backtester._resolve_rebalance_min_days() == 7
         # config's binding is not the one read
-        monkeypatch.setattr(config, "KELLY_TRIM_MIN_DAYS_SINCE_TRADE", 3)
-        assert backtester._resolve_trim_min_days() == 7
+        monkeypatch.setattr(config, "REBALANCE_MIN_DAYS_SINCE_TRADE", 3)
+        assert backtester._resolve_rebalance_min_days() == 7
         for days in (0, 8, 30, np.int64(14)):
             self._wait(monkeypatch, days)
-            resolved = backtester._resolve_trim_min_days()
+            resolved = backtester._resolve_rebalance_min_days()
             assert resolved == days and type(resolved) is int
         # The check, and the rule itself, are config's own
-        assert backtester.kelly_trim_min_days is config.kelly_trim_min_days
-        assert backtester.kelly_trim_rested is config.kelly_trim_rested
+        assert backtester.rebalance_min_days is config.rebalance_min_days
+        assert backtester.rebalance_rested is config.rebalance_rested
 
     def test_the_last_trade_is_the_latest_purchase_add_on_or_trim(self):
         last = backtester._last_trade_day
@@ -23152,11 +22822,11 @@ class TestTrimWait:
         # Another pair's trim, or these two markets the other way round, is not this pair's
         others = {("QB", "QA"): trimmed, ("XA", "XB"): trimmed}
         assert last(self._position(bought, added), others) == added
-        # A plain date, which is all config.kelly_trim_rested accepts
+        # A plain date, which is all config.rebalance_rested accepts
         assert type(last(self._position(bought, added), {pair: trimmed})) is date
 
-    def test_the_price_rise_is_measured_from_that_same_day(self):
-        # _price_rise compares the pair's price on _last_trade_day with its price on `day`
+    def test_the_price_move_is_measured_from_that_same_day(self):
+        # _price_move compares the pair's price on _last_trade_day with its price on `day`
         (held,) = backtester._simulate_at_discount(
             self._records(), self._START, 10_000.0, k=0.75, size_cap=0.10,
             end_date=self._END).trades
@@ -23166,7 +22836,7 @@ class TestTrimWait:
                                 ([held, added], {("SA", "SB"): self._M[3]})):
             day = self._M[4]
             since = backtester._last_trade_day(position, trims)
-            assert backtester._price_rise(position, day, trims) == config.pair_price_rise(
+            assert backtester._price_move(position, day, trims) == config.pair_price_move(
                 backtester._pair_price(held, since), backtester._pair_price(held, day))
 
     @pytest.mark.parametrize("last_trade", ["purchase", "add-on", "trim"])
@@ -23185,10 +22855,10 @@ class TestTrimWait:
         last_day = backtester._last_trade_day(position, trims)
         assert last_day == then
         # Not rested through day 6, rested from day 7
-        assert backtester.kelly_trim_rested(last_day, day, 7) is (gap >= 7)
+        assert backtester.rebalance_rested(last_day, day, 7) is (gap >= 7)
         # ... and at any other wait the same two dates decide
         for wait in (0, 1, 6, 8, 14):
-            assert backtester.kelly_trim_rested(last_day, day, wait) is (gap >= wait)
+            assert backtester.rebalance_rested(last_day, day, wait) is (gap >= wait)
 
     @pytest.mark.parametrize("days_after_monday", range(0, 7))
     def test_through_the_walk_a_pair_waits_by_the_days_since_it_was_bought(
@@ -23198,13 +22868,13 @@ class TestTrimWait:
         bought = self._M[0] + timedelta(days=days_after_monday)
         gap = 7 - days_after_monday
         asked: list = []
-        real = backtester.kelly_trim_rested
+        real = backtester.rebalance_rested
 
         def spy(last_trade, day, min_days):
             asked.append((last_trade, day, min_days))
             return real(last_trade, day, min_days)
 
-        monkeypatch.setattr(backtester, "kelly_trim_rested", spy)
+        monkeypatch.setattr(backtester, "rebalance_rested", spy)
         for wait in range(0, 9):
             self._wait(monkeypatch, wait)
             asked.clear()
@@ -23229,7 +22899,7 @@ class TestTrimWait:
         self._wait(monkeypatch, 0)
         base = self._sim(records)
         assert self._sold_on(base) == list(self._M[1:])
-        assert base.trim_rises == pytest.approx((0.10, 0.06, 0.06, 0.06, 0.06), abs=1e-12)
+        assert base.moves == pytest.approx((0.10, 0.06, 0.06, 0.06, 0.06), abs=1e-12)
         self._wait(monkeypatch, wait)
         with caplog.at_level(logging.DEBUG):
             point = self._sim(records)
@@ -23254,7 +22924,7 @@ class TestTrimWait:
         assert not kept.sold and kept.n + first.n + second.n == held.n
         # Each rise is measured from the last trade: the purchase (0.62 to
         # 0.78), then Monday 3's trim (0.78 to 0.90)
-        assert point.trim_rises == pytest.approx((0.16, 0.12), abs=1e-12)
+        assert point.moves == pytest.approx((0.16, 0.12), abs=1e-12)
         # Nothing was sold on Monday 2, so Monday 3 sells more than the run with no wait
         assert first.n > next(t.n for t in base.trades if t.exit_date == self._M[2])
         # The pair waited on Mondays 2, 4 and 6; from Monday 7 it has rested
@@ -23290,105 +22960,122 @@ class TestTrimWait:
 
     def test_an_add_on_restarts_the_wait_and_so_does_a_trim_that_sells_it_whole(
             self, monkeypatch, caplog):
-        # The _DIP prices: an adding run buys more at Monday 2's dip
+        # The _DIP3 prices: an adding run buys more at Monday 3's dip, 14 days
+        # after the purchase, so an 8-day wait lets the add-on through too
         def run(**kw):
-            return self._sim(self._records(self._DIP_MONDAYS, self._DIP), **kw)
+            return self._sim(self._records(self._DIP3_MONDAYS, self._DIP3), **kw)
 
-        # With no wait: trimmed on Mondays 3 to 6, adding or not
+        # With no wait: trimmed on Mondays 2, 4, 5 and 6, adding or not. With
+        # adding, the add-on's move is measured from Monday 2's trim (0.52 is
+        # 20c below that trim's 0.72, though only 10c below the purchase)
         self._wait(monkeypatch, 0)
-        assert self._sold_on(run()) == list(self._M[2:])
-        assert self._sold_on(run(add_to_held=True)) == list(self._M[2:])
+        expected = [self._M[1], *self._M[3:]]
+        assert self._sold_on(run()) == expected
+        both = run(add_to_held=True)
+        assert self._sold_on(both) == expected
+        assert both.moves[:2] == pytest.approx((0.72 - 0.62, 0.52 - 0.72), abs=1e-12)
         self._wait(monkeypatch, 8)
-        # Without adding: trimmed on Monday 3 (14 days on), then Monday 5
-        assert self._sold_on(run()) == [self._M[2], self._M[4]]
+        # Without adding: Monday 2 waits (7 days on), Monday 3's dip is not
+        # past its size, Monday 4 trims, Monday 5 waits and Monday 6 trims
+        assert self._sold_on(run()) == [self._M[3], self._M[5]]
         with caplog.at_level(logging.INFO):
             point = run(add_to_held=True)
-        kept, add_on, part, later = point.trades
-        assert add_on.add_on and add_on.entry_date == self._M[1]
-        # The add-on on Monday 2 blocks Monday 3. Monday 4's trim sells the
+        kept, add_on, part = point.trades
+        assert add_on.add_on and add_on.entry_date == self._M[2]
+        # The add-on on Monday 3 blocks Monday 4. Monday 5's trim sells the
         # add-on whole and part of the first purchase
-        assert (add_on.sold, add_on.exit_date) == (True, self._M[3])
-        assert (part.sold, part.add_on, part.exit_date) == (True, False, self._M[3])
-        # That trim is now the last trade: Monday 5 is blocked, Monday 6 trims
-        assert (later.sold, later.add_on, later.exit_date) == (True, False, self._M[5])
+        assert (add_on.sold, add_on.exit_date) == (True, self._M[4])
+        assert (part.sold, part.add_on, part.exit_date) == (True, False, self._M[4])
+        # That trim is now the last trade: Monday 6 is blocked
         assert not kept.sold and kept.entry_date == self._M[0]
-        assert self._sold_on(point) == [self._M[3], self._M[5]]
-        assert point.trim_rises == pytest.approx((0.87 - 0.52, 0.97 - 0.87), abs=1e-12)
-        # It waited on Monday 2 (before the add-on was bought), 3, 5 and 7
-        assert [line.rsplit(": ", 1)[1] for line in self._waiting(caplog)] == ["4"]
-        # Buying is not held back: the add-on is the one the run with no wait buys
-        self._wait(monkeypatch, 0)
-        added = next(t for t in run(add_to_held=True).trades if t.add_on)
+        assert self._sold_on(point) == [self._M[4]]
+        # The add-on's move (10c below the purchase), then the trim's (35c
+        # above the add-on)
+        assert point.moves == pytest.approx((0.52 - 0.62, 0.87 - 0.52), abs=1e-12)
+        # The trim waited on Mondays 2, 4 and 6
+        assert [line.rsplit(": ", 1)[1] for line in self._waiting(caplog)] == ["3"]
+        # The add-on, 14 days on, did not wait: it is the one the run that only
+        # adds (and has made no trim before Monday 3 either) buys
+        assert not [r for r in caplog.records
+                    if r.getMessage().startswith(_ADD_ON_WAIT_LINE)]
+        adding = backtester._simulate_at_discount(
+            self._records(self._DIP3_MONDAYS, self._DIP3), self._START, 10_000.0, k=0.75,
+            size_cap=0.10, end_date=self._END, add_to_held=True)
+        added = next(t for t in adding.trades if t.add_on)
         assert (add_on.n, add_on.entry_date, add_on.total_cost, add_on.fees) == (
             added.n, added.entry_date, added.total_cost, added.fees)
 
     def test_the_line_counts_exact_pairs_only(self, monkeypatch, caplog):
         # TestAddToALoneLeg's fixture: P (YES PA / NO PB) bought on Monday 1; PA pays
-        # out on 01-10, and on Monday 2 Q (YES QA / NO PB) adds to PB: three markets
+        # out on 01-10, and on Monday 4, 21 days on (an add-on waits 15 days too),
+        # Q (YES QA / NO PB) adds to PB: three markets
         pb = _ladder_market("PB", "EVB-1", "2026-03-20")
         p = _ladder_record(_ladder_market("PA", "EVA-1", "2026-01-10"), pb, "q",
                            [(self._M[0], 0.20, 0.45, 0.55)])
         q = _ladder_record(_ladder_market("QA", "EVQ-1", "2026-03-20"), pb, "q",
-                           [(self._M[1], 0.20, 0.70, 0.30)])
+                           [(self._M[3], 0.20, 0.70, 0.30)])
         self._wait(monkeypatch, 15)
         with caplog.at_level(logging.INFO):
             point = backtester._simulate_at_discount(
                 [p, q], self._START, 10_000.0, k=0.85, size_cap=0.20, end_date=self._END,
                 add_to_held=True, trim_to_kelly=True)
         first, add = point.trades
-        assert _traded(point) == [("PA", self._M[0]), ("QA", self._M[1])]
+        assert _traded(point) == [("PA", self._M[0]), ("QA", self._M[3])]
         assert add.add_on and not backtester._exact_pair([first, add])
-        # Counted once, for P alone on Monday 2. On Mondays 3 and 4 the add-on is under
-        # 15 days old too, but the position is no longer an exact pair, so it is not counted
+        # Counted twice, for P alone on Mondays 2 and 3. On Mondays 5 and 6 the add-on
+        # is under 15 days old too, but the position is no longer an exact pair, so it
+        # is not counted
         (line,) = self._waiting(caplog)
         assert line.startswith(f"{_TRIM_WAIT_LINE} 15 days before (k=0.850, band 0-1, all")
-        assert line.endswith(", adding to held pairs, trimming to Kelly): 1")
+        assert line.endswith(", rebalancing): 2")
 
     @pytest.mark.parametrize("wait, waited, held_back", [(7, 0, 10), (8, 1, 9), (15, 2, 8)])
-    def test_a_waiting_pair_is_not_counted_on_the_price_rise_line(
+    def test_a_waiting_pair_is_not_counted_on_the_price_move_line(
             self, monkeypatch, caplog, wait, waited, held_back):
         # A 95c minimum never trims: each of the ten checkpoints from Monday 2 to the
         # pay-out is counted on one line or the other, never both
         assert len(backtester._sale_checkpoints(self._M[1], date(2026, 3, 20))) == 10
         self._wait(monkeypatch, wait)
         with caplog.at_level(logging.INFO):
-            point = self._sim(self._records(), trim_min_rise=0.95)
-        assert point.trim_rises == ()
-        label = f"{_label(0.10)}, trimming to Kelly only after a 95c price rise"
+            point = self._sim(self._records(), min_move=0.95)
+        assert point.moves == ()
+        label = f"{_label(0.10)}, trimming to Kelly only after a 95c price move"
         messages = [r.getMessage() for r in caplog.records]
         assert self._waiting(caplog) == (
             [f"{_TRIM_WAIT_LINE} {wait} days before ({label}): {waited}"] if waited else [])
-        assert (f"{TestTrimMinRise._HELD_BACK} 95c since its last trade ({label}): "
+        assert (f"{TestTrimMinMove._HELD_BACK} 95c either way since its last trade ({label}): "
                 f"{held_back}") in messages
         # The wait is asked first, so its line comes first
         if waited:
             assert messages.index(self._waiting(caplog)[0]) < next(
-                i for i, m in enumerate(messages) if m.startswith(TestTrimMinRise._HELD_BACK))
+                i for i, m in enumerate(messages) if m.startswith(TestTrimMinMove._HELD_BACK))
 
-    def test_with_a_minimum_price_rise_too_each_trim_needs_both(self, monkeypatch, caplog):
+    def test_with_a_minimum_price_move_too_each_trim_needs_both(self, monkeypatch, caplog):
         records = self._records()
         # With no wait and a 15c minimum: Monday 3 (+16c since the purchase),
         # then Monday 6 (+18c since that trim)
         self._wait(monkeypatch, 0)
-        base = self._sim(records, trim_min_rise=0.15)
+        base = self._sim(records, min_move=0.15)
         assert self._sold_on(base) == [self._M[2], self._M[5]]
         # At 8 days the run is the same: the wait holds back only Mondays the
         # minimum already holds back
         self._wait(monkeypatch, 8)
         with caplog.at_level(logging.INFO):
-            point = self._sim(records, trim_min_rise=0.15)
+            point = self._sim(records, min_move=0.15)
         self._same(point, base)
-        label = f"{_label(0.10)}, trimming to Kelly only after a 15c price rise"
+        label = f"{_label(0.10)}, trimming to Kelly only after a 15c price move"
         messages = [r.getMessage() for r in caplog.records]
-        # Ten checkpoints: two trims, three waiting (Mondays 2, 4 and 7) and
-        # five short of the minimum
+        # Ten checkpoints: two trims, three waiting (Mondays 2, 4 and 7), one
+        # short of the minimum (Monday 5, +12c) and four looked at and kept
+        # (from 02-23, SA paid out, the price is far below Monday 6's trim)
         assert f"{_TRIM_WAIT_LINE} 8 days before ({label}): 3" in messages
-        assert f"{TestTrimMinRise._HELD_BACK} 15c since its last trade ({label}): 5" in messages
+        assert (f"{TestTrimMinMove._HELD_BACK} 15c either way since its last trade "
+                f"({label}): 1") in messages
         # At 15 days Monday 3 is too soon: Monday 4 trims (+22c since the purchase)
         self._wait(monkeypatch, 15)
-        later = self._sim(records, trim_min_rise=0.15)
+        later = self._sim(records, min_move=0.15)
         assert self._sold_on(later) == [self._M[3]]
-        assert later.trim_rises == pytest.approx((0.22,), abs=1e-12)
+        assert later.moves == pytest.approx((0.22,), abs=1e-12)
 
     def test_a_run_in_which_every_trim_waits_is_the_run_that_cannot_trim(self, monkeypatch):
         # TestTrimToKelly's pair has fresh quotes on Mondays 2 to 4 only, so a 30-day
@@ -23398,12 +23085,12 @@ class TestTrimWait:
             records, self._START, 10_000.0, k=0.75, size_cap=0.20, end_date=self._END)
         self._wait(monkeypatch, 0)
         trimming = self._sim(records, cap=0.20)
-        assert trimming.trim_rises and trimming.cap_free_from > plain.cap_free_from
+        assert trimming.moves and trimming.cap_free_from > plain.cap_free_from
         self._wait(monkeypatch, 30)
         point = self._sim(records, cap=0.20)
         assert [astuple(t) for t in point.trades] == [astuple(t) for t in plain.trades]
         pd.testing.assert_frame_equal(point.equity_df, plain.equity_df, check_exact=True)
-        assert point.trim_rises == () and point.trim_to_kelly is True
+        assert point.moves == () and point.trim_to_kelly is True
         assert point.cap_free_from == plain.cap_free_from
 
     # ── The dashboard's shortcuts stay exact under a wait ──
@@ -23438,8 +23125,8 @@ class TestTrimWait:
                 assert [astuple(t) for t in point.trades] == [
                     astuple(t) for t in fresh.trades], (k, cap)
                 pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df)
-                assert point.trim_rises == fresh.trim_rises
-                trimmed += bool(point.trim_rises)
+                assert point.moves == fresh.moves
+                trimmed += bool(point.moves)
                 changed += [astuple(t) for t in fresh.trades] != [
                     astuple(t) for t in seven[(k, cap)].trades]
         # Not vacuous: the fixture still trims under the wait, the wait
@@ -23448,10 +23135,10 @@ class TestTrimWait:
         assert cs.simulated + cs.reused == len(cs.ks) * len(cs.caps)
 
     @pytest.mark.parametrize("wait", [8, 15])
-    def test_under_a_wait_every_minimum_and_cap_of_the_rise_grid_equals_a_fresh_simulation(
+    def test_under_a_wait_every_minimum_and_cap_of_the_move_grid_equals_a_fresh_simulation(
             self, monkeypatch, wait):
-        # TestTrimRiseGrid's parity check, over its three fixtures and this class's two
-        grid = TestTrimRiseGrid()
+        # TestMoveGrid's parity check, over its three fixtures and this class's two
+        grid = TestMoveGrid()
         self._wait(monkeypatch, wait)
         kinds: Counter = Counter()
         for entries, rises, caps in (
@@ -23464,8 +23151,7 @@ class TestTrimWait:
                  backtester.SIZE_CAP_SWEEP)):
             family = grid._family(entries, rises, caps=caps)
             for k in grid._KS:
-                for add in (False, True):
-                    kinds += grid._parity(family, entries, k, add)
+                kinds += grid._parity(family, entries, k)
         # Not vacuous: every kind of cell occurs
         for kind in ("point that trims", "point that trims nothing", "same as no minimum",
                      "same as a smaller minimum"):
@@ -23481,23 +23167,23 @@ class TestTrimWait:
         with pytest.raises(ValueError, match=_BAD_TRIM_WAIT):
             self._sim([{}])
         with pytest.raises(ValueError, match=_BAD_TRIM_WAIT):
-            backtester._resolve_trim_min_days()
-        # A run that does not trim never reads it
+            backtester._resolve_rebalance_min_days()
+        # A run that neither adds nor trims never reads it
         with pytest.raises(KeyError):
             backtester._simulate_at_discount([{}], self._START, 10_000.0, k=0.75,
                                              size_cap=0.10, end_date=self._END)
         point = backtester._simulate_at_discount(
             self._records(), self._START, 10_000.0, k=0.75, size_cap=0.10, end_date=self._END)
-        assert point.trim_to_kelly is False and point.trim_rises is None
+        assert point.trim_to_kelly is False and point.moves is None
 
     @pytest.mark.parametrize("options", [
-        {}, {"trim_sweep": False}, {"trim_sweep": True},
-        {"trim_sweep": True, "trim_rise_sweep": True},
+        {}, {"rebalance_sweep": False}, {"rebalance_sweep": True},
+        {"rebalance_sweep": True, "move_sweep": True},
         {"band_sweep": True, "cap_sweep": True, "sell_sweep": True}])
     @pytest.mark.parametrize("bad", [True, 7.5, 31, -1, "7"])
     def test_a_bad_wait_is_refused_before_the_fetch_on_every_run(self, monkeypatch, caplog,
                                                                   bad, options):
-        # With or without the Trim to Kelly family: the dashboard shows the wait on
+        # With or without the Rebalance family: the dashboard shows the wait on
         # every page
         self._wait(monkeypatch, bad)
         monkeypatch.setattr(backtester, "_prepare_candidates",
@@ -23512,20 +23198,20 @@ class TestTrimWait:
 
     def test_the_walk_hands_the_rule_plain_dates_and_the_wait_it_resolved(self, monkeypatch):
         # Real entries (the golden fixture), so the dates are a real run's;
-        # kelly_trim_rested accepts only plain dates
+        # rebalance_rested accepts only plain dates
         golden = TestPrepareEntriesGolden()
         with monkeypatch.context() as mp:
             golden._patch(mp)
             entries, _ = backtester._prepare_entries(MagicMock(), MagicMock(), golden._START,
                                                      True, None, same_event_ladders=True)
         asked: list = []
-        real = backtester.kelly_trim_rested
+        real = backtester.rebalance_rested
 
         def spy(last_trade, day, min_days):
             asked.append((last_trade, day, min_days))
             return real(last_trade, day, min_days)
 
-        monkeypatch.setattr(backtester, "kelly_trim_rested", spy)
+        monkeypatch.setattr(backtester, "rebalance_rested", spy)
         for wait in (7, 8):
             self._wait(monkeypatch, wait)
             asked.clear()
@@ -23545,14 +23231,19 @@ class TestTrimWait:
 
 
 class _AlsoWithNoWait:
-    """Mixin: makes every trimming simulation again with no wait and requires the
-    same run. Checkpoints are a week apart, so at 7 days no pair ever waits."""
+    """Mixin: makes every simulation that rebalances (one that turns on a
+    keyword of _REBALANCES: trimming, by default) again with no wait and
+    requires the same run. Checkpoints are a week apart, so at 7 days no pair
+    ever waits, for a trim or for an add-on."""
+
+    # The simulation keywords that make a run one this mixin checks
+    _REBALANCES = ("trim_to_kelly",)
 
     @pytest.fixture(autouse=True)
-    def _every_trimming_run_is_made_again_with_no_wait(self, monkeypatch):
-        assert backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE == 7
+    def _every_rebalancing_run_is_made_again_with_no_wait(self, monkeypatch):
+        assert backtester.REBALANCE_MIN_DAYS_SINCE_TRADE == 7
         walk = backtester._simulate_at_discount
-        rule = backtester.kelly_trim_rested
+        rule = backtester.rebalance_rested
         self.compared = 0
 
         def rested(last_trade, day, min_days):
@@ -23564,12 +23255,12 @@ class _AlsoWithNoWait:
         @functools.wraps(walk)
         def both(*args, **kwargs):
             point = walk(*args, **kwargs)
-            if not kwargs.get("trim_to_kelly"):
+            if not any(kwargs.get(name) for name in self._REBALANCES):
                 return point
             # The same run with no wait, its log lines kept out of the test's own
             muted = logging.root.manager.disable
             with monkeypatch.context() as mp:
-                mp.setattr(backtester, "KELLY_TRIM_MIN_DAYS_SINCE_TRADE", 0)
+                mp.setattr(backtester, "REBALANCE_MIN_DAYS_SINCE_TRADE", 0)
                 logging.disable(logging.CRITICAL)
                 try:
                     again = walk(*args, **kwargs)
@@ -23577,46 +23268,341 @@ class _AlsoWithNoWait:
                     logging.disable(muted)
             assert [astuple(t) for t in again.trades] == [astuple(t) for t in point.trades]
             pd.testing.assert_frame_equal(again.equity_df, point.equity_df, check_exact=True)
-            assert again.trim_rises == point.trim_rises
+            assert again.moves == point.moves
             assert again.cap_free_from == point.cap_free_from
             self.compared += 1
             return point
 
-        monkeypatch.setattr(backtester, "kelly_trim_rested", rested)
+        monkeypatch.setattr(backtester, "rebalance_rested", rested)
         monkeypatch.setattr(backtester, "_simulate_at_discount", both)
 
-    def test_a_trimming_run_here_is_compared_with_the_run_with_no_wait(self):
-        # The mixin compares trimming runs and leaves the others alone
+    def test_a_rebalancing_run_here_is_compared_with_the_run_with_no_wait(self):
+        # The mixin compares the runs its keywords turn on and leaves the others alone
         records = TestTrimToKelly()._records()
         TestTrimToKelly()._sim(records)
         assert self.compared == 0
-        point = TestTrimToKelly()._sim(records, trim_to_kelly=True)
-        assert self.compared == 1 and point.trim_rises
+        point = TestTrimToKelly()._sim(records, **{self._REBALANCES[0]: True})
+        assert self.compared == 1 and point.moves is not None
 
 
 class TestTrimWaitOfAWeekChangesNoTrimToKellyRun(_AlsoWithNoWait, TestTrimToKelly):
     """Every TestTrimToKelly test again, each trimming run checked against no wait."""
 
 
-class TestTrimWaitOfAWeekChangesNoTrimMinRiseRun(_AlsoWithNoWait, TestTrimMinRise):
-    """Every TestTrimMinRise test again, each trimming run checked against no wait."""
+class TestTrimWaitOfAWeekChangesNoTrimMinMoveRun(_AlsoWithNoWait, TestTrimMinMove):
+    """Every TestTrimMinMove test again, each trimming run checked against no wait."""
 
 
 class TestTrimWaitOfAWeekChangesNoTrimCapSweepRun(_AlsoWithNoWait, TestTrimCapSweep):
     """Every TestTrimCapSweep test again, each trimming run checked against no wait."""
 
 
+class TestAddOnWaitOfAWeekChangesNoAddToHeldRun(_AlsoWithNoWait, TestAddToHeldPairs):
+    """Every TestAddToHeldPairs test again, each run that adds to held pairs
+    checked against the same run with no wait: an add-on now waits
+    REBALANCE_MIN_DAYS_SINCE_TRADE days after the last trade on what it adds
+    to, and at weekly checkpoints the shipped 7 days hold none back."""
+
+    _REBALANCES = ("add_to_held",)
+
+
+class TestAddOnWaitOfAWeekChangesNoLoneLegRun(_AlsoWithNoWait, TestAddToALoneLeg):
+    """Every TestAddToALoneLeg test again, each run that adds to held pairs
+    checked against the same run with no wait, for an add-on to a lone leg."""
+
+    _REBALANCES = ("add_to_held",)
+
+
+class TestAddOnWaitsForAMove:
+    """With add_to_held, an add-on is a rebalance, so it waits as a Kelly
+    trim does: it is held back until REBALANCE_MIN_DAYS_SINCE_TRADE calendar
+    days have passed since the last trade on what it adds to and, with a
+    min_move set, until that price has moved at least the minimum, up or
+    down, since then (config.rebalance_rested, config.price_move_reached).
+    For an exact held pair the price is its total price and the last trade
+    its latest purchase, add-on or trim (_held_pair_move, the day and price
+    the trim reads); for a lone leg, its own market's price and the latest
+    purchase or trim among the trades holding it (_lone_leg_move). Each
+    hold-back is counted on a line of its own, and the move behind every
+    add-on made joins the trims' on SweepPoint.moves.
+
+    The exact pair is YES on PA and NO on PB, bought on Monday 1 at a total
+    ask of 0.75 (narrow), then 0.50 on Monday 2 and 0.35 on Monday 3, where
+    Kelly wants more each time. The lone leg is TestAddToALoneLeg's: P (YES
+    PA / NO PB) bought on Monday 1, PA paying out on 01-10, and Q (YES QA /
+    NO PB) on Monday 2, when PB's NO ask has gone from 0.55 to 0.30.
+    Simulations use k 0.85 and a 20% cap."""
+
+    _START = date(2026, 1, 1)
+    _END = date(2026, 4, 1)
+    _NARROW, _WIDE, _WIDER = (0.20, 0.45, 0.55), (0.20, 0.70, 0.30), (0.20, 0.85, 0.15)
+    _MONDAYS = ((_LADDER_M1, _NARROW), (_LADDER_M2, _WIDE), (_LADDER_M3, _WIDER))
+
+    @staticmethod
+    def _pair(mondays) -> list[dict]:
+        """The exact pair passing on each of `mondays` ((day, (pA, pB, nB))), quoted alike."""
+        record = _ladder_record(_ladder_market("PA", "EVA-1", "2026-03-20"),
+                                _ladder_market("PB", "EVB-1", "2026-03-20"), "q",
+                                [(day, *quotes) for day, quotes in mondays])
+        candles = {"PA": [_candle(_ck(day), pA, round(1.0 - pA, 4))
+                          for day, (pA, _pB, _nB) in mondays],
+                   "PB": [_candle(_ck(day), pB, nB) for day, (_pA, pB, nB) in mondays]}
+        return _quoted([record], candles)
+
+    def _lone(self, q_days=(_LADDER_M2,)) -> list[dict]:
+        """P on Monday 1 and Q, adding to P's PB once PA has paid out, on each of q_days."""
+        pb = _ladder_market("PB", "EVB-1", "2026-03-20")
+        p = _ladder_record(_ladder_market("PA", "EVA-1", "2026-01-10"), pb, "q",
+                           [(_LADDER_M1, *self._NARROW)])
+        q = _ladder_record(_ladder_market("QA", "EVQ-1", "2026-03-20"), pb, "q",
+                           [(day, *self._WIDE) for day in q_days])
+        candles = {"PA": [_candle(_ck(_LADDER_M1), 0.20, 0.80)],
+                   "PB": [_candle(_ck(day), round(1.0 - no, 4), no)
+                          for day, no in ((_LADDER_M1, 0.55), (_LADDER_M2, 0.30),
+                                          (_LADDER_M3, 0.25))],
+                   "QA": [_candle(_ck(day), 0.20, 0.80) for day in q_days]}
+        return _quoted([p, q], candles)
+
+    def _sim(self, records, **kw):
+        return backtester._simulate_at_discount(
+            records, self._START, 10_000.0, k=0.85, size_cap=0.20, end_date=self._END,
+            add_to_held=True, **kw)
+
+    @staticmethod
+    def _added(point) -> list[date]:
+        return [t.entry_date for t in point.trades if t.add_on]
+
+    @staticmethod
+    def _wait(monkeypatch, days) -> None:
+        """Set the wait the backtester reads (its own binding, never config's)."""
+        monkeypatch.setattr(backtester, "REBALANCE_MIN_DAYS_SINCE_TRADE", days)
+
+    @staticmethod
+    def _lines(caplog, prefix: str) -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.getMessage().startswith(prefix)]
+
+    # ── An exact pair ──
+
+    def test_with_no_minimum_the_pair_is_added_to_on_both_mondays(self, caplog):
+        with caplog.at_level(logging.INFO):
+            point = self._sim(self._pair(self._MONDAYS))
+        assert self._added(point) == [_LADDER_M2, _LADDER_M3]
+        # Monday 2 is 25c below the purchase, Monday 3 15c below Monday 2's add-on
+        assert point.moves == pytest.approx((0.50 - 0.75, 0.35 - 0.50), abs=1e-12)
+        assert type(point.moves) is tuple
+        assert point.min_move is None and point.trim_to_kelly is False
+        # Nothing held back, so neither hold-back line is logged
+        assert not self._lines(caplog, _ADD_ON_WAIT_LINE)
+        assert not self._lines(caplog, _ADD_ON_MOVE_LINE)
+
+    @pytest.mark.parametrize("min_move, added_on, moves, held_back", [
+        # Both moves pass: 25c, then 15c measured from the Monday 2 add-on
+        (0.10, [_LADDER_M2, _LADDER_M3], (-0.25, -0.15), 0),
+        # Monday 2 (25c) is added to; Monday 3 is only 15c below that add-on,
+        # though 40c below the purchase, so it is held back
+        (0.20, [_LADDER_M2], (-0.25,), 1),
+        (0.25, [_LADDER_M2], (-0.25,), 1),
+        # Monday 2 is held back, so Monday 3 is measured from the purchase: 40c
+        (0.30, [_LADDER_M3], (-0.40,), 1),
+        (0.40, [_LADDER_M3], (-0.40,), 1),
+        # Neither Monday has moved 45c
+        (0.45, [], (), 2),
+    ])
+    def test_an_add_on_waits_for_the_minimum_move_either_way(
+            self, caplog, min_move, added_on, moves, held_back):
+        with caplog.at_level(logging.INFO):
+            point = self._sim(self._pair(self._MONDAYS), min_move=min_move)
+        assert self._added(point) == added_on
+        assert point.moves == pytest.approx(moves, abs=1e-12)
+        assert point.min_move == min_move
+        cents = backtester._cap_percent(min_move)
+        label = f"k=0.850, band 0-1, all, cap 20%, adding to held pairs only after a {cents}c " \
+                "price move"
+        assert self._lines(caplog, _ADD_ON_MOVE_LINE) == (
+            [f"{_ADD_ON_MOVE_LINE} {cents}c since its last trade ({label}): {held_back}"]
+            if held_back else [])
+        assert f"Backtest complete at {label}:" in caplog.text
+
+    def test_a_run_that_also_sells_names_the_minimum_beside_the_adding(self, caplog):
+        # The minimum holds back add-ons, not sales, so on a run that adds and
+        # sells it follows ", adding to held pairs", before the sell level
+        with caplog.at_level(logging.INFO):
+            self._sim(self._pair(self._MONDAYS), min_move=0.10, sell_at=0.85)
+        label = ("k=0.850, band 0-1, all, cap 20%, adding to held pairs only after a 10c "
+                 f"price move, {backtester._sale_label(0.85, None)}")
+        assert f"Backtest complete at {label}:" in caplog.text
+
+    def test_a_held_back_add_on_changes_nothing_but_its_own_trade(self):
+        # At 45c no add-on is made: the run is the purchase alone, as the run
+        # that cannot add makes it
+        held_back = self._sim(self._pair(self._MONDAYS), min_move=0.45)
+        plain = backtester._simulate_at_discount(
+            self._pair(self._MONDAYS), self._START, 10_000.0, k=0.85, size_cap=0.20,
+            end_date=self._END)
+        assert [astuple(t) for t in held_back.trades] == [astuple(t) for t in plain.trades]
+        pd.testing.assert_frame_equal(held_back.equity_df, plain.equity_df, check_exact=True)
+
+    def test_the_move_is_measured_from_the_latest_purchase_add_on_or_trim(self):
+        (bought,) = backtester._simulate_at_discount(
+            self._pair(self._MONDAYS), self._START, 10_000.0, k=0.85, size_cap=0.20,
+            end_date=self._END).trades
+        move = backtester._held_pair_move
+        # From the purchase: the day and the move the trim's gate reads
+        assert move([bought], _LADDER_M3, {}) == (
+            _LADDER_M1, backtester._price_move([bought], _LADDER_M3, {}))
+        assert move([bought], _LADDER_M3, {})[1] == pytest.approx(-0.40, abs=1e-12)
+        # From a later add-on
+        added = dc_replace(bought, entry_date=_LADDER_M2, add_on=True)
+        assert move([bought, added], _LADDER_M3, {}) == (_LADDER_M2, pytest.approx(-0.15,
+                                                                                   abs=1e-12))
+        # From a later trim of the pair, and not from another pair's
+        assert move([bought], _LADDER_M3, {("PA", "PB"): _LADDER_M2}) == (
+            _LADDER_M2, pytest.approx(-0.15, abs=1e-12))
+        assert move([bought], _LADDER_M3, {("PB", "PA"): _LADDER_M2})[0] == _LADDER_M1
+        # With no quotes there is no move to read, though the day is known
+        assert move([dc_replace(bought, marks=None)], _LADDER_M3, {}) == (_LADDER_M1, None)
+
+    def test_an_add_on_with_no_quotes_is_held_back_by_any_minimum(self, caplog):
+        # TestAddToHeldPairs' widening pair carries no quotes: with no minimum
+        # it is added to on Monday 2, recorded as a move of 0.0; any minimum
+        # holds it back
+        record = TestAddToHeldPairs()._widening_pair()
+        base = self._sim([record])
+        assert self._added(base) == [_LADDER_M2] and base.moves == (0.0,)
+        with caplog.at_level(logging.INFO):
+            point = self._sim([record], min_move=config.MIN_ACTIVE_PRICE_DOLLARS)
+        assert self._added(point) == [] and point.moves == ()
+        assert len(self._lines(caplog, _ADD_ON_MOVE_LINE)) == 1
+
+    # ── A lone leg ──
+
+    @pytest.mark.parametrize("min_move, adds", [(None, True), (0.10, True), (0.25, True),
+                                                (0.30, False)])
+    def test_a_lone_leg_waits_for_its_own_market_s_move(self, caplog, min_move, adds):
+        # PB's NO ask fell 25c, from 0.55 at P's purchase to 0.30 on Monday 2
+        with caplog.at_level(logging.INFO):
+            point = self._sim(self._lone(), min_move=min_move)
+        assert _traded(point) == [("PA", _LADDER_M1)] + ([("QA", _LADDER_M2)] if adds else [])
+        assert point.moves == (pytest.approx((-0.25,), abs=1e-12) if adds else ())
+        assert len(self._lines(caplog, _ADD_ON_MOVE_LINE)) == (0 if adds else 1)
+
+    def test_a_lone_leg_s_move_reads_its_own_market_from_its_last_trade(self):
+        (p_trade,) = backtester._simulate_at_discount(
+            self._lone()[:1], self._START, 10_000.0, k=0.85, size_cap=0.20,
+            end_date=self._END).trades
+        legs = [{"trade": p_trade, "ticker": "PB"}]
+        move = backtester._lone_leg_move
+        # From P's purchase: PB's NO ask, 0.55 then and 0.25 on Monday 3
+        assert move(legs, _LADDER_M3, {}) == (_LADDER_M1, pytest.approx(-0.30, abs=1e-12))
+        # A trim of P, made while it was still whole, is its last trade; another
+        # pair's trim is not
+        assert move(legs, _LADDER_M3, {("PA", "PB"): _LADDER_M2}) == (
+            _LADDER_M2, pytest.approx(-0.05, abs=1e-12))
+        assert move(legs, _LADDER_M3, {("QA", "PB"): _LADDER_M2})[0] == _LADDER_M1
+        # The held market can be market A in one trade and market B in another:
+        # each trade's own side of it is read (here a same-title trade holding NO
+        # on PB as its market A, bought on Monday 2)
+        flipped = dc_replace(p_trade, pair_type="same_title", ticker_a="PB", ticker_b="XB",
+                             marks=(p_trade.marks[1], p_trade.marks[0]),
+                             entry_date=_LADDER_M2)
+        assert backtester.leg_sides("same_title")[0] == backtester.leg_sides("time_series")[1]
+        both = [*legs, {"trade": flipped, "ticker": "PB"}]
+        assert move(both, _LADDER_M3, {}) == (_LADDER_M2, pytest.approx(-0.05, abs=1e-12))
+        # No quotes, no move
+        assert move([{"trade": dc_replace(p_trade, marks=None), "ticker": "PB"}],
+                    _LADDER_M3, {}) == (_LADDER_M1, None)
+
+    # ── The wait ──
+
+    @pytest.mark.parametrize("wait, added_on, waited", [
+        # At 7 days (shipped) and below, a weekly add-on never waits
+        (0, [_LADDER_M2, _LADDER_M3, _M4], 0),
+        (7, [_LADDER_M2, _LADDER_M3, _M4], 0),
+        # 8 days: Monday 2 (7 days on) waits, Monday 3 adds, Monday 4 (7 days
+        # after that add-on) waits
+        (8, [_LADDER_M3], 2),
+        # 15 days: Mondays 2 and 3 wait, Monday 4 (21 days on) adds
+        (15, [_M4], 2),
+    ])
+    def test_a_longer_wait_holds_an_add_on_back(self, monkeypatch, caplog, wait, added_on,
+                                                 waited):
+        self._wait(monkeypatch, wait)
+        mondays = (*self._MONDAYS, (_M4, (0.20, 0.88, 0.12)))
+        with caplog.at_level(logging.INFO):
+            point = self._sim(self._pair(mondays))
+        assert self._added(point) == added_on
+        assert self._lines(caplog, _ADD_ON_WAIT_LINE) == (
+            [f"{_ADD_ON_WAIT_LINE} {wait} days before (k=0.850, band 0-1, all, cap 20%, "
+             f"adding to held pairs): {waited}"] if waited else [])
+
+    @pytest.mark.parametrize("wait, added_on", [(7, _LADDER_M2), (8, _LADDER_M3)])
+    def test_a_lone_leg_waits_too(self, monkeypatch, caplog, wait, added_on):
+        # Q passes on Mondays 2 and 3; at 8 days its Monday 2 add-on (7 days
+        # after P's purchase) waits and Monday 3's is made
+        self._wait(monkeypatch, wait)
+        with caplog.at_level(logging.INFO):
+            point = self._sim(self._lone((_LADDER_M2, _LADDER_M3)))
+        assert _traded(point) == [("PA", _LADDER_M1), ("QA", added_on)]
+        assert len(self._lines(caplog, _ADD_ON_WAIT_LINE)) == (wait > 7)
+
+    def test_with_no_wait_and_no_minimum_the_run_is_the_shipped_one(self, monkeypatch):
+        # Weekly checkpoints: patching the wait to 0 changes no add-on, exact
+        # pair or lone leg
+        assert backtester.REBALANCE_MIN_DAYS_SINCE_TRADE == 7
+        for records in (lambda: self._pair(self._MONDAYS), self._lone):
+            shipped = self._sim(records())
+            with monkeypatch.context() as mp:
+                self._wait(mp, 0)
+                none = self._sim(records())
+            assert [astuple(t) for t in none.trades] == [astuple(t) for t in shipped.trades]
+            pd.testing.assert_frame_equal(none.equity_df, shipped.equity_df, check_exact=True)
+            assert none.moves == shipped.moves
+
+    def test_the_wait_is_asked_before_the_move_with_plain_dates(self, monkeypatch, caplog):
+        # 15 days and a 45c minimum: Mondays 2 and 3 wait, so neither is counted on
+        # the move's line; both lines go through the shared rule
+        seen = []
+        real = backtester.rebalance_rested
+
+        def spy(last_trade, day, min_days):
+            assert type(last_trade) is date and type(day) is date
+            seen.append((last_trade, day, min_days))
+            return real(last_trade, day, min_days)
+
+        monkeypatch.setattr(backtester, "rebalance_rested", spy)
+        self._wait(monkeypatch, 15)
+        with caplog.at_level(logging.INFO):
+            point = self._sim(self._pair(self._MONDAYS), min_move=0.45)
+        assert self._added(point) == []
+        assert seen == [(_LADDER_M1, _LADDER_M2, 15), (_LADDER_M1, _LADDER_M3, 15)]
+        assert len(self._lines(caplog, _ADD_ON_WAIT_LINE)) == 1
+        assert not self._lines(caplog, _ADD_ON_MOVE_LINE)
+
+    def test_a_run_that_adds_resolves_the_wait_before_any_entry_is_scored(self, monkeypatch):
+        # [{}] raises KeyError the moment Pass 1b scores it, so a ValueError
+        # here was raised before
+        self._wait(monkeypatch, 31)
+        with pytest.raises(ValueError, match=_BAD_TRIM_WAIT):
+            self._sim([{}])
+        # A run that neither adds nor trims never reads it
+        with pytest.raises(KeyError):
+            backtester._simulate_at_discount([{}], self._START, 10_000.0)
+
+
 @pytest.fixture(scope="class")
-def trim_run():
-    """The golden band sweep with the Kelly-trim family, over add_on_run's
-    narrowed grid (4 bands x 3 k, two of the bands re-run with the tier floors
-    off), beside the same run with the flag off, one with it left out, one
-    without the size-cap sweep, one without the band sweep and one with the
-    family's minimum price rises as well (trim_rise_sweep). Every
-    simulation during the runs goes through a spy that records its keywords,
-    and each run's INFO log is kept; the spy is undone before any cell is
-    read. The clock is frozen while the runs go. Pins
-    apply_pre_toggle_defaults on its own MonkeyPatch, as add_on_run does."""
+def rebalance_run():
+    """The golden band sweep with the Rebalance family, over a narrowed grid —
+    floors (0, 0.35) x ceilings (0.5, 1.0) x k (0.5, 1.0) plus the primary
+    0.75, so the two floor-0 bands bind at the tiers: 4 bands x 3 k, two of
+    the bands re-run with the tier floors off. Beside it: the same run with
+    the flag off and with it left out, one without the size-cap sweep, one
+    without the band sweep and one with the family's minimum price movements
+    as well (move_sweep). Every simulation during the runs goes through a spy
+    that records its keywords, and each run's INFO log is kept; the spy is
+    undone before any cell is read, so the cells run the real function. The
+    clock is frozen while the runs go, so every equity frame the tests
+    compare across runs ends on one day. Pins apply_pre_toggle_defaults on
+    its own MonkeyPatch, as cap_sweep_run does."""
     toggles = pytest.MonkeyPatch()
     mp = pytest.MonkeyPatch()
     try:
@@ -23658,41 +23644,55 @@ def trim_run():
             return res, list(sims), list(handler.messages)
 
         every = {"band_sweep": True, "tier_off_sweep": True, "cap_sweep": True}
-        on, sims_on, msgs_on = run(trim_sweep=True, **every)
-        off, sims_off, msgs_off = run(trim_sweep=False, **every)
+        on, sims_on, msgs_on = run(rebalance_sweep=True, **every)
+        off, sims_off, msgs_off = run(rebalance_sweep=False, **every)
         default, sims_default, _ = run(**every)
-        no_cap, _, _ = run(band_sweep=True, tier_off_sweep=True, trim_sweep=True)
-        single, _, _ = run(band_sweep=False, trim_sweep=True)
-        rise, sims_rise, msgs_rise = run(trim_sweep=True, trim_rise_sweep=True, **every)
+        no_cap, _, _ = run(band_sweep=True, tier_off_sweep=True, rebalance_sweep=True)
+        single, _, _ = run(band_sweep=False, rebalance_sweep=True)
+        move, sims_move, msgs_move = run(rebalance_sweep=True, move_sweep=True, **every)
         mp.undo()
         yield SimpleNamespace(
-            on=on, off=off, default=default, no_cap=no_cap, single=single, rise=rise,
+            on=on, off=off, default=default, no_cap=no_cap, single=single, move=move,
             sims_on=sims_on, sims_off=sims_off, sims_default=sims_default,
-            sims_rise=sims_rise, msgs_on=msgs_on, msgs_off=msgs_off, msgs_rise=msgs_rise,
+            sims_move=sims_move, msgs_on=msgs_on, msgs_off=msgs_off, msgs_move=msgs_move,
             start=golden._START)
     finally:
         mp.undo()
         toggles.undo()
 
 
-@pytest.mark.usefixtures("trim_run")
-class TestTrimSweep:
-    """run_backtest_sweep(trim_sweep=True): the dashboard's "Trim to Kelly"
-    family, a TrimSweep that builds, for one Tier floors and add-on setting, a
-    lazy CapSweep whose every simulation trims to Kelly. The run itself
-    simulates nothing extra: its points, simulations and INFO log are those
-    of a run without the flag, but for the setting lines and the summary
-    line. With trim_rise_sweep=True as well, the family carries the minimum
-    price rises a trim can be made to wait for (TrimSweep.min_rises), still
-    with nothing simulated during the run."""
+@pytest.mark.usefixtures("rebalance_run")
+class TestRebalanceSweep:
+    """run_backtest_sweep(rebalance_sweep=True): the dashboard's "Rebalance"
+    family, a RebalanceSweep that builds, for one Tier floors and
+    price-movement setting, a lazy CapSweep whose every simulation adds to
+    and trims held pairs together (add_to_held and trim_to_kelly both on),
+    the "all" population only. There is no setting that does only one of
+    the two. The run itself simulates nothing extra: its points, simulations
+    and INFO log are those of a run without the flag, but for the setting
+    lines and the summary line. Each cell ends its curves on the day its
+    eager twin's ended. With move_sweep=True as well, the family carries the
+    minimum price movements an add-on or a trim can be made to wait for
+    (RebalanceSweep.min_moves), still with nothing simulated during the
+    run, and every (minimum, cap) of move_grid equals a fresh rebalancing
+    simulation at that minimum."""
 
-    _TRIMMING = "Trimming to Kelly"
-    _SETTING_ON = (f"{_TRIMMING} (backtest): on — a held pair is trimmed only when at least 7 "
-                   "days have passed since the last trade on it "
-                   "(config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE); the dashboard's Trim to Kelly "
-                   "select is simulated when the dashboard is built")
-    _SUMMARY = (f"{_TRIMMING}: 20 size cap(s) x 4 band(s) (2 with the tier floors off) x 3 k, "
-                "adding to held pairs or not, each simulated when the dashboard reads it")
+    _REBALANCING = "Rebalancing"
+    _SETTING_ON = (f"{_REBALANCING} (backtest): on — a held pair is added to or trimmed only "
+                   "when at least 7 days have passed since the last trade on it "
+                   "(config.REBALANCE_MIN_DAYS_SINCE_TRADE); the dashboard's Rebalance select "
+                   "is simulated when the dashboard is built")
+    _SETTING_OFF = (f"{_REBALANCING} (backtest): off — the dashboard's Rebalance select stays "
+                    "disabled")
+    _MOVES_OFF = (f"{_REBALANCING} (backtest): minimum price movements off — the dashboard's "
+                  "Min. price movement select stays disabled")
+    _SUMMARY = (f"{_REBALANCING}: 20 size cap(s) x 4 band(s) (2 with the tier floors off) x 3 k, "
+                "each simulated when the dashboard reads it")
+
+    @staticmethod
+    def _eager(points) -> dict:
+        """(band, k, population) -> point of a run's eager scenarios."""
+        return {(p.spread_band, p.k, p.population): p for p in points}
 
     @staticmethod
     def _trades(point) -> list:
@@ -23700,16 +23700,37 @@ class TestTrimSweep:
 
     @classmethod
     def _others(cls, messages) -> list:
-        return [m for m in messages if not m.startswith((cls._TRIMMING, "Peak RSS"))]
+        """A run's INFO lines but for the Rebalance ones, the two that report the
+        process's peak memory and the one that says how many event competitions
+        came from the cache, which differ from one run to the next."""
+        return [m for m in messages if not m.startswith(
+            (cls._REBALANCING, "Peak RSS", "Event competitions:"))]
 
-    def test_off_is_the_default_and_builds_nothing(self, trim_run):
-        default = inspect.signature(run_backtest_sweep).parameters["trim_sweep"]
+    @staticmethod
+    def _settings(family) -> tuple:
+        """(tier_floors, bands, entries, end dates, eager scenarios) for each Tier
+        floors setting of a run's family."""
+        return ((True, family.bands, family.entries_by_band, family.end_dates),
+                (False, family.off_bands, family.off_entries_by_band, family.off_end_dates))
+
+    def test_off_is_the_default_and_builds_nothing(self, rebalance_run):
+        default = inspect.signature(run_backtest_sweep).parameters["rebalance_sweep"]
         assert default.default is False and default.kind is default.KEYWORD_ONLY
-        assert trim_run.off.trim_sweep is None and trim_run.default.trim_sweep is None
+        assert rebalance_run.off.rebalance_sweep is None
+        assert rebalance_run.default.rebalance_sweep is None
 
-    def test_on_adds_no_simulation_and_no_run_figure(self, trim_run):
-        assert trim_run.sims_on == trim_run.sims_off == trim_run.sims_default
-        on, off = trim_run.on, trim_run.off
+    def test_there_is_no_add_on_family_any_more(self):
+        # One family adds to or trims held pairs, so no run can ask for adding alone
+        assert "add_on_sweep" not in inspect.signature(run_backtest_sweep).parameters
+        assert "add_on_sweep" not in inspect.signature(
+            backtester._sweep_from_candidates).parameters
+        names = {f.name for f in fields(backtester.BacktestSweep)}
+        assert not names & {"add_on_cap_sweep", "add_on_tier_off_cap_sweep", "trim_sweep"}
+        assert "rebalance_sweep" in names
+
+    def test_on_adds_no_simulation_and_no_run_figure(self, rebalance_run):
+        assert rebalance_run.sims_on == rebalance_run.sims_off == rebalance_run.sims_default
+        on, off = rebalance_run.on, rebalance_run.off
         assert self._trades(on.primary) == self._trades(off.primary)
         pd.testing.assert_frame_equal(on.primary.equity_df, off.primary.equity_df)
         for mine, theirs in ((on.points, off.points), (on.scenarios, off.scenarios),
@@ -23717,137 +23738,305 @@ class TestTrimSweep:
             assert len(mine) == len(theirs) > 0
             for a, b in zip(mine, theirs, strict=True):
                 assert self._trades(a) == self._trades(b)
-                assert a.trim_to_kelly is False
+                assert a.trim_to_kelly is False and a.add_to_held is False
 
-    def test_on_adds_no_info_line_but_its_own(self, trim_run):
-        trimming = [m for m in trim_run.msgs_on if m.startswith(self._TRIMMING)]
-        assert trimming == [
-            self._SETTING_ON,
-            f"{self._TRIMMING} (backtest): minimum price rises off — the dashboard's Min. "
-            "price rise select stays disabled",
-            self._SUMMARY]
+    def test_on_adds_no_info_line_but_its_own(self, rebalance_run):
+        rebalancing = [m for m in rebalance_run.msgs_on if m.startswith(self._REBALANCING)]
+        assert rebalancing == [self._SETTING_ON, self._MOVES_OFF, self._SUMMARY]
         # The second setting line comes right after the first
-        first = trim_run.msgs_on.index(self._SETTING_ON)
-        assert trim_run.msgs_on[first + 1] == trimming[1]
-        assert self._others(trim_run.msgs_on) == self._others(trim_run.msgs_off)
-        # A run without the family says nothing about its minimum price rises
-        assert [m for m in trim_run.msgs_off if m.startswith(self._TRIMMING)] == [
-            f"{self._TRIMMING} (backtest): off — the dashboard's Trim to Kelly select "
-            "stays disabled"]
+        first = rebalance_run.msgs_on.index(self._SETTING_ON)
+        assert rebalance_run.msgs_on[first + 1] == self._MOVES_OFF
+        assert self._others(rebalance_run.msgs_on) == self._others(rebalance_run.msgs_off)
+        assert len(self._others(rebalance_run.msgs_on)) > 20
+        # A run without the family says nothing about its minimum price movements
+        assert [m for m in rebalance_run.msgs_off if m.startswith(self._REBALANCING)] == [
+            self._SETTING_OFF]
+        # ... and neither run says anything about adding to held pairs alone
+        assert not [m for m in rebalance_run.msgs_on + rebalance_run.msgs_off
+                    if m.startswith(("Adding to held pairs", "Trimming to Kelly"))]
 
-    def test_the_family_s_axes_are_the_grid_s(self, trim_run):
-        on = trim_run.on
-        family = on.trim_sweep
-        assert isinstance(family, backtester.TrimSweep)
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_the_setting_lines_follow_the_sell_line_after_the_checkpoint_line(
+            self, monkeypatch, caplog):
+        # The per-trade cap line, then the checkpoint line, then each lazy
+        # family's setting line: Sell's, then Rebalance's
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        for flag in (True, False):
+            caplog.clear()
+            with caplog.at_level(logging.INFO):
+                run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
+                                   rebalance_sweep=flag)
+            messages = [r.getMessage() for r in caplog.records]
+            cap = next(i for i, m in enumerate(messages)
+                       if m.startswith("Per-trade size cap"))
+            assert messages[cap + 1].startswith("Entry checkpoint (backtest):")
+            assert messages[cap + 2].startswith("Selling early (backtest):")
+            assert messages[cap + 3] == (self._SETTING_ON if flag else self._SETTING_OFF)
+            if flag:
+                assert messages[cap + 4] == self._MOVES_OFF
+
+    def test_the_family_s_axes_are_the_grid_s(self, rebalance_run):
+        on = rebalance_run.on
+        family = on.rebalance_sweep
+        assert isinstance(family, backtester.RebalanceSweep)
         assert family.caps == on.cap_sweep.caps and len(family.caps) == 20
         assert family.bands == on.cap_sweep.bands and family.ks == on.cap_sweep.ks
+        assert len(family.bands) == 4 and family.ks == (0.5, 0.75, 1.0)
         assert family.off_bands == on.tier_off_cap_sweep.bands
+        assert len(family.off_bands) == 2
         assert (family.primary_cap, family.primary_k) == (on.primary.size_cap, on.primary.k)
         # Over the very entries the size-cap sweeps keep (one retention)
         assert family.entries_by_band is on.cap_sweep.entries_by_band
         assert family.off_entries_by_band is on.tier_off_cap_sweep.entries_by_band
-        for tier, add in ((True, False), (True, True), (False, False), (False, True)):
-            cs = family.sweep(tier_floors=tier, add_to_held=add)
-            assert (cs.trim_to_kelly, cs.tier_floors, cs.add_to_held, cs.checks) == (
-                True, tier, add, False)
+        for tier in (True, False):
+            cs = family.sweep(tier_floors=tier)
+            # Both steps on, always: no sweep adds alone or trims alone
+            assert (cs.add_to_held, cs.trim_to_kelly, cs.tier_floors, cs.checks,
+                    cs.min_move) == (True, True, tier, False, None)
             assert cs.eager == {} and cs.same_title_eager is None and cs.split_date is None
+            assert cs.st_entries == []
             assert cs.bands == (family.bands if tier else family.off_bands)
             assert cs.caps == family.caps and cs.ks == family.ks
-            # Every cell has the day its eager twin's curve ended on
-            assert all((band, k, "all") in cs.end_dates for band in cs.bands for k in cs.ks)
         assert family.entry_events() == (on.cap_sweep.entry_events()
                                          | on.tier_off_cap_sweep.entry_events())
+        # sweep() takes no add-on setting at all
+        assert "add_to_held" not in inspect.signature(family.sweep).parameters
+        assert "add_to_held" not in inspect.signature(family.move_grid).parameters
 
-    def test_without_the_size_cap_sweep_the_run_s_own_cap_is_the_axis(self, trim_run):
-        res = trim_run.no_cap
+    def test_each_cell_has_the_day_its_eager_twin_ended_on(self, rebalance_run):
+        on = rebalance_run.on
+        family = on.rebalance_sweep
+        for (tier, bands, _entries, end_dates), scenarios in zip(
+                self._settings(family), (on.scenarios, on.tier_off_scenarios), strict=True):
+            eager = self._eager(scenarios)
+            # One day per (band, k) cell, keyed by the exact objects it is read with
+            assert set(end_dates) == {(b, k, "all") for b in bands for k in family.ks}, tier
+            for (band, k, pop), day in end_dates.items():
+                assert day == backtester._curve_end_date(eager[(band, k, pop)])
+                assert type(day) is date
+
+    def test_every_cell_is_an_all_point_that_rebalances(self, rebalance_run):
+        on = rebalance_run.on
+        family = on.rebalance_sweep
+        for (tier, bands, _entries, _ends), scenarios in zip(
+                self._settings(family), (on.scenarios, on.tier_off_scenarios), strict=True):
+            cs = family.sweep(tier_floors=tier)
+            eager = self._eager(scenarios)
+            add_ons = 0
+            for band in bands:
+                for k in family.ks:
+                    cell = cs.cell(band, k)
+                    day = backtester._curve_end_date(eager[(band, k, "all")])
+                    assert tuple(cell) == cs.caps
+                    for cap, by_pop in cell.items():
+                        assert set(by_pop) == {"all"}
+                        point = by_pop["all"]
+                        assert (point.k, point.spread_band, point.size_cap) == (k, band, cap)
+                        assert point.population == "all"
+                        assert point.add_to_held is True and point.trim_to_kelly is True
+                        assert point.tier_floors is tier
+                        # Every add-on and trim it made has its move recorded
+                        assert point.moves is not None
+                        # No checks: the bar reads the "all" point alone
+                        assert point.halves is None and point.ex_top_event is None
+                        # The eager twin's last day, and so its row count
+                        assert point.equity_df["date"].iloc[-1] == day
+                        assert len(point.equity_df) == len(
+                            eager[(band, k, "all")].equity_df)
+                        add_ons += sum(t.add_on for t in point.trades)
+            # Not vacuous: the golden pairs are added to in this family
+            assert add_ons > 0 and cs.simulated > 0, tier
+
+    def test_without_the_size_cap_sweep_the_run_s_own_cap_is_the_axis(self, rebalance_run):
+        res = rebalance_run.no_cap
         assert res.cap_sweep is None
-        assert res.trim_sweep.caps == (res.primary.size_cap,)
-        assert len(res.trim_sweep.off_bands) == 2
+        assert res.rebalance_sweep.caps == (res.primary.size_cap,)
+        assert len(res.rebalance_sweep.off_bands) == 2
+        assert res.rebalance_sweep.bands == tuple(sorted(
+            {(0.0, 0.5), (0.0, 1.0), (0.35, 0.5), (0.35, 1.0)}))
 
-    def test_a_single_band_run_has_no_tier_floors_off_half(self, trim_run):
-        family = trim_run.single.trim_sweep
+    def test_a_single_band_run_has_no_tier_floors_off_half(self, rebalance_run):
+        family = rebalance_run.single.rebalance_sweep
         assert family.bands == (BACKTEST_DEFAULT_SPREAD_BAND,) and family.off_bands == ()
-        with pytest.raises(ValueError, match="no tier-floors-off family to trim in"):
+        assert family.ks == tuple(p.k for p in rebalance_run.single.points)
+        with pytest.raises(ValueError, match="no tier-floors-off family to rebalance in"):
             family.sweep(tier_floors=False)
 
-    @pytest.mark.parametrize(("tier", "add"), [(True, False), (True, True), (False, False),
-                                               (False, True)])
-    def test_a_cell_is_a_fresh_trimming_simulation_at_every_cap(self, trim_run, tier, add):
-        on = trim_run.on
-        cs = on.trim_sweep.sweep(tier_floors=tier, add_to_held=add)
+    @pytest.mark.parametrize("tier", [True, False])
+    def test_a_cell_is_a_fresh_rebalancing_simulation_at_every_cap(self, rebalance_run, tier):
+        on = rebalance_run.on
+        cs = on.rebalance_sweep.sweep(tier_floors=tier)
         band, k = cs.bands[0], 0.5
         cell = cs.cell(band, k)
         end = cs.end_dates[(band, k, "all")]
         for cap in cs.caps:
             point = cell[cap]["all"]
             fresh = backtester._simulate_at_discount(
-                cs.entries_by_band[band], trim_run.start, 10_000.0, k=k, spread_band=band,
-                size_cap=cap, quiet=True, end_date=end, tier_floors=tier, add_to_held=add,
-                trim_to_kelly=True)
+                cs.entries_by_band[band], rebalance_run.start, 10_000.0, k=k,
+                spread_band=band, size_cap=cap, quiet=True, end_date=end, tier_floors=tier,
+                add_to_held=True, trim_to_kelly=True)
             assert (point.size_cap, point.trim_to_kelly, point.add_to_held,
-                    point.tier_floors) == (cap, True, add, tier)
+                    point.tier_floors) == (cap, True, True, tier)
             assert self._trades(point) == self._trades(fresh), cap
             pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df)
+        # ... and the family differs from a run that never rebalances, somewhere in it
+        plain = (on.cap_sweep if tier else on.tier_off_cap_sweep).cell(band, k)
+        assert any(self._trades(cell[cap]["all"]) != self._trades(plain[cap]["all"])
+                   for cap in cs.caps)
 
-    def test_the_minimum_price_rises_are_off_by_default(self, trim_run):
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_a_cell_read_after_utc_midnight_ends_every_cap_on_the_eager_day(
+        self, monkeypatch,
+    ):
+        golden = TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
+        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (1.0,))
+        clock = type("Clock", (TestCapSweepEndDate._Clock,),
+                     {"moment": datetime(2026, 9, 26, 23, 58, tzinfo=UTC)})
+        monkeypatch.setattr(backtester, "datetime", clock)
+        run = run_backtest_sweep(MagicMock(), MagicMock(), golden._START, 10_000.0,
+                                 same_event_ladders=True, band_sweep=True, cap_sweep=True,
+                                 tier_off_sweep=True, rebalance_sweep=True)
+        band, k = (0.0, 1.0), run.primary.k
+        # The report reads the cells four minutes later, on the next UTC day
+        clock.moment = datetime(2026, 9, 27, 0, 2, tzinfo=UTC)
+        for cs, eager in ((run.rebalance_sweep.sweep(tier_floors=True), run.primary),
+                          (run.rebalance_sweep.sweep(tier_floors=False),
+                           self._eager(run.tier_off_scenarios)[(band, k, "all")])):
+            cell = cs.cell(band, k)
+            # Not vacuous: caps were simulated after midnight
+            assert cs.simulated > 0
+            assert eager.equity_df["date"].iloc[-1] == date(2026, 9, 26)
+            for cap, by_pop in cell.items():
+                point = by_pop["all"]
+                assert point.equity_df["date"].iloc[-1] == date(2026, 9, 26), cap
+                assert len(point.equity_df) == len(eager.equity_df), cap
+        # ... while the clock really did move: an unpinned simulation now runs
+        # one day further
+        fresh = backtester._simulate_at_discount(
+            run.rebalance_sweep.entries_by_band[band], golden._START, 10_000.0, k=k,
+            size_cap=0.05, quiet=True, add_to_held=True, trim_to_kelly=True)
+        assert fresh.equity_df["date"].iloc[-1] == date(2026, 9, 27)
+
+    class _DailyClock(TestCapSweepEndDate._Clock):
+        """A clock one day later on every now() call, so each eager point
+        ends its curve on a day of its own."""
+
+        calls = 0
+
+        @classmethod
+        def now(cls, tz=None):
+            cls.calls += 1
+            moment = cls.moment + timedelta(days=cls.calls)
+            return moment if tz is None else moment.astimezone(tz)
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_every_cap_of_every_cell_ends_on_its_own_twin_s_day(self, monkeypatch):
+        """With a clock that moves on every read, each eager "all" point of
+        both Tier floors settings ends on a different day. Every cap of every
+        cell must still end on the day of its own (band, k) twin in ITS
+        setting: a cell given the primary's day, or a tier-off cell the
+        tier-on twin's, is caught here. Reading cells never reads the clock."""
+        golden = TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.35))
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.5, 1.0))
+        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5, 1.0))
+        clock = type("Clock", (self._DailyClock,),
+                     {"moment": datetime(2026, 9, 26, 12, 0, tzinfo=UTC), "calls": 0})
+        monkeypatch.setattr(backtester, "datetime", clock)
+        run = run_backtest_sweep(MagicMock(), MagicMock(), golden._START, 10_000.0,
+                                 same_event_ladders=True, band_sweep=True, cap_sweep=True,
+                                 tier_off_sweep=True, rebalance_sweep=True)
+        calls_after_the_run = clock.calls
+        family = run.rebalance_sweep
+        settings = []
+        for tier, scenarios in ((True, run.scenarios), (False, run.tier_off_scenarios)):
+            twins = {key: point for key, point in self._eager(scenarios).items()
+                     if key[2] == "all"}
+            settings.append((family.sweep(tier_floors=tier), twins,
+                             {key: backtester._curve_end_date(point)
+                              for key, point in twins.items()}))
+        # Not vacuous: no two eager "all" points, tier-off twins included, end
+        # on the same day
+        every_day = [day for _cs, _twins, days in settings for day in days.values()]
+        assert len(every_day) == len(set(every_day)) > 6
+        for cs, twins, days in settings:
+            assert set(cs.end_dates) == {(b, k, "all") for b in cs.bands for k in cs.ks}
+            for band in cs.bands:
+                for k in cs.ks:
+                    assert cs.end_dates[(band, k, "all")] == days[(band, k, "all")]
+                    for cap, by_pop in cs.cell(band, k).items():
+                        point = by_pop["all"]
+                        assert point.equity_df["date"].iloc[-1] == days[(band, k, "all")], (
+                            band, k, cap)
+                        assert len(point.equity_df) == len(twins[(band, k, "all")].equity_df)
+            assert cs.simulated > 0
+        assert clock.calls == calls_after_the_run
+
+    def test_the_minimum_price_movements_are_off_by_default(self, rebalance_run):
         for function in (run_backtest_sweep, backtester._sweep_from_candidates):
-            default = inspect.signature(function).parameters["trim_rise_sweep"]
+            default = inspect.signature(function).parameters["move_sweep"]
             assert default.default is False and default.kind is default.KEYWORD_ONLY
-        for res in (trim_run.on, trim_run.no_cap, trim_run.single):
-            assert res.trim_sweep.min_rises == ()
+        for res in (rebalance_run.on, rebalance_run.no_cap, rebalance_run.single):
+            assert res.rebalance_sweep.min_moves == ()
 
-    def test_with_the_minimum_price_rises_the_run_adds_no_simulation_and_no_figure(
-            self, trim_run):
-        assert trim_run.sims_rise == trim_run.sims_on == trim_run.sims_off
-        rise, off = trim_run.rise, trim_run.off
-        assert self._trades(rise.primary) == self._trades(off.primary)
-        pd.testing.assert_frame_equal(rise.primary.equity_df, off.primary.equity_df)
-        for mine, theirs in ((rise.points, off.points), (rise.scenarios, off.scenarios),
-                             (rise.tier_off_scenarios, off.tier_off_scenarios)):
+    def test_with_the_minimum_price_movements_the_run_adds_no_simulation_and_no_figure(
+            self, rebalance_run):
+        assert rebalance_run.sims_move == rebalance_run.sims_on == rebalance_run.sims_off
+        move, off = rebalance_run.move, rebalance_run.off
+        assert self._trades(move.primary) == self._trades(off.primary)
+        pd.testing.assert_frame_equal(move.primary.equity_df, off.primary.equity_df)
+        for mine, theirs in ((move.points, off.points), (move.scenarios, off.scenarios),
+                             (move.tier_off_scenarios, off.tier_off_scenarios)):
             assert len(mine) == len(theirs) > 0
             for a, b in zip(mine, theirs, strict=True):
                 assert self._trades(a) == self._trades(b)
-                assert a.trim_to_kelly is False and a.trim_min_rise is None
+                assert a.trim_to_kelly is False and a.add_to_held is False
+                assert a.min_move is None
 
-    def test_with_the_minimum_price_rises_the_family_carries_config_s_grid(self, trim_run):
-        family = trim_run.rise.trim_sweep
-        assert family.min_rises == backtester._resolve_trim_min_rises()
-        assert family.min_rises == config.TRIM_MIN_PRICE_RISES and len(family.min_rises) == 19
+    def test_with_the_minimum_price_movements_the_family_carries_config_s_grid(
+            self, rebalance_run):
+        family = rebalance_run.move.rebalance_sweep
+        assert family.min_moves == backtester._resolve_min_moves()
+        assert family.min_moves == config.MIN_PRICE_MOVES and len(family.min_moves) == 19
         # Every other axis is the family's without them
-        plain = trim_run.on.trim_sweep
-        assert dc_replace(family, min_rises=()) == plain
+        plain = rebalance_run.on.rebalance_sweep
+        assert dc_replace(family, min_moves=()) == plain
         for tier in (True, False):
-            cs = family.sweep(tier_floors=tier, min_rise=family.min_rises[1])
-            assert (cs.trim_to_kelly, cs.trim_min_rise, cs.tier_floors, cs.caps) == (
-                True, family.min_rises[1], tier, family.caps)
+            cs = family.sweep(tier_floors=tier, min_move=family.min_moves[1])
+            assert (cs.add_to_held, cs.trim_to_kelly, cs.min_move, cs.tier_floors,
+                    cs.caps) == (True, True, family.min_moves[1], tier, family.caps)
 
-    def test_with_the_minimum_price_rises_the_run_logs_only_its_own_setting_line(
-            self, trim_run):
-        trimming = [m for m in trim_run.msgs_rise if m.startswith(self._TRIMMING)]
-        assert trimming == [
+    def test_with_the_minimum_price_movements_the_run_logs_only_its_own_setting_line(
+            self, rebalance_run):
+        rebalancing = [m for m in rebalance_run.msgs_move if m.startswith(self._REBALANCING)]
+        assert rebalancing == [
             self._SETTING_ON,
-            f"{self._TRIMMING} (backtest): minimum price rises on — the dashboard's Min. "
-            "price rise select (5c to 95c, config.TRIM_MIN_PRICE_RISES) is simulated when "
-            "the dashboard is built",
+            f"{self._REBALANCING} (backtest): minimum price movements on — the dashboard's "
+            "Min. price movement select (5c to 95c, config.MIN_PRICE_MOVES) is simulated "
+            "when the dashboard is built",
             self._SUMMARY]
-        assert self._others(trim_run.msgs_rise) == self._others(trim_run.msgs_off)
+        assert self._others(rebalance_run.msgs_move) == self._others(rebalance_run.msgs_off)
 
     def test_the_setting_line_names_the_range_of_the_grid_it_resolved(self, monkeypatch,
                                                                        caplog):
         monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
         for grid, span in (((0.30, 0.125, 0.02), "2c to 30c"), ((0.25,), "25c")):
-            monkeypatch.setattr(backtester, "TRIM_MIN_PRICE_RISES", grid)
+            monkeypatch.setattr(backtester, "MIN_PRICE_MOVES", grid)
             caplog.clear()
             with caplog.at_level(logging.INFO):
                 run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
-                                   start_date=date(2026, 1, 1), trim_sweep=True,
-                                   trim_rise_sweep=True)
-            assert (f"{self._TRIMMING} (backtest): minimum price rises on — the dashboard's "
-                    f"Min. price rise select ({span}, config.TRIM_MIN_PRICE_RISES) is "
-                    "simulated when the dashboard is built") in [
+                                   start_date=date(2026, 1, 1), rebalance_sweep=True,
+                                   move_sweep=True)
+            assert (f"{self._REBALANCING} (backtest): minimum price movements on — the "
+                    f"dashboard's Min. price movement select ({span}, config.MIN_PRICE_MOVES) "
+                    "is simulated when the dashboard is built") in [
                 r.getMessage() for r in caplog.records]
-        assert backtester._trim_rises_span((0.05, 0.95)) == "5c to 95c"
-        assert backtester._trim_rises_span((0.125, 1.0)) == "12.5c to 100c"
+        assert backtester._moves_span((0.05, 0.95)) == "5c to 95c"
+        assert backtester._moves_span((0.125, 1.0)) == "12.5c to 100c"
 
     def test_the_setting_line_names_the_wait_after_a_trade_it_resolved(self, monkeypatch,
                                                                          caplog):
@@ -23856,122 +24045,265 @@ class TestTrimSweep:
                             (1, "only when at least 1 day has passed since the last trade on it"),
                             (14, "only when at least 14 days have passed since the last trade "
                                  "on it")):
-            monkeypatch.setattr(backtester, "KELLY_TRIM_MIN_DAYS_SINCE_TRADE", days)
-            assert backtester._trim_wait_text(days) == words
+            monkeypatch.setattr(backtester, "REBALANCE_MIN_DAYS_SINCE_TRADE", days)
+            assert backtester._rebalance_wait_text(days) == words
             caplog.clear()
             with caplog.at_level(logging.INFO):
                 run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
-                                   start_date=date(2026, 1, 1), trim_sweep=True)
+                                   start_date=date(2026, 1, 1), rebalance_sweep=True)
                 # A run without the family says nothing about the wait
                 run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
                                    start_date=date(2026, 1, 1))
             assert [r.getMessage() for r in caplog.records
-                    if r.getMessage().startswith(f"{self._TRIMMING} (backtest): o")] == [
-                f"{self._TRIMMING} (backtest): on — a held pair is trimmed {words} "
-                "(config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE); the dashboard's Trim to Kelly "
+                    if r.getMessage().startswith(f"{self._REBALANCING} (backtest): o")] == [
+                f"{self._REBALANCING} (backtest): on — a held pair is added to or trimmed "
+                f"{words} (config.REBALANCE_MIN_DAYS_SINCE_TRADE); the dashboard's Rebalance "
                 "select is simulated when the dashboard is built",
-                f"{self._TRIMMING} (backtest): off — the dashboard's Trim to Kelly select "
-                "stays disabled"]
+                self._SETTING_OFF]
 
     @pytest.mark.parametrize("entry", ["run_backtest_sweep", "_sweep_from_candidates"])
-    def test_the_minimum_price_rises_need_the_family(self, monkeypatch, caplog, entry):
+    def test_the_minimum_price_movements_need_the_family(self, monkeypatch, caplog, entry):
         monkeypatch.setattr(backtester, "_prepare_candidates",
                             lambda *a, **k: pytest.fail("fetched"))
         # A grid that would be refused is not even read: the pairing is checked first
-        monkeypatch.setattr(backtester, "TRIM_MIN_PRICE_RISES", ())
+        monkeypatch.setattr(backtester, "MIN_PRICE_MOVES", ())
         with caplog.at_level(logging.INFO), pytest.raises(
-                ValueError, match="trim_rise_sweep needs trim_sweep"):
+                ValueError, match="move_sweep needs rebalance_sweep"):
             if entry == "run_backtest_sweep":
                 run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
                                    start_date=date(2026, 1, 1), band_sweep=True,
-                                   cap_sweep=True, trim_rise_sweep=True)
+                                   cap_sweep=True, move_sweep=True)
             else:
                 # Refused before the candidates are touched (None has none to read)
                 backtester._sweep_from_candidates(
                     None, 10_000.0, interval_discount=None, sweep=False, spread_band=None,
-                    band_sweep=False, trim_rise_sweep=True)
+                    band_sweep=False, move_sweep=True)
         # Refused before the run's first line
         assert not caplog.records
 
     @pytest.mark.parametrize("bad", [(), (0.05, 0.05), (0.05, np.float64(0.05)), (0,), (0.0,),
                                      (1.5,), (True,), (float("nan"),), ("0.05",),
                                      (Decimal("0.05"),), 0.05, None])
-    def test_bad_minimum_price_rises_are_refused_before_any_fetch(self, monkeypatch, caplog,
-                                                                    bad):
-        monkeypatch.setattr(backtester, "TRIM_MIN_PRICE_RISES", bad)
+    def test_bad_minimum_price_movements_are_refused_before_any_fetch(self, monkeypatch,
+                                                                        caplog, bad):
+        monkeypatch.setattr(backtester, "MIN_PRICE_MOVES", bad)
         monkeypatch.setattr(backtester, "_prepare_candidates",
                             lambda *a, **k: pytest.fail("fetched"))
         with caplog.at_level(logging.INFO), pytest.raises(ValueError,
-                                                          match="TRIM_MIN_PRICE_RISES"):
+                                                          match="MIN_PRICE_MOVES"):
             run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
-                               start_date=date(2026, 1, 1), trim_sweep=True,
-                               trim_rise_sweep=True)
+                               start_date=date(2026, 1, 1), rebalance_sweep=True,
+                               move_sweep=True)
         # Refused before the run's first line
         assert not caplog.records
         # Only a run that asks for them reads them
         monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
-        for options in ({}, {"trim_sweep": True}):
+        for options in ({}, {"rebalance_sweep": True}):
             assert run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
-                                      start_date=date(2026, 1, 1), **options).trim_sweep is None
+                                      start_date=date(2026, 1, 1),
+                                      **options).rebalance_sweep is None
 
-    def test_the_minimum_price_rises_are_checked_and_sorted(self, monkeypatch):
+    def test_the_minimum_price_movements_are_checked_and_sorted(self, monkeypatch):
         with monkeypatch.context() as mp:
-            mp.setattr(backtester, "TRIM_MIN_PRICE_RISES", (np.float64(0.30), 0.05, 1))
-            rises = backtester._resolve_trim_min_rises()
-            assert rises == (0.05, 0.30, 1.0) and all(type(rise) is float for rise in rises)
+            mp.setattr(backtester, "MIN_PRICE_MOVES", (np.float64(0.30), 0.05, 1))
+            moves = backtester._resolve_min_moves()
+            assert moves == (0.05, 0.30, 1.0) and all(type(move) is float for move in moves)
             # Read when called, from this module's own binding: config's is not it
-            mp.setattr(config, "TRIM_MIN_PRICE_RISES", (0.5,))
-            assert backtester._resolve_trim_min_rises() == (0.05, 0.30, 1.0)
-            mp.setattr(backtester, "TRIM_MIN_PRICE_RISES", [0.10])
-            assert backtester._resolve_trim_min_rises() == (0.10,)
-        assert backtester._resolve_trim_min_rises() == tuple(
+            mp.setattr(config, "MIN_PRICE_MOVES", (0.5,))
+            assert backtester._resolve_min_moves() == (0.05, 0.30, 1.0)
+            mp.setattr(backtester, "MIN_PRICE_MOVES", [0.10])
+            assert backtester._resolve_min_moves() == (0.10,)
+        assert backtester._resolve_min_moves() == tuple(
             cents / 100 for cents in range(5, 100, 5))
-        for bad, words in (((), "must name at least one minimum price rise"),
+        for bad, words in (((), "must name at least one minimum price move"),
                            ((0.05, 0.05), "names a value twice"),
                            (5, "must be a tuple of dollar amounts"),
-                           ((0.05, 1.5), r"each of TRIM_MIN_PRICE_RISES must be in \(0, 1\]"),
-                           ((1e-9, 0.05), "each of TRIM_MIN_PRICE_RISES must be at least"),
-                           ((True,), "each of TRIM_MIN_PRICE_RISES must be a real number")):
+                           ((0.05, 1.5), r"each of MIN_PRICE_MOVES must be in \(0, 1\]"),
+                           ((1e-9, 0.05), "each of MIN_PRICE_MOVES must be at least"),
+                           ((True,), "each of MIN_PRICE_MOVES must be a real number")):
             with monkeypatch.context() as mp:
-                mp.setattr(backtester, "TRIM_MIN_PRICE_RISES", bad)
+                mp.setattr(backtester, "MIN_PRICE_MOVES", bad)
                 with pytest.raises(ValueError, match=words):
-                    backtester._resolve_trim_min_rises()
+                    backtester._resolve_min_moves()
 
-    def test_the_infeasible_window_has_no_family_with_or_without_them(self, monkeypatch):
+    def test_the_infeasible_window_has_no_family_with_or_without_them(self, monkeypatch,
+                                                                       caplog):
         monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
-        res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
-                                 start_date=date(2026, 1, 1), trim_sweep=True,
-                                 trim_rise_sweep=True, band_sweep=True, cap_sweep=True)
-        assert res.trim_sweep is None
+        with caplog.at_level(logging.INFO):
+            res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                     start_date=date(2026, 1, 1), rebalance_sweep=True,
+                                     move_sweep=True, band_sweep=True, cap_sweep=True)
+        assert res.rebalance_sweep is None and res.cap_sweep is None
+        # No summary line is logged for a family that was not built
+        assert not [r for r in caplog.records
+                    if r.getMessage().startswith(f"{self._REBALANCING}:")]
 
-    @pytest.mark.parametrize(("tier", "add"), [(True, False), (False, True)])
-    def test_a_run_that_trims_nothing_is_simulated_once_for_every_minimum(self, trim_run,
-                                                                           tier, add):
-        # Nothing is trimmed on the golden fixture, so through the run's own
-        # family every minimum is the run with no minimum, and only that run
-        # is simulated; a fresh simulation at a minimum is indeed that run
-        family = trim_run.rise.trim_sweep
+    @pytest.mark.parametrize("tier", [True, False])
+    def test_every_minimum_is_a_fresh_simulation_or_the_run_it_names(self, rebalance_run,
+                                                                      tier):
+        # Every cell of move_grid, at two caps, against a fresh rebalancing
+        # simulation at its minimum: a SameMove is the run in hand, a point is
+        # the fresh run and differs from the run it replaces. The record holds
+        # each add-on's move beside each trim's, so a minimum that holds an
+        # add-on back is another run
+        family = rebalance_run.move.rebalance_sweep
         band = (family.bands if tier else family.off_bands)[0]
         entries = (family.entries_by_band if tier else family.off_entries_by_band)[band]
         end = (family.end_dates if tier else family.off_end_dates)[(band, 0.5, "all")]
-        base = family.sweep(tier_floors=tier, add_to_held=add).cell(band, 0.5)
-        assert all(base[cap]["all"].trim_rises == () for cap in family.caps)
+        caps = (family.caps[0], family.caps[-1])
+        base = family.sweep(tier_floors=tier, caps=caps).cell(band, 0.5)
+
+        def fresh(cap, minimum):
+            return backtester._simulate_at_discount(
+                entries, rebalance_run.start, 10_000.0, k=0.5, spread_band=band,
+                size_cap=cap, quiet=True, end_date=end, tier_floors=tier, add_to_held=True,
+                trim_to_kelly=True, min_move=minimum)
+
+        hand = {}
+        for cap in caps:
+            point = base[cap]["all"]
+            # One move per add-on and per trim (a trim can sell more than one record)
+            add_ons = sum(t.add_on for t in point.trades)
+            assert add_ons <= len(point.moves) <= add_ons + sum(t.sold for t in point.trades)
+            hand[cap] = point
+        assert any(hand[cap].moves for cap in caps)
+        kinds: Counter = Counter()
         stats: dict = {}
-        grid = list(family.rise_grid(band, 0.5, tier_floors=tier, add_to_held=add,
-                                     stats=stats))
-        assert [minimum for minimum, _ in grid] == list(family.min_rises)
-        assert all(by_cap == dict.fromkeys(family.caps, backtester.SameTrim(None))
-                   for _minimum, by_cap in grid)
-        assert stats["simulated"] + stats["reused"] == len(family.caps)
-        assert stats["same"] == len(family.min_rises) * len(family.caps)
-        for minimum in (family.min_rises[0], family.min_rises[-1]):
-            for cap in (family.caps[0], family.caps[-1]):
-                fresh = backtester._simulate_at_discount(
-                    entries, trim_run.start, 10_000.0, k=0.5, spread_band=band,
-                    size_cap=cap, quiet=True, end_date=end, tier_floors=tier,
-                    add_to_held=add, trim_to_kelly=True, trim_min_rise=minimum)
-                assert self._trades(fresh) == self._trades(base[cap]["all"])
-                pd.testing.assert_frame_equal(fresh.equity_df, base[cap]["all"].equity_df)
+        for minimum, by_cap in family.move_grid(band, 0.5, tier_floors=tier, caps=caps,
+                                                stats=stats):
+            for cap, cell in by_cap.items():
+                run = fresh(cap, minimum)
+                if isinstance(cell, backtester.SameMove):
+                    assert self._trades(run) == self._trades(hand[cap])
+                    kinds["same"] += 1
+                else:
+                    assert (cell.min_move, cell.add_to_held, cell.trim_to_kelly) == (
+                        minimum, True, True)
+                    assert self._trades(run) == self._trades(cell)
+                    assert self._trades(cell) != self._trades(hand[cap])
+                    hand[cap] = cell
+                    kinds["point"] += 1
+        assert kinds["same"] > 0 and kinds["point"] > 0
+        assert sum(kinds.values()) == len(family.min_moves) * len(caps)
+        assert stats["same"] == kinds["same"]
+
+    def test_a_run_that_adds_and_trims_is_labelled_rebalancing(self, caplog):
+        # A run with both steps on names itself ", rebalancing" after the cap
+        # (its minimum price movement right after); one that does only one
+        # keeps its own words; every prefix is unique
+        p = TestAddToHeldPairs()._widening_pair()
+        with caplog.at_level(logging.INFO):
+            for kw in ({"add_to_held": True}, {"trim_to_kelly": True},
+                       {"add_to_held": True, "trim_to_kelly": True},
+                       {"add_to_held": True, "trim_to_kelly": True, "min_move": 0.10},
+                       {"add_to_held": True, "trim_to_kelly": True, "size_cap": 0.35},
+                       {"add_to_held": True, "trim_to_kelly": True, "sell_at": 0.85}):
+                TestAddToHeldPairs()._sim([p], k=0.75, **kw)
+        lines = _completion_lines(caplog)
+        assert lines[0].startswith(
+            "Backtest complete at k=0.750, band 0-1, all, adding to held pairs:")
+        assert lines[1].startswith(
+            "Backtest complete at k=0.750, band 0-1, all, trimming to Kelly:")
+        assert lines[2].startswith("Backtest complete at k=0.750, band 0-1, all, rebalancing:")
+        assert lines[3].startswith("Backtest complete at k=0.750, band 0-1, all, rebalancing "
+                                   "only after a 10c price move:")
+        assert lines[4].startswith(
+            "Backtest complete at k=0.750, band 0-1, all, cap 35%, rebalancing:")
+        assert lines[5].startswith(
+            "Backtest complete at k=0.750, band 0-1, all, rebalancing, "
+            f"{backtester._sale_label(0.85, None)}:")
+        prefixes = _completion_prefixes(lines)
+        assert len(prefixes) == len(set(prefixes)) == 6
+
+
+@pytest.mark.usefixtures("pre_toggle_defaults")
+class TestNoHalfRebalancing:
+    """No backtest scenario adds to held pairs without trimming them, or trims
+    without adding: every CapSweep a run builds — the size-cap sweeps during
+    the run, and the Sell and Rebalance families' sweeps as a report reads
+    their cells — has add_to_held equal to trim_to_kelly, and so does every
+    _simulate_at_discount call made meanwhile, whether through a CapSweep or
+    directly (an eager loop, a split-half or excluding-top-event check), none
+    that adds and trims also selling. The Rebalance family is the only one
+    that turns them on, always both together."""
+
+    def test_every_cap_sweep_a_run_builds_adds_and_trims_together_or_not_at_all(
+            self, monkeypatch):
+        golden = TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
+        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
+        monkeypatch.setattr(backtester, "TAKE_PROFIT_LEVELS", (0.5,))
+        monkeypatch.setattr(backtester, "TAKE_PROFIT_MIN_DAYS", (1,))
+        monkeypatch.setattr(backtester, "MIN_PRICE_MOVES", (0.05, 0.40))
+        built: list = []
+        real = backtester.CapSweep.__post_init__
+
+        def spy(self):
+            built.append((self.add_to_held, self.trim_to_kelly, self.sell_at))
+            real(self)
+
+        monkeypatch.setattr(backtester.CapSweep, "__post_init__", spy)
+        # (add_to_held, trim_to_kelly, sell_at) of every simulation, read
+        # through backtester's own global as every caller reaches it
+        calls: list = []
+        real_sim = backtester._simulate_at_discount
+
+        def sim_spy(*args, **kw):
+            calls.append((bool(kw.get("add_to_held")), bool(kw.get("trim_to_kelly")),
+                          kw.get("sell_at")))
+            return real_sim(*args, **kw)
+
+        monkeypatch.setattr(backtester, "_simulate_at_discount", sim_spy)
+        res = run_backtest_sweep(MagicMock(), MagicMock(), golden._START, 10_000.0,
+                                 same_event_ladders=True, band_sweep=True,
+                                 tier_off_sweep=True, cap_sweep=True, sell_sweep=True,
+                                 rebalance_sweep=True, move_sweep=True)
+        during_the_run = len(built)
+        # Read one cell of every lazy family, both Tier floors settings, the
+        # minimum price movements included
+        caps = (res.cap_sweep.caps[0], res.cap_sweep.caps[-1])
+        family, sold = res.rebalance_sweep, res.sell_sweep
+        for tier, bands in ((True, family.bands), (False, family.off_bands)):
+            band = bands[0]
+            family.sweep(tier_floors=tier, caps=caps).cell(band, 0.5)
+            list(family.move_grid(band, 0.5, tier_floors=tier, caps=caps))
+            for _level, _days, _by_cap in sold.sold_grid(band, 0.5, tier_floors=tier,
+                                                          caps=caps):
+                pass
+        assert during_the_run >= 2 and len(built) > during_the_run
+        assert all(add is trim for add, trim, _sell in built), built
+        # Not vacuous: sweeps that rebalance and sweeps that do neither were built
+        assert (True, True) in {(add, trim) for add, trim, _sell in built}
+        assert (False, False) in {(add, trim) for add, trim, _sell in built}
+        # ... and a sweep that sells never rebalances
+        assert all(not add for add, _trim, sell in built if sell is not None)
+        # Every simulation itself, not only every CapSweep: none adds alone or
+        # trims alone, some do both, and none that does both also sells
+        assert [c for c in calls if c[0] != c[1]] == []
+        assert any(c[0] and c[1] for c in calls)
+        assert [c for c in calls if c[0] and c[2] is not None] == []
+
+    def test_every_cap_sweep_the_module_builds_names_both_switches_or_neither(self):
+        # In backtester.py's own source, a CapSweep(...) call either passes
+        # neither add_to_held nor trim_to_kelly or passes both, as the same
+        # literal True: no family can be built that adds alone or trims alone
+        tree = ast.parse(inspect.getsource(backtester))
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == "CapSweep"]
+        assert len(calls) >= 4
+        both = 0
+        for call in calls:
+            given = {kw.arg: kw.value for kw in call.keywords}
+            switches = {name: given.get(name) for name in ("add_to_held", "trim_to_kelly")}
+            if all(value is None for value in switches.values()):
+                continue
+            assert all(isinstance(value, ast.Constant) and value.value is True
+                       for value in switches.values()), ast.unparse(call)
+            both += 1
+        # The Rebalance family's sweep() is the one call that turns them on
+        assert both == 1
 
 
 class _WalkedSellingGolden(_SellingGolden):
@@ -24003,7 +24335,7 @@ def walked_sell_run():
         res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
                                  start_date=golden._START, initial_balance=10_000.0,
                                  same_event_ladders=True, band_sweep=True, cap_sweep=True,
-                                 tier_off_sweep=True, add_on_sweep=True, sell_sweep=True,
+                                 tier_off_sweep=True, rebalance_sweep=True, sell_sweep=True,
                                  depth_model=_walk_model())
         mp.undo()
         yield SimpleNamespace(on=res, start=golden._START)
@@ -24049,23 +24381,22 @@ class TestWalkedSellSweep:
         walked = sold = 0
         for level in sell.levels:
             for k in sell.ks:
-                for add in (False, True):
-                    cell = sell.cell(level, sell.bands[0], k, add_to_held=add)
-                    for pops in cell.values():
-                        for t in pops["all"].trades:
-                            assert t.book_walked
-                            if not t.sold:
+                cell = sell.cell(level, sell.bands[0], k)
+                for pops in cell.values():
+                    for t in pops["all"].trades:
+                        assert t.book_walked
+                        if not t.sold:
+                            continue
+                        sold += 1
+                        sides = scanner.leg_sides(t.pair_type)
+                        for quotes, side, price in zip(t.marks, sides,
+                                                       (t.sale_price_a, t.sale_price_b),
+                                                       strict=True):
+                            if price is None:
                                 continue
-                            sold += 1
-                            sides = scanner.leg_sides(t.pair_type)
-                            for quotes, side, price in zip(t.marks, sides,
-                                                           (t.sale_price_a, t.sale_price_b),
-                                                           strict=True):
-                                if price is None:
-                                    continue
-                                bid = quotes.bid_at_checkpoint(t.exit_date, side)
-                                assert price <= bid
-                                walked += price < bid
+                            bid = quotes.bid_at_checkpoint(t.exit_date, side)
+                            assert price <= bid
+                            walked += price < bid
         # Positions sell, and their sales walk past the best bid
         assert sold > 0 and walked > 0
 
@@ -25070,8 +25401,9 @@ class TestStaleQuoteKeepsEveryLazyFamilyExact:
     """The stale-quote check reads no size cap, so every lazy family stays
     exact with it on: every cap of every kind of CapSweep (the size-cap family
     with its split-half and excluding-top-event checks, tier floors off,
-    adding to held pairs, selling, trimming), every cell of SellSweep.sold_grid
-    and of TrimSweep.rise_grid equals a fresh simulation. The fixture is
+    adding to held pairs, selling, trimming, rebalancing), every cell of
+    SellSweep.sold_grid and of RebalanceSweep.move_grid equals a fresh
+    simulation. The fixture is
     TestTrimCapSweep's three pairs over walked books, every candle trading in
     its hour but two frozen markets: PA's last move is three days before Monday
     1 (so its pair, which qualifies only then, never enters) and SB's two days
@@ -25116,7 +25448,8 @@ class TestStaleQuoteKeepsEveryLazyFamilyExact:
                  "tier floors off": {"tier_floors": False},
                  "adding to held pairs": {"add_to_held": True},
                  "selling": {"sell_at": 0.25},
-                 "trimming": {"trim_to_kelly": True}}
+                 "trimming": {"trim_to_kelly": True},
+                 "rebalancing": {"add_to_held": True, "trim_to_kelly": True}}
 
     @pytest.mark.parametrize("family", list(_FAMILIES))
     def test_every_cap_of_every_kind_of_cap_sweep_equals_a_fresh_simulation(self, family):
@@ -25186,13 +25519,12 @@ class TestStaleQuoteKeepsEveryLazyFamilyExact:
         kinds = TestSellSweep()._grid_parity(SimpleNamespace(start=self._START), sell=sell)
         assert kinds["point"] > 0 and kinds["same"] + kinds["pruned, level"] > 0
 
-    @pytest.mark.parametrize("add", [False, True])
-    def test_every_cell_of_the_rise_grid_equals_a_fresh_simulation(self, add):
+    def test_every_cell_of_the_move_grid_equals_a_fresh_simulation(self):
         entries = self._entries()
-        grid = TestTrimRiseGrid()
+        grid = TestMoveGrid()
         family = grid._family(entries, grid._SHORT)
         for k in self._KS:
-            kinds = grid._parity(family, entries, k, add)
+            kinds = grid._parity(family, entries, k)
             assert sum(kinds.values()) > 0
 
 
@@ -25701,7 +26033,7 @@ class TestVolumeCapKeepsEveryLazyFamilyExact(TestStaleQuoteKeepsEveryLazyFamilyE
     """The same lazy-family parity as the stale-quote check's, with the volume
     cap on (and the stale-quote check off): the cap reads no size cap, so
     every cap of every kind of CapSweep, every cell of sold_grid and of
-    rise_grid equals a fresh simulation. The volume ahead binds on entries,
+    move_grid equals a fresh simulation. The volume ahead binds on entries,
     add-ons, sales and trims: the early pair may buy 2 contract pairs, the
     first pair 30 on Monday 2 and 300 on Monday 4."""
 

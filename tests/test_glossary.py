@@ -8,7 +8,9 @@ Purpose:
     term is complete, listed once and tagged with a known page, a page lists
     only its own terms, every cell is escaped, the Terms link points at the
     section's id, the heading clears the sticky filter bar, the tier-floor
-    figures match config's, and the module imports only the standard library.
+    figures and the Rebalance wait match config's, the Rebalance and Min. price
+    movement entries sit after Size cap on the backtest page alone, and the
+    module imports only the standard library.
 """
 
 import ast
@@ -55,6 +57,33 @@ class TestTerms:
         assert f"{config.SHORT_DEADLINE_GAP_DAYS + 1} to {config.MAX_DEADLINE_GAP_DAYS} " \
                "days apart" in text
         assert f"at least {long_}" in text
+
+    def test_the_rebalance_terms_follow_size_cap_on_the_backtest_page_alone(self):
+        # They name two choices of the backtest page's filter bar, which sit
+        # right after Size cap there, so the Data page does not list them
+        names = [entry[0] for entry in glossary.TERMS]
+        at = names.index("Size cap")
+        assert names[at + 1:at + 3] == ["Rebalance", "Min. price movement"]
+        pages = {entry[0]: entry[3] for entry in glossary.TERMS}
+        assert pages["Rebalance"] == pages["Min. price movement"] == (
+            glossary.PAGE_BACKTEST,)
+        data = {t for t, _, _ in glossary.terms_for(glossary.PAGE_DATA)}
+        assert not data & {"Rebalance", "Min. price movement"}
+
+    def test_the_rebalance_wait_matches_config(self):
+        # The entry types the wait out, since this module imports no project
+        # module, so a changed wait must change the entry
+        text = {t: m for t, m, _, _ in glossary.TERMS}["Rebalance"]
+        assert f"{config.REBALANCE_MIN_DAYS_SINCE_TRADE} days have passed" in text
+
+    def test_the_movement_example_is_a_choice_the_menu_offers(self):
+        # "10c is 10% of a $1 payout": a contract pays $1, and 10c is one of the
+        # minimums the Min. price movement menu offers
+        text = {t: m for t, m, _, _ in glossary.TERMS}["Min. price movement"]
+        assert "10c is 10% of a $1 payout" in text
+        assert config.CONTRACT_PAYOUT_DOLLARS == 1.0
+        assert any(abs(move - 0.10) < config.PRICE_EPSILON
+                   for move in config.MIN_PRICE_MOVES)
 
 
 class TestPages:

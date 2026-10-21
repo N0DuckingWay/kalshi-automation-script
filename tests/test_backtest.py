@@ -22,13 +22,13 @@ And --no-cap-sweep: the per-trade size-cap sweep is on by default
 (cap_sweep=True), the flag threads cap_sweep=False, and the echo line names
 the setting.
 
-And --no-add-on-sweep: the dashboard's Add to held pairs family is on by
-default (add_on_sweep=True), the flag threads add_on_sweep=False, and the echo
-line names the setting right after the cap sweep's. --no-sell-sweep does the
-same for the Sell family (sell_sweep), named right after the add-on sweep, and
---no-trim-sweep for the Trim to Kelly family (trim_sweep), named after that.
---no-trim-rise-sweep leaves that family on without its minimum price rises
-(trim_rise_sweep=False), and changes only the echo's trim clause.
+And --no-sell-sweep: the dashboard's Sell family is on by default
+(sell_sweep=True), the flag threads sell_sweep=False, and the echo line names
+the setting right after the cap sweep's. --no-rebalance-sweep does the same
+for the Rebalance family (rebalance_sweep), named after that, and the old
+--no-add-on-sweep, --no-trim-sweep and --no-trim-rise-sweep are refused.
+--no-move-sweep leaves that family on without its minimum price movements
+(move_sweep=False), and changes only the echo's rebalance clause.
 
 And the echo's "live rule=" clause: the saved live defaults' rule (with their
 origin), "none saved" with no file, "not recorded" with a refused one — a read
@@ -100,9 +100,9 @@ from kalshi_betting.backtester import (
     BacktestSweep,
     CapSweep,
     CorpusProvenance,
+    RebalanceSweep,
     SellSweep,
     SweepPoint,
-    TrimSweep,
 )
 from kalshi_betting.config import (
     MAX_DEADLINE_GAP_DAYS,
@@ -775,95 +775,74 @@ class TestCapSweepArgument:
         assert "k=0.620" in text and "spread band=0-1" in text and "band sweep=on" in text
 
 
-class TestAddOnSweepArgument:
-    """--no-add-on-sweep: the "Add to held pairs" family is ON by default, like
-    the cap sweep, and the flag threads add_on_sweep=False into
-    run_backtest_sweep."""
-
-    def test_add_on_sweep_is_on_by_default(self, cli, monkeypatch):
-        _run(monkeypatch)
-        assert cli["sweep_kwargs"]["add_on_sweep"] is True
-
-    def test_no_add_on_sweep_turns_it_off(self, cli, monkeypatch):
-        _run(monkeypatch, "--no-add-on-sweep")
-        assert cli["sweep_kwargs"]["add_on_sweep"] is False
-
-    def test_it_is_independent_of_the_other_sweeps(self, cli, monkeypatch):
-        _run(monkeypatch, "--no-band-sweep", "--no-cap-sweep", "--no-sweep")
-        kwargs = cli["sweep_kwargs"]
-        assert (kwargs["add_on_sweep"], kwargs["band_sweep"], kwargs["cap_sweep"],
-                kwargs["sweep"]) == (True, False, False, False)
-        _run(monkeypatch, "--no-add-on-sweep")
-        kwargs = cli["sweep_kwargs"]
-        assert (kwargs["add_on_sweep"], kwargs["band_sweep"], kwargs["cap_sweep"],
-                kwargs["sweep"]) == (False, True, True, True)
-
-    def test_the_echo_names_the_setting_after_the_cap_sweep(self, cli, monkeypatch, caplog):
-        with caplog.at_level(logging.INFO):
-            _run(monkeypatch)
-        # The band and cap sweeps' substrings other tests read stay a prefix
-        assert "| band sweep=on | cap sweep=on | add-on sweep=on | sell sweep=on (" \
-            in caplog.text
-        caplog.clear()
-        with caplog.at_level(logging.INFO):
-            _run(monkeypatch, "--no-add-on-sweep", "--no-cap-sweep", "--sell-workers", "1")
-        assert ("| cap sweep=off | add-on sweep=off | sell sweep=on (1 worker process) "
-                "| trim sweep=on | live rule=") in caplog.text
-
-
 class TestSellSweepArgument:
     """--no-sell-sweep: the dashboard's Sell family is ON by default, like the
-    add-on family, and the flag threads sell_sweep=False into
-    run_backtest_sweep; the echo names the setting after the add-on sweep's."""
+    cap sweep, and the flag threads sell_sweep=False into run_backtest_sweep;
+    the echo names the setting right after the cap sweep's."""
 
-    def test_sell_sweep_is_on_by_default(self, cli, monkeypatch):
-        _run(monkeypatch)
+    def test_sell_sweep_is_on_by_default(self, cli, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
         assert cli["sweep_kwargs"]["sell_sweep"] is True
+        # The band and cap sweeps' substrings other tests read stay a prefix
+        assert "| band sweep=on | cap sweep=on | sell sweep=on (" in caplog.text
 
     def test_no_sell_sweep_turns_only_it_off(self, cli, monkeypatch, caplog):
         with caplog.at_level(logging.INFO):
             _run(monkeypatch, "--no-sell-sweep")
         kwargs = cli["sweep_kwargs"]
-        assert (kwargs["sell_sweep"], kwargs["add_on_sweep"], kwargs["band_sweep"],
+        assert (kwargs["sell_sweep"], kwargs["rebalance_sweep"], kwargs["band_sweep"],
                 kwargs["cap_sweep"]) == (False, True, True, True)
-        assert "| add-on sweep=on | sell sweep=off | trim sweep=on | live rule=" in caplog.text
+        assert "| cap sweep=on | sell sweep=off | rebalance sweep=on | live rule=" in caplog.text
 
 
-class TestTrimSweepArgument:
-    """--no-trim-sweep: the dashboard's Trim to Kelly family is ON by default,
-    like the add-on and Sell families, and the flag threads trim_sweep=False
-    into run_backtest_sweep; the echo names the setting after the sell sweep's."""
+class TestRebalanceSweepArgument:
+    """--no-rebalance-sweep: the dashboard's Rebalance family is ON by default,
+    like the cap and Sell families, and the flag threads rebalance_sweep=False
+    into run_backtest_sweep; the echo names the setting after the sell
+    sweep's. There is no flag for adding to or trimming held pairs alone."""
 
-    def test_trim_sweep_is_on_by_default(self, cli, monkeypatch, caplog):
+    def test_rebalance_sweep_is_on_by_default(self, cli, monkeypatch, caplog):
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
-        assert cli["sweep_kwargs"]["trim_sweep"] is True
-        assert ") | trim sweep=on | live rule=" in caplog.text
+        assert cli["sweep_kwargs"]["rebalance_sweep"] is True
+        assert ") | rebalance sweep=on | live rule=" in caplog.text
+        # The family the old flags named is gone from the call
+        assert "add_on_sweep" not in cli["sweep_kwargs"]
+        assert "trim_sweep" not in cli["sweep_kwargs"]
 
-    def test_no_trim_sweep_turns_only_it_off(self, cli, monkeypatch, caplog):
+    def test_no_rebalance_sweep_turns_only_it_off(self, cli, monkeypatch, caplog):
         with caplog.at_level(logging.INFO):
-            _run(monkeypatch, "--no-trim-sweep")
+            _run(monkeypatch, "--no-rebalance-sweep", "--no-cap-sweep", "--sell-workers", "1")
         kwargs = cli["sweep_kwargs"]
-        assert (kwargs["trim_sweep"], kwargs["sell_sweep"], kwargs["add_on_sweep"],
-                kwargs["band_sweep"], kwargs["cap_sweep"]) == (False, True, True, True, True)
-        assert ") | trim sweep=off | live rule=" in caplog.text
+        assert (kwargs["rebalance_sweep"], kwargs["sell_sweep"], kwargs["band_sweep"],
+                kwargs["cap_sweep"]) == (False, True, True, False)
+        assert ("| cap sweep=off | sell sweep=on (1 worker process) | rebalance sweep=off "
+                "| live rule=") in caplog.text
 
-    def test_the_help_names_the_flag_that_makes_one_live_run_trim(self, cli, monkeypatch,
-                                                                    capsys):
-        # The help names main.py --trim-to-kelly, which makes one live run trim
-        # whatever is saved
-        text = _option_help(monkeypatch, capsys, "--no-trim-sweep", "--no-trim-rise-sweep")
-        assert text.startswith("Skip the dashboard's Trim to Kelly select")
-        assert "trims only when its saved trim_to_kelly is on" not in text
-        assert "trims by its own saved trim_to_kelly (main.py --trim-to-kelly for one run)" in text
+    @pytest.mark.parametrize("flag", ["--no-add-on-sweep", "--no-trim-sweep",
+                                      "--no-trim-rise-sweep"])
+    def test_the_old_flags_are_refused(self, cli, monkeypatch, capsys, flag):
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, flag)
+        assert exc.value.code == 2
+        assert "unrecognized arguments" in capsys.readouterr().err
+        assert "sweep_kwargs" not in cli
+
+    def test_the_help_names_both_selects_it_skips(self, cli, monkeypatch, capsys):
+        text = _option_help(monkeypatch, capsys, "--no-rebalance-sweep", "--no-move-sweep")
+        assert text.startswith(
+            "Skip the dashboard's Rebalance select and its Min. price movement select")
+        assert "a live run adds to and trims held pairs by its own saved settings" in text
 
 
-class TestTrimRiseSweepArgument:
-    """--no-trim-rise-sweep: the Trim to Kelly family's minimum price rises
-    (the dashboard's Min. price rise select) are ON with the family by
-    default; the flag threads trim_rise_sweep=False into run_backtest_sweep
-    and leaves the family itself on, and --no-trim-sweep turns both off. The
-    echo's trim clause says which, and a default run's echo is unchanged."""
+class TestMoveSweepArgument:
+    """--no-move-sweep: the Rebalance family's minimum price movements (the
+    dashboard's Min. price movement select) are ON with the family by
+    default; the flag threads move_sweep=False into run_backtest_sweep and
+    leaves the family itself on, and --no-rebalance-sweep turns both off.
+    The echo's rebalance clause says which, and a default run's echo reads
+    "rebalance sweep=on"."""
 
     @staticmethod
     def _echo(caplog) -> str:
@@ -871,63 +850,64 @@ class TestTrimRiseSweepArgument:
                    if r.getMessage().startswith("Backtest config:")]
         return line
 
-    def test_the_minimum_price_rises_are_on_with_the_family_by_default(self, cli, monkeypatch,
-                                                                         caplog):
+    def test_the_minimum_price_movements_are_on_with_the_family_by_default(
+            self, cli, monkeypatch, caplog):
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
         kwargs = cli["sweep_kwargs"]
-        assert (kwargs["trim_sweep"], kwargs["trim_rise_sweep"]) == (True, True)
-        assert ") | trim sweep=on | live rule=" in self._echo(caplog)
+        assert (kwargs["rebalance_sweep"], kwargs["move_sweep"]) == (True, True)
+        assert ") | rebalance sweep=on | live rule=" in self._echo(caplog)
 
-    def test_no_trim_rise_sweep_turns_only_them_off(self, cli, monkeypatch, caplog):
+    def test_no_move_sweep_turns_only_them_off(self, cli, monkeypatch, caplog):
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
         default_kwargs, default_echo = cli["sweep_kwargs"], self._echo(caplog)
         caplog.clear()
         with caplog.at_level(logging.INFO):
-            _run(monkeypatch, "--no-trim-rise-sweep")
+            _run(monkeypatch, "--no-move-sweep")
         kwargs = cli["sweep_kwargs"]
-        assert (kwargs["trim_rise_sweep"], kwargs["trim_sweep"], kwargs["sell_sweep"],
-                kwargs["add_on_sweep"], kwargs["band_sweep"], kwargs["cap_sweep"]) == (
-            False, True, True, True, True, True)
+        assert (kwargs["move_sweep"], kwargs["rebalance_sweep"], kwargs["sell_sweep"],
+                kwargs["band_sweep"], kwargs["cap_sweep"]) == (False, True, True, True, True)
         # No other keyword moves (each run builds a client of its own)
-        skipped = {"trim_rise_sweep", "hist_client"}
+        skipped = {"move_sweep", "hist_client"}
         assert set(kwargs) == set(default_kwargs)
         assert ({key: value for key, value in kwargs.items() if key not in skipped}
                 == {key: value for key, value in default_kwargs.items()
                     if key not in skipped})
-        # ... and only the echo's trim clause does
-        assert "| trim sweep=on | live rule=" in default_echo
+        # ... and only the echo's rebalance clause does
+        assert "| rebalance sweep=on | live rule=" in default_echo
         assert self._echo(caplog) == default_echo.replace(
-            "| trim sweep=on | live rule=",
-            "| trim sweep=on (no minimum price rises) | live rule=")
+            "| rebalance sweep=on | live rule=",
+            "| rebalance sweep=on (no minimum price movements) | live rule=")
 
-    @pytest.mark.parametrize("flags", [("--no-trim-sweep",),
-                                       ("--no-trim-sweep", "--no-trim-rise-sweep")])
-    def test_no_trim_sweep_turns_both_off(self, cli, monkeypatch, caplog, flags):
+    @pytest.mark.parametrize("flags", [("--no-rebalance-sweep",),
+                                       ("--no-rebalance-sweep", "--no-move-sweep")])
+    def test_no_rebalance_sweep_turns_both_off(self, cli, monkeypatch, caplog, flags):
         with caplog.at_level(logging.INFO):
             _run(monkeypatch, *flags)
         kwargs = cli["sweep_kwargs"]
-        assert (kwargs["trim_sweep"], kwargs["trim_rise_sweep"]) == (False, False)
-        assert ") | trim sweep=off | live rule=" in self._echo(caplog)
+        assert (kwargs["rebalance_sweep"], kwargs["move_sweep"]) == (False, False)
+        assert ") | rebalance sweep=off | live rule=" in self._echo(caplog)
 
     def test_the_help_names_the_select_it_skips(self, cli, monkeypatch, capsys):
         with pytest.raises(SystemExit) as exc:
             _run(monkeypatch, "--help")
         assert exc.value.code == 0
         text = " ".join(capsys.readouterr().out.split())
-        assert "--no-trim-rise-sweep" in text
-        assert "Skip the dashboard's Min. price rise select" in text
-        assert "Trim to Kelly itself is still built" in text
+        assert "--no-move-sweep" in text
+        assert "Skip the dashboard's Min. price movement select" in text
+        assert "Rebalance itself is still built" in text
         assert "sweep_kwargs" not in cli
 
     def test_the_help_names_the_flag_that_sets_one_live_runs_minimum(self, cli, monkeypatch,
                                                                        capsys):
-        # The help names main.py --trim-min-rise, which sets one live run's minimum
-        text = _option_help(monkeypatch, capsys, "--no-trim-rise-sweep", "--sell-workers")
-        assert text.startswith("Skip the dashboard's Min. price rise select")
-        assert text.endswith("waits for a price rise by its own saved trim_min_rise "
-                             "(main.py --trim-min-rise for one run)")
+        # The help names main.py --min-price-move, which sets one live run's minimum,
+        # and says the minimum holds back a live run's add-ons and trims alike
+        text = _option_help(monkeypatch, capsys, "--no-move-sweep", "--sell-workers")
+        assert text.startswith("Skip the dashboard's Min. price movement select")
+        assert text.endswith("a live run's rebalancing (add-ons and trims) waits for a price "
+                             "move by its own saved min_price_move (main.py --min-price-move "
+                             "for one run)")
 
 
 class TestSellWorkersArgument:
@@ -948,7 +928,8 @@ class TestSellWorkersArgument:
         with caplog.at_level(logging.INFO):
             _run(monkeypatch, "--sell-workers", "3")
         assert cli["dashboard"][1]["sell_workers"] == 3
-        assert "| sell sweep=on (3 worker processes) | trim sweep=on | live rule=" in caplog.text
+        assert ("| sell sweep=on (3 worker processes) | rebalance sweep=on | live rule="
+                in caplog.text)
 
     @pytest.mark.parametrize("value", ["0", "-2"])
     def test_a_count_below_one_is_refused(self, cli, monkeypatch, capsys, value):
@@ -1112,6 +1093,18 @@ class TestLiveRuleEcho:
         assert "live rule=not recorded — the saved live defaults are refused (" in text
         assert str(config.LIVE_DEFAULTS_FILE) in text
         # The run still went ahead
+        assert "sweep_kwargs" in cli
+
+    def test_a_file_an_older_version_saved_is_refused_too(self, cli, monkeypatch, caplog):
+        # A file an older version saved is a refused file here: the echo never
+        # names its values in their new form, and the run still goes ahead
+        from .test_config import _OLD_VERSION_BYTES
+        config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        text = caplog.text
+        assert "live rule=not recorded — the saved live defaults are refused (" in text
+        assert str(config.LIVE_DEFAULTS_FILE) in text
         assert "sweep_kwargs" in cli
 
 
@@ -2064,7 +2057,8 @@ class TestDashboardOnly:
             with gzip.open(path, "wb") as handle:
                 handle.write(b"not json\n")
         elif damage == "other format":
-            _rewrite_header(path, format="backtest-sweep-v0")
+            # The format a run saved before the one Rebalance family
+            _rewrite_header(path, format="backtest-sweep-v1")
         else:
             _rewrite_header(path, fingerprint_parts=None)
         with pytest.raises(SystemExit) as exc:
@@ -2074,8 +2068,9 @@ class TestDashboardOnly:
         assert exc.value.code.startswith(f"backtest: {path} cannot be used: ")
         assert exc.value.code.endswith("run the backtest again to save a new one")
         if damage == "other format":
-            assert "'backtest-sweep-v0'" in exc.value.code
+            assert "'backtest-sweep-v1'" in exc.value.code
             assert repr(config.BACKTEST_SWEEP_FORMAT) in exc.value.code
+            assert config.BACKTEST_SWEEP_FORMAT == "backtest-sweep-v2"
         assert "dashboard" not in rebuild
 
     @pytest.mark.parametrize("damage", ["cut short", "not the inputs"])
@@ -2155,8 +2150,8 @@ class TestDashboardOnly:
         dests = {a.dest for a in backtest._build_parser()._actions} - {"help"}
         run_only = {dest for dest, _ in backtest._RUN_ONLY_FLAGS}
         rebuild = {"dashboard_only", "accept_changed_simulator", "sell_workers",
-                   "no_cap_sweep", "no_add_on_sweep", "no_sell_sweep", "no_trim_sweep",
-                   "no_trim_rise_sweep", "no_eda"}
+                   "no_cap_sweep", "no_sell_sweep", "no_rebalance_sweep", "no_move_sweep",
+                   "no_eda"}
         assert run_only | rebuild == dests
         assert not run_only & rebuild
 
@@ -2168,17 +2163,15 @@ class TestDashboardOnly:
     def test_the_skip_flags_drop_their_families(self, cli, monkeypatch, tmp_path, caplog):
         # The saved sweep carries a stand-in for every family each flag drops
         cli["result"] = dataclasses.replace(
-            _sweep(), add_on_cap_sweep=SimpleNamespace(), add_on_tier_off_cap_sweep=None,
-            sell_sweep=SimpleNamespace(), trim_sweep=SimpleNamespace())
+            _sweep(), sell_sweep=SimpleNamespace(), rebalance_sweep=SimpleNamespace())
         _run(monkeypatch)
         with caplog.at_level(logging.INFO):
-            _run(monkeypatch, "--dashboard-only", "--no-add-on-sweep", "--no-sell-sweep",
-                 "--no-trim-sweep")
+            _run(monkeypatch, "--dashboard-only", "--no-sell-sweep", "--no-rebalance-sweep")
         sweep = cli["dashboard"][1]["sweep"]
-        assert (sweep.add_on_cap_sweep, sweep.sell_sweep, sweep.trim_sweep) == (None,) * 3
+        assert (sweep.sell_sweep, sweep.rebalance_sweep) == (None,) * 2
         assert any(r.getMessage() == (
-            "Dashboard rebuilt without: Add to held pairs (--no-add-on-sweep); "
-            "Sell (--no-sell-sweep); Trim to Kelly (--no-trim-sweep)")
+            "Dashboard rebuilt without: Sell (--no-sell-sweep); "
+            "Rebalance (--no-rebalance-sweep)")
             for r in caplog.records)
 
 
@@ -2193,12 +2186,10 @@ def _families() -> dict:
              "end_dates": {}, "off_end_dates": {}}
     return {
         "cap_sweep": CapSweep(caps=(0.1, 0.2), bands=band, **lazy, **common),
-        "add_on_cap_sweep": CapSweep(caps=(0.1, 0.2), bands=band, add_to_held=True, **lazy,
-                                     **common),
         "sell_sweep": SellSweep(levels=(0.5,), min_days=(1,), caps=(0.1, 0.2), bands=band,
                                 **lists, **common),
-        "trim_sweep": TrimSweep(caps=(0.1, 0.2), bands=band, min_rises=(0.05, 0.1),
-                                **lists, **common),
+        "rebalance_sweep": RebalanceSweep(caps=(0.1, 0.2), bands=band, min_moves=(0.05, 0.1),
+                                          **lists, **common),
     }
 
 
@@ -2213,8 +2204,8 @@ class TestWithoutFamilies:
 
     @staticmethod
     def _call(sweep, **off):
-        flags = {"cap_sweep": True, "add_on_sweep": True, "sell_sweep": True,
-                 "trim_sweep": True, "trim_rise_sweep": True}
+        flags = {"cap_sweep": True, "sell_sweep": True, "rebalance_sweep": True,
+                 "move_sweep": True}
         flags.update(dict.fromkeys(off, False))
         return backtest._without_families(sweep, **flags)
 
@@ -2227,35 +2218,33 @@ class TestWithoutFamilies:
         sweep = self._sweep()
         out, notes = self._call(sweep, cap_sweep=False)
         assert out.cap_sweep is None and out.tier_off_cap_sweep is None
-        for name in ("add_on_cap_sweep", "sell_sweep", "trim_sweep"):
+        for name in ("sell_sweep", "rebalance_sweep"):
             assert getattr(out, name) == dataclasses.replace(getattr(sweep, name), caps=(0.2,))
         assert notes == ["the size caps (--no-cap-sweep)"]
         # The loaded sweep is left as it was
         assert sweep.cap_sweep.caps == (0.1, 0.2) and sweep.sell_sweep.caps == (0.1, 0.2)
 
     @pytest.mark.parametrize("flag, names, note", [
-        ("add_on_sweep", ("add_on_cap_sweep", "add_on_tier_off_cap_sweep"),
-         "Add to held pairs (--no-add-on-sweep)"),
         ("sell_sweep", ("sell_sweep",), "Sell (--no-sell-sweep)"),
-        ("trim_sweep", ("trim_sweep",), "Trim to Kelly (--no-trim-sweep)"),
+        ("rebalance_sweep", ("rebalance_sweep",), "Rebalance (--no-rebalance-sweep)"),
     ])
     def test_each_flag_drops_its_family(self, flag, names, note):
         out, notes = self._call(self._sweep(), **{flag: False})
         assert all(getattr(out, name) is None for name in names)
         assert notes == [note]
 
-    def test_without_the_minimum_price_rises_trimming_stays(self):
+    def test_without_the_minimum_price_movements_rebalancing_stays(self):
         sweep = self._sweep()
-        out, notes = self._call(sweep, trim_rise_sweep=False)
-        assert out.trim_sweep == dataclasses.replace(sweep.trim_sweep, min_rises=())
-        assert notes == ["Min. price rise (--no-trim-rise-sweep)"]
-        # Dropping trimming drops its minimums with it, named once
-        out, notes = self._call(sweep, trim_sweep=False, trim_rise_sweep=False)
-        assert out.trim_sweep is None and notes == ["Trim to Kelly (--no-trim-sweep)"]
+        out, notes = self._call(sweep, move_sweep=False)
+        assert out.rebalance_sweep == dataclasses.replace(sweep.rebalance_sweep, min_moves=())
+        assert notes == ["Min. price movement (--no-move-sweep)"]
+        # Dropping the family drops its minimums with it, named once
+        out, notes = self._call(sweep, rebalance_sweep=False, move_sweep=False)
+        assert out.rebalance_sweep is None and notes == ["Rebalance (--no-rebalance-sweep)"]
 
     def test_a_family_the_run_did_not_build_is_not_named(self):
-        out, notes = self._call(_sweep(), cap_sweep=False, add_on_sweep=False,
-                                sell_sweep=False, trim_sweep=False)
+        out, notes = self._call(_sweep(), cap_sweep=False, sell_sweep=False,
+                                rebalance_sweep=False)
         assert notes == []
 
 
@@ -2295,8 +2284,8 @@ class TestSimulatorFingerprint:
             .replace("File: backtester.py", "File: backtester.py (reworded)", 1)
             + "\n\n# A comment added at the end\n")
         edited["config"] = sources["config"].replace(
-            "KELLY_TRIM_MIN_DAYS_SINCE_TRADE = 7",
-            "KELLY_TRIM_MIN_DAYS_SINCE_TRADE = (\n    7  # spread over two lines\n)")
+            "REBALANCE_MIN_DAYS_SINCE_TRADE = 7",
+            "REBALANCE_MIN_DAYS_SINCE_TRADE = (\n    7  # spread over two lines\n)")
         assert edited["config"] != sources["config"]
         assert backtest._simulator_fingerprint_parts(edited) == base
 
@@ -2312,20 +2301,20 @@ class TestSimulatorFingerprint:
         sources = self._sources()
         base = backtest._simulator_fingerprint_parts(sources)
         edited = {**sources, "config": sources["config"].replace(
-            "KELLY_TRIM_MIN_DAYS_SINCE_TRADE = 7", "KELLY_TRIM_MIN_DAYS_SINCE_TRADE = 8")}
+            "REBALANCE_MIN_DAYS_SINCE_TRADE = 7", "REBALANCE_MIN_DAYS_SINCE_TRADE = 8")}
         assert self._changed(base, backtest._simulator_fingerprint_parts(edited)) == {"config"}
 
     def test_a_config_value_reached_through_another_changes_it_too(self):
-        # Read by config.kelly_trim_min_days, which the backtester calls; no
+        # Read by config.rebalance_min_days, which the backtester calls; no
         # simulator module names it itself
         sources = self._sources()
         read = set().union(*(backtest._config_names_read(ast.parse(sources[name]))
                              for name in backtest._SIMULATOR_MODULES))
-        assert "KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX" not in read
+        assert "REBALANCE_MIN_DAYS_SINCE_TRADE_MAX" not in read
         base = backtest._simulator_fingerprint_parts(sources)
         edited = {**sources, "config": sources["config"].replace(
-            "KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX = 30",
-            "KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX = 31")}
+            "REBALANCE_MIN_DAYS_SINCE_TRADE_MAX = 30",
+            "REBALANCE_MIN_DAYS_SINCE_TRADE_MAX = 31")}
         assert self._changed(base, backtest._simulator_fingerprint_parts(edited)) == {"config"}
 
     def test_config_the_simulator_never_reads_does_not_count(self):
@@ -2366,7 +2355,7 @@ class TestSimulatorFingerprint:
 def saved_golden_run(tmp_path_factory):
     """The backtester's selling golden fixture through run_backtest_sweep with every
     lazy family on, on a narrowed grid (band 0-1, k 0.5, four sell levels, three
-    minimum-days options, three minimum price rises), saved by the full run's own
+    minimum-days options, three minimum price movements), saved by the full run's own
     save and loaded back by the rebuild's own load, then paged twice: once from the
     run's inputs as a full run pages them, once from the loaded copy.
 
@@ -2387,7 +2376,7 @@ def saved_golden_run(tmp_path_factory):
         mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
         mp.setattr(backtester, "TAKE_PROFIT_LEVELS", (0.05, 0.25, 0.5, 1.0))
         mp.setattr(backtester, "TAKE_PROFIT_MIN_DAYS", (1, 14, 30))
-        mp.setattr(backtester, "TRIM_MIN_PRICE_RISES", (0.05, 0.1, 0.3))
+        mp.setattr(backtester, "MIN_PRICE_MOVES", (0.05, 0.1, 0.3))
         # One clock for every run of the class, so their curves end on one day
         mp.setattr(backtester, "datetime", type(
             "Clock", (_tb.TestCapSweepEndDate._Clock,),
@@ -2404,11 +2393,10 @@ def saved_golden_run(tmp_path_factory):
 
         def run(**flags):
             options = {"band_sweep": True, "tier_off_sweep": True, "cap_sweep": True,
-                       "add_on_sweep": True, "sell_sweep": True, "trim_sweep": True,
-                       "trim_rise_sweep": True}
+                       "sell_sweep": True, "rebalance_sweep": True, "move_sweep": True}
             options.update(flags)
-            # As backtest.py sets it: the minimum price rises go with their family
-            options["trim_rise_sweep"] = options["trim_rise_sweep"] and options["trim_sweep"]
+            # As backtest.py sets it: the minimum price movements go with their family
+            options["move_sweep"] = options["move_sweep"] and options["rebalance_sweep"]
             return backtester.run_backtest_sweep(
                 MagicMock(), MagicMock(), golden._START, 10_000.0, same_event_ladders=True,
                 interval_discount=0.5, **options)
@@ -2453,11 +2441,11 @@ class TestRebuildFromTheSavedSweep:
 
     def test_every_lazy_family_is_saved(self, saved_golden_run):
         swept, loaded = saved_golden_run.swept, saved_golden_run.loaded["sweep"]
-        for name in ("cap_sweep", "tier_off_cap_sweep", "add_on_cap_sweep",
-                     "add_on_tier_off_cap_sweep", "sell_sweep", "trim_sweep"):
+        for name in ("cap_sweep", "tier_off_cap_sweep", "sell_sweep", "rebalance_sweep"):
             assert getattr(swept, name) is not None, name
             assert type(getattr(loaded, name)) is type(getattr(swept, name)), name
-        assert loaded.trim_sweep.min_rises == swept.trim_sweep.min_rises == (0.05, 0.1, 0.3)
+        assert (loaded.rebalance_sweep.min_moves == swept.rebalance_sweep.min_moves
+                == (0.05, 0.1, 0.3))
         assert loaded.sell_sweep.levels == swept.sell_sweep.levels
 
     def test_the_rebuilt_page_is_byte_identical(self, saved_golden_run):
@@ -2468,16 +2456,16 @@ class TestRebuildFromTheSavedSweep:
         assert rebuilt == live
 
     @pytest.mark.parametrize("off", [
-        ("cap_sweep", "trim_rise_sweep"),
-        ("add_on_sweep", "sell_sweep", "trim_sweep"),
+        ("cap_sweep", "move_sweep"),
+        ("sell_sweep", "rebalance_sweep"),
     ])
     def test_the_skip_flags_build_the_page_a_run_with_them_builds(self, saved_golden_run, off):
         flags = dict.fromkeys(off, False)
         ran = saved_golden_run.run(**flags)
         expected = _page_and_sidecars(saved_golden_run.page(saved_golden_run.inputs_of(ran),
                                                             "run-with-flags"))
-        kept = {"cap_sweep": True, "add_on_sweep": True, "sell_sweep": True,
-                "trim_sweep": True, "trim_rise_sweep": True}
+        kept = {"cap_sweep": True, "sell_sweep": True, "rebalance_sweep": True,
+                "move_sweep": True}
         kept.update(flags)
         loaded = saved_golden_run.loaded
         sweep, dropped = backtest._without_families(loaded["sweep"], **kept)

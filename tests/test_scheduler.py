@@ -784,6 +784,28 @@ class TestCheckLiveDefaults:
         assert error.endswith("every scheduled run will exit 2 until the file is fixed, "
                               "or deleted and saved again")
 
+    def test_an_outdated_file_logs_how_to_save_it_again(self, caplog):
+        # A file an older version saved (the settings Rebalance replaced): the
+        # remedy is one save through the defaults server, never a delete
+        config.LIVE_DEFAULTS_FILE.write_text(json.dumps({
+            "format": config.LIVE_DEFAULTS_FORMAT, "saved_at": "2026-10-11T18:22:05Z",
+            "source": "", "settings": {
+                "tier_floors": False, "spread_band": [0.0, 0.8], "interval_discount": 0.7,
+                "size_cap": 0.15, "same_title_size_cap": 0.2, "categories": None,
+                "tags": None, "add_to_held_pairs": True, "trim_to_kelly": True,
+                "trim_min_rise": 0.1}}), encoding="utf-8")
+        with caplog.at_level(logging.INFO):
+            scheduler._check_live_defaults()
+        (error,) = self._errors(caplog)
+        assert error.startswith("The saved live defaults are out of date (")
+        assert str(config.LIVE_DEFAULTS_FILE) in error
+        assert "its pages offer them as rebalance yes, min price movement 10c" in error
+        assert error.endswith(
+            "every scheduled run will exit 2 until they are saved again through the "
+            f"defaults server (./start_dashboard.sh, run in {scheduler.PROJECT_ROOT}); do "
+            "not delete the file")
+        assert "fixed, or deleted" not in error
+
     @pytest.mark.usefixtures("saved_live_defaults")
     def test_a_usable_file_logs_nothing(self, caplog):
         with caplog.at_level(logging.DEBUG):

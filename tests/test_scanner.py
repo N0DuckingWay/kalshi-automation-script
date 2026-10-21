@@ -9645,6 +9645,41 @@ def _priced_rung(ticker: str, deadline: str, *, yes_ask, no_ask):
                           _STAR_TITLE, yes_ask=yes_ask, no_ask=no_ask)
 
 
+class TestListedAsk:
+    """scanner.listed_ask: one side's ask as this run's market list shows it,
+    usable only strictly between 0 and 1. It is the one reading of a held
+    market's ask now: _held_leg_worth values a held market at it, and
+    seller.plan_add_ons reads a held pair's price now from it."""
+
+    @staticmethod
+    def _market(yes_ask: Any = None, no_ask: Any = None) -> SimpleNamespace:
+        return SimpleNamespace(yes_ask_dollars=yes_ask, no_ask_dollars=no_ask)
+
+    def test_each_side_reads_its_own_ask(self):
+        market = self._market("0.44", "0.58")
+        assert scanner.listed_ask(market, "yes") == 0.44
+        assert scanner.listed_ask(market, "no") == 0.58
+        # A plain number is read too
+        assert scanner.listed_ask(self._market(0.3), "yes") == 0.3
+
+    @pytest.mark.parametrize("raw", [None, "0", "1.00", "0.0000", "1", 0, 1, 1.5, -0.2,
+                                     "nan", "inf", "abc", "", True, False, [0.4], 10 ** 400])
+    def test_anything_but_a_price_strictly_between_0_and_1_is_none(self, raw):
+        assert scanner.listed_ask(self._market(raw, raw), "yes") is None
+        assert scanner.listed_ask(self._market(raw, raw), "no") is None
+
+    def test_a_market_the_list_lacks_is_none(self):
+        assert scanner.listed_ask(None, "yes") is None
+
+    def test_a_held_market_is_valued_at_it(self):
+        # _held_leg_worth: the contracts at the listed ask, else at what they cost
+        position = HeldPosition("T", -30.0, 12.0, 0.5)
+        assert scanner._held_leg_worth(position, "no", self._market("0.2", "0.6")) == (
+            pytest.approx(18.0))
+        assert scanner._held_leg_worth(position, "no", self._market("0.2", "1.0")) == 12.0
+        assert scanner._held_leg_worth(position, "no", None) == 12.0
+
+
 class TestHeldPairs:
     """held_pairs finds the held pairs a run may add to: exactly two held
     markets on one ladder, one YES and one NO of equal size, both costs
