@@ -15870,10 +15870,12 @@ class TestLiveRuleLine:
         res = self._infeasible(monkeypatch, caplog)
         words = config.describe_trade_filter(config.live_settings())
         # The line cannot name the menu boxes (only the page knows which it offers),
-        # so it says that ticking the filter's own categories and tags shows it
+        # so it says what to tick in each menu and leaves the names to the page
         slices = ("; the dashboard's filter bar shows the live category/tag filter of it "
-                  "when its Category and Tag menus tick the categories and tags the filter "
-                  "lists (each offered where this run filed a pair under it)")
+                  "when its Exclude categories menu ticks every category in which the "
+                  "filter keeps none of this run's pairs and, in each category the filter "
+                  "keeps only in part, its Tag menu ticks the tags it keeps (the page's "
+                  "Live rule line names them)")
         assert self._line(caplog) == (
             f"Live time-series rule (saved live defaults): {rule}; category/tag filter ({words}) — "
             f"this run's primary scenario applies its time-series rule{slices}")
@@ -15891,8 +15893,10 @@ class TestLiveRuleLine:
             "scenario does not (tier floors on, band 0-1); its grid simulated the live rule "
             "as band 0.35-0.5 with the tier floors on, which the dashboard's filter bar "
             "shows; the dashboard's filter bar shows the live category/tag filter of that "
-            "scenario when its Category and Tag menus tick the categories and tags the "
-            "filter lists (each offered where this run filed a pair under it)")
+            "scenario when its Exclude categories menu ticks every category in which the "
+            "filter keeps none of this run's pairs and, in each category the filter keeps "
+            "only in part, its Tag menu ticks the tags it keeps (the page's Live rule line "
+            "names them)")
 
     def test_the_filter_words_are_describe_trade_filters(self):
         from kalshi_betting import config
