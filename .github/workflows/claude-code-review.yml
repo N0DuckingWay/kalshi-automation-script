@@ -14,21 +14,42 @@ on:
     #   - "src/**/*.jsx"
 
 jobs:
-  # Same rule as the size gate in ci.yml: a PR is reviewed only when it changes
-  # more than one file or more than 50 lines (additions + deletions). Keep the
-  # two in step.
+  # Same rules as the size gate in ci.yml: a PR is reviewed only when it changes
+  # more than one file or more than 50 lines (additions + deletions), and not
+  # when its newest commit is a clean pull of main into the branch (a merge
+  # commit titled "Merge branch 'main' into ...", whose tree equals replaying
+  # the merge). Keep the two in step.
   gate:
     name: Size gate
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
-      run_review: ${{ steps.decide.outputs.run_review }}
+      # verify only runs for a suspected pull of main and, when it does, has
+      # the last word; otherwise the first step's answer stands.
+      run_review: ${{ steps.verify.outputs.run_review || steps.decide.outputs.run_review }}
     steps:
       - id: decide
         env:
           FILES: ${{ github.event.pull_request.changed_files }}
           ADDITIONS: ${{ github.event.pull_request.additions }}
           DELETIONS: ${{ github.event.pull_request.deletions }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
+          # Two parents plus a "Merge branch 'main'" (or remote-tracking
+          # 'origin/main') title marks a pull of main into this branch.
+          PARENTS=$(gh api "repos/$GH_REPO/commits/$HEAD_SHA" --jq '.parents | length')
+          TITLE=$(gh api "repos/$GH_REPO/commits/$HEAD_SHA" --jq '.commit.message | split("\n")[0]')
+          echo "Head commit has $PARENTS parent(s): $TITLE"
+          if [ "$PARENTS" -ge 2 ] && echo "$TITLE" | grep -Eq "^Merge (remote-tracking )?branch '(origin/)?main'"; then
+            # Looks like a pull of main; the next steps replay it to see if it
+            # was clean. Until they say so, the review runs.
+            echo "main_pull=true" >> "$GITHUB_OUTPUT"
+            echo "run_review=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           LINES=$((ADDITIONS + DELETIONS))
           echo "PR changes $FILES file(s) and $LINES line(s)"
           if [ "$FILES" -gt 1 ] || [ "$LINES" -gt 50 ]; then
@@ -36,6 +57,33 @@ jobs:
           else
             echo "run_review=false" >> "$GITHUB_OUTPUT"
           fi
+
+      # Only for a commit that looks like a pull of main: replay the merge and
+      # compare. The full history is needed so both parents are available.
+      - if: steps.decide.outputs.main_pull == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - id: verify
+        if: steps.decide.outputs.main_pull == 'true'
+        run: |
+          git config user.name ci
+          git config user.email ci@example.invalid
+          git checkout --detach "$HEAD_SHA^1"
+          # A merge git completes by itself, with no conflicts, is a clean one.
+          # Its tree must equal the pushed commit's; any difference means the
+          # author resolved conflicts or changed code inside the merge.
+          if git merge --no-commit --no-ff "$HEAD_SHA^2" >/dev/null 2>&1 \
+             && [ "$(git write-tree)" = "$(git rev-parse "$HEAD_SHA^{tree}")" ]; then
+            echo "Clean pull of main; skipping review"
+            echo "run_review=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Merge had conflicts or extra changes; running review"
+            echo "run_review=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
 
   claude-review:
     needs: gate
