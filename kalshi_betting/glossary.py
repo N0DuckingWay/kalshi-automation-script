@@ -20,10 +20,11 @@ Notes:
     textbook version. Change a figure's arithmetic and its entry here in the
     same commit. Every cell is escaped when it is rendered, so a term may
     hold any text; the rows are written as plain text, never as HTML. The
-    tier-floor figures in the "Tier floors" entry are typed out here, because
-    this module imports only the standard library; a test holds them equal to
-    config's MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP and
-    SHORT_DEADLINE_GAP_DAYS.
+    tier-floor figures in the "Tier floors" entry and the 7-day wait in the
+    "Rebalance" entry are typed out here, because this module imports only the
+    standard library; a test holds them equal to config's
+    MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS
+    and REBALANCE_MIN_DAYS_SINCE_TRADE.
 """
 
 import html
@@ -136,6 +137,23 @@ TERMS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
      "of the two applies.",
      "Limits how much one wrong forecast can cost.",
      _BACKTEST),
+    ("Rebalance",
+     "Yes: at each weekly run a held pair is topped up to its Kelly size (its Kelly "
+     "fraction of the portfolio value, held to the size cap) when it has room, and "
+     "sold down to it when it has grown past it, once 7 days have passed since its "
+     "last trade. No: a pair is bought once and held. Live runs follow the saved "
+     "setting.",
+     "Shows whether keeping every pair at the size Kelly wants beats buying once "
+     "and holding.",
+     _BACKTEST),
+    ("Min. price movement",
+     "Used only with Rebalance yes. A held pair is topped up or sold down only "
+     "once its total price, the side held on each market added together, has "
+     "moved at least this many cents, up or down, since its last trade. 10c is "
+     "10% of a $1 payout.",
+     "Every top-up or sale pays fees, so this shows whether acting on small price "
+     "moves is worth it.",
+     _BACKTEST),
     ("Fills",
      "Whether a trade was priced by walking a modeled order book, whose depth comes "
      "from saved snapshots, or at the top-of-book price in any size.",
@@ -224,7 +242,7 @@ TERMS_ANCHOR = "terms"
 
 _LINK_STYLE = "font-size:13px; font-family:sans-serif;"
 # scroll-margin-top keeps a jump to #terms below the page's sticky filter bar
-# (dashboard.py's #flt-bar, position:sticky; top:0): the bar's eleven controls
+# (dashboard.py's #flt-bar, position:sticky; top:0): the bar's ten controls
 # wrap onto two to four rows of about 35px, with a summary line under them, so
 # it can stand about 130px to 190px tall. 220px clears that; a page with no
 # sticky bar just scrolls the heading a little below the top

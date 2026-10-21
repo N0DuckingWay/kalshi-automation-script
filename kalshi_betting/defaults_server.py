@@ -34,7 +34,13 @@ Purpose:
         the proposed settings, then runs the live bot with them, placing real
         orders). Closing the tab cancels; nothing is written on the way in.
         With no live defaults saved, every live run refuses to start, so this
-        is also how the first file is made.
+        is also how the first file is made. A file an older version saved
+        (holding add_to_held_pairs, trim_to_kelly and trim_min_rise, which
+        rebalance and min_price_move replaced) is refused by every live run
+        too: this page then counts nothing as in force, says so above the
+        table, and one Confirm and save replaces the file. The other pages
+        (/, /trade, /saved) show a notice with a link to this page holding
+        the old file's values in their new form.
       - /trade shows the saved defaults and offers Dry run and Confirm and
         trade with them.
       - /runs/<id> shows one run: while it runs, its progress and the end of
@@ -48,7 +54,7 @@ Purpose:
         port).
 
     Each run is its own `python -m kalshi_betting.main --mode prod` process,
-    started with all twelve toggles as explicit flags (config.live_settings_argv)
+    started with all eleven toggles as explicit flags (config.live_settings_argv)
     so it trades exactly what its page showed, in a new session (so Ctrl-C on
     this server, or closing its terminal, never reaches it), from
     config.PROJECT_ROOT, writing everything it prints to its own folder under
@@ -56,11 +62,13 @@ Purpose:
 
 Dependencies:
     Imports config and run_lock only (besides the standard library). From
-    config: LiveSettings, LIVE_TOGGLE_FIELDS (the twelve toggle names the
-    fingerprint reads), LiveDefaultsError (a refused saved file) and the
+    config: LiveSettings, LIVE_TOGGLE_FIELDS (the eleven toggle names the
+    fingerprint reads), LiveDefaultsError (a refused saved file),
+    LiveDefaultsOutdated (a file an older version saved, which carries what
+    it reads as now, offered here for one more save) and the
     saved-defaults helpers (read_saved_live_defaults, save_live_defaults,
     live_settings_changes, describe_live_settings, live_rule_warnings,
-    trim_change_warnings, live_defaults_source), live_settings_argv (a run's
+    rebalance_change_warnings, live_defaults_source), live_settings_argv (a run's
     flags), the seed values and their source note, the source-note pattern,
     the exit codes, the run result's format tag, the DEFAULTS_SERVER_*,
     DASHBOARD_FILENAME, DASHBOARD_MARKER_SCAN_BYTES and SCHEDULER_*
@@ -206,6 +214,7 @@ from .config import (
     SCHEDULER_STATE_FILENAME,
     TAG_SCOPE_SEPARATOR,
     LiveDefaultsError,
+    LiveDefaultsOutdated,
     LiveSettings,
     count_text,
     describe_live_settings,
@@ -214,20 +223,23 @@ from .config import (
     live_settings_argv,
     live_settings_changes,
     read_saved_live_defaults,
+    rebalance_change_warnings,
     save_live_defaults,
-    trim_change_warnings,
 )
 
 # The fields a confirmation request carries, in the GET query and repeated in
 # the POST body; the signed text is built from exactly these, as raw strings
 _FIELDS = ("tier_floors", "spread_min", "spread_max", "k", "size_cap",
-           "same_title_size_cap", "add_to_held_pairs", "sell_at", "sell_min_days",
-           "trim_to_kelly", "trim_min_rise", "category", "tag", "source")
+           "same_title_size_cap", "rebalance", "min_price_move", "sell_at",
+           "sell_min_days", "category", "tag", "source")
+# The fields a link built by an older version could carry, which rebalance and
+# min_price_move replaced: a link naming one is refused with a message that says so
+_RETIRED_FIELDS = ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise")
 # The fields a proposal must carry; every other one may be left out
 _REQUIRED = ("tier_floors", "spread_min", "spread_max", "k", "size_cap")
 # The fields a request may give more than once: one per category or tag named
 _REPEATABLE = ("category", "tag")
-# The largest number of fields a query or form may hold: its fourteen fields, the
+# The largest number of fields a query or form may hold: its thirteen fields, the
 # fingerprint, nonce, token, action and acknowledgement (with room to spare),
 # plus the most categories and tags a link may name; more is refused unread
 _MAX_FIELDS = 20 + 2 * DEFAULTS_SERVER_MAX_FILTER_NAMES
@@ -859,7 +871,10 @@ def _kept(name: str, current: LiveSettings | None, source: str) -> object:
 
     Args:
         name (str): The LiveSettings field's name.
-        current (LiveSettings | None): The live defaults in force, or None if none are saved.
+        current (LiveSettings | None): The saved values a left-out field keeps
+            (_kept_base: the live defaults in force or, for a file an older
+            version saved, its values in their new form), or None if neither
+            can be read.
         source (str): The request's source note ("" when it has none).
 
     Returns:
@@ -870,6 +885,29 @@ def _kept(name: str, current: LiveSettings | None, source: str) -> object:
     return getattr(LIVE_DEFAULTS_SEED, name)
 
 
+def _kept_base(current: LiveSettings | None,
+               outdated: LiveDefaultsOutdated | None) -> LiveSettings | None:
+    """
+    Return the settings a confirmation request's left-out fields keep.
+
+    The live defaults in force; with a file an older version saved, that
+    file's values in their new form (LiveDefaultsOutdated.proposal), so a link
+    that names only some fields keeps the rest as the file had them; None when
+    neither can be read, so the left-out fields take the seed's.
+
+    Args:
+        current (LiveSettings | None): The live defaults in force, or None.
+        outdated (LiveDefaultsOutdated | None): The refusal of a file an older
+            version saved, or None.
+
+    Returns:
+        LiveSettings | None: What _proposal keeps a left-out field from.
+    """
+    if current is not None:
+        return current
+    return None if outdated is None else outdated.proposal
+
+
 def _proposal(params: dict[str, list[str]],
               current: LiveSettings | None) -> tuple[LiveSettings, str]:
     """
@@ -877,14 +915,16 @@ def _proposal(params: dict[str, list[str]],
 
     Required: tier_floors ("on"/"off"), spread_min, spread_max, k and
     size_cap (a fraction, e.g. 0.2). Optional: same_title_size_cap,
-    add_to_held_pairs ("on"/"off"), sell_at ("off" or a share in (0, 1]),
-    sell_min_days ("off" or whole days), trim_to_kelly ("on"/"off") and
-    trim_min_rise ("off" or dollars, e.g. 0.1 for 10c). One left out keeps
-    the saved value, or takes the seed's when none is saved or (all but
-    same_title_size_cap) when the link carries the seed's note, so such a
-    link still proposes exactly the seed. LiveSettings refuses a minimum
-    price rise with trimming off, as it refuses a minimum of days with no
-    sell level.
+    rebalance ("on"/"off"), min_price_move ("off" or dollars, e.g. 0.1 for
+    10c), sell_at ("off" or a share in (0, 1]) and sell_min_days ("off" or
+    whole days). One left out keeps the saved value (for a file an older
+    version saved, its value in the new form), or takes the seed's when none
+    is saved or (all but same_title_size_cap) when the link carries the
+    seed's note, so such a link still proposes exactly the seed.
+    LiveSettings refuses a minimum price movement with rebalancing off, as it
+    refuses a minimum of days with no sell level. A link that names one of
+    _RETIRED_FIELDS (built before rebalance and min_price_move replaced them)
+    is refused, with a message saying how to get a new one.
 
     category and tag may each repeat, one name per field, at most
     config.DEFAULTS_SERVER_MAX_FILTER_NAMES of each as sent; a missing one
@@ -898,20 +938,26 @@ def _proposal(params: dict[str, list[str]],
 
     Args:
         params (dict[str, list[str]]): The request's fields (_params).
-        current (LiveSettings | None): The live defaults in force, or None
-            when none are saved.
+        current (LiveSettings | None): The saved values a left-out field
+            keeps (_kept_base: the live defaults in force or, for a file an
+            older version saved, its values in their new form), or None when
+            none are saved.
 
     Returns:
         tuple[LiveSettings, str]: The proposed defaults and the source note.
 
     Raises:
-        ValueError: Naming the first rule the request breaks: an unknown,
-            blank or missing field; a field given more than once (a category
+        ValueError: Naming the first rule the request breaks: a retired,
+            unknown, blank or missing field; a field given more than once (a category
             or tag only past the cap); a malformed value (two spaces in a row
             included); the same category or tag twice; a tag with no
             category; a source of another shape; anything LiveSettings
             refuses; or the seed's note on other values.
     """
+    retired = [field_name for field_name in _RETIRED_FIELDS if field_name in params]
+    if retired:
+        raise ValueError(f"this link was built before Rebalance (it names {retired[0]}): "
+                         "rebuild the backtest dashboard, or open this server's start page")
     unknown = sorted(set(params) - set(_FIELDS))
     if unknown:
         raise ValueError(f"unknown field {unknown[0]!r}")
@@ -939,13 +985,18 @@ def _proposal(params: dict[str, list[str]],
     else:
         same_title = LIVE_DEFAULTS_SEED.same_title_size_cap
     source = value.get("source", "")
-    if "add_to_held_pairs" in value:
-        if value["add_to_held_pairs"] not in ("on", "off"):
-            raise ValueError("add_to_held_pairs must be on or off, got "
-                             f"{value['add_to_held_pairs']!r}")
-        add_on = value["add_to_held_pairs"] == "on"
+    if "rebalance" in value:
+        if value["rebalance"] not in ("on", "off"):
+            raise ValueError(f"rebalance must be on or off, got {value['rebalance']!r}")
+        rebalance = value["rebalance"] == "on"
     else:
-        add_on = _kept("add_to_held_pairs", current, source)
+        rebalance = _kept("rebalance", current, source)
+    # "off" means no minimum price movement; a number is dollars (0.1 for 10c)
+    if "min_price_move" in value:
+        min_price_move = (None if value["min_price_move"] == "off"
+                          else _number(value["min_price_move"], "min_price_move"))
+    else:
+        min_price_move = _kept("min_price_move", current, source)
     # "off" means never selling, or no minimum of days
     if "sell_at" in value:
         sell_at = None if value["sell_at"] == "off" else _number(value["sell_at"], "sell_at")
@@ -956,19 +1007,6 @@ def _proposal(params: dict[str, list[str]],
                          else _whole_number(value["sell_min_days"], "sell_min_days"))
     else:
         sell_min_days = _kept("sell_min_days", current, source)
-    if "trim_to_kelly" in value:
-        if value["trim_to_kelly"] not in ("on", "off"):
-            raise ValueError("trim_to_kelly must be on or off, got "
-                             f"{value['trim_to_kelly']!r}")
-        trim_to_kelly = value["trim_to_kelly"] == "on"
-    else:
-        trim_to_kelly = _kept("trim_to_kelly", current, source)
-    # "off" means no minimum price rise; a number is dollars (0.1 for 10c)
-    if "trim_min_rise" in value:
-        trim_min_rise = (None if value["trim_min_rise"] == "off"
-                         else _number(value["trim_min_rise"], "trim_min_rise"))
-    else:
-        trim_min_rise = _kept("trim_min_rise", current, source)
     if "tag" in params and "category" not in params:
         raise ValueError("a tag needs a category")
     categories = _name_list(params, "category")
@@ -994,11 +1032,10 @@ def _proposal(params: dict[str, list[str]],
         same_title_size_cap=same_title,
         categories=categories,
         tags=tags,
-        add_to_held_pairs=add_on,
+        rebalance=rebalance,
+        min_price_move=min_price_move,
         sell_at=sell_at,
         sell_min_days=sell_min_days,
-        trim_to_kelly=trim_to_kelly,
-        trim_min_rise=trim_min_rise,
     )
     # The seed's note names the seed values, so it may label nothing else
     if source == LIVE_DEFAULTS_SEED_SOURCE and settings != LIVE_DEFAULTS_SEED:
@@ -1007,36 +1044,56 @@ def _proposal(params: dict[str, list[str]],
     return settings, source
 
 
-def _seed_query() -> str:
+def _settings_query(values: LiveSettings, *, source: str = "") -> str:
     """
-    Build the confirmation page's query that proposes LIVE_DEFAULTS_SEED.
+    Build a confirmation page's query that proposes exactly these settings.
 
-    Numbers are written as their repr (the exact float), switches as on or
-    off, an unset sell level, minimum of days or minimum price rise as off,
-    and a category or tag only when the seed sets one (it sets none: any).
-    The source note is LIVE_DEFAULTS_SEED_SOURCE.
+    The fields come in _FIELDS order. Numbers are written as their repr (the
+    exact float, which _proposal reads back as the same number), switches as
+    on or off, an unset minimum price movement, sell level or minimum of days
+    as off, and each category and each tag as a field of its own, in the
+    values' order. Every field is named, so the page proposes these
+    settings whatever is saved.
+
+    Args:
+        values (LiveSettings): The settings to propose.
+        source (str): The source note to carry; "" (default) carries none.
 
     Returns:
         str: The query string, without the "?".
     """
-    seed = LIVE_DEFAULTS_SEED
     pairs = [
-        ("tier_floors", "on" if seed.tier_floors else "off"),
-        ("spread_min", repr(seed.spread_band[0])),
-        ("spread_max", repr(seed.spread_band[1])),
-        ("k", repr(seed.interval_discount)),
-        ("size_cap", repr(seed.size_cap)),
-        ("same_title_size_cap", repr(seed.same_title_size_cap)),
-        ("add_to_held_pairs", "on" if seed.add_to_held_pairs else "off"),
-        ("sell_at", "off" if seed.sell_at is None else repr(seed.sell_at)),
-        ("sell_min_days", "off" if seed.sell_min_days is None else str(seed.sell_min_days)),
-        ("trim_to_kelly", "on" if seed.trim_to_kelly else "off"),
-        ("trim_min_rise", "off" if seed.trim_min_rise is None else repr(seed.trim_min_rise)),
+        ("tier_floors", "on" if values.tier_floors else "off"),
+        ("spread_min", repr(values.spread_band[0])),
+        ("spread_max", repr(values.spread_band[1])),
+        ("k", repr(values.interval_discount)),
+        ("size_cap", repr(values.size_cap)),
+        ("same_title_size_cap", repr(values.same_title_size_cap)),
+        ("rebalance", "on" if values.rebalance else "off"),
+        ("min_price_move",
+         "off" if values.min_price_move is None else repr(values.min_price_move)),
+        ("sell_at", "off" if values.sell_at is None else repr(values.sell_at)),
+        ("sell_min_days",
+         "off" if values.sell_min_days is None else str(values.sell_min_days)),
     ]
-    pairs += [("category", name) for name in seed.categories or ()]
-    pairs += [("tag", name) for name in seed.tags or ()]
-    pairs.append(("source", LIVE_DEFAULTS_SEED_SOURCE))
+    pairs += [("category", name) for name in values.categories or ()]
+    pairs += [("tag", name) for name in values.tags or ()]
+    if source:
+        pairs.append(("source", source))
     return urlencode(pairs)
+
+
+def _seed_query() -> str:
+    """
+    Build the confirmation page's query that proposes LIVE_DEFAULTS_SEED.
+
+    The seed's settings as _settings_query spells them (it sets no category
+    or tag: any), with LIVE_DEFAULTS_SEED_SOURCE as the source note.
+
+    Returns:
+        str: The query string, without the "?".
+    """
+    return _settings_query(LIVE_DEFAULTS_SEED, source=LIVE_DEFAULTS_SEED_SOURCE)
 
 
 def _current_defaults() -> LiveSettings | None:
@@ -1047,30 +1104,49 @@ def _current_defaults() -> LiveSettings | None:
         LiveSettings | None: The saved defaults, or None when none are saved.
 
     Raises:
-        LiveDefaultsError: If a file exists but is refused.
+        LiveDefaultsOutdated: If the file was saved by an older version (it
+            holds settings rebalance and min_price_move replaced); it carries
+            what the file reads as now, which the pages offer for one save.
+        LiveDefaultsError: If a file exists but is refused for any other reason.
     """
     # config's strict read, the one a live run makes through live_defaults(),
     # but returning None rather than raising when no file is saved
     return read_saved_live_defaults()
 
 
-def _fingerprint(current: LiveSettings | None) -> str:
+def _fingerprint(current: LiveSettings | None,
+                 outdated: LiveDefaultsOutdated | None = None) -> str:
     """
     Fingerprint the live defaults in force, so a page built on them can tell they changed.
 
     The origin names the second the file was saved and its source note, so
     a later save changes the fingerprint even when it writes the same
     values, unless it also has the same note and falls in the same second
-    (and then the page still describes the defaults in force).
+    (and then the page still describes the defaults in force). A file an
+    older version saved counts as nothing in force, but gets a fingerprint
+    of its own (its message, and its proposal's origin and toggles), so a
+    page built while it was there is not taken for one built with no file,
+    or on another such file.
 
     Args:
-        current (LiveSettings | None): The saved defaults, or None when none are saved.
+        current (LiveSettings | None): The saved defaults, or None when none
+            are saved (or the saved file is outdated).
+        outdated (LiveDefaultsOutdated | None): The refusal of a file an
+            older version saved, when that is what is at the path; None
+            (default) otherwise.
 
     Returns:
-        str: The SHA-256 hex digest of "none", or of the origin and the twelve
-            toggles as JSON.
+        str: The SHA-256 hex digest of "none", of the outdated file's
+            refusal, or of the origin and the eleven toggles as JSON.
     """
-    if current is None:
+    if outdated is not None:
+        proposal = outdated.proposal
+        text = "outdated\n" + str(outdated) + "\n" + (
+            "none" if proposal is None else json.dumps(
+                {"origin": proposal.origin,
+                 **{name: getattr(proposal, name) for name in LIVE_TOGGLE_FIELDS}},
+                sort_keys=True))
+    elif current is None:
         text = "none"
     else:
         text = json.dumps({"origin": current.origin,
@@ -1286,19 +1362,107 @@ def _settings_table(settings: LiveSettings) -> str:
     return "".join(table)
 
 
+def _outdated_reading(proposal: LiveSettings) -> str:
+    """
+    Say how an outdated saved file's settings read now, in the dashboard's words.
+
+    Args:
+        proposal (LiveSettings): LiveDefaultsOutdated.proposal: the file's
+            settings in their new form.
+
+    Returns:
+        str: "Rebalance yes and Min. price movement 10c" ("any" with no
+            minimum), or "Rebalance no".
+    """
+    if not proposal.rebalance:
+        return "Rebalance no"
+    move = ("any" if proposal.min_price_move is None
+            else f"{round(proposal.min_price_move * 100)}c")
+    return f"Rebalance yes and Min. price movement {move}"
+
+
+def _outdated_notice_html(outdated: LiveDefaultsOutdated) -> str:
+    """
+    Say, as HTML, that the saved file was saved by an older version, with a link to save it again.
+
+    The pages that cannot use such a file (/, /trade, /saved) show it. With a
+    proposal, the link opens the confirmation page holding the file's values
+    in their new form (every field named, no source note), where one Confirm
+    and save replaces the file. With none (the file's other settings are
+    refused too), it links to the seed values and names the dashboard.
+
+    Args:
+        outdated (LiveDefaultsOutdated): Why the saved file is refused, with
+            what it reads as now.
+
+    Returns:
+        str: One red notice paragraph.
+    """
+    if outdated.proposal is None:
+        seed = html.escape("/confirm?" + _seed_query())
+        return ("<p class=\"banner\">The saved live defaults were saved before Rebalance, and "
+                f"every live run refuses them: {html.escape(str(outdated))}. Save new ones from "
+                f"<a href=\"{seed}\">the seed values</a> or the backtest dashboard's Save as "
+                "live defaults… button; a save replaces the file.</p>")
+    link = html.escape("/confirm?" + _settings_query(outdated.proposal))
+    reading = html.escape(_outdated_reading(outdated.proposal))
+    return ("<p class=\"banner\">The saved live defaults were saved before Rebalance, so every "
+            f"live run refuses them until they are saved again. <a href=\"{link}\">Review their "
+            f"values, read as {reading}</a>: one Confirm and save there replaces the file.</p>")
+
+
+def _outdated_confirm_html(outdated: LiveDefaultsOutdated, proposed: LiveSettings) -> str:
+    """
+    Say, as HTML, above the confirmation table, that the saved file was saved by an older version.
+
+    When the page proposes exactly the file's values in their new form, it
+    says so; otherwise it says the save replaces the file with the settings
+    below, and links to the file's own values when they can be read.
+
+    Args:
+        outdated (LiveDefaultsOutdated): Why the saved file is refused, with
+            what it reads as now.
+        proposed (LiveSettings): The settings the page proposes.
+
+    Returns:
+        str: One red notice paragraph.
+    """
+    proposal = outdated.proposal
+    if proposal is not None and proposed == proposal:
+        reading = html.escape(_outdated_reading(proposal))
+        return ("<p class=\"banner\">The saved live defaults were saved before Rebalance. "
+                f"Below: their values, read as {reading}. Confirm and save to replace the "
+                "file.</p>")
+    if proposal is not None:
+        link = html.escape("/confirm?" + _settings_query(proposal))
+        reading = html.escape(_outdated_reading(proposal))
+        return ("<p class=\"banner\">The saved live defaults were saved before Rebalance, so "
+                "every live run refuses them. Confirm and save replaces the file with the "
+                f"settings below; <a href=\"{link}\">their own values</a> read as {reading}."
+                "</p>")
+    return ("<p class=\"banner\">The saved live defaults were saved before Rebalance, and every "
+            f"live run refuses them: {html.escape(str(outdated))}. Confirm and save replaces "
+            "the file with the settings below.</p>")
+
+
 def _confirm_html(current: LiveSettings | None, settings: LiveSettings, source: str,
                   params: dict[str, list[str]], controls: _Controls,
-                  banner: str | None) -> str:
+                  banner: str | None, outdated: LiveDefaultsOutdated | None = None) -> str:
     """
     Build the confirmation page: the defaults in force beside the proposed ones.
 
     Every changed row is highlighted, the new value in bold with a "changed"
-    tag. In red: any live_rule_warnings sentence, and trim_change_warnings'
-    against the defaults in force (with trimming on, a lower size cap or a
-    higher k sells more of the held pairs at the next run). The form posts
-    back every proposal field as the request gave it, with the fingerprint,
-    nonce and token, through three buttons rendered disabled (the page script
-    arms them): Dry run, Confirm and save, and, set apart below a red line,
+    tag. In red: any live_rule_warnings sentence, and rebalance_change_warnings'
+    against the settings a save replaces (with rebalancing on, a lower size
+    cap or a higher k sells more of the held pairs at the next run): the
+    defaults in force or, for a file an older version saved, that file's
+    values in their new form (outdated.proposal); with neither, none. With a
+    file an older version saved at the path (outdated), nothing counts as in
+    force, so every row is compared with nothing, and a red notice above the
+    table says so (_outdated_confirm_html). The form posts back every
+    proposal field as the request gave it, with the fingerprint, nonce and
+    token, through three buttons rendered disabled (the page script arms
+    them): Dry run, Confirm and save, and, set apart below a red line,
     Confirm and trade. A button that does not apply is a placeholder with its
     reason.
 
@@ -1309,6 +1473,9 @@ def _confirm_html(current: LiveSettings | None, settings: LiveSettings, source: 
         params (dict[str, list[str]]): The request's fields, carried into the form as given.
         controls (_Controls): The signed fields, the buttons and any attention warning.
         banner (str | None): A notice to show above everything else, or None.
+        outdated (LiveDefaultsOutdated | None): The refusal of a file an older
+            version saved, when that is at the path (current is then None);
+            None (default) otherwise.
 
     Returns:
         str: The HTML page.
@@ -1316,16 +1483,27 @@ def _confirm_html(current: LiveSettings | None, settings: LiveSettings, source: 
     # Each toggle in the "Live settings:" line's words, flagged when it changes
     rows = live_settings_changes(current, settings)
     changes = sum(1 for *_, changed in rows if changed)
-    title = ("Overwrite the live trading defaults?" if current is not None
-             else "Save the first live trading defaults?")
+    if current is not None:
+        title = "Overwrite the live trading defaults?"
+    elif outdated is not None:
+        title = "Save the live trading defaults again?"
+    else:
+        title = "Save the first live trading defaults?"
     parts = []
     if banner is not None:
         parts.append(f"<p class=\"banner\">{html.escape(banner)}</p>")
     if controls.attention is not None:
         parts.append(f"<p class=\"banner\">{controls.attention.html}</p>")
+    if outdated is not None:
+        parts.append(_outdated_confirm_html(outdated, settings))
     parts.append(_where_html(saving=bool(changes), trading=True))
-    in_force = (html.escape(current.origin) if current is not None
-                else "none saved — live runs refuse to start until defaults are saved")
+    if current is not None:
+        in_force = html.escape(current.origin)
+    elif outdated is not None:
+        in_force = ("none — the saved file was saved before Rebalance, and live runs refuse "
+                    "it until it is saved again")
+    else:
+        in_force = "none saved — live runs refuse to start until defaults are saved"
     parts.append(f"<p>Live defaults in force: {in_force}</p>")
     parts.append("<p>New defaults from: "
                  + (html.escape(source) if source else "(no source note)") + "</p>")
@@ -1342,9 +1520,14 @@ def _confirm_html(current: LiveSettings | None, settings: LiveSettings, source: 
     # The same warnings a live run on these settings would log
     for warning in live_rule_warnings(settings):
         parts.append(f"<p class=\"warn\">Warning: {html.escape(warning)}.</p>")
-    if current is not None:
-        # Changes that would sell more of the held pairs once trimming is on
-        for warning in trim_change_warnings(current, settings):
+    # What a save replaces: the defaults in force or, for a file an older
+    # version saved, its values in their new form, which the held pairs were
+    # bought and trimmed under
+    replaced = current if current is not None else (
+        outdated.proposal if outdated is not None else None)
+    if replaced is not None:
+        # Changes that would sell more of the held pairs with rebalancing on
+        for warning in rebalance_change_warnings(replaced, settings):
             parts.append(f"<p class=\"warn\">Warning: {html.escape(warning)}.</p>")
     if not changes:
         parts.append("<p>These are already the live defaults — nothing to save.</p>")
@@ -2406,9 +2589,21 @@ def _index_html() -> str:
     """
     Build the page at "/": what this server is for and the newest runs, with no form and no script.
 
+    When the saved file was saved by an older version, a red notice at the
+    top links to the confirmation page that saves it again
+    (_outdated_notice_html); any other refusal of the file is left to the
+    pages that read it.
+
     Returns:
         str: The HTML page.
     """
+    try:
+        _current_defaults()
+        notice = ""
+    except LiveDefaultsOutdated as exc:
+        notice = _outdated_notice_html(exc)
+    except LiveDefaultsError:
+        notice = ""
     dashboard = config.PROJECT_ROOT / DASHBOARD_FILENAME
     state, why = _dashboard_state(dashboard)
     shown = html.escape(str(dashboard.absolute()))
@@ -2452,8 +2647,9 @@ def _index_html() -> str:
                     f"</a> — {kind} — {html.escape(state)}</li>")
     runs = ("<h2>Runs started here</h2>\n<ul>" + "".join(rows) + "</ul>" if rows
             else "<p class=\"note\">No run has been started from this checkout's server.</p>")
-    return _page("Live trading defaults",
-                 "\n".join((intro, links, runs, _where_html(saving=False, trading=True))))
+    parts = ((notice,) if notice else ()) + (
+        intro, links, runs, _where_html(saving=False, trading=True))
+    return _page("Live trading defaults", "\n".join(parts))
 
 
 class _App:
@@ -2579,6 +2775,27 @@ class _App:
             409, "The saved live defaults are refused",
             f"{exc}. Fix or delete {config.LIVE_DEFAULTS_FILE.absolute()} first; nothing "
             "can be saved over it or traded from here.")
+
+    def _outdated_file(self, exc: LiveDefaultsOutdated) -> _Response:
+        """
+        Refuse a page or a run because the saved file was saved by an older version.
+
+        Nothing runs from such a file. The page says so and links to the
+        confirmation page that saves its values again (_outdated_notice_html),
+        where one Confirm and save replaces it.
+
+        Args:
+            exc (LiveDefaultsOutdated): Why the file is refused, with what it
+                reads as now.
+
+        Returns:
+            _Response: A 409 page with the notice and no form.
+        """
+        logging.warning("Refused (409 Conflict): the saved live defaults were saved before "
+                        "Rebalance: %s", _log_safe(str(exc)))
+        body = "\n".join((_outdated_notice_html(exc), _where_html(saving=False),
+                          "<p class=\"note\">HTTP 409 Conflict</p>"))
+        return _Response(409, _page("The saved live defaults must be saved again", body))
 
     def _own_run(self) -> _Run | None:
         """
@@ -2742,7 +2959,8 @@ class _App:
                          slots, self._attention())
 
     def _render_confirm(self, current: LiveSettings | None, *, settings: LiveSettings,
-                        source: str, params: dict[str, list[str]], banner: str | None) -> str:
+                        source: str, params: dict[str, list[str]], banner: str | None,
+                        outdated: LiveDefaultsOutdated | None) -> str:
         """
         Build the confirmation page for a proposal, against the defaults in force.
 
@@ -2752,14 +2970,18 @@ class _App:
             source (str): The proposed source note.
             params (dict[str, list[str]]): The request's proposal fields.
             banner (str | None): A notice to show above everything else.
+            outdated (LiveDefaultsOutdated | None): The refusal of a file an
+                older version saved, when that is at the path (current is
+                then None); None otherwise.
 
         Returns:
             str: The HTML page.
         """
         changes = any(changed for *_, changed in live_settings_changes(current, settings))
-        controls = self._controls(purpose="confirm", fingerprint=_fingerprint(current),
+        controls = self._controls(purpose="confirm",
+                                  fingerprint=_fingerprint(current, outdated),
                                   params=params, current=current, changes=changes)
-        return _confirm_html(current, settings, source, params, controls, banner)
+        return _confirm_html(current, settings, source, params, controls, banner, outdated)
 
     def _render_trade(self, current: LiveSettings, banner: str | None) -> str:
         """
@@ -2785,19 +3007,27 @@ class _App:
 
         Returns:
             _Response: 200 with the page, 400 when the proposal is refused,
-                409 when the saved file is refused.
+                409 when the saved file is refused. A file an older version
+                saved counts as nothing in force, so the page can be shown
+                and a save replaces it.
         """
+        outdated = None
         try:
             current = _current_defaults()
+        except LiveDefaultsOutdated as exc:
+            # Saved before Rebalance: nothing is in force, and a save here replaces it
+            current, outdated = None, exc
         except LiveDefaultsError as exc:
             return self._refused_file(exc)
         try:
             params = _params(query)
-            settings, source = _proposal(params, current)
+            # A left-out field keeps the saved value, an outdated file's included
+            settings, source = _proposal(params, _kept_base(current, outdated))
         except ValueError as exc:
             return self._refuse(400, "These settings cannot be saved", str(exc))
         return _Response(200, self._render_confirm(current, settings=settings, source=source,
-                                                   params=params, banner=None))
+                                                   params=params, banner=None,
+                                                   outdated=outdated))
 
     def _get_saved(self) -> _Response:
         """
@@ -2805,10 +3035,13 @@ class _App:
 
         Returns:
             _Response: 200 with the page, 404 when none are saved, 409 when
-                the saved file is refused.
+                the saved file is refused (an outdated one with a link to
+                save it again).
         """
         try:
             settings = _current_defaults()
+        except LiveDefaultsOutdated as exc:
+            return self._outdated_file(exc)
         except LiveDefaultsError as exc:
             return self._refused_file(exc)
         if settings is None:
@@ -2838,10 +3071,13 @@ class _App:
 
         Returns:
             _Response: 200 with the page, 404 when none are saved, 409 when
-                the saved file is refused.
+                the saved file is refused (an outdated one with a link to
+                save it again).
         """
         try:
             current = _current_defaults()
+        except LiveDefaultsOutdated as exc:
+            return self._outdated_file(exc)
         except LiveDefaultsError as exc:
             return self._refused_file(exc)
         if current is None:
@@ -2970,9 +3206,11 @@ class _App:
         its fingerprint, nonce, token and action must be readable and the
         token must sign exactly these fields for this server's confirmation
         page; a nonce already used is sent to what it produced; the saved
-        file must be usable; the proposal must be valid; the defaults in force
-        must still be the ones the page was built on (else the page is shown
-        again against them). Then, by action: "save" with nothing to change
+        file must be usable (a file an older version saved counts as nothing
+        in force, so a save replaces it); the proposal must be valid (a field
+        it leaves out keeps the saved value, _kept_base); the defaults in
+        force must still be the ones the page was built on (else the page is
+        shown again against them). Then, by action: "save" with nothing to change
         writes nothing; "trade" and "dry_run" are refused while a run is
         blocked, "dry_run" while no defaults are saved, and "trade" while the
         last real-money run needs attention and its box is not ticked — every
@@ -3000,19 +3238,27 @@ class _App:
         used = self._used(nonce)
         if used is not None:
             return used
+        outdated = None
         try:
             current = _current_defaults()
+        except LiveDefaultsOutdated as exc:
+            # Saved before Rebalance: nothing is in force, and a save here
+            # replaces it; a run still needs every check below (a dry run
+            # needs saved defaults, so it is refused until the save)
+            current, outdated = None, exc
         except LiveDefaultsError as exc:
             return self._refused_file(exc)
         try:
-            settings, source = _proposal(form, current)
+            # A left-out field keeps the saved value, an outdated file's included
+            settings, source = _proposal(form, _kept_base(current, outdated))
         except ValueError as exc:
             return self._refuse(400, "These settings cannot be saved", str(exc))
-        if _fingerprint(current) != posted_fingerprint:
+        if _fingerprint(current, outdated) != posted_fingerprint:
             logging.warning("Refused a POST from a page built on other live defaults; "
                             "showing it again against the defaults in force")
             return _Response(409, self._render_confirm(current, settings=settings, source=source,
-                                                       params=form, banner=_STALE_BANNER))
+                                                       params=form, banner=_STALE_BANNER,
+                                                       outdated=outdated))
         # Nothing is written when every toggle already has the proposed value
         changes = any(changed for *_, changed in live_settings_changes(current, settings))
         if action == "save" and not changes:
@@ -3034,7 +3280,7 @@ class _App:
                                 "attention and its box was not ticked")
                 return _Response(409, self._render_confirm(
                     current, settings=settings, source=source, params=form,
-                    banner=_ACK_BANNER))
+                    banner=_ACK_BANNER, outdated=outdated))
         # Every check has passed: from here this page's button counts as used
         use = _NonceUse(None, "the request did not finish")
         self._used_nonces[nonce] = use
@@ -3076,9 +3322,10 @@ class _App:
         In order: the Origin, the form, exactly the fingerprint, nonce, token
         and action (plus an optional acknowledgement) and nothing else, the
         token signed for the trade page, a nonce already used, the saved file
-        usable and something saved, the same defaults still in force (else the
-        page is shown again), then the run's blockers and, for "trade", the
-        attention acknowledgement. Only then is the nonce marked used and the
+        usable (never one an older version saved, which is refused with a
+        link to save it again) and something saved, the same defaults still
+        in force (else the page is shown again), then the run's blockers and,
+        for "trade", the attention acknowledgement. Only then is the nonce marked used and the
         run started with the saved defaults.
 
         Args:
@@ -3100,6 +3347,9 @@ class _App:
             return used
         try:
             current = _current_defaults()
+        except LiveDefaultsOutdated as exc:
+            # Nothing runs from a file an older version saved
+            return self._outdated_file(exc)
         except LiveDefaultsError as exc:
             return self._refused_file(exc)
         if current is None:
@@ -3161,7 +3411,7 @@ class _App:
         The one place the server starts a process. It makes the run's folder
         under config.LIVE_RUNS_DIR, writes run.json (what the run is) before
         anything starts, locks output.log and starts
-        `python -m kalshi_betting.main --mode prod` with all twelve toggles as
+        `python -m kalshi_betting.main --mode prod` with all eleven toggles as
         flags (config.live_settings_argv), --result-file in the folder and,
         for a dry run, --dry-run, from config.PROJECT_ROOT, its output going
         to output.log. The process inherits the lock through its output, so
@@ -3191,7 +3441,7 @@ class _App:
         started = datetime.now(UTC)
         folder = config.LIVE_RUNS_DIR / f"{started.strftime(_FOLDER_TIME)}-{run_id}"
         folder.mkdir(parents=True)
-        # All twelve toggles as flags, so the run trades exactly these settings
+        # All eleven toggles as flags, so the run trades exactly these settings
         argv = [sys.executable, "-m", "kalshi_betting.main", "--mode", "prod",
                 *live_settings_argv(settings), "--result-file", str(folder / _RESULT_NAME)]
         if dry_run:
@@ -3765,6 +4015,18 @@ def main(argv: list[str] | None = None) -> None:
                  config.LIVE_DEFAULTS_FILE, base)
     try:
         settings = _current_defaults()
+    except LiveDefaultsOutdated as exc:
+        # Saved before Rebalance: every live run refuses it, and a page here saves it again
+        if exc.proposal is None:
+            logging.warning("The saved live defaults were saved before Rebalance, and every "
+                            "live run refuses them (%s): open %s/ and save new ones; a save "
+                            "replaces the file", exc, base)
+        else:
+            logging.warning("The saved live defaults were saved before Rebalance, and every "
+                            "live run refuses them until they are saved again: open %s/confirm?%s "
+                            "to review their values (read as %s) and save them; do not delete "
+                            "the file", base, _settings_query(exc.proposal),
+                            _outdated_reading(exc.proposal))
     except LiveDefaultsError as exc:
         logging.warning("The saved live defaults are refused (%s): fix or delete the file "
                         "before saving new ones here", exc)

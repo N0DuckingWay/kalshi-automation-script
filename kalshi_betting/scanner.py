@@ -66,9 +66,9 @@ Dependencies:
     cost (get_held_tickers() is its tickers), and held_pairs() finds what a
     run may add to (HeldPosition, HeldPair, pair_held): exact held pairs, and
     lone legs whose partner has paid out. main._run_prod passes them as each
-    finder's keyword-only add_on_pairs when the run's add_to_held_pairs
-    setting is on, which lets such a pair through, and only with the side
-    already held on each held market.
+    finder's keyword-only add_on_pairs when the run's rebalance setting is
+    on, which lets such a pair through, and only with the side already held
+    on each held market.
     historical.py imports event_series too, so the backtest's event-title
     lookup budget tells a combo ticker from any other exactly as the
     one-series rule does (DR-51).
@@ -80,7 +80,9 @@ Dependencies:
     get_fill_times (when each market last traded), held_positions_bid_value
     (what the held markets would fetch at this run's bids) and held_pair_kind
     (which kind of pair two held markets are); for main._run_prod,
-    get_resting_orders (a run trims nothing while an order rests).
+    get_resting_orders (a run trims nothing while an order rests). For
+    seller.plan_add_ons, get_fill_times too and listed_ask (a held market's
+    ask as this run's market list shows it).
     Depends on the KalshiClient produced by auth.py.
 
 Notes:
@@ -3491,8 +3493,8 @@ def get_fill_times(client: Any) -> FillTimes | None:
 
     Walks every page of the account's fills (retried, read-only GETs with no
     time filter) and keeps each market's newest fill time and the list's
-    oldest. seller.plan_trims reads it for its wait after a pair's last trade
-    and its minimum price rise.
+    oldest. seller.plan_trims and seller.plan_add_ons read it for the wait
+    after a pair's last trade and the minimum price movement.
 
     Fails closed: returns None, with one WARNING, when a page cannot be read,
     a cursor repeats, SCANNER_MAX_PAGES cuts the list short, or any one fill's
@@ -4003,19 +4005,35 @@ def _held_leg_worth(position: HeldPosition, side: str, market: Any) -> float:
     Returns:
         float: The worth in dollars.
     """
-    raw = getattr(market, f"{side}_ask_dollars", None) if market is not None else None
-    price = None
-    # A dollar string or a plain number only (Python counts True as the number 1)
-    if isinstance(raw, (str, int, float)) and not isinstance(raw, bool):
-        try:
-            price = float(raw)
-        except (ValueError, OverflowError):
-            # Not a number, or an integer too large for a float
-            price = None
-    # Strictly inside (0, 1): 0 or 1 is a settled market, and NaN fails both tests
-    if price is not None and 0.0 < price < 1.0:
+    # The ask of the side held, when it is a usable price
+    price = listed_ask(market, side)
+    if price is not None:
         return abs(position.count) * price
     return position.exposure_dollars
+
+
+def listed_ask(market: Any, side: str) -> float | None:
+    """
+    Return one side's ask on a market as this run's market list shows it, in dollars.
+
+    The price of buying more of that side: yes_ask_dollars for YES,
+    no_ask_dollars for NO. The one reading of a held market's ask now:
+    _held_leg_worth values a held market at it, and seller.plan_add_ons reads
+    a held pair's price now from it.
+
+    Args:
+        market (Any): The market from this run's market list, or None when
+            the list does not have it.
+        side (str): "yes" or "no".
+
+    Returns:
+        float | None: The ask; None when the market is None, or its ask is
+            missing, not a number, or not strictly between 0 and 1 (0 or 1
+            is a settled market).
+    """
+    raw = getattr(market, f"{side}_ask_dollars", None) if market is not None else None
+    # The test every quote read from the market list gets
+    return _unit_quote(raw)
 
 
 def held_pairs(positions: dict, labels_by_ticker: dict, markets_by_ticker: dict, *,
@@ -4174,10 +4192,12 @@ def _unit_quote(raw: Any) -> float | None:
     """
     Read one quote from the market list as dollars, or None when it is not a usable price.
 
-    Read as _held_leg_worth reads an ask.
+    The one test of a listed quote: listed_ask (a held market's ask) and
+    held_positions_bid_value (its bid) both read through it.
 
     Args:
-        raw (Any): A market's yes_bid_dollars or yes_ask_dollars, as listed.
+        raw (Any): A market's yes_bid_dollars, yes_ask_dollars or no_ask_dollars,
+            as listed.
 
     Returns:
         float | None: The price in dollars; None when it is missing, not a

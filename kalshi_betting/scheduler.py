@@ -105,6 +105,7 @@ from .config import (
     SCHEDULER_BLIND_RETRY_SECONDS,
     SCHEDULER_JOB_TIMEOUT_SECONDS,
     SCHEDULER_STATE_FILENAME,
+    LiveDefaultsOutdated,
     read_saved_live_defaults,
 )
 
@@ -825,9 +826,12 @@ def _check_live_defaults() -> None:
     refused. The daemon says so as soon as it starts, naming the fix, rather
     than only after the next Monday run has spent its slot: for a missing
     file, the checkout (PROJECT_ROOT) the defaults must be saved in, since the
-    runs it spawns read the file there; for a refused one, that it must be
-    fixed, or deleted before new defaults are saved (the defaults server will
-    not save over it). Nothing is logged when a usable file is saved.
+    runs it spawns read the file there; for one an older version saved
+    (LiveDefaultsOutdated), that it must be saved again through the defaults
+    server, whose pages offer its settings in their new form; for any other
+    refused one, that it must be fixed, or deleted before new defaults are
+    saved (the defaults server will not save over it). Nothing is logged when
+    a usable file is saved.
 
     Returns:
         None
@@ -840,6 +844,14 @@ def _check_live_defaults() -> None:
         # The one read the daemon makes of the saved defaults; main.py reads
         # them again, itself, on every run it spawns
         saved = read_saved_live_defaults()
+    except LiveDefaultsOutdated as exc:
+        # Saved by an older version: one save through the defaults server
+        # replaces it, so it is neither to be fixed by hand nor deleted
+        logging.error("The saved live defaults are out of date (%s): every scheduled run "
+                      "will exit 2 until they are saved again through the defaults server "
+                      "(./start_dashboard.sh, run in %s); do not delete the file", exc,
+                      PROJECT_ROOT)
+        return
     except Exception as exc:     # a refused file, or anything unexpected
         # The defaults server will not save over a refused file, so it must be
         # fixed, or deleted before new defaults are saved
