@@ -383,15 +383,12 @@ def _fee_type(raw: Any) -> str:
 
 def _parse_fee_multiplier(raw: Any) -> float | None:
     """
-    Read a series' fee_multiplier: a finite real number from 0 to 1, else unknown.
+    A series' listed fee_multiplier when it can be trusted, else None (unknown).
 
-    The listing gave 1 on 15,154 series, 0.5 on 19 and 0 on 14 (2026-10-16),
-    as JSON numbers. Anything else (a bool, a string such as "0.5", NaN or
-    infinity, a number outside 0 to 1, a missing value) is not a multiplier
-    this code can trust, so it reads as unknown (None) and a reader charges
-    the full fee for that series. (Events can carry a fee_multiplier_override
-    and fee_type_override of their own; 4 of 500 events sampled did, all with
-    a multiplier of 1. Nothing here reads events.)
+    It checks the value rather than reformatting it: only a real number from 0
+    to 1 is kept (Kalshi lists 1, 0.5 or 0). A bool, a string such as "0.5",
+    NaN, a number outside 0 to 1 or a missing value reads as None, and a
+    reader then charges that series the full fee.
 
     Args:
         raw (Any): The listing's fee_multiplier value.
@@ -428,9 +425,12 @@ def _parse_series_fees(raw: Any) -> dict[str, tuple[str, float | None]] | None:
         return None
     out: dict[str, tuple[str, float | None]] = {}
     for ticker, value in raw.items():
+        # Each entry is the [fee type, multiplier] pair _fetch_series_listing
+        # writes, so the multiplier is always second; any other shape is skipped
         if (isinstance(ticker, str) and isinstance(value, list) and len(value) == 2
                 and isinstance(value[0], str)):
-            out[ticker] = (value[0], _parse_fee_multiplier(value[1]))
+            fee_type, multiplier = value
+            out[ticker] = (fee_type, _parse_fee_multiplier(multiplier))
     return out
 
 

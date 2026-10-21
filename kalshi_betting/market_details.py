@@ -94,8 +94,10 @@ _PERIOD_SECONDS = config.CANDLESTICK_PERIOD_INTERVAL_MINUTES * 60
 # A market's ticker as a file name; anything else is fetched but never cached
 _FILE_SAFE_TICKER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
-# The expected JSON type of every field this module keeps. "number" means an
-# int or a float but never a bool.
+# The fields this module keeps from a market's record, each with the JSON type
+# it must have ("number" means an int or a float, never a bool). Every market
+# gets TIMING_FIELDS; a pair market's "full" record also gets FULL_ONLY_FIELDS
+# (volumes, prices, strikes and rules text), which only full records carry.
 _NUMBER = "number"
 TIMING_FIELDS: dict[str, Any] = {
     "ticker": str,
@@ -276,14 +278,17 @@ def timing_epochs(record: dict) -> tuple[int | None, int | None, int | None]:
         tuple[int | None, int | None, int | None]: The three times; None for
             one that is absent or cannot be read.
     """
-    out: list[int | None] = []
-    for name in ("close_time", "latest_expiration_time", "expected_expiration_time"):
+    def seconds(name: str) -> int | None:
+        """One field of the record as Unix seconds; None when absent or unreadable."""
         moment = _parse_time(record.get(name)) if isinstance(record, dict) else None
         try:
-            out.append(None if moment is None else int(moment.timestamp()))
+            return None if moment is None else int(moment.timestamp())
         except (OverflowError, OSError, ValueError):
-            out.append(None)
-    return out[0], out[1], out[2]
+            return None
+
+    # The order CLOSE_RULE_FIELDS reads them by
+    return (seconds("close_time"), seconds("latest_expiration_time"),
+            seconds("expected_expiration_time"))
 
 
 def _type_ok(value: Any, expected: Any) -> bool:
@@ -339,8 +344,9 @@ def _fetch_batch(client: Any, batch: list[str], full: frozenset[str]
     """
     Read one batch of tickers: /markets first, /historical/markets for the rest.
 
-    Never raises. A request that fails ends the batch there: what was read so
-    far is kept, the tickers still unread come back as failed.
+    Never raises. A request that fails (after its retries) ends the batch:
+    what was read is kept, and the rest are reported as failed, never as
+    missing, so the caller warns and the next run asks for them again.
 
     Args:
         client (Any): An authenticated KalshiClient.
@@ -719,36 +725,13 @@ def load_market_trades(client: Any, ticker: str, *, settled_before_trades_cutoff
     """
     Every trade of one market, as (time in ms, YES price, contracts, taker side).
 
-    Oldest first. A cached walk is returned as it was saved. Otherwise the
-    trades are paged from /historical/trades (a market settled before Kalshi's
-    trades cutoff) or /markets/trades (after it), the other endpoint when the
-    first answers 404. Kalshi moves the trades CREATED before the cutoff to the
-    archive, so a market that opened before the cutoff and settled after it has
-    its earlier trades only in /historical/trades and its later ones only in
-    /markets/trades; such a market needs both endpoints, merged, each trade id
-    kept once (a trade both endpoints list is kept from the first one walked).
-    spans_trades_cutoff says which case this is: True walks both endpoints,
-    False walks one, and None (the default, for a caller that does not know)
-    walks the first and, only when its trades fall short of volume_fp by more
-    than INTEGRITY_VOLUME_TOLERANCE, the other as well (a failure of that extra
-    walk keeps the first walk's trades, uncached, as a market read from one
-    endpoint always was). With spans_trades_cutoff True a 404 from one
-    endpoint means it holds nothing for the market, a failure of either walk
-    otherwise returns None.
-
-    The repeated-id count is a repeat within ONE endpoint's own listing (each
-    repeat is dropped and counted); an id the two endpoints share is expected
-    near the cutoff, is dropped silently and is not counted, so the count
-    stays a sign of a listing fault. The merged trades are returned; they are
-    cached under backtest_cache/trades/<ticker>.json.gz only when every walk
-    reached its end and, as well, they add up to the market's volume_fp within
-    INTEGRITY_VOLUME_TOLERANCE (with no readable volume_fp nothing is cached),
-    so a cache file is always a consistent one and an off-volume market is read
-    again next run (the integrity check still reports it). A cut-short walk (a
-    failed request, a repeated cursor, the page cap, a reply or trade that
-    cannot be read) returns None and caches nothing; the reason goes to
-    stats_out and a DEBUG line, never a WARNING (the caller counts them). With
-    client None only the cache is read.
+    Oldest first, from the cache when it has the market, else from Kalshi:
+    /historical/trades for trades made before Kalshi's trades cutoff and
+    /markets/trades for later ones (both, merged, for a market that spans the
+    cutoff). The trades are cached only when the walk reached its end and they
+    add up to the market's volume_fp, so a cache file is always complete. A
+    walk cut short returns None and caches nothing. With client None only the
+    cache is read.
 
     Args:
         client (Any): An authenticated KalshiClient, or None to read the cache only.
@@ -757,7 +740,9 @@ def load_market_trades(client: Any, ticker: str, *, settled_before_trades_cutoff
         volume_fp (Any): The market's volume_fp (a string as Kalshi sends it, or
             a number), from its full record; None when not known.
         spans_trades_cutoff (bool | None): Whether the market opened before the
-            trades cutoff and settled at or after it (see above); None when not known.
+            trades cutoff and settled at or after it, so both endpoints are
+            walked; None when not known (the second endpoint is then walked
+            only when the first one's trades fall short of volume_fp).
         stats_out (dict | None): When given, filled with "duplicates",
             "price_failures" (trades whose YES and NO prices are not both in
             (0, 1) or do not sum to 1), "unsound_ms" (their times), "from_cache",

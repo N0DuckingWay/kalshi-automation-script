@@ -438,10 +438,10 @@ from .config import (
     _exact_number,
     _names_text,
     _step_cap,
+    confirmed_fee_multiplier,
     days_to_maturity,
     describe_time_series_rule,
     fee_leg_exact,
-    confirmed_fee_multiplier,
     fee_per_pair_approx,
     held_pair_fraction,
     held_pair_win_prob,
@@ -4823,6 +4823,11 @@ def _resolve_max_volume_share(value: Any = None) -> float | None:
     """
     The volume cap a run trades under, as a share in (0, 1], or None when the cap is off.
 
+    A run's cap can come from three places (the config value, an override such
+    as backtest.py's --max-volume-share, or False for --no-volume-cap); this
+    picks the one that applies and checks it once, before the hour-long fetch,
+    so a bad value stops the run at once.
+
     Args:
         value (Any): None (the default) reads THIS MODULE's binding of
             config.BACKTEST_MAX_VOLUME_SHARE at call time (itself None to
@@ -6633,12 +6638,8 @@ def _close_gate_and_labels(pairs: list, series_categories: dict | None) -> list:
     gap_skips = label_skips = admitted = refused = 0
     for pair in pairs:
         mA, mB = pair[0], pair[1]
-        # realized closes, only to count pairs the scheduled closes judge differently
-        realized = _comparable_closes_dicts(mA, mB)
-        # The ONE definition of the gate (scanner.closes_apart). A scheduled
-        # close is an aware UTC moment; beside a naive realized close the two
-        # cannot be compared and closes_apart refuses the pair (fail closed)
-        # the gate, on the closes a live run would have seen
+        realized = _comparable_closes_dicts(mA, mB)  # realized closes, for the count below
+        # The gate: are the closes a live run would have seen too far apart?
         apart = closes_apart(_maturity_close(mA), _maturity_close(mB))
         apart_realized = realized is None or closes_apart(*realized)
         if apart != apart_realized:
@@ -6906,13 +6907,12 @@ def _extract_pairs(
             (historical.series_labels' fallback), so nearly every pair of
             series is filed alike. Has no effect on string-keyed
             (time-series) groups.
-        defer_close_gate (bool): Keyword-only. For 3-tuple-keyed groups, stop
-            each candidate after the close-time readability check and return
-            it unjudged by the close gate and the label check, which
-            _close_gate_and_labels then applies on the closes a live run would
-            have read (_prepare_candidates does this while the scheduled close
-            is on and some series has a rule). False (the default) applies
-            both here, on the realized closes, exactly as before.
+        defer_close_gate (bool): Keyword-only. Return same-title candidates
+            before the close gate and the label check, so that
+            _close_gate_and_labels can run them on scheduled closes. Those need
+            each market's timing record, which is loaded only for these
+            candidates (too costly for every market). False (the default)
+            runs both checks here, on the realized closes.
 
     Returns:
         list[tuple[dict, dict, str, object]]: One (market_a, market_b,
@@ -7341,11 +7341,9 @@ def _extract_pairs(
             ts_undated_members,
         )
     if ts_beyond_window:
-        # The window reads the REALIZED close dates. With the scheduled close
-        # on, a pair beyond it on its realized closes but within the cap on
-        # its scheduled ones is never visited: a recorded residual that can
-        # only miss trades (see _maturity_close). The line's words stay as
-        # they are, so the run with the switch off logs what it always did
+        # This window uses the realized close dates, so with the scheduled
+        # close on a pair can be skipped here that its scheduled closes would
+        # allow (it can only miss trades)
         logging.info(
             "Time-series candidate pairs the sweep never visits because their "
             "close dates are more than %d days apart (a performance bound, no "
@@ -7830,8 +7828,10 @@ def _moved_ts(candle: dict | None) -> int:
 
     _project_candles writes every in-memory candle's moved_ts; a candle without
     one (a hand-built list), or with one that is not a whole number of
-    seconds, counts as never having moved, so the stale-quote check fails
-    closed on it.
+    seconds, counts as never having moved. -1 rather than None keeps the
+    arrays of these times integer arrays that the stale-quote check can do
+    arithmetic on, and since it lies before any real time, the quote reads as
+    stale (fails closed).
 
     Args:
         candle (dict | None): A candle, or None for no candle.
@@ -7863,11 +7863,11 @@ def _volume_ahead(ordered: list[dict], checkpoint_timestamps: list[int],
         list[float]: One sum per moment; NaN when a candle in its window
             carries no readable volume (not a finite number at least 0).
     """
-    stamps = [c["ts"] for c in ordered]
+    candle_end_timestamps = [c["ts"] for c in ordered]
     out: list[float] = []
     for moment in checkpoint_timestamps:
-        lo = bisect.bisect_right(stamps, moment)
-        hi = bisect.bisect_right(stamps, moment + window)
+        lo = bisect.bisect_right(candle_end_timestamps, moment)
+        hi = bisect.bisect_right(candle_end_timestamps, moment + window)
         total = 0.0
         for candle in ordered[lo:hi]:
             volume = candle.get("volume")
@@ -8418,49 +8418,13 @@ def _find_entry(
         return None
 
     if pair_type == "time_series":
-        # Live-scanner invariant: market A is the EARLIER-closing contract.
-        # Never swap by price — the trade only exists when the LATER contract
-        # is priced higher (checked per Monday below).
-        #
-        # Decide on the close DATETIMES, like scanner.find_time_series_pairs
-        # sorts on m.close_time. Two contracts closing on the same UTC date at
-        # different times are a valid zero-day-gap pair (live data shows 9
-        # distinct close dates across 43 distinct times of day), and deciding on
-        # the parsed DATES made that a tie — neither `close_b < close_a` nor its
-        # mirror was true — so "market A" was left as whichever the group list
-        # happened to hold first. The pair was then either dropped (the
-        # direction test goes negative) or replayed with the legs inverted,
-        # whose genuine in-between settlement reads as the impossible
-        # A=YES/B=NO cell: booked as a premise violation, excluded from P&L and
-        # dropped from the interval-discount calibration's denominator (TS-06).
-        # The date comparison survives only as the fallback for a naive/aware
-        # mix (reachable from a hand-edited cache, since every live timestamp is
-        # tz-aware), per this file's "can't parse it = unknown, not an error"
-        # convention.
-        #
-        # That parity is on the datetime-vs-date fix only, not on what
-        # close_time MEANS: live reads the SCHEDULED close of a still-open
-        # market, this reads the REALIZED close Kalshi recorded for a settled
-        # one, which for an event that resolved early can sit before the
-        # original schedule — a later-deadline leg that resolved early is
-        # ordered first on the realized gap. With the scheduled close on,
-        # order and gap use the close a live run would have read; a series
-        # with no rule keeps the realized close.
-        # DR-73: a same-event deadline LADDER is the one time-series shape
-        # close_time cannot order or measure, so it is ordered and gapped on
-        # the two rungs' STATED deadlines instead. Gated on the resolved flag,
-        # never on event_ticker equality alone: _extract_pairs only proposes a
-        # same-event pair while the switch is on, but a caller that builds one
-        # itself must not silently get ladder semantics from a switched-off
-        # tree.
-        #
-        # The classification here IS per pair, and that is a deliberate,
-        # bounded exemption from DR-70's once-per-market rule: this function
-        # receives two market dicts and holds no memo to hang a per-market
-        # verdict on, and it runs once per CANDIDATE PAIR rather than once per
-        # pair of members — 975 ladder pairs over the whole 284-slice archive
-        # at the <= 30-day cap, at ~12.3 us a classification. _extract_pairs,
-        # which does face the O(N^2) enumeration, memoizes per member.
+        # Market A is the EARLIER-closing contract, as in the live scanner; the
+        # legs are never swapped by price. Cross-event pairs are ordered on the
+        # close datetimes a live run would have read (_maturity_close), so two
+        # markets closing on one day at different times still order correctly.
+        # A same-event ladder is ordered and gapped on its rungs' stated
+        # deadlines instead, and only while the ladder switch is on. The ladder
+        # is classified here per pair, which is cheap (under 1,000 pairs).
         ladders_on = (TIME_SERIES_SAME_EVENT_LADDERS if same_event_ladders is None
                       else same_event_ladders)
         event_a = mA.get("event_ticker") or ""
@@ -8560,17 +8524,9 @@ def _find_entry(
     for ts, ca, cb in zip(checkpoints, candles_at_a, candles_at_b, strict=True):
         entry_date = datetime.fromtimestamp(ts, tz=UTC).date()
 
-        # Optional opt-in bet-horizon cap: skip checkpoints where the
-        # later-closing leg would close further out than max_horizon_days from
-        # THIS simulated checkpoint — a cheap comparison done before reading
-        # this Monday's quotes. Deliberately max(close_a, close_b) rather than close_b:
-        # same_title has no ordering at all, and since DR-73 a same-event
-        # LADDER is ordered by STATED deadline, so close_b >= close_a no longer
-        # holds for every time_series pair either (in the archive 13 dated
-        # same-event pairs are ordered the wrong way round by realized close,
-        # and 681 have a close gap of ZERO days). The max() keeps this correct
-        # under all three. The horizon filter reads the close a live run would
-        # read (scheduled where known), not the stated deadline.
+        # Optional horizon cap: skip a Monday when the later of the two closes
+        # (as a live run would see them) is more than max_horizon_days away.
+        # The later of the two, since a ladder is ordered by stated deadline.
         if max_horizon_days is not None and (max(maturity_a, maturity_b) - entry_date).days > max_horizon_days:
             continue
 
@@ -8600,15 +8556,9 @@ def _find_entry(
             mA_i, mB_i = mA, mB
             pA, pB, nA, nB = p_a_raw, p_b_raw, n_a_raw, n_b_raw
             gap = pB - pA
-            # A Monday with no in-between mass (pB - pA not strictly positive)
-            # has nothing to dispute, as the live spread rule says
-            # (config.time_series_spread_refusal). Inert with the tiers
-            # on, since every tier > 0 already demands more; it keeps the
-            # tier-floors-off family, whose floor-0 threshold is 0.0, from
-            # entering such a pair. PRICE_EPSILON sits on the REJECT side here
-            # and TIGHTENS, like scanner's pA + nB guard: a zero spread that
-            # evaluates a hair above 0 is still refused, while a genuine
-            # one-tick spread (>= $0.0001) is two orders of magnitude clear.
+            # A spread that is not above zero has nothing to bet against (the
+            # live rule refuses it too); the small tolerance refuses a zero
+            # spread that float noise puts a hair above zero
             if gap <= PRICE_EPSILON:
                 continue
         else:
@@ -8869,18 +8819,18 @@ def _project_candles(candles: list[dict], *, window_open: int | None = None,
     """
     Keep, for each hourly candle, only what the backtest reads, plus two derived numbers.
 
-    Every candle is kept, cut to "ts", "yes_ask_close", "no_ask_close",
-    "volume", "open_interest" and "moved_ts". The bid close and the
-    open/high/low values are used only to work out "moved_ts", then dropped
-    from memory (the full record stays in the candle cache).
+    Each candle keeps "ts", "yes_ask_close", "no_ask_close", "volume" and
+    "open_interest", and gains "moved_ts". What is dropped, to save memory, is
+    each side's open, high and low, the YES bid close and the traded-price
+    block: they are read here only to work out moved_ts. Every candle is kept.
 
-    "moved_ts" is the end of the latest hour, at or before this candle, in
-    which contracts traded or a quote changed (-1 if none yet); the
-    stale-quote check reads it. With window_open, it is worked out from the
-    request's own window only, so it does not depend on a wider cache file:
-    the window's first hour counts as moved only if it traded, has its own
-    range, or is the market's opening hour. Without window_open, the first
-    hour counts as moved.
+    "moved_ts" is the end of the latest hour, at or before this one, in which
+    the market traded or its quote changed (_hour_moved); -1 when there is none
+    yet. It is worked out from the request's own window (window_open), so a
+    wider cached file gives the same answer: hours before the window read -1,
+    and the window's first hour counts as moved only when it traded, its price
+    moved within the hour, or the market opened in it. With no window_open
+    (a test) the first hour counts as moved.
 
     Args:
         candles (list[dict]): One ticker's candles from fetch_candlesticks.
@@ -8939,8 +8889,11 @@ def _fetch_projected_candles(hist_client: Any, ticker: str, open_ts: int, close_
     """
     Fetch one ticker's candles and cut them to what the backtest keeps.
 
-    Runs on a worker thread of _fetch_candles_parallel, so the full records are
-    dropped as soon as they are cut rather than held until every ticker is done.
+    The full hourly records are checked (check_out) and then cut by
+    _project_candles: each side's open, high and low, the YES bid close and the
+    traded-price block are dropped once moved_ts is worked out from them. This
+    runs on a worker thread of _fetch_candles_parallel, so the full records are
+    dropped as soon as each ticker is done.
 
     Args:
         hist_client (Any): Historical KalshiClient.
@@ -10522,20 +10475,13 @@ def _prepare_candidates(
             "Same-title sport check: no /series listing this run, so every series is "
             "filed by its ticker prefix and only the competition check tells two "
             "series apart")
-    # The ladder flag rides through unresolved (None included): the two calls
-    # here and every _find_entry call of every later entry pass (it is carried
-    # on the returned _Candidates) receive the same argument and resolve the
-    # same module constant at their own call time — see _Candidates for why
-    # that holds only while the name is not rebound between the halves. The
-    # same-title call takes it too, for signature uniformity — 3-tuple-keyed
-    # groups have no deadline concept and the flag is inert there.
-    # Scheduled close: load the per-series rules (None reads this module's
-    # binding of the switch)
+    # The ladder flag is passed on unresolved; each call resolves it the same way
+    # The scheduled-close switch; on, the rules learned per series
     scheduled_on = bool(BACKTEST_SCHEDULED_CLOSE if scheduled_close is None
                         else scheduled_close)
     close_rules = market_details.load_close_rules(hist_client) if scheduled_on else {}
-    # If any series has a rule, the same-title close gate waits for the
-    # scheduled closes; otherwise it runs inside _extract_pairs on realized closes
+    # With any rule, the same-title close gate waits until the candidates'
+    # scheduled closes are known (below)
     defer_gate = bool(close_rules)
     ts_pairs     = _extract_pairs(ts_groups, same_event_ladders=same_event_ladders)
     same_pairs   = _extract_pairs(same_groups, same_event_ladders=same_event_ladders,

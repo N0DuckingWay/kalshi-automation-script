@@ -2354,20 +2354,14 @@ CANDLESTICK_MAX_CANDLES_PER_REQUEST = 5000
 # so the older candlesticks/ folder is never read or written.
 CANDLESTICK_CACHE_FIELDS_VERSION = 3
 
-# The backtest's side data (market_details.py): each market's extra fields, its
-# trades and the checks that the candles, trades and market totals agree. Read
-# only by that module. A request asks for this many tickers at once on /markets
-# and /historical/markets (Kalshi's `tickers` filter), and for this many rows
-# per page of a listing or of trades (the most either endpoint serves). The
-# pause after each request is the one historical.fetch_candlesticks uses.
+# market_details.py's requests: tickers per request, rows per page, and the
+# pause after each request.
 MARKET_DETAILS_BATCH_SIZE = 100
 MARKET_DETAILS_PAGE_SIZE = 1000
 MARKET_DETAILS_REQUEST_PAUSE_SECONDS = 0.15
 
-# How far two contract totals may differ and still count as equal (volumes are
-# written to two decimals), the slack in seconds around a market's life within
-# which a trade or a candle still counts as part of it, and the most example
-# sentences a check keeps per ticker and logs per run.
+# The integrity checks: how far two contract totals may differ and still match,
+# the slack in seconds around a market's life, and how many examples are logged.
 INTEGRITY_VOLUME_TOLERANCE = 0.005
 INTEGRITY_LIFE_SLACK_SECONDS = 3600
 INTEGRITY_MAX_EXAMPLES = 10
@@ -2377,16 +2371,12 @@ INTEGRITY_MAX_EXAMPLES = 10
 # backtest.py --scheduled-close / --no-scheduled-close set it for one run.
 BACKTEST_SCHEDULED_CLOSE = True
 
-# The fewest observations (a live close beside the same market's settled record,
-# carrying both latest_expiration_time and expected_expiration_time) a series
-# needs before its scheduled-close rule is trusted; the rule must also
-# reproduce every one of them, and is applied only to a market whose
-# latest-minus-expected gap is one of those observations' (its fingerprint).
+# How many observed markets a series needs before its scheduled-close rule is
+# trusted (market_details.learn_close_rules).
 SCHEDULED_CLOSE_MIN_OBSERVATIONS = 20
 
-# ... and the fewest distinct events those observations must come from: one
-# event's markets share one schedule, so a rule seen on a single event (one
-# day's diesel prices, say) proves nothing about the series' next one.
+# How many different events those markets must come from, since one event's
+# markets all share one schedule.
 SCHEDULED_CLOSE_MIN_EVENTS = 2
 
 # A quote counts only if the market traded or moved within this many seconds of
@@ -2399,7 +2389,7 @@ BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS = 86_400
 # Backtest only; backtest.py --max-volume-share PCT / --no-volume-cap set it.
 BACKTEST_MAX_VOLUME_SHARE = 0.10
 
-# ... and the window after a checkpoint that volume is read over, in seconds
+# The length of that "next day", in seconds.
 BACKTEST_VOLUME_SHARE_WINDOW_SECONDS = 86_400
 
 # The highest NO ask a candle can carry: historical.fetch_candlesticks stores a
