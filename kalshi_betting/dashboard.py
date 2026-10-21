@@ -4751,12 +4751,21 @@ def _tick_phrase(ticks: _MenuTicks, *, as_instruction: bool) -> str:
     (_MENU_CAT_ALL, _MENU_CAT_NONE, _MENU_TAG_ALL). Each list of names is
     joined by commas alone, in the bar's order (a Kalshi category can hold
     "and"). While no more categories are kept than are excluded, the
-    exclusions are said the short way: every category but the ones kept, by
-    ticking All categories and then unticking those. A box unticked takes
-    its twins with it, as a box ticked does, so the count here is of groups
-    of letter-case twins, each counted once, as the reader clicks them. The
-    summary line counts every name instead (_selection_name's "only ..."),
-    so the two can say one selection different ways.
+    exclusions are said the short way: All categories ticked, then the ones
+    kept unticked. A box unticked takes its twins with it, as a box ticked
+    does, so the count here is of groups of letter-case twins, each counted
+    once, as the reader clicks them. The summary line counts every name
+    instead (_selection_name's "only ..."), so the two can say one selection
+    different ways.
+
+    As an instruction and as a description alike, the line names only boxes
+    to click, one per group of twins, in the order to click them, so a
+    reader who clicks exactly the boxes named gets the page the line
+    describes. That is why the short way names the "All" box and the boxes
+    to untick after it, and never says "every category but ...": a reader
+    who ticked every other box by hand would tick a kept category's
+    letter-case twin, and with it the kept category ("health" ticks
+    "Health"), so every category would be left out.
 
     Args:
         ticks (_MenuTicks): The categories to exclude and keep and the tags to
@@ -4771,13 +4780,14 @@ def _tick_phrase(ticks: _MenuTicks, *, as_instruction: bool) -> str:
             Politics ticked in the Exclude categories menu and Sports ·
             Basketball ticked in the Tag menu"; said the short way, "then tick
             All categories in the Exclude categories menu, untick Sports there
-            and tick Basketball in the Tag menu", or "with every category but
-            Sports ticked in the Exclude categories menu and Basketball ticked
-            in the Tag menu". A part that names nothing is left out. With
-            nothing to exclude or tick, 'then leave the Exclude categories
-            menu showing "None" and the Tag menu showing "All tags" (the live
-            category/tag filter keeps every category and tag this run filed a
-            pair under)', or the same after "with" in place of "then leave".
+            and tick Basketball in the Tag menu", or "with All categories
+            ticked in the Exclude categories menu and Sports unticked there,
+            and Basketball ticked in the Tag menu". A part that names nothing
+            is left out. With nothing to exclude or tick, 'then leave the
+            Exclude categories menu showing "None" and the Tag menu showing
+            "All tags" (the live category/tag filter keeps every category and
+            tag this run filed a pair under)', or the same after "with" in
+            place of "then leave".
     """
     cat_menu = f"the {_MENU_CAT_LABEL} menu"
     tag_menu = f"the {_MENU_TAG_LABEL} menu"
@@ -4800,9 +4810,15 @@ def _tick_phrase(ticks: _MenuTicks, *, as_instruction: bool) -> str:
         said = steps[0] if len(steps) == 1 else f"{', '.join(steps[:-1])} and {steps[-1]}"
         return f"then {said}"
     if short:
-        parts = [f"every category but {kept} ticked in {cat_menu}"]
-    else:
-        parts = [f"{excluded} ticked in {cat_menu}"] if ticks.excluded else []
+        # The clicks the instruction names, in the order a reader makes them
+        # (never "every category but ...", which a reader would follow by
+        # ticking a kept category's twin); the comma before the Tag menu's
+        # part keeps the two menus apart
+        said = f"{_MENU_CAT_ALL} ticked in {cat_menu} and {kept} unticked there"
+        if ticks.tags:
+            said += f", and {tags} ticked in {tag_menu}"
+        return f"with {said}"
+    parts = [f"{excluded} ticked in {cat_menu}"] if ticks.excluded else []
     if ticks.tags:
         parts.append(f"{tags} ticked in {tag_menu}")
     return "with " + " and ".join(parts)
