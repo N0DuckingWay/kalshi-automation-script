@@ -4616,19 +4616,86 @@ def _run_settings_html(sweep: BacktestSweep | None, *,
     )
 
 
+@dataclass(frozen=True)
+class _MenuTicks:
+    """
+    What to do in the filter bar's two menus to show a live category/tag filter.
+
+    Built by _live_filter_ticks and worded by _tick_phrase. Each name stands
+    for its letter-case twins too: it is the first of them in the bar's
+    order, and the page ticks and unticks a box's twins with it, so a reader
+    who clicked every twin in turn would undo the first click with the
+    second.
+
+    Attributes:
+        excluded (tuple[str, ...]): The categories to tick in the Exclude
+            categories menu, in the bar's order.
+        kept (tuple[str, ...]): The categories the filter keeps, in the bar's
+            order: the ones to untick after ticking All categories, the way
+            the exclusions are said while no more categories are kept than
+            excluded, each group of letter-case twins counted once. Empty
+            when the filter keeps no pair this run filed.
+        tags (tuple[str, ...]): The tags to tick in the Tag menu, in the bar's
+            order, each named as that menu names it once the categories are
+            set: "Category · Tag", or the tag alone while exactly one box of
+            the Exclude categories menu is left unticked (the menu then leaves
+            the category's name out).
+    """
+
+    excluded: tuple[str, ...]
+    kept: tuple[str, ...]
+    tags: tuple[str, ...]
+
+
+def _one_per_twin_group(items: list, key: Callable) -> tuple:
+    """
+    Keep the first of each group of items whose keys are equal, in the order given.
+
+    Args:
+        items (list): The items, in the bar's order.
+        key (Callable): The group key of an item: equal for names the live
+            filter reads as one (letter case ignored), as _case_twins groups
+            them.
+
+    Returns:
+        tuple: The first item of each group, in the order given.
+    """
+    seen: set = set()
+    out = []
+    for item in items:
+        if key(item) not in seen:
+            seen.add(key(item))
+            out.append(item)
+    return tuple(out)
+
+
 def _live_filter_ticks(categories: tuple[str, ...] | None,
                        tags: tuple[str, ...] | None,
-                       bar: dict) -> tuple[list[str], list[str]]:
+                       bar: dict) -> _MenuTicks:
     """
-    Name what to tick in the filter bar's Category and Tag menus to show the live filter.
+    Name what to exclude and tick in the filter bar's menus to show the live filter.
 
-    Every (category, tag) the bar offers is asked of config.trade_filter_for,
-    the one rule the live run keeps a pair by (letter case ignored), so a plain
-    tag, a tied "Category · Tag" and a list of categories all read as the live
-    run reads them. A category the filter keeps whole needs only its own tick; a
-    category it narrows to some of the bar's tags needs those tags ticked too
-    (ticking a tag ticks its category). A category none of whose offered tags
-    the filter keeps is left out: this run filed no pair under it.
+    The categories to exclude and the tags to tick are both boxes to tick:
+    the first in the Exclude categories menu, the second in the Tag menu. A
+    category with no tag ticked counts in full. Every (category, tag) the
+    bar offers is asked of config.trade_filter_for, the one rule the live
+    run keeps a pair by (letter case ignored), so a plain tag, a tied
+    "Category · Tag" and a list of categories all read as the live run reads
+    them. A category the filter keeps with every tag the bar offers for it
+    needs nothing. One it keeps with only some of them needs those tags
+    ticked. One it keeps with none is excluded, whether the filter does not
+    list it or narrows it to tags this run filed no pair under.
+
+    Categories whose names differ only in letter case are one category to
+    the filter, and the page leaves them out and narrows them together
+    (_case_twins), so they are decided together, over all their tags; tags
+    whose categories and names differ only in letter case are one tag to it.
+    Each such group is named once, by its first member in the bar's order,
+    since the page ticks a box's twins with it. The categories kept are
+    named too, for the shorter way of saying a long list of exclusions
+    (_tick_phrase). A category with no tag on the bar (never on a built
+    page, whose categories all come from its pairs) is kept or excluded as
+    a whole.
 
     Args:
         categories (tuple[str, ...] | None): BacktestSweep.live_categories; None = any.
@@ -4636,48 +4703,109 @@ def _live_filter_ticks(categories: tuple[str, ...] | None,
         bar (dict): _filter_payload's base block ("categories", "subcats").
 
     Returns:
-        tuple[list[str], list[str]]: The categories to tick, then the tags to
-            tick as "Category · Tag", both in the bar's order. Both empty when the
-            bar offers nothing the filter keeps.
+        _MenuTicks: The categories to exclude, the categories kept and the
+            tags to tick, each letter-case group named once, in the bar's
+            order. No category is excluded and no tag ticked when the filter
+            keeps every pair the bar offers; none is kept when it keeps none.
     """
     # Cross-module: the same rule the live run decides every pair by
     keeps = trade_filter_for(categories, tags)
     names = bar["categories"]
-    offered: dict[int, list[str]] = {}
-    for ci, tag in bar["subcats"]:
-        offered.setdefault(ci, []).append(tag)
-    ticked_categories: list[str] = []
-    ticked_tags: list[str] = []
-    for ci, name in enumerate(names):
-        own = offered.get(ci, [])
-        if not own:
-            # A category with no tag on the bar is kept as a whole or not at all
-            if keeps(name, ""):
-                ticked_categories.append(name)
-            continue
-        kept = [tag for tag in own if keeps(name, tag)]
-        if not kept:
-            continue
-        ticked_categories.append(name)
-        if len(kept) < len(own):
-            ticked_tags.extend(f"{name}{TAG_SCOPE_SEPARATOR}{tag}" for tag in kept)
-    return ticked_categories, ticked_tags
+    pairs = [(names[ci], tag) for ci, tag in bar["subcats"]]
+    tagged = {name for name, _ in pairs}
+    # Each category's (category, tag) pairs, grouped with its letter-case
+    # twins' under their case-folded name (the fold category_twins is built
+    # with)
+    by_name: dict[str, list[tuple[str, str]]] = {}
+    # A category with no tag on the bar is kept or excluded whole: one pair
+    # with no tag
+    for name, tag in pairs + [(name, "") for name in names if name not in tagged]:
+        by_name.setdefault(name.casefold(), []).append((name, tag))
+    excluded_keys: set[str] = set()
+    narrowed: set[tuple[str, str]] = set()
+    for key, members in by_name.items():
+        kept_members = [pair for pair in members if keeps(*pair)]
+        if not kept_members:
+            excluded_keys.add(key)
+        elif len(kept_members) < len(members):
+            narrowed.update(kept_members)
+    kept_names = [name for name in names if name.casefold() not in excluded_keys]
+    # While one category alone is kept of several, the Tag menu names its
+    # tags without the category's name (the page script's lone)
+    lone = len(kept_names) == 1 and len(names) > 1
+    tick = _one_per_twin_group([pair for pair in pairs if pair in narrowed],
+                               lambda pair: (pair[0].casefold(), pair[1].casefold()))
+    return _MenuTicks(
+        excluded=_one_per_twin_group(
+            [name for name in names if name.casefold() in excluded_keys], str.casefold),
+        kept=_one_per_twin_group(kept_names, str.casefold),
+        tags=tuple(tag if lone else f"{name}{TAG_SCOPE_SEPARATOR}{tag}" for name, tag in tick))
 
 
-def _tick_phrase(ticked: tuple[list[str], list[str]]) -> str:
+def _tick_phrase(ticks: _MenuTicks, *, as_instruction: bool) -> str:
     """
-    Word what _live_filter_ticks returned as "Category A, B and Tag C · D".
+    Word what _live_filter_ticks returned, as the live-rule line says it.
+
+    The menus are named by their labels in the bar (_MENU_CAT_LABEL,
+    _MENU_TAG_LABEL), and the words a menu shows by its own constants
+    (_MENU_CAT_ALL, _MENU_CAT_NONE, _MENU_TAG_ALL). Each list of names is
+    joined by commas alone, in the bar's order (a Kalshi category can hold
+    "and"). While no more categories are kept than are excluded, the
+    exclusions are said the short way: every category but the ones kept, by
+    ticking All categories and then unticking those. A box unticked takes
+    its twins with it, as a box ticked does, so the count here is of groups
+    of letter-case twins, each counted once, as the reader clicks them. The
+    summary line counts every name instead (_selection_name's "only ..."),
+    so the two can say one selection different ways.
 
     Args:
-        ticked (tuple[list[str], list[str]]): The categories and the tags to tick.
+        ticks (_MenuTicks): The categories to exclude and keep and the tags to
+            tick. The caller guarantees that at least one category is kept.
+        as_instruction (bool): Keyword-only. True for the clause after "choose
+            ... in the filter bar", which says what to do next; False for the
+            one after "this run's primary", which says what the page then has.
 
     Returns:
-        str: e.g. "Category Economics, Sports and Tag Sports · Basketball"; the
-            tags part is left out when no tag needs ticking.
+        str: e.g. "then tick Politics in the Exclude categories menu and tick
+            Sports · Basketball in the Tag menu" (as an instruction), or "with
+            Politics ticked in the Exclude categories menu and Sports ·
+            Basketball ticked in the Tag menu"; said the short way, "then tick
+            All categories in the Exclude categories menu, untick Sports there
+            and tick Basketball in the Tag menu", or "with every category but
+            Sports ticked in the Exclude categories menu and Basketball ticked
+            in the Tag menu". A part that names nothing is left out. With
+            nothing to exclude or tick, 'then leave the Exclude categories
+            menu showing "None" and the Tag menu showing "All tags" (the live
+            category/tag filter keeps every category and tag this run filed a
+            pair under)', or the same after "with" in place of "then leave".
     """
-    categories, tags = ticked
-    phrase = "Category " + ", ".join(categories)
-    return phrase + (" and Tag " + ", ".join(tags) if tags else "")
+    cat_menu = f"the {_MENU_CAT_LABEL} menu"
+    tag_menu = f"the {_MENU_TAG_LABEL} menu"
+    if not ticks.excluded and not ticks.tags:
+        state = (f'{cat_menu} showing "{_MENU_CAT_NONE}" and {tag_menu} showing '
+                 f'"{_MENU_TAG_ALL}" (the live category/tag filter keeps every category '
+                 "and tag this run filed a pair under)")
+        return f"then leave {state}" if as_instruction else f"with {state}"
+    excluded, kept, tags = (", ".join(ticks.excluded), ", ".join(ticks.kept),
+                            ", ".join(ticks.tags))
+    short = bool(ticks.excluded) and len(ticks.kept) <= len(ticks.excluded)
+    if as_instruction:
+        if short:
+            steps = [f"tick {_MENU_CAT_ALL} in {cat_menu}", f"untick {kept} there"]
+        else:
+            steps = [f"tick {excluded} in {cat_menu}"] if ticks.excluded else []
+        if ticks.tags:
+            steps.append(f"tick {tags} in {tag_menu}")
+        # The last step after "and", any before it after commas
+        said = steps[0] if len(steps) == 1 else f"{', '.join(steps[:-1])} and {steps[-1]}"
+        return f"then {said}"
+    if short:
+        parts = [f"every category but {kept} ticked in {cat_menu}"]
+    else:
+        parts = [f"{excluded} ticked in {cat_menu}"] if ticks.excluded else []
+    if ticks.tags:
+        parts.append(f"{tags} ticked in {tag_menu}")
+    return "with " + " and ".join(parts)
 
 
 def _live_sizing_bar_clause(sweep: BacktestSweep, bar: dict | None,
@@ -4916,8 +5044,11 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     line's "</p>" suffix). It reads the BacktestSweep.live_* fields the run
     recorded from the saved live defaults before its fetch, never main.py's
     per-run overrides, and takes where the grid holds the rule from
-    backtester._live_rule_view, as the run's log line does. When the saved
-    defaults size at a k or caps other than this run's primary, it says so
+    backtester._live_rule_view, as the run's log line does. For a saved
+    category/tag filter it names what to exclude in the bar's Exclude
+    categories menu and tick in its Tag menu to show it, or why the page
+    cannot (_live_filter_ticks, _tick_phrase). When the saved defaults
+    size at a k or caps other than this run's primary, it says so
     (backtester._live_sizing_note) and, where the page shows the rule, how
     its filter bar shows it at that sizing (_live_sizing_bar_clause). When
     the saved defaults add to held pairs, which no primary does, it says so
@@ -4966,18 +5097,18 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
                       "same-title trades capped at the lower of the size cap shown and "
                       f"{_cap_percent(st_cap)}% ({own})")
 
-    # What to tick in the Category and Tag menus to show a live filter (ticks); when
-    # the bar cannot show it, why not (slices)
-    ticks = None
+    # What to exclude and tick in the bar's menus to show a live filter
+    # (ticks); when the bar cannot show it, why not (slices)
+    ticks: _MenuTicks | None = None
     slices = ""
     if filtered and bar is None:
         slices = ("; this page's filter bar could not be built, so the live category/tag "
                   "filter cannot be shown")
     elif filtered:
-        ticked = _live_filter_ticks(categories, tags, bar)
-        if ticked[0]:
-            ticks = _tick_phrase(ticked)
-        else:
+        ticks = _live_filter_ticks(categories, tags, bar)
+        if not ticks.kept:
+            # Every category excluded: the filter keeps no pair this run filed
+            ticks = None
             slices = ("; no scenario of this run has a pair filed under the live "
                       "category/tag filter")
     # Tier floors off at a band no tier binds at: the tier-on cell holds it
@@ -4991,7 +5122,7 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     if view.where == _LIVE_RULE_NOT_SIMULATED:
         tail = "not simulated by this run"
     elif view.where == _LIVE_RULE_PRIMARY:
-        chosen = "" if ticks is None else f", with {ticks} ticked in the filter bar"
+        chosen = "" if ticks is None else ", " + _tick_phrase(ticks, as_instruction=False)
         tail = f"this run's primary{never_binds}{chosen}{slices}{ladders}"
         # The primary is a tier-on cell, at the band the page was rendered at
         shown = (None if bar is None else bar["primary"][0], True)
@@ -5010,7 +5141,8 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
             option = entries[index]["option"]
             choices = ([f"Spread band {option}", f"Tier floors on{never_binds}"]
                        if view.tier_floors else ["Tier floors off", f"Spread band {option}"])
-            tick_clause = "" if ticks is None else f", and tick {ticks} there"
+            tick_clause = ("" if ticks is None else
+                           ", " + _tick_phrase(ticks, as_instruction=True))
             tail = (f"choose {', '.join(choices[:-1])} and {choices[-1]} in the filter bar"
                     f"{tick_clause}{slices}{ladders}")
             shown = (index, view.tier_floors)
@@ -6933,11 +7065,14 @@ def _bar_reach(kd_follows: bool, explorer_follows: bool, *, explorer_caps: bool 
 # category ticked is left out of the figures the bar re-scopes; a tag ticked
 # narrows its own category to the tags ticked in it. The page shows what the live filter's
 # rule keeps (config.trade_filter_for) when it lists every category but those
-# left out and each tag ticked tied to its category. The words of each menu's
-# "All" box (the first leaves out every category; the Tag one, ticked as
-# rendered, means every tag), of the first menu's button while nothing is
+# left out and each tag ticked tied to its category. Each menu's label in the
+# bar (which the live-rule line names it by, _tick_phrase), the words of each
+# menu's "All" box (the first leaves out every category; the Tag one, ticked
+# as rendered, means every tag), of the first menu's button while nothing is
 # left out, the hover text each menu carries, how many names the summary line
 # spells out before it counts the rest, and the menus' styling.
+_MENU_CAT_LABEL = "Exclude categories"
+_MENU_TAG_LABEL = "Tag"
 _MENU_CAT_ALL = "All categories"
 _MENU_CAT_NONE = "None"
 _MENU_TAG_ALL = "All tags"
@@ -13125,8 +13260,8 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
         f'title="{days_title}">{days_opts}</select></label>&nbsp;&nbsp;'
         # Not inside a <label>, which would hand a click on the menu to its
         # first box
-        f'<span>Exclude categories: </span>{cat_menu}&nbsp;&nbsp;'
-        f'<span>Tag: </span>{tag_menu}'
+        f'<span>{html.escape(_MENU_CAT_LABEL)}: </span>{cat_menu}&nbsp;&nbsp;'
+        f'<span>{html.escape(_MENU_TAG_LABEL)}: </span>{tag_menu}'
         # The save button, disabled like the selects (autocomplete="off": a
         # browser that restores a control's disabled state on reload must not)
         f'&nbsp;&nbsp;<button id="flt-save" type="button" disabled autocomplete="off" '
