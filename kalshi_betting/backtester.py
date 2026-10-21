@@ -842,12 +842,10 @@ def _carried_forward(values: Any) -> np.ndarray:
 
 def _cut_levels(levels: list, cap: int) -> list[list[float]]:
     """
-    One side's bids, best first, cut to hold at most `cap` contracts.
+    Keep the best bids, in order, until they add up to `cap` contracts.
 
-    The levels are taken in order (best bid first) until `cap` contracts are
-    reached, the last one cut short; a walk of at most `cap` contracts takes
-    exactly what it took before (scanner.walk_bids). The volume cap's one
-    cut, for a sale's ladder and a synthetic book's two sides alike.
+    The last bid kept is cut short if needed. Used so a sale or a modeled
+    order book can never take more than the volume cap allows.
 
     Args:
         levels (list): [[price, contracts], ...], best (highest) first.
@@ -6199,33 +6197,14 @@ def _maturity_close(m: dict, *, as_date: bool = False) -> datetime | date | None
     """
     The close a live run would have read for a market: its scheduled close, else its realized one.
 
-    Once a market settles, its close_time is the moment it actually closed,
-    which for an event decided early is before the close a live run saw.
-    _prepare_candidates writes the scheduled close (learned per series,
-    market_details.scheduled_close) on a pair market's record under
-    _SCHEDULED_CLOSE_KEY while config.BACKTEST_SCHEDULED_CLOSE (or the run's
-    override) is on, and pops it otherwise, so a record without the key reads
-    its realized close exactly as before.
+    With the switch off, records carry no scheduled close, so this is the
+    realized close, as before. Used for days-to-maturity, ranking, cross-event
+    pair order, gap and horizon, and the same-title close gate. The exchange's
+    own timing (candle windows, scan end, prefilter, payouts) keeps the
+    realized close.
 
-    Read where a live run reads its close: the sell rule's days to maturity
-    (the trades' close_date_a/_b, read by _days_left, _far_enough and
-    _sale_reach), the ranking's days to the later close (expected_days in
-    _simulate_at_discount), a cross-event time-series pair's order, gap and
-    horizon in _find_entry, and the same-title close gate
-    (_close_gate_and_labels). NOT read where the exchange's own timing
-    matters, which keep the realized close: _find_entry's scan_end (candles
-    exist only until the market really closed), _can_ever_enter and
-    SETTLED_PREFILTER_CACHE_TAG (so no corpus is orphaned), the candle windows
-    (_fetch_candles_parallel), the time-series sweep window in _extract_pairs
-    (a bound on which pairs are visited) and _leg_quotes' payout moments
-    (settlement_ts). A same-event ladder keeps its stated deadlines.
-
-    A residual of that window, recorded rather than fixed: a cross-event
-    pair whose realized closes are more than MAX_DEADLINE_GAP_DAYS + 1 days
-    apart but whose scheduled closes are within MAX_DEADLINE_GAP_DAYS is
-    never visited, so never traded. That is pessimistic (it can only miss
-    trades), and such a pair's earlier market closed far ahead of schedule,
-    the shape whose earlier leg settles YES (a winning cell) that is missed.
+    Known cost: a pair more than 31 days apart by realized close but within
+    30 by scheduled close is never visited, so it can only miss trades.
 
     Args:
         m (dict): A market record (the compact historical._market_to_dict form).
@@ -6563,9 +6542,8 @@ def _series_label_filer(series_categories: dict | None) -> Callable[[dict], tupl
     """
     A function giving the (category, tag) a market's series is filed under, worked out once per series.
 
-    The one filing rule of the same-title sport check's label half (DR-79),
-    historical.series_labels over the listing: _extract_pairs and the
-    deferred gate (_close_gate_and_labels) both read it.
+    Used so each series is looked up once, not once per candidate pair. The
+    returned function keeps the per-series cache between calls.
 
     Args:
         series_categories (dict | None): Kalshi's /series listing; None or {}
@@ -6593,7 +6571,7 @@ def _series_label_filer(series_categories: dict | None) -> Callable[[dict], tupl
 
 def _log_close_gap_refusals(count: int) -> None:
     """
-    The same-title close-gap line (DR-74) for the deferred gate (silent at zero).
+    The same-title close-gap line for the deferred gate (silent at zero).
 
     Word for word the line _extract_pairs and scanner.find_same_title_pairs
     log (tests/test_backtester.py pins the three equal).
@@ -6612,7 +6590,7 @@ def _log_close_gap_refusals(count: int) -> None:
 
 def _log_label_refusals(count: int) -> None:
     """
-    The same-title label line (DR-79) for the deferred gate (silent at zero).
+    The same-title label line for the deferred gate (silent at zero).
 
     Word for word the line _extract_pairs and scanner.find_same_title_pairs
     log (tests/test_backtester.py pins the three equal).
@@ -6655,10 +6633,12 @@ def _close_gate_and_labels(pairs: list, series_categories: dict | None) -> list:
     gap_skips = label_skips = admitted = refused = 0
     for pair in pairs:
         mA, mB = pair[0], pair[1]
+        # realized closes, only to count pairs the scheduled closes judge differently
         realized = _comparable_closes_dicts(mA, mB)
         # The ONE definition of the gate (scanner.closes_apart). A scheduled
         # close is an aware UTC moment; beside a naive realized close the two
         # cannot be compared and closes_apart refuses the pair (fail closed)
+        # the gate, on the closes a live run would have seen
         apart = closes_apart(_maturity_close(mA), _maturity_close(mB))
         apart_realized = realized is None or closes_apart(*realized)
         if apart != apart_realized:
@@ -7869,13 +7849,14 @@ def _moved_ts(candle: dict | None) -> int:
     return int(moved)
 
 
-def _volume_ahead(ordered: list[dict], moments: list[int], window: float) -> list[float]:
+def _volume_ahead(ordered: list[dict], checkpoint_timestamps: list[int],
+                  window: float) -> list[float]:
     """
-    The contracts traded in the window after each moment: candles ending in (moment, moment + window].
+    The contracts traded in the window after each checkpoint: candles ending in (checkpoint, checkpoint + window].
 
     Args:
         ordered (list[dict]): One market's candles, ascending by "ts".
-        moments (list[int]): Unix times.
+        checkpoint_timestamps (list[int]): The weekly entry checkpoints, in Unix seconds.
         window (float): The window's length in seconds.
 
     Returns:
@@ -7884,7 +7865,7 @@ def _volume_ahead(ordered: list[dict], moments: list[int], window: float) -> lis
     """
     stamps = [c["ts"] for c in ordered]
     out: list[float] = []
-    for moment in moments:
+    for moment in checkpoint_timestamps:
         lo = bisect.bisect_right(stamps, moment)
         hi = bisect.bisect_right(stamps, moment + window)
         total = 0.0
@@ -8857,7 +8838,8 @@ def _hour_moved(candle: dict, prev_ask: float | None, prev_bid: float | None) ->
     """
     Whether one hourly candle shows any trading or any change of quote.
 
-    The hour moved when contracts traded in it, or when its YES ask (open, high,
+    Used by _project_candles to tell a live quote from one carried forward
+    unchanged, for the stale-quote check. The hour moved when contracts traded in it, or when its YES ask (open, high,
     low or close) or its YES bid (open, high, low or close) differs, by more than
     PRICE_EPSILON, from the previous hour's closing ask or bid. A price the
     candle does not carry (no open/high/low, no bid) is not compared.
@@ -8890,31 +8872,18 @@ def _project_candles(candles: list[dict], *, window_open: int | None = None,
     """
     Keep, for each hourly candle, only what the backtest reads, plus two derived numbers.
 
-    historical.fetch_candlesticks returns the whole hourly record; holding every
-    ticker's full records for a run would cost far more memory than the four
-    fields the backtest reads, so each candle is cut to exactly "ts",
-    "yes_ask_close", "no_ask_close", "volume", "moved_ts" and "open_interest".
-    Every candle is kept, so every other reader gets exactly the candles the
-    fetch returned.
+    Every candle is kept, cut to "ts", "yes_ask_close", "no_ask_close",
+    "volume", "open_interest" and "moved_ts". The bid close and the
+    open/high/low values are used only to work out "moved_ts", then dropped
+    from memory (the full record stays in the candle cache).
 
-    "moved_ts" is the end (ts) of the latest hour, at or before this one, in
-    which contracts traded or either side's quote changed (_hour_moved), or -1
-    when there is none yet. The stale-quote check reads it
-    (_quote_is_fresh). With window_open given — the start of the candle
-    request, as _fetch_candles_parallel asks for it (_candle_window_open) — it
-    is worked out from the request's own window only, so it does not depend on
-    whether the candle cache held a wider file:
-      * a candle ending at or before window_open (one a wider cached file
-        holds from before the request) gets -1;
-      * the first candle after it counts as moved only when contracts traded
-        in it, its own open, high or low differ from its close on either side,
-        or it is the market's opening hour (it ends no later than one candle
-        period after market_open); otherwise -1, until a later hour moves;
-      * every later candle is compared with the previous candle's closes.
-    So a quiet market reads as not having moved at the window's first
-    checkpoint until something moves: a slight pessimism, at the window's
-    start only. With no window_open (a caller with no request window, such as
-    a test) the series' first hour counts as having moved.
+    "moved_ts" is the end of the latest hour, at or before this candle, in
+    which contracts traded or a quote changed (-1 if none yet); the
+    stale-quote check reads it. With window_open, it is worked out from the
+    request's own window only, so it does not depend on a wider cache file:
+    the window's first hour counts as moved only if it traded, has its own
+    range, or is the market's opening hour. Without window_open, the first
+    hour counts as moved.
 
     Args:
         candles (list[dict]): One ticker's candles from fetch_candlesticks.
@@ -9860,6 +9829,9 @@ def _audit_pair_markets(
     """
     Load each pair market's trades, check them against its details and candles, and keep summaries.
 
+    Used only for the report-only integrity checks: it compares each pair
+    market's trades with its volume totals and candles.
+
     One worker per market on CANDLESTICK_FETCH_MAX_WORKERS threads
     (market_details.audit_market), paced like the candle fetch. Each market's
     trades are read from the cache or Kalshi, checked and dropped inside its
@@ -10153,17 +10125,11 @@ def _apply_scheduled_closes(needed_tickers: dict, details: dict, rules: dict | N
     """
     Write each pair market's scheduled close on its record (or pop it), and log what that changes.
 
-    With the switch off (rules None) every record's key is popped and nothing
-    is logged. On, a market whose close the deferred same-title gate already
-    worked out keeps that answer (so the gate and every later reader agree);
-    every other one is worked out from its full details. Logs one INFO line
-    with how many pair markets use a scheduled close and how many keep the
-    realized one for want of a rule, then, each silent at zero, those whose
-    series has a rule that their own fingerprint does not match
-    (market_details.close_rule_applies: their latest-minus-expected
-    expiration gap is not one the rule saw), those whose series has a rule
-    that matches but gave no usable time, and the cross-event
-    time-series pairs whose order or deadline gap the scheduled closes change.
+    For each pair market, works out the close a live run would have seen and
+    stores it on the record. A market with no learned rule for its series
+    keeps its actual close. With the switch off (rules None), any stored
+    scheduled close is removed. Logs how many markets got a scheduled close
+    and how many pair orderings or gaps it changes.
 
     Args:
         needed_tickers (dict): Ticker -> record, every pair market.

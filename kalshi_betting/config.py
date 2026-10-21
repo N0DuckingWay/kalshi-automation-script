@@ -2372,19 +2372,9 @@ INTEGRITY_VOLUME_TOLERANCE = 0.005
 INTEGRITY_LIFE_SLACK_SECONDS = 3600
 INTEGRITY_MAX_EXAMPLES = 10
 
-# Whether the backtest reads each market's SCHEDULED close where a live run
-# reads its close (the backtest only; live code reads the close the exchange
-# lists, which is the scheduled one already). Once a market settles, Kalshi's
-# close_time is the moment it actually closed, which for an event decided early
-# is before the close a live run saw. With this on, the backtest works out the
-# scheduled close from a rule learned per series (market_details.learn_close_rules,
-# from the captures under backtest_cache/scheduled_closes/) and uses it for the
-# days-to-maturity rule of selling, the ranking's days to the later close, the
-# order, gap and horizon of a cross-event time-series pair and the same-title
-# close gate; everywhere the exchange's own timing matters (the candle windows,
-# the scan's last Monday, the eligibility prefilter) it keeps the realized close.
-# A series with no proven rule keeps the realized close. backtest.py
-# --scheduled-close / --no-scheduled-close set it for one run.
+# Whether the backtest uses a market's scheduled close (learned per series) where
+# a live run would, instead of its realized close. Backtest only;
+# backtest.py --scheduled-close / --no-scheduled-close set it for one run.
 BACKTEST_SCHEDULED_CLOSE = True
 
 # The fewest observations (a live close beside the same market's settled record,
@@ -2399,27 +2389,14 @@ SCHEDULED_CLOSE_MIN_OBSERVATIONS = 20
 # day's diesel prices, say) proves nothing about the series' next one.
 SCHEDULED_CLOSE_MIN_EVENTS = 2
 
-# How old, at most, a market's last move may be for the backtest to trade on its
-# quote: an entry, a sale or a Kelly trim at a weekly checkpoint needs each of
-# its markets (each one still to pay out, for a sale) to have traded, or to have
-# changed either side's quote, within this many seconds before the checkpoint
-# (the backtest only; a live run always reads a fresh order book). A candle's
-# "moved_ts" is the end of the latest hour, at or before it, in which that
-# happened, and the check reads the candle the checkpoint reads; exactly this
-# old is still fresh. A quote that has sat unchanged for days may no longer be
-# on the book. None turns the check off. backtest.py --stale-quote-hours N /
-# --no-stale-quote-check set it for one run.
+# A quote counts only if the market traded or moved within this many seconds of
+# the checkpoint (24 h); None turns the check off. Backtest only;
+# backtest.py --stale-quote-hours N / --no-stale-quote-check set it for one run.
 BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS = 86_400
 
-# The share of a market's real traded volume a backtest buy or sale may take:
-# at a weekly checkpoint, a trade (each leg) or a sale may take at most this
-# share of the contracts that traded in that market over the next
-# BACKTEST_VOLUME_SHARE_WINDOW_SECONDS (candles ending in that window after the
-# checkpoint). Where that is tighter than the modeled order book, it wins. It
-# reads the hours after the checkpoint, which a live run cannot see, so it only
-# ever makes a trade smaller. A market whose volume ahead cannot be read is not
-# capped. None turns the cap off. The backtest only; backtest.py
-# --max-volume-share PCT / --no-volume-cap set it for one run.
+# The largest share of the next 24 h's traded contracts one fill may take (10%);
+# None turns the cap off. It reads the future, so it only ever shrinks trades.
+# Backtest only; backtest.py --max-volume-share PCT / --no-volume-cap set it.
 BACKTEST_MAX_VOLUME_SHARE = 0.10
 
 # ... and the window after a checkpoint that volume is read over, in seconds
