@@ -1296,31 +1296,17 @@ def learn_close_rules(observations: Iterable[tuple[str, str, int, tuple]],
     """
     Per series, the field and fixed offset that reproduce every observed live close.
 
-    Each observation is one market seen open by a live run and then settled:
-    (its ticker, its series, the close_time the live run saw, in Unix
-    seconds, and the settled record's timing_epochs tuple). For every series,
-    each of the three fields of CLOSE_RULE_FIELDS is tried, in the order of
-    CLOSE_RULE_PREFERENCE, with the one offset (seconds) its first
-    observation implies (live close minus that field); the first field that
-    every observation of the series has, and that plus the offset equals
-    every live close, is the series' rule.
+    For each series, finds which of close_time, latest_expiration_time or
+    expected_expiration_time, plus one fixed offset, matches every live close
+    seen (tried in CLOSE_RULE_PREFERENCE order). A rule is kept only with at
+    least config.SCHEDULED_CLOSE_MIN_OBSERVATIONS observations from at least
+    config.SCHEDULED_CLOSE_MIN_EVENTS events, and it applies only to markets
+    whose latest-minus-expected gap is one the rule saw (its fingerprint),
+    because Kalshi has set these fields differently over time. The same
+    market seen twice with the same live close counts once.
 
-    A rule also records the FINGERPRINT of the markets it was learned on:
-    each observation's latest_expiration_time minus its
-    expected_expiration_time. Kalshi has changed how it sets these fields
-    over time (older markets of one series, and markets across a clock
-    change, can carry another gap between them), and a rule learned on one
-    convention gives a close that is too LATE on another, which the "not
-    before the realized close" guard cannot catch. So scheduled_close applies
-    a rule only to a market whose own fingerprint is one the rule saw. Only
-    observations carrying both fields support the rule (give it a
-    fingerprint and count toward its minimums): a series needs at least
-    config.SCHEDULED_CLOSE_MIN_OBSERVATIONS of them, from at least
-    config.SCHEDULED_CLOSE_MIN_EVENTS distinct events (an event ticker is
-    the market ticker less its last hyphenated part). A series with a miss
-    on every field, or too little support, has no rule.
-
-    The same market seen twice with the same live close counts once.
+    Each observation is (ticker, series, live close in Unix seconds, the
+    settled record's timing_epochs).
 
     Args:
         observations (Iterable): (ticker, series, live close seconds, timing tuple).

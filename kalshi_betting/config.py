@@ -1204,7 +1204,7 @@ MVE_SERIES_FAMILY_PREFIX      = "KXMVE"
 # The quadratic P*(1-P) factor means fees are highest near 50¢ and lowest near 1¢/99¢.
 # A series may list a fee multiplier (Kalshi's /series listing, fee_multiplier):
 # each leg's rate is then TAKER_FEE_RATE × that market's multiplier, but only
-# for a multiplier in CONFIRMED_FEE_MULTIPLIERS (fee_multiplier() below).
+# for a multiplier in CONFIRMED_FEE_MULTIPLIERS (confirmed_fee_multiplier() below).
 TAKER_FEE_RATE                = 0.07
 
 # The series fee multipliers that are charged as listed. Any other multiplier
@@ -2700,7 +2700,7 @@ def time_series_profit_prob(spread: float, k: float | None = None) -> float:
     return 1.0 - discount * max(0.0, spread)
 
 
-def fee_multiplier(raw: object) -> float:
+def confirmed_fee_multiplier(raw: object) -> float:
     """
     Return the fee multiplier a leg is charged at: the listed one when confirmed, else 1.0.
 
@@ -2729,7 +2729,7 @@ def unconfirmed_fee_multipliers_text(listed: Iterable) -> str | None:
     Return the one line naming markets whose listed fee multiplier is charged in full.
 
     Counts each listed multiplier that is a real, finite number other than 1.0
-    and that fee_multiplier() does not confirm (so the market is charged the
+    and that confirmed_fee_multiplier() does not confirm (so the market is charged the
     full fee), by multiplier. A live run (main._attach_series_labels) and a
     backtest (backtester._prepare_candidates) log it once each, at INFO.
 
@@ -2747,7 +2747,7 @@ def unconfirmed_fee_multipliers_text(listed: Iterable) -> str | None:
         if isinstance(raw, bool) or not isinstance(raw, numbers.Real):
             continue
         value = float(raw)
-        if not math.isfinite(value) or value == 1.0 or fee_multiplier(value) != 1.0:
+        if not math.isfinite(value) or value == 1.0 or confirmed_fee_multiplier(value) != 1.0:
             continue
         counts[value] = counts.get(value, 0) + 1
     if not counts:
@@ -2783,7 +2783,7 @@ def fee_per_pair_approx(price_a: float, price_b: float, *,
         price_b (float): Cost in dollars of the side bought on the second leg.
             Range: (0, 1).
         multiplier_a (float): Keyword-only. The fee multiplier of the first
-            leg's market (config.fee_multiplier of its series' listed one).
+            leg's market (config.confirmed_fee_multiplier of its series' listed one).
         multiplier_b (float): Keyword-only. The same for the second leg.
 
     Returns:
@@ -2819,7 +2819,7 @@ def fee_leg_exact(n: int, p: float, *, multiplier: float = 1.0) -> float:
         p (float): Price in dollars of the side bought on this leg (the YES ask
             for a YES buy, the NO ask for a NO buy). Range: (0, 1).
         multiplier (float): Keyword-only. The fee multiplier of this leg's
-            market (config.fee_multiplier of its series' listed one).
+            market (config.confirmed_fee_multiplier of its series' listed one).
 
     Returns:
         float: Taker fee in dollars, rounded up to the nearest cent.

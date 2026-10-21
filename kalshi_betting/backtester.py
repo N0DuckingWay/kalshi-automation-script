@@ -441,7 +441,7 @@ from .config import (
     days_to_maturity,
     describe_time_series_rule,
     fee_leg_exact,
-    fee_multiplier,
+    confirmed_fee_multiplier,
     fee_per_pair_approx,
     held_pair_fraction,
     held_pair_win_prob,
@@ -1797,7 +1797,7 @@ class BacktestTrade:
             synthetic order book; False when it filled at the top of the book
             (no depth model, or no volume data that Monday).
         fee_multiplier_a (float): The fee multiplier market A's leg was
-            charged at: config.fee_multiplier of its series' listed one, so
+            charged at: config.confirmed_fee_multiplier of its series' listed one, so
             1.0 (the full fee) unless config.CONFIRMED_FEE_MULTIPLIERS holds
             it. A sale or trim of that leg pays its fee at the same one.
         fee_multiplier_b (float): The same for market B's leg.
@@ -1892,7 +1892,7 @@ class BacktestTrade:
     fill_price_a: float | None = None
     fill_price_b: float | None = None
     book_walked: bool = False
-    # The fee multiplier each leg was charged at (config.fee_multiplier of its
+    # The fee multiplier each leg was charged at (config.confirmed_fee_multiplier of its
     # market's series' listed one; 1.0 is the full fee). Every fee the trade
     # pays later — a sale's, a trim's — reads its own leg's
     fee_multiplier_a: float = 1.0
@@ -2650,7 +2650,7 @@ def _listed_fee_multiplier(market: dict) -> float:
 
 def _charged_fee_multiplier(market: dict) -> float:
     """
-    The fee multiplier a market's leg is charged at: config.fee_multiplier of its listed one.
+    The fee multiplier a market's leg is charged at: config.confirmed_fee_multiplier of its listed one.
 
     The full fee (1.0) unless config.CONFIRMED_FEE_MULTIPLIERS holds the
     multiplier its series lists (_listed_fee_multiplier).
@@ -2661,7 +2661,7 @@ def _charged_fee_multiplier(market: dict) -> float:
     Returns:
         float: The multiplier to price the leg's fee at.
     """
-    return fee_multiplier(_listed_fee_multiplier(market))
+    return confirmed_fee_multiplier(_listed_fee_multiplier(market))
 
 
 def _curve_end_date(point: SweepPoint | None) -> date | None:
@@ -4417,10 +4417,10 @@ def _trade_fee_multipliers(trade: BacktestTrade) -> tuple[float, float]:
 
     Returns:
         tuple[float, float]: (market A's multiplier, market B's), each through
-            config.fee_multiplier.
+            config.confirmed_fee_multiplier.
     """
-    return (fee_multiplier(getattr(trade, "fee_multiplier_a", 1.0)),
-            fee_multiplier(getattr(trade, "fee_multiplier_b", 1.0)))
+    return (confirmed_fee_multiplier(getattr(trade, "fee_multiplier_a", 1.0)),
+            confirmed_fee_multiplier(getattr(trade, "fee_multiplier_b", 1.0)))
 
 
 def _open_leg_stake(trade: BacktestTrade, ticker: str, day: date) -> float:
@@ -8443,10 +8443,9 @@ def _find_entry(
         # market, this reads the REALIZED close Kalshi recorded for a settled
         # one, which for an event that resolved early can sit before the
         # original schedule — a later-deadline leg that resolved early is
-        # ordered first on the realized gap (CLAUDE.md TS-06). With the
-        # scheduled close on, the order and the gap are read on the close a
-        # live run would have read (_maturity_close) wherever the market's
-        # series has a learned rule; a series with none keeps the realized one.
+        # ordered first on the realized gap. With the scheduled close on,
+        # order and gap use the close a live run would have read; a series
+        # with no rule keeps the realized close.
         # DR-73: a same-event deadline LADDER is the one time-series shape
         # close_time cannot order or measure, so it is ordered and gapped on
         # the two rungs' STATED deadlines instead. Gated on the resolved flag,
@@ -8570,10 +8569,8 @@ def _find_entry(
         # holds for every time_series pair either (in the archive 13 dated
         # same-event pairs are ordered the wrong way round by realized close,
         # and 681 have a close gap of ZERO days). The max() keeps this correct
-        # under all three. It reads the close a live run would have read (the
-        # scheduled one where carried: a live run's horizon filter reads the
-        # listed close), not the stated deadline, because this bounds when a
-        # market is still OPEN.
+        # under all three. The horizon filter reads the close a live run would
+        # read (scheduled where known), not the stated deadline.
         if max_horizon_days is not None and (max(maturity_a, maturity_b) - entry_date).days > max_horizon_days:
             continue
 
@@ -10532,17 +10529,13 @@ def _prepare_candidates(
     # that holds only while the name is not rebound between the halves. The
     # same-title call takes it too, for signature uniformity — 3-tuple-keyed
     # groups have no deadline concept and the flag is inert there.
-    # The scheduled-close switch, resolved at call time (None reads this
-    # module's binding of the constant, like the ladder flag). On, the rules
-    # each series' scheduled close is worked out by (cross-module: read from
-    # the captures, cached; observations with no record looked up)
+    # Scheduled close: load the per-series rules (None reads this module's
+    # binding of the switch)
     scheduled_on = bool(BACKTEST_SCHEDULED_CLOSE if scheduled_close is None
                         else scheduled_close)
     close_rules = market_details.load_close_rules(hist_client) if scheduled_on else {}
-    # With a rule for some series, the same-title close gate waits for the
-    # candidates' scheduled closes (read below); with none it runs inside
-    # _extract_pairs, on the realized closes, through the very call made with
-    # the switch off (the keyword is handed only when the gate waits)
+    # If any series has a rule, the same-title close gate waits for the
+    # scheduled closes; otherwise it runs inside _extract_pairs on realized closes
     defer_gate = bool(close_rules)
     ts_pairs     = _extract_pairs(ts_groups, same_event_ladders=same_event_ladders)
     same_pairs   = _extract_pairs(same_groups, same_event_ladders=same_event_ladders,

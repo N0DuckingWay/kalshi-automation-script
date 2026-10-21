@@ -4831,13 +4831,13 @@ class TestFeeMultipliers:
     def test_fee_multiplier_charges_an_unconfirmed_one_in_full(self, monkeypatch):
         for raw in (0.5, 0, 0.0, 2.0, float("nan"), float("inf"), None, "0.5", True, False,
                     MagicMock(), [0.5]):
-            assert config.fee_multiplier(raw) == 1.0, raw
-        assert config.fee_multiplier(1) == 1.0
+            assert config.confirmed_fee_multiplier(raw) == 1.0, raw
+        assert config.confirmed_fee_multiplier(1) == 1.0
         monkeypatch.setattr(config, "CONFIRMED_FEE_MULTIPLIERS", frozenset({1.0, 0.5, 0.0}))
-        assert config.fee_multiplier(0.5) == 0.5
-        assert config.fee_multiplier(0) == 0.0
-        assert config.fee_multiplier(0.25) == 1.0
-        assert config.fee_multiplier(False) == 1.0
+        assert config.confirmed_fee_multiplier(0.5) == 0.5
+        assert config.confirmed_fee_multiplier(0) == 0.0
+        assert config.confirmed_fee_multiplier(0.25) == 1.0
+        assert config.confirmed_fee_multiplier(False) == 1.0
 
     def test_the_unconfirmed_count_line(self, monkeypatch):
         assert config.unconfirmed_fee_multipliers_text([1.0, 1.0, None]) is None

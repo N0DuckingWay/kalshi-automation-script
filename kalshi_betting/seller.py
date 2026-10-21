@@ -62,7 +62,7 @@ from .config import (
     count_text,
     days_to_maturity,
     fee_leg_exact,
-    fee_multiplier,
+    confirmed_fee_multiplier,
     fee_per_pair_approx,
     held_pair_win_prob,
     kelly_hold_fraction,
@@ -516,7 +516,7 @@ class _Reads:
             event_ticker (str): Its event's ticker (its series names its multiplier).
 
         Returns:
-            float: The listed multiplier (config.fee_multiplier charges it).
+            float: The listed multiplier (config.confirmed_fee_multiplier charges it).
         """
         # Cross-module: the event's override, else the series'; unknown -> the full fee
         return listed_fee_multiplier(
@@ -742,7 +742,7 @@ def _plan_one(pair: HeldPair, reads: _Reads, held_labels: dict, *, sell_at: floa
             # market's own fee multiplier (a partner not yet paid out by this
             # check, which carries no market, at the one it is listed at)
             multiplier = (market_fee_multiplier(leg.market) if leg.market is not None
-                          else fee_multiplier(leg.partner_fee_multiplier))
+                          else confirmed_fee_multiplier(leg.partner_fee_multiplier))
             value += count * bid - fee_leg_exact(count, bid, multiplier=multiplier)
         profits.append((value - cost, potential))
         # Cross-module: config.take_profit_reached, the rule's test at this check

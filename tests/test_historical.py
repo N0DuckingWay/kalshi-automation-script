@@ -7186,7 +7186,7 @@ class TestLoadSeriesFeeMultipliers:
     @pytest.mark.parametrize("huge", [10 ** 400, -(10 ** 400)])
     def test_a_huge_integer_multiplier_is_unknown_not_an_error(self, cache, monkeypatch, huge):
         # float() of a 400-digit integer raises OverflowError; it must not cost the listing
-        assert historical._fee_multiplier(huge) is None
+        assert historical._parse_fee_multiplier(huge) is None
         self._stub(monkeypatch, {"series": [
             {"ticker": "KXHUGE", "category": "Sports", "tags": [], "fee_multiplier": huge},
             {"ticker": "KXGOOD", "category": "Sports", "tags": [], "fee_multiplier": 0.5}]})

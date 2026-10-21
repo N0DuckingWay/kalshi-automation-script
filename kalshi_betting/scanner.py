@@ -211,7 +211,7 @@ from .config import (
     TIME_SERIES_SAME_EVENT_LADDERS,
     LiveSettings,
     describe_time_series_rule,
-    fee_multiplier,
+    confirmed_fee_multiplier,
     fee_per_pair_approx,
     kelly_budget,
     live_settings,
@@ -1192,7 +1192,7 @@ def market_fee_multiplier(market: Any) -> float:
     backtest), read by type: a market that carries none, a test double's
     auto-attribute or anything that is not a number reads 1.0, and a listed
     multiplier counts only when config.CONFIRMED_FEE_MULTIPLIERS holds it
-    (config.fee_multiplier).
+    (config.confirmed_fee_multiplier).
 
     Args:
         market (Any): A market (ApiMarket, or anything exposing _fee_multiplier).
@@ -1200,7 +1200,7 @@ def market_fee_multiplier(market: Any) -> float:
     Returns:
         float: The multiplier to price this market's leg fee at.
     """
-    return fee_multiplier(getattr(market, "_fee_multiplier", 1.0))
+    return confirmed_fee_multiplier(getattr(market, "_fee_multiplier", 1.0))
 
 
 def leg_fee_multipliers(pair: Any) -> tuple[float, float]:
@@ -1218,7 +1218,7 @@ def leg_fee_multipliers(pair: Any) -> tuple[float, float]:
 
     Returns:
         tuple[float, float]: (market_a's multiplier, market_b's multiplier),
-            each through config.fee_multiplier.
+            each through config.confirmed_fee_multiplier.
     """
     return (market_fee_multiplier(getattr(pair, "market_a", None)),
             market_fee_multiplier(getattr(pair, "market_b", None)))
@@ -1642,7 +1642,7 @@ def _valid_multiplier(raw: Any) -> float | None:
     """
     A fee multiplier as Kalshi gives one: a real, finite number from 0 to 1, else None.
 
-    The validation historical._fee_multiplier applies to a series' multiplier,
+    The validation historical._parse_fee_multiplier applies to a series' multiplier,
     written here so the event override, which live ingest reads, is checked alike.
 
     Args:
@@ -1706,7 +1706,7 @@ def listed_fee_multiplier(series_listed: Any, event_override: Any) -> float:
     partner). An override that is not known (EVENT_FEE_OVERRIDE_UNKNOWN, or
     anything that is neither None nor a valid multiplier) gives 1.0, the full
     fee, never the series' multiplier, so a full-fee event of a reduced series
-    is never charged the reduced fee. config.fee_multiplier then charges the
+    is never charged the reduced fee. config.confirmed_fee_multiplier then charges the
     result only when it is confirmed.
 
     Args:

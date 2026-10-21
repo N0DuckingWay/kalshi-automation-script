@@ -10659,7 +10659,7 @@ class _SellTask:
             before it is sold.
         confirmed_fee_multipliers (frozenset): config.CONFIRMED_FEE_MULTIPLIERS
             as the parent reads it: the series fee multipliers charged as
-            listed (config.fee_multiplier), so a worker charges each leg's
+            listed (config.confirmed_fee_multiplier), so a worker charges each leg's
             fee as the parent would.
         install (bool): Whether the task runs in a worker process of its own,
             which then installs those four bindings first (a spawned process
@@ -10955,7 +10955,7 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
         _backtester.SCHEDULED_RUN = task.scheduled_run
         _backtester.TAKE_PROFIT_HOLD_DAYS = task.hold_days
         # ... and charge each leg's fee at the multipliers the parent confirms
-        # (config.fee_multiplier reads config's own binding when called)
+        # (config.confirmed_fee_multiplier reads config's own binding when called)
         _config.CONFIRMED_FEE_MULTIPLIERS = task.confirmed_fee_multipliers
     family = task.family
     band = family.bands[0] if task.tier_floors else family.off_bands[0]

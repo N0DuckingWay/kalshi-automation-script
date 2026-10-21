@@ -381,7 +381,7 @@ def _fee_type(raw: Any) -> str:
     return raw if isinstance(raw, str) else ""
 
 
-def _fee_multiplier(raw: Any) -> float | None:
+def _parse_fee_multiplier(raw: Any) -> float | None:
     """
     Read a series' fee_multiplier: a finite real number from 0 to 1, else unknown.
 
@@ -430,7 +430,7 @@ def _parse_series_fees(raw: Any) -> dict[str, tuple[str, float | None]] | None:
     for ticker, value in raw.items():
         if (isinstance(ticker, str) and isinstance(value, list) and len(value) == 2
                 and isinstance(value[0], str)):
-            out[ticker] = (value[0], _fee_multiplier(value[1]))
+            out[ticker] = (value[0], _parse_fee_multiplier(value[1]))
     return out
 
 
@@ -472,7 +472,7 @@ def _fetch_series_listing(
                     tuple(t for t in tags if isinstance(t, str)),
                 )
                 fees[s["ticker"]] = (
-                    _fee_type(s.get("fee_type")), _fee_multiplier(s.get("fee_multiplier")))
+                    _fee_type(s.get("fee_type")), _parse_fee_multiplier(s.get("fee_multiplier")))
         cursor = data.get("cursor")
         if not cursor or cursor in seen:
             break
