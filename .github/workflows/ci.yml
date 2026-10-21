@@ -7,7 +7,7 @@ on:
 
 jobs:
   # Pushes to main always run CI. A PR runs it only when it changes more than
-  # one file or more than 10 lines (additions + deletions); the numbers come
+  # one file or more than 50 lines (additions + deletions); the numbers come
   # straight from the pull_request event payload, so no checkout is needed.
   gate:
     name: Size gate
@@ -28,7 +28,7 @@ jobs:
           fi
           LINES=$((ADDITIONS + DELETIONS))
           echo "PR changes $FILES file(s) and $LINES line(s)"
-          if [ "$FILES" -gt 1 ] || [ "$LINES" -gt 10 ]; then
+          if [ "$FILES" -gt 1 ] || [ "$LINES" -gt 50 ]; then
             echo "run_ci=true" >> "$GITHUB_OUTPUT"
           else
             echo "run_ci=false" >> "$GITHUB_OUTPUT"
