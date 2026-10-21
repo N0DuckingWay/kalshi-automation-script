@@ -15606,9 +15606,11 @@ def generate_dashboard(
                 logging.warning(
                     "The page cannot combine categories and tags for %d of its trade "
                     "list(s): a tag's curve there does not cover the page's dates day for "
-                    "day, or could not be rebuilt exactly from its trades. Ticking more "
-                    "than one category or tag at such a scenario shows a 'not available' "
-                    "line; every single choice is unaffected.", unmixable)
+                    "day, or could not be rebuilt exactly from its trades. At such a "
+                    "scenario the page can show only the whole run, one category kept "
+                    "alone or one tag alone (every other category excluded); any other "
+                    "choice, such as excluding just one category of three or more, shows "
+                    "a 'not available' line.", unmixable)
             filter_data = _filter_payload(
                 source, chunker, start_date, initial_balance, series_categories, kd=kd,
                 tainted=tainted, explorer=explorer_grid,

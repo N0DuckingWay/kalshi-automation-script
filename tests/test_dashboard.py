@@ -5051,6 +5051,18 @@ class TestMixData:
         assert len(said) == 1
         chunks = TestFilterPage._chunks(page)
         assert len(chunks) > 1 and said[0].args[0] == len(chunks)
+        # The second sentence says what the page can still show (the whole
+        # run, one category kept alone, one tag alone: the views Python ships
+        # whole) and that anything else, excluding one category of three or
+        # more included, is refused; it must not claim every single choice
+        # is unaffected
+        message = said[0].getMessage()
+        assert "every single choice is unaffected" not in message
+        for words in ("only the whole run", "one category kept alone",
+                      "one tag alone", "every other category excluded",
+                      "excluding just one category of three or more",
+                      "'not available' line"):
+            assert words in message
         assert not any("m" in view for chunk in chunks.values()
                        for view in chunk["list"]["views"].values())
         # A page whose lists can all be mixed says nothing
