@@ -13,7 +13,7 @@ jobs:
   # commit titled "Merge branch 'main' into ...", which is what GitHub's
   # "Update branch" button and `git merge main` write) skips CI too: main
   # already passed it, and the branch's own changes were tested on earlier
-  # pushes. "Clean" means replaying the merge gives the same files as the
+  # pushes. A PR that changes only this file skips CI as well. "Clean" means replaying the merge gives the same files as the
   # commit; conflict fixes or extra edits inside it still run CI.
   gate:
     name: Size gate
@@ -32,9 +32,17 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           if [ "$EVENT" != "pull_request" ]; then
             echo "run_ci=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A PR that touches nothing but this workflow file has no code to test.
+          OTHER=$(gh api --paginate "repos/$GH_REPO/pulls/$PR_NUMBER/files" --jq '.[].filename' | grep -vxF '.github/workflows/ci.yml' || true)
+          if [ -z "$OTHER" ]; then
+            echo "PR only changes ci.yml; skipping CI"
+            echo "run_ci=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # Two parents plus a "Merge branch 'main'" (or remote-tracking
