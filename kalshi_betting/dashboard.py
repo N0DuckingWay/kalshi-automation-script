@@ -13647,20 +13647,29 @@ _FILTER_JS = r"""
       if (off) { menu.open = false; }
     });
   }
+  // The categories a set of ticks keeps trades from, as indexes into
+  // D.categories: the ticked ones, or every category while none is ticked.
+  // Callers ask here rather than counting boxes, so what a category tick
+  // means is decided here and in atomsOf.
+  function keptCats(cats) {
+    return cats.length ? cats : D.categories.map(function(_, i) { return i; });
+  }
   // The category · tag views a set of ticks covers, as indexes into
-  // D.subcats: for each ticked category its ticked tags, or every one of its
+  // D.subcats: for each category kept, its ticked tags, or every one of its
   // tags when none of them is ticked — the page's twin of the live filter's
   // rule (config.trade_filter). null when nothing is ticked: everything.
   function atomsOf(cats, tags) {
-    if (!cats.length) { return null; }
-    var out = [];
+    if (!cats.length && !tags.length) { return null; }
+    var kept = keptCats(cats), out = [];
     D.subcats.forEach(function(sc, i) {
-      if (cats.indexOf(sc[0]) < 0) { return; }
+      if (kept.indexOf(sc[0]) < 0) { return; }
       var narrowed = tags.some(function(t) { return D.subcats[t][0] === sc[0]; });
       if (!narrowed || tags.indexOf(i) >= 0) { out.push(i); }
     });
     return out;
   }
+  // Nothing ticked: every trade, as Python's own view of them all shows it
+  function noTicks(cats, tags) { return atomsOf(cats, tags) === null; }
   // A set of ticks by name (Python's _selection_name): a ticked category's
   // own name where none of its tags is ticked, else each of its ticked tags
   // with the category in front; the first D.mix.names of them, then how
@@ -14143,8 +14152,8 @@ _FILTER_JS = r"""
                       sellSel.value, daysSel.value, trimSel.value, riseSel.value);
   }
   // The summary line: the templates _filter_summary_text fills for the view
-  // Python rendered, filled here for every other one. With categories
-  // ticked it names them (selectionName) and, for a view worked out here
+  // Python rendered, filled here for every other one. With any tick it
+  // names the ticks (selectionName) and, for a view worked out here
   // (v.mix), closes on Python's note that the page combined it
   function summary(v, cats, tags) {
     var T = D.text, text, id = cellChunk();
@@ -14153,7 +14162,7 @@ _FILTER_JS = r"""
     var shown = id !== null && id !== undefined;
     if (!shown) {
       text = fill(T.missing, {scenario: scenario()});
-    } else if (!cats.length) {
+    } else if (noTicks(cats, tags)) {
       text = fill(T.all, {scenario: scenario(), count: trades(v.n)});
       // Any other scenario closes on Python's other_scenario note — and the
       // primary cell with the tiers off at a binding band on other_run
@@ -14305,12 +14314,10 @@ _FILTER_JS = r"""
   // showing the last one drawn, and a Group-by change meanwhile must draw
   // that one too — so a chunk that then fails to load leaves nothing behind.
 
-  // A band's k-hat figures for a set of ticks: Python's own group wherever
-  // the ticks are one of its groups (everything, one whole category, one
-  // tag), else the covered tags' groups pooled here from their raw counts —
-  // k-hat is the share of entries that settled in between over the mean
-  // implied gap, backtester._calibration_bucket's arithmetic, with the
-  // cells, bar label and k-hat − k per k written as Python writes them
+  // Several tags' k-hat figures at a band, pooled here from their groups'
+  // raw counts — k-hat is the share of entries that settled in between over
+  // the mean implied gap, backtester._calibration_bucket's arithmetic, with
+  // the cells, bar label and k-hat − k per k written as Python writes them
   // (_khat_cells, _khat_bar_text, _khat_delta). null with no entry.
   function pooledKhat(band, atoms) {
     band._pool = band._pool || {at: {}, keys: []};
@@ -14360,25 +14367,41 @@ _FILTER_JS = r"""
     var half = t * (Math.sqrt(events / (events - 1) * spread) / gaps);
     return fill(D.text.khat_ci, {lo: fixed(Math.max(0, k - half), 3), hi: fixed(k + half, 3)});
   }
+  // The group of Python's k-hat breakdown that a set of category · tag
+  // views (atomsOf) is: "all" for everything, "c<i>" for every tag of one
+  // category and no other tag, "s<i>" for one tag; null for any other set,
+  // whose tags' groups are pooled (pooledKhat). Two choices are deliberate.
+  // The whole-category test comes before the one-tag test, so a category
+  // with a single tag reads as the category. And unlike plainKey there is
+  // no "every tag" clause: ticks covering every tag of several categories
+  // are pooled (on a page with one category they read as that category,
+  // "c0"), so a calibration with no tag groups, only "all", shows nothing
+  // for them, as for any other ticked selection.
+  function khatKey(atoms) {
+    if (atoms === null) { return 'all'; }
+    // No tag kept: no group (and pooling nothing gives null)
+    if (!atoms.length) { return null; }
+    var c = D.subcats[atoms[0]][0];
+    function inCategory(i) { return D.subcats[i][0] === c; }
+    var own = D.subcats.filter(function(sc) { return sc[0] === c; }).length;
+    if (atoms.every(inCategory) && atoms.length === own) { return 'c' + c; }
+    return atoms.length === 1 ? 's' + atoms[0] : null;
+  }
+  // A band's k-hat figures for a set of ticks: Python's own group wherever
+  // the ticks are one of its groups (khatKey: everything, one whole
+  // category, one tag), else the covered tags' groups pooled (pooledKhat)
   function khatFor(band, cats, tags) {
     if (!band) { return null; }
-    if (!cats.length) { return band.groups.all || null; }
-    var atoms = atomsOf(cats, tags);
-    if (cats.length === 1) {
-      var own = D.subcats.filter(function(sc) { return sc[0] === cats[0]; }).length;
-      // The whole category: none of its tags ticked, or every one of them
-      if (!tags.length || tags.length === own) { return band.groups['c' + cats[0]] || null; }
-      if (tags.length === 1) { return band.groups['s' + tags[0]] || null; }
-    }
-    return pooledKhat(band, atoms);
+    var atoms = atomsOf(cats, tags), key = khatKey(atoms);
+    return key !== null ? (band.groups[key] || null) : pooledKhat(band, atoms);
   }
   // The k-hat chart's rows for a grouping: [{label, st, kind}], kind "all"
   // (the grouping's whole population), "selected" (ticked in the filter on
   // screen) or "bar". By category: every category at the band shown, each
   // ticked one marked. By tag: with one category ticked its tags alone,
-  // under its own total, each ticked tag marked; otherwise every tag, those
-  // the ticks cover marked. By band: every band — as the Tier floors choice
-  // shown reads it — for the ticks shown (khatFor).
+  // under its own total, each tag ticked in it marked; otherwise every tag,
+  // those the ticks cover marked. By band: every band — as the Tier floors
+  // choice shown reads it — for the ticks shown (khatFor).
   // _section_khat renders the same rows for the default (by category,
   // primary band, tier floors on, no filter), from the same payload.
   function khatRows(group) {
@@ -14393,9 +14416,16 @@ _FILTER_JS = r"""
     }
     var band = K[bi];
     if (!band) { return out; }
+    // The categories marked: those the ticks keep trades from, none while
+    // nothing is ticked
+    var atoms = atomsOf(cats, tags), markedCats = atoms === null ? [] : keptCats(cats);
     if (group === 'tag') {
-      var one = cats.length === 1 ? cats[0] : null;
-      var marked = cats.length > 1 ? atomsOf(cats, tags) : tags;
+      var one = markedCats.length === 1 ? markedCats[0] : null;
+      // One category: its own total heads the chart, so only a tag ticked in
+      // it is marked (a category counting in full marks none). Several:
+      // every tag the ticks cover is marked.
+      var markedTags = one !== null
+        ? tags.filter(function(t) { return D.subcats[t][0] === one; }) : (atoms || []);
       out.push({label: one === null ? T.khat_all_tags
                                     : fill(T.khat_all_in, {category: D.categories[one]}),
                 st: band.groups[one === null ? 'all' : 'c' + one] || null, kind: 'all'});
@@ -14404,7 +14434,7 @@ _FILTER_JS = r"""
         var st = band.groups['s' + si];
         if (st) {
           out.push({label: subName(si, one === null), st: st,
-                    kind: marked.indexOf(si) >= 0 ? 'selected' : 'bar'});
+                    kind: markedTags.indexOf(si) >= 0 ? 'selected' : 'bar'});
         }
       });
       return out;
@@ -14413,7 +14443,8 @@ _FILTER_JS = r"""
     D.categories.forEach(function(name, ci) {
       var st = band.groups['c' + ci];
       if (st) {
-        out.push({label: name, st: st, kind: cats.indexOf(ci) >= 0 ? 'selected' : 'bar'});
+        out.push({label: name, st: st,
+                  kind: markedCats.indexOf(ci) >= 0 ? 'selected' : 'bar'});
       }
     });
     return out;
@@ -14425,7 +14456,8 @@ _FILTER_JS = r"""
   function khatTitle(group) {
     var T = D.text, scope;
     if (group === 'band') {
-      scope = SHOWN[3].length ? selectionName(SHOWN[3], SHOWN[4]) : T.khat_every_category;
+      scope = noTicks(SHOWN[3], SHOWN[4]) ? T.khat_every_category
+                                          : selectionName(SHOWN[3], SHOWN[4]);
       if (offAt(SHOWN[5])) { scope = fill(T.khat_scope_tier_off, {scope: scope}); }
     } else {
       scope = bandsAt(SHOWN[5])[SHOWN[0]].where;
@@ -14790,7 +14822,8 @@ _FILTER_JS = r"""
     setText('flt-summary', err === null
       ? fill(D.text.mix_unavailable, {
           selection: ticks, failed: tried,
-          shown: SHOWN[3].length ? selectionName(SHOWN[3], SHOWN[4]) : D.text.mix_still_all,
+          shown: noTicks(SHOWN[3], SHOWN[4]) ? D.text.mix_still_all
+                                              : selectionName(SHOWN[3], SHOWN[4]),
           at: tried === still ? '' : fill(D.text.mix_still_at, {scenario: still})})
       : fill(D.text.unavailable, {failed: tried, reason: String(err), scenario: still}));
     // The scenario still shown can be saved again
