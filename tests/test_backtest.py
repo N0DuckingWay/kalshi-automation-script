@@ -218,6 +218,10 @@ def cli(monkeypatch, tmp_path):
     calls["series_categories"] = {"KXTEST": ("Sports", ("Basketball",))}
     monkeypatch.setattr(backtest, "load_series_categories",
                         lambda client: calls["series_categories"])
+    # ... and for the series fee multipliers (carried by the sweep, unused)
+    calls["fee_multipliers"] = {"KXTEST": 0.5}
+    monkeypatch.setattr(backtest, "load_series_fee_multipliers",
+                        lambda client, **kwargs: calls["fee_multipliers"])
     # Never read the real backtest_cache or the network for the risk-free rate
     calls["risk_free"] = RiskFreeRates(
         ((date(2026, 1, 5), 0.04),), SOURCE_API, datetime(2026, 9, 27, tzinfo=UTC),
@@ -323,6 +327,161 @@ class TestNoSweepArgument:
         assert kwargs["max_horizon_days"] == 14
         assert kwargs["initial_balance"] == pytest.approx(500.0)
         assert kwargs["use_cache"] is True
+
+
+class TestScheduledCloseArgument:
+    """--scheduled-close / --no-scheduled-close (C5): the backtest reads each
+    market's scheduled close, or its realized close, for this run."""
+
+    def test_default_is_no_override(self, cli, monkeypatch):
+        # None is resolved by _prepare_candidates at call time
+        _run(monkeypatch)
+        assert cli["sweep_kwargs"]["scheduled_close"] is None
+
+    @pytest.mark.parametrize("flag, value", [("--scheduled-close", True),
+                                             ("--no-scheduled-close", False)])
+    def test_the_flags_reach_the_sweep(self, cli, monkeypatch, flag, value):
+        _run(monkeypatch, flag)
+        assert cli["sweep_kwargs"]["scheduled_close"] is value
+
+    @pytest.mark.parametrize("flag, configured, echo", [
+        (None, True, "scheduled close=on | k="),
+        (None, False, "scheduled close=off | k="),
+        ("--no-scheduled-close", True, "scheduled close=off (config: on) | k="),
+        ("--scheduled-close", False, "scheduled close=on (config: off) | k="),
+    ])
+    def test_the_config_echo_names_it(self, cli, monkeypatch, caplog, flag, configured, echo):
+        monkeypatch.setattr(backtest, "BACKTEST_SCHEDULED_CLOSE", configured)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, *([flag] if flag else []))
+        assert f"| cache=on | {echo}" in caplog.text
+
+    @pytest.mark.parametrize("configured, word", [(True, "on"), (False, "off")])
+    def test_the_help_text_names_the_configured_value(self, cli, monkeypatch, capsys,
+                                                       configured, word):
+        monkeypatch.setattr(backtest, "BACKTEST_SCHEDULED_CLOSE", configured)
+        with pytest.raises(SystemExit):
+            _run(monkeypatch, "--help")
+        help_text = " ".join(capsys.readouterr().out.split())
+        assert f"config.BACKTEST_SCHEDULED_CLOSE, currently {word})" in help_text
+
+
+class TestStaleQuoteArgument:
+    """--stale-quote-hours N / --no-stale-quote-check (C6): how recently each
+    market of an entry, a sale or a Kelly trim must have moved, for this run."""
+
+    def test_default_is_no_override(self, cli, monkeypatch):
+        # None is resolved by backtester at call time
+        _run(monkeypatch)
+        assert cli["sweep_kwargs"]["stale_quote_max_age"] is None
+
+    @pytest.mark.parametrize("flags, value", [(["--stale-quote-hours", "48"], 48 * 3600.0),
+                                              (["--stale-quote-hours", "1.5"], 5400.0),
+                                              (["--no-stale-quote-check"], False)])
+    def test_the_flags_reach_the_sweep(self, cli, monkeypatch, flags, value):
+        _run(monkeypatch, *flags)
+        assert cli["sweep_kwargs"]["stale_quote_max_age"] == value
+        assert type(cli["sweep_kwargs"]["stale_quote_max_age"]) is type(value)
+
+    @pytest.mark.parametrize("hours", ["0", "-1", "nan", "inf"])
+    def test_a_bad_number_of_hours_is_a_usage_error(self, cli, monkeypatch, capsys, hours):
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "--stale-quote-hours", hours)
+        assert exc.value.code == 2
+        assert "--stale-quote-hours must be a positive number of hours" in capsys.readouterr().err
+
+    def test_the_two_flags_are_exclusive(self, cli, monkeypatch, capsys):
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "--stale-quote-hours", "48", "--no-stale-quote-check")
+        assert exc.value.code == 2
+
+    @pytest.mark.parametrize("flags, configured, echo", [
+        ([], 86_400, "| stale quotes=24 h | volume cap="),
+        ([], None, "| stale quotes=off | volume cap="),
+        (["--no-stale-quote-check"], 86_400, "| stale quotes=off (config: 24 h) | volume cap="),
+        (["--stale-quote-hours", "48"], 86_400, "| stale quotes=48 h (config: 24 h) | volume cap="),
+        (["--stale-quote-hours", "24"], 86_400, "| stale quotes=24 h | volume cap="),
+        (["--stale-quote-hours", "6"], None, "| stale quotes=6 h (config: off) | volume cap="),
+    ])
+    def test_the_config_echo_names_it(self, cli, monkeypatch, caplog, flags, configured, echo):
+        monkeypatch.setattr(backtest, "BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS", configured)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, *flags)
+        assert echo in caplog.text
+        # Between k and the volume cap, so the scheduled-close echo still meets k
+        assert "| scheduled close=on | k=" in caplog.text
+
+    @pytest.mark.parametrize("configured, word", [(86_400, "24 h"), (None, "off")])
+    def test_the_help_text_names_the_configured_value(self, cli, monkeypatch, capsys,
+                                                       configured, word):
+        monkeypatch.setattr(backtest, "BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS", configured)
+        with pytest.raises(SystemExit):
+            _run(monkeypatch, "--help")
+        help_text = " ".join(capsys.readouterr().out.split())
+        assert f"config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS, currently {word})" in help_text
+
+    def test_the_shipped_binding_is_the_config_s(self):
+        from kalshi_betting import config
+        assert backtest.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS == \
+            config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS == 86_400
+
+
+class TestMaxVolumeShareArgument:
+    """--max-volume-share PCT / --no-volume-cap (C7): the most of a market's
+    next-day traded contracts a buy or a sale may take, for this run."""
+
+    def test_default_is_no_override(self, cli, monkeypatch):
+        _run(monkeypatch)
+        assert cli["sweep_kwargs"]["max_volume_share"] is None
+
+    @pytest.mark.parametrize("flags, value", [(["--max-volume-share", "10"], 0.10),
+                                              (["--max-volume-share", "2.5"], 0.025),
+                                              (["--max-volume-share", "100"], 1.0),
+                                              (["--no-volume-cap"], False)])
+    def test_the_flags_reach_the_sweep(self, cli, monkeypatch, flags, value):
+        _run(monkeypatch, *flags)
+        assert cli["sweep_kwargs"]["max_volume_share"] == value
+        assert type(cli["sweep_kwargs"]["max_volume_share"]) is type(value)
+
+    @pytest.mark.parametrize("pct", ["0", "-1", "100.5", "nan", "inf"])
+    def test_a_bad_percent_is_a_usage_error(self, cli, monkeypatch, capsys, pct):
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "--max-volume-share", pct)
+        assert exc.value.code == 2
+        assert "--max-volume-share must be a percent above 0 and at most 100" in \
+            capsys.readouterr().err
+
+    def test_the_two_flags_are_exclusive(self, cli, monkeypatch):
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "--max-volume-share", "5", "--no-volume-cap")
+        assert exc.value.code == 2
+
+    @pytest.mark.parametrize("flags, configured, echo", [
+        ([], 0.10, "| volume cap=10% | ladders="),
+        ([], None, "| volume cap=off | ladders="),
+        (["--no-volume-cap"], 0.10, "| volume cap=off (config: 10%) | ladders="),
+        (["--max-volume-share", "5"], 0.10, "| volume cap=5% (config: 10%) | ladders="),
+        (["--max-volume-share", "10"], 0.10, "| volume cap=10% | ladders="),
+    ])
+    def test_the_config_echo_names_it(self, cli, monkeypatch, caplog, flags, configured, echo):
+        monkeypatch.setattr(backtest, "BACKTEST_MAX_VOLUME_SHARE", configured)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, *flags)
+        assert echo in caplog.text
+
+    @pytest.mark.parametrize("configured, word", [(0.10, "10%"), (None, "off")])
+    def test_the_help_text_names_the_configured_value(self, cli, monkeypatch, capsys,
+                                                       configured, word):
+        monkeypatch.setattr(backtest, "BACKTEST_MAX_VOLUME_SHARE", configured)
+        with pytest.raises(SystemExit):
+            _run(monkeypatch, "--help")
+        help_text = " ".join(capsys.readouterr().out.split())
+        assert f"config.BACKTEST_MAX_VOLUME_SHARE, currently {word})" in help_text
+
+    def test_the_shipped_binding_is_the_config_s(self):
+        from kalshi_betting import config
+        assert backtest.BACKTEST_MAX_VOLUME_SHARE == config.BACKTEST_MAX_VOLUME_SHARE == 0.10
+        assert config.BACKTEST_VOLUME_SHARE_WINDOW_SECONDS == 86_400
 
 
 class TestSameEventLaddersArgument:
@@ -1211,6 +1370,21 @@ class TestDashboardHandoff:
         assert cli["order"].index("load_series_categories") < cli["order"].index(
             "run_backtest_sweep")
 
+    def test_the_fee_multipliers_are_read_once_and_passed_to_the_sweep(self, cli, monkeypatch):
+        # Read with the production client beside the listing, handed to the
+        # sweep (which carries them; no fee reads them yet)
+        reads: list = []
+
+        def load(client, **kwargs):
+            reads.append((client, kwargs))
+            return cli["fee_multipliers"]
+
+        monkeypatch.setattr(backtest, "load_series_fee_multipliers", load)
+        _run(monkeypatch)
+        # The backtest alone may upgrade a current file that has no fees
+        assert reads == [(cli["live_client"], {"upgrade": True})]
+        assert cli["sweep_kwargs"]["fee_multipliers"] is cli["fee_multipliers"]
+
     def test_the_risk_free_rates_are_passed_through(self, cli, monkeypatch):
         _run(monkeypatch)
         _, kwargs = cli["dashboard"]
@@ -1742,7 +1916,8 @@ def rebuild(cli, monkeypatch, tmp_path):
         return call
 
     for name in ("build_historical_client", "build_prod_live_client", "read_account_balance",
-                 "run_backtest_sweep", "load_series_categories", "load_depth_model"):
+                 "run_backtest_sweep", "load_series_categories",
+                 "load_series_fee_multipliers", "load_depth_model"):
         monkeypatch.setattr(backtest, name, forbidden(name))
     return cli
 

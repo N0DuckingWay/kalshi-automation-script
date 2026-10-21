@@ -629,6 +629,11 @@ def _order_rounded_fee_per_contract(price: float, precision: str) -> Decimal:
     return rounded / PROBE_COUNT
 
 
+# The fee multiplier the probe's fee line models at: the full fee. The probe
+# reads no /series listing, so it never knows the market's series multiplier
+_PROBE_FEE_MULTIPLIER = 1.0
+
+
 def _report_fee(data: dict, price_str: str) -> None:
     """
     Print the fee the exchange charged per contract next to the bot's fee
@@ -639,8 +644,9 @@ def _report_fee(data: dict, price_str: str) -> None:
     fills, including Kalshi's rounding of the order's total fee. The model is
     printed three ways, at the price _fee_model_price picks:
       * TAKER_FEE_RATE × p × (1 − p), before any rounding;
-      * config.fee_leg_exact(1, p): one whole contract, rounded up to the
-        cent, as the bot's trade sizing uses;
+      * config.fee_leg_exact(1, p, multiplier=1.0): one whole contract,
+        rounded up to the cent, as the bot's trade sizing uses, at the full
+        fee (the line names the multiplier; the probe reads no series listing);
       * rounded as Kalshi rounds this order, at each amount in
         FEE_BALANCE_PRECISIONS (second line). On the probe's tiny order the
         rounding is a large part of the fee, so the figure at the account's
@@ -679,14 +685,19 @@ def _report_fee(data: dict, price_str: str) -> None:
     price, price_label = model_price
     # Fee per contract before any rounding
     unrounded = config.TAKER_FEE_RATE * price * (1.0 - price)
-    # The bot's own fee for one whole contract (what trade sizing uses)
-    whole_contract = config.fee_leg_exact(1, price)
+    # The bot's own fee for one whole contract (what trade sizing uses), at
+    # the full fee: the probe reads no series listing, so it has no series
+    # fee multiplier for the market
+    multiplier = _PROBE_FEE_MULTIPLIER
+    whole_contract = config.fee_leg_exact(1, price, multiplier=multiplier)
     print(
         f"Fee check (informational, no verdict), per contract at p={price} ({price_label}): "
         f"exchange average_fee_paid=${charged} per contract | "
         f"model TAKER_FEE_RATE*p*(1-p) = ${unrounded:.6f} per contract before rounding | "
         f"config.fee_leg_exact(1, {price}) = ${whole_contract:.2f} for one whole contract, "
-        "rounded up to the cent"
+        f"rounded up to the cent | every model figure here is the full fee (fee multiplier "
+        f"{multiplier:g}): the probe reads no series listing, so it does not know the "
+        "market's series fee multiplier"
     )
     # The model rounded as Kalshi rounds this order, at each amount
     rounded = " or ".join(

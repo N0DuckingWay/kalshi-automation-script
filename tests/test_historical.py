@@ -2911,6 +2911,21 @@ class TestJsonCacheDurability:
         assert historical._load_json_cache(path) is None
 
 
+def _write_candle_cache(candles_dir: Path, ticker: str, doc) -> Path:
+    """Write one ticker's candle cache file the way fetch_candlesticks does (gzipped JSON)."""
+    candles_dir.mkdir(parents=True, exist_ok=True)
+    path = candles_dir / f"{ticker}.json.gz"
+    with gzip.open(path, "wb") as fh:
+        fh.write(json.dumps(doc).encode())
+    return path
+
+
+def _read_candle_cache(candles_dir: Path, ticker: str):
+    """Read one ticker's gzipped candle cache file back as JSON."""
+    with gzip.open(candles_dir / f"{ticker}.json.gz", "rb") as fh:
+        return json.loads(fh.read())
+
+
 def _patch_candle_fetch(monkeypatch, ts, yes_ask="0.55", yes_bid="0.53",
                         legacy_format=False, volume=None) -> MagicMock:
     """Patch _signed_raw_get to serve one raw candlestick page.
@@ -3016,6 +3031,203 @@ class TestCandleCount:
             assert historical._candle_count(bad) is None
 
 
+_KALSHI_PAYLOADS = Path(__file__).parent / "fixtures" / "kalshi_payloads"
+
+
+def _candle_payload(name: str) -> dict:
+    """One of the real hourly-candle payloads saved under tests/fixtures/kalshi_payloads/."""
+    return json.loads((_KALSHI_PAYLOADS / name).read_text())
+
+
+class TestCandleFullRecord:
+    """The candle parser keeps the hour's whole record, from either endpoint's spelling.
+
+    candles_archive_6h.json and candles_live_6h.json are the first six hours of one
+    real market as /historical/markets/{t}/candlesticks and
+    /series/{s}/markets/{t}/candlesticks sent them (2026-10-16): bare keys and
+    an all-null price block on one, "*_dollars" keys and an empty price block on
+    the other.
+    """
+
+    @staticmethod
+    def _parse(monkeypatch, payload):
+        monkeypatch.setattr(historical, "_historical_get", MagicMock(return_value=payload))
+        monkeypatch.setattr(historical.time, "sleep", lambda _s: None)
+        candles, raw, dropped = historical._fetch_candle_pages(
+            MagicMock(), "/x", [(0, 1)], 0.0, {})
+        assert (raw, dropped) == (len(payload["candlesticks"]), 0)
+        return candles
+
+    def test_the_archive_and_live_spellings_of_one_hour_give_equal_records(self, monkeypatch):
+        archive = self._parse(monkeypatch, _candle_payload("candles_archive_6h.json"))
+        live = self._parse(monkeypatch, _candle_payload("candles_live_6h.json"))
+        assert len(archive) == 6
+        assert archive == live
+
+    def test_a_trading_hour_keeps_every_field(self, monkeypatch):
+        candle = self._parse(monkeypatch, _candle_payload("candles_live_6h.json"))[1]
+        assert candle == {
+            "ts": 1786658400,
+            "yes_ask_close": 0.5,
+            "no_ask_close": pytest.approx(0.56),
+            "volume": 19.32,
+            "yes_ask_ohl": (0.5, 0.5, 0.5),
+            "yes_bid_ohl": (0.42, 0.44, 0.39),
+            "yes_bid_close": 0.44,
+            "price": (0.5, 0.5, 0.5, 0.5, 0.5, None),
+            "open_interest": 19.32,
+        }
+
+    def test_an_hour_with_no_trades_has_no_price_of_its_own(self, monkeypatch):
+        first, _, third = self._parse(monkeypatch, _candle_payload("candles_archive_6h.json"))[:3]
+        # Nothing traded in hour one: no price block at all
+        assert first["price"] is None
+        assert first["volume"] == 0.0
+        # Hour three only carries the previous trade price
+        assert third["price"] == (None, None, None, None, None, 0.5)
+
+    def test_the_four_original_keys_are_computed_as_before(self, monkeypatch):
+        for name in ("candles_archive_6h.json", "candles_live_6h.json"):
+            first = self._parse(monkeypatch, _candle_payload(name))[0]
+            assert first["ts"] == 1786654800
+            assert first["yes_ask_close"] == 0.5
+            assert first["no_ask_close"] == pytest.approx(0.58)   # 1 - yes bid 0.42
+            assert first["volume"] == 0.0
+
+    def test_ohl_reads_either_spelling_and_needs_all_three(self):
+        assert historical._candle_ohl({"open": "0.5", "high": "0.6", "low": "0.4"}) == (0.5, 0.6, 0.4)
+        assert historical._candle_ohl(
+            {"open_dollars": "0.5", "high_dollars": "0.6", "low_dollars": "0.4"}) == (0.5, 0.6, 0.4)
+        # The dollars spelling wins, by presence: a falsy 0 is a price
+        assert historical._candle_ohl(
+            {"open_dollars": 0, "open": "0.9", "high": "0.6", "low": "0.4"}) == (0.0, 0.6, 0.4)
+        for bad in ({}, None, "x", [1], {"open": "0.5", "high": "0.6"},
+                    {"open": "0.5", "high": "n/a", "low": "0.4"},
+                    {"open": "0.5", "high": "nan", "low": "0.4"},
+                    {"open": True, "high": "0.6", "low": "0.4"}):
+            assert historical._candle_ohl(bad) is None, bad
+
+    def test_price_reads_all_six_and_none_where_missing(self):
+        full = {"open": "0.1", "high": "0.3", "low": "0.1", "close": "0.2",
+                "mean": "0.15", "previous": "0.1"}
+        assert historical._candle_price(full) == (0.1, 0.3, 0.1, 0.2, 0.15, 0.1)
+        assert historical._candle_price({"close_dollars": "0.2", "mean": None}) == (
+            None, None, None, 0.2, None, None)
+        for empty in ({}, None, "x", [], {"close": None, "open": ""}, {"close": "junk"}):
+            assert historical._candle_price(empty) is None, empty
+
+    def test_fixed_reads_the_fp_key_first(self):
+        assert historical._candle_fixed({"open_interest_fp": "4.5", "open_interest": 9},
+                                        "open_interest_fp", "open_interest") == 4.5
+        assert historical._candle_fixed({"open_interest": "649.55"},
+                                        "open_interest_fp", "open_interest") == 649.55
+        assert historical._candle_fixed({"open_interest_fp": "junk", "open_interest": 9},
+                                        "open_interest_fp", "open_interest") is None
+
+    def test_a_malformed_optional_field_leaves_the_candle_with_none(self, monkeypatch):
+        payload = {"candlesticks": [{
+            "end_period_ts": 100,
+            "yes_ask": {"close": "0.55", "open": "n/a", "high": "0.6", "low": "0.5"},
+            "yes_bid": {"close": "0.53", "open": "0.5", "high": "0.54", "low": "0.5"},
+            "price": "not a dict",
+            "volume": "3.00",
+            "open_interest": "-4",
+        }]}
+        [candle] = self._parse(monkeypatch, payload)
+        assert candle["yes_ask_close"] == 0.55 and candle["volume"] == 3.0
+        assert candle["yes_ask_ohl"] is None
+        assert candle["yes_bid_ohl"] == (0.5, 0.54, 0.5)
+        assert candle["price"] is None
+        assert candle["open_interest"] is None
+
+    def test_an_unreadable_ask_or_bid_close_still_drops_the_candle(self, monkeypatch):
+        payload = {"candlesticks": [
+            {"end_period_ts": 1, "yes_ask": {"open": "0.5", "high": "0.5", "low": "0.5"},
+             "yes_bid": {"close": "0.4"}},
+            {"end_period_ts": 2, "yes_ask": {"close": "0.5"}, "yes_bid": {"close": "0.4"}},
+        ]}
+        monkeypatch.setattr(historical, "_historical_get", MagicMock(return_value=payload))
+        monkeypatch.setattr(historical.time, "sleep", lambda _s: None)
+        candles, raw, dropped = historical._fetch_candle_pages(MagicMock(), "/x", [(0, 1)], 0.0, {})
+        assert [c["ts"] for c in candles] == [2] and (raw, dropped) == (2, 1)
+
+
+class TestCandleCacheV3:
+    """The candle cache is one gzipped file per ticker under candlesticks_v3/."""
+
+    def _fetch(self, monkeypatch, tmp_path, use_cache=True):
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candlesticks_v3")
+        monkeypatch.setattr(historical.time, "sleep", lambda _s: None)
+        return historical.fetch_candlesticks(
+            MagicMock(), "T1", open_ts=1786654800 - 3600, close_ts=1786672800,
+            use_cache=use_cache, rate_limit_sleep=0.0)
+
+    def test_the_shipped_cache_folder_and_version(self):
+        assert historical._CANDLES_DIR == historical.CACHE_DIR / "candlesticks_v3"
+        assert historical.CANDLESTICK_CACHE_FIELDS_VERSION == 3
+
+    def test_a_fetch_is_cached_gzipped_and_reread_with_no_request(self, tmp_path, monkeypatch):
+        get = MagicMock(return_value=_candle_payload("candles_archive_6h.json"))
+        monkeypatch.setattr(historical, "_historical_get", get)
+        first = self._fetch(monkeypatch, tmp_path)
+        assert get.call_count == 1 and len(first) == 6
+        path = tmp_path / "candlesticks_v3" / "T1.json.gz"
+        assert path.read_bytes()[:2] == b"\x1f\x8b"          # gzip magic bytes
+        assert not (tmp_path / "candlesticks_v3" / "T1.json").exists()
+        saved = _read_candle_cache(tmp_path / "candlesticks_v3", "T1")
+        assert saved["fields"] == 3 and len(saved["candles"]) == 6
+        # Re-read: no request, and equal to what the fetch returned (tuples again)
+        again = self._fetch(monkeypatch, tmp_path)
+        assert get.call_count == 1
+        assert again == first
+        assert isinstance(again[1]["yes_ask_ohl"], tuple)
+
+    def test_a_file_in_the_old_candlesticks_folder_is_never_read_or_written(
+        self, tmp_path, monkeypatch,
+    ):
+        old_dir = tmp_path / "candlesticks"
+        old_dir.mkdir()
+        old = old_dir / "T1.json"
+        old.write_text(json.dumps({
+            "open_ts": 0, "close_ts": 10**10, "period_interval": 60, "fields": 2,
+            "candles": [{"ts": 5, "yes_ask_close": 0.5, "no_ask_close": 0.5, "volume": 1.0}],
+        }))
+        before = old.read_bytes()
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path)
+        get = MagicMock(return_value=_candle_payload("candles_live_6h.json"))
+        monkeypatch.setattr(historical, "_historical_get", get)
+        out = self._fetch(monkeypatch, tmp_path)
+        assert get.call_count == 1
+        assert out[0]["ts"] == 1786654800
+        assert old.read_bytes() == before
+        assert sorted(f.name for f in old_dir.iterdir()) == ["T1.json"]
+
+    def test_a_truncated_gzip_is_a_miss_with_one_warning(self, tmp_path, monkeypatch, caplog):
+        get = MagicMock(return_value=_candle_payload("candles_archive_6h.json"))
+        monkeypatch.setattr(historical, "_historical_get", get)
+        self._fetch(monkeypatch, tmp_path)
+        path = tmp_path / "candlesticks_v3" / "T1.json.gz"
+        raw = path.read_bytes()
+        path.write_bytes(raw[: len(raw) // 2])
+        with caplog.at_level(logging.WARNING):
+            out = self._fetch(monkeypatch, tmp_path)
+        assert get.call_count == 2 and len(out) == 6
+        assert [r.getMessage() for r in caplog.records
+                if "Corrupt gzipped JSON cache" in r.getMessage()] == [
+            f"Corrupt gzipped JSON cache {path} — treating as cache miss"]
+        # Refetched and rewritten whole
+        assert len(_read_candle_cache(tmp_path / "candlesticks_v3", "T1")["candles"]) == 6
+
+    def test_a_gz_helper_round_trip_and_miss_cases(self, tmp_path):
+        path = tmp_path / "x" / "a.json.gz"
+        assert historical._load_gz_json_cache(path) is None
+        historical._save_gz_json_cache(path, {"a": [1, 2]})
+        assert historical._load_gz_json_cache(path) == {"a": [1, 2]}
+        assert not list(path.parent.glob("*.tmp"))
+        path.write_bytes(gzip.compress(b"{not json"))
+        assert historical._load_gz_json_cache(path) is None
+
+
 class TestFetchCandlesticks:
     def test_parses_current_dollar_string_close(self, tmp_path, monkeypatch):
         # Current wire format: yes_ask.close is the fixed-point DOLLAR string
@@ -3029,6 +3241,12 @@ class TestFetchCandlesticks:
             "yes_ask_close": pytest.approx(0.55),
             "no_ask_close": pytest.approx(0.47),  # 1 - yes_bid 0.53
             "volume": None,                        # this payload carries no volume
+            # The rest of the hourly record: this payload carries only the closes
+            "yes_ask_ohl": None,
+            "yes_bid_ohl": None,
+            "yes_bid_close": pytest.approx(0.53),
+            "price": None,
+            "open_interest": None,
         }]
 
     def test_each_candle_keeps_its_hours_volume(self, tmp_path, monkeypatch):
@@ -3180,10 +3398,10 @@ class TestFetchCandlesticks:
         candles_dir = tmp_path / "candles"
         monkeypatch.setattr(historical, "_CANDLES_DIR", candles_dir)
         candles_dir.mkdir(parents=True)
-        (candles_dir / "T1.json").write_text(json.dumps({
+        _write_candle_cache(candles_dir, "T1", {
             "open_ts": 0, "close_ts": 1000, "period_interval": 1440,
             "candles": [{"ts": 500, "yes_ask_close": 0.5, "no_ask_close": 0.5}],
-        }))
+        })
         fetch = _patch_candle_fetch(monkeypatch, 1_700_000_000)
         out = historical.fetch_candlesticks(
             MagicMock(), "T1", open_ts=100, close_ts=200, rate_limit_sleep=0.0,
@@ -3200,10 +3418,10 @@ class TestFetchCandlesticks:
         candles_dir = tmp_path / "candles"
         monkeypatch.setattr(historical, "_CANDLES_DIR", candles_dir)
         candles_dir.mkdir(parents=True)
-        (candles_dir / "T1.json").write_text(json.dumps({
+        _write_candle_cache(candles_dir, "T1", {
             "open_ts": 0, "close_ts": 1000, "period_interval": 60,
             "candles": [{"ts": 500, "yes_ask_close": 0.5, "no_ask_close": 0.5}],
-        }))
+        })
         fetch = _patch_candle_fetch(monkeypatch, 1_700_000_000, volume="9.00")
         out = historical.fetch_candlesticks(
             MagicMock(), "T1", open_ts=100, close_ts=200, rate_limit_sleep=0.0,
@@ -3211,7 +3429,7 @@ class TestFetchCandlesticks:
         assert fetch.call_count == 1
         assert out[0]["ts"] == 1_700_000_000
         assert out[0]["volume"] == 9.0
-        saved = json.loads((candles_dir / "T1.json").read_text())
+        saved = _read_candle_cache(candles_dir, "T1")
         assert saved["fields"] == historical.CANDLESTICK_CACHE_FIELDS_VERSION
         assert saved["candles"][0]["volume"] == 9.0
 
@@ -3219,11 +3437,11 @@ class TestFetchCandlesticks:
         candles_dir = tmp_path / "candles"
         monkeypatch.setattr(historical, "_CANDLES_DIR", candles_dir)
         candles_dir.mkdir(parents=True)
-        (candles_dir / "T1.json").write_text(json.dumps({
+        _write_candle_cache(candles_dir, "T1", {
             "open_ts": 0, "close_ts": 1000, "period_interval": 60,
             "fields": historical.CANDLESTICK_CACHE_FIELDS_VERSION - 1,
             "candles": [{"ts": 500, "yes_ask_close": 0.5, "no_ask_close": 0.5}],
-        }))
+        })
         fetch = _patch_candle_fetch(monkeypatch, 1_700_000_000)
         historical.fetch_candlesticks(
             MagicMock(), "T1", open_ts=100, close_ts=200, rate_limit_sleep=0.0,
@@ -3235,11 +3453,11 @@ class TestFetchCandlesticks:
         monkeypatch.setattr(historical, "_CANDLES_DIR", candles_dir)
         candles_dir.mkdir(parents=True)
         cached = [{"ts": 500, "yes_ask_close": 0.5, "no_ask_close": 0.5, "volume": 3.0}]
-        (candles_dir / "T1.json").write_text(json.dumps({
+        _write_candle_cache(candles_dir, "T1", {
             "open_ts": 0, "close_ts": 1000, "period_interval": 60,
             "fields": historical.CANDLESTICK_CACHE_FIELDS_VERSION,
             "candles": cached,
-        }))
+        })
         fetch = _patch_candle_fetch(monkeypatch, 1_700_000_000)
         out = historical.fetch_candlesticks(
             MagicMock(), "T1", open_ts=100, close_ts=200, rate_limit_sleep=0.0,
@@ -3255,8 +3473,8 @@ class TestFetchCandlesticks:
             MagicMock(), "T1", open_ts=100, close_ts=200, use_cache=False,
             rate_limit_sleep=0.0,
         )
-        saved = json.loads((candles_dir / "T1.json").read_text())
-        assert saved["fields"] == historical.CANDLESTICK_CACHE_FIELDS_VERSION == 2
+        saved = _read_candle_cache(candles_dir, "T1")
+        assert saved["fields"] == historical.CANDLESTICK_CACHE_FIELDS_VERSION == 3
 
     def test_legacy_bare_list_cache_is_migrated(self, tmp_path, monkeypatch):
         # Cache files written before the windowed-cache fix are a bare list
@@ -3266,9 +3484,8 @@ class TestFetchCandlesticks:
         candles_dir = tmp_path / "candles"
         monkeypatch.setattr(historical, "_CANDLES_DIR", candles_dir)
         candles_dir.mkdir(parents=True)
-        (candles_dir / "T1.json").write_text(
-            '[{"ts": 1, "yes_ask_close": 0.5, "no_ask_close": 0.5}]'
-        )
+        _write_candle_cache(candles_dir, "T1",
+                            [{"ts": 1, "yes_ask_close": 0.5, "no_ask_close": 0.5}])
         fetch = _patch_candle_fetch(monkeypatch, 1_700_000_000)
         out = historical.fetch_candlesticks(
             MagicMock(), "T1", open_ts=100, close_ts=200, rate_limit_sleep=0.0,
@@ -3284,9 +3501,7 @@ class TestFetchCandlesticks:
         candles_dir = tmp_path / "candles"
         monkeypatch.setattr(historical, "_CANDLES_DIR", candles_dir)
         candles_dir.mkdir(parents=True)
-        (candles_dir / "T1.json").write_text(
-            '{"open_ts": 0, "close_ts": 1000, "period_interval": 60, "candles": [{"ts"'
-        )
+        (candles_dir / "T1.json.gz").write_bytes(b"not a gzip file at all")
         fetch = _patch_candle_fetch(monkeypatch, 1_700_000_000)
 
         with caplog.at_level(logging.WARNING):
@@ -3296,9 +3511,9 @@ class TestFetchCandlesticks:
 
         assert fetch.call_count == 1
         assert out[0]["ts"] == 1_700_000_000
-        assert any("Corrupt JSON cache" in r.getMessage() for r in caplog.records)
+        assert any("Corrupt gzipped JSON cache" in r.getMessage() for r in caplog.records)
         # The refetch rewrites the file in the current tagged format.
-        assert json.loads((candles_dir / "T1.json").read_text())["candles"] == out
+        assert _read_candle_cache(candles_dir, "T1")["candles"] == out
 
     def test_use_cache_false_still_persists_fetch_to_disk(self, tmp_path, monkeypatch):
         # Regression: use_cache=False (--no-cache) must still refresh the disk
@@ -3346,7 +3561,7 @@ class TestFetchCandlesticks:
         assert "HTTP response headers" not in msgs[0]
         assert len(msgs[0]) < 200
         # Still not cached — a poisoned empty file would silence this ticker
-        assert not (tmp_path / "candles" / "T1.json").exists()
+        assert not (tmp_path / "candles" / "T1.json.gz").exists()
 
 
 _HOUR = 3600
@@ -3459,7 +3674,7 @@ class TestFetchCandlesticksEndpoints:
         assert [name for name, *_ in endpoints.calls] == ["live"]
         assert [c["ts"] for c in out] == endpoints.archive.served(self.OPEN, self.CLOSE)
         # Cached like any other fetch: the next run reads it with no request
-        cached = json.loads((tmp_path / "candles" / "T1.json").read_text())
+        cached = _read_candle_cache(tmp_path / "candles", "T1")
         assert cached["candles"] == out
 
     def test_a_404_from_the_archive_asks_the_live_endpoint(self, monkeypatch, tmp_path):
@@ -3491,7 +3706,7 @@ class TestFetchCandlesticksEndpoints:
                 if "Candlestick fetch failed" in r.getMessage()]
         assert msgs == ["Candlestick fetch failed for T1: HTTP 404 Not Found "
                         "(live then historical endpoint)"]
-        assert not (tmp_path / "candles" / "T1.json").exists()
+        assert not (tmp_path / "candles" / "T1.json.gz").exists()
 
     def test_any_other_failure_is_final_without_asking_the_other_endpoint(
         self, monkeypatch, tmp_path, caplog,
@@ -3543,15 +3758,16 @@ class TestRecentCandles:
     def _no_cache(self, monkeypatch, tmp_path):
         """Point every cache path at a fresh folder and make any cache access fail."""
         # Kept so a test can compare with fetch_candlesticks, which caches
-        self.real_cache = (historical._load_json_cache, historical._save_json_cache)
+        self.real_cache = (historical._load_gz_json_cache, historical._save_gz_json_cache)
         monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
-        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "cache" / "candlesticks")
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "cache" / "candlesticks_v3")
 
         def refuse(*_args, **_kwargs):
             raise AssertionError("recent_candles touched the candle cache")
 
-        monkeypatch.setattr(historical, "_load_json_cache", refuse)
-        monkeypatch.setattr(historical, "_save_json_cache", refuse)
+        for name in ("_load_json_cache", "_save_json_cache",
+                     "_load_gz_json_cache", "_save_gz_json_cache"):
+            monkeypatch.setattr(historical, name, refuse)
         yield
         # Nothing was written: not the candle folder, not the cache folder
         assert not (tmp_path / "cache").exists()
@@ -3589,15 +3805,18 @@ class TestRecentCandles:
         assert params["period_interval"] == historical.CANDLESTICK_PERIOD_INTERVAL_MINUTES
         # fetch_candlesticks reads the same reply to the same candles
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(historical, "_load_json_cache", self.real_cache[0])
-            mp.setattr(historical, "_save_json_cache", self.real_cache[1])
+            mp.setattr(historical, "_load_gz_json_cache", self.real_cache[0])
+            mp.setattr(historical, "_save_gz_json_cache", self.real_cache[1])
             mp.setattr(historical, "_CANDLES_DIR", tmp_path / "elsewhere")
             mp.setattr(historical, "_signed_raw_get",
                        MagicMock(return_value=_raw_resp(payload)))
             cached = historical.fetch_candlesticks(
                 MagicMock(), "T1", self.OPEN, self.CLOSE, use_cache=False,
                 rate_limit_sleep=0.0, series="KXSERIES", live_first=True)
-        assert recent == cached
+        # recent_candles keeps the four keys live selling reads; the rest of the
+        # hourly record is fetch_candlesticks'
+        assert set(recent[0]) == {"ts", "yes_ask_close", "no_ask_close", "volume"}
+        assert recent == [{k: c[k] for k in recent[0]} for c in cached]
 
     def test_asks_the_live_endpoint_first_and_stops_there(self, monkeypatch):
         endpoints = _TwoCandleEndpoints(self.OPEN, self.CLOSE, holds={"live", "historical"})
@@ -3750,7 +3969,7 @@ class TestFetchCandlesticksPaging:
         assert [c["ts"] for c in out] == endpoint.served(self.OPEN, close)
         assert out[0]["yes_ask_close"] == pytest.approx(0.55)
         # Cached ONCE, under the whole window
-        cached = json.loads((tmp_path / "candles" / "T1.json").read_text())
+        cached = _read_candle_cache(tmp_path / "candles", "T1")
         assert (cached["open_ts"], cached["close_ts"]) == (self.OPEN, close)
         assert cached["candles"] == out
 
@@ -3795,7 +4014,7 @@ class TestFetchCandlesticksPaging:
         # All-or-nothing: the first request's candles are NOT returned or
         # cached as if they were the whole window.
         assert out == []
-        assert not (tmp_path / "candles" / "T1.json").exists()
+        assert not (tmp_path / "candles" / "T1.json.gz").exists()
         msgs = [r.getMessage() for r in caplog.records
                 if "Candlestick fetch failed" in r.getMessage()]
         assert len(msgs) == 1
@@ -6712,6 +6931,283 @@ class TestLoadSeriesCategories:
 _REAL_FETCH_EVENT_COMPETITION = historical._fetch_event_competition
 
 
+class TestLoadSeriesFeeMultipliers:
+    """The fee settings the /series listing carries (fee_type and fee_multiplier):
+    kept in a "fees" block of the same cache file as the categories, read by
+    load_series_fee_multipliers, fetched together with the categories (one
+    request per run), and nothing else about load_series_categories moves.
+    The fee reader never refreshes a missing or stale file itself (the
+    categories reader does, just before it); it only upgrades a current file
+    that has no "fees" block."""
+
+    LISTING = {"series": [
+        {"ticker": "KXMLBGAME", "category": "Sports", "tags": ["Baseball"],
+         "fee_type": "quadratic_with_maker_fees", "fee_multiplier": 0.5},
+        {"ticker": "KXBTCY", "category": "Crypto", "tags": ["BTC"],
+         "fee_type": "quadratic", "fee_multiplier": 0},
+        {"ticker": "KXFULL", "category": "Politics", "tags": [],
+         "fee_type": "quadratic", "fee_multiplier": 1},
+        {"ticker": "KXNOFEE", "category": "Politics", "tags": []},
+    ]}
+
+    @pytest.fixture
+    def cache(self, monkeypatch, tmp_path):
+        path = tmp_path / "series_categories.json"
+        monkeypatch.setattr(historical, "_SERIES_CATEGORIES_CACHE", path)
+        return path
+
+    @staticmethod
+    def _stub(monkeypatch, response):
+        calls = []
+
+        def fake_get(client, path, **params):
+            calls.append((path, params))
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        monkeypatch.setattr(historical, "_historical_get", fake_get)
+        return calls
+
+    @staticmethod
+    def _write(cache, **blocks):
+        cache.write_text(json.dumps({"fetched_at": datetime.now(UTC).isoformat(), **blocks}))
+
+    def test_the_fee_block_round_trips(self, cache, monkeypatch):
+        calls = self._stub(monkeypatch, self.LISTING)
+        client = MagicMock()
+        historical.load_series_categories(client)
+        got = historical.load_series_fee_multipliers(client)
+        # A series with no multiplier is unknown, so it is left out
+        assert got == {"KXMLBGAME": 0.5, "KXBTCY": 0.0, "KXFULL": 1.0}
+        assert all(isinstance(m, float) for m in got.values())
+        assert calls == [("/trade-api/v2/series", {})]
+        on_disk = json.loads(cache.read_text())
+        assert on_disk["fees"] == {
+            "KXMLBGAME": ["quadratic_with_maker_fees", 0.5], "KXBTCY": ["quadratic", 0],
+            "KXFULL": ["quadratic", 1], "KXNOFEE": ["", None]}
+        assert on_disk["series"]["KXMLBGAME"] == ["Sports", ["Baseball"]]
+        # Read back from the file with no client: the same map, no request
+        assert historical.load_series_fee_multipliers(None) == got
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("bad", [True, False, "0.5", float("nan"), float("inf"), -1, -0.01,
+                                     2, 1.01, None, [1], {"a": 1}])
+    def test_a_bad_multiplier_reads_as_unknown(self, cache, monkeypatch, bad):
+        self._stub(monkeypatch, {"series": [
+            {"ticker": "KXBAD", "category": "Sports", "tags": [], "fee_multiplier": bad},
+            {"ticker": "KXGOOD", "category": "Sports", "tags": [], "fee_multiplier": 0.5}]})
+        client = MagicMock()
+        historical.load_series_categories(client)
+        assert historical.load_series_fee_multipliers(client) == {"KXGOOD": 0.5}
+        assert json.loads(cache.read_text())["fees"]["KXBAD"][1] is None
+
+    def test_a_bad_value_in_a_cached_fee_block_reads_as_unknown(self, cache):
+        self._write(cache, series={"KXA": ["Sports", []]},
+                    fees={"KXA": ["quadratic", True], "KXB": ["quadratic", 7],
+                          "KXC": ["quadratic", 0.5], "KXD": "not a list", "KXF": [5, 1],
+                          "KXE": ["quadratic", None]})
+        assert historical.load_series_fee_multipliers(None) == {"KXC": 0.5}
+
+    def test_an_old_cache_without_fees_still_reads_for_categories(self, cache, monkeypatch):
+        self._write(cache, series={"KXA": ["Sports", ["Soccer"]]})
+        calls = self._stub(monkeypatch, self.LISTING)
+        # Fresh for categories: no request
+        assert historical.load_series_categories(MagicMock()) == {"KXA": ("Sports", ("Soccer",))}
+        assert calls == []
+
+    def test_a_current_cache_without_fees_is_upgraded_by_one_request(self, cache, monkeypatch):
+        self._write(cache, series={"KXA": ["Sports", ["Soccer"]]})
+        calls = self._stub(monkeypatch, self.LISTING)
+        # No client: nothing to fetch with, so nothing is known
+        assert historical.load_series_fee_multipliers(None) == {}
+        assert calls == []
+        # With a client but no opt-in (a live run): the file only, no request
+        assert historical.load_series_fee_multipliers(MagicMock()) == {}
+        assert calls == []
+        # Opted in (the backtest): one request, which also refreshes the categories
+        assert historical.load_series_fee_multipliers(MagicMock(), upgrade=True) == {
+            "KXMLBGAME": 0.5, "KXBTCY": 0.0, "KXFULL": 1.0}
+        assert len(calls) == 1
+        assert "KXMLBGAME" in historical.load_series_categories(MagicMock())
+        assert historical.load_series_fee_multipliers(MagicMock(), upgrade=True)["KXBTCY"] == 0.0
+        assert len(calls) == 1
+
+    def test_a_stale_cache_is_left_to_the_categories_reader(self, cache, monkeypatch):
+        old = datetime.now(UTC) - timedelta(
+            seconds=historical.SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS + 1)
+        for blocks in ({"series": {"KXA": ["Sports", []]}},
+                       {"series": {"KXA": ["Sports", []]}, "fees": {"KXA": ["quadratic", 0.5]}}):
+            cache.write_text(json.dumps({"fetched_at": old.isoformat(), **blocks}))
+            calls = self._stub(monkeypatch, self.LISTING)
+            got = historical.load_series_fee_multipliers(MagicMock(), upgrade=True)
+            # No request of its own: the file as it stands, however old
+            assert calls == []
+            assert got == ({"KXA": 0.5} if "fees" in blocks else {})
+        # ... and the categories reader's fetch refreshes both blocks
+        historical.load_series_categories(MagicMock())
+        assert len(calls) == 1
+        assert historical.load_series_fee_multipliers(MagicMock())["KXMLBGAME"] == 0.5
+        assert len(calls) == 1
+
+    def test_no_cache_at_all_makes_no_request_here(self, cache, monkeypatch):
+        calls = self._stub(monkeypatch, self.LISTING)
+        assert historical.load_series_fee_multipliers(MagicMock(), upgrade=True) == {}
+        assert calls == []
+        assert not cache.exists()
+
+    def test_a_fresh_cache_with_fees_makes_no_request(self, cache, monkeypatch):
+        self._write(cache, series={"KXA": ["Sports", []]}, fees={"KXA": ["quadratic", 0.5]})
+        calls = self._stub(monkeypatch, self.LISTING)
+        assert historical.load_series_fee_multipliers(MagicMock()) == {"KXA": 0.5}
+        assert calls == []
+
+    def test_both_readers_on_a_stale_cache_make_one_request(self, cache, monkeypatch):
+        calls = self._stub(monkeypatch, self.LISTING)
+        client = MagicMock()
+        cats = historical.load_series_categories(client)
+        fees = historical.load_series_fee_multipliers(client)
+        assert len(calls) == 1
+        assert set(cats) == {"KXMLBGAME", "KXBTCY", "KXFULL", "KXNOFEE"}
+        assert fees == {"KXMLBGAME": 0.5, "KXBTCY": 0.0, "KXFULL": 1.0}
+
+    def test_the_categories_are_what_they_were_with_or_without_fee_fields(
+        self, cache, monkeypatch,
+    ):
+        stripped = {"series": [{k: v for k, v in s.items() if not k.startswith("fee_")}
+                               for s in self.LISTING["series"]]}
+        self._stub(monkeypatch, self.LISTING)
+        with_fees = historical.load_series_categories(MagicMock())
+        cache.unlink()
+        self._stub(monkeypatch, stripped)
+        assert historical.load_series_categories(MagicMock()) == with_fees == {
+            "KXMLBGAME": ("Sports", ("Baseball",)), "KXBTCY": ("Crypto", ("BTC",)),
+            "KXFULL": ("Politics", ()), "KXNOFEE": ("Politics", ())}
+
+    def test_a_failed_categories_fetch_leaves_the_fee_reader_quiet(
+        self, cache, monkeypatch, caplog,
+    ):
+        # The fee reader adds no request and no WARNING to the categories
+        # reader's own failure, with a stale copy or none
+        old = datetime(2020, 1, 1, tzinfo=UTC)
+        cache.write_text(json.dumps({"fetched_at": old.isoformat(),
+                                     "series": {"KXA": ["Sports", []]},
+                                     "fees": {"KXA": ["quadratic", 0.5]}}))
+        calls = self._stub(monkeypatch, RuntimeError("offline"))
+        client = MagicMock()
+        with caplog.at_level(logging.INFO):
+            historical.load_series_categories(client)
+            caplog.clear()
+            assert historical.load_series_fee_multipliers(client) == {"KXA": 0.5}
+        assert len(calls) == 1
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+        cache.unlink()
+        assert historical.load_series_fee_multipliers(client) == {}
+        assert len(calls) == 1
+
+    def test_a_failed_upgrade_fetch_falls_back_to_no_multipliers(
+        self, cache, monkeypatch, caplog,
+    ):
+        self._write(cache, series={"KXA": ["Sports", []]})
+        calls = self._stub(monkeypatch, RuntimeError("offline"))
+        with caplog.at_level(logging.INFO):
+            assert historical.load_series_fee_multipliers(MagicMock(), upgrade=True) == {}
+        assert len(calls) == 1
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+        assert "every series is charged the full fee" in caplog.text
+
+    def test_an_unreadable_cache_is_missing_not_an_error(self, cache, monkeypatch):
+        cache.write_text("{not json")
+        calls = self._stub(monkeypatch, self.LISTING)
+        assert historical.load_series_fee_multipliers(None) == {}
+        assert historical.load_series_fee_multipliers(MagicMock(), upgrade=True) == {}
+        assert calls == []
+
+    def test_an_upgrade_is_used_when_its_cache_cannot_be_written(
+        self, cache, monkeypatch, caplog,
+    ):
+        self._write(cache, series={"KXA": ["Sports", []]})
+        self._stub(monkeypatch, self.LISTING)
+
+        def broken(path, data):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(historical, "_save_json_cache", broken)
+        with caplog.at_level(logging.INFO):
+            assert historical.load_series_fee_multipliers(
+                MagicMock(), upgrade=True)["KXMLBGAME"] == 0.5
+        assert "could not cache" in caplog.text
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    def test_a_corrupt_cache_file_is_warned_about_once(self, cache, monkeypatch, caplog):
+        # The categories reader reports the corrupt file; the fee reader parses it
+        # on its own and says nothing at WARNING
+        cache.write_text("{not json")
+        self._stub(monkeypatch, RuntimeError("offline"))
+        with caplog.at_level(logging.INFO):
+            historical.load_series_categories(None)
+            warnings_after_categories = [r for r in caplog.records
+                                         if r.levelno >= logging.WARNING]
+            assert historical.load_series_fee_multipliers(None) == {}
+            assert historical.load_series_fee_multipliers(MagicMock(), upgrade=True) == {}
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == (
+            warnings_after_categories)
+        assert len(warnings_after_categories) == 1
+
+    def test_a_live_style_read_never_upgrades(self, cache, monkeypatch):
+        # The default (a live run): a current file without fees gives {} and no request
+        self._write(cache, series={"KXA": ["Sports", []]})
+        calls = self._stub(monkeypatch, self.LISTING)
+        assert historical.load_series_fee_multipliers(MagicMock()) == {}
+        assert historical.load_series_fee_multipliers(MagicMock(), upgrade=False) == {}
+        assert calls == []
+        assert "fees" not in json.loads(cache.read_text())
+
+    def test_the_upgrade_is_keyword_only_and_off_by_default(self):
+        import inspect
+        param = inspect.signature(historical.load_series_fee_multipliers).parameters["upgrade"]
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY and param.default is False
+
+    @pytest.mark.parametrize("series", [{}, None, [], "x", {"KXA": "not a pair"}])
+    def test_a_current_file_whose_series_block_is_empty_is_not_upgraded(
+        self, cache, monkeypatch, series,
+    ):
+        # The categories reader would not serve this file as current, so its
+        # failed fetch must not be followed by a second request here
+        blocks = {} if series is None else {"series": series}
+        self._write(cache, **blocks)
+        calls = self._stub(monkeypatch, RuntimeError("offline"))
+        client = MagicMock()
+        assert historical.load_series_categories(client) == {}
+        assert len(calls) == 1
+        assert historical.load_series_fee_multipliers(client, upgrade=True) == {}
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("huge", [10 ** 400, -(10 ** 400)])
+    def test_a_huge_integer_multiplier_is_unknown_not_an_error(self, cache, monkeypatch, huge):
+        # float() of a 400-digit integer raises OverflowError; it must not cost the listing
+        assert historical._parse_fee_multiplier(huge) is None
+        self._stub(monkeypatch, {"series": [
+            {"ticker": "KXHUGE", "category": "Sports", "tags": [], "fee_multiplier": huge},
+            {"ticker": "KXGOOD", "category": "Sports", "tags": [], "fee_multiplier": 0.5}]})
+        client = MagicMock()
+        assert set(historical.load_series_categories(client)) == {"KXHUGE", "KXGOOD"}
+        assert historical.load_series_fee_multipliers(client) == {"KXGOOD": 0.5}
+
+    def test_one_info_line_counts_the_listed_series(self, cache, monkeypatch, caplog):
+        self._stub(monkeypatch, {"series": [
+            {"ticker": "A", "fee_multiplier": 1}, {"ticker": "B", "fee_multiplier": 0.5},
+            {"ticker": "C", "fee_multiplier": 0.5}, {"ticker": "D", "fee_multiplier": 0},
+            {"ticker": "E", "fee_multiplier": 0.25}, {"ticker": "F"}]})
+        client = MagicMock()
+        historical.load_series_categories(client)
+        with caplog.at_level(logging.INFO):
+            historical.load_series_fee_multipliers(client)
+        lines = [m for m in caplog.messages if m.startswith("Series fee multipliers:")]
+        assert lines == ["Series fee multipliers: 5 series listed, 4 below 1 "
+                         "(2 at 0.5, 1 at 0, 1 other)"]
+
+
 class TestLoadEventCompetitions:
     """DR-79's backtest half: each event's product_metadata.competition, read
     once from /events/{ticker} and cached in event_competitions.json. Only
@@ -7362,3 +7858,142 @@ class TestCandleReadsBid:
             assert historical.candle_reads_bid(0.25, "no") is True
         # Each bid is asked about as the other side's ask
         assert calls == [(0.75, "no"), (0.75, "yes")]
+
+
+class TestLoadEventFeeOverrides:
+    """Each pair market's event's fee override, cached; an event not read is
+    left out (unknown, so the full fee) and asked again next run."""
+
+    def test_reads_caches_and_leaves_unknown_out(self, monkeypatch):
+        answers = {"E-HALF": 0.5, "E-NONE": None, "E-ODD": historical.EVENT_FEE_OVERRIDE_UNKNOWN}
+        reads: list = []
+
+        def fetch(client, ticker):
+            reads.append(ticker)
+            if ticker == "E-FAIL":
+                raise RuntimeError("boom")
+            return answers[ticker]
+
+        monkeypatch.setattr(historical, "_fetch_event_fee_override", fetch)
+        got = historical.load_event_fee_overrides(
+            MagicMock(), ["E-HALF", "E-NONE", "E-ODD", "E-FAIL", "", None])
+        assert got == {"E-HALF": 0.5, "E-NONE": None}
+        # Only answers Kalshi gave are cached; the others are asked again
+        reads.clear()
+        got = historical.load_event_fee_overrides(MagicMock(), ["E-HALF", "E-NONE", "E-ODD"])
+        assert got == {"E-HALF": 0.5, "E-NONE": None}
+        assert reads == ["E-ODD"]
+
+    def test_no_client_reads_the_cache_only(self, monkeypatch):
+        monkeypatch.setattr(historical, "_fetch_event_fee_override",
+                            lambda c, t: pytest.fail("no read without a client"))
+        assert historical.load_event_fee_overrides(None, ["E1"]) == {}
+
+    def test_the_cap_reads_the_events_named_first_first(self, monkeypatch):
+        reads: list = []
+        monkeypatch.setattr(historical, "EVENT_COMPETITION_MAX_LOOKUPS", 1)
+        monkeypatch.setattr(historical, "_fetch_event_fee_override",
+                            lambda c, t: reads.append(t) or None)
+        got = historical.load_event_fee_overrides(MagicMock(), ["A-1", "Z-1"], first={"Z-1"})
+        assert reads == ["Z-1"] and got == {"Z-1": None}
+
+
+# The real reader, taken before conftest's session stub replaces it
+_REAL_FETCH_EVENT_FACTS = historical._fetch_event_facts
+
+
+class TestLoadEventFacts:
+    """Each pair market's event's settlement sources and mutually_exclusive
+    flag, for the backtest's report only: cached, and an event not read is
+    left out and asked again next run."""
+
+    _FACTS = {"settlement_sources": ("NHL",), "mutually_exclusive": False}
+
+    def test_reads_caches_and_leaves_unknown_out(self, monkeypatch):
+        answers = {"E-ONE": self._FACTS,
+                   "E-OPTIONS": {"settlement_sources": (), "mutually_exclusive": True},
+                   "E-ODD": None}
+        reads: list = []
+
+        def fetch(client, ticker):
+            reads.append(ticker)
+            if ticker == "E-FAIL":
+                raise RuntimeError("boom")
+            return answers[ticker]
+
+        monkeypatch.setattr(historical, "_fetch_event_facts", fetch)
+        got = historical.load_event_facts(
+            MagicMock(), ["E-ONE", "E-OPTIONS", "E-ODD", "E-FAIL", "", None])
+        assert got == {"E-ONE": self._FACTS, "E-OPTIONS": answers["E-OPTIONS"]}
+        # Only answers Kalshi gave are cached, read back as the same facts;
+        # the others are asked again
+        reads.clear()
+        got = historical.load_event_facts(MagicMock(), ["E-ONE", "E-OPTIONS", "E-ODD"])
+        assert got == {"E-ONE": self._FACTS, "E-OPTIONS": answers["E-OPTIONS"]}
+        assert reads == ["E-ODD"]
+        saved = json.loads(historical._EVENT_FACTS_CACHE.read_text())
+        assert saved == {"facts": {
+            "E-ONE": {"settlement_sources": ["NHL"], "mutually_exclusive": False},
+            "E-OPTIONS": {"settlement_sources": [], "mutually_exclusive": True}}}
+
+    def test_no_client_reads_the_cache_only(self, monkeypatch):
+        monkeypatch.setattr(historical, "_fetch_event_facts",
+                            lambda c, t: pytest.fail("no read without a client"))
+        assert historical.load_event_facts(None, ["E1"]) == {}
+        assert historical.load_event_facts(MagicMock(), []) == {}
+
+    def test_the_cap_reads_in_ticker_order(self, monkeypatch):
+        reads: list = []
+        monkeypatch.setattr(historical, "EVENT_COMPETITION_MAX_LOOKUPS", 1)
+        monkeypatch.setattr(historical, "_fetch_event_facts",
+                            lambda c, t: reads.append(t) or self._FACTS)
+        got = historical.load_event_facts(MagicMock(), ["Z-1", "A-1"])
+        assert reads == ["A-1"] and got == {"A-1": self._FACTS}
+
+    def test_an_unreadable_cache_is_left_as_it_is(self, monkeypatch, caplog):
+        historical._EVENT_FACTS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        historical._EVENT_FACTS_CACHE.write_text("not json")
+        monkeypatch.setattr(historical, "_load_json_cache",
+                            lambda path: (_ for _ in ()).throw(RecursionError("deep")))
+        monkeypatch.setattr(historical, "_fetch_event_facts", lambda c, t: self._FACTS)
+        with caplog.at_level(logging.WARNING):
+            got = historical.load_event_facts(MagicMock(), ["E1"])
+        assert got == {"E1": self._FACTS}
+        assert historical._EVENT_FACTS_CACHE.read_text() == "not json"
+        assert any("could not read the cached facts" in m for m in caplog.messages)
+
+    def test_the_one_count_line(self, monkeypatch, caplog):
+        monkeypatch.setattr(historical, "_fetch_event_facts", lambda c, t: self._FACTS)
+        with caplog.at_level(logging.INFO):
+            historical.load_event_facts(MagicMock(), ["E1", "E2"])
+        assert ("Event facts: 2 events, 0 from the cache, 2 read from Kalshi, 0 unknown"
+                in caplog.messages)
+
+    def test_the_facts_of_an_event_object(self):
+        facts = historical._event_facts
+        assert facts({"settlement_sources": [{"name": "NHL", "url": "https://nhl.com"},
+                                             {"url": "https://b.example"}, {"name": ""},
+                                             "ESPN", 7],
+                      "mutually_exclusive": True}) == {
+            "settlement_sources": ("ESPN", "NHL", "https://b.example"),
+            "mutually_exclusive": True}
+        # No sources listed is an empty tuple; a flag that is not a bool is None
+        assert facts({"mutually_exclusive": "yes"}) == {
+            "settlement_sources": (), "mutually_exclusive": None}
+        # Sources that are there but are not a list cannot be read
+        assert facts({"settlement_sources": "NHL"}) is None
+        assert facts(["not", "an", "event"]) is None
+
+    def test_the_reader_reads_a_real_event_payload(self, monkeypatch):
+        payload = json.loads((_KALSHI_PAYLOADS / "event_with_competition.json").read_text())
+        paths: list = []
+        monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS", 0)
+        monkeypatch.setattr(historical, "_historical_get",
+                            lambda client, path, **kw: paths.append(path) or payload)
+        got = _REAL_FETCH_EVENT_FACTS(MagicMock(), "KXNHLAST-26OCT17NYITOR")
+        assert got == {"settlement_sources": ("NHL",), "mutually_exclusive": False}
+        assert paths == [f"{historical._API_PREFIX}/events/KXNHLAST-26OCT17NYITOR"]
+        # A reply with no event object is an error, which the loader reports
+        monkeypatch.setattr(historical, "_historical_get", lambda client, path, **kw: {})
+        with pytest.raises(ValueError):
+            _REAL_FETCH_EVENT_FACTS(MagicMock(), "E1")
