@@ -3,7 +3,13 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/claude-code-review.yml"
   pull_request:
+    paths-ignore:
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/claude-code-review.yml"
 
 jobs:
   # Pushes to main always run CI. A PR runs it only when it changes more than
