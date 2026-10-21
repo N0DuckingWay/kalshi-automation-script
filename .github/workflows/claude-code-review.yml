@@ -3,6 +3,9 @@ name: Claude Code Review
 on:
   pull_request:
     types: [opened, synchronize, ready_for_review, reopened]
+    paths-ignore:
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/claude-code-review.yml"
     # Optional: Only run on specific file changes
     # paths:
     #   - "src/**/*.ts"
@@ -11,7 +14,32 @@ on:
     #   - "src/**/*.jsx"
 
 jobs:
+  # Same rule as the size gate in ci.yml: a PR is reviewed only when it changes
+  # more than one file or more than 50 lines (additions + deletions). Keep the
+  # two in step.
+  gate:
+    name: Size gate
+    runs-on: ubuntu-latest
+    outputs:
+      run_review: ${{ steps.decide.outputs.run_review }}
+    steps:
+      - id: decide
+        env:
+          FILES: ${{ github.event.pull_request.changed_files }}
+          ADDITIONS: ${{ github.event.pull_request.additions }}
+          DELETIONS: ${{ github.event.pull_request.deletions }}
+        run: |
+          LINES=$((ADDITIONS + DELETIONS))
+          echo "PR changes $FILES file(s) and $LINES line(s)"
+          if [ "$FILES" -gt 1 ] || [ "$LINES" -gt 50 ]; then
+            echo "run_review=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_review=false" >> "$GITHUB_OUTPUT"
+          fi
+
   claude-review:
+    needs: gate
+    if: needs.gate.outputs.run_review == 'true'
     # Optional: Filter by PR author
     # if: |
     #   github.event.pull_request.user.login == 'external-contributor' ||

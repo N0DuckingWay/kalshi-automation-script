@@ -13,11 +13,15 @@ jobs:
   # commit titled "Merge branch 'main' into ...", which is what GitHub's
   # "Update branch" button and `git merge main` write) skips CI too: main
   # already passed it, and the branch's own changes were tested on earlier
-  # pushes. A PR that changes only this file skips CI as well. "Clean" means replaying the merge gives the same files as the
+  # pushes. A PR that changes only this file and claude-code-review.yml skips CI as well
+  # (the workflow still starts, so the required Lint and Test checks report
+  # "skipped" instead of staying "expected"). "Clean" means replaying the merge gives the same files as the
   # commit; conflict fixes or extra edits inside it still run CI.
   gate:
     name: Size gate
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
     outputs:
       # verify only runs for a suspected pull of main and, when it does, has
       # the last word; otherwise the first step's answer stands.
@@ -38,10 +42,10 @@ jobs:
             echo "run_ci=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # A PR that touches nothing but this workflow file has no code to test.
-          OTHER=$(gh api --paginate "repos/$GH_REPO/pulls/$PR_NUMBER/files" --jq '.[].filename' | grep -vxF '.github/workflows/ci.yml' || true)
+          # A PR that touches nothing but the CI/review workflow files has no code to test.
+          OTHER=$(gh api --paginate "repos/$GH_REPO/pulls/$PR_NUMBER/files" --jq '.[].filename' | grep -vxF -e '.github/workflows/ci.yml' -e '.github/workflows/claude-code-review.yml' || true)
           if [ -z "$OTHER" ]; then
-            echo "PR only changes ci.yml; skipping CI"
+            echo "PR only changes the CI/review workflows; skipping CI"
             echo "run_ci=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
