@@ -3041,6 +3041,7 @@ class TestEntryCheckpointHeader:
             r"<p [^>]*>Live rule: none recorded[^\n]*</p>\n"
             rf'<p style="color:#616161; font-size:14px;">{re.escape(self._RECORDED)}\n'
             r"<p [^>]*>Fills: [^\n]*</p>\n"
+            r"<p [^>]*>Extra data: [^\n]*</p>\n"
             r"<p [^>]*>Risk-free rate[^\n]*</p>\n"
             r"<p [^>]*>Outcome-label coverage for this run is below the floor",
             page)
@@ -18388,10 +18389,13 @@ class TestOpenTradesAtMarket:
         rows = [tuple(getattr(t, name) for name in dashboard._TRADE_FIELDS) for t in trades]
         assert dashboard._list_key(0.75, trades) == hashlib.sha256(
             repr((0.75, rows)).encode("utf-8")).hexdigest()
-        # marks is the one BacktestTrade field not compared, and so not in
-        # _TRADE_FIELDS: the key reads it through the quotes' fingerprints
+        # marks is not compared and not in _TRADE_FIELDS: the key reads it
+        # through the quotes' fingerprints. The report-only fields the rows
+        # show are not compared either, and _TRADE_FIELDS adds them
         uncompared = [f.name for f in dataclasses.fields(BacktestTrade) if not f.compare]
-        assert uncompared == ["marks"]
+        assert uncompared == ["marks", "scheduled_close_a", "scheduled_close_b",
+                              "quote_age_hours_a", "quote_age_hours_b",
+                              "next_day_volume_share"]
         assert dashboard._TRADE_FIELDS == tuple(
             f.name for f in dataclasses.fields(BacktestTrade) if f.name != "marks")
 
@@ -20315,6 +20319,108 @@ class TestMixedSelection:
                           "roundTo(x, 2), roundTo(x, 4)]; })")
         for x, drawn in zip(points, rounded, strict=True):
             assert drawn == [float(np.round(x, digits)) for digits in (0, 2, 4)], x
+
+
+class TestExtraDataHeader:
+    """C8: the header's Extra data line names the scheduled close, the
+    stale-quote check, the volume cap and the confirmed fee multipliers the
+    run read, and what the integrity checks found (red when one failed); a
+    switch that was off reads off, and one not recorded says so."""
+
+    _GREY = '<p style="color:#616161; font-size:14px;">'
+
+    @staticmethod
+    def _report(**changes) -> backtester.ExtraDataReport:
+        base = dict(strikes_differ=0, strikes_checked=0, sources_differ=0, sources_checked=0,
+                    rules_differ=0, rules_checked=0, option_ladders=0, ladders_checked=0,
+                    integrity_failures=tuple((name, 0) for name in ("candle_range",
+                                                                    "trade_prices")),
+                    anomaly_markets=2, anomaly_hours=5, pair_markets=40,
+                    scheduled_close_markets=31)
+        return backtester.ExtraDataReport(**{**base, **changes})
+
+    def _sweep(self, **fields_) -> BacktestSweep:
+        pt = _scn_point((0.3, 0.6), 0.75, trades=[make_trade()])
+        return BacktestSweep(primary=pt, points=[pt], calibration=None, **fields_)
+
+    def test_a_run_with_every_switch_on_and_every_check_passing(self):
+        line = dashboard._extra_data_html(self._sweep(
+            scheduled_close=True, stale_quote_max_age=86_400.0, max_volume_share=0.10,
+            extra_data_report=self._report()))
+        assert line == (
+            f"{self._GREY}Extra data: scheduled close on (31 of 40 pair markets) | "
+            "stale-quote check 24 h | volume cap 10% | fees by series (multipliers "
+            "confirmed: 1) | integrity: all checks pass; crossed candles in Kalshi's data: "
+            "2 markets, 5 hours (reported, not a failure)</p>")
+
+    def test_switches_off_read_off(self):
+        line = dashboard._extra_data_html(self._sweep(
+            scheduled_close=False, stale_quote_max_age=False, max_volume_share=False,
+            extra_data_report=self._report(scheduled_close_markets=None)))
+        assert ("Extra data: scheduled close off | stale-quote check off | volume cap off | "
+                in line)
+
+    def test_nothing_recorded_reads_not_recorded(self):
+        assert dashboard._extra_data_html(None) == f"{self._GREY}Extra data: not recorded</p>"
+        line = dashboard._extra_data_html(self._sweep())
+        assert ("scheduled close not recorded | stale-quote check not recorded | volume cap "
+                "not recorded | fees by series (multipliers confirmed: 1) | integrity: not "
+                "recorded</p>") in line
+
+    def test_a_failing_check_is_red_and_named_and_anomalies_never_are(self):
+        line = dashboard._extra_data_html(self._sweep(
+            scheduled_close=True, extra_data_report=self._report(
+                integrity_failures=(("candle_range", 3), ("trade_prices", 0)))))
+        assert ('<span style="color:#B71C1C; font-weight:700;">integrity: 1 check fail '
+                "(candle_range 3 pair markets)</span>; crossed candles in Kalshi's data: "
+                "2 markets, 5 hours (reported, not a failure)</p>") in line
+        assert "trade_prices" not in line
+
+    def test_the_confirmed_multipliers_are_read_when_the_page_is_built(self, monkeypatch):
+        monkeypatch.setattr(config, "CONFIRMED_FEE_MULTIPLIERS", frozenset({1.0, 0.5, 0.0}))
+        assert "(multipliers confirmed: 1, 0.5, 0)" in dashboard._extra_data_html(self._sweep())
+
+    def test_the_page_carries_the_line_under_the_fills_line(self, monkeypatch, tmp_path):
+        page = TestRunSettingsHeader._page(monkeypatch, tmp_path, sweep=self._sweep(
+            scheduled_close=True, extra_data_report=self._report()))
+        assert page.count("Extra data: ") == 1
+        assert (page.index("Fills: ") < page.index("Extra data: scheduled close on (31 of 40")
+                < page.index("Portfolio Performance"))
+
+
+class TestTradeRowExtraData:
+    """C8: a trade row names, per leg, its scheduled close where the trade
+    read one that differs from the realized close and its quote's age at
+    entry, and once the share of the next day's volume it took; a trade with
+    none of them reads as it always did."""
+
+    def test_the_row_names_what_is_known(self):
+        t = make_trade()
+        plain = dashboard._trade_row_head(t, "#fff")
+        shown = dataclasses.replace(t, scheduled_close_b=date(2026, 3, 1),
+                                    quote_age_hours_a=2.0, quote_age_hours_b=0.5,
+                                    next_day_volume_share=0.0375)
+        head = dashboard._trade_row_head(shown, "#fff")
+        assert f"(closes {dashboard._fmt_day(t.close_date_a)}) at $" in head
+        assert f"(scheduled close {dashboard._fmt_day(date(2026, 3, 1))}) at $" in head
+        assert ", quote 2 h old" in head and ", quote 0.5 h old" in head
+        assert head.count("<br>3.8% of the next day's volume") == 1
+        assert "quote" not in plain and "volume" not in plain
+        # Only the report fields moved: dropping them gives the plain row back
+        assert dashboard._trade_row_head(dataclasses.replace(
+            shown, scheduled_close_b=None, quote_age_hours_a=None, quote_age_hours_b=None,
+            next_day_volume_share=None), "#fff") == plain
+
+    def test_kalshi_strings_stay_escaped(self):
+        t = dataclasses.replace(make_trade(title_a="<b>x</b>"), quote_age_hours_a=1.0)
+        head = dashboard._trade_row_head(t, "#fff")
+        assert "<b>x</b>" not in head and "&lt;b&gt;x&lt;/b&gt;" in head
+
+    def test_lists_that_differ_in_the_row_text_do_not_share_a_chunk(self):
+        t = make_trade()
+        aged = dataclasses.replace(t, quote_age_hours_a=3.0)
+        assert t == aged
+        assert dashboard._list_key(0.75, [t]) != dashboard._list_key(0.75, [aged])
 
 
 class TestTermsLinkAndSection:

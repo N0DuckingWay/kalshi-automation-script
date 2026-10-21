@@ -571,6 +571,7 @@ import yfinance as yf
 from plotly.subplots import make_subplots
 
 from . import backtester as _backtester
+from . import config as _config
 from .backtester import (
     _LIVE_RULE_LABEL,
     _LIVE_RULE_NONE,
@@ -1245,7 +1246,8 @@ def _score_text(value: float | None) -> str:
 
 
 def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
-                    k: float | None = None, *, spread: float | None = None) -> float:
+                    k: float | None = None, *, spread: float | None = None,
+                    multiplier_a: float = 1.0, multiplier_b: float = 1.0) -> float:
     """
     Uncapped Kelly fraction f* = p - (1-p)/b for one pair trade.
 
@@ -1294,6 +1296,9 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
             entry quotes' own (_entry_mid_spread), as the live sizer prices
             its legs at the fills and its forecast at the book's tops.
             Ignored for same_title.
+        multiplier_a (float): Keyword-only. Market A's fee multiplier, the one
+            the trade was priced at (BacktestTrade.fee_multiplier_a).
+        multiplier_b (float): Keyword-only. Market B's.
 
     Returns:
         float: Uncapped Kelly fraction, clamped to be >= 0.
@@ -1310,7 +1315,9 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
         price_a, price_b = nA, pB
         p = SAME_TITLE_CO_RESOLVE_PROB
     cost = price_a + price_b
-    fee_approx = fee_per_pair_approx(price_a, price_b)
+    # Each leg at its own market's fee multiplier (market order, as price_a, price_b)
+    fee_approx = fee_per_pair_approx(price_a, price_b, multiplier_a=multiplier_a,
+                                     multiplier_b=multiplier_b)
     net_spread = (1.0 - price_a - price_b) - fee_approx
     if cost <= 0 or net_spread <= 0:
         return 0.0
@@ -5384,6 +5391,75 @@ def _fills_html(sweep: BacktestSweep | None) -> str:
             "(no depth data)</p>")
 
 
+def _extra_data_html(sweep: BacktestSweep | None) -> str:
+    """
+    Render the page-header line naming the extra data the run read and what its checks found.
+
+    Read off the sweep: whether the run used each market's scheduled close
+    (and how many pair markets had one), the stale-quote check's limit, the
+    volume cap, the fee multipliers charged as listed
+    (config.CONFIRMED_FEE_MULTIPLIERS, read when the page is built), and
+    the integrity checks over the pair markets (BacktestSweep.
+    extra_data_report). A switch that was off reads "off", and one the sweep
+    does not record reads "not recorded". The integrity part is red, naming
+    each failing check, when any check failed; Kalshi's crossed candles are
+    named in grey, since they are Kalshi's own data, not a failure.
+
+    Args:
+        sweep (BacktestSweep | None): The run's sweep payload, or None.
+
+    Returns:
+        str: One <p> line starting "Extra data: ".
+    """
+    grey = '<p style="color:#616161; font-size:14px;">'
+    if sweep is None:
+        return f"{grey}Extra data: not recorded</p>"
+    report = getattr(sweep, "extra_data_report", None)
+    scheduled = getattr(sweep, "scheduled_close", None)
+    if scheduled is True:
+        if report is not None and report.scheduled_close_markets is not None:
+            scheduled_text = (f"scheduled close on ({report.scheduled_close_markets} of "
+                              f"{report.pair_markets} pair markets)")
+        else:
+            scheduled_text = "scheduled close on"
+    elif scheduled is False:
+        scheduled_text = "scheduled close off"
+    else:
+        scheduled_text = "scheduled close not recorded"
+    stale = getattr(sweep, "stale_quote_max_age", None)
+    if stale is False:
+        stale_text = "stale-quote check off"
+    elif isinstance(stale, (int, float)) and not isinstance(stale, bool):
+        stale_text = f"stale-quote check {stale / 3600:g} h"
+    else:
+        stale_text = "stale-quote check not recorded"
+    share = getattr(sweep, "max_volume_share", None)
+    if share is False:
+        volume_text = "volume cap off"
+    elif isinstance(share, (int, float)) and not isinstance(share, bool):
+        volume_text = f"volume cap {share * 100:g}%"
+    else:
+        volume_text = "volume cap not recorded"
+    confirmed = ", ".join(f"{m:g}" for m in sorted(_config.CONFIRMED_FEE_MULTIPLIERS,
+                                                   reverse=True))
+    fees_text = f"fees by series (multipliers confirmed: {confirmed})"
+    if report is None:
+        integrity_text = "integrity: not recorded"
+    else:
+        failing = [(name, count) for name, count in report.integrity_failures if count]
+        if failing:
+            named = ", ".join(f"{html.escape(str(name))} {count}" for name, count in failing)
+            integrity_text = ('<span style="color:#B71C1C; font-weight:700;">integrity: '
+                              f"{len(failing)} check{'' if len(failing) == 1 else 's'} "
+                              f"fail ({named} pair markets)</span>")
+        else:
+            integrity_text = "integrity: all checks pass"
+        integrity_text += (f"; crossed candles in Kalshi's data: {report.anomaly_markets} "
+                           f"markets, {report.anomaly_hours} hours (reported, not a failure)")
+    return (f"{grey}Extra data: {scheduled_text} | {stale_text} | {volume_text} | "
+            f"{fees_text} | {integrity_text}</p>")
+
+
 def _corpus_provenance_html(sweep: BacktestSweep | None) -> str:
     """
     Render the page-header line saying what settled-market corpus the run read.
@@ -6063,8 +6139,10 @@ def _trade_row_head(t: BacktestTrade, color: str) -> str:
     Render the first half of a best/worst-trade row, up to the size cells.
 
     Everything from the <tr> through the outcome cell: the entry date, the
-    pair type, the prices paid, each leg's side, market and close date, and
-    how each leg settled — for a trade sold before it paid out (a Sell
+    pair type, the prices paid, each leg's side, market and close date (its
+    scheduled close when the trade read one that differs from the realized
+    close) and, when known, its quote's age at entry, the share of the next
+    day's volume the trade took, and how each leg settled — for a trade sold before it paid out (a Sell
     level), each leg's sale day and price, or its payout when its market paid
     out before the sale, beside how it settled. The prices are what the trade
     paid per contract (backtester._paid_prices) and, for a sold trade, the
@@ -6090,11 +6168,21 @@ def _trade_row_head(t: BacktestTrade, color: str) -> str:
         (side_b, price_b, t.title_b, t.subtitle_b, t.ticker_b, t.close_date_b,
          t.outcome_b, t.settled_date_b),
     )
+    # Report only: a leg whose close is its scheduled one (not the realized
+    # one) says so, and each leg's quote age at entry when it is known
+    scheduled = (t.scheduled_close_a, t.scheduled_close_b)
+    ages = (t.quote_age_hours_a, t.quote_age_hours_b)
     details = "<br>".join(
         f"<b>{side.upper()}</b> on {_leg_market(title, sub, ticker)} "
-        f"(closes {_fmt_day(closes)}) at ${price:.2f}"
-        for side, price, title, sub, ticker, closes, _, _ in legs
+        + (f"(scheduled close {_fmt_day(sched)})" if sched is not None
+           else f"(closes {_fmt_day(closes)})")
+        + f" at ${price:.2f}"
+        + ("" if age is None else f", quote {round(age, 1):g} h old")
+        for (side, price, title, sub, ticker, closes, _, _), sched, age
+        in zip(legs, scheduled, ages, strict=True)
     )
+    if t.next_day_volume_share is not None:
+        details += f"<br>{t.next_day_volume_share * 100:.1f}% of the next day's volume"
     if t.sold:
         # A trade sold before it paid out: each leg's sale, or its payout when
         # its market paid out before the sale, beside how its market settled
@@ -6305,7 +6393,9 @@ def _kelly_points(trades: list[BacktestTrade],
     # trades were actually sized at rather than the config one
     kelly_fracs = [
         _kelly_fraction(*_quotes_at_fills(t), t.pair_type, k=k,
-                        spread=_entry_mid_spread(t))
+                        spread=_entry_mid_spread(t),
+                        multiplier_a=getattr(t, "fee_multiplier_a", 1.0),
+                        multiplier_b=getattr(t, "fee_multiplier_b", 1.0))
         for t in trades
     ]
     # The actual fraction uses the portfolio value at each trade's entry
@@ -7368,7 +7458,12 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date) -> 
 # identity of a trade list is these values, trade by trade, plus the
 # fingerprints of the trade's marks (the prices that value an open trade at
 # market), the one field left out here because it is not compared.
-_TRADE_FIELDS = tuple(f.name for f in dataclasses.fields(BacktestTrade) if f.compare)
+# Every compared field, and the report-only fields the trade rows show
+# (left out of BacktestTrade's equality, but two lists differing in them
+# draw different rows)
+_TRADE_FIELDS = (tuple(f.name for f in dataclasses.fields(BacktestTrade) if f.compare)
+                 + ("scheduled_close_a", "scheduled_close_b", "quote_age_hours_a",
+                    "quote_age_hours_b", "next_day_volume_share"))
 
 # The walk logs its progress about this many times over a size-cap sweep's
 # grid, whose cells are simulated as they are read.
@@ -8485,8 +8580,9 @@ def _list_key(k: float | None, trades: list[BacktestTrade]) -> str:
 
     Two scenarios that traded equal lists show the same views — except the
     Kelly scatter, whose x values are priced at the scenario's k — so the
-    key holds k beside every compared field of every trade (_TRADE_FIELDS,
-    read without a deep copy) and, for a trade valued at market, its two
+    key holds k beside every compared field of every trade and the
+    report-only fields its row shows (_TRADE_FIELDS, read without a deep
+    copy) and, for a trade valued at market, its two
     markets' quote fingerprints (backtester.LegQuotes.fingerprint), since
     two lists equal but for their quotes draw different curves. A SHA-256 of
     their repr: repr is exact for every field type those fields carry (str,
@@ -10739,8 +10835,12 @@ class _SellTask:
         hold_days (int): backtester.TAKE_PROFIT_HOLD_DAYS as the parent reads
             it: how many days in a row a position must stay at a level
             before it is sold.
+        confirmed_fee_multipliers (frozenset): config.CONFIRMED_FEE_MULTIPLIERS
+            as the parent reads it: the series fee multipliers charged as
+            listed (config.confirmed_fee_multiplier), so a worker charges each leg's
+            fee as the parent would.
         install (bool): Whether the task runs in a worker process of its own,
-            which then installs those three bindings first (a spawned process
+            which then installs those four bindings first (a spawned process
             imports backtester afresh, from config). False in the parent.
     """
     index: int
@@ -10762,6 +10862,7 @@ class _SellTask:
     same_title_size_cap: float
     scheduled_run: object
     hold_days: int
+    confirmed_fee_multipliers: frozenset = frozenset({1.0})
     install: bool = False
 
 
@@ -11011,8 +11112,8 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
     dropped before the next is read.
 
     Runs in a worker process (task.install True: the parent's
-    SAME_TITLE_SIZE_CAP, SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS are
-    installed first) or in the parent itself.
+    SAME_TITLE_SIZE_CAP, SCHEDULED_RUN, TAKE_PROFIT_HOLD_DAYS and
+    config.CONFIRMED_FEE_MULTIPLIERS are installed first) or in the parent itself.
 
     Args:
         task (_SellTask): The task.
@@ -11031,6 +11132,9 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
         _backtester.SAME_TITLE_SIZE_CAP = task.same_title_size_cap
         _backtester.SCHEDULED_RUN = task.scheduled_run
         _backtester.TAKE_PROFIT_HOLD_DAYS = task.hold_days
+        # ... and charge each leg's fee at the multipliers the parent confirms
+        # (config.confirmed_fee_multiplier reads config's own binding when called)
+        _config.CONFIRMED_FEE_MULTIPLIERS = task.confirmed_fee_multipliers
     family = task.family
     band = family.bands[0] if task.tier_floors else family.off_bands[0]
     axis_end = task.axis[-1] if len(task.axis) else None
@@ -11132,10 +11236,11 @@ def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: da
               "series_categories": series_categories, "cat_index": dict(chunker.cat_index),
               "sub_index": dict(chunker.sub_index), "risk_free": risk_free,
               "inline_keys": frozenset(chunker.seen), "out_dir": folder,
-              # The three bindings a spawned worker installs (_run_sell_task)
+              # The four bindings a spawned worker installs (_run_sell_task)
               "same_title_size_cap": _backtester.SAME_TITLE_SIZE_CAP,
               "scheduled_run": _backtester.SCHEDULED_RUN,
-              "hold_days": _backtester.TAKE_PROFIT_HOLD_DAYS}
+              "hold_days": _backtester.TAKE_PROFIT_HOLD_DAYS,
+              "confirmed_fee_multipliers": _config.CONFIRMED_FEE_MULTIPLIERS}
     tasks: list[_SellTask] = []
 
     def add(bi: int, band, tier_floors: bool, rows: dict) -> None:
@@ -15536,7 +15641,10 @@ def generate_dashboard(
             live-rule line under it (_live_rule_html), the entry-checkpoint
             line (_entry_checkpoint_html) and the fills line (_fills_html:
             how many of its primary trades walked a modeled order book, from
-            which depth snapshots). None
+            which depth snapshots) and the extra-data line under it
+            (_extra_data_html: the scheduled close, the stale-quote check,
+            the volume cap, the confirmed fee multipliers and the integrity
+            checks). None
             (default) renders both sections' placeholders and the k-hat
             breakdown's "not recorded" notice — and therefore no coverage line
             either, which is honest: that path shows no k̂ card
@@ -15857,6 +15965,9 @@ def generate_dashboard(
     entry_checkpoint = _entry_checkpoint_html(sweep)
     # How the trades filled: over a modeled order book, or at the top of the book
     fills_note = _fills_html(sweep)
+    # The extra data the run read (scheduled close, stale quotes, volume cap,
+    # fees by series) and what the integrity checks found
+    extra_data_note = _extra_data_html(sweep)
 
     # Each section is built as it is written, so only one is alive at a time
     sections = (
@@ -15923,6 +16034,7 @@ def generate_dashboard(
 {live_rule}
 {entry_checkpoint}
 {fills_note}
+{extra_data_note}
 {rf_note}
 {header_note}
 {filter_bar}

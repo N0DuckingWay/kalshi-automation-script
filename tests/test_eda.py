@@ -363,8 +363,9 @@ class TestCandles:
         _standard_cache(tmp_path)
         folder = tmp_path / historical._CANDLES_DIR.name
         folder.mkdir()
-        for name in ("FED-A.json", "COMBO-2.json", "NOMARKET.json", "FED-A.json.tmp"):
-            (folder / name).write_text("{}")
+        for name in ("FED-A.json.gz", "COMBO-2.json.gz", "NOMARKET.json.gz", "FED-A.json.gz.tmp",
+                     "OLD-PLAIN.json"):
+            (folder / name).write_bytes(gzip.compress(b"{}"))
         candle_set = eda.candle_tickers(tmp_path)
         assert candle_set == frozenset({"FED-A", "COMBO-2", "NOMARKET"})
         merged = _merge(_build(tmp_path), candle_set=candle_set)
@@ -386,7 +387,7 @@ class TestWorkers:
             (cache / historical._EVENT_TITLES_CACHE.name).write_text(
                 json.dumps({"KXFED-26AUG": "Fed decision in August"}))
             (cache / historical._CANDLES_DIR.name).mkdir()
-            (cache / historical._CANDLES_DIR.name / "FED-C.json").write_text("{}")
+            (cache / historical._CANDLES_DIR.name / "FED-C.json.gz").write_bytes(gzip.compress(b"{}"))
         merged_one = _merge(_build(one, workers=1))
         merged_two = _merge(_build(two, workers=2))
         assert merged_two == merged_one
@@ -730,20 +731,21 @@ CLOSE = "2026-08-10T00:00:00Z"
 CLOSE_TS = _day_ts("2026-08-10")
 
 
-def _candle_file(cache, ticker, candles, *, fields=2, bare_list=False, raw=None):
-    """Write <cache>/candlesticks/<ticker>.json in historical.fetch_candlesticks' format."""
+def _candle_file(cache, ticker, candles, *, fields=config.CANDLESTICK_CACHE_FIELDS_VERSION,
+                 bare_list=False, raw=None):
+    """Write <cache>/candlesticks_v3/<ticker>.json.gz in historical.fetch_candlesticks' format."""
     folder = Path(cache) / historical._CANDLES_DIR.name
     folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"{ticker}.json"
+    path = folder / f"{ticker}.json.gz"
     if raw is not None:
         path.write_bytes(raw)
     elif bare_list:
-        path.write_text(json.dumps(candles))
+        path.write_bytes(gzip.compress(json.dumps(candles).encode()))
     else:
         body = {"open_ts": 0, "close_ts": CLOSE_TS, "period_interval": 60, "candles": candles}
         if fields is not None:
             body["fields"] = fields
-        path.write_text(json.dumps(body))
+        path.write_bytes(gzip.compress(json.dumps(body).encode()))
     return path
 
 
@@ -863,7 +865,7 @@ class TestSummariseCandles:
         out = eda.summarise_candles(tmp_path, info)
         assert out["read"] == 1 and out["reused"] == 0
         # A fact with no "wide" list is refused too, whatever its version says
-        del saved["files"]["FAV.json"]["wide"]
+        del saved["files"]["FAV.json.gz"]["wide"]
         saved["version"] = config.EDA_CANDLE_FACTS_VERSION
         path.write_text(json.dumps(saved))
         assert eda.summarise_candles(tmp_path, info)["read"] == 1
@@ -927,11 +929,11 @@ class TestSummariseCandles:
         _candle_file(tmp_path, "BAD", None, raw=b"{not json")
         _candle_file(tmp_path, "SHAPE", None, raw=b'{"fields": 2, "candles": 5}')
         _candle_file(tmp_path, "ORPHAN", [_c(before, 0.5, 0.5, 4)])
-        (Path(tmp_path) / "candlesticks" / "ignored.txt").write_text("x")
+        (Path(tmp_path) / historical._CANDLES_DIR.name / "ignored.txt").write_text("x")
         info = {t: _info() for t in ("V2", "V1", "LIST", "EMPTY", "BAD", "SHAPE")}
         out = eda.summarise_candles(tmp_path, info)
         assert out["files"] == 7
-        assert out["by_fields"] == {"2": 3, "1": 2}
+        assert out["by_fields"] == {str(config.CANDLESTICK_CACHE_FIELDS_VERSION): 3, "1": 2}
         assert out["empty"] == 1
         assert out["unreadable"] == 2
         assert out["unjoined"] == 1
@@ -949,7 +951,7 @@ class TestSummariseCandles:
         real = os.scandir
         monkeypatch.setattr(os, "scandir", lambda p: (calls.append(str(p)), real(p))[1])
         eda.summarise_candles(tmp_path, {"A": _info()})
-        assert calls == [str(tmp_path / "candlesticks")]
+        assert calls == [str(tmp_path / historical._CANDLES_DIR.name)]
 
     def _spy(self, monkeypatch):
         calls = []
@@ -1000,7 +1002,7 @@ class TestSummariseCandles:
             monkeypatch.setattr(config, "EDA_CANDLE_FACTS_VERSION",
                                 config.EDA_CANDLE_FACTS_VERSION + 1)
         out = eda.summarise_candles(tmp_path, info)
-        assert calls == ["A.json"] and out["read"] == 1
+        assert calls == ["A.json.gz"] and out["read"] == 1
 
     def test_a_close_time_moves_the_price_that_is_read(self, tmp_path):
         _candle_file(tmp_path, "A", [_c(CLOSE_TS - 7200, 0.60, 0.38),
@@ -1018,7 +1020,7 @@ class TestSummariseCandles:
         a.unlink()
         eda.summarise_candles(tmp_path, {"B": _info()})
         saved = json.loads((tmp_path / config.EDA_SUMMARY_DIRNAME / "candles.json").read_text())
-        assert sorted(saved["files"]) == ["B.json"]
+        assert sorted(saved["files"]) == ["B.json.gz"]
 
     @pytest.mark.parametrize("content", [b"", b"[]", b"{not json", b'{"version": 1}'])
     def test_a_damaged_fact_file_is_just_rebuilt(self, tmp_path, content):
@@ -1047,9 +1049,9 @@ class TestSummariseCandles:
         saved = json.loads(saved_path.read_text())
         key, value = change
         if value == "missing":
-            del saved["files"]["A.json"][key]
+            del saved["files"]["A.json.gz"][key]
         else:
-            saved["files"]["A.json"][key] = value
+            saved["files"]["A.json.gz"][key] = value
         # allow_nan keeps a NaN in the file, as a hand-edit or a bug could leave it
         saved_path.write_text(json.dumps(saved))
         out = eda.summarise_candles(tmp_path, {"A": _info()})
@@ -1092,8 +1094,8 @@ class TestInventory:
         (tmp_path / "settled_markets_2025-01-01.jsonl.gz").write_bytes(b"this is not gzip")
         (tmp_path / "settled_markets_2024-01-01.json").write_text("{}")
         (tmp_path / "event_titles_v2.json").write_text("{}")
-        (tmp_path / "scheduled_closes").mkdir()
-        (tmp_path / "scheduled_closes" / "x.json").write_text("{}")
+        (tmp_path / "mystery_folder").mkdir()
+        (tmp_path / "mystery_folder" / "x.json").write_text("{}")
         (tmp_path / "mystery.bin").write_bytes(b"12345")
         (tmp_path / "event_titles.json").write_text("{}")
         (tmp_path / ".DS_Store").write_bytes(b"x")
@@ -1111,7 +1113,7 @@ class TestInventory:
         assert (archive["first_day"], archive["last_day"]) == ("2026-08-05", "2026-08-07")
         assert archive["bytes"] == sum(f.stat().st_size for f in (tmp_path / "archive_days").iterdir())
         assert archive["description"] == eda.INVENTORY_DESCRIPTIONS["archive_days"]
-        candles = rows["candlesticks"]
+        candles = rows[historical._CANDLES_DIR.name]
         assert candles["files"] == 3 and candles["first_day"] is None
         depth = rows[config.DEPTH_SNAPSHOTS_DIRNAME]
         assert depth["detail"] == {"snapshots": 2, "newest": "2026-10-16T07:39:03+00:00"}
@@ -1123,9 +1125,9 @@ class TestInventory:
     def test_unknown_entries_are_listed_not_skipped(self, tmp_path):
         self._tree(tmp_path)
         rows = self._rows(tmp_path)
-        for name in ("scheduled_closes", "mystery.bin"):
+        for name in ("mystery_folder", "mystery.bin"):
             assert rows[name]["description"] == eda.INVENTORY_NOT_DESCRIBED
-        assert rows["scheduled_closes"]["files"] == 1
+        assert rows["mystery_folder"]["files"] == 1
         assert rows["mystery.bin"]["bytes"] == 5
 
     def test_hidden_entries_are_left_out_and_the_old_title_file_is_described(self, tmp_path):
@@ -1189,7 +1191,7 @@ class TestInventory:
         real = os.scandir
         monkeypatch.setattr(os, "scandir", lambda p: (calls.append(str(p)), real(p))[1])
         eda.inventory(tmp_path)
-        assert calls.count(str(tmp_path / "candlesticks")) == 1
+        assert calls.count(str(tmp_path / historical._CANDLES_DIR.name)) == 1
 
     def test_an_unreadable_folder_gets_a_row_saying_so(self, tmp_path, monkeypatch):
         self._tree(tmp_path)
@@ -1204,7 +1206,7 @@ class TestInventory:
         rows = self._rows(tmp_path)
         assert rows["archive_days"]["error"].startswith("PermissionError")
         assert rows["archive_days"]["files"] is None
-        assert rows["candlesticks"]["error"] is None
+        assert rows[historical._CANDLES_DIR.name]["error"] is None
 
     def test_a_missing_cache_folder_is_one_error_row(self, tmp_path):
         rows = eda.inventory(tmp_path / "nope")
@@ -1487,8 +1489,9 @@ class TestDataPage:
         table = _Dom(text).tables[0]
         assert table[0] == list(eda.INVENTORY_HEADERS)
         by_name = {row[0]: row for row in table[1:]}
-        assert set(by_name) == {"archive_days/", "live_days/", "candlesticks/", "eda_days/"}
-        assert by_name["candlesticks/"][1] == "2"
+        candles = historical._CANDLES_DIR.name + "/"
+        assert set(by_name) == {"archive_days/", "live_days/", candles, "eda_days/"}
+        assert by_name[candles][1] == "2"
         assert by_name["archive_days/"][3] == "2026-08-05 to 2026-08-05"
         assert re.fullmatch(r"\d+(\.\d)? (B|KB|MB|GB)", by_name["live_days/"][2])
         assert eda.INVENTORY_NOTE in html.unescape(text)
