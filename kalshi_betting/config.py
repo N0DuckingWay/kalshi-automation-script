@@ -2389,7 +2389,7 @@ BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS = 86_400
 # Backtest only; backtest.py --max-volume-share PCT / --no-volume-cap set it.
 BACKTEST_MAX_VOLUME_SHARE = 0.10
 
-# The length of that "next day", in seconds.
+# ... and the length of that window after the checkpoint, in seconds.
 BACKTEST_VOLUME_SHARE_WINDOW_SECONDS = 86_400
 
 # The highest NO ask a candle can carry: historical.fetch_candlesticks stores a
