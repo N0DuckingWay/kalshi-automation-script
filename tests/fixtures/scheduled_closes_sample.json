@@ -1,0 +1,1609 @@
+{
+ "meta": {
+  "source": "real observations from backtest_cache/scheduled_closes/2026-09-22 and 2026-09-23 (public market data)",
+  "taken_at": "2026-09-22",
+  "format": "scheduled-closes-v1"
+ },
+ "observations": [
+  {
+   "ticker": "KXMLBGAME-26SEP242210SDLAD-SD",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-28T02:10:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-25T05:06:41Z",
+    "expiration_time": "2026-09-28T02:10:00Z",
+    "latest_expiration_time": "2026-09-28T02:10:00Z",
+    "expected_expiration_time": "2026-09-25T05:10:00Z",
+    "occurrence_datetime": "2026-09-25T05:10:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-25T05:09:48.278605Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP242210SDLAD-LAD",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-28T02:10:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-25T05:06:41Z",
+    "expiration_time": "2026-09-28T02:10:00Z",
+    "latest_expiration_time": "2026-09-28T02:10:00Z",
+    "expected_expiration_time": "2026-09-25T05:10:00Z",
+    "occurrence_datetime": "2026-09-25T05:10:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-25T05:09:48.278605Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP242140LAASEA-LAA",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-28T01:40:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-25T04:30:18Z",
+    "expiration_time": "2026-09-28T01:40:00Z",
+    "latest_expiration_time": "2026-09-28T01:40:00Z",
+    "expected_expiration_time": "2026-09-25T04:40:00Z",
+    "occurrence_datetime": "2026-09-25T04:40:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-25T04:33:18.231929Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP242140LAASEA-SEA",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-28T01:40:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-25T04:30:18Z",
+    "expiration_time": "2026-09-28T01:40:00Z",
+    "latest_expiration_time": "2026-09-28T01:40:00Z",
+    "expected_expiration_time": "2026-09-25T04:40:00Z",
+    "occurrence_datetime": "2026-09-25T04:40:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-25T04:33:18.231929Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP242140HOUATH-HOU",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-28T01:40:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-25T04:30:16Z",
+    "expiration_time": "2026-09-28T01:40:00Z",
+    "latest_expiration_time": "2026-09-28T01:40:00Z",
+    "expected_expiration_time": "2026-09-25T04:40:00Z",
+    "occurrence_datetime": "2026-09-25T04:40:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-25T04:33:18.211366Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP242140HOUATH-ATH",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-28T01:40:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-25T04:30:16Z",
+    "expiration_time": "2026-09-28T01:40:00Z",
+    "latest_expiration_time": "2026-09-28T01:40:00Z",
+    "expected_expiration_time": "2026-09-25T04:40:00Z",
+    "occurrence_datetime": "2026-09-25T04:40:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-25T04:33:18.211366Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP241915CINATL-CIN",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T23:15:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-25T02:00:28Z",
+    "expiration_time": "2026-09-27T23:15:00Z",
+    "latest_expiration_time": "2026-09-27T23:15:00Z",
+    "expected_expiration_time": "2026-09-25T02:15:00Z",
+    "occurrence_datetime": "2026-09-25T02:15:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-25T02:03:28.192732Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP241915CINATL-ATL",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T23:15:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-25T02:00:28Z",
+    "expiration_time": "2026-09-27T23:15:00Z",
+    "latest_expiration_time": "2026-09-27T23:15:00Z",
+    "expected_expiration_time": "2026-09-25T02:15:00Z",
+    "occurrence_datetime": "2026-09-25T02:15:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-25T02:03:28.192732Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP241905TBNYY-TB",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T23:05:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-25T02:05:44Z",
+    "expiration_time": "2026-09-27T23:05:00Z",
+    "latest_expiration_time": "2026-09-27T23:05:00Z",
+    "expected_expiration_time": "2026-09-25T02:05:00Z",
+    "occurrence_datetime": "2026-09-25T02:05:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-25T02:08:48.351359Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP241905TBNYY-NYY",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T23:05:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-25T02:05:44Z",
+    "expiration_time": "2026-09-27T23:05:00Z",
+    "latest_expiration_time": "2026-09-27T23:05:00Z",
+    "expected_expiration_time": "2026-09-25T02:05:00Z",
+    "occurrence_datetime": "2026-09-25T02:05:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-25T02:08:48.351359Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP241845CLEBOS-CLE",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T22:45:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-25T01:15:58Z",
+    "expiration_time": "2026-09-27T22:45:00Z",
+    "latest_expiration_time": "2026-09-27T22:45:00Z",
+    "expected_expiration_time": "2026-09-25T01:45:00Z",
+    "occurrence_datetime": "2026-09-25T01:45:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-25T01:18:58.139438Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP241845CLEBOS-BOS",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T22:45:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-25T01:15:58Z",
+    "expiration_time": "2026-09-27T22:45:00Z",
+    "latest_expiration_time": "2026-09-27T22:45:00Z",
+    "expected_expiration_time": "2026-09-25T01:45:00Z",
+    "occurrence_datetime": "2026-09-25T01:45:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-25T01:18:58.139438Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP241805MILPHI-MIL",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T22:05:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-25T01:00:39Z",
+    "expiration_time": "2026-09-27T22:05:00Z",
+    "latest_expiration_time": "2026-09-27T22:05:00Z",
+    "expected_expiration_time": "2026-09-25T01:05:00Z",
+    "occurrence_datetime": "2026-09-25T01:05:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-25T01:03:38.169367Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP241805MILPHI-PHI",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T22:05:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-25T01:00:39Z",
+    "expiration_time": "2026-09-27T22:05:00Z",
+    "latest_expiration_time": "2026-09-27T22:05:00Z",
+    "expected_expiration_time": "2026-09-25T01:05:00Z",
+    "occurrence_datetime": "2026-09-25T01:05:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-25T01:03:38.169367Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP241510AZCOL-AZ",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T19:10:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-24T22:26:43Z",
+    "expiration_time": "2026-09-27T19:10:00Z",
+    "latest_expiration_time": "2026-09-27T19:10:00Z",
+    "expected_expiration_time": "2026-09-24T22:10:00Z",
+    "occurrence_datetime": "2026-09-24T22:10:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-24T22:29:48.123964Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP241510AZCOL-COL",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T19:10:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-24T22:26:43Z",
+    "expiration_time": "2026-09-27T19:10:00Z",
+    "latest_expiration_time": "2026-09-27T19:10:00Z",
+    "expected_expiration_time": "2026-09-24T22:10:00Z",
+    "occurrence_datetime": "2026-09-24T22:10:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-24T22:29:48.123964Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP241435NYMTEX-NYM",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T18:35:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-24T21:10:12Z",
+    "expiration_time": "2026-09-27T18:35:00Z",
+    "latest_expiration_time": "2026-09-27T18:35:00Z",
+    "expected_expiration_time": "2026-09-24T21:35:00Z",
+    "occurrence_datetime": "2026-09-24T21:35:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-24T21:13:18.181211Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP241435NYMTEX-TEX",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T18:35:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-24T21:10:12Z",
+    "expiration_time": "2026-09-27T18:35:00Z",
+    "latest_expiration_time": "2026-09-27T18:35:00Z",
+    "expected_expiration_time": "2026-09-24T21:35:00Z",
+    "occurrence_datetime": "2026-09-24T21:35:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-24T21:13:18.181211Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP241420MIACHC-MIA",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T18:20:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-24T20:50:16Z",
+    "expiration_time": "2026-09-27T18:20:00Z",
+    "latest_expiration_time": "2026-09-27T18:20:00Z",
+    "expected_expiration_time": "2026-09-24T21:20:00Z",
+    "occurrence_datetime": "2026-09-24T21:20:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-24T20:53:18.148565Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP241420MIACHC-CHC",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T18:20:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-24T20:50:16Z",
+    "expiration_time": "2026-09-27T18:20:00Z",
+    "latest_expiration_time": "2026-09-27T18:20:00Z",
+    "expected_expiration_time": "2026-09-24T21:20:00Z",
+    "occurrence_datetime": "2026-09-24T21:20:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-24T20:53:18.148565Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP241410CWSKC-CWS",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T18:10:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-24T20:50:17Z",
+    "expiration_time": "2026-09-27T18:10:00Z",
+    "latest_expiration_time": "2026-09-27T18:10:00Z",
+    "expected_expiration_time": "2026-09-24T21:10:00Z",
+    "occurrence_datetime": "2026-09-24T21:10:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-24T20:53:18.160307Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP241410CWSKC-KC",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T18:10:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-24T20:50:17Z",
+    "expiration_time": "2026-09-27T18:10:00Z",
+    "latest_expiration_time": "2026-09-27T18:10:00Z",
+    "expected_expiration_time": "2026-09-24T21:10:00Z",
+    "occurrence_datetime": "2026-09-24T21:10:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-24T20:53:18.160307Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP241235STLPIT-STL",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T16:35:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-24T19:20:22Z",
+    "expiration_time": "2026-09-27T16:35:00Z",
+    "latest_expiration_time": "2026-09-27T16:35:00Z",
+    "expected_expiration_time": "2026-09-24T19:35:00Z",
+    "occurrence_datetime": "2026-09-24T19:35:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-24T19:23:28.20859Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP241235STLPIT-PIT",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T16:35:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-24T19:20:22Z",
+    "expiration_time": "2026-09-27T16:35:00Z",
+    "latest_expiration_time": "2026-09-27T16:35:00Z",
+    "expected_expiration_time": "2026-09-24T19:35:00Z",
+    "occurrence_datetime": "2026-09-24T19:35:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-24T19:23:28.20859Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP232210SDLAD-SD",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T02:10:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-24T05:20:06Z",
+    "expiration_time": "2026-09-27T02:10:00Z",
+    "latest_expiration_time": "2026-09-27T02:10:00Z",
+    "expected_expiration_time": "2026-09-24T05:10:00Z",
+    "occurrence_datetime": "2026-09-24T05:10:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-24T05:23:08.329843Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP232210SDLAD-LAD",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T02:10:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-24T05:20:06Z",
+    "expiration_time": "2026-09-27T02:10:00Z",
+    "latest_expiration_time": "2026-09-27T02:10:00Z",
+    "expected_expiration_time": "2026-09-24T05:10:00Z",
+    "occurrence_datetime": "2026-09-24T05:10:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-24T05:23:08.329843Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP232210HOUSEA-HOU",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T02:10:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-24T05:36:44Z",
+    "expiration_time": "2026-09-27T02:10:00Z",
+    "latest_expiration_time": "2026-09-27T02:10:00Z",
+    "expected_expiration_time": "2026-09-24T05:10:00Z",
+    "occurrence_datetime": "2026-09-24T05:10:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-24T05:39:48.317521Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP232210HOUSEA-SEA",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T02:10:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-24T05:36:44Z",
+    "expiration_time": "2026-09-27T02:10:00Z",
+    "latest_expiration_time": "2026-09-27T02:10:00Z",
+    "expected_expiration_time": "2026-09-24T05:10:00Z",
+    "occurrence_datetime": "2026-09-24T05:10:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-24T05:39:48.317521Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP232140LAAATH-LAA",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T01:40:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-24T04:41:54Z",
+    "expiration_time": "2026-09-27T01:40:00Z",
+    "latest_expiration_time": "2026-09-27T01:40:00Z",
+    "expected_expiration_time": "2026-09-24T04:40:00Z",
+    "occurrence_datetime": "2026-09-24T04:40:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-24T04:44:58.237374Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXMLBGAME-26SEP232140LAAATH-ATH",
+   "series": "KXMLBGAME",
+   "live_close_time": "2026-09-27T01:40:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-24T04:41:54Z",
+    "expiration_time": "2026-09-27T01:40:00Z",
+    "latest_expiration_time": "2026-09-27T01:40:00Z",
+    "expected_expiration_time": "2026-09-24T04:40:00Z",
+    "occurrence_datetime": "2026-09-24T04:40:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-24T04:44:58.237374Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.850",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.855",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.860",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.865",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.870",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.875",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.880",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.885",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.890",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.895",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.900",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.905",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.910",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.915",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.920",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.925",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.930",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.935",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.940",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.945",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.950",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.955",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.960",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.965",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.970",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.975",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.980",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.985",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.990",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNATGASD-26SEP2317-T2.995",
+   "series": "KXNATGASD",
+   "live_close_time": "2026-09-23T21:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-09-23T21:00:00Z",
+    "expiration_time": "2026-09-30T22:00:00Z",
+    "latest_expiration_time": "2026-09-30T22:00:00Z",
+    "expected_expiration_time": "2026-09-23T21:00:00Z",
+    "occurrence_datetime": "2026-09-23T21:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-09-23T22:10:48.212189Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-26-DJT",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2026-12-31T23:59:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2026-10-09T09:08:29Z",
+    "latest_expiration_time": "2026-10-09T09:08:29Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.655286Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-26-FRA",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2026-12-31T23:59:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2026-10-09T09:08:29Z",
+    "latest_expiration_time": "2026-10-09T09:08:29Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.642495Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-26-NAR",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2026-12-31T23:59:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2026-10-09T09:08:29Z",
+    "latest_expiration_time": "2026-10-09T09:08:29Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.643449Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-26-VOL",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2026-12-31T23:59:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2026-10-09T09:08:29Z",
+    "latest_expiration_time": "2026-10-09T09:08:29Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.64331Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-26-EUR",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2026-12-31T23:59:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2026-10-09T09:08:29Z",
+    "latest_expiration_time": "2026-10-09T09:08:29Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.646602Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-26-ELO",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2026-12-31T23:59:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2026-10-09T09:08:29Z",
+    "latest_expiration_time": "2026-10-09T09:08:29Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.644354Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-26-DOC",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2026-12-31T23:59:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2026-10-09T09:08:29Z",
+    "latest_expiration_time": "2026-10-09T09:08:29Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.650674Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-26-ICJ",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2026-12-31T23:59:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2026-10-09T09:08:29Z",
+    "latest_expiration_time": "2026-10-09T09:08:29Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.647942Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-26-CE",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2026-12-31T23:59:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2026-10-09T09:08:29Z",
+    "latest_expiration_time": "2026-10-09T09:08:29Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.64622Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-26-SUD",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2026-12-31T23:59:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2026-10-09T09:08:29Z",
+    "latest_expiration_time": "2026-10-09T09:08:29Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.659697Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-26-MIN",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2026-12-31T23:59:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2026-12-31T23:59:00Z",
+    "latest_expiration_time": "2026-12-31T23:59:00Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.661445Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-26-DAR",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2027-01-01T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2027-01-01T15:00:00Z",
+    "latest_expiration_time": "2027-01-01T15:00:00Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.661614Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-26-SAM",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2027-01-01T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2027-01-01T15:00:00Z",
+    "latest_expiration_time": "2027-01-01T15:00:00Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.643486Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-27-YNAV",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2027-01-01T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2027-01-01T15:00:00Z",
+    "latest_expiration_time": "2027-01-01T15:00:00Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.660484Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-27-MKUL",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2027-01-01T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2027-01-01T15:00:00Z",
+    "latest_expiration_time": "2027-01-01T15:00:00Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.661122Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-27-STC",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2027-01-01T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2027-01-01T15:00:00Z",
+    "latest_expiration_time": "2027-01-01T15:00:00Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.663015Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-27-CPJ",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2027-01-01T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2027-01-01T15:00:00Z",
+    "latest_expiration_time": "2027-01-01T15:00:00Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.661798Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-27-ICC",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2027-01-01T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2027-01-01T15:00:00Z",
+    "latest_expiration_time": "2027-01-01T15:00:00Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.648103Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-27-PLEO",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2027-01-01T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2027-01-01T15:00:00Z",
+    "latest_expiration_time": "2027-01-01T15:00:00Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.647572Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-27-UNRWA",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2027-01-01T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2027-01-01T15:00:00Z",
+    "latest_expiration_time": "2027-01-01T15:00:00Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.655848Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-27-SSHA",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2027-01-01T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2027-01-01T15:00:00Z",
+    "latest_expiration_time": "2027-01-01T15:00:00Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.643887Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-26-MAR",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2027-01-01T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2027-01-01T15:00:00Z",
+    "latest_expiration_time": "2027-01-01T15:00:00Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.656226Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-26-SAR",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2027-01-01T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2027-01-01T15:00:00Z",
+    "latest_expiration_time": "2027-01-01T15:00:00Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.64363Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNOBELPEACE-26-TAM",
+   "series": "KXNOBELPEACE",
+   "live_close_time": "2027-01-01T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-09T09:08:29Z",
+    "expiration_time": "2027-01-01T15:00:00Z",
+    "latest_expiration_time": "2027-01-01T15:00:00Z",
+    "expected_expiration_time": "2027-01-01T15:00:00Z",
+    "occurrence_datetime": "2026-10-09T08:43:58.949Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-09T09:38:33.64648Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNEXTLABORSEC-29-KSON",
+   "series": "KXNEXTLABORSEC",
+   "live_close_time": "2029-01-20T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-01T13:07:34Z",
+    "expiration_time": "2029-01-20T15:00:00Z",
+    "latest_expiration_time": "2029-01-20T15:00:00Z",
+    "expected_expiration_time": "2029-01-20T15:00:00Z",
+    "occurrence_datetime": "2029-01-20T15:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-01T13:37:44.16649Z",
+    "result": "yes"
+   }
+  },
+  {
+   "ticker": "KXNEXTLABORSEC-29-PPIZ",
+   "series": "KXNEXTLABORSEC",
+   "live_close_time": "2029-01-20T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-01T13:07:34Z",
+    "expiration_time": "2029-01-20T15:00:00Z",
+    "latest_expiration_time": "2029-01-20T15:00:00Z",
+    "expected_expiration_time": "2029-01-20T15:00:00Z",
+    "occurrence_datetime": "2029-01-20T15:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-01T13:37:44.16649Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNEXTLABORSEC-29-BSLA",
+   "series": "KXNEXTLABORSEC",
+   "live_close_time": "2029-01-20T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-01T13:07:34Z",
+    "expiration_time": "2029-01-20T15:00:00Z",
+    "latest_expiration_time": "2029-01-20T15:00:00Z",
+    "expected_expiration_time": "2029-01-20T15:00:00Z",
+    "occurrence_datetime": "2029-01-20T15:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-01T13:37:44.16649Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNEXTLABORSEC-29-JBER",
+   "series": "KXNEXTLABORSEC",
+   "live_close_time": "2029-01-20T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-01T13:07:34Z",
+    "expiration_time": "2029-01-20T15:00:00Z",
+    "latest_expiration_time": "2029-01-20T15:00:00Z",
+    "expected_expiration_time": "2029-01-20T15:00:00Z",
+    "occurrence_datetime": "2029-01-20T15:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-01T13:37:44.16649Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNEXTLABORSEC-29-JTAY",
+   "series": "KXNEXTLABORSEC",
+   "live_close_time": "2029-01-20T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-01T13:07:34Z",
+    "expiration_time": "2029-01-20T15:00:00Z",
+    "latest_expiration_time": "2029-01-20T15:00:00Z",
+    "expected_expiration_time": "2029-01-20T15:00:00Z",
+    "occurrence_datetime": "2029-01-20T15:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-01T13:37:44.16649Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNEXTLABORSEC-29-BWIL",
+   "series": "KXNEXTLABORSEC",
+   "live_close_time": "2029-01-20T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-01T13:07:34Z",
+    "expiration_time": "2029-01-20T15:00:00Z",
+    "latest_expiration_time": "2029-01-20T15:00:00Z",
+    "expected_expiration_time": "2029-01-20T15:00:00Z",
+    "occurrence_datetime": "2029-01-20T15:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-01T13:37:44.16649Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNEXTLABORSEC-29-APUZ",
+   "series": "KXNEXTLABORSEC",
+   "live_close_time": "2029-01-20T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-01T13:07:34Z",
+    "expiration_time": "2029-01-20T15:00:00Z",
+    "latest_expiration_time": "2029-01-20T15:00:00Z",
+    "expected_expiration_time": "2029-01-20T15:00:00Z",
+    "occurrence_datetime": "2029-01-20T15:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-01T13:37:44.16649Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNEXTLABORSEC-29-GYOU",
+   "series": "KXNEXTLABORSEC",
+   "live_close_time": "2029-01-20T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-01T13:07:34Z",
+    "expiration_time": "2029-01-20T15:00:00Z",
+    "latest_expiration_time": "2029-01-20T15:00:00Z",
+    "expected_expiration_time": "2029-01-20T15:00:00Z",
+    "occurrence_datetime": "2029-01-20T15:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-01T13:37:44.16649Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNEXTLABORSEC-29-RDES",
+   "series": "KXNEXTLABORSEC",
+   "live_close_time": "2029-01-20T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-01T13:07:34Z",
+    "expiration_time": "2029-01-20T15:00:00Z",
+    "latest_expiration_time": "2029-01-20T15:00:00Z",
+    "expected_expiration_time": "2029-01-20T15:00:00Z",
+    "occurrence_datetime": "2029-01-20T15:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-01T13:37:44.16649Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNEXTLABORSEC-29-SOBR",
+   "series": "KXNEXTLABORSEC",
+   "live_close_time": "2029-01-20T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-01T13:07:34Z",
+    "expiration_time": "2029-01-20T15:00:00Z",
+    "latest_expiration_time": "2029-01-20T15:00:00Z",
+    "expected_expiration_time": "2029-01-20T15:00:00Z",
+    "occurrence_datetime": "2029-01-20T15:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-01T13:37:44.16649Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNEXTLABORSEC-29-ESCA",
+   "series": "KXNEXTLABORSEC",
+   "live_close_time": "2029-01-20T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-01T13:07:34Z",
+    "expiration_time": "2029-01-20T15:00:00Z",
+    "latest_expiration_time": "2029-01-20T15:00:00Z",
+    "expected_expiration_time": "2029-01-20T15:00:00Z",
+    "occurrence_datetime": "2029-01-20T15:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-01T13:37:44.16649Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNEXTLABORSEC-29-VMIC",
+   "series": "KXNEXTLABORSEC",
+   "live_close_time": "2029-01-20T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-01T13:07:34Z",
+    "expiration_time": "2029-01-20T15:00:00Z",
+    "latest_expiration_time": "2029-01-20T15:00:00Z",
+    "expected_expiration_time": "2029-01-20T15:00:00Z",
+    "occurrence_datetime": "2029-01-20T15:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-01T13:37:44.16649Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNEXTLABORSEC-29-AROG",
+   "series": "KXNEXTLABORSEC",
+   "live_close_time": "2029-01-20T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-01T13:07:34Z",
+    "expiration_time": "2029-01-20T15:00:00Z",
+    "latest_expiration_time": "2029-01-20T15:00:00Z",
+    "expected_expiration_time": "2029-01-20T15:00:00Z",
+    "occurrence_datetime": "2029-01-20T15:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-01T13:37:44.16649Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNEXTLABORSEC-29-RPAL",
+   "series": "KXNEXTLABORSEC",
+   "live_close_time": "2029-01-20T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-01T13:07:34Z",
+    "expiration_time": "2029-01-20T15:00:00Z",
+    "latest_expiration_time": "2029-01-20T15:00:00Z",
+    "expected_expiration_time": "2029-01-20T15:00:00Z",
+    "occurrence_datetime": "2029-01-20T15:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-01T13:37:44.16649Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNEXTLABORSEC-29-DARO",
+   "series": "KXNEXTLABORSEC",
+   "live_close_time": "2029-01-20T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-01T13:07:34Z",
+    "expiration_time": "2029-01-20T15:00:00Z",
+    "latest_expiration_time": "2029-01-20T15:00:00Z",
+    "expected_expiration_time": "2029-01-20T15:00:00Z",
+    "occurrence_datetime": "2029-01-20T15:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-01T13:37:44.16649Z",
+    "result": "no"
+   }
+  },
+  {
+   "ticker": "KXNEXTLABORSEC-29-RMOO",
+   "series": "KXNEXTLABORSEC",
+   "live_close_time": "2029-01-20T15:00:00Z",
+   "record": {
+    "status": "finalized",
+    "close_time": "2026-10-01T13:07:34Z",
+    "expiration_time": "2029-01-20T15:00:00Z",
+    "latest_expiration_time": "2029-01-20T15:00:00Z",
+    "expected_expiration_time": "2029-01-20T15:00:00Z",
+    "occurrence_datetime": "2029-01-20T15:00:00Z",
+    "can_close_early": true,
+    "settlement_ts": "2026-10-01T13:37:44.16649Z",
+    "result": "no"
+   }
+  }
+ ]
+}

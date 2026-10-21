@@ -402,8 +402,10 @@ def _seed_series_listing(series: dict, fetched_at: datetime | None = None) -> No
     """
     stamp = datetime.now(UTC) if fetched_at is None else fetched_at
     historical._SERIES_CATEGORIES_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    # A "fees" block too (every series at the full fee), as the fetch writes it
     historical._SERIES_CATEGORIES_CACHE.write_text(json.dumps(
-        {"fetched_at": stamp.isoformat(), "series": series}))
+        {"fetched_at": stamp.isoformat(), "series": series,
+         "fees": {t: ["quadratic", 1] for t in series}}))
 
 
 def _main_with(monkeypatch, argv: list, **patches) -> dict:
@@ -3179,6 +3181,100 @@ class TestSeriesLabelsAreAttached:
                                                   max_horizon_days=None))
         assert caplog.messages.count(self._NO_LISTING) == 1
 
+    def test_each_market_carries_its_series_fee_multiplier(self):
+        # 1.0, the full fee, for a series the map lacks; the listed one otherwise
+        # (each from an event read with no fee override, as the run's list is)
+        markets = [SimpleNamespace(event_ticker="KXMLBGAME-26OCT16LADNYM",
+                                   _event_fee_override=None),
+                   SimpleNamespace(event_ticker="KXBTCY-26DEC31", _event_fee_override=None),
+                   SimpleNamespace(event_ticker="KXNCAAFGAME-26OCT16UKOKLA",
+                                   _event_fee_override=None),
+                   SimpleNamespace(event_ticker="", _event_fee_override=None)]
+        main._attach_series_labels(
+            markets, {}, fee_multipliers={"KXMLBGAME": 0.5, "KXBTCY": 0.0})
+        assert [m._fee_multiplier for m in markets] == [0.5, 0.0, 1.0, 1.0]
+
+    def test_an_event_override_wins_and_an_unknown_one_is_the_full_fee(self):
+        markets = [SimpleNamespace(event_ticker="KXMLBGAME-26OCT16LADNYM",
+                                   _event_fee_override=1.0),
+                   SimpleNamespace(event_ticker="KXMLBGAME-26OCT17LADNYM",
+                                   _event_fee_override=0.0),
+                   SimpleNamespace(event_ticker="KXMLBGAME-26OCT18LADNYM",
+                                   _event_fee_override="unknown"),
+                   # A market not from the run's event listing carries none
+                   SimpleNamespace(event_ticker="KXMLBGAME-26OCT19LADNYM")]
+        main._attach_series_labels(markets, {}, fee_multipliers={"KXMLBGAME": 0.5})
+        assert [m._fee_multiplier for m in markets] == [1.0, 0.0, 1.0, 1.0]
+
+    def test_markets_whose_multiplier_is_not_confirmed_are_counted_once(self, caplog):
+        markets = [SimpleNamespace(event_ticker=t, _event_fee_override=None)
+                   for t in ("KXMLBGAME-26OCT16LADNYM", "KXMLBGAME-26OCT17LADNYM",
+                             "KXBTCY-26DEC31", "KXNCAAFGAME-26OCT16UKOKLA")]
+        with caplog.at_level(logging.INFO):
+            main._attach_series_labels(
+                markets, {}, fee_multipliers={"KXMLBGAME": 0.5, "KXBTCY": 0.0})
+        line = ("Fee multipliers listed but not confirmed (charged in full): 3 markets "
+                "(multipliers: 0.5 x 2, 0 x 1)")
+        assert caplog.messages.count(line) == 1
+
+    def test_no_unconfirmed_multiplier_logs_no_count(self, caplog):
+        markets = [SimpleNamespace(event_ticker="KXNCAAFGAME-26OCT16UKOKLA")]
+        with caplog.at_level(logging.INFO):
+            main._attach_series_labels(markets, {}, fee_multipliers={"KXMLBGAME": 0.5})
+        assert not any("Fee multipliers listed" in m for m in caplog.messages)
+
+    def test_no_multipliers_given_means_the_full_fee(self):
+        markets = [SimpleNamespace(event_ticker="KXMLBGAME-26OCT16LADNYM")]
+        main._attach_series_labels(markets, {"KXMLBGAME": ("Sports", ("Baseball",))})
+        assert markets[0]._fee_multiplier == 1.0
+        assert markets[0]._series_labels == ("Sports", "Baseball")
+
+    @staticmethod
+    def _spy_multipliers(monkeypatch) -> list:
+        reads: list = []
+        real = main.load_series_fee_multipliers
+
+        def load(client, **kwargs):
+            # A live run only reads the cache file: it never asks for an upgrade fetch
+            assert not kwargs.get("upgrade"), kwargs
+            reads.append(client)
+            return real(client, **kwargs)
+
+        monkeypatch.setattr(main, "load_series_fee_multipliers", load)
+        return reads
+
+    def test_a_production_run_reads_the_multipliers_once_with_its_client(self, monkeypatch):
+        client = _live_shape_client(monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD)
+        historical._SERIES_CATEGORIES_CACHE.write_text(json.dumps(
+            {"fetched_at": datetime.now(UTC).isoformat(),
+             "series": {"EXPEVT": ["Sports", ["Baseball"]]},
+             "fees": {"EXPEVT": ["quadratic", 0.5]}}))
+        reads = self._spy_multipliers(monkeypatch)
+        seen: list = []
+        real_st = main.find_same_title_pairs
+
+        def same_title(markets, *args, **kwargs):
+            seen.extend(markets)
+            return real_st(markets, *args, **kwargs)
+
+        monkeypatch.setattr(main, "find_same_title_pairs", same_title)
+        monkeypatch.setattr(main, "append_to_prod_log",
+                            lambda *a, **k: pathlib.Path("/fake/trade_log.xlsx"))
+        main._run_prod(client, _args(dry_run=True))
+        assert reads == [client]
+        # Every market is filed with a multiplier, 1.0 for every series the map lacks
+        assert {m._fee_multiplier for m in seen if m.event_ticker.startswith("EXPEVT")} == {0.5}
+        assert {m._fee_multiplier for m in seen
+                if not m.event_ticker.startswith("EXPEVT")} == {1.0}
+
+    def test_a_dev_run_reads_the_cached_multipliers_only(self, monkeypatch):
+        client = _live_shape_client(monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD)
+        _capture_dev_simulation(monkeypatch)
+        reads = self._spy_multipliers(monkeypatch)
+        main._run_dev(client, SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None))
+        # No client: the sandbox key never signs a production request
+        assert reads == [None]
+
     def test_two_series_filed_differently_form_no_same_title_pair(self, monkeypatch, caplog):
         # The live-shape fixture's one tradeable pair (SAME-EXP / SAME-CHEAP)
         # with its two series filed under two different tags: the finder
@@ -3681,10 +3777,11 @@ class TestLiveSettingsReachEverySite:
         # The seller is handed the run's settings (a production run only: dev holds nothing)
         real_plan_sales = main.plan_sales
 
-        def plan_sales_spy(client_, positions, labels, by_ticker, *, settings, now):
+        def plan_sales_spy(client_, positions, labels, by_ticker, *, settings, now,
+                           fee_multipliers):
             captured.setdefault("plan_sales", []).append(settings)
             return real_plan_sales(client_, positions, labels, by_ticker, settings=settings,
-                                   now=now)
+                                   now=now, fee_multipliers=fee_multipliers)
 
         monkeypatch.setattr(main, "plan_sales", plan_sales_spy)
         # ... and so is the trim planner, with the run's cash and positions value
@@ -5618,9 +5715,10 @@ def _run_selling(exchange: _SellExchange, monkeypatch, caplog, *, dry_run: bool,
     real_collateral = main.ensure_shard_collateral
     real_ts, real_st = main.find_time_series_pairs, main.find_same_title_pairs
 
-    def plan_spy(client_, positions, labels, by_ticker, *, settings, now):
+    def plan_spy(client_, positions, labels, by_ticker, *, settings, now, fee_multipliers):
         seen["plan_sales"].append(settings)
-        return real_plan(client_, positions, labels, by_ticker, settings=settings, now=now)
+        return real_plan(client_, positions, labels, by_ticker, settings=settings, now=now,
+                         fee_multipliers=fee_multipliers)
 
     def trims_spy(client_, positions, labels, by_ticker, *, settings, now, cash_cents,
                   positions_value_cents, skip=frozenset()):
@@ -7465,9 +7563,10 @@ class TestRunProdTrimsAfterAPriceMove:
         seen: dict = {"plan_sales": [], "plan_trims": [], "log": []}
         real_sales, real_trims = main.plan_sales, main.plan_trims
 
-        def sales_spy(client_, *args, settings, now):
+        def sales_spy(client_, *args, settings, now, fee_multipliers):
             seen["plan_sales"].append(settings)
-            return real_sales(client_, *args, settings=settings, now=now)
+            return real_sales(client_, *args, settings=settings, now=now,
+                              fee_multipliers=fee_multipliers)
 
         def trims_spy(client_, *args, **kwargs):
             seen["plan_trims"].append(kwargs)

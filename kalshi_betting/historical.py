@@ -41,10 +41,15 @@ Dependencies:
     fetch_all_settled_markets(), fetch_candlesticks(), and infer_category(),
     all called by backtester.py (infer_category() by main.py and
     live_portfolio.py too). load_series_categories() is called by
-    backtest.py, backtester.py, main.py and live_dashboard.py, series_labels()
+    backtest.py, backtester.py, main.py and live_dashboard.py,
+    load_series_fee_multipliers() (each series' fee multiplier from the same
+    cached listing; carried, not yet used for a fee) by backtest.py,
+    backtester.py and main.py, series_labels()
     by backtester.py, dashboard.py, main.py and live_portfolio.py, and
     load_event_competitions() (each event's competition label, for the
-    backtest's same-title sport check, DR-79) by backtester.py. live_portfolio.py (the Live
+    backtest's same-title sport check, DR-79) and load_event_facts() (each
+    event's settlement sources and mutually_exclusive flag, for the
+    backtest's report only) by backtester.py. live_portfolio.py (the Live
     trading tab, which only reads) also reads _historical_get with
     _API_PREFIX, its only way to Kalshi, _candle_close, and _load_json_cache
     and _save_json_cache for the finalized markets' daily prices it keeps.
@@ -200,7 +205,7 @@ from .config import (
     SETTLED_FETCH_CHUNK_RECORDS,
     SETTLED_FETCH_MAX_WORKERS,
 )
-from .scanner import event_competition, event_series
+from .scanner import EVENT_FEE_OVERRIDE_UNKNOWN, event_competition, event_fee_override, event_series
 
 # Optional acceleration for the day-slice store, which serializes and re-parses
 # tens of millions of compact market dicts per full-history fetch. orjson is an
@@ -222,7 +227,13 @@ _API_HOST = f"{_PROD_PARSED.scheme}://{_PROD_PARSED.netloc}"
 _API_PREFIX = _PROD_PARSED.path  # "/trade-api/v2"
 
 CACHE_DIR = PROJECT_ROOT / "backtest_cache"
-_CANDLES_DIR = CACHE_DIR / "candlesticks"
+# The hourly candle cache: one gzipped JSON file per ticker, holding the whole hourly
+# record (CANDLESTICK_CACHE_FIELDS_VERSION 3). It lives in its own folder, apart from
+# the plain-JSON "candlesticks" folder an older checkout still reads and writes, so
+# the two never refetch over each other; nothing here ever reads or writes that one.
+_CANDLES_DIR = CACHE_DIR / "candlesticks_v3"
+# A candle file's name is "<ticker>" plus this (eda.py lists the folder by it)
+_CANDLE_FILE_SUFFIX = ".json.gz"
 # Maps event_ticker → event_title, populated lazily by _load_or_build_event_titles
 # so the backtester can construct the same (event_title + market_title) grouping
 # key the live scanner uses. The "_v2" file holds GENUINE answers only; the
@@ -322,7 +333,10 @@ def series_labels(
 
 
 # Disk copy of Kalshi's /series listing: {"fetched_at": ISO, "series":
-# {series_ticker: [category, [tags...]]}}. See load_series_categories.
+# {series_ticker: [category, [tags...]]}, "fees": {series_ticker:
+# [fee_type, multiplier-or-null]}}. See load_series_categories and
+# load_series_fee_multipliers. A file written before the "fees" block existed
+# still reads for categories; for fees it counts as stale.
 _SERIES_CATEGORIES_CACHE = CACHE_DIR / "series_categories.json"
 # /series served every series in one response when checked (2026-09-25, no
 # cursor); should it ever paginate, this bounds the walk.
@@ -348,6 +362,148 @@ def _parse_series_categories(raw: Any) -> dict[str, tuple[str, tuple[str, ...]]]
                 and isinstance(value[0], str) and isinstance(value[1], list)):
             out[ticker] = (value[0], tuple(t for t in value[1] if isinstance(t, str)))
     return out
+
+
+def _fee_type(raw: Any) -> str:
+    """
+    Read a series' fee_type: its text, or "" when it is not text.
+
+    Kalshi lists "quadratic" (15,024 of 15,187 series on 2026-10-16),
+    "quadratic_with_maker_fees" (160) and "quadratic_with_combo_maker_fees"
+    (3). Nothing reads it yet; it is kept so a later change can.
+
+    Args:
+        raw (Any): The listing's fee_type value.
+
+    Returns:
+        str: The fee type, or "" when the value is not a string.
+    """
+    return raw if isinstance(raw, str) else ""
+
+
+def _parse_fee_multiplier(raw: Any) -> float | None:
+    """
+    A series' listed fee_multiplier when it can be trusted, else None (unknown).
+
+    It checks the value rather than reformatting it: only a real number from 0
+    to 1 is kept (Kalshi lists 1, 0.5 or 0). A bool, a string such as "0.5",
+    NaN, a number outside 0 to 1 or a missing value reads as None, and a
+    reader then charges that series the full fee.
+
+    Args:
+        raw (Any): The listing's fee_multiplier value.
+
+    Returns:
+        float | None: The multiplier, or None when unknown.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    try:
+        value = float(raw)
+    except OverflowError:  # a JSON integer of hundreds of digits
+        return None
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        return None
+    return value
+
+
+def _parse_series_fees(raw: Any) -> dict[str, tuple[str, float | None]] | None:
+    """
+    Read a series_categories.json "fees" block back into (fee_type, multiplier).
+
+    Args:
+        raw (Any): The cached "fees" value. Anything but a dict gives None,
+            which tells the caller the file has no usable fee block.
+
+    Returns:
+        dict[str, tuple[str, float | None]] | None: series ticker ->
+            (fee type, multiplier or None when unknown), skipping any entry
+            that is not [str, number-or-null]; each multiplier is checked
+            again, so a hand-edited bad one reads as unknown.
+    """
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, tuple[str, float | None]] = {}
+    for ticker, value in raw.items():
+        # Each entry is the [fee type, multiplier] pair _fetch_series_listing
+        # writes, so the multiplier is always second; any other shape is skipped
+        if (isinstance(ticker, str) and isinstance(value, list) and len(value) == 2
+                and isinstance(value[0], str)):
+            fee_type, multiplier = value
+            out[ticker] = (fee_type, _parse_fee_multiplier(multiplier))
+    return out
+
+
+def _fetch_series_listing(
+    client: Any,
+) -> tuple[dict[str, tuple[str, tuple[str, ...]]], dict[str, tuple[str, float | None]]]:
+    """
+    Read Kalshi's /series listing once: each series' labels and fee settings.
+
+    One read-only GET through _historical_get (retried on 429/5xx; the
+    response is about 19 MB and breaks part-way about one time in three, which
+    that retry covers), shared by load_series_categories and
+    load_series_fee_multipliers so one run's two readers make one request.
+
+    Args:
+        client (Any): A KalshiClient pointed at prod.
+
+    Returns:
+        tuple: (series ticker -> (category, tags), series ticker ->
+            (fee_type, multiplier or None)), the same tickers in both.
+
+    Raises:
+        ValueError: The reply is not an object or lists no series.
+        Exception: Whatever the retried GET raises once its retries run out.
+    """
+    fresh: dict[str, tuple[str, tuple[str, ...]]] = {}
+    fees: dict[str, tuple[str, float | None]] = {}
+    cursor, seen = None, set()
+    for _ in range(_SERIES_LIST_MAX_PAGES):
+        params = {"cursor": cursor} if cursor else {}
+        data = _historical_get(client, f"{_API_PREFIX}/series", **params)
+        if not isinstance(data, dict):
+            raise ValueError(f"/series returned a {type(data).__name__}, not an object")
+        for s in data.get("series") or []:
+            if isinstance(s, dict) and isinstance(s.get("ticker"), str) and s["ticker"]:
+                tags = s.get("tags") if isinstance(s.get("tags"), list) else []
+                fresh[s["ticker"]] = (
+                    s.get("category") if isinstance(s.get("category"), str) else "",
+                    tuple(t for t in tags if isinstance(t, str)),
+                )
+                fees[s["ticker"]] = (
+                    _fee_type(s.get("fee_type")), _parse_fee_multiplier(s.get("fee_multiplier")))
+        cursor = data.get("cursor")
+        if not cursor or cursor in seen:
+            break
+        seen.add(cursor)
+    if not fresh:
+        raise ValueError("/series returned no series")
+    return fresh, fees
+
+
+def _save_series_listing(
+    now: datetime,
+    fresh: dict[str, tuple[str, tuple[str, ...]]],
+    fees: dict[str, tuple[str, float | None]],
+) -> None:
+    """
+    Write a fetched /series listing to backtest_cache/series_categories.json.
+
+    Args:
+        now (datetime): The fetch time, stored as "fetched_at".
+        fresh (dict): series ticker -> (category, tags).
+        fees (dict): series ticker -> (fee_type, multiplier or None); the
+            multiplier is written as JSON null when unknown.
+
+    Raises:
+        Exception: Whatever _save_json_cache raises; callers log it and go on.
+    """
+    _save_json_cache(_SERIES_CATEGORIES_CACHE, {
+        "fetched_at": now.isoformat(),
+        "series": {t: [cat, list(tags)] for t, (cat, tags) in fresh.items()},
+        "fees": {t: [ft, m] for t, (ft, m) in fees.items()},
+    })
 
 
 def load_series_categories(
@@ -413,26 +569,7 @@ def load_series_categories(
             and 0 <= (now - fetched_at).total_seconds() < max_age_seconds):
         return cached_map
     try:
-        fresh: dict[str, tuple[str, tuple[str, ...]]] = {}
-        cursor, seen = None, set()
-        for _ in range(_SERIES_LIST_MAX_PAGES):
-            params = {"cursor": cursor} if cursor else {}
-            data = _historical_get(client, f"{_API_PREFIX}/series", **params)
-            if not isinstance(data, dict):
-                raise ValueError(f"/series returned a {type(data).__name__}, not an object")
-            for s in data.get("series") or []:
-                if isinstance(s, dict) and isinstance(s.get("ticker"), str) and s["ticker"]:
-                    tags = s.get("tags") if isinstance(s.get("tags"), list) else []
-                    fresh[s["ticker"]] = (
-                        s.get("category") if isinstance(s.get("category"), str) else "",
-                        tuple(t for t in tags if isinstance(t, str)),
-                    )
-            cursor = data.get("cursor")
-            if not cursor or cursor in seen:
-                break
-            seen.add(cursor)
-        if not fresh:
-            raise ValueError("/series returned no series")
+        fresh, fees = _fetch_series_listing(client)
     except Exception as exc:  # never end a run over it (the live filter fails closed on {})
         logging.warning(
             "Series category listing unavailable (%s) — %s",
@@ -444,16 +581,138 @@ def load_series_categories(
         )
         return cached_map
     try:
-        _save_json_cache(_SERIES_CATEGORIES_CACHE, {
-            "fetched_at": now.isoformat(),
-            "series": {t: [cat, list(tags)] for t, (cat, tags) in fresh.items()},
-        })
+        _save_series_listing(now, fresh, fees)
     except Exception as exc:  # the listing is in hand: a failed write costs the cache only
         logging.warning(
             "Series categories: could not cache Kalshi's /series listing (%s) — this run "
             "still files by the %d series it fetched", _exception_summary(exc), len(fresh))
     logging.info("Series categories: %d series from Kalshi's /series listing", len(fresh))
     return fresh
+
+
+def _log_fee_multipliers(multipliers: dict[str, float]) -> None:
+    """
+    Log how many listed series charge less than the full fee.
+
+    Args:
+        multipliers (dict[str, float]): load_series_fee_multipliers' map.
+    """
+    below = [m for m in multipliers.values() if m < 1.0]
+    halves = sum(1 for m in below if m == 0.5)
+    zeros = sum(1 for m in below if m == 0.0)
+    logging.info(
+        "Series fee multipliers: %d series listed, %d below 1 (%d at 0.5, %d at 0, %d other)",
+        len(multipliers), len(below), halves, zeros, len(below) - halves - zeros)
+
+
+def _read_series_cache_quietly() -> dict | None:
+    """
+    Read series_categories.json for the fee reader, with no WARNING.
+
+    load_series_categories reads the same file first and warns about a file
+    it cannot use (through _load_json_cache); this parse is the fee reader's
+    own, so a corrupt file is not reported twice. A failure logs at INFO.
+
+    Returns:
+        dict | None: The parsed object, or None when the file is absent,
+            unreadable, corrupt or not an object.
+    """
+    try:
+        path = _SERIES_CATEGORIES_CACHE
+        if not path.exists():
+            return None
+        parsed = json.loads(path.read_text())
+    except Exception as exc:  # corrupt, unreadable, nested too deeply: the categories reader warns
+        logging.info(
+            "Series fee multipliers: could not read the cached /series listing (%s) — "
+            "treating it as missing", _exception_summary(exc))
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def load_series_fee_multipliers(
+    client: Any,
+    max_age_seconds: int = SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS,
+    *,
+    upgrade: bool = False,
+) -> dict[str, float]:
+    """
+    Map every Kalshi series ticker to its fee multiplier, where one is known.
+
+    Kalshi's /series listing carries a fee_multiplier per series (1 on almost
+    all, 0.5 on MLB game and prop series, 0 on a few yearly crypto series on
+    2026-10-16). It sits in the same backtest_cache/series_categories.json
+    that load_series_categories reads, in a "fees" block beside "series".
+    Nothing prices, sizes or logs a trade on it yet; main._attach_series_labels
+    and the backtester carry it so a later change can.
+
+    This reader is a companion of load_series_categories, which a run calls
+    first with the same client and whose fetch (the weekly refresh) writes
+    both blocks. So it reads the file as it stands, with no request. The one
+    exception is opt-in: with upgrade=True, a file that load_series_categories
+    would serve as current (younger than max_age_seconds, its "series" block
+    non-empty) but that has no "fees" block (written before the block
+    existed) is upgraded by one fetch of the 19 MB listing, through the
+    retried GET. Live runs never upgrade (a retry can wait about a minute
+    and log WARNINGs): they read the file only, so an old file gives {} and
+    every market the full fee, the safe direction (a fee is never lowered
+    by a multiplier it could not read). The
+    backtest (backtest.py) upgrades. A missing or stale file is never fetched
+    here (the categories reader just tried). It never raises, and a failed
+    fetch, unreadable file or failed cache write adds no WARNING of the
+    categories reader's own: they log at INFO. Logs one INFO line counting
+    the series listed and those below 1.
+
+    Args:
+        client (Any): A KalshiClient pointed at prod, used only by an upgrade;
+            None reads the cached copy only (a dev run; no request is made).
+        max_age_seconds (int): How young the file must be to be upgraded.
+            Used only with upgrade=True.
+        upgrade (bool): Keyword-only. Allow the one upgrade fetch above.
+            Defaults to False.
+
+    Returns:
+        dict[str, float]: series ticker -> multiplier in [0, 1], for every
+            series whose multiplier is known; a series that is missing from
+            the map has an unknown multiplier (readers use 1.0, the full fee).
+    """
+    cached = _read_series_cache_quietly()
+    cached_fees: dict[str, tuple[str, float | None]] | None = None
+    fetched_at: datetime | None = None
+    has_series = False
+    if cached is not None:
+        cached_fees = _parse_series_fees(cached.get("fees"))
+        has_series = bool(_parse_series_categories(cached.get("series")))
+        try:
+            fetched_at = datetime.fromisoformat(cached.get("fetched_at"))
+        except (TypeError, ValueError):
+            fetched_at = None
+
+    def known(fees: dict[str, tuple[str, float | None]] | None) -> dict[str, float]:
+        return {t: m for t, (_, m) in (fees or {}).items() if m is not None}
+
+    result = known(cached_fees)
+    if upgrade and client is not None and cached_fees is None and has_series \
+            and fetched_at is not None and fetched_at.tzinfo is not None:
+        now = datetime.now(UTC)
+        if 0 <= (now - fetched_at).total_seconds() < max_age_seconds:
+            # A current file from before the "fees" block: upgrade it once
+            try:
+                fresh, fees = _fetch_series_listing(client)
+            except Exception as exc:  # never end a run over it (readers charge the full fee)
+                logging.info("Series fee listing unavailable (%s) — every series is charged "
+                             "the full fee", _exception_summary(exc))
+            else:
+                result = known(fees)
+                try:
+                    _save_series_listing(now, fresh, fees)
+                except Exception as exc:  # the listing is in hand: only the cache is lost
+                    logging.info(
+                        "Series fee multipliers: could not cache Kalshi's /series listing "
+                        "(%s) — this run still uses the %d series it fetched",
+                        _exception_summary(exc), len(fresh))
+    _log_fee_multipliers(result)
+    return result
 
 
 # Each event's competition label as the backtest's same-title check read it
@@ -619,6 +878,328 @@ def load_event_competitions(client: Any, event_tickers: Iterable[str]) -> dict[s
     logging.info("Event competitions: %d events, %d from the cache, %d read from "
                  "Kalshi, %d unknown", len(wanted), len(wanted) - len(missing),
                  len(fresh), len(wanted) - len(found))
+    return found
+
+
+# Each event's fee multiplier override as the backtest read it
+# (load_event_fee_overrides): {"overrides": {event_ticker: null | number}},
+# null for an event that sets none. Only answers Kalshi gave are kept: an event
+# whose read failed, or whose override cannot be read, is not stored, so it is
+# unknown (the full fee) and a later run asks again.
+_EVENT_FEE_OVERRIDES_CACHE = CACHE_DIR / "event_fee_overrides.json"
+
+
+def _fetch_event_fee_override(client: Any, event_ticker: str) -> float | None | str:
+    """
+    Read one event's fee multiplier override from /events/{ticker}, then pause.
+
+    One read-only GET through _historical_get (retried on 429/5xx), whose event
+    object is read by scanner.event_fee_override, the reading live ingest uses.
+    Each read is followed by an EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS
+    pause, as _fetch_event_competition's are.
+
+    Args:
+        client (Any): The production live client.
+        event_ticker (str): The event to read.
+
+    Returns:
+        float | None | str: The override, None when the event sets none, or
+            scanner.EVENT_FEE_OVERRIDE_UNKNOWN when it cannot be read.
+
+    Raises:
+        ValueError: When the reply carries no event object.
+        Exception: Whatever the read itself raises once its retries are spent.
+    """
+    try:
+        data = _historical_get(client, f"{_API_PREFIX}/events/{event_ticker}")
+        event = data.get("event") if isinstance(data, dict) else None
+        if not isinstance(event, dict):
+            raise ValueError(f"/events/{event_ticker} returned no event object")
+        # Cross-module: the one reading of the override, shared with live ingest
+        return event_fee_override(event)
+    finally:
+        time.sleep(EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS)
+
+
+def load_event_fee_overrides(client: Any, event_tickers: Iterable[str], *,
+                             first: Iterable[str] = ()) -> dict[str, float | None]:
+    """
+    Each event's fee multiplier override, from the cache or one read-only GET each.
+
+    The backtest's half of the event override rule (scanner.listed_fee_multiplier):
+    cached markets carry no event payload, so backtester._prepare_candidates asks
+    for the events of every pair market. An event already in
+    backtest_cache/event_fee_overrides.json costs no request; the others are
+    read on EVENT_TITLE_FALLBACK_MAX_WORKERS threads, at most
+    EVENT_COMPETITION_MAX_LOOKUPS per call, the events in `first` (those whose
+    series lists a multiplier below 1, where an override can raise the fee)
+    before the rest, each group in ticker order. An event left out — past the
+    cap, a read that failed, an override that cannot be read, no client — is
+    unknown, which the rule charges as the full fee, and is not stored, so a
+    later run asks again. New answers are merged into the cache (a failed save
+    is a WARNING). One INFO line counts where they came from. Never raises.
+
+    Args:
+        client (Any): The production live client, or None for the cache only.
+        event_tickers (Iterable[str]): The events wanted; blank or non-string
+            tickers are left out.
+        first (Iterable[str]): Keyword-only. Events to read before the others.
+
+    Returns:
+        dict[str, float | None]: Each wanted event whose override is known ->
+            the override, or None when it sets none. An event missing from it
+            is unknown.
+    """
+    wanted = sorted({t for t in event_tickers if isinstance(t, str) and t})
+    if not wanted:
+        return {}
+    cached: dict[str, float | None] = {}
+    cache_readable = True
+    try:
+        raw = _load_json_cache(_EVENT_FEE_OVERRIDES_CACHE)
+        block = raw.get("overrides") if isinstance(raw, dict) else None
+        if isinstance(block, dict):
+            for t, value in block.items():
+                if not isinstance(t, str):
+                    continue
+                # Only an answer the override rule reads alike is used
+                parsed = event_fee_override({"fee_multiplier_override": value})
+                if parsed != EVENT_FEE_OVERRIDE_UNKNOWN:
+                    cached[t] = parsed
+    except Exception as exc:  # a folder that cannot be searched, a file nested too deeply
+        logging.warning(
+            "Event fee overrides: could not read the cached overrides (%s) — reading the "
+            "wanted events from Kalshi, and leaving the cache file as it is",
+            _exception_summary(exc))
+        cached, cache_readable = {}, False
+
+    found = {t: cached[t] for t in wanted if t in cached}
+    early = {t for t in first if isinstance(t, str)}
+    missing = ([t for t in wanted if t not in found and t in early]
+               + [t for t in wanted if t not in found and t not in early])
+    to_read = [] if client is None else missing[:EVENT_COMPETITION_MAX_LOOKUPS]
+    if len(missing) > len(to_read):
+        logging.warning(
+            "Event fee overrides: %d events are not in the cache and %s, so their "
+            "markets are charged the full fee this run", len(missing) - len(to_read),
+            "no client was given" if client is None else
+            f"are past the cap EVENT_COMPETITION_MAX_LOOKUPS={EVENT_COMPETITION_MAX_LOOKUPS}")
+
+    def _read_one(ticker: str) -> tuple[str, Any, BaseException | None]:
+        """One event's read, with its failure kept rather than raised."""
+        try:
+            return ticker, _fetch_event_fee_override(client, ticker), None
+        except Exception as exc:
+            return ticker, None, exc
+
+    fresh: dict[str, float | None] = {}
+    if to_read:
+        try:
+            with ThreadPoolExecutor(
+                    max_workers=min(EVENT_TITLE_FALLBACK_MAX_WORKERS, len(to_read))) as pool:
+                for ticker, value, exc in pool.map(_read_one, to_read):
+                    if exc is not None:
+                        logging.warning(
+                            "Could not read the fee override of event %s: HTTP %s %s — its "
+                            "markets are charged the full fee this run", ticker,
+                            getattr(exc, "status", "?"), _exception_summary(exc))
+                    elif value == EVENT_FEE_OVERRIDE_UNKNOWN:
+                        logging.warning(
+                            "The fee override of event %s cannot be read — its markets are "
+                            "charged the full fee this run", ticker)
+                    else:
+                        fresh[ticker] = value
+        except Exception as exc:  # a pool that cannot start: keep what was read
+            logging.warning("Event fee overrides: the reads stopped (%s) — the events not "
+                            "read are charged the full fee", _exception_summary(exc))
+
+    if fresh and cache_readable:
+        try:
+            _save_json_cache(_EVENT_FEE_OVERRIDES_CACHE, {"overrides": {**cached, **fresh}})
+        except Exception as exc:  # the answers are in hand: a failed write costs the cache only
+            logging.warning(
+                "Event fee overrides: could not save the cached overrides (%s) — this run "
+                "still uses the %d it read", _exception_summary(exc), len(fresh))
+    found.update(fresh)
+    logging.info("Event fee overrides: %d events, %d from the cache, %d read from Kalshi, "
+                 "%d unknown (charged the full fee), %d with an override", len(wanted),
+                 len(wanted) - len(missing), len(fresh), len(wanted) - len(found),
+                 sum(1 for v in found.values() if v is not None))
+    return found
+
+
+# What the backtest's report reads of each pair market's event
+# (load_event_facts): {"facts": {event_ticker: {"settlement_sources": [names],
+# "mutually_exclusive": true | false | null}}}. Only answers Kalshi gave are
+# kept: an event whose read failed, or whose facts cannot be read, is not
+# stored, so a later run asks again.
+_EVENT_FACTS_CACHE = CACHE_DIR / "event_facts.json"
+
+
+def _event_facts(event: Any) -> dict | None:
+    """
+    Read the two report-only facts of one event object.
+
+    Args:
+        event (Any): An event object from /events/{ticker}, or a cached fact
+            dict (the same two keys).
+
+    Returns:
+        dict | None: {"settlement_sources": a sorted tuple of each source's
+            name (its url when it has no name), "mutually_exclusive": True,
+            False or None}; None when the object is not a dict or its
+            settlement_sources is there but is not a list. An event that
+            lists no sources reads as an empty tuple, and a
+            mutually_exclusive that is not a bool reads as None.
+    """
+    if not isinstance(event, dict):
+        return None
+    raw = event.get("settlement_sources")
+    if raw is None:
+        raw = []
+    if not isinstance(raw, list):
+        return None
+    names = set()
+    for source in raw:
+        if isinstance(source, str) and source.strip():
+            names.add(source.strip())
+        elif isinstance(source, dict):
+            for key in ("name", "url"):
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    names.add(value.strip())
+                    break
+    exclusive = event.get("mutually_exclusive")
+    return {"settlement_sources": tuple(sorted(names)),
+            "mutually_exclusive": exclusive if isinstance(exclusive, bool) else None}
+
+
+def _fetch_event_facts(client: Any, event_ticker: str) -> dict | None:
+    """
+    Read one event's report-only facts from /events/{ticker}, then pause.
+
+    One read-only GET through _historical_get (retried on 429/5xx), its
+    event object read by _event_facts. Each read is followed by an
+    EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS pause, as
+    _fetch_event_fee_override's are.
+
+    Args:
+        client (Any): The production live client.
+        event_ticker (str): The event to read.
+
+    Returns:
+        dict | None: The facts (see _event_facts), or None when they cannot
+            be read.
+
+    Raises:
+        ValueError: When the reply carries no event object.
+        Exception: Whatever the read itself raises once its retries are spent.
+    """
+    try:
+        data = _historical_get(client, f"{_API_PREFIX}/events/{event_ticker}")
+        event = data.get("event") if isinstance(data, dict) else None
+        if not isinstance(event, dict):
+            raise ValueError(f"/events/{event_ticker} returned no event object")
+        return _event_facts(event)
+    finally:
+        time.sleep(EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS)
+
+
+def load_event_facts(client: Any, event_tickers: Iterable[str]) -> dict[str, dict]:
+    """
+    Each event's settlement sources and mutually_exclusive flag, from the cache or one read-only GET each.
+
+    Report only: backtester._prepare_candidates counts the pairs whose two
+    events name different settlement sources, and the same-event ladders whose
+    event is a set of mutually exclusive options; nothing decides on them.
+    An event already in backtest_cache/event_facts.json costs no request; the
+    others are read on EVENT_TITLE_FALLBACK_MAX_WORKERS threads, at most
+    EVENT_COMPETITION_MAX_LOOKUPS per call, in ticker order. An event left
+    out — past the cap, a read that failed, facts that cannot be read, no
+    client — is unknown and is not stored, so a later run asks again. New
+    answers are merged into the cache (a failed save is a WARNING). One INFO
+    line counts where they came from. Never raises.
+
+    Args:
+        client (Any): The production live client, or None for the cache only.
+        event_tickers (Iterable[str]): The events wanted; blank or non-string
+            tickers are left out.
+
+    Returns:
+        dict[str, dict]: Each wanted event whose facts are known -> its facts
+            (see _event_facts). An event missing from it is unknown.
+    """
+    wanted = sorted({t for t in event_tickers if isinstance(t, str) and t})
+    if not wanted:
+        return {}
+    cached: dict[str, dict] = {}
+    cache_readable = True
+    try:
+        raw = _load_json_cache(_EVENT_FACTS_CACHE)
+        block = raw.get("facts") if isinstance(raw, dict) else None
+        if isinstance(block, dict):
+            for t, value in block.items():
+                parsed = _event_facts(value) if isinstance(t, str) else None
+                if parsed is not None:
+                    cached[t] = parsed
+    except Exception as exc:  # a folder that cannot be searched, a file nested too deeply
+        logging.warning(
+            "Event facts: could not read the cached facts (%s) — reading the wanted events "
+            "from Kalshi, and leaving the cache file as it is", _exception_summary(exc))
+        cached, cache_readable = {}, False
+
+    found = {t: cached[t] for t in wanted if t in cached}
+    missing = [t for t in wanted if t not in found]
+    to_read = [] if client is None else missing[:EVENT_COMPETITION_MAX_LOOKUPS]
+    if len(missing) > len(to_read):
+        logging.warning(
+            "Event facts: %d events are not in the cache and %s, so the report leaves "
+            "them out this run", len(missing) - len(to_read),
+            "no client was given" if client is None else
+            f"are past the cap EVENT_COMPETITION_MAX_LOOKUPS={EVENT_COMPETITION_MAX_LOOKUPS}")
+
+    def _read_one(ticker: str) -> tuple[str, Any, BaseException | None]:
+        """One event's read, with its failure kept rather than raised."""
+        try:
+            return ticker, _fetch_event_facts(client, ticker), None
+        except Exception as exc:
+            return ticker, None, exc
+
+    fresh: dict[str, dict] = {}
+    if to_read:
+        try:
+            with ThreadPoolExecutor(
+                    max_workers=min(EVENT_TITLE_FALLBACK_MAX_WORKERS, len(to_read))) as pool:
+                for ticker, value, exc in pool.map(_read_one, to_read):
+                    if exc is not None:
+                        logging.warning(
+                            "Could not read the facts of event %s: HTTP %s %s — the report "
+                            "leaves it out this run", ticker,
+                            getattr(exc, "status", "?"), _exception_summary(exc))
+                    elif value is None:
+                        logging.warning(
+                            "The facts of event %s cannot be read — the report leaves it "
+                            "out this run", ticker)
+                    else:
+                        fresh[ticker] = value
+        except Exception as exc:  # a pool that cannot start: keep what was read
+            logging.warning("Event facts: the reads stopped (%s) — the events not read are "
+                            "left out of the report", _exception_summary(exc))
+
+    if fresh and cache_readable:
+        stored = {t: {"settlement_sources": list(f["settlement_sources"]),
+                      "mutually_exclusive": f["mutually_exclusive"]}
+                  for t, f in {**cached, **fresh}.items()}
+        try:
+            _save_json_cache(_EVENT_FACTS_CACHE, {"facts": stored})
+        except Exception as exc:  # the answers are in hand: a failed write costs the cache only
+            logging.warning(
+                "Event facts: could not save the cached facts (%s) — this run still uses "
+                "the %d it read", _exception_summary(exc), len(fresh))
+    found.update(fresh)
+    logging.info("Event facts: %d events, %d from the cache, %d read from Kalshi, "
+                 "%d unknown", len(wanted), len(wanted) - len(missing), len(fresh),
+                 len(wanted) - len(found))
     return found
 
 
@@ -852,7 +1433,7 @@ def _load_json_cache(path: Path):
     file is "no cache" — same guarded-read philosophy as _day_store_load.
 
     The whole file is read into one string and parsed at once, so it is only
-    for small caches (candlesticks) — and for LEGACY assembled settled-market
+    for small caches — and for LEGACY assembled settled-market
     caches (settled_markets_*.json), which fetch_all_settled_markets still
     serves this way for compatibility. That path materializes the whole
     corpus (TS-07 in CLAUDE.md records what it cost); new assembled caches are
@@ -897,15 +1478,63 @@ def _save_json_cache(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # Atomic tmp+replace, same idiom as _day_store_save. The tmp name is derived
     # from the destination, so it is unique because cache paths themselves are
-    # unique (per-ticker for candlesticks; the one event-title accumulator per run)
-    # — the same path-uniqueness invariant that keeps the parallel candlestick
-    # fetch safe. Never introduce a fetch whose cache path is shared across
+    # unique (the one event-title accumulator per run, for example) — the same
+    # path-uniqueness invariant that keeps the parallel candlestick fetch's
+    # per-ticker gz files (_save_gz_json_cache) safe. Never introduce a fetch whose cache path is shared across
     # workers. (The assembled settled-market cache no longer comes through
     # here: since SS-1 it is streamed by _DayStreamWriter, same idiom.)
     # live_portfolio keeps one file per finalized market under
     # config.LIVE_MARKS_CACHE_DIR through this too; treasury its yields.
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(data, default=str))
+    tmp.replace(path)
+
+
+def _load_gz_json_cache(path: Path):
+    """
+    Load and parse a gzipped JSON file from disk, treating corruption as a miss.
+
+    The gzipped twin of _load_json_cache, for the candle cache. A file that is
+    not gzip, was cut short by an interrupted write, has a damaged deflate
+    stream or does not hold valid JSON is not an error: it reads as no cache,
+    with one WARNING, and the caller fetches again.
+
+    Args:
+        path (Path): The .json.gz file.
+
+    Returns:
+        Any: The parsed JSON, or None when the file is absent, unreadable or corrupt.
+    """
+    if not path.exists():
+        return None
+    try:
+        with gzip.open(path, "rb") as fh:
+            return json.loads(fh.read())
+    except (OSError, EOFError, zlib.error, ValueError):
+        # OSError covers a bad gzip header and a CRC mismatch, EOFError a stream
+        # cut before its end, zlib.error a damaged deflate block (not an
+        # OSError), ValueError bad JSON or bytes that are not UTF-8.
+        logging.warning("Corrupt gzipped JSON cache %s — treating as cache miss", path)
+        return None
+
+
+def _save_gz_json_cache(path: Path, data) -> None:
+    """
+    Atomically write data to path as gzipped JSON, creating parent folders as needed.
+
+    The gzipped twin of _save_json_cache (same serializer, same temp-file and
+    rename, so an interrupted run never leaves a truncated file a later run
+    would trust, and the same rule that every cache path is unique to one
+    ticker so two workers never share a temp name).
+
+    Args:
+        path (Path): Destination file. Parent folders are created if absent.
+        data: JSON-serializable data to write.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with gzip.open(tmp, "wb") as fh:
+        fh.write(json.dumps(data, default=str).encode("utf-8"))
     tmp.replace(path)
 
 
@@ -5864,25 +6493,29 @@ def _candle_close(side: dict) -> float | None:
     return None
 
 
-def _candle_count(candle: dict) -> float | None:
+def _candle_fixed(candle: dict, fp_key: str, plain_key: str) -> float | None:
     """
-    Read the contracts traded in one candle's hour.
+    Read one non-negative count from a candle, preferring its fixed-point spelling.
 
-    Takes the fixed-point "volume_fp" when the candle has it, else "volume"
-    (a number or a numeric string). A value that is present but unreadable is
-    not replaced by the other key.
+    Takes the fixed-point key (the live endpoint's "volume_fp", say) when the
+    candle has it, else the plain one (the archive's "volume"): a number or a
+    numeric string. A value that is present but unreadable is not replaced by
+    the other key. _candle_count reads the hour's traded volume with it and the
+    candle parser the hour's open interest.
 
     Args:
         candle (dict): One raw candle from the API.
+        fp_key (str): The fixed-point key, tried first.
+        plain_key (str): The plain key, tried when the first is absent.
 
     Returns:
-        float | None: A finite count of zero or more. None when the candle has
+        float | None: A finite number of zero or more. None when the candle has
             neither key, or the value is not a readable non-negative number.
             Never raises.
     """
     if not isinstance(candle, dict):
         return None
-    for key in ("volume_fp", "volume"):
+    for key in (fp_key, plain_key):
         raw = candle.get(key)
         if raw is None or raw == "":
             continue
@@ -5895,6 +6528,98 @@ def _candle_count(candle: dict) -> float | None:
         # "+ 0.0" turns a negative zero ("-0") into a plain 0.0
         return count + 0.0 if math.isfinite(count) and count >= 0 else None
     return None
+
+
+def _candle_count(candle: dict) -> float | None:
+    """
+    Read the contracts traded in one candle's hour.
+
+    Takes the fixed-point "volume_fp" when the candle has it, else "volume"
+    (see _candle_fixed).
+
+    Args:
+        candle (dict): One raw candle from the API.
+
+    Returns:
+        float | None: A finite count of zero or more. None when the candle has
+            neither key, or the value is not a readable non-negative number.
+            Never raises.
+    """
+    return _candle_fixed(candle, "volume_fp", "volume")
+
+
+def _candle_dollars(side: Any, name: str) -> float | None:
+    """
+    Read one named price from a candle's price dict, in dollars.
+
+    Takes "<name>_dollars" when it is present (None and "" count as absent),
+    else the bare "<name>", as _candle_close does for "close": a present but
+    unreadable value is None, not replaced by the other key.
+
+    Args:
+        side (Any): A candle's "yes_ask", "yes_bid" or "price" sub-dict.
+        name (str): "open", "high", "low", "close", "mean" or "previous".
+
+    Returns:
+        float | None: A finite price; None when absent, unreadable or not
+            finite (or when side is not a dict). Never raises.
+    """
+    if not isinstance(side, dict):
+        return None
+    for key in (f"{name}_dollars", name):
+        raw = side.get(key)
+        if raw is None or raw == "":
+            continue
+        if isinstance(raw, bool):
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return value if math.isfinite(value) else None
+    return None
+
+
+def _candle_ohl(side: Any) -> tuple[float, float, float] | None:
+    """
+    Read the open, high and low of one side of a candle's hour.
+
+    Both endpoints' spellings are read ("open_dollars" or "open", and so on).
+    The three come together or not at all.
+
+    Args:
+        side (Any): A candle's "yes_ask" or "yes_bid" sub-dict.
+
+    Returns:
+        tuple[float, float, float] | None: (open, high, low) in dollars; None
+            unless all three are readable. Never raises.
+    """
+    values = tuple(_candle_dollars(side, name) for name in ("open", "high", "low"))
+    if any(v is None for v in values):
+        return None
+    return values  # type: ignore[return-value]
+
+
+def _candle_price(price: Any) -> tuple[float | None, ...] | None:
+    """
+    Read the traded-price block of one candle's hour.
+
+    An hour with no trades sends an empty block (live) or one of nulls
+    (archive), which reads as no price.
+
+    Args:
+        price (Any): A candle's "price" sub-dict.
+
+    Returns:
+        tuple | None: (open, high, low, close, mean, previous) in dollars, None
+            in place of any one that is missing or unreadable; None when the
+            block is empty, absent or has none of the six. Never raises.
+    """
+    if not isinstance(price, dict):
+        return None
+    values = tuple(_candle_dollars(price, name)
+                   for name in ("open", "high", "low", "close", "mean", "previous"))
+    return None if all(v is None for v in values) else values
 
 
 def _candle_request_windows(open_ts: int, close_ts: int) -> list[tuple[int, int]]:
@@ -6029,9 +6754,9 @@ def _fetch_candle_pages(client: Any, path: str, windows: list[tuple[int, int]],
             request in flight, for the caller's failure line.
 
     Returns:
-        tuple[list[dict], int, int]: The parsed candles ("ts", "yes_ask_close",
-            "no_ask_close", "volume"), how many raw candles came back and how
-            many of them could not be parsed.
+        tuple[list[dict], int, int]: The parsed candles (the keys
+            fetch_candlesticks documents), how many raw candles came back and
+            how many of them could not be parsed.
 
     Raises:
         Exception: Whatever a request raises (an ApiException carries .status).
@@ -6087,6 +6812,15 @@ def _fetch_candle_pages(client: Any, path: str, windows: list[tuple[int, int]],
                     "no_ask_close": no_ask,
                     # Contracts traded in this hour; None when not readable
                     "volume": _candle_count(c),
+                    # The rest of the hour's record, from either endpoint's
+                    # spelling. Each is None when the hour lacks it or it cannot
+                    # be read, and a bad one never drops the candle: only an
+                    # unreadable ask or bid close does (above).
+                    "yes_ask_ohl": _candle_ohl(ya),
+                    "yes_bid_ohl": _candle_ohl(yb),
+                    "yes_bid_close": yes_bid,
+                    "price": _candle_price(c.get("price")),
+                    "open_interest": _candle_fixed(c, "open_interest_fp", "open_interest"),
                 })
             except (ValueError, TypeError, AttributeError, KeyError):
                 dropped += 1
@@ -6134,6 +6868,31 @@ def _fetch_candles_from_endpoints(client: Any, endpoints: list[tuple[str, str]],
             # The failed request took no sleep of its own
             time.sleep(rate_limit_sleep)
     raise ValueError("no candlestick endpoint to ask")
+
+
+_CANDLE_TUPLE_KEYS = ("yes_ask_ohl", "yes_bid_ohl", "price")
+
+
+def _tuples_from_cache(candles: list) -> list:
+    """
+    Turn the price ranges of cached candles back into tuples.
+
+    JSON has no tuples, so the (open, high, low) and price ranges a candle is
+    parsed with come back from the cache as lists. Putting them back as tuples
+    makes a cached candle equal to the one the same fetch returned.
+
+    Args:
+        candles (list): Candle dicts read from the cache; changed in place.
+
+    Returns:
+        list: The same list.
+    """
+    for candle in candles:
+        if isinstance(candle, dict):
+            for key in _CANDLE_TUPLE_KEYS:
+                if isinstance(candle.get(key), list):
+                    candle[key] = tuple(candle[key])
+    return candles
 
 
 def fetch_candlesticks(
@@ -6186,8 +6945,10 @@ def fetch_candlesticks(
     series cached as complete would silently drop the missing span on every
     later run.
 
-    Results are cached per ticker in backtest_cache/candlesticks/<ticker>.json,
-    tagged with the [open_ts, close_ts] window, the period_interval and the
+    Results are cached per ticker, gzipped, in
+    backtest_cache/candlesticks_v3/<ticker>.json.gz (a file that cannot be
+    read is a miss; the older plain-JSON backtest_cache/candlesticks/ folder is
+    never read or written), tagged with the [open_ts, close_ts] window, the period_interval and the
     fields version (CANDLESTICK_CACHE_FIELDS_VERSION) that were actually
     fetched — the whole window as one entry, however many requests it took. A
     cache hit requires the cached window to COVER the
@@ -6233,20 +6994,27 @@ def fetch_candlesticks(
               usable_candle_ask reads as no quote.
             - "volume" (float | None): Contracts traded in the candle's hour;
               None when the API gave no readable count.
+            - "yes_ask_ohl" / "yes_bid_ohl" (tuple | None): the hour's YES ask
+              / YES bid (open, high, low) in dollars; None unless all three
+              are readable.
+            - "yes_bid_close" (float): The YES bid at close.
+            - "price" (tuple | None): The hour's traded price (open, high, low,
+              close, mean, previous), None in place of any one that is
+              missing; None for an hour with no price block.
+            - "open_interest" (float | None): Open interest at the hour's end;
+              None when not readable.
             Returns an empty list on API failure, including a failure of any
             one request of a paged window.
     """
     _CANDLES_DIR.mkdir(parents=True, exist_ok=True)
-    cache_path = _CANDLES_DIR / f"{ticker}.json"
+    cache_path = _CANDLES_DIR / f"{ticker}{_CANDLE_FILE_SUFFIX}"
     if use_cache:
         # Guarded loader: absent OR corrupt (a truncated file from an
         # interrupted run) both read back as None, so a damaged cache falls
         # through to a refetch instead of raising out of the worker thread.
-        cached = _load_json_cache(cache_path)
-        # Legacy cache files are a bare list with no window metadata (or predate
-        # the period_interval or fields tag) — we can't confirm what
-        # range/granularity/fields they cover, so fall through and refetch. The
-        # refetch below re-saves in the current tagged format, migrating it.
+        cached = _load_gz_json_cache(cache_path)
+        # A file without the window, period or fields tags (or with other values)
+        # cannot be shown to cover this request, so it is refetched and re-saved.
         if isinstance(cached, dict) and cached.get("open_ts", None) is not None:
             covers_window = (
                 cached["open_ts"] <= open_ts and cached["close_ts"] >= close_ts
@@ -6260,7 +7028,7 @@ def fetch_candlesticks(
                 # empty was likely a previous transient failure, not a
                 # genuinely empty market.
                 if candles:
-                    return candles
+                    return _tuples_from_cache(candles)
                 age = time.time() - cache_path.stat().st_mtime
                 if age < _EMPTY_CANDLE_TTL_SECONDS:
                     return candles
@@ -6294,7 +7062,7 @@ def fetch_candlesticks(
         # --no-cache run would never actually refresh the file the next
         # default run loads. Which endpoint served the candles is not
         # recorded: the candles are the same market's either way.
-        _save_json_cache(cache_path, {
+        _save_gz_json_cache(cache_path, {
             "open_ts": open_ts, "close_ts": close_ts,
             "period_interval": CANDLESTICK_PERIOD_INTERVAL_MINUTES,
             "fields": CANDLESTICK_CACHE_FIELDS_VERSION,
@@ -6324,6 +7092,9 @@ def fetch_candlesticks(
         return []
 
 
+_RECENT_CANDLE_KEYS = ("ts", "yes_ask_close", "no_ask_close", "volume")
+
+
 def recent_candles(client: Any, ticker: str, event_ticker: str, start_ts: int,
                    end_ts: int) -> list[dict] | None:
     """
@@ -6343,8 +7114,9 @@ def recent_candles(client: Any, ticker: str, event_ticker: str, start_ts: int,
         end_ts (int): Window end, Unix seconds.
 
     Returns:
-        list[dict] | None: The candles as fetch_candlesticks returns them ([] if none;
-            a quiet market has hours with no candle). None, with one WARNING, when any request
+        list[dict] | None: The candles with the four keys ts, yes_ask_close, no_ask_close and
+            volume, as fetch_candlesticks returns them ([] if none; a quiet market has hours
+            with no candle). None, with one WARNING, when any request
             fails or an end time is not an integer: the earlier days are then unknown.
     """
     series = series_ticker(event_ticker if isinstance(event_ticker, str) else "")
@@ -6368,6 +7140,9 @@ def recent_candles(client: Any, ticker: str, event_ticker: str, start_ts: int,
         return None
     if dropped:
         logging.warning("%s: dropped %d/%d malformed candles", ticker, dropped, raw_count)
+    # Live selling reads the four keys it always has; the rest of the hourly
+    # record (fetch_candlesticks) is for the backtest.
+    candles = [{key: c[key] for key in _RECENT_CANDLE_KEYS} for c in candles]
     # bid_before would raise on a non-integer end time (null, a string), so refuse the reply
     unplaced = sum(1 for c in candles
                    if not isinstance(c["ts"], int) or isinstance(c["ts"], bool))

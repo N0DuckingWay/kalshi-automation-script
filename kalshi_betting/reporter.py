@@ -114,7 +114,7 @@ from .config import (
     create_new_output,
     fee_leg_exact,
 )
-from .scanner import display_title, leg_prices, leg_sides, pair_held
+from .scanner import display_title, leg_prices, leg_sides, market_fee_multiplier, pair_held
 from .strategy import TradeSpec
 
 # The shared trade log; live_portfolio.trade_log_paths reads it (and the
@@ -280,6 +280,30 @@ def _apply_header_row(ws, fill: PatternFill) -> None:
     ws.freeze_panes = "A2"
 
 
+def _fee_mult_note(spec: object) -> str:
+    """
+    Return " fee_mult=A/B" for a trade priced at a reduced fee on either leg, else "".
+
+    Reads TradeSpec.fee_multipliers (market_a's, market_b's) by type, so a
+    spec without real numbers there (one built by hand, a test double) reads
+    as the full fee and adds nothing: every row priced at the full fee is
+    unchanged.
+
+    Args:
+        spec (object): The trade's TradeSpec.
+
+    Returns:
+        str: The note, or "".
+    """
+    mults = getattr(spec, "fee_multipliers", None)
+    if (not isinstance(mults, tuple) or len(mults) != 2
+            or not all(isinstance(m, (int, float)) and not isinstance(m, bool)
+                       for m in mults)
+            or mults == (1.0, 1.0)):
+        return ""
+    return f" fee_mult={mults[0]:g}/{mults[1]:g}"
+
+
 def _result_to_row(result: TradeResult, run_ts: datetime) -> list:
     """
     Serialize a TradeResult to a flat list matching the _TRADE_COLUMNS column order.
@@ -326,7 +350,7 @@ def _result_to_row(result: TradeResult, run_ts: datetime) -> list:
     held_note = f" adds to {count_text(held.count)} held" if held is not None else ""
     notes = (
         f"[{pair.pair_type}: {side_a.upper()} A / {side_b.upper()} B{nb_note}"
-        f" fees=${fees:.2f}{held_note}] "
+        f" fees=${fees:.2f}{_fee_mult_note(spec)}{held_note}] "
         + (result.error or "")
     )
 
@@ -452,7 +476,8 @@ def _sale_to_row(sale: SaleResult, run_ts: datetime) -> list:
     cells_b = _sale_leg_cells(legs[1], plan, sold) if len(legs) > 1 else [""] * 5
     sides = " / ".join(f"{leg.side.upper()} {'AB'[i]}" for i, leg in enumerate(legs[:2]))
     # Cross-module: the one fee rule, on each held market's sale at its average bid
-    fees = sum(fee_leg_exact(plan.count, plan.walked[leg.ticker][0])
+    fees = sum(fee_leg_exact(plan.count, plan.walked[leg.ticker][0],
+                             multiplier=market_fee_multiplier(leg.market))
                for leg in legs if leg.market is not None)
     realized, potential = plan.profits[0]
     whole = sale.status in _SALE_WHOLE_STATUSES

@@ -212,6 +212,7 @@ from .config import (
     TIME_SERIES_LEG_SIDES,
     TIME_SERIES_SAME_EVENT_LADDERS,
     LiveSettings,
+    confirmed_fee_multiplier,
     describe_time_series_rule,
     fee_per_pair_approx,
     kelly_budget,
@@ -1184,6 +1185,69 @@ def leg_prices(pair: Any) -> tuple[float, float]:
     return pair.nA, pair.pB
 
 
+def market_fee_multiplier(market: Any) -> float:
+    """
+    Return the fee multiplier one market's leg is charged at.
+
+    The one reader of a market's _fee_multiplier (set by
+    main._attach_series_labels live and backtester._candidate_pair in the
+    backtest), read by type: a market that carries none, a test double's
+    auto-attribute or anything that is not a number reads 1.0, and a listed
+    multiplier counts only when config.CONFIRMED_FEE_MULTIPLIERS holds it
+    (config.confirmed_fee_multiplier).
+
+    Args:
+        market (Any): A market (ApiMarket, or anything exposing _fee_multiplier).
+
+    Returns:
+        float: The multiplier to price this market's leg fee at.
+    """
+    return confirmed_fee_multiplier(getattr(market, "_fee_multiplier", 1.0))
+
+
+def leg_fee_multipliers(pair: Any) -> tuple[float, float]:
+    """
+    Return each leg's fee multiplier, as (market_a's, market_b's), in MARKET order.
+
+    The same order as leg_prices(pair), so fee_per_pair_approx(*leg_prices(pair),
+    multiplier_a=a, multiplier_b=b) prices each leg at its own market's
+    multiplier. A time-series pair's NO leg is market_b, so it gets market_b's
+    multiplier; code that works in submission order (NO leg first) must map
+    each leg to its own market, never use this tuple's positions as the legs'.
+
+    Args:
+        pair (Any): A CandidatePair (or anything exposing market_a and market_b).
+
+    Returns:
+        tuple[float, float]: (market_a's multiplier, market_b's multiplier),
+            each through config.confirmed_fee_multiplier.
+    """
+    return (market_fee_multiplier(getattr(pair, "market_a", None)),
+            market_fee_multiplier(getattr(pair, "market_b", None)))
+
+
+def _side_fee_multipliers(pair: Any) -> tuple[float, float]:
+    """
+    Return the fee multipliers of the pair's YES leg and NO leg, in that (SIDE) order.
+
+    Enrichment and validate_pair_price work in SIDE order, (yes_price,
+    no_price) levels, so each side is mapped here to the market it is bought
+    on (leg_sides): the YES leg is market_a for a time-series pair and
+    market_b for a same-title pair.
+
+    Args:
+        pair (Any): A CandidatePair.
+
+    Returns:
+        tuple[float, float]: (YES leg's multiplier, NO leg's multiplier).
+    """
+    mult_a, mult_b = leg_fee_multipliers(pair)
+    side_a, _side_b = leg_sides(getattr(pair, "pair_type", None))
+    if side_a == "yes":
+        return mult_a, mult_b
+    return mult_b, mult_a
+
+
 def deadline_gap_days(market_a: Any, market_b: Any) -> int:
     """
     Return the whole-day gap between two markets' deadlines, independent of order.
@@ -1562,6 +1626,116 @@ def close_gap_bound_text(seconds: int | None = None) -> str:
         minutes = bound // 60
         return f"{minutes} minute{'' if minutes == 1 else 's'}"
     return f"{bound} second{'' if bound == 1 else 's'}"
+
+
+# An event's fee override that is not known: the market was not built from an
+# event this code read (a market looked up outside the run's list, a test
+# double), or the override in the payload could not be read. Charged as the
+# full fee, never as the series' multiplier (listed_fee_multiplier).
+EVENT_FEE_OVERRIDE_UNKNOWN = "unknown"
+
+# The event fee_type_override values the multiplier model is written for: the
+# three taker-quadratic types Kalshi lists for series
+_QUADRATIC_FEE_TYPES = frozenset({"quadratic", "quadratic_with_maker_fees",
+                                  "quadratic_with_combo_maker_fees"})
+
+
+def _valid_multiplier(raw: Any) -> float | None:
+    """
+    A fee multiplier as Kalshi gives one: a real, finite number from 0 to 1, else None.
+
+    The validation historical._parse_fee_multiplier applies to a series' multiplier,
+    written here so the event override, which live ingest reads, is checked alike.
+
+    Args:
+        raw (Any): The value.
+
+    Returns:
+        float | None: The multiplier, or None when it is not one.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    try:
+        value = float(raw)
+    except OverflowError:  # a JSON integer of hundreds of digits
+        return None
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        return None
+    return value
+
+
+def event_fee_override(event: Any) -> float | None | str:
+    """
+    The fee multiplier an event sets over its series' own, if any.
+
+    An event can carry fee_multiplier_override (and fee_type_override). None
+    means the event was read and sets no override, so its markets are charged
+    at their series' multiplier. A multiplier override that is a real, finite
+    number from 0 to 1 is returned. Anything that cannot be read — an event
+    that is not an object, an override that is not such a number, or a
+    fee_type_override that is not one of the quadratic taker types — reads as
+    EVENT_FEE_OVERRIDE_UNKNOWN, which listed_fee_multiplier charges as the
+    full fee. fetch_open_events_with_markets attaches it
+    to each market as _event_fee_override; historical.load_event_fee_overrides
+    reads the backtest's with it.
+
+    Args:
+        event (Any): One event object from an /events reply.
+
+    Returns:
+        float | None | str: The override, None for none, or
+            EVENT_FEE_OVERRIDE_UNKNOWN.
+    """
+    if not isinstance(event, dict):
+        return EVENT_FEE_OVERRIDE_UNKNOWN
+    fee_type = event.get("fee_type_override")
+    if fee_type is not None and (not isinstance(fee_type, str)
+                                 or fee_type not in _QUADRATIC_FEE_TYPES):
+        return EVENT_FEE_OVERRIDE_UNKNOWN
+    raw = event.get("fee_multiplier_override")
+    if raw is None:
+        return None
+    value = _valid_multiplier(raw)
+    return EVENT_FEE_OVERRIDE_UNKNOWN if value is None else value
+
+
+def listed_fee_multiplier(series_listed: Any, event_override: Any) -> float:
+    """
+    The fee multiplier a market is listed at: its event's override, else its series'.
+
+    The one rule both paths file a market's multiplier by (main._attach_series_labels
+    live, backtester._prepare_candidates in the backtest, seller for a paid-out
+    partner). An override that is not known (EVENT_FEE_OVERRIDE_UNKNOWN, or
+    anything that is neither None nor a valid multiplier) gives 1.0, the full
+    fee, never the series' multiplier, so a full-fee event of a reduced series
+    is never charged the reduced fee. config.confirmed_fee_multiplier then charges the
+    result only when it is confirmed.
+
+    Args:
+        series_listed (Any): The series' multiplier (1.0 when unknown).
+        event_override (Any): event_fee_override's answer for the event.
+
+    Returns:
+        float: The listed multiplier, from 0 to 1.
+    """
+    if event_override is None:
+        value = _valid_multiplier(series_listed)
+    else:
+        value = _valid_multiplier(event_override)
+    return 1.0 if value is None else value
+
+
+def market_event_fee_override(market: Any) -> float | None | str:
+    """
+    A market's event fee override, read by type (EVENT_FEE_OVERRIDE_UNKNOWN when it has none).
+
+    Args:
+        market (Any): A market (ApiMarket, or anything exposing _event_fee_override).
+
+    Returns:
+        float | None | str: What the market carries, or EVENT_FEE_OVERRIDE_UNKNOWN.
+    """
+    return getattr(market, "_event_fee_override", EVENT_FEE_OVERRIDE_UNKNOWN)
 
 
 def event_competition(event: Any) -> str | None:
@@ -3549,6 +3723,18 @@ class ApiMarket:
             under in Kalshi's /series listing (historical.series_labels),
             set by main._attach_series_labels; None until then, which the
             same-title sport check (_labels_differ) reads as unknown.
+        _event_fee_override (float | None | str): The fee multiplier override
+            its event sets (event_fee_override): None for none, and
+            EVENT_FEE_OVERRIDE_UNKNOWN (the default, for a market not built
+            from an event read in full) charges the full fee.
+        _fee_multiplier (float): The fee multiplier the market is listed at
+            (listed_fee_multiplier: its event's override, else its series' in
+            Kalshi's /series listing, historical.load_series_fee_multipliers),
+            set by main._attach_series_labels; 1.0, the full fee, for a series
+            the listing does not give one for, an event override not known,
+            and until it is set. Read only
+            through market_fee_multiplier (leg_fee_multipliers), which charges
+            it only when config.CONFIRMED_FEE_MULTIPLIERS holds it.
     """
     ticker: str
     event_ticker: str
@@ -3566,10 +3752,15 @@ class ApiMarket:
     _event_competition: str | None = field(default="")
     # (category, tag); main._attach_series_labels sets it
     _series_labels: Any = field(default=None)
+    # The event's fee override as read; unknown (the full fee) by default
+    _event_fee_override: Any = field(default=EVENT_FEE_OVERRIDE_UNKNOWN)
+    # main._attach_series_labels sets it; 1.0 (the full fee) until then
+    _fee_multiplier: float = field(default=1.0)
 
 
 def _market_from_dict(m: dict, event_title: str,
-                      event_competition: str | None = "") -> ApiMarket:
+                      event_competition: str | None = "", *,
+                      event_fee_override: Any = EVENT_FEE_OVERRIDE_UNKNOWN) -> ApiMarket:
     """
     Build an ApiMarket from one raw market JSON dict.
 
@@ -3585,6 +3776,10 @@ def _market_from_dict(m: dict, event_title: str,
             names (event_competition), attached as _event_competition. ""
             (the default) when it names none or the caller did not read it;
             None when it could not be read.
+        event_fee_override (Any): Keyword-only. The parent event's fee
+            override (event_fee_override), attached as _event_fee_override;
+            EVENT_FEE_OVERRIDE_UNKNOWN (the default) when the caller did not
+            read the event in full.
 
     Returns:
         ApiMarket: Parsed market ready for the pair-detection pipeline.
@@ -3617,6 +3812,7 @@ def _market_from_dict(m: dict, event_title: str,
         exchange_index=_shard_index(m),
         _event_title=event_title,
         _event_competition=event_competition,
+        _event_fee_override=event_fee_override,
     )
 
 
@@ -3699,7 +3895,9 @@ def _fetch_held_market(client: Any, ticker: str, event_titles: dict, *,
             event_titles[event_ticker] = (event.get("title") or "",
                                           event_competition(event))
         title, competition = event_titles[event_ticker]
-        # Parsed like the market list, so its labels match its ladder-mates'
+        # Parsed like the market list, so its labels match its ladder-mates'.
+        # Its event fee override stays unknown (the full fee): a market
+        # looked up outside the run's list is never charged a reduced fee
         return _market_from_dict(raw, title, competition)
     except Exception as exc:
         logging.warning("Could not look up %s %s: %s", noun, ticker, _error_text(exc))
@@ -4674,6 +4872,8 @@ def fetch_open_events_with_markets(
             ev_title = ev.get("title") or ""
             # The competition the event names, for the same-title sport check
             ev_competition = event_competition(ev)
+            # The fee multiplier the event sets over its series', if any
+            ev_fee_override = event_fee_override(ev)
             for m in ev.get("markets") or []:
                 # An "open" event can still nest closed/settled/determined markets
                 # (e.g. one option in a multi-choice event already resolved while
@@ -4691,7 +4891,8 @@ def fetch_open_events_with_markets(
                     continue
                 # Parse into ApiMarket with the parent event title attached so
                 # pair_key()/display_title() can find it, and its competition
-                markets.append(_market_from_dict(m, ev_title, ev_competition))
+                markets.append(_market_from_dict(m, ev_title, ev_competition,
+                                                 event_fee_override=ev_fee_override))
         if pages % SCANNER_PROGRESS_LOG_EVERY_PAGES == 0:
             logging.info("Open-events fetch: %d pages, %d markets so far", pages, len(markets))
         new_cursor = data.get("cursor")
@@ -4761,6 +4962,7 @@ def fetch_open_events_with_markets(
                 ev_title = ev.get("title") or ""
                 # The competition the event names, as in the standard loop
                 ev_competition = event_competition(ev)
+                ev_fee_override = event_fee_override(ev)
                 for m in ev.get("markets") or []:
                     # Only include markets that are still open — MVE response may
                     # include closed/settled options inside an otherwise-open event.
@@ -4773,7 +4975,8 @@ def fetch_open_events_with_markets(
                         if _shard_index(m) in inactive:
                             skipped_shard += 1
                             continue
-                        markets.append(_market_from_dict(m, ev_title, ev_competition))
+                        markets.append(_market_from_dict(
+                            m, ev_title, ev_competition, event_fee_override=ev_fee_override))
                         mve_market_count += 1
                         page_active_count += 1
             if mve_pages % SCANNER_PROGRESS_LOG_EVERY_PAGES == 0:
@@ -5478,7 +5681,9 @@ def find_time_series_pairs(
                 # are pA and nB, not nA/pB. This is not a guarantee against the
                 # in-between loss cell; the pB > pA conjunct restates the direction.
                 # fee_per_pair_approx returns a continuous estimate of total taker fees.
-                tradeable = ((1.0 - pA - nB) > fee_per_pair_approx(pA, nB)) and (pB > pA)
+                tradeable = ((1.0 - pA - nB) > fee_per_pair_approx(
+                    pA, nB, multiplier_a=market_fee_multiplier(mA),
+                    multiplier_b=market_fee_multiplier(mB))) and (pB > pA)
 
                 group_pairs.append(
                     CandidatePair(
@@ -5967,7 +6172,9 @@ def find_same_title_pairs(
 
                 # tradeable=True when buying NO on A and YES on B covers all costs.
                 # fee_per_pair_approx returns a continuous estimate of total taker fees.
-                tradeable = (1.0 - nA - pB) > fee_per_pair_approx(nA, pB)
+                tradeable = (1.0 - nA - pB) > fee_per_pair_approx(
+                    nA, pB, multiplier_a=market_fee_multiplier(mA),
+                    multiplier_b=market_fee_multiplier(mB))
                 group_pairs.append(
                     CandidatePair(
                         market_a=mA,
@@ -6691,7 +6898,8 @@ def _pair_max_sum(pair: Any, settings: LiveSettings) -> float:
     return 1.0 - SAME_TITLE_MIN_PRICE_DIFF
 
 
-def _levels_with_edge_after_fee(qualifying: list) -> list:
+def _levels_with_edge_after_fee(qualifying: list, *, yes_multiplier: float = 1.0,
+                                no_multiplier: float = 1.0) -> list:
     """
     Cut a pair's qualifying levels at the first one with no edge left after the fee.
 
@@ -6705,12 +6913,16 @@ def _levels_with_edge_after_fee(qualifying: list) -> list:
     Args:
         qualifying (list): (yes_price, no_price, qty) levels in SIDE order,
             ascending by combined price, already under the price-sum ceiling.
+        yes_multiplier (float): Keyword-only. The YES leg's market's fee
+            multiplier (_side_fee_multipliers); every package call passes it.
+        no_multiplier (float): Keyword-only. The NO leg's market's.
 
     Returns:
         list: The longest prefix whose every level keeps an edge after the fee.
     """
     return list(itertools.takewhile(
-        lambda lvl: (1.0 - lvl[0] - lvl[1]) > fee_per_pair_approx(lvl[0], lvl[1]),
+        lambda lvl: (1.0 - lvl[0] - lvl[1]) > fee_per_pair_approx(
+            lvl[0], lvl[1], multiplier_a=yes_multiplier, multiplier_b=no_multiplier),
         qualifying,
     ))
 
@@ -6812,7 +7024,9 @@ def _enrich_pair(
 
     # Keep the prefix that still has an edge after the fee, as validate_pair_price does
     before = len(qualifying)
-    qualifying = _levels_with_edge_after_fee(qualifying)
+    yes_mult, no_mult = _side_fee_multipliers(pair)
+    qualifying = _levels_with_edge_after_fee(
+        qualifying, yes_multiplier=yes_mult, no_multiplier=no_mult)
     if before and not qualifying:
         log(logging.INFO,
             "No contract pair for '%s' keeps an edge after the fee — skipping",
@@ -6965,7 +7179,8 @@ def _enrich_pair(
 
     # Re-validate tradeability at the depth-weighted prices (the pair may still be
     # unprofitable if all qualifying contracts are at the edge of the gap threshold).
-    profitable = (1.0 - avg_no - avg_yes) > fee_per_pair_approx(avg_no, avg_yes)
+    profitable = (1.0 - avg_no - avg_yes) > fee_per_pair_approx(
+        avg_no, avg_yes, multiplier_a=no_mult, multiplier_b=yes_mult)
 
     if not profitable:
         # Kept as its own arm so this line only ever reports the profitability
@@ -7162,7 +7377,9 @@ def validate_pair_price(client: Any, spec: Any, *, settings: LiveSettings | None
 
     # The edge cut enrichment prices with. At a floor of 0 the 1.0 ceiling above checks
     # no edge, so this is then the only edge re-check before submission.
-    qualifying = _levels_with_edge_after_fee(qualifying)
+    yes_mult, no_mult = _side_fee_multipliers(pair)
+    qualifying = _levels_with_edge_after_fee(
+        qualifying, yes_multiplier=yes_mult, no_multiplier=no_mult)
     if not qualifying:
         logging.warning(
             "Pre-execution check failed for '%s' — no contract pair on the book now "

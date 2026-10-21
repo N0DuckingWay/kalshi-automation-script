@@ -4,13 +4,15 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Suite-wide pytest fixtures and two helpers. Nine autouse guards
+    Suite-wide pytest fixtures and two helpers. Thirteen autouse guards
     (_offline_event_competitions_for_the_session,
     _isolate_event_title_accumulator, _isolate_treasury_rates,
     _fresh_order_write_pacer, _fresh_v2_mapping_disproof_state,
     _isolate_live_defaults_for_the_session, _isolate_live_defaults,
-    _isolate_live_runs and _isolate_live_dashboard, in the order described
-    here): one answers every event-competition read with "" (an event naming
+    _isolate_live_runs, _isolate_live_dashboard,
+    _offline_market_details_for_the_session, _isolate_market_details,
+    _stale_quote_check_off_for_the_session and
+    _volume_cap_off_for_the_session, in the order described here): one answers every event-competition read with "" (an event naming
     no competition) and points the competition cache and Kalshi's cached
     /series listing at an empty session directory, in force during class
     setup too, so no test reaches Kalshi for a label and no class-scoped
@@ -36,7 +38,21 @@ Purpose:
     reads, its kept daily prices and its server log) and the trade log it
     reads (reporter.PROD_LOG_PATH, with its lock) at each test's own
     tmp_path, so no test writes them into the checkout or reads the
-    operator's trade log. pre_toggle_defaults pins
+    operator's trade log; and two keep market_details offline: the session one
+    replaces its request function with a stub (no markets and no trades
+    listed, a plain RuntimeError for anything else), points its three cache locations at an
+    empty session directory and removes the pause after each request, and the
+    per-test one points the same three locations at each test's tmp_path;
+    and one turns the backtest's stale-quote check off (backtester's binding
+    of config.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS set to None) for the
+    whole session, class setup included, since the suite's candle fixtures
+    hold one candle a week and were written before the check existed; a test
+    of the check turns it on itself (its monkeypatch, or the run's
+    stale_quote_max_age argument); and one turns the backtest's volume cap
+    off the same way (backtester's binding of config.BACKTEST_MAX_VOLUME_SHARE
+    set to None), for the same reason: the suite's figures were pinned before
+    it existed, and a test of the cap turns it on itself.
+    pre_toggle_defaults pins
     the live toggles for a test whose figures assume fixed values (they pin
     arithmetic, not config.py's policy); its helper, apply_pre_toggle_defaults,
     also serves class-scoped fixtures. save_config_live_defaults (and the
@@ -47,7 +63,8 @@ Dependencies:
     Imports kalshi_betting.historical (the four cache paths, and
     _fetch_event_competition, which the session guard replaces),
     kalshi_betting.treasury (its _RATES_CACHE path and _get_json),
-    kalshi_betting.trader (its _WritePacer, _ORDER_WRITE_PACER,
+    kalshi_betting.market_details (its request function and three cache
+    locations), kalshi_betting.trader (its _WritePacer, _ORDER_WRITE_PACER,
     _V2_NO_MAPPING_DISPROVEN, _V2_UNCHECKED_NO_LEGS and
     _V2_UNCHECKED_BASELINES), config (the toggle
     constants, the order-write rate and burst, LIVE_DEFAULTS_FILE,
@@ -84,9 +101,20 @@ Notes:
     changes nothing, since the session stub never calls it. The session stub
     returns once the test's monkeypatch is undone.
 """
+from pathlib import Path
+
 import pytest
 
-from kalshi_betting import backtest, backtester, config, historical, reporter, trader, treasury
+from kalshi_betting import (
+    backtest,
+    backtester,
+    config,
+    historical,
+    market_details,
+    reporter,
+    trader,
+    treasury,
+)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -102,7 +130,11 @@ def _offline_event_competitions_for_the_session(tmp_path_factory):
     before any function-scoped fixture is active. The stub answers "" (an
     event that names no competition), so every existing same-title fixture
     keeps pairing exactly as before; a test of the read itself replaces it.
-    The two caches point at an empty session directory, so class setup never
+    Each pair market's event's fee override (load_event_fee_overrides,
+    through _fetch_event_fee_override) is answered as none, so every market
+    keeps its series' multiplier, and its facts (load_event_facts, through
+    _fetch_event_facts) as no settlement source and no mutually_exclusive
+    flag. The caches point at an empty session directory, so class setup never
     reads the operator's series_categories.json or writes an
     event_competitions.json into the checkout; each test body sees its own
     tmp_path (the redirect below).
@@ -119,8 +151,151 @@ def _offline_event_competitions_for_the_session(tmp_path_factory):
     mp.setattr(historical, "_EVENT_COMPETITIONS_CACHE", folder / "event_competitions.json")
     mp.setattr(historical, "_SERIES_CATEGORIES_CACHE", folder / "series_categories.json")
     mp.setattr(historical, "_fetch_event_competition", lambda client, event_ticker: "")
+    # The pair markets' events' fee overrides, read the same way: answered as
+    # an event that sets none (None), with their cache off the checkout too
+    mp.setattr(historical, "_EVENT_FEE_OVERRIDES_CACHE", folder / "event_fee_overrides.json")
+    mp.setattr(historical, "_fetch_event_fee_override", lambda client, event_ticker: None)
+    # The pair markets' events' report-only facts (load_event_facts): answered
+    # as an event that lists no settlement source and no mutually_exclusive flag
+    mp.setattr(historical, "_EVENT_FACTS_CACHE", folder / "event_facts.json")
+    mp.setattr(historical, "_fetch_event_facts",
+               lambda client, event_ticker: {"settlement_sources": (),
+                                             "mutually_exclusive": None})
+
+    # Nothing is saved into the session directory. A class-scoped fixture that
+    # runs a backtest twice would otherwise see its second run read what its
+    # first run wrote (an "Event competitions: N events, C from the cache" line
+    # that differs between the two runs, and that depends on which tests ran
+    # first). A test body saves into its own tmp_path, which this does not touch.
+    real_save = historical._save_json_cache
+
+    def save_unless_session_dir(path, data, *args, **kwargs):
+        if Path(path).parent == folder:
+            return None
+        return real_save(path, data, *args, **kwargs)
+
+    mp.setattr(historical, "_save_json_cache", save_unless_session_dir)
     yield
     mp.undo()
+
+
+def _offline_market_details_get(client, path, **params):
+    """
+    Stand in for market_details._get: no test reaches Kalshi for market details or trades.
+
+    The market listings and the two trades endpoints answer with nothing (no
+    markets, no trades), so the backtest's side data comes back empty and quiet
+    (a raised error there would be a WARNING in every test that prepares
+    candidates). Every other path (the cutoff, a capture) raises a plain
+    RuntimeError, which the callers treat as a failed request.
+
+    Args:
+        client: Ignored.
+        path (str): The API path asked for.
+        **params: Ignored.
+
+    Returns:
+        dict: {"markets": []} for a market listing, {"trades": []} for a
+            trades listing.
+
+    Raises:
+        RuntimeError: For any other path.
+    """
+    if path.endswith("/markets") or path.endswith("/historical/markets"):
+        return {"markets": [], "cursor": ""}
+    if path.endswith("/trades"):
+        return {"trades": [], "cursor": ""}
+    raise RuntimeError("offline: the test suite makes no request to Kalshi")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _offline_market_details_for_the_session(tmp_path_factory):
+    """
+    Keep market_details off the network and off the checkout, for the whole session.
+
+    Session-scoped, like the event-competition stub above, because the
+    backtester's class-scoped sweep fixtures run whole backtests (and so the
+    side-data loaders) before any function-scoped fixture is active. Replaces
+    market_details._get with _offline_market_details_get, points the three
+    cache locations at an empty session directory and removes the pause after
+    each request. The module's own tests put their fake exchange where the
+    stub is.
+
+    Args:
+        tmp_path_factory (pytest.TempPathFactory): pytest's session-wide
+            temporary-directory maker.
+
+    Yields:
+        None: The stub and the redirect hold until the session ends.
+    """
+    mp = pytest.MonkeyPatch()
+    folder = tmp_path_factory.mktemp("market-details")
+    mp.setattr(market_details, "_get", _offline_market_details_get)
+    mp.setattr(market_details, "_DETAILS_CACHE", folder / "market_details.json.gz")
+    mp.setattr(market_details, "_TRADES_DIR", folder / "trades")
+    mp.setattr(market_details, "_CLOSES_DIR", folder / "scheduled_closes")
+    mp.setattr(config, "MARKET_DETAILS_REQUEST_PAUSE_SECONDS", 0.0)
+    yield
+    mp.undo()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _stale_quote_check_off_for_the_session():
+    """
+    Turn the backtest's stale-quote check off for the whole session.
+
+    The suite's candle fixtures mostly hold one candle a week with nothing
+    traded, so under the shipped 24-hour limit every later Monday's quote reads
+    as stale and their pinned trades would vanish. Session-scoped, because the
+    backtester's class-scoped sweep fixtures run whole backtests before any
+    function-scoped fixture is active. A test of the check turns it on with its
+    own monkeypatch of backtester.BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS (undone
+    back to None), or hands a run its stale_quote_max_age; a hand-built
+    LegQuotes carries no limit either way.
+
+    Yields:
+        None: The setting holds until the session ends.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setattr(backtester, "BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS", None)
+    yield
+    mp.undo()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _volume_cap_off_for_the_session():
+    """
+    Turn the backtest's volume cap off for the whole session.
+
+    The suite's figures were pinned before the cap existed, and many of its
+    candles trade nothing, which the cap would read as no volume ahead (no
+    trade). Session-scoped, like the stale-quote one above, because class
+    setup runs whole backtests before any function-scoped fixture. A test of
+    the cap turns it on with its own monkeypatch of
+    backtester.BACKTEST_MAX_VOLUME_SHARE (undone back to None), or hands a
+    run its max_volume_share; a hand-built LegQuotes carries no cap either way.
+
+    Yields:
+        None: The setting holds until the session ends.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setattr(backtester, "BACKTEST_MAX_VOLUME_SHARE", None)
+    yield
+    mp.undo()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_market_details(tmp_path, monkeypatch):
+    """
+    Point market_details' three caches at the test's own tmp_path.
+
+    Args:
+        tmp_path (Path): pytest's per-test temporary directory.
+        monkeypatch (pytest.MonkeyPatch): Restores the session paths afterwards.
+    """
+    monkeypatch.setattr(market_details, "_DETAILS_CACHE", tmp_path / "market_details.json.gz")
+    monkeypatch.setattr(market_details, "_TRADES_DIR", tmp_path / "trades")
+    monkeypatch.setattr(market_details, "_CLOSES_DIR", tmp_path / "scheduled_closes")
 
 
 @pytest.fixture(autouse=True)
@@ -141,6 +316,9 @@ def _isolate_event_title_accumulator(tmp_path, monkeypatch):
                         tmp_path / "series_categories.json")
     monkeypatch.setattr(historical, "_EVENT_COMPETITIONS_CACHE",
                         tmp_path / "event_competitions.json")
+    monkeypatch.setattr(historical, "_EVENT_FEE_OVERRIDES_CACHE",
+                        tmp_path / "event_fee_overrides.json")
+    monkeypatch.setattr(historical, "_EVENT_FACTS_CACHE", tmp_path / "event_facts.json")
 
 
 def apply_pre_toggle_defaults(mp) -> None:

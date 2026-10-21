@@ -6285,8 +6285,10 @@ def _mid_books(*, a_yes_bids=((0.27, 100),), a_no_bids=((0.70, 100),),
 _MID_TOPS = (1.0 - 0.70, 1.0 - 0.27, 1.0 - 0.36, 1.0 - 0.52)
 
 
-def _asymmetric_fee(price_a, price_b):
+def _asymmetric_fee(price_a, price_b, **_multipliers):
     """A fake fee: none when the first price is the lower, $1 otherwise.
+
+    It takes (and ignores) the fee multipliers every package call names.
 
     The edge cut asks it (YES price, NO price) and the profitability check
     (NO price, YES price), so a pair whose YES leg is the cheaper one keeps
@@ -12460,3 +12462,119 @@ class TestFloorToTick:
             assert high - low in (Decimal(0), tick)
             assert low / tick == (low / tick).to_integral_value()
             assert (low == price) is (high == price)
+
+
+class TestLegFeeMultipliers:
+    """scanner.leg_fee_multipliers reads each leg's own market's fee multiplier,
+    in MARKET order, and counts one only when config confirms it."""
+
+    @pytest.fixture
+    def half_confirmed(self, monkeypatch):
+        monkeypatch.setattr(config, "CONFIRMED_FEE_MULTIPLIERS", frozenset({1.0, 0.5}))
+
+    def test_a_time_series_no_leg_on_b_gets_bs_multiplier(self, half_confirmed):
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.45)
+        pair.market_b._fee_multiplier = 0.5
+        assert scanner.leg_fee_multipliers(pair) == (1.0, 0.5)
+        # Side order: YES on A, NO on B
+        assert scanner._side_fee_multipliers(pair) == (1.0, 0.5)
+
+    def test_a_same_title_no_leg_on_a_gets_as_multiplier(self, half_confirmed):
+        pair = _st_candidate(pA=0.70, pB=0.60, nA=0.32)
+        pair.market_a._fee_multiplier = 0.5
+        assert scanner.leg_fee_multipliers(pair) == (0.5, 1.0)
+        # Side order: YES on B, NO on A
+        assert scanner._side_fee_multipliers(pair) == (1.0, 0.5)
+
+    def test_an_unconfirmed_multiplier_reads_the_full_fee(self):
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.45)
+        pair.market_a._fee_multiplier = 0.0
+        pair.market_b._fee_multiplier = 0.5
+        assert scanner.leg_fee_multipliers(pair) == (1.0, 1.0)
+
+    def test_anything_but_a_number_reads_the_full_fee(self, half_confirmed):
+        pair = SimpleNamespace(market_a=MagicMock(), market_b=SimpleNamespace())
+        assert scanner.leg_fee_multipliers(pair) == (1.0, 1.0)
+        assert scanner.leg_fee_multipliers(SimpleNamespace()) == (1.0, 1.0)
+        pair = SimpleNamespace(market_a=SimpleNamespace(_fee_multiplier="0.5"),
+                               market_b=SimpleNamespace(_fee_multiplier=True))
+        assert scanner.leg_fee_multipliers(pair) == (1.0, 1.0)
+
+    def test_a_ladder_swapped_onto_its_stated_deadlines_keeps_each_markets_own(
+            self, monkeypatch, half_confirmed):
+        # The earlier-stated rung closes LATER, so the finder swaps the legs:
+        # market A is the earlier-stated rung, and its multiplier goes with it
+        monkeypatch.setattr(scanner, "TIME_SERIES_SAME_EVENT_LADDERS", True)
+        early = _ladder_rung("RUNG-EARLY", "by March 1, 2026", yes_ask=0.20, no_ask=0.80,
+                             close=datetime(2026, 3, 25, tzinfo=UTC))
+        late = _ladder_rung("RUNG-LATE", "by March 20, 2026", yes_ask=0.60, no_ask=0.40,
+                            close=datetime(2026, 3, 21, tzinfo=UTC))
+        early._fee_multiplier = 0.5
+        pairs = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[late, early])
+        assert len(pairs) == 1
+        assert (pairs[0].market_a.ticker, pairs[0].market_b.ticker) == ("RUNG-EARLY",
+                                                                         "RUNG-LATE")
+        assert scanner.leg_fee_multipliers(pairs[0]) == (0.5, 1.0)
+
+    def test_the_edge_cut_prices_each_side_at_its_multiplier(self, monkeypatch):
+        # Edge 0.02 is under the full fee (about 0.035) and over a zero one
+        level = [(0.48, 0.50, 10)]
+        assert scanner._levels_with_edge_after_fee(level, yes_multiplier=1.0,
+                                                   no_multiplier=1.0) == []
+        assert scanner._levels_with_edge_after_fee(level, yes_multiplier=0.0,
+                                                   no_multiplier=0.0) == level
+
+
+class TestEventFeeOverrides:
+    """An event's fee_multiplier_override wins over its series' multiplier;
+    one not known (not read, or unreadable) is the full fee, never the
+    series' reduced one."""
+
+    def test_reading_an_events_override(self):
+        read = scanner.event_fee_override
+        assert read({}) is None
+        assert read({"fee_multiplier_override": None}) is None
+        assert read({"fee_multiplier_override": 1}) == 1.0
+        assert read({"fee_multiplier_override": 0.5,
+                     "fee_type_override": "quadratic"}) == 0.5
+        unknown = scanner.EVENT_FEE_OVERRIDE_UNKNOWN
+        for event in ({"fee_multiplier_override": "0.5"}, {"fee_multiplier_override": True},
+                      {"fee_multiplier_override": 2.0},
+                      {"fee_multiplier_override": float("nan")},
+                      {"fee_type_override": "flat", "fee_multiplier_override": 0.5},
+                      {"fee_type_override": 3}, None, []):
+            assert read(event) == unknown, event
+
+    def test_the_listed_multiplier(self):
+        listed = scanner.listed_fee_multiplier
+        unknown = scanner.EVENT_FEE_OVERRIDE_UNKNOWN
+        assert listed(0.5, None) == 0.5
+        # A full-fee event of a reduced series is the full fee
+        assert listed(0.5, 1.0) == 1.0
+        assert listed(1.0, 0.0) == 0.0
+        assert listed(0.5, unknown) == 1.0
+        assert listed(0.5, "x") == 1.0
+        assert listed("0.5", None) == 1.0
+        assert scanner.market_event_fee_override(SimpleNamespace()) == unknown
+        assert scanner.ApiMarket(ticker="T", event_ticker="E", title="", subtitle="",
+                                 status="active", close_time=None)._event_fee_override == unknown
+
+    def test_ingest_attaches_each_events_override_in_both_loops(self, monkeypatch):
+        monkeypatch.setattr(scanner, "INCLUDE_MVE_MARKETS", True)
+        standard = [
+            {"title": "Full fee event", "fee_multiplier_override": 1.0,
+             "markets": [_raw_market("STD-OVR", "Rain tomorrow")]},
+            {"title": "Plain", "markets": [_raw_market("STD-NONE", "Snow tomorrow")]},
+            {"title": "Odd", "fee_multiplier_override": "half",
+             "markets": [_raw_market("STD-ODD", "Hail tomorrow")]},
+        ]
+        mve = [{"title": "Parlay", "fee_multiplier_override": 0.0,
+                "markets": [_raw_market("MVE-OVR", "All legs hit")]}]
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page(standard))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page(mve))
+        by_ticker = {m.ticker: m for m in fetch_open_events_with_markets(client)}
+        assert {t: m._event_fee_override for t, m in by_ticker.items()} == {
+            "STD-OVR": 1.0, "STD-NONE": None,
+            "STD-ODD": scanner.EVENT_FEE_OVERRIDE_UNKNOWN, "MVE-OVR": 0.0}

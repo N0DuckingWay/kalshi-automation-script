@@ -7,6 +7,7 @@ MagicMock auto-attribute would TypeError inside compute_trade's arithmetic.
 """
 import ast
 import dataclasses
+import importlib
 import inspect
 import json
 import logging
@@ -1927,7 +1928,9 @@ def _backtest_sizing_problems(source: str) -> list[str]:
         problems.append(f"the trade is sized as {ast.unparse(size)}")
     if size.lineno <= walk.lineno:
         problems.append("the trade is sized before its book is walked")
-    if bound.get("pair") != ["_candidate_pair(c, held, markets)"]:
+    # The candidate's pair at its quotes; with the volume cap and no book to
+    # walk, the same pair as a one-level book holding the cap's limit (C7)
+    if bound.get("pair") != ["_candidate_pair(c, held, markets)", "_capped_at(pair, limit)"]:
         problems.append(f"the pair is {bound.get('pair')}")
     cents = _def_named(source, "_cents")
     returns = [ast.unparse(n.value) for n in ast.walk(cents) if isinstance(n, ast.Return)]
@@ -2597,6 +2600,50 @@ class TestTimeSeriesKellyParity:
         [dev_read] = _calls_to(dev, "load_series_categories")
         assert ast.unparse(dev_read) == "load_series_categories(None)"
 
+    def test_ast_the_scheduled_close_has_one_reader_and_its_readers_are_listed(self):
+        # C5: the close a live run would have read is read only through
+        # backtester._maturity_close, by exactly these functions; where the
+        # exchange's own timing matters the realized close is kept
+        tree = ast.parse(inspect.getsource(backtester))
+        functions = {node.name: node for node in ast.walk(tree)
+                     if isinstance(node, ast.FunctionDef)}
+        readers = {name for name, node in functions.items()
+                   if name != "_maturity_close" and _calls_to(node, "_maturity_close")}
+        assert readers == {"_find_entry", "_simulate_at_discount", "_close_gate_and_labels",
+                           "_apply_scheduled_closes"}
+        for name in ("_can_ever_enter", "_checkpoint_floor", "_fetch_candles_parallel",
+                     "_candle_window_open", "_extract_pairs", "_attach_leg_quotes",
+                     "_leg_quotes", "_prepare_candidates"):
+            assert not _calls_to(functions[name], "_maturity_close"), name
+        # The private key is read by _maturity_close and written only by
+        # _write_scheduled_close (and popped with the switch off)
+        key_users = {name for name, node in functions.items()
+                     if any(isinstance(n, ast.Name) and n.id == "_SCHEDULED_CLOSE_KEY"
+                            for n in ast.walk(node))}
+        assert key_users == {"_maturity_close", "_write_scheduled_close",
+                             "_apply_scheduled_closes"}
+        # _find_entry's scan window stays on the realized closes
+        find = functions["_find_entry"]
+        [scan_end] = [n for n in ast.walk(find) if isinstance(n, ast.Assign)
+                      and any(isinstance(t, ast.Name) and t.id == "scan_end" for t in n.targets)]
+        assert ast.unparse(scan_end.value) == "min(close_a, close_b) - timedelta(days=1)"
+        reads = {ast.unparse(n.value) for n in ast.walk(find) if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id in ("close_a", "close_b")
+                         for t in n.targets) and isinstance(n.value, ast.Call)}
+        assert reads == {"_parse_iso_date(mA.get('close_time'))",
+                         "_parse_iso_date(mB.get('close_time'))"}
+        # The deferred gate runs after both extractions and before the
+        # competitions are read, and the rule is the one market_details defines
+        prepare = functions["_prepare_candidates"]
+        [gate] = _calls_to(prepare, "_close_gate_and_labels")
+        [read] = _calls_to(prepare, "load_event_competitions")
+        assert all(c.lineno < gate.lineno for c in _calls_to(prepare, "_extract_pairs"))
+        assert gate.lineno < read.lineno
+        assert _function_calls(backtester, "_close_gate_and_labels", "closes_apart")
+        assert _function_calls(backtester, "_close_gate_and_labels", "labels_differ")
+        assert _function_calls(backtester, "_write_scheduled_close", "scheduled_close")
+        assert _function_calls(backtester, "_prepare_candidates", "load_close_rules")
+
     def test_ast_the_backtest_applies_the_sport_check(self):
         # DR-79's backtest half, through the definitions the live finder uses:
         # the label half inside _extract_pairs' same-title branch, right after
@@ -2604,7 +2651,9 @@ class TestTimeSeriesKellyParity:
         tree = ast.parse(inspect.getsource(backtester))
         extract = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
                        and node.name == "_extract_pairs")
-        assert _function_calls(backtester, "_extract_pairs", "series_labels")
+        assert _function_calls(backtester, "_extract_pairs", "_series_label_filer")
+        assert _function_calls(backtester, "_series_label_filer", "series_labels")
+        assert _function_calls(backtester, "_close_gate_and_labels", "_series_label_filer")
         [labels] = _calls_to(extract, "labels_differ")
         [closes] = _calls_to(extract, "closes_apart")
         assert closes.lineno < labels.lineno
@@ -3520,6 +3569,111 @@ class TestTimeSeriesKellyParity:
                             "    return reference\n")
         assert [where.split(":")[0] for where in self._proposal_readers(sources)] == ["main"]
 
+    @staticmethod
+    def _fee_call_problems(source: str) -> list[str]:
+        """Every fee call in source that does not name its multiplier keyword(s)."""
+        wanted = {"fee_leg_exact": {"multiplier"},
+                  "fee_per_pair_approx": {"multiplier_a", "multiplier_b"},
+                  # Helpers whose multiplier keywords default to the full fee
+                  "_levels_with_edge_after_fee": {"yes_multiplier", "no_multiplier"},
+                  "_kelly_fraction": {"multiplier_a", "multiplier_b"},
+                  # A paid-out partner's fee reads the series map plan_sales is handed
+                  "plan_sales": {"fee_multipliers"}}
+        problems = []
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = (func.id if isinstance(func, ast.Name)
+                    else func.attr if isinstance(func, ast.Attribute) else None)
+            if name in wanted:
+                named = {k.arg for k in node.keywords}
+                if not wanted[name] <= named:
+                    problems.append(f"{name} at line {node.lineno}")
+        return problems
+
+    def test_ast_every_fee_call_names_its_multiplier(self):
+        # A fee call that leaves its multiplier to the 1.0 default would charge
+        # that leg the full fee once a reduced multiplier is confirmed, while
+        # its twin is charged the reduced one: every call in the package names
+        # each leg's multiplier, so none is missed
+        import pkgutil
+
+        import kalshi_betting
+        names = sorted(m.name for m in pkgutil.iter_modules(kalshi_betting.__path__))
+        found = 0
+        for name in names:
+            module = importlib.import_module(f"kalshi_betting.{name}")
+            source = inspect.getsource(module)
+            assert self._fee_call_problems(source) == [], name
+            found += sum(1 for node in ast.walk(ast.parse(source))
+                         if isinstance(node, ast.Call)
+                         and getattr(node.func, "id", getattr(node.func, "attr", None))
+                         in ("fee_leg_exact", "fee_per_pair_approx"))
+        # The calls exist (32 in eight modules), so the walk is not vacuous
+        assert found >= 30
+        # The check catches a call that leaves a multiplier out
+        assert self._fee_call_problems("fee_leg_exact(n, p)\n") == ["fee_leg_exact at line 1"]
+        assert self._fee_call_problems(
+            "config.fee_per_pair_approx(a, b, multiplier_a=x)\n") == [
+            "fee_per_pair_approx at line 1"]
+        assert self._fee_call_problems(
+            "fee_per_pair_approx(a, b, multiplier_a=x, multiplier_b=y)\n"
+            "config.fee_leg_exact(n, p, multiplier=m)\n") == []
+        assert self._fee_call_problems("_levels_with_edge_after_fee(q)\n") == [
+            "_levels_with_edge_after_fee at line 1"]
+        assert self._fee_call_problems("dashboard._kelly_fraction(1, 2, 3, 4, t)\n") == [
+            "_kelly_fraction at line 1"]
+        assert self._fee_call_problems("plan_sales(c, p, l, m, settings=s, now=n)\n") == [
+            "plan_sales at line 1"]
+
+    def test_ast_the_fee_multiplier_attribute_has_one_reader(self):
+        # scanner.market_fee_multiplier (behind scanner.leg_fee_multipliers)
+        # is the one reader of a market's _fee_multiplier; only
+        # main._attach_series_labels (live) and backtester._candidate_pair
+        # (the backtest) write it
+        import pkgutil
+
+        import kalshi_betting
+        reads, writes = set(), set()
+        for name in sorted(m.name for m in pkgutil.iter_modules(kalshi_betting.__path__)):
+            module = importlib.import_module(f"kalshi_betting.{name}")
+            tree = ast.parse(inspect.getsource(module))
+            for func in ast.walk(tree):
+                if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for node in ast.walk(func):
+                    if isinstance(node, ast.Attribute) and node.attr == "_fee_multiplier":
+                        (writes if isinstance(node.ctx, ast.Store) else reads).add(
+                            (name, func.name))
+                    elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                          and node.func.id in ("getattr", "setattr", "hasattr")
+                          and any(isinstance(a, ast.Constant) and a.value == "_fee_multiplier"
+                                  for a in node.args)):
+                        (writes if node.func.id == "setattr" else reads).add(
+                            (name, func.name))
+        assert reads == {("scanner", "market_fee_multiplier")}
+        # ... and an event's fee override has one reader too
+        override_reads = set()
+        for name in sorted(m.name for m in pkgutil.iter_modules(kalshi_betting.__path__)):
+            module = importlib.import_module(f"kalshi_betting.{name}")
+            for func in ast.walk(ast.parse(inspect.getsource(module))):
+                if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for node in ast.walk(func):
+                    if ((isinstance(node, ast.Attribute)
+                         and node.attr == "_event_fee_override")
+                            or (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                                and node.func.id == "getattr"
+                                and any(isinstance(a, ast.Constant)
+                                        and a.value == "_event_fee_override"
+                                        for a in node.args))):
+                        override_reads.add((name, func.name))
+        assert override_reads == {("scanner", "market_event_fee_override")}
+        assert writes == {("main", "_attach_series_labels"),
+                          ("backtester", "_candidate_pair")}
+        assert _function_calls(scanner, "leg_fee_multipliers", "market_fee_multiplier")
+
     def test_ast_every_sizer_caps_through_pair_size_cap(self):
         # config.pair_size_cap is the ONE definition of a pair's per-trade cap,
         # so the live sizer, enrichment's bound and the backtester agree
@@ -3750,6 +3904,121 @@ class TestTimeSeriesKellyParity:
             assert mutant != shape, name
             assert _live_held_pair_problems(mutant), name
 
+    def test_ast_the_volume_cap_has_one_reading_and_its_readers(self):
+        # C7: the volume ahead of each checkpoint is read only by LegQuotes
+        # itself (volume_cap_at, the one reading of the cap) and by the one
+        # writer's count of unreadable markets; the cap is asked only where a
+        # buy or a sale is sized: the buy books (_books_for), the buy limit
+        # (_volume_limit), the sale ladder and the gate of the count of the
+        # sales it held back (_volume_capped_leg)
+        import importlib
+        import pkgutil
+
+        import kalshi_betting
+
+        names = sorted(m.name for m in pkgutil.iter_modules(kalshi_betting.__path__))
+        callers: set = set()
+        readers: dict[str, set] = {"volume_ahead_checkpoints": set(), "volume_share": set()}
+        for name in names:
+            module = importlib.import_module(f"kalshi_betting.{name}")
+            tree = ast.parse(inspect.getsource(module))
+            for func in ast.walk(tree):
+                if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for sub in ast.walk(func):
+                    if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+                            and sub.func.attr == "volume_cap_at"):
+                        callers.add((name, func.name))
+                    if (isinstance(sub, ast.Attribute) and sub.attr in readers
+                            and isinstance(sub.ctx, ast.Load)):
+                        readers[sub.attr].add((name, func.name))
+        assert callers == {("backtester", "sale_ladder"), ("backtester", "_books_for"),
+                           ("backtester", "_volume_limit"),
+                           ("backtester", "_volume_capped_leg")}
+        # ... and volume_ahead_at, the report-only reading a trade's
+        # volume_share is taken from (C8), which decides nothing
+        assert readers["volume_ahead_checkpoints"] == {
+            ("backtester", "volume_cap_at"), ("backtester", "__reduce__"),
+            ("backtester", "__eq__"), ("backtester", "_attach_leg_quotes"),
+            ("backtester", "volume_ahead_at")}
+        assert readers["volume_share"] == {
+            ("backtester", "volume_cap_at"), ("backtester", "__init__"),
+            ("backtester", "__reduce__"), ("backtester", "__eq__"),
+            ("backtester", "_simulate_at_discount")}
+        # Sized by the live code where the cap binds: the one-level book only
+        # in _size_trade, and the cut only through _cut_levels
+        assert _function_calls(backtester, "_size_trade", "_capped_at")
+        assert _function_calls(backtester, "_size_trade", "_volume_limit")
+        assert _function_calls(backtester, "_books_for", "_cut_levels")
+        assert _function_calls(backtester, "sale_ladder", "_cut_levels")
+        assert _function_calls(backtester, "_leg_quotes", "_volume_ahead")
+        for caller in ("_prepare_entries", "_sweep_from_candidates"):
+            (value,) = _keyword_values(backtester, caller, "_attach_leg_quotes",
+                                       "volume_share")
+            assert ast.unparse(value) == "candidates.max_volume_share", caller
+        assert _function_calls(backtester, "_prepare_candidates", "_resolve_max_volume_share")
+        assert _function_calls(backtester, "run_backtest_sweep", "_resolve_max_volume_share")
+
+    def test_ast_the_stale_quote_check_has_one_test_and_three_readers(self):
+        # C6: a backtest entry, sale or Kelly trim needs each market's quote
+        # to have moved recently. One test, backtester._quote_is_fresh, read
+        # in exactly three places anywhere in the package: Pass 1b's Kelly
+        # gate, the checkpoint sale value and the Kelly trim's fresh bids.
+        # The moved times and the limit it reads are read nowhere else but
+        # LegQuotes itself (and the gate's skip-count line, the limit only).
+        import importlib
+        import pkgutil
+
+        import kalshi_betting
+
+        names = sorted(m.name for m in pkgutil.iter_modules(kalshi_betting.__path__))
+        callers: set = set()
+        readers: dict[str, set] = {"moved_checkpoints": set(), "stale_max_age": set()}
+        for name in names:
+            module = importlib.import_module(f"kalshi_betting.{name}")
+            tree = ast.parse(inspect.getsource(module))
+            for func in ast.walk(tree):
+                if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for sub in ast.walk(func):
+                    if isinstance(sub, ast.Call):
+                        fn = sub.func
+                        called = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
+                        if called == "_quote_is_fresh":
+                            callers.add((name, func.name))
+                    if (isinstance(sub, ast.Attribute) and sub.attr in readers
+                            and isinstance(sub.ctx, ast.Load)):
+                        readers[sub.attr].add((name, func.name))
+        assert callers == {("backtester", "_simulate_at_discount"),
+                           ("backtester", "_position_sale_value"),
+                           ("backtester", "_fresh_bids"),
+                           # ... and the gate of the walk's count-only revaluations
+                           ("backtester", "_stale_unpaid_leg")}
+        assert _function_calls(backtester, "_simulate_at_discount", "_stale_unpaid_leg")
+        # ... and quote_age_at, the report-only age a trade's row shows (C8)
+        assert readers["moved_checkpoints"] == {("backtester", "_quote_is_fresh"),
+                                                ("backtester", "__reduce__"),
+                                                ("backtester", "__eq__"),
+                                                ("backtester", "quote_age_at")}
+        assert readers["stale_max_age"] == {("backtester", "_quote_is_fresh"),
+                                            ("backtester", "__init__"),
+                                            ("backtester", "__reduce__"),
+                                            ("backtester", "__eq__"),
+                                            ("backtester", "_simulate_at_discount")}
+        # The quotes carry the run's limit: written by the one quote builder,
+        # from the one writer of "leg_quotes", from the run's resolved limit
+        assert _function_calls(backtester, "_leg_quotes", "_moved_ts")
+        assert _function_calls(backtester, "_prepare_candidates",
+                               "_resolve_stale_quote_max_age")
+        assert _function_calls(backtester, "run_backtest_sweep", "_resolve_stale_quote_max_age")
+        for caller in ("_prepare_entries", "_sweep_from_candidates"):
+            (value,) = _keyword_values(backtester, caller, "_attach_leg_quotes",
+                                       "stale_max_age")
+            assert ast.unparse(value) == "candidates.stale_quote_max_age", caller
+        (value,) = _keyword_values(backtester, "_attach_leg_quotes", "_leg_quotes",
+                                   "stale_max_age")
+        assert ast.unparse(value) == "stale_max_age"
+
     def test_ast_open_trades_are_valued_through_one_definition(self):
         # The backtest values an open trade at market from the quotes the one
         # writer, _attach_leg_quotes, puts on each entry record under
@@ -3835,7 +4104,12 @@ class TestTimeSeriesKellyParity:
                     if name in sale_readers:
                         sale_readers[name].add(func.name)
         assert sale_readers == {"bid_at_checkpoint": {"_position_sale_value", "_fresh_bids"},
-                                "paid_at_checkpoint": {"_position_sale_value"},
+                                # ... and the gate of the stale-quote check's
+                                # count-only revaluations (C6), which decides nothing
+                                "paid_at_checkpoint": {"_position_sale_value",
+                                                       "_stale_unpaid_leg",
+                                                       # ... and the volume cap's (C7)
+                                                       "_volume_capped_leg"},
                                 "sale_ladder": {"_position_sale_value"},
                                 "_position_sale_value": {"_hold_readings", "_kelly_trim",
                                                          "net_sale"},
@@ -3870,9 +4144,16 @@ class TestTimeSeriesKellyParity:
         # sized on (the one checkpoint_value assignment)
         walk = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
                     and node.name == "_simulate_at_discount")
-        [decided] = _calls_to(walk, "_kelly_trim")
+        [decided, counted, capped] = _calls_to(walk, "_kelly_trim")
         assert [ast.unparse(arg) for arg in decided.args] == [
             "position", "d", "value", "effective_k", "cap", "st_cap"] and not decided.keywords
+        # The second call only counts the trims the stale-quote check held
+        # back, and the third those the volume cap cut or held back: the same
+        # arguments with that one check skipped, read for nothing but the count
+        for call, skipped in ((counted, "stale_check=False"), (capped, "volume_cap=False")):
+            assert [ast.unparse(arg) for arg in call.args] == [
+                ast.unparse(arg) for arg in decided.args]
+            assert [ast.unparse(kw) for kw in call.keywords] == [skipped]
         plans = _calls_to(walk, "planned_trims")
         assert sorted(ast.unparse(call) for call in plans) == [
             "planned_trims(d, value, open_now)",
@@ -3954,7 +4235,9 @@ class TestTimeSeriesKellyParity:
                     and node.name == "planned_trims")
         [measured] = _calls_to(plan, "_price_move")
         [tested] = _calls_to(plan, "price_move_reached")
-        [decided] = _calls_to(plan, "_kelly_trim")
+        # The decision; the calls after it (stale_check=False,
+        # volume_cap=False) only count the trims those checks held back
+        decided, *_counted = _calls_to(plan, "_kelly_trim")
         assert measured.lineno < tested.lineno < decided.lineno
         assert [ast.unparse(arg) for arg in measured.args] == ["position", "d", "last_trim"]
         assert [ast.unparse(arg) for arg in tested.args] == ["move", "min_move"]
@@ -4009,7 +4292,7 @@ class TestTimeSeriesKellyParity:
         # counted on no other line and adds nothing to cap_free_from
         [measured] = _calls_to(plan, "_price_move")
         [tested] = _calls_to(plan, "price_move_reached")
-        [decided] = _calls_to(plan, "_kelly_trim")
+        decided, *_counted = _calls_to(plan, "_kelly_trim")
         assert gate.lineno < gate.end_lineno < measured.lineno < tested.lineno < decided.lineno
         # Only the walk asks the rule (for a trim in planned_trims, for an
         # add-on in its own body). It needs no config.trade_day: its
@@ -5787,3 +6070,63 @@ class TestPortfolioSummaryIsFeeInclusive:
         # These hand-built specs carry no order reserve, so the walk set aside
         # their fee-inclusive costs, rounded up to the cent
         assert "(up to $32.10 of cash at the orders' limit prices)" in line
+
+
+class TestComputeTradeChargesEachLegItsMultiplier:
+    """compute_trade prices each leg's fee at its own market's multiplier
+    (scanner.leg_fee_multipliers), and only a confirmed one lowers it."""
+
+    _TS_LEVELS = [(0.30, 0.38, 400.0), (0.31, 0.39, 400.0)]
+    _ST_LEVELS = [(0.30, 0.60, 500.0), (0.31, 0.61, 500.0)]
+
+    @staticmethod
+    def _fields(spec):
+        # Every field but the pair (whose markets carry the multiplier)
+        return {f.name: getattr(spec, f.name) for f in dataclasses.fields(spec)
+                if f.name not in ("pair", "fee_multipliers")}
+
+    def _pair(self, pair_type, mult_a=None, mult_b=None):
+        levels = self._TS_LEVELS if pair_type == "time_series" else self._ST_LEVELS
+        pair = make_booked_pair(levels, pair_type=pair_type, pB=0.62)
+        if mult_a is not None:
+            pair.market_a._fee_multiplier = mult_a
+        if mult_b is not None:
+            pair.market_b._fee_multiplier = mult_b
+        return pair
+
+    @pytest.mark.parametrize("pair_type, mult_a, mult_b", [
+        ("time_series", None, 0.5), ("time_series", 0.5, None),
+        ("same_title", 0.5, None), ("same_title", None, 0.5)])
+    def test_a_confirmed_half_halves_only_its_own_legs_fee(self, monkeypatch, caplog,
+                                                          pair_type, mult_a, mult_b):
+        monkeypatch.setattr(config, "CONFIRMED_FEE_MULTIPLIERS", frozenset({1.0, 0.5}))
+        with caplog.at_level(logging.INFO):
+            spec = compute_trade(self._pair(pair_type, mult_a, mult_b), 1_000_000,
+                                 settings=_live())
+        assert spec is not None
+        want = (mult_a or 1.0, mult_b or 1.0)
+        assert spec.fee_multipliers == want
+        price_a, price_b = leg_prices(spec.pair)
+        n = spec.x
+        fee_a = fee_leg_exact(n, price_a, multiplier=want[0])
+        fee_b = fee_leg_exact(n, price_b, multiplier=want[1])
+        assert spec.cost_with_fees_a == pytest.approx(n * price_a + fee_a)
+        assert spec.cost_with_fees_b == pytest.approx(n * price_b + fee_b)
+        assert spec.total_cost_with_fees == pytest.approx(n * (price_a + price_b) + fee_a + fee_b)
+        # The halved leg really is cheaper than the full fee there
+        halved = 0 if want[0] == 0.5 else 1
+        price = (price_a, price_b)[halved]
+        assert (fee_a, fee_b)[halved] < fee_leg_exact(n, price, multiplier=1.0)
+        assert f"| fee multipliers {want[0]:g}/{want[1]:g}" in caplog.text
+
+    @pytest.mark.parametrize("pair_type", ["time_series", "same_title"])
+    def test_an_unconfirmed_half_is_charged_in_full(self, caplog, pair_type):
+        full = compute_trade(self._pair(pair_type), 1_000_000, settings=_live())
+        with caplog.at_level(logging.INFO):
+            listed = compute_trade(self._pair(pair_type, 0.5, 0.0), 1_000_000,
+                                   settings=_live())
+        assert full is not None and listed is not None
+        assert listed.fee_multipliers == (1.0, 1.0)
+        assert self._fields(listed) == self._fields(full)
+        assert leg_prices(listed.pair) == leg_prices(full.pair)
+        assert "fee multipliers" not in caplog.text

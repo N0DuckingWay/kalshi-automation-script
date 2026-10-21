@@ -35,6 +35,7 @@ import pytest
 from kalshi_betting import backtester, config, depth_model, historical, seller
 from kalshi_betting import scanner as scanner_mod
 from kalshi_betting.config import fee_leg_exact
+from kalshi_betting.historical import series_ticker
 from kalshi_betting.scanner import (
     ApiMarket,
     FillTimes,
@@ -143,7 +144,8 @@ class _World:
         return {t: market_ladder_keys(self.known[t]) for t in self.positions}
 
     def plan(self, monkeypatch, level: float | None = 0.01, *, min_days: int | None = None,
-             now: datetime = _NOW, labels: dict | None = None) -> list:
+             now: datetime = _NOW, labels: dict | None = None,
+             fee_multipliers: dict | None = None) -> list:
         """Run seller.plan_sales against this world, its reads stubbed and recorded."""
         def book(client, ticker):
             self.calls["book"].append(ticker)
@@ -177,7 +179,7 @@ class _World:
         plans = seller.plan_sales(client, dict(self.positions),
                                   self.labels() if labels is None else labels,
                                   dict(self.markets), settings=_settings(level, min_days),
-                                  now=now)
+                                  now=now, fee_multipliers=fee_multipliers)
         # Every read went through a stub: the client itself is never touched
         assert client.mock_calls == []
         return plans
@@ -446,6 +448,34 @@ class TestParityWithTheBacktest:
         assert case.world.plan(monkeypatch, top)
         if top < 1.0:
             assert not case.world.plan(monkeypatch, round(top + 0.01, 2))
+
+    @pytest.mark.parametrize("build", [_paid_between_case, _same_title_lone_paid_between])
+    def test_a_partners_fee_is_charged_at_its_own_multiplier_as_the_backtest_charges_it(
+            self, monkeypatch, build):
+        # Confirmed reduced multipliers: the paid-out partner A at 0.5 (its
+        # series', its event setting no override) and the held B at 0
+        monkeypatch.setattr(config, "CONFIRMED_FEE_MULTIPLIERS", frozenset({1.0, 0.5, 0.0}))
+        case = build()
+        full_profits = case.readings()[1]
+        case.trade = dc_replace(case.trade, fee_multiplier_a=0.5, fee_multiplier_b=0.0)
+        market_a = case.world.lookup[_A]
+        market_a._event_fee_override = None
+        case.world.markets[_B]._fee_multiplier = 0.0
+        sale, profits = case.readings()
+        # Not vacuous: the multipliers move the backtest's checks
+        assert profits != full_profits
+        (plan,) = case.world.plan(monkeypatch, 0.01,
+                                  fee_multipliers={series_ticker(_EV_A): 0.5})
+        (partner,) = [leg for leg in plan.legs if leg.market is None]
+        assert partner.partner_fee_multiplier == 0.5
+        for (live, _lp), (back, _bp) in zip(plan.profits, profits, strict=True):
+            assert live == pytest.approx(back, abs=1e-9)
+        # The partner's event override not known: charged the full fee, never 0.5
+        market_a._event_fee_override = "unknown"
+        (plan,) = case.world.plan(monkeypatch, 0.01,
+                                  fee_multipliers={series_ticker(_EV_A): 0.5})
+        (partner,) = [leg for leg in plan.legs if leg.market is None]
+        assert partner.partner_fee_multiplier == 1.0
 
     def test_the_levels_tell_the_cases_apart(self):
         # Not vacuous: each case's highest selling level lies strictly inside
