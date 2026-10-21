@@ -2324,7 +2324,7 @@ class TestYesCloseDispatch:
         assert v2_probe.main(["--ticker", TICKER, "--step", "yes-close", "--yes"]) == 0
         assert exchange.position == 0
         closing = capsys.readouterr().out.split("RESULT: yes-close -> PASS", 1)[1]
-        assert ("--step yes-close has to PASS before live selling or trimming is turned on"
+        assert ("--step yes-close has to PASS before live selling or rebalancing is turned on"
                 in closing)
 
     @pytest.mark.parametrize("outcome", [v2_probe._FAIL, v2_probe._NEUTRAL])
@@ -2335,21 +2335,23 @@ class TestYesCloseDispatch:
             monkeypatch, capsys, "yes-close", outcome,
             ["--ticker", TICKER, "--step", "yes-close"],
         )
-        assert ("--step yes-close has to PASS before live selling or trimming is turned on"
+        assert ("--step yes-close has to PASS before live selling or rebalancing is turned on"
                 in closing)
         if outcome == v2_probe._FAIL:
             # The same closing line as the other order steps
             assert v2_probe._ORDER_FAIL_CLOSING in closing
 
-    def test_the_header_the_help_and_the_closing_line_name_trimming_beside_selling(
+    def test_the_header_the_help_and_the_closing_line_name_rebalancing_beside_selling(
         self, capsys,
     ):
-        # A trim sends the same reduce-only sale orders live selling does, so the
-        # step that checks the YES sale must PASS before either is turned on
+        # Rebalancing sells through Kelly trims, which send the same reduce-only
+        # sale orders live selling does, so the step that checks the YES sale
+        # must PASS before either is turned on; the order itself is still
+        # named as what live trimming sends
         header = " ".join(v2_probe.__doc__.split())
-        assert "live selling or live trimming on" in header
-        assert "what live selling and live trimming wait for" in header
-        assert "trimming" in v2_probe._YES_CLOSE_MUST_PASS
+        assert "live selling or live rebalancing on" in header
+        assert "what live selling and live rebalancing wait for" in header
+        assert "rebalancing" in v2_probe._YES_CLOSE_MUST_PASS
         assert v2_probe._YES_CLOSE_MUST_PASS in v2_probe._STEPS_MUST_PASS
         assert v2_probe._YES_CLOSE_MUST_PASS in v2_probe._PASS_CLOSING
         with pytest.raises(SystemExit) as exc_info:
@@ -2357,7 +2359,7 @@ class TestYesCloseDispatch:
         assert exc_info.value.code == 0
         text = " ".join(capsys.readouterr().out.split())
         assert "reduce-only ask live selling and live trimming send" in text
-        assert "run it before turning selling or trimming on" in text
+        assert "run it before turning selling or rebalancing on" in text
 
     def test_a_non_v2_order_path_refuses_the_step(self, monkeypatch, capsys):
         monkeypatch.setattr(config, "ORDER_API_VERSION", "legacy")

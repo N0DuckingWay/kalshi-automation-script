@@ -64,8 +64,8 @@ Dependencies:
     Also exports the candle bid rule a sale reads: usable_candle_ask and candle_sale_bids
     (read by backtester.py, and by bid_before) and bid_before (seller.py only), plus
     recent_candles, seller.py's never-cached candle fetch. For seller.plan_trims:
-    ask_before (a side's price at a past moment) and candle_reads_bid (whether a
-    candle could show a given best bid).
+    ask_before (a side's price at a past moment, which seller.plan_add_ons reads
+    too) and candle_reads_bid (whether a candle could show a given best bid).
 
 Notes:
     Historical market data only exists on the production API — the sandbox does
@@ -6795,12 +6795,21 @@ def _fetch_candle_pages(client: Any, path: str, windows: list[tuple[int, int]],
                     # cached with no visible signal at all (BS-23).
                     dropped += 1
                     continue
-                # NO ask ≈ 1 - YES bid (binary market complement); clamp to avoid 0 or 1
-                no_ask = 1.0 - yes_bid
+                if math.isfinite(yes_bid) and 0.0 <= yes_bid < 1.0:
+                    # NO ask = 1 - YES bid (the two sides of one book), held
+                    # to 0.01..CANDLE_NO_ASK_CEILING
+                    no_ask = max(0.01, min(CANDLE_NO_ASK_CEILING, 1.0 - yes_bid))
+                else:
+                    # A YES bid that is not a price (not finite, below 0, or $1
+                    # or more, such as a whole-cent close like 47 read as
+                    # dollars) means no YES bid: the NO ask is stored at the
+                    # ceiling, which usable_candle_ask reads as no quote. Held
+                    # to the 0.01 floor instead, it would read as a real 1c ask.
+                    no_ask = CANDLE_NO_ASK_CEILING
                 candles.append({
                     "ts": c["end_period_ts"],
                     "yes_ask_close": yes_ask,
-                    "no_ask_close": max(0.01, min(CANDLE_NO_ASK_CEILING, no_ask)),
+                    "no_ask_close": no_ask,
                     # Contracts traded in this hour; None when not readable
                     "volume": _candle_count(c),
                     # The rest of the hour's record, from either endpoint's
@@ -6980,7 +6989,9 @@ def fetch_candlesticks(
             - "ts" (int): Unix timestamp of the candle's end period.
             - "yes_ask_close" (float): YES ask price at close. Range: [0.01, 0.99].
             - "no_ask_close" (float): Approximated NO ask price at close (1 − yes_bid_close).
-              Clamped to [0.01, 0.99].
+              Clamped to [0.01, 0.99]. A YES bid that is not a price of at least 0
+              and below $1 is stored at CANDLE_NO_ASK_CEILING (0.99), which
+              usable_candle_ask reads as no quote.
             - "volume" (float | None): Contracts traded in the candle's hour;
               None when the API gave no readable count.
             - "yes_ask_ohl" / "yes_bid_ohl" (tuple | None): the hour's YES ask
@@ -7089,8 +7100,9 @@ def recent_candles(client: Any, ticker: str, event_ticker: str, start_ts: int,
     """
     Fetch one market's hourly candles over [start_ts, end_ts] for a live run, never cached.
 
-    Read by seller.plan_sales (through bid_before, for the days before a sale) and
-    seller.plan_trims (through ask_before, for a held market's price when its pair last traded).
+    Read by seller.plan_sales (through bid_before, for the days before a sale), and by
+    seller.plan_trims and seller.plan_add_ons (through ask_before, for a held market's
+    price when its pair last traded).
     Fetched and parsed as fetch_candlesticks does (read-only GETs), but never cached:
     a live sale gets the latest candles and touches nothing in backtest_cache/.
 

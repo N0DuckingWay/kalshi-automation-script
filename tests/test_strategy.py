@@ -2761,7 +2761,7 @@ class TestTimeSeriesKellyParity:
             assert _function_calls(backtester, function, "_entry_mondays"), function
         # ... the census being _entry_events, which every sweep's
         # entry_events (the size-cap family's, the sell family's and the
-        # Kelly-trim family's) calls
+        # Rebalance family's) calls
         census_readers = [
             node for node in ast.walk(ast.parse(inspect.getsource(backtester)))
             if isinstance(node, ast.FunctionDef) and node.name == "entry_events"]
@@ -2809,15 +2809,19 @@ class TestTimeSeriesKellyParity:
         "save_live_defaults": frozenset({("defaults_server", "_App._post_confirm")}),
     }
 
-    # The saved file's path, config's private parse of it and the seed values: a
-    # walked module reaches the saved live defaults only through a
-    # _DEFAULTS_READERS reader, so it names none of these (a second read of the
-    # file through them would slip past that table)
+    # The saved file's path, config's private parse of it (with the reading of a
+    # file an older version saved in its new form) and the seed values: a walked
+    # module reaches the saved live defaults only through a _DEFAULTS_READERS
+    # reader, so it names none of these (a second read of the file through them
+    # would slip past that table)
     _SAVED_FILE_INTERNALS = frozenset({
         "LIVE_DEFAULTS_FILE",
         "LIVE_DEFAULTS_SEED",
+        "_RetiredSettings",
+        "_retired_proposal",
         "_saved_settings",
         "_settings_from_bytes",
+        "_settings_from_toggles",
     })
 
     # The one module that may name some of those internals, and which: the
@@ -2939,11 +2943,10 @@ class TestTimeSeriesKellyParity:
             "SAME_TITLE_SIZE_CAP",
             "TRADE_CATEGORIES",
             "TRADE_TAGS",
-            "ADD_TO_HELD_PAIRS",
+            "REBALANCE",
+            "MIN_PRICE_MOVE",
             "SELL_AT",
             "SELL_MIN_DAYS",
-            "TRIM_TO_KELLY",
-            "TRIM_MIN_RISE",
         } | self._SAVED_FILE_INTERNALS
         resolver = "live_settings"
         # (module, exempted name) -> references found, so no exemption outlives its use
@@ -3506,6 +3509,65 @@ class TestTimeSeriesKellyParity:
         # Non-vacuous: both report reads are there, through the one reader
         assert _function_calls(backtester, "_live_settings_for_report", "live_defaults")
         assert _function_calls(backtest, "main", "live_defaults")
+
+    @staticmethod
+    def _proposal_readers(sources: dict[str, str]) -> list[str]:
+        """
+        Find where a module other than the defaults server reads `.proposal`.
+
+        Args:
+            sources (dict[str, str]): Module name -> its source.
+
+        Returns:
+            list[str]: "module:line" for each read, outside config (which sets
+                it) and defaults_server (which offers it for one save).
+        """
+        found = []
+        for mod, text in sources.items():
+            if mod in ("config", "defaults_server"):
+                continue
+            for node in ast.walk(ast.parse(text)):
+                if isinstance(node, ast.Attribute) and node.attr == "proposal":
+                    found.append(f"{mod}:{node.lineno}")
+        return found
+
+    @staticmethod
+    def _package_sources() -> dict[str, str]:
+        """
+        Read every module of the package.
+
+        Returns:
+            dict[str, str]: Module name -> its source.
+        """
+        import importlib
+        import pkgutil
+
+        import kalshi_betting
+
+        names = sorted(m.name for m in pkgutil.iter_modules(kalshi_betting.__path__))
+        return {name: inspect.getsource(importlib.import_module(f"kalshi_betting.{name}"))
+                for name in names}
+
+    def test_ast_only_the_defaults_server_reads_an_outdated_file_s_proposal(self):
+        # config.LiveDefaultsOutdated.proposal is a file an older version saved,
+        # read in its new form: the defaults server offers it on a page for one
+        # Confirm and save, and no other module may read it (main, the
+        # scheduler or a report reading it would trade or report values nobody
+        # confirmed)
+        sources = self._package_sources()
+        assert {"main", "scheduler", "defaults_server", "backtester"} <= set(sources)
+        assert self._proposal_readers(sources) == []
+        # Non-vacuous: the defaults server does read it
+        assert ".proposal" in sources["defaults_server"]
+
+    def test_ast_a_proposal_read_outside_the_defaults_server_is_caught(self):
+        # control — main reading an outdated file's proposal as its reference
+        # is refused by the check above
+        sources = self._package_sources()
+        sources["main"] += ("\n\ndef _mutant(exc):\n"
+                            "    reference = exc.proposal\n"
+                            "    return reference\n")
+        assert [where.split(":")[0] for where in self._proposal_readers(sources)] == ["main"]
 
     @staticmethod
     def _fee_call_problems(source: str) -> list[str]:
@@ -4141,43 +4203,44 @@ class TestTimeSeriesKellyParity:
         for func in ("_far_enough", "_sale_reach"):
             assert _function_calls(backtester, func, "_days_left"), func
 
-    def test_ast_a_trim_waits_for_a_price_rise_through_one_definition(self):
-        # With a minimum price rise (trim_min_rise), the walk asks one
-        # question before it sizes a trim: has the pair's total price risen
-        # far enough since the last trade on it? The answer comes from
-        # config's two functions, which live code can import
-        # (pair_price_rise for the rise, trim_rise_reached for the test), and
-        # the two prices from the quote an open trade is valued at: _price_rise
+    def test_ast_a_trim_waits_for_a_price_move_through_one_definition(self):
+        # With a minimum price move (min_move), the walk asks one
+        # question before it sizes a trim: has the pair's total price moved
+        # far enough, up or down, since the last trade on it? The answer comes
+        # from config's two functions, which live code can import
+        # (pair_price_move for the move, price_move_reached for the test), and
+        # the two prices from the quote an open trade is valued at: _price_move
         # reads the pair's price at both moments through _pair_price, which
         # reads each leg through _leg_mark, the one reader of a checkpoint quote
-        assert backtester.pair_price_rise is config.pair_price_rise
-        assert backtester.trim_rise_reached is config.trim_rise_reached
-        assert _function_calls(backtester, "planned_trims", "_price_rise")
-        assert _function_calls(backtester, "planned_trims", "trim_rise_reached")
-        assert _function_calls(backtester, "_price_rise", "_pair_price")
-        assert _function_calls(backtester, "_price_rise", "pair_price_rise")
+        assert backtester.pair_price_move is config.pair_price_move
+        assert backtester.price_move_reached is config.price_move_reached
+        assert _function_calls(backtester, "planned_trims", "_price_move")
+        assert _function_calls(backtester, "planned_trims", "price_move_reached")
+        assert _function_calls(backtester, "_price_move", "_pair_price")
+        assert _function_calls(backtester, "_price_move", "pair_price_move")
         assert _function_calls(backtester, "_pair_price", "_leg_mark")
         # A position the trim leaves alone has no rise to test
-        assert _function_calls(backtester, "_price_rise", "_exact_pair")
-        # The walk measures every pair's rise in one place, and asks before
-        # the trim is sized: a pair short of the minimum is never handed to
-        # _kelly_trim
+        assert _function_calls(backtester, "_price_move", "_exact_pair")
+        # The walk measures every pair's move in one place for a trim
+        # (planned_trims) and one for an add-on (_held_pair_move, the same
+        # function), and asks before the trim is sized: a pair short of the
+        # minimum is never handed to _kelly_trim
         tree = ast.parse(inspect.getsource(backtester))
         rise_callers = {func.name for func in ast.walk(tree)
                         if isinstance(func, ast.FunctionDef)
                         and any(isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
-                                and sub.func.id == "_price_rise" for sub in ast.walk(func))}
-        assert rise_callers == {"_simulate_at_discount", "planned_trims"}
+                                and sub.func.id == "_price_move" for sub in ast.walk(func))}
+        assert rise_callers == {"_simulate_at_discount", "planned_trims", "_held_pair_move"}
         plan = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
                     and node.name == "planned_trims")
-        [measured] = _calls_to(plan, "_price_rise")
-        [tested] = _calls_to(plan, "trim_rise_reached")
+        [measured] = _calls_to(plan, "_price_move")
+        [tested] = _calls_to(plan, "price_move_reached")
         # The decision; the calls after it (stale_check=False,
         # volume_cap=False) only count the trims those checks held back
         decided, *_counted = _calls_to(plan, "_kelly_trim")
         assert measured.lineno < tested.lineno < decided.lineno
         assert [ast.unparse(arg) for arg in measured.args] == ["position", "d", "last_trim"]
-        assert [ast.unparse(arg) for arg in tested.args] == ["rise", "min_rise"]
+        assert [ast.unparse(arg) for arg in tested.args] == ["move", "min_move"]
         # ... and the trim that is carried out notes its checkpoint, the day
         # the pair's next rise is measured from
         carry_out = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
@@ -4188,19 +4251,19 @@ class TestTimeSeriesKellyParity:
         assert [ast.unparse(node.value) for node in noted] == ["d"]
         # The minimum is checked where the other options are, before any
         # entry is scored, and a CapSweep checks it as it is built
-        assert _function_calls(backtester, "_simulate_at_discount", "_resolve_trim_min_rise")
+        assert _function_calls(backtester, "_simulate_at_discount", "_resolve_min_move")
         cap_sweep = next(node for node in tree.body if isinstance(node, ast.ClassDef)
                          and node.name == "CapSweep")
         built = next(node for node in cap_sweep.body if isinstance(node, ast.FunctionDef)
                      and node.name == "__post_init__")
-        assert _calls_to(built, "_resolve_trim_min_rise")
+        assert _calls_to(built, "_resolve_min_move")
 
     def test_ast_a_trim_waits_days_after_a_trade_through_one_definition(self):
         # The backtest trims a held pair only once enough days have passed since
-        # its last trade: config.kelly_trim_rested (shared with live code) decides,
-        # on the day _last_trade_day finds. The price rise counts from that same day
-        assert backtester.kelly_trim_rested is config.kelly_trim_rested
-        assert backtester.kelly_trim_min_days is config.kelly_trim_min_days
+        # its last trade: config.rebalance_rested (shared with live code) decides,
+        # on the day _last_trade_day finds. The price move counts from that same day
+        assert backtester.rebalance_rested is config.rebalance_rested
+        assert backtester.rebalance_min_days is config.rebalance_min_days
         source = inspect.getsource(backtester)
         tree = ast.parse(source)
 
@@ -4213,8 +4276,8 @@ class TestTimeSeriesKellyParity:
         plan = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
                     and node.name == "planned_trims")
         # planned_trims asks with exactly this call
-        [rested] = _calls_to(plan, "kelly_trim_rested")
-        asked = "kelly_trim_rested(_last_trade_day(position, last_trim), d, trim_min_days)"
+        [rested] = _calls_to(plan, "rebalance_rested")
+        asked = "rebalance_rested(_last_trade_day(position, last_trim), d, wait_days)"
         assert ast.unparse(rested) == asked
         [day] = _calls_to(plan, "_last_trade_day")
         assert rested.args[0] is day
@@ -4225,20 +4288,22 @@ class TestTimeSeriesKellyParity:
             f"_exact_pair(position) and not {asked}", mode="eval").body)
         assert [ast.unparse(stmt) for stmt in gate.body] == ["pairs_waiting += 1", "continue"]
         assert not gate.orelse
-        # ... before the price rise or trim size is worked out, so a waiting pair is
+        # ... before the price move or trim size is worked out, so a waiting pair is
         # counted on no other line and adds nothing to cap_free_from
-        [measured] = _calls_to(plan, "_price_rise")
-        [tested] = _calls_to(plan, "trim_rise_reached")
+        [measured] = _calls_to(plan, "_price_move")
+        [tested] = _calls_to(plan, "price_move_reached")
         decided, *_counted = _calls_to(plan, "_kelly_trim")
         assert gate.lineno < gate.end_lineno < measured.lineno < tested.lineno < decided.lineno
-        # Only the walk asks the rule. It needs no config.trade_day: its
+        # Only the walk asks the rule (for a trim in planned_trims, for an
+        # add-on in its own body). It needs no config.trade_day: its
         # checkpoints are already dates
-        assert callers("kelly_trim_rested") == {"_simulate_at_discount", "planned_trims"}
+        assert callers("rebalance_rested") == {"_simulate_at_discount", "planned_trims"}
         assert not hasattr(backtester, "trade_day")
-        # The price rise reads the same day, and only _last_trade_day reads last_trim
+        # The price move reads the same day; an add-on to an exact pair reads
+        # both through _held_pair_move
         assert callers("_last_trade_day") == {"_simulate_at_discount", "planned_trims",
-                                              "_price_rise"}
-        rise = _def_named(source, "_price_rise")
+                                              "_price_move", "_held_pair_move"}
+        rise = _def_named(source, "_price_move")
         [since] = _calls_to(rise, "_last_trade_day")
         assert [ast.unparse(arg) for arg in since.args] == ["position", "last_trim"]
         [assigned] = [node for node in ast.walk(rise) if isinstance(node, ast.Assign)
@@ -4246,56 +4311,120 @@ class TestTimeSeriesKellyParity:
         assert ast.unparse(assigned.targets[0]) == "last_day"
         then, now = _calls_to(rise, "_pair_price")
         assert [ast.unparse(call.args[1]) for call in (then, now)] == ["last_day", "day"]
+        # Only _last_trade_day (an exact pair) and _lone_leg_move (a lone leg,
+        # whose trades can be of several pairs) read last_trim
         trim_readers = {func.name for func in ast.walk(tree) if isinstance(func, ast.FunctionDef)
                         and any(isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
                                 and sub.func.attr == "get"
                                 and ast.unparse(sub.func.value) == "last_trim"
                                 for sub in ast.walk(func))}
-        assert trim_readers == {"_last_trade_day"}
-        # The wait is backtester's own binding, checked by config.kelly_trim_min_days:
-        # by a trimming run before it scores any entry, and by every sweep before its fetch
-        resolve = _def_named(source, "_resolve_trim_min_days")
+        assert trim_readers == {"_last_trade_day", "_lone_leg_move"}
+        # The wait is backtester's own binding, checked by config.rebalance_min_days:
+        # by a run that adds or trims before it scores any entry, and by every sweep
+        # before its fetch
+        resolve = _def_named(source, "_resolve_rebalance_min_days")
         assert ast.unparse(resolve.body[-1]) == (
-            "return kelly_trim_min_days(KELLY_TRIM_MIN_DAYS_SINCE_TRADE)")
+            "return rebalance_min_days(REBALANCE_MIN_DAYS_SINCE_TRADE)")
         assert len(resolve.body) == 2 and isinstance(resolve.body[0].value, ast.Constant)
         walk = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
                     and node.name == "_simulate_at_discount")
         [days] = [node for node in walk.body if isinstance(node, ast.Assign)
-                  and ast.unparse(node.targets[0]) == "trim_min_days"]
-        assert ast.unparse(days.value) == "_resolve_trim_min_days() if trim_to_kelly else 0"
+                  and ast.unparse(node.targets[0]) == "wait_days"]
+        assert ast.unparse(days.value) == (
+            "_resolve_rebalance_min_days() if add_to_held or trim_to_kelly else 0")
         scored = next(node.lineno for node in walk.body if isinstance(node, ast.Assign)
                       and ast.unparse(node.targets[0]) == "candidates")
         assert days.lineno < scored
         assert [node.lineno for node in ast.walk(walk) if isinstance(node, ast.Assign)
-                and ast.unparse(node.targets[0]) == "trim_min_days"] == [days.lineno]
+                and ast.unparse(node.targets[0]) == "wait_days"] == [days.lineno]
         sweep = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
                      and node.name == "run_backtest_sweep")
         # A statement of the function's own body, so no flag can skip it
         [checked] = [node for node in sweep.body if isinstance(node, ast.Assign)
-                     and ast.unparse(node.value) == "_resolve_trim_min_days()"]
+                     and ast.unparse(node.value) == "_resolve_rebalance_min_days()"]
         [fetched] = _calls_to(sweep, "_prepare_candidates")
         [first_line] = [call for call in _calls_to(sweep, "info")
                         if ast.unparse(call.args[0]).startswith("'Starting backtest")]
         assert checked.lineno < first_line.lineno < fetched.lineno
-        assert callers("_resolve_trim_min_days") == {"_simulate_at_discount",
+        assert callers("_resolve_rebalance_min_days") == {"_simulate_at_discount",
                                                      "run_backtest_sweep"}
 
+    def test_ast_an_add_on_waits_and_reads_the_move_before_it_is_sized(self):
+        # An add-on is a rebalance: in the walk's own body (not a helper inside
+        # it), what it adds to is asked first whether it has rested
+        # (config.rebalance_rested, on the day of its last trade) and then,
+        # with a minimum, whether its price has moved far enough
+        # (config.price_move_reached), both before held_pair_fraction sizes it.
+        # The day and the move come from _held_pair_move (an exact pair, the
+        # trim's own _last_trade_day and _price_move) or _lone_leg_move (a lone
+        # leg, its own market's mark), and the move of every add-on made is
+        # recorded beside the trims'
+        source = inspect.getsource(backtester)
+        tree = ast.parse(source)
+        walk = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "_simulate_at_discount")
+        own = list(_own_nodes(walk))
+
+        def own_calls(callee: str) -> list:
+            calls = [n for n in own if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                     and n.func.id == callee]
+            return sorted(calls, key=lambda c: (c.lineno, c.col_offset))
+
+        [pair_move] = own_calls("_held_pair_move")
+        [leg_move] = own_calls("_lone_leg_move")
+        [rested] = own_calls("rebalance_rested")
+        [moved] = own_calls("price_move_reached")
+        [share] = own_calls("held_pair_fraction")
+        [sized] = own_calls("_size_trade")
+        assert (max(pair_move.lineno, leg_move.lineno) < rested.lineno < moved.lineno
+                < share.lineno < sized.lineno)
+        assert ast.unparse(rested) == "rebalance_rested(last_day, d, wait_days)"
+        assert ast.unparse(moved) == "price_move_reached(add_move, min_move)"
+        assert [ast.unparse(arg) for arg in pair_move.args] == [
+            "[t for t, _paid in held['trades']]", "d", "last_trim"]
+        assert [ast.unparse(arg) for arg in leg_move.args] == ["lone_legs", "d", "last_trim"]
+        # Each test holds the add-on back with a count and nothing else
+        for call, count in ((rested, "adds_waiting"), (moved, "adds_held_back")):
+            [gate] = [n for n in own if isinstance(n, ast.If)
+                      and any(sub is call for sub in ast.walk(n.test))]
+            assert [ast.unparse(stmt) for stmt in gate.body] == [f"{count} += 1", "continue"]
+            assert not gate.orelse
+        # A move that cannot be read is held back by any minimum
+        [gate] = [n for n in own if isinstance(n, ast.If)
+                  and any(sub is moved for sub in ast.walk(n.test))]
+        assert ast.unparse(gate.test) == (
+            "min_move is not None and (add_move is None or not "
+            "price_move_reached(add_move, min_move))")
+        # The two helpers read the trim's own day and move, and a lone leg's mark
+        assert _function_calls(backtester, "_held_pair_move", "_last_trade_day")
+        assert _function_calls(backtester, "_held_pair_move", "_price_move")
+        assert _function_calls(backtester, "_lone_leg_move", "_leg_mark")
+        assert _function_calls(backtester, "_lone_leg_move", "pair_price_move")
+        # Every add-on made adds its move to the record move_grid reads
+        [recorded] = [n for n in own if isinstance(n, ast.Call)
+                      and ast.unparse(n.func) == "moves.append"]
+        assert ast.unparse(recorded) == (
+            "moves.append(0.0 if add_move is None else add_move)")
+        [made] = [n for n in own if isinstance(n, ast.If)
+                  and ast.unparse(n.test) == "trade.add_on"]
+        assert any(sub is recorded for sub in ast.walk(made))
+
     def test_ast_a_run_stands_for_a_larger_minimum_through_the_walk_s_own_test(self):
-        # TrimSweep.rise_grid lets a run it already has stand for a larger
-        # minimum price rise only when every trim that run made would still
-        # be made there. It asks config.trim_rise_reached about each of the
-        # run's rises: the function the walk itself holds a trim back with
-        # (planned_trims), so the two cannot disagree at a boundary
-        assert backtester.trim_rise_reached is config.trim_rise_reached
+        # RebalanceSweep.move_grid lets a run it already has stand for a larger
+        # minimum price movement only when every add-on and trim that run made
+        # would still be made there. It asks config.price_move_reached about
+        # each of the run's moves: the function the walk itself holds a trim
+        # and an add-on back with, so the two cannot disagree at a boundary
+        assert backtester.price_move_reached is config.price_move_reached
         tree = ast.parse(inspect.getsource(backtester))
         family = next(node for node in tree.body if isinstance(node, ast.ClassDef)
-                      and node.name == "TrimSweep")
+                      and node.name == "RebalanceSweep")
         grid = next(node for node in family.body if isinstance(node, ast.FunctionDef)
-                    and node.name == "rise_grid")
-        [covered] = _calls_to(grid, "trim_rise_reached")
-        assert [ast.unparse(arg) for arg in covered.args] == ["rise", "min_rise"]
-        # ... for every trim the run made: the call is what all(...) tests,
-        # over the rises kept of that run
+                    and node.name == "move_grid")
+        [covered] = _calls_to(grid, "price_move_reached")
+        assert [ast.unparse(arg) for arg in covered.args] == ["move", "min_move"]
+        # ... for every add-on and trim the run made: the call is what all(...)
+        # tests, over the moves kept of that run
         [every] = [node for node in ast.walk(grid) if isinstance(node, ast.Call)
                    and isinstance(node.func, ast.Name) and node.func.id == "all"
                    and any(sub is covered for sub in ast.walk(node))]
@@ -4303,31 +4432,33 @@ class TestTimeSeriesKellyParity:
         assert isinstance(tested, ast.GeneratorExp) and tested.elt is covered
         [loop] = tested.generators
         assert (ast.unparse(loop.target), ast.unparse(loop.iter), loop.ifs) == (
-            "rise", "rises", [])
+            "move", "moves", [])
         # Only the walk and the grid ask it (each named with the function it sits in)
         askers = {func.name for func in ast.walk(tree) if isinstance(func, ast.FunctionDef)
-                  and _calls_to(func, "trim_rise_reached")}
-        assert askers == {"_simulate_at_discount", "planned_trims", "rise_grid", "cells_at"}
+                  and _calls_to(func, "price_move_reached")}
+        assert askers == {"_simulate_at_discount", "planned_trims", "move_grid", "cells_at"}
 
         def rise_comparisons(source_tree: ast.AST) -> list[str]:
-            """Every <, <=, > or >= with a side that names a price rise."""
+            """Every <, <=, > or >= with a side that names a price movement."""
             def names_a_rise(node: ast.AST) -> bool:
                 names = [sub.id if isinstance(sub, ast.Name) else sub.attr
                          for sub in ast.walk(node) if isinstance(sub, (ast.Name, ast.Attribute))]
-                return any({"rise", "rises"} & set(name.split("_")) for name in names)
+                return any({"rise", "rises", "move", "moves"} & set(name.split("_"))
+                           for name in names)
             return [ast.unparse(node) for node in ast.walk(source_tree)
                     if isinstance(node, ast.Compare)
                     and any(isinstance(op, (ast.Lt, ast.LtE, ast.Gt, ast.GtE)) for op in node.ops)
                     and any(names_a_rise(side) for side in (node.left, *node.comparators))]
 
-        # ... and nothing in the module compares a rise with a minimum itself
+        # ... and nothing in the module compares a move with a minimum itself
         assert rise_comparisons(tree) == []
         # The check finds such a comparison when one is written
-        for written in ("def f(rise, min_rise):\n    return rise >= min_rise - 1e-6\n",
-                        "def f(run, minimum):\n    return min(run.trim_rises) < minimum\n",
-                        "def f(rises, m):\n    return all(m <= r for r in rises) or m > rises[0]\n"):
+        for written in ("def f(move, min_move):\n    return move >= min_move - 1e-6\n",
+                        "def f(run, minimum):\n    return min(run.moves) < minimum\n",
+                        "def f(moves, m):\n    return all(m <= r for r in moves) or m > moves[0]\n",
+                        "def f(rise, min_rise):\n    return rise >= min_rise - 1e-6\n"):
             assert rise_comparisons(ast.parse(written)), written
-        assert rise_comparisons(ast.parse("def f(min_rise):\n    return min_rise is None\n")) == []
+        assert rise_comparisons(ast.parse("def f(min_move):\n    return min_move is None\n")) == []
 
     def test_ast_the_backtest_reads_the_sell_rule_where_live_code_can(self):
         # The sell rule's arithmetic lives in config, scanner and historical,
@@ -4415,7 +4546,7 @@ class TestTimeSeriesKellyParity:
             "tier_floors": "tier_floors is not False", "spread_band": "(band_lo, band_hi)",
             "interval_discount": "effective_k", "size_cap": "cap",
             "same_title_size_cap": "st_cap", "categories": "None", "tags": "None",
-            "add_to_held_pairs": "bool(add_to_held)"}
+            "rebalance": "bool(add_to_held or trim_to_kelly)"}
         assert _bound_from(func, built) == ["settings"]
         # The cap a simulation shares from reads the live bound on the search
         assert _function_calls(backtester, "_simulate_at_discount", "max_kelly_fraction")
@@ -4660,7 +4791,8 @@ class TestTimeSeriesKellyParity:
         # main._run_prod plans and sends its sales before either finder runs
         # and before it looks for held pairs to add to, as the backtest sells
         # before it buys; a dry run sends no sale order; the markets it sold
-        # stay blocked from both finders
+        # stay blocked from both finders; and the held pairs it may add to
+        # pass seller.plan_add_ons (the wait and the price move) first
         [plan] = _call_nodes(main, "_run_prod", "plan_sales")
         [sell] = _call_nodes(main, "_run_prod", "sell_positions")
         [settings_value] = [k.value for k in plan.keywords if k.arg == "settings"]
@@ -4713,6 +4845,37 @@ class TestTimeSeriesKellyParity:
                              for t in n.targets)]
         assert "sold_tickers" in {n.id for n in ast.walk(blocked.value)
                                   if isinstance(n, ast.Name)}
+        # The held pairs a run may add to wait as a trim does: asked once, after
+        # held_pairs found them and before either finder, with the run's own
+        # settings and moment, its result the add_on_pairs every later step reads
+        [add_ons] = _call_nodes(main, "_run_prod", "plan_add_ons")
+        finders = (_call_nodes(main, "_run_prod", "find_time_series_pairs")
+                   + _call_nodes(main, "_run_prod", "find_same_title_pairs"))
+        assert len(finders) == 2
+        assert pairs.lineno < add_ons.lineno < min(call.lineno for call in finders)
+        # ... and after the pairs already at their size cap, and those picked for a
+        # sale or a trim, are taken out, so it reads and logs only pairs the run may
+        # still add to
+        drops = [n for n in ast.walk(func) if isinstance(n, ast.Assign)
+                 and [ast.unparse(t) for t in n.targets] == ["add_on_pairs"]
+                 and isinstance(n.value, ast.DictComp)]
+        assert {"full", "picked"} <= {name.id for drop in drops
+                                      for name in ast.walk(drop.value)
+                                      if isinstance(name, ast.Name)}
+        assert all(drop.lineno < add_ons.lineno for drop in drops)
+        assert [ast.unparse(arg) for arg in add_ons.args] == [
+            "client", "add_on_pairs", "markets_by_ticker"]
+        add_on_keywords = {k.arg: ast.unparse(k.value) for k in add_ons.keywords}
+        assert add_on_keywords == {"settings": "settings", "now": "datetime.now(UTC)"}
+        [assigned] = [n for n in ast.walk(func) if isinstance(n, ast.Assign)
+                      and isinstance(n.value, ast.Call)
+                      and getattr(n.value.func, "id", None) == "plan_add_ons"]
+        assert [ast.unparse(t) for t in assigned.targets] == ["add_on_pairs"]
+        # ... so add_on_tickers, built only from add_on_pairs, comes after it
+        [tickers] = [n for n in ast.walk(func) if isinstance(n, ast.Assign)
+                     and any(isinstance(t, ast.Name) and t.id == "add_on_tickers"
+                             for t in n.targets)]
+        assert add_ons.lineno < tickers.lineno < blocked.lineno
 
     def test_ast_the_backtest_reads_ladders_through_the_one_definition(self):
         # The backtest's one-open-trade-per-ladder rule labels each market

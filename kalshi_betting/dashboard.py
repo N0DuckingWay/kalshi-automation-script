@@ -32,17 +32,17 @@ Purpose:
     is written to PROJECT_ROOT and can be opened directly in any browser.
     A small Terms link under the title jumps to a Terms section after the
     last of them: the backtest page's share of the dictionary of scores in
-    glossary.py (the Data page will render its own share of the same text).
+    glossary.py (the Data page renders its own share of the same text).
 
     A sticky filter bar at the top of the page — Spread band, Tier floors, k,
-    Size cap, Add to held pairs, Trim to Kelly, Min. price rise, Sell, Min.
-    days to maturity, Category, Tag — re-scopes every
+    Size cap, Rebalance, Min. price movement, Sell, Min. days to maturity,
+    Category, Tag — re-scopes every
     trade-derived section (performance, decomposition, calibration,
     diagnostics, risk, the benchmark's strategy row) to the run at another
     spread band, with the deadline-gap tier floors on (the run as simulated)
     or off (the band sweep's tier-floors-off run of that band), interval
-    discount k and per-trade size cap, with or without adding to pairs the
-    run still holds, holding every position to its pay-out or selling it at
+    discount k and per-trade size cap, with or without rebalancing the pairs
+    the run still holds, holding every position to its pay-out or selling it at
     a share of its potential profit (no nearer to maturity than a number of
     days), and/or any set of its Kalshi categories and category · tags
     (the Category and Tag menus are check-box dropdowns: a ticked category
@@ -83,73 +83,62 @@ Purpose:
     Python renders with (_mix_base, "mix") and each tag group's raw k-hat
     counts.
 
-    The bar's Add to held pairs choice is "off" (the page as rendered) or
-    "on (up to the size cap)": the same scenario re-simulated with every pair
-    the simulation still holds bought again on a later Monday, sized on the
-    whole position (backtester._simulate_at_discount's add_to_held). The run
-    itself simulates none of them. The sweep carries them as two lazy
-    size-cap sweeps (BacktestSweep.add_on_cap_sweep, and
-    add_on_tier_off_cap_sweep over the tier-floors-off family), and this
-    module simulates every cell as the page is built, the "all" population
-    only (_with_add_on, _walk_add_cells). The choice changes the trade
-    sections, the header's trade count and the save button's
-    add_to_held_pairs; the k-hat figures are measured before sizing, so they
-    do not change, and the Scenario Explorer and the Interval Discount
-    section never follow it (their visitors have no `add` method). A page
-    whose sweep has no such family, or whose family does not fit the grid,
-    keeps the select disabled with a short note.
+    The bar's Rebalance choice is "no" (the page as rendered) or "yes": the
+    same scenario re-simulated so that, at each weekly run, every held pair
+    is brought back to its Kelly size (the share of the portfolio the Kelly
+    rule gives it) — topped up when it has room below that size
+    (backtester._simulate_at_discount's add_to_held) and sold down when it
+    has grown past it at that day's sale prices, or past the size cap
+    (trim_to_kelly) — but only once backtester.REBALANCE_MIN_DAYS_SINCE_TRADE
+    calendar days have passed since its last trade (at weekly runs the
+    shipped 7 days never hold anything back; the select's hover text says
+    so, _rebalance_select_title). Every rebalancing run does both: the run
+    itself simulates none of them, the sweep carries a lazy family
+    (BacktestSweep.rebalance_sweep), and this module simulates every cell as
+    the page is built, the "all" population only (_with_rebalance,
+    _walk_rebalance_cells). The choice changes the trade sections and the
+    header's trade count only; the k-hat figures are measured before sizing,
+    so they do not change, and the Scenario Explorer and the Interval
+    Discount section never follow it (their visitors have no `rebalance`
+    method). While it is yes, Sell is set to "no selling" and shut (a sell
+    level is not simulated together with rebalancing). A page whose sweep
+    has no such family, or whose family does not fit the grid, keeps the
+    select disabled with a short note.
 
-    The bar's Trim to Kelly choice is "off" (the page as rendered) or "on
-    (sell down to the Kelly size)": the same scenario re-simulated so that,
-    at each weekly run, a held pair that has outgrown its Kelly size at that
-    day's sale prices (or the size cap) is sold down to it
-    (backtester._simulate_at_discount's trim_to_kelly), but only once
-    backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE calendar days have passed
-    since its last trade (at weekly runs the shipped 7 days never hold a
-    trim back; the select's hover text says so, _trim_select_title). With
-    Add to held pairs on as well, a pair is topped up or sold down each week.
-    The run itself simulates none of them: the sweep carries a lazy family
-    (BacktestSweep.trim_sweep), and this module simulates every cell as the
-    page is built, the "all" population only (_with_trim, _walk_trim_cells).
-    The choice changes the trade sections and the header's trade count
-    only. While it is on, Sell is set to "no selling" and shut (a sell level
-    is not simulated together with trimming). Save as live defaults… saves
-    the choice as the live defaults' trim_to_kelly, which live runs trim by.
-
-    When that family carries minimum price rises
-    (backtester.TrimSweep.min_rises: trim a held pair only once its total
-    price has risen that far since the last trade on it), the walk's last
-    phase reads every Trim to Kelly scenario at each of them
-    (_walk_trim_rise_cells, through TrimSweep.rise_grid, which simulates
-    only the runs that differ). A run of its own is packed as a chunk; a run
-    that repeats another stores that run's chunk id. The base block carries
-    the minimums ("trim_rises") and, per scenario, each minimum's chunk id
-    ("grid_trim_rise" and its tier-floors-off and adding-on twins), where a
-    null cell means every minimum shows the Trim to Kelly cell itself. The
-    bar's "Min. price rise" select, right after Trim to Kelly, picks one:
-    "any" (no minimum: the Trim to Kelly run itself) or one of the minimums
-    ("5c", "10c", ...). It is on every page and open only while Trim to
-    Kelly is on, on a page that carries the minimums; a page that shows Trim
-    to Kelly without them says why in a short note beside it. Like Trim to
-    Kelly it changes the trade sections and the header's trade count only,
-    and Sell stays shut at any minimum. Save as live defaults… saves the
-    minimum shown as trim_min_rise, always beside the Trim to Kelly choice
-    ("any", or Trim to Kelly off, saves none).
+    When that family carries minimum price movements
+    (backtester.RebalanceSweep.min_moves: add to or trim a held pair only
+    once its total price has moved that far, up or down, since the last
+    trade on it), the walk's last phase reads every Rebalance scenario at
+    each of them (_walk_move_cells, through RebalanceSweep.move_grid, which
+    simulates only the runs that differ). A run of its own is packed as a
+    chunk; a run that repeats another stores that run's chunk id. The base
+    block carries the minimums ("moves") and, per scenario, each minimum's
+    chunk id ("grid_move" and its tier-floors-off twin), where a null cell
+    means every minimum shows the rebalancing cell itself. The bar's "Min.
+    price movement" select, right after Rebalance, picks one: "any" (no
+    minimum: the rebalancing run itself) or one of the minimums ("5c",
+    "10c", ...). It is on every page and open only while Rebalance is yes, on
+    a page that carries the minimums; a page that shows Rebalance without
+    them says why in a short note beside it. Like Rebalance it changes the
+    trade sections and the header's trade count only, and Sell stays shut at
+    any minimum.
 
     The bar's Sell choice is "no selling" (the page as rendered) or one of the
     sell family's levels (backtester.SellSweep; config.TAKE_PROFIT_LEVELS,
     every 1% from 80% to 100%), and the "Min. days to maturity" select
     beside it picks one of config.TAKE_PROFIT_MIN_DAYS (1 to 7, 14 or 21
     days; shut while Sell says "no selling"): the same scenario re-simulated
-    so each position — a pair and everything added to it — is sold whole at
+    so each position (a pair) is sold whole at
     the first weekly checkpoint where its realized profit (what selling it
     at the bids would return, after the sale's fees, less what it cost) has
     stayed at or above that share of its potential profit for
     config.TAKE_PROFIT_HOLD_DAYS days in a row, checked once a day, and at
     least that many days remain before its last market stops trading
     (backtester._simulate_at_discount's sell_at and sell_min_days). It
-    covers every scenario the bar shows: every band, Tier floors choice, k,
-    size cap and Add to held pairs choice. The run simulates none of it, and
+    covers every scenario the bar shows with Rebalance no: every band, Tier
+    floors choice, k and size cap. Sell is set to "no selling" and shut
+    while Rebalance is yes, so no sell run adds to or trims a held pair. The
+    run simulates none of it, and
     neither does the page's walk: after the walk, _build_sell_grid reads
     every (level, minimum) of every cell the page shows through
     SellSweep.sold_grid, in worker processes (one task per spread band and
@@ -183,13 +172,13 @@ Purpose:
     the defaults server's confirmation page (kalshi_betting.defaults_server,
     started by ./start_dashboard.sh, on config.DEFAULTS_SERVER_HOST and
     DEFAULTS_SERVER_PORT) in a new tab, for the bar's scenario on screen —
-    its spread band, Tier floors choice, k, size cap, Add to held pairs
-    choice, Sell level and Min. days to maturity, Trim to Kelly choice and
-    Min. price rise (each only on a page that simulated it; the last two
-    always together, so a minimum is never sent with trimming off) and the
-    categories and tags ticked, with this run's
-    same-title cap when the run recorded one — never
-    for the Scenario Explorer's own selects. The address names each ticked
+    its spread band, Tier floors choice, k, size cap, Rebalance choice and
+    Min. price movement (only on a page that simulated rebalancing, sent as
+    the defaults server's rebalance and min_price_move, always together, so
+    a minimum is never sent with Rebalance no), Sell level and Min. days to
+    maturity (only on a page that simulated selling) and the categories and
+    tags ticked, with this run's same-title cap when the run recorded one —
+    never for the Scenario Explorer's own selects. The address names each ticked
     category once and each ticked tag once, as "Category · Tag" (the form
     the live filter ties a tag to its category by), and never shortens a
     category whose listed tags are all ticked to the category alone: the
@@ -240,21 +229,21 @@ Dependencies:
     whole off view is withheld — the family's calibration keys, never this
     test, decide which bands were simulated again), _live_rule_view() with
     its _LIVE_RULE_* verdicts, _live_rule_ladder_note(), _live_filter_text(),
-    _live_sizing_note(), _live_add_on_note(), _live_sell_note(),
-    _live_trim_note(), _LIVE_RULE_LABEL and _LIVE_RULE_NONE (the live-rule
+    _live_sizing_note(), _live_rebalance_note(), _live_sell_note(),
+    _LIVE_RULE_LABEL and _LIVE_RULE_NONE (the live-rule
     line's pieces, shared with the run's log line, which names the saved
     live defaults) — and reads
-    BacktestSweep.cap_sweep, tier_off_cap_sweep, add_on_cap_sweep and
-    add_on_tier_off_cap_sweep (each a backtester.CapSweep), sell_sweep (a
-    backtester.SellSweep) and trim_sweep (a backtester.TrimSweep, whose
-    rise_grid hands back a backtester.SameTrim for a minimum price rise that
-    repeats another run) by their attributes; imports backtester itself to
+    BacktestSweep.cap_sweep and tier_off_cap_sweep (each a
+    backtester.CapSweep), sell_sweep (a backtester.SellSweep) and
+    rebalance_sweep (a backtester.RebalanceSweep, whose move_grid hands back
+    a backtester.SameMove for a minimum price movement that repeats another
+    run) by their attributes; imports backtester itself to
     read, and in a worker process install, its SAME_TITLE_SIZE_CAP,
     SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS (_run_sell_task; the last also
     names the Sell select's rule, _sell_select_title), to read its
-    KELLY_TRIM_MIN_DAYS_SINCE_TRADE (named in the Trim to Kelly select's
-    hover text, _trim_select_title), and to word a minimum
-    price rise as a run's label does (_trim_rise_label) — and
+    REBALANCE_MIN_DAYS_SINCE_TRADE (named in the Rebalance select's hover
+    text, _rebalance_select_title), and to word a minimum price movement as
+    a run's label does (_move_label) — and
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT, DASHBOARD_FILENAME (the
     page's file name, which defaults_server opens when run on its own and
     live_dashboard serves as its Backtest tab), DASHBOARD_FILES_DIRNAME
@@ -365,7 +354,7 @@ Notes:
     selection too. A tag is Kalshi's FIRST tag of the series (_series_labels),
     so every breakdown partitions. Its k and size cap also move the
     interval-discount section (at the primary spread band, always with the
-    tier floors on); its band, Tier floors choice, Add to held pairs choice,
+    tier floors on); its band, Tier floors choice, Rebalance choice,
     category and tag never do. Its band, Tier floors choice, k and size cap
     move the scenario explorer's selects (window.dashScenarioSelect(band, k,
     cap, tier), which the explorer's own script defines and the bar's calls
@@ -374,8 +363,8 @@ Notes:
     made in the explorer survives a bar change on another axis, and an axis
     the explorer refused (a size cap it holds no tier-floors-off block for,
     or a block it could not unpack) is applied again on the bar's next
-    change to any axis; its Add to held pairs choice, category and tag never
-    do. The bar's summary line says what it reaches on THIS page
+    change to any axis; its Rebalance choice, category and tag never do. The
+    bar's summary line says what it reaches on THIS page
     (_bar_reach: _BAR_REACH when both follow it, a band-and-k variant when
     the explorer shows the run's own size cap only,
     _BAR_REACH_NO_EXPLORER_TIERS' sentences when the explorer renders no
@@ -399,9 +388,11 @@ Notes:
     primary cap first, then the tier-floors-off cells of the bands the tiers
     bind at (_GridSource.off_cell, handed to the visitors that define an
     `off` method; a band the tiers never bind at reuses its tier-on chunks,
-    so nothing is simulated twice), then the Add to held pairs cells
-    (_GridSource.add_cell and add_off_cell, handed to the visitors that
-    define an `add` method: the chunk visitor) — by
+    so nothing is simulated twice), then the Rebalance cells
+    (_GridSource.rebalance_cell and rebalance_off_cell, handed to the
+    visitors that define a `rebalance` method: the chunk visitor) and their
+    minimum price movements (move_cell, to the visitors with a `move`
+    method) — by
     visitors that keep only what they
     build (the Sell select's cells are not walked: _build_sell_grid simulates
     them afterwards, in worker processes, over the grid the walk walked):
@@ -442,7 +433,7 @@ Notes:
     or a base block that cannot be, costs the bar, never the page: the page
     is written without it, with a notice in its place and a WARNING in the
     log. The page as rendered IS the primary scenario's unfiltered view with
-    the tier floors on, adding to held pairs off and no selling: the
+    the tier floors on, Rebalance no and no selling: the
     script inflates the base block and the primary scenario's chunk as the
     page loads, sets the bar back to that view (a browser can restore a stale
     choice on reload) and keeps its selects disabled until both are ready,
@@ -575,8 +566,8 @@ from .backtester import (
     CorpusProvenance,
     IntervalCalibration,
     OutcomeLabelCoverage,
+    SameMove,
     SameSale,
-    SameTrim,
     SweepPoint,
     _band_label,
     _build_equity_curve,
@@ -584,13 +575,12 @@ from .backtester import (
     _cap_percent,
     _carry_steps,
     _exact_label,
-    _live_add_on_note,
     _live_filter_text,
+    _live_rebalance_note,
     _live_rule_ladder_note,
     _live_rule_view,
     _live_sell_note,
     _live_sizing_note,
-    _live_trim_note,
     _paid_prices,
     _tier_floors_bind,
     _value_steps,
@@ -4768,39 +4758,6 @@ def _live_sizing_bar_clause(sweep: BacktestSweep, bar: dict | None,
     return "; " + ", and ".join(parts)
 
 
-def _add_on_shown_at(bar: dict | None, band_index: int | None, tier_on: bool) -> bool:
-    """
-    Say whether the filter bar's Add to held pairs view holds a scenario at one band.
-
-    The live-rule line names where the bar shows the saved defaults' rule (a
-    band and a Tier floors setting) and, when they add to held pairs, tells
-    the reader to choose Add to held pairs on there. That is true only where
-    the bar's add-on grid has chunks for the band: a page whose add-on runs
-    did not cover it (no add-on view at all, or a band the tiers bind at whose
-    tier-floors-off add-on runs are missing) shows "not simulated" instead.
-
-    Args:
-        bar (dict | None): _filter_payload's base block ("grid_add" and
-            "grid_add_off", each [band][k][cap] -> chunk id or null, or null
-            when the page has no such view), or None without a filter bar.
-        band_index (int | None): The band's index in the bar (None with no bar).
-        tier_on (bool): True for the Tier floors on grid, False for the off one.
-
-    Returns:
-        bool: True when at least one k and cap of that band has a chunk in the
-            grid the Tier floors setting reads; False otherwise.
-
-    Raises:
-        Nothing. It only reads the bar's entries.
-    """
-    if bar is None or band_index is None:
-        return False
-    grid = bar.get("grid_add" if tier_on else "grid_add_off")
-    if grid is None or not 0 <= band_index < len(grid):
-        return False
-    return any(cid is not None for row in grid[band_index] for cid in row)
-
-
 def _sell_choice_in_bar(sweep: BacktestSweep, bar: dict | None, band_index: int | None,
                         tier_on: bool) -> str | None:
     """
@@ -4847,62 +4804,65 @@ def _sell_choice_in_bar(sweep: BacktestSweep, bar: dict | None, band_index: int 
             f'"{days_entry["label"]}"' + (" (the nearest to no minimum)" if days is None else ""))
 
 
-def _trim_choice_in_bar(bar: dict | None, band_index: int | None, tier_on: bool, adds: bool,
-                        min_rise: float | None) -> str:
+# The live-rule line's clause for a page whose filter bar holds no
+# rebalancing run at the band it names (_rebalance_choice_in_bar)
+_NO_REBALANCE_VIEW = "this page has no Rebalance view"
+
+
+def _rebalance_choice_in_bar(bar: dict | None, band_index: int | None, tier_on: bool,
+                             min_move: float | None) -> str:
     """
-    Say how the filter bar shows the saved defaults' Kelly trim at one band, or why it cannot.
+    Say how the filter bar shows the saved defaults' rebalancing at one band, or why it cannot.
 
     Part of the live-rule line, at the band and Tier floors setting where it
-    says the bar shows the rule. It reads the trim grids the page script
-    reads (gridAt, riseGridAt), the adding-on ones when the saved defaults
-    add to held pairs. A minimum counts as shown when some k and cap of the
-    band has a chunk for it: its own entry, or the Trim to Kelly chunk
-    where the cell is null (no minimum changes that run), as chunkAt picks.
+    says the bar shows the rule, for saved defaults that rebalance (add to
+    held pairs and trim them, together, as the bar shows them). It reads the
+    grids the page script reads (gridAt, moveGridAt). A minimum counts as
+    shown when some k and cap of the band has a chunk for it: its own entry,
+    or the rebalancing chunk where the cell is null (no minimum changes that
+    run), as chunkAt picks.
 
     Args:
-        bar (dict | None): _filter_payload's base block (the "grid_trim*"
-            and "grid_trim_rise*" grids and "trim_rises"), or None without a
-            filter bar.
+        bar (dict | None): _filter_payload's base block (the
+            "grid_rebalance*" and "grid_move*" grids and "moves"), or None
+            without a filter bar.
         band_index (int | None): The band's index in the bar (None with no bar).
         tier_on (bool): True for the Tier floors on grids, False for the off ones.
-        adds (bool): Whether the saved defaults add to held pairs.
-        min_rise (float | None): The saved minimum price rise in dollars, or
-            None for no minimum.
+        min_move (float | None): The saved minimum price movement in dollars,
+            or None for no minimum.
 
     Returns:
-        str: 'choose Trim to Kelly on and Min. price rise "10c" in the filter
-            bar to see it' ("any" with no minimum); "this page has no Trim to
-            Kelly view" (plus " with Add to held pairs on" when they add)
-            when the grid holds no chunk at the band; or "this page cannot
-            show that minimum price rise".
+        str: 'choose Rebalance yes and Min. price movement "10c" in the
+            filter bar to see it' ("any" with no minimum); "this page has no
+            Rebalance view" when the grid holds no chunk at the band; or
+            "this page cannot show that minimum price movement".
 
     Raises:
         Nothing. It only reads the bar's entries.
     """
     # The grids the script reads for this setting
-    suffix = ("_add" if adds else "") + ("" if tier_on else "_off")
-    grid = None if bar is None else bar.get("grid_trim" + suffix)
+    suffix = "" if tier_on else "_off"
+    grid = None if bar is None else bar.get("grid_rebalance" + suffix)
     row = (grid[band_index] if grid is not None and band_index is not None
            and 0 <= band_index < len(grid) else None)
     if row is None or not any(cid is not None for cells in row for cid in cells):
-        return "this page has no Trim to Kelly view" + (
-            " with Add to held pairs on" if adds else "")
-    if min_rise is None:
-        label = _TRIM_RISE_OPTION_ANY
+        return _NO_REBALANCE_VIEW
+    if min_move is None:
+        label = _MOVE_OPTION_ANY
     else:
         # The page's minimums are floats on the 5c grid, as the saved one is
-        place = next((i for i, entry in enumerate(bar.get("trim_rises") or [])
-                      if abs(entry["value"] - min_rise) <= PRICE_EPSILON), None)
-        rises = bar.get("grid_trim_rise" + suffix)
-        rise_row = rises[band_index] if rises is not None and band_index < len(rises) else None
-        if place is None or rise_row is None or not any(
+        place = next((i for i, entry in enumerate(bar.get("moves") or [])
+                      if abs(entry["value"] - min_move) <= PRICE_EPSILON), None)
+        moves = bar.get("grid_move" + suffix)
+        move_row = moves[band_index] if moves is not None and band_index < len(moves) else None
+        if place is None or move_row is None or not any(
                 (ids is None and cid is not None)
                 or (ids is not None and place < len(ids) and ids[place] is not None)
-                for cells, rise_cells in zip(row, rise_row, strict=False)
-                for cid, ids in zip(cells, rise_cells, strict=False)):
-            return "this page cannot show that minimum price rise"
-        label = bar["trim_rises"][place]["label"]
-    return f'choose Trim to Kelly on and Min. price rise "{label}" in the filter bar to see it'
+                for cells, move_cells in zip(row, move_row, strict=False)
+                for cid, ids in zip(cells, move_cells, strict=False)):
+            return "this page cannot show that minimum price movement"
+        label = bar["moves"][place]["label"]
+    return f'choose Rebalance yes and Min. price movement "{label}" in the filter bar to see it'
 
 
 def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
@@ -4917,17 +4877,16 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     defaults size at a k or caps other than this run's primary, it says so
     (backtester._live_sizing_note) and, where the page shows the rule, how
     its filter bar shows it at that sizing (_live_sizing_bar_clause). When
-    the saved defaults add to held pairs, which no primary does, it says so
-    too (backtester._live_add_on_note) and, where the page shows the rule,
-    whether the filter bar's Add to held pairs choice shows it at that band
-    and Tier floors setting (_add_on_shown_at). When they sell, it says so
-    too (backtester._live_sell_note) and, where the page shows the rule,
-    which Sell options show it, if any (_sell_choice_in_bar). When they trim
-    to Kelly, it says so last (backtester._live_trim_note) and, where the
-    page shows the rule, which Trim to Kelly and Min. price rise choices show
-    it, or why they cannot (_trim_choice_in_bar). The page never shows trimming and selling
-    together, so when the defaults do both the trim clause says so and the
-    Sell clause offers the selling alone.
+    the saved defaults rebalance held pairs or sell, which no primary does,
+    it says so too, in that order (backtester._live_rebalance_note and
+    _live_sell_note) and, where the page shows the rule, how the filter bar
+    shows each: the Rebalance and Min. price movement choices that show the
+    rebalancing, or why they cannot (_rebalance_choice_in_bar), and the Sell
+    options that show the selling, if any (_sell_choice_in_bar). The page
+    never shows selling together with rebalancing (Sell is shut while
+    Rebalance is yes), so when the defaults do both, the rebalancing clause
+    says so (or, on a page with no Rebalance view, that it has none), and
+    the Sell clause offers the selling alone.
 
     Args:
         sweep (BacktestSweep | None): The run's sweep payload, or None.
@@ -4937,7 +4896,7 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     Returns:
         str: One <p>, its text escaped: the rule, any live filter, the same-title cap
             and where (or whether) the page shows the rule, plus any ladder-departure,
-            sizing, adding-to-held-pairs, selling and trimming notes; "Live rule: not
+            sizing, rebalancing and selling notes; "Live rule: not
             recorded" when sweep is None, and backtester._LIVE_RULE_NONE's words when
             the run recorded no live rule.
     """
@@ -5014,33 +4973,29 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     # The saved defaults' own sizing when it is not this run's, and where the bar shows it
     note = _live_sizing_note(sweep)
     sizing = f"{note}{_live_sizing_bar_clause(sweep, bar, shown)}" if note else ""
-    # Adding to held pairs, which no primary does: said whenever the saved
-    # defaults do it, with where the bar shows it only where the line shows
-    # the rule at all
-    add_note = _live_add_on_note(sweep)
-    if add_note and shown is not None:
-        add_note += (" — choose Add to held pairs on in the filter bar to see it"
-                     if _add_on_shown_at(bar, *shown)
-                     else " — this page has no Add to held pairs view")
-    # Selling, likewise. With trimming saved too, the Sell options show the
-    # selling alone: the page never shows the two together
+    # Rebalancing and selling, which no primary does: each said whenever the
+    # saved defaults do it, with where the bar shows it only where the line
+    # shows the rule at all
+    rebalance_note = _live_rebalance_note(sweep)
     sell_note = _live_sell_note(sweep)
-    trim_note = _live_trim_note(sweep)
+    if rebalance_note and shown is not None:
+        clause = _rebalance_choice_in_bar(bar, *shown, sweep.live_min_price_move)
+        # The bar never shows rebalancing together with selling (Sell is shut
+        # while Rebalance is yes): with selling saved too, a page that holds
+        # rebalancing runs still cannot show them beside it; a page with none
+        # says so
+        if sell_note and clause != _NO_REBALANCE_VIEW:
+            clause = "this page cannot show rebalancing together with selling"
+        rebalance_note += " — " + clause
+    # Selling, likewise. With rebalancing saved too, the Sell options show the
+    # selling alone
     if sell_note and shown is not None:
         choice = _sell_choice_in_bar(sweep, bar, *shown)
-        seen = "the selling alone" if trim_note else "it"
+        seen = "the selling alone" if rebalance_note else "it"
         sell_note += (f" — choose {choice} in the filter bar to see {seen}" if choice is not None
                       else " — this page cannot show that Sell level and minimum of days")
-    # Trimming to Kelly, last, as on the run's log line; its choices are named
-    # only where the line shows the rule
-    if trim_note and shown is not None:
-        trim_note += " — " + ("this page cannot show trimming together with selling"
-                              if sell_note else
-                              _trim_choice_in_bar(bar, *shown,
-                                                  sweep.live_add_to_held_pairs is True,
-                                                  sweep.live_trim_min_rise))
     text = (f"Live rule ({_LIVE_RULE_LABEL}): {rule}; {cap_clause} — {tail}{sizing}"
-            f"{add_note}{sell_note}{trim_note}")
+            f"{rebalance_note}{sell_note}")
     return f"{style}{html.escape(text, quote=False)}</p>"
 
 
@@ -6560,7 +6515,7 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
     )
 
 
-# ─── Page-wide filter: spread band x tier floors x k x size cap x add to held pairs
+# ─── Page-wide filter: spread band x tier floors x k x size cap x rebalance
 #     x Kalshi category x tag ───
 
 # The view every trade list carries: all of its trades, no category or tag.
@@ -6587,72 +6542,39 @@ _TIER_SELECT_TITLE = (
     "band's floor; off — the band's floor alone (the spread must still be positive); "
     f"live trading follows {_LIVE_TIER_FLOORS_READ}.")
 
-# The filter bar's "Add to held pairs" options: the run as simulated (off), or
-# the same scenario re-simulated so a pair the run still holds can be bought
-# again (BacktestSweep.add_on_cap_sweep). Short menu words; the select's title
-# carries the detail.
-_ADD_ON_OPTION_OFF = "off"
-_ADD_ON_OPTION_ON = "on (up to the size cap)"
-_ADD_ON_SELECT_TITLE = (
-    "off: a pair is bought once and not again while it is held. on: a pair still held "
-    "can be bought again on a later Monday (the same two markets, the same side on "
-    "each), sized so old and new together, with the fees paid, stay within the size "
-    "cap's share of the portfolio value (cash plus open trades at market). Live trading follows "
-    "the saved live defaults, not this choice. The Scenario Explorer and Interval "
-    "Discount sections always show it off. In the Risk section's Kelly chart an added "
-    "trade plots only what it added, so it sits below the 1:1 line.")
-# Appended to a scenario's summary phrase when adding is on
-_ADD_ON_PHRASE = ", adding to held pairs"
-# Added to the summary line while adding is on: the trade counts and the Kelly
-# chart read an added purchase as a trade of its own
-_ADD_ON_SUMMARY_NOTE = (" Each purchase that adds to a held pair counts as a trade of its "
-                        "own; in the Kelly chart it shows only what it added.")
-# Closes the summary line's reach sentence on a page that has the add-on view;
-# the second is for a page with no Scenario Explorer grid (never claim a reach
-# the page lacks)
-_ADD_ON_REACH = ("Add to held pairs changes the trade sections only; the k̂ figures do not "
-                 "depend on it, and the Scenario Explorer and Interval Discount sections "
-                 "always show it off.")
-_ADD_ON_REACH_NO_EXPLORER = ("Add to held pairs changes the trade sections only; the k̂ "
-                             "figures do not depend on it, and the Interval Discount "
-                             "section always shows it off.")
-# Beside the select when the page keeps it shut, by the payload's "add_state"
-# (worded apart from the Tier floors note, "(not simulated for this run)")
-_ADD_ON_NOTES = {
-    "not simulated": "(not simulated in this backtest)",
-    "unavailable": "(not available on this page; see the log)",
-}
-# Beside the save button on a page with the add-on view, when the saved live
-# defaults add to held pairs: saving from the bar sends the choice shown, and
-# "off" turns adding off in the defaults
-_ADD_ON_SAVE_NOTE = ("The live defaults add to held pairs; saving with Add to held pairs "
-                     "off here turns that off.")
-# The Trim to Kelly view's words: the select's two options (its hover text
-# is _trim_select_title's)
-_TRIM_OPTION_OFF = "off"
-_TRIM_OPTION_ON = "on (sell down to the Kelly size)"
+# The filter bar's "Rebalance" options: the run as simulated (no), or the same
+# scenario re-simulated so that, at every weekly run, a held pair is brought
+# back to its Kelly size (the share of the portfolio the Kelly rule gives it):
+# topped up when it has room below that size, sold down when it has grown past
+# it (BacktestSweep.rebalance_sweep, whose runs always do both). Short menu
+# words; the select's title carries the detail (_rebalance_select_title).
+_REBALANCE_OPTION_NO = "no"
+_REBALANCE_OPTION_YES = "yes"
 # Days between two of the backtest's weekly runs: a wait after a trade no
-# longer than this never holds a Kelly trim back on the page
+# longer than this never holds an add-on or a trim back on the page
 _DAYS_BETWEEN_WEEKLY_RUNS = timedelta(weeks=1).days
 
 
-def _trim_select_title(days) -> str:
+def _rebalance_select_title(days) -> str:
     """
-    The Trim to Kelly select's hover text: what "on" does, and how long a trim waits after a trade.
+    The Rebalance select's hover text: what "yes" does, and how long a rebalance waits after a trade.
 
     The number is not checked here (the backtest checks it before it runs).
     A value that cannot be compared with a number of days still gives a
     text, so drawing the filter bar never fails over it.
 
     Args:
-        days: Calendar days a held pair must go without a trade before a
-            trim (backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE), as it stands.
+        days: Calendar days a held pair must go without a trade before it is
+            topped up or sold down (backtester.REBALANCE_MIN_DAYS_SINCE_TRADE),
+            as it stands.
 
     Returns:
         str: The rule in plain words: the wait (at a week or less, that it
-            never holds a trim back here) and, when there is one, how a live
-            run counts it; what Save as live defaults saves; and the
-            sections that always show trimming off.
+            never holds anything back here) and, when there is one, how a
+            live run counts it before an add-on or a trim; the Min. price
+            movement it can also wait for; that Sell is shut while it is yes;
+            what Save as live defaults saves; and the sections that always
+            show it as no.
     """
     try:
         # No wait, a one-day wait, and whether the week between runs covers it
@@ -6663,126 +6585,130 @@ def _trim_select_title(days) -> str:
         # ArithmeticError): claim nothing about it
         none = one = covered = False
     if none:
-        wait = "A pair can be trimmed at any weekly run after a trade on it. "
+        wait = "however recently it was last traded"
         # No wait for a live run to count either
         live = ""
     else:
         passed = "day has" if one else "days have"
-        wait = (f"A pair is trimmed only when at least {days} {passed} passed since its "
-                "last purchase, add-on or trim"
-                + (f"; weekly runs are {_DAYS_BETWEEN_WEEKLY_RUNS} days apart, so this never "
-                   "holds a trim back here. " if covered else ". "))
-        # A live run reads its trades from Kalshi's list of the account's fills
-        live = ("A live run counts the wait in calendar days on the bot's own clock from "
-                "the last fill of any sort on either market, a trade by hand included, and "
-                "trims nothing while Kalshi's list of the account's fills does not reach "
-                "back that far. ")
-    return ("off: no part of a held pair is sold to cut its size. on: at each weekly run, a "
-            "pair that has grown past its Kelly size at that day's sale prices, or past the "
-            "size cap, is sold down to it, the latest purchase first; with Add to held pairs "
-            f"on as well, a pair is topped up or sold down each week. {wait}Min. price rise "
-            "can make a trim wait until the pair's price has gone up. Each part sold counts "
-            f"as a trade of its own. {live}While this is on, Sell is set to no selling (the two "
-            "are not simulated together). From a page that simulated trimming, Save as live "
-            "defaults saves this choice and the Min. price rise shown, for live runs to trim "
-            "by; from any other page it keeps the saved ones. With this on, saving from a "
-            "page that simulated selling turns live selling off; saving from one that did "
-            "not keeps the saved sell level. The Scenario Explorer and Interval Discount "
-            "sections always show it off.")
+        wait = (f"once at least {days} {passed} passed since its last trade (its purchase, "
+                "an add-on or a trim)")
+        # A live run reads a pair's trades from Kalshi's list of the account's
+        # fills, before an add-on and before a trim alike
+        live = ("A live run waits this way before an add-on or a trim, counting calendar "
+                "days on the bot's own clock from the last fill of any sort on the pair's "
+                "markets, a trade by hand included. ")
+    weekly = (f" Weekly runs are {_DAYS_BETWEEN_WEEKLY_RUNS} days apart, so the wait never "
+              "holds anything back here." if covered and not none else "")
+    return ("no: a pair is bought once and held as it is. yes: at each weekly run a held "
+            "pair is topped up to its Kelly size when it has room, and sold down to it when "
+            f"it has grown past it, {wait} and, with a Min. price movement, once its price "
+            f"has moved that far up or down.{weekly} Each added purchase and each part sold "
+            f"counts as a trade of its own. {live}While yes, Sell is set to no selling (the "
+            "two are not simulated together). From a page that simulated rebalancing, Save "
+            "as live defaults saves this choice and the Min. price movement shown; from any "
+            "other page it keeps the saved ones. With yes, saving from a page that simulated "
+            "selling turns live selling off. The Scenario Explorer and Interval Discount "
+            "sections always show it as no.")
 
 
-# Beside the select when the page keeps it shut, by the payload's "trim_state"
-_TRIM_NOTES = {
+# Beside the select when the page keeps it shut, by the payload's
+# "rebalance_state" (worded apart from the Tier floors note, "(not simulated
+# for this run)")
+_REBALANCE_NOTES = {
     "not simulated": "(not simulated in this backtest)",
     "unavailable": "(not available on this page; see the log)",
 }
-# Appended to a scenario's summary phrase when trimming is on
-_TRIM_PHRASE = ", trimming to Kelly"
-# Added to the summary line while trimming is on: a part sold is a record of
-# its own in the trade counts and the Kelly chart
-_TRIM_SUMMARY_NOTE = (" A part of a held pair that a trim sells counts as a trade of its "
-                      "own; in the Kelly chart a pair that was trimmed shows as several "
-                      "smaller trades.")
-# Closes the summary line's reach sentence on a page that has the trim view;
-# the second is for a page with no Scenario Explorer grid
-_TRIM_REACH = ("Trim to Kelly changes the trade sections only; the k̂ figures do not depend "
-               "on it, and the Scenario Explorer and Interval Discount sections always show "
-               "it off.")
-_TRIM_REACH_NO_EXPLORER = ("Trim to Kelly changes the trade sections only; the k̂ figures do "
-                           "not depend on it, and the Interval Discount section always "
-                           "shows it off.")
-# The "Min. price rise" select beside Trim to Kelly: its first option (no
-# minimum: the Trim to Kelly run itself; the others are _trim_rise_option's,
-# one per minimum the base block names), its hover text, and the note beside
-# it when the page shows Trim to Kelly without the minimums, by the payload's
-# "trim_rise_state"
-_TRIM_RISE_OPTION_ANY = "any"
-_TRIM_RISE_TITLE = (
-    "Used only while Trim to Kelly is on. A held pair is trimmed only if its price has "
-    "risen at least this many cents since the last trade on it: its purchase, an add-on "
-    "(Add to held pairs) or an earlier trim. The price is the two sides held, added: for "
-    "a time-series pair, YES on the earlier market plus NO on the later one. A fall never "
-    "counts. any: no minimum, so a pair can be trimmed whichever way its price moved. "
-    "From a page that simulated trimming, Save as live defaults saves the minimum shown, "
-    "for live runs to wait for (any, or Trim to Kelly off, saves none); from any other "
+# Appended to a scenario's summary phrase when Rebalance is yes
+_REBALANCE_PHRASE = ", rebalancing"
+# Added to the summary line while Rebalance is yes: the trade counts and the
+# Kelly chart read an added purchase, and a part a trim sold, as trades of
+# their own
+_REBALANCE_SUMMARY_NOTE = (" Each purchase that adds to a held pair, and each part of a "
+                           "pair a trim sells, counts as a trade of its own; in the Kelly "
+                           "chart an added purchase shows only what it added, and a trimmed "
+                           "pair shows as several smaller trades.")
+# Closes the summary line's reach sentence on a page that has the Rebalance
+# view; the second is for a page with no Scenario Explorer grid (never claim a
+# reach the page lacks)
+_REBALANCE_REACH = ("Rebalance changes the trade sections only; the k̂ figures do not depend "
+                    "on it, and the Scenario Explorer and Interval Discount sections always "
+                    "show it as no.")
+_REBALANCE_REACH_NO_EXPLORER = ("Rebalance changes the trade sections only; the k̂ figures do "
+                                "not depend on it, and the Interval Discount section always "
+                                "shows it as no.")
+# The "Min. price movement" select beside Rebalance: its first option (no
+# minimum: the rebalancing run itself; the others are _move_option's, one per
+# minimum the base block names), its hover text, and the note beside it when
+# the page shows Rebalance without the minimums, by the payload's
+# "move_state"
+_MOVE_OPTION_ANY = "any"
+_MOVE_TITLE = (
+    "Used only while Rebalance is yes. A held pair is topped up or sold down only once its "
+    "total price has moved at least this many cents, up or down, since its last trade: its "
+    "purchase, an add-on or a trim. The total price is the side held on each market, "
+    "added: for a time-series pair, YES on the earlier market plus NO on the later one "
+    "(for a held market whose partner has paid out, its own price). 10c is 10% of a $1 "
+    "payout. any: no minimum. From a page that simulated rebalancing, Save as live "
+    "defaults saves the minimum shown (any, or Rebalance no, saves none); from any other "
     "page it keeps the saved one. A live run reads the price at the pair's last fill on "
-    "Kalshi, so with a minimum set it does not trim a pair whose last fill is older than "
-    "Kalshi's list of the account's fills reaches.")
-_TRIM_RISE_NOTES = {
+    "Kalshi, so with a minimum set it neither trims nor adds to a pair whose last fill is "
+    "older than Kalshi's list of the account's fills reaches.")
+_MOVE_NOTES = {
     "not simulated": "(not simulated in this backtest)",
     "unavailable": "(not available on this page; see the log)",
 }
-# The reach sentence in _TRIM_REACH's place on a page that also shows the
-# minimum price rises (both selects reach the same sections); the second is
-# for a page with no Scenario Explorer grid
-_TRIM_RISE_REACH = ("Trim to Kelly and Min. price rise change the trade sections only; the "
-                    "k̂ figures do not depend on them, and the Scenario Explorer and "
-                    "Interval Discount sections always show trimming off.")
-_TRIM_RISE_REACH_NO_EXPLORER = ("Trim to Kelly and Min. price rise change the trade sections "
-                                "only; the k̂ figures do not depend on them, and the "
-                                "Interval Discount section always shows trimming off.")
+# The reach sentence in _REBALANCE_REACH's place on a page that also shows the
+# minimum price movements (both selects reach the same sections); the second
+# is for a page with no Scenario Explorer grid
+_MOVE_REACH = ("Rebalance and Min. price movement change the trade sections only; the k̂ "
+               "figures do not depend on them, and the Scenario Explorer and Interval "
+               "Discount sections always show no rebalancing.")
+_MOVE_REACH_NO_EXPLORER = ("Rebalance and Min. price movement change the trade sections "
+                           "only; the k̂ figures do not depend on them, and the Interval "
+                           "Discount section always shows no rebalancing.")
 
 
-def _trim_rise_option(rise: float) -> str:
+def _move_option(move: float) -> str:
     """
-    Name a minimum price rise in a few characters, in cents.
+    Name a minimum price movement in a few characters, in cents.
 
     The base block ships it as each minimum's "label" (_filter_payload's
-    "trim_rises").
+    "moves").
 
     Args:
-        rise (float): The minimum, in dollars, in (0, 1].
+        move (float): The minimum, in dollars, in (0, 1].
 
     Returns:
-        str: "<cents>c", e.g. "5c" for 0.05 (backtester._cap_percent prints
+        str: "<cents>c", e.g. "10c" for 0.10 (backtester._cap_percent prints
             every digit that tells two values apart, so no two minimums read
             alike).
     """
-    return f"{_cap_percent(rise)}c"
+    return f"{_cap_percent(move)}c"
 
 
-def _trim_rise_phrase(rise: float) -> str:
+def _move_phrase(move: float) -> str:
     """
-    Name a minimum price rise as it follows the Trim to Kelly phrase in a scenario's summary.
+    Name a minimum price movement as it follows the Rebalance phrase in a scenario's summary.
 
-    The words are the backtester's own (backtester._trim_rise_label), so the
+    The words are the backtester's own (backtester._move_label), so the
     page names a run as that run's log line does. The base block ships it as
     each minimum's "phrase".
 
     Args:
-        rise (float): The minimum, in dollars, in (0, 1].
+        move (float): The minimum, in dollars, in (0, 1].
 
     Returns:
-        str: " only after a <cents>c price rise", e.g. " only after a 5c
-            price rise" for 0.05.
+        str: " only after a <cents>c price move", e.g. " only after a 10c
+            price move" for 0.10.
     """
-    return _backtester._trim_rise_label(rise)
+    return _backtester._move_label(move)
 
 
-# Beside the save button on a page with the Trim to Kelly view, when the saved
-# live defaults trim: saving with "off" shown turns live trimming off
-_TRIM_SAVE_NOTE = ("The live defaults trim to Kelly; saving with Trim to Kelly off here turns "
-                   "that off.")
+# Beside the save button on a page with the Rebalance view, when the saved
+# live defaults rebalance (live_rebalance is on): saving from the bar sends the
+# choice shown, and Rebalance no turns it off in the defaults
+_REBALANCE_SAVE_NOTE = ("The live defaults rebalance; saving with Rebalance no here turns "
+                        "that off.")
 
 # Beside the save button on a page with the Sell view whose saved live defaults sell
 _SELL_SAVE_NOTE = ('The live defaults sell; saving with Sell set to "no selling" turns live '
@@ -6822,13 +6748,15 @@ def _sell_select_title(hold_days: int) -> str:
         live_rule = (f"has held its level for {hold_days} days in a row (read on Kalshi's "
                      "hourly candles for the days before the run)")
     return ("no selling: every position is held until its markets pay out. A level: at each "
-            "weekly checkpoint (the live run's time), a position (a pair and everything "
-            "added to it) is sold whole once its realized profit (what selling it at the "
+            "weekly checkpoint (the live run's time), a position (a pair) is sold whole "
+            "once its realized profit (what selling it at the "
             f"bids would return, after the sale's fees, less what it cost) {rule} It is sold "
             "only while at least the days the Min. days to maturity select names remain "
             "before its last market stops trading. A position sold at a checkpoint is not "
-            "bought again or added to there. Save as live defaults… saves the level and "
-            "minimum shown: a live run then sells at them, on real order books, once a "
+            "bought again there. Sell is shut (no selling) while Rebalance is yes: the two "
+            "are not simulated together. Save as live "
+            "defaults… saves the level and minimum shown: a live run then sells at them, "
+            "on real order books, once a "
             f"position {live_rule}. The Scenario Explorer and Interval Discount sections "
             "always show no selling.")
 
@@ -6998,15 +6926,14 @@ def _bar_reach(kd_follows: bool, explorer_follows: bool, *, explorer_caps: bool 
 # view at a size cap other than the run's own), "loading" the line shown
 # while a scenario's chunk is inflated, and "unavailable" a chunk that could
 # not be loaded: {failed} is the scenario asked for, {reason} the error and
-# {scenario} the one the sections still show. "add_on" closes a scenario's
-# phrase when the Add to held pairs choice is on, and a scenario with it on
-# is always its own simulation, so its whole-run view closes on "other_run"
-# at the primary band, k and size cap; so is one at a sell level, whose
-# phrase the base block's sell_levels carry, and "sell_note" is added to the
-# line while a level is chosen. "trim" and "trim_note" do for the Trim to
-# Kelly choice what "add_on" and "add_on_note" do for adding; a minimum price
-# rise's phrase, which the base block's trim_rises carry, follows "trim".
-# "sidecar_missing" and "sidecar_empty" are a
+# {scenario} the one the sections still show. "rebalance" closes a
+# scenario's phrase when the Rebalance choice is yes (followed by the phrase
+# of the Min. price movement shown, which the base block's moves carry), and
+# "rebalance_note" is added to the line then; a scenario with it yes is
+# always its own simulation, so its whole-run view closes on "other_run" at
+# the primary band, k and size cap. So is one at a sell level, whose phrase
+# the base block's sell_levels carry, and "sell_note" is added to the line
+# while a level is chosen. "sidecar_missing" and "sidecar_empty" are a
 # sidecar chunk file's {reason} in "unavailable": it could not be loaded, or
 # it ran without handing anything over ({file}: the address asked for).
 # The Category and Tag menus of the filter bar: check-box dropdowns. The words
@@ -7043,10 +6970,8 @@ _SUMMARY_TEMPLATES = {
     "other_scenario": (" This spread band, k and size cap is its own simulation, "
                        "not a slice of the primary run."),
     "other_run": " This is its own simulation, not a slice of the primary run.",
-    "add_on": _ADD_ON_PHRASE,
-    "add_on_note": _ADD_ON_SUMMARY_NOTE,
-    "trim": _TRIM_PHRASE,
-    "trim_note": _TRIM_SUMMARY_NOTE,
+    "rebalance": _REBALANCE_PHRASE,
+    "rebalance_note": _REBALANCE_SUMMARY_NOTE,
     "sell_note": _SELL_SUMMARY_NOTE,
     "sidecar_missing": _SIDECAR_MISSING,
     "sidecar_empty": _SIDECAR_EMPTY,
@@ -7103,12 +7028,12 @@ _FILTER_UNAVAILABLE_HTML = (
 # opens that page, so every word about it is here.
 _SAVE_LABEL = "Save as live defaults…"
 _SAVE_TITLE = ("Open a confirmation page, in a new tab, that compares the filter bar's "
-               "scenario on screen — its spread band, tier floors, k, size cap, its Add to "
-               "held pairs choice (when this page simulated it), its Sell level and Min. "
-               "days to maturity (when this page simulated selling), its Trim to Kelly "
-               "choice and Min. price rise (when this page simulated trimming) and the "
-               "categories and tags ticked (each ticked tag is saved under its own "
-               "category), with this run's same-title cap when the run recorded one; "
+               "scenario on screen — its spread band, tier floors, k, size cap, its "
+               "Rebalance choice and Min. price movement (when this page simulated "
+               "rebalancing), its Sell level and Min. days to maturity (when this page "
+               "simulated selling) and the categories and tags ticked (each ticked tag is "
+               "saved under its own category), with this run's same-title cap when the run "
+               "recorded one; "
                "not the Scenario Explorer's own selects — with the live trading defaults. "
                "Nothing is saved until you press a button there: Confirm and save saves "
                "it; Confirm and trade saves it and then runs the live bot with it, placing "
@@ -7202,13 +7127,12 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
 
     The button opens the defaults server's confirmation page with the bar's
     scenario in the address (its spread band, Tier floors choice, k, size
-    cap, Add to held pairs choice, Sell level, Min. days to maturity, Trim
-    to Kelly choice, Min. price rise and any category or tag); this is the
-    rest of that address, fixed when the page is built. The server accepts
-    no source note but one of the shapes
-    config.LIVE_DEFAULTS_SOURCE_PATTERN allows, so the note is checked
-    against that pattern here, as the server checks it (whole, ASCII digits
-    only), and left out should it ever not match.
+    cap, Rebalance choice, Min. price movement, Sell level, Min. days to
+    maturity and any category or tag); this is the rest of that address,
+    fixed when the page is built. The server accepts no source note but one
+    of the shapes config.LIVE_DEFAULTS_SOURCE_PATTERN allows, so the note is
+    checked against that pattern here, as the server checks it (whole, ASCII
+    digits only), and left out should it ever not match.
 
     Args:
         sweep (BacktestSweep | None): The run's sweep: its same-title cap and
@@ -7233,12 +7157,11 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
             <start> to <today>", plus a note when the run's same-event ladder
             setting differed from config.py's, so its pairs are not the live
             bot's; None if it would not match the pattern);
-            "live_adds_to_held_pairs" (whether the saved live defaults add to
-            held pairs, as the run recorded them; the note beside the save
-            button says so on a page with the Add to held pairs view);
+            "live_rebalances" (whether the saved live defaults rebalance, as
+            the run recorded them: the note beside the save button on a page
+            with the Rebalance view shows only then, since saving with
+            Rebalance no turns it off);
             "live_sells" (whether they sell: the Sell view's save note shows only then);
-            "live_trims" (whether they trim: the Trim to Kelly view's save
-            note shows only then);
             "max_names" (config.DEFAULTS_SERVER_MAX_FILTER_NAMES: the most
             categories, and the most tags, the server takes on one address).
     """
@@ -7270,9 +7193,8 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
         "same_title_size_cap": None if sweep is None else sweep.same_title_size_cap,
         "filed_by_listing": bool(series_categories),
         "source": source,
-        "live_adds_to_held_pairs": getattr(sweep, "live_add_to_held_pairs", None) is True,
+        "live_rebalances": getattr(sweep, "live_rebalance", None) is True,
         "live_sells": getattr(sweep, "live_sell_at", None) is not None,
-        "live_trims": getattr(sweep, "live_trim_to_kelly", None) is True,
         "max_names": DEFAULTS_SERVER_MAX_FILTER_NAMES,
     }
 
@@ -7392,55 +7314,44 @@ class _GridSource:
             cap (off_cap_sweep None) — what the walk falls back to when an
             off cell cannot be simulated, keeping the tier-on cap axis
             (_walk_once).
-        add_cell: Callable (band, k) -> {cap: {population: SweepPoint}} — the
-            same cell simulated with adding to held pairs
-            (BacktestSweep.add_on_cap_sweep's cell, run as the walk reads it,
-            so it may raise); None when the page has no Add to held pairs
-            view (_with_add_on).
-        add_off_cell: The same over a binding band's tier-floors-off run
-            (BacktestSweep.add_on_tier_off_cap_sweep); {} for a band the
-            tiers never bind at; None unless the grid has both the tier-off
-            view and a family over it.
-        add_cap_sweep, add_off_cap_sweep: The CapSweeps behind add_cell and
-            add_off_cell — read only for their simulated / reused counters in
-            the walk's log; None without them.
         sell: The backtester.SellSweep the page's Sell select is built from
             after the walk (_build_sell_grid), when its bands, ks and caps fit
             this grid (_with_sell); None without it. Its cells are never walked
             here: they are simulated in worker processes, level by level.
-        trim_cell: Callable (band, k, add) -> {cap: {population: SweepPoint}}
-            — the same cell simulated with held pairs trimmed to their Kelly
-            size, and with adding to held pairs when `add`
-            (BacktestSweep.trim_sweep's sweeps, run as the walk reads them,
-            so it may raise); None when the page has no Trim to Kelly view
-            (_with_trim).
-        trim_off_cell: The same over a binding band's tier-floors-off run; {}
-            for a band the tiers never bind at; None unless the grid has both
-            the tier-off view and a family over it.
-        trim_sweeps: (add, tier floors off) -> the CapSweep behind those
-            cells, read only for its simulated / reused counters in the
-            walk's log; empty without the view.
-        trim_rises (tuple[float, ...]): The minimum price rises the Trim to
-            Kelly family covers (backtester.TrimSweep.min_rises), in
-            dollars, ascending: with one, a held pair is trimmed only once
-            its total price has risen that far since the last trade on it.
-            Empty when the family carries none, or the page has no Trim to
-            Kelly view.
-        trim_rise_cell: Callable (band, k, add, tier floors off, start) ->
-            an iterator of (minimum price rise, {cap: SweepPoint | SameTrim}),
-            one per minimum of trim_rises, ascending
-            (backtester.TrimSweep.rise_grid over the grid's caps). `start`
-            is {cap: the trim_rises of that cell's Trim to Kelly point}, so
+        rebalance_cell: Callable (band, k) -> {cap: {population:
+            SweepPoint}} — the same cell simulated with held pairs
+            rebalanced: topped up to their Kelly size and sold down to it
+            at each weekly run (BacktestSweep.rebalance_sweep's tier-on
+            sweep, run as the walk reads it, so it may raise); None when the
+            page has no Rebalance view (_with_rebalance).
+        rebalance_off_cell: The same over a binding band's tier-floors-off
+            run; {} for a band the tiers never bind at; None unless the grid
+            has both the tier-off view and a family over it.
+        rebalance_sweeps (dict): Tier floors off (bool) -> the CapSweep
+            behind those cells, read only for its simulated / reused
+            counters in the walk's log; empty without the view, and without
+            the True key when the tier-off half is not shown.
+        moves (tuple[float, ...]): The minimum price movements the
+            Rebalance family covers (backtester.RebalanceSweep.min_moves),
+            in dollars, ascending: with one, a held pair is topped up or
+            sold down only once its total price has moved that far, up or
+            down, since the last trade on it. Empty when the family carries
+            none, or the page has no Rebalance view.
+        move_cell: Callable (band, k, tier floors off, start) -> an iterator
+            of (minimum price movement, {cap: SweepPoint | SameMove}), one
+            per minimum of moves, ascending
+            (backtester.RebalanceSweep.move_grid over the grid's caps).
+            `start` is {cap: the moves of that cell's rebalancing point}, so
             the run with no minimum is not simulated again. A SweepPoint is
             the "all" point of a run simulated at that minimum; a
-            SameTrim(None) says the cap's run is its Trim to Kelly run, and
-            a SameTrim(m) that it is the point yielded earlier at minimum m.
-            The runs are simulated as the iterator is read, so it may raise.
-            None without trim_rises.
-        trim_rise_stats (dict): (add, tier floors off) -> the "simulated",
-            "reused" and "same" counts trim_rise_cell's reads have added up
-            for that setting, read only for the walk's log; empty until a
-            cell is read.
+            SameMove(None) says the cap's run is its rebalancing run with no
+            minimum, and a SameMove(m) that it is the point yielded earlier
+            at minimum m. The runs are simulated as the iterator is read, so
+            it may raise. None without moves.
+        move_stats (dict): Tier floors off (bool) -> the "simulated",
+            "reused" and "same" counts move_cell's reads have added up for
+            that setting, read only for the walk's log; empty until a cell
+            is read.
     """
     bands: tuple
     ks: tuple
@@ -7459,18 +7370,14 @@ class _GridSource:
     off_events: frozenset = frozenset()
     off_cap_sweep: object | None = None
     off_fallback: Callable[[], "_GridSource"] | None = None
-    add_cell: Callable[[tuple[float, float] | None, float | None], dict] | None = None
-    add_off_cell: Callable[[tuple[float, float] | None, float | None], dict] | None = None
-    add_cap_sweep: object | None = None
-    add_off_cap_sweep: object | None = None
     sell: object | None = None
-    trim_cell: Callable[[tuple[float, float] | None, float | None, bool], dict] | None = None
-    trim_off_cell: Callable[[tuple[float, float] | None, float | None, bool],
-                            dict] | None = None
-    trim_sweeps: dict = field(default_factory=dict)
-    trim_rises: tuple[float, ...] = ()
-    trim_rise_cell: Callable | None = None
-    trim_rise_stats: dict = field(default_factory=dict)
+    rebalance_cell: Callable[[tuple[float, float] | None, float | None], dict] | None = None
+    rebalance_off_cell: Callable[[tuple[float, float] | None, float | None],
+                                 dict] | None = None
+    rebalance_sweeps: dict = field(default_factory=dict)
+    moves: tuple[float, ...] = ()
+    move_cell: Callable | None = None
+    move_stats: dict = field(default_factory=dict)
 
 
 def _primary_calibration(sweep: BacktestSweep | None) -> IntervalCalibration | None:
@@ -7686,41 +7593,48 @@ def _with_tier_off(source: "_GridSource", sweep: BacktestSweep | None) -> "_Grid
             capped, off_cell=eager_off_cell, off_cap_sweep=None, off_fallback=None))
 
 
-def _warn_add_on_lost_with_the_cap_sweep() -> None:
+def _warn_rebalance_lost_with_the_cap_sweep() -> None:
     """
-    Log why the Add to held pairs select stays disabled when the size-cap sweep is set aside.
+    Log why the Rebalance select stays disabled when the size-cap sweep is set aside.
 
-    The add-on simulations are read on the size-cap sweep's own grid, so a page
-    that falls back to the eager points (the cap sweep could not be read, does
-    not hold the run's primary scenario, or failed to simulate a cell) has no
-    add-on view either. The size-cap sweep's own WARNING names its failure;
-    this one says what that costs the select, so the note beside the select
-    ("see the log") is true.
+    The rebalancing simulations are read on the size-cap sweep's own grid, so a
+    page that falls back to the eager points (the cap sweep could not be read,
+    does not hold the run's primary scenario, or failed to simulate a cell)
+    has no Rebalance view either. The size-cap sweep's own WARNING names its
+    failure; this one says what that costs the select, so the note beside the
+    select ("see the log") is true.
     """
-    logging.warning("The Add to held pairs simulations are not shown, because the size-cap "
-                    "sweep they are read with could not be used; the filter bar's Add to "
-                    "held pairs select stays disabled")
+    logging.warning("The Rebalance simulations are not shown, because the size-cap sweep "
+                    "they are read with could not be used; the filter bar's Rebalance select "
+                    "stays disabled")
 
 
-def _with_add_on(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSource":
+def _with_rebalance(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSource":
     """
-    Attach a sweep's Add to held pairs family to a grid, when it fits.
+    Attach a sweep's Rebalance family to a grid, when it fits.
 
-    The family (BacktestSweep.add_on_cap_sweep, and add_on_tier_off_cap_sweep
-    over the tier-floors-off family) is lazy only: every cell is simulated as
-    the walk reads it, and no eager point exists to stand in for one. It
-    therefore fits a grid only on the very same bands, ks and caps: the
-    size-cap grid, or the eager grid of a run without a size-cap sweep.
-    Anything else (the eager fallback of a size-cap grid, a mismatched or
-    unreadable sweep) gets no add-on view, with one WARNING when a family
-    existed, and the page offers that choice off only. The tier-floors-off
-    twin is attached only when the grid carries the tier-off view and the
-    twin holds every binding band on the same ks and caps; without it, the
-    choice reads "not simulated" with the tier floors off.
+    The family (BacktestSweep.rebalance_sweep) is lazy only: every cell is
+    simulated as the walk reads it, with no eager point to stand in for one,
+    and every one of its runs both tops held pairs up and sells them down.
+    It therefore fits a grid only on the very same bands, ks and caps: the
+    size-cap grid, or the eager grid of a run without a size-cap sweep. It
+    gives the grid two lazy size-cap sweeps (RebalanceSweep.sweep): one with
+    the tier floors on, and one with them off when the grid carries the
+    tier-off view and the family holds every band the tiers bind at.
+    Anything else (a mismatched or unreadable family) gets no view, with one
+    WARNING, and the page offers Rebalance "no" only; a tier-floors-off half
+    that does not fit, or cannot be read, costs that half alone.
+
+    A family that carries minimum price movements (its min_moves) also gives
+    the grid moves and move_cell, the reader of one cell at every minimum
+    (the family's move_grid over the grid's caps), whose counts add up in
+    move_stats for the walk's log. A family without them, or a stand-in
+    with no such attribute, gets no reader: moves stays empty and move_cell
+    None.
 
     The grid's off_fallback (the eager tier-off lookup the walk swaps in when
     a tier-floors-off cell fails) is re-wrapped to keep the family, so the
-    add-on phase still runs on the grid it returns.
+    rebalancing phase still runs on the grid it returns.
 
     Args:
         source (_GridSource): The grid, its tier-floors-off family already
@@ -7729,238 +7643,118 @@ def _with_add_on(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSo
 
     Returns:
         _GridSource: The source itself when there is no family, no band or
-            no fit; else a copy carrying add_cell (and add_off_cell), their
-            sweeps and the events the family's trades can carry.
+            no fit; else a copy carrying rebalance_cell (and
+            rebalance_off_cell), their sweeps, the events the family's trades
+            can carry and, when the family covers minimum price movements,
+            those and their reader.
     """
-    add = getattr(sweep, "add_on_cap_sweep", None) if sweep is not None else None
-    if add is None or source.bands == (None,):
-        return source
-    try:
-        usable = (tuple(add.bands) == tuple(source.bands) and tuple(add.ks) == tuple(source.ks)
-                  and tuple(add.caps) == tuple(source.caps))
-        # Every entry's event, as an add-on run files its trades: a run whose
-        # cash differs can trade a pair no other scenario traded, and the bar
-        # must list its category and tag before any cell is simulated
-        events = source.events | frozenset(add.entry_events()) if usable else None
-    except Exception:
-        logging.warning("The Add to held pairs simulations could not be read; the filter "
-                        "bar's Add to held pairs select stays disabled", exc_info=True)
-        return source
-    if not usable:
-        logging.warning("The Add to held pairs simulations do not match the page's grid (its "
-                        "bands, ks or caps); the filter bar's Add to held pairs select stays "
-                        "disabled")
-        return source
-    off = getattr(sweep, "add_on_tier_off_cap_sweep", None)
-    add_off_cell = add_off = None
-    off_events = source.off_events
-    if source.tier_binds is not None and off is not None:
-        binding = {band for band, own in zip(source.bands, source.tier_binds, strict=True)
-                   if own}
-        try:
-            fits = (tuple(off.ks) == tuple(source.ks) and tuple(off.caps) == tuple(source.caps)
-                    and binding <= set(off.bands))
-            if fits:
-                off_events = source.off_events | frozenset(off.entry_events())
-        except Exception:
-            fits = False
-        if fits:
-            add_off = off
-
-            def add_off_cell(band, k) -> dict:
-                """
-                One binding (band, k)'s add-on points with the tier floors off, at every cap.
-
-                Args:
-                    band: The cell's band.
-                    k: The cell's k.
-
-                Returns:
-                    dict: {cap: {population: point}} (backtester.CapSweep.cell,
-                        simulated as it is read — it may raise), or {} for a
-                        band the tiers never bind at.
-                """
-                return off.cell(band, k) if band in binding else {}
-        else:
-            logging.warning("The Add to held pairs simulations with the tier floors off do "
-                            "not match the page's grid; with the tier floors off, adding "
-                            "is not shown")
-    fields = {"add_cell": add.cell, "add_off_cell": add_off_cell, "add_cap_sweep": add,
-              "add_off_cap_sweep": add_off, "events": events, "off_events": off_events}
-    attached = dataclasses.replace(source, **fields)
-    if source.off_fallback is None:
-        return attached
-    # The walk swaps in off_fallback() when a tier-floors-off cell fails. That
-    # grid was built before this family was attached, so it is re-wrapped to
-    # keep it: without the family the add-on phase would be skipped on it
-    return dataclasses.replace(attached, off_fallback=lambda: dataclasses.replace(
-        source.off_fallback(), **fields))
-
-
-def _warn_trim_lost_with_the_cap_sweep() -> None:
-    """
-    Log why the Trim to Kelly select stays disabled when the size-cap sweep is set aside.
-
-    Like the add-on simulations, the trimming ones are read on the size-cap
-    sweep's own grid, so a page that falls back to the eager points has no
-    Trim to Kelly view either. The size-cap sweep's own WARNING names its
-    failure; this one says what that costs the select.
-    """
-    logging.warning("The Trim to Kelly simulations are not shown, because the size-cap "
-                    "sweep they are read with could not be used; the filter bar's Trim to "
-                    "Kelly select stays disabled")
-
-
-def _with_trim(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSource":
-    """
-    Attach a sweep's Trim to Kelly family to a grid, when it fits.
-
-    The family (BacktestSweep.trim_sweep) is lazy only, like the Add to held
-    pairs one: every cell is simulated as the walk reads it, with no eager
-    point to stand in for one. It fits a grid on the very same bands, ks and
-    caps: the size-cap grid, or the eager grid of a run without a size-cap
-    sweep. It holds four lazy size-cap sweeps: adding to held pairs off or
-    on, each with the tier floors on, and with them off when the grid
-    carries the tier-off view and the family holds every band the tiers bind
-    at. Anything else (a mismatched or unreadable family) gets no view, with
-    one WARNING, and the page offers that choice off only; a tier-floors-off
-    half that does not fit, or cannot be read, costs that half alone.
-
-    A family that carries minimum price rises (its min_rises) also gives the
-    grid trim_rises and trim_rise_cell, the reader of one cell at every
-    minimum (the family's rise_grid over the grid's caps), whose counts add
-    up in trim_rise_stats for the walk's log. A family without them, or a
-    stand-in with no such attribute, gets no reader: trim_rises stays empty
-    and trim_rise_cell None.
-
-    The grid's off_fallback is re-wrapped to keep the family, as _with_add_on
-    keeps its own.
-
-    Args:
-        source (_GridSource): The grid, its tier-floors-off and Add to held
-            pairs families already attached.
-        sweep (BacktestSweep | None): The run's sweep, or None.
-
-    Returns:
-        _GridSource: The source itself when there is no family, no band or
-            no fit; else a copy carrying trim_cell (and trim_off_cell), their
-            sweeps, the events the family's trades can carry and, when the
-            family covers minimum price rises, those and their reader.
-    """
-    trim = getattr(sweep, "trim_sweep", None) if sweep is not None else None
-    if trim is None or source.bands == (None,):
+    family = getattr(sweep, "rebalance_sweep", None) if sweep is not None else None
+    if family is None or source.bands == (None,):
         return source
     sweeps: dict = {}
     try:
-        usable = (tuple(trim.bands) == tuple(source.bands)
-                  and tuple(trim.ks) == tuple(source.ks)
-                  and tuple(trim.caps) == tuple(source.caps))
+        usable = (tuple(family.bands) == tuple(source.bands)
+                  and tuple(family.ks) == tuple(source.ks)
+                  and tuple(family.caps) == tuple(source.caps))
         if usable:
             # Every entry's event, both Tier floors settings: a run whose cash
             # differs can trade a pair no other scenario traded. The bar's
             # labels read events and off_events together, so one set holds them
-            found = frozenset(trim.entry_events())
-            for add in (False, True):
-                sweeps[(add, False)] = trim.sweep(tier_floors=True, add_to_held=add)
-            # The minimum price rises the family covers: none on a family
+            found = frozenset(family.entry_events())
+            sweeps[False] = family.sweep(tier_floors=True)
+            # The minimum price movements the family covers: none on a family
             # built without them, or on a stand-in with no such attribute
-            rises = tuple(getattr(trim, "min_rises", ()) or ())
+            moves = tuple(getattr(family, "min_moves", ()) or ())
     except Exception:
-        logging.warning("The Trim to Kelly simulations could not be read; the filter "
-                        "bar's Trim to Kelly select stays disabled", exc_info=True)
+        logging.warning("The Rebalance simulations could not be read; the filter bar's "
+                        "Rebalance select stays disabled", exc_info=True)
         return source
     if not usable:
-        logging.warning("The Trim to Kelly simulations do not match the page's grid (its "
-                        "bands, ks or caps); the filter bar's Trim to Kelly select stays "
-                        "disabled")
+        logging.warning("The Rebalance simulations do not match the page's grid (its bands, "
+                        "ks or caps); the filter bar's Rebalance select stays disabled")
         return source
-    trim_off_cell = None
+    rebalance_off_cell = None
     if source.tier_binds is not None:
         binding = {band for band, own in zip(source.bands, source.tier_binds, strict=True)
                    if own}
         unread = False
         try:
-            fits = binding <= set(trim.off_bands)
+            fits = binding <= set(family.off_bands)
             if fits:
-                for add in (False, True):
-                    sweeps[(add, True)] = trim.sweep(tier_floors=False, add_to_held=add)
+                sweeps[True] = family.sweep(tier_floors=False)
         except Exception:
             fits, unread = False, True
-            logging.warning("The Trim to Kelly simulations with the tier floors off "
-                            "could not be read; with the tier floors off, trimming is "
-                            "not shown", exc_info=True)
+            logging.warning("The Rebalance simulations with the tier floors off could not be "
+                            "read; with the tier floors off, rebalancing is not shown",
+                            exc_info=True)
         if fits:
-            def trim_off_cell(band, k, add) -> dict:
+            def rebalance_off_cell(band, k) -> dict:
                 """
-                One binding (band, k)'s trimming points with the tier floors off, at every cap.
+                One binding (band, k)'s rebalancing points with the tier floors off, at every cap.
 
                 Args:
                     band: The cell's band.
                     k: The cell's k.
-                    add: Whether the run also adds to held pairs.
 
                 Returns:
                     dict: {cap: {population: point}} (backtester.CapSweep.cell,
                         simulated as it is read — it may raise), or {} for a
                         band the tiers never bind at.
                 """
-                return sweeps[(add, True)].cell(band, k) if band in binding else {}
+                return sweeps[True].cell(band, k) if band in binding else {}
         else:
-            sweeps = {key: value for key, value in sweeps.items() if not key[1]}
+            sweeps.pop(True, None)
             if not unread:
-                logging.warning("The Trim to Kelly simulations with the tier floors off "
-                                "do not match the page's grid; with the tier floors off, "
-                                "trimming is not shown")
+                logging.warning("The Rebalance simulations with the tier floors off do not "
+                                "match the page's grid; with the tier floors off, rebalancing "
+                                "is not shown")
 
-    def trim_cell(band, k, add) -> dict:
+    def rebalance_cell(band, k) -> dict:
         """
-        One (band, k)'s trimming points with the tier floors on, at every cap.
+        One (band, k)'s rebalancing points with the tier floors on, at every cap.
 
         Args:
             band: The cell's band.
             k: The cell's k.
-            add: Whether the run also adds to held pairs.
 
         Returns:
             dict: {cap: {population: point}} (backtester.CapSweep.cell,
                 simulated as it is read — it may raise).
         """
-        return sweeps[(add, False)].cell(band, k)
+        return sweeps[False].cell(band, k)
 
-    # Per (adding to held pairs, tier floors off): what reading that setting's
-    # minimum price rises has cost so far, for the walk's progress line
-    rise_stats: dict = {}
+    # Per Tier floors setting (off or not): what reading that setting's minimum
+    # price movements has cost so far, for the walk's progress line
+    move_stats: dict = {}
 
-    def trim_rise_cell(band, k, add, off, start):
+    def move_cell(band, k, off, start):
         """
-        One (band, k)'s trimming runs at every minimum price rise, at every cap.
+        One (band, k)'s rebalancing runs at every minimum price movement, at every cap.
 
         Args:
             band: The cell's band.
             k: The cell's k.
-            add: Whether the runs also add to held pairs.
             off: Whether the tier floors are off (a band the tiers bind at).
-            start: {cap: the trim_rises of the cell's Trim to Kelly point},
-                which the walk has already read.
+            start: {cap: the moves of the cell's rebalancing point}, which
+                the walk has already read.
 
         Returns:
-            Iterator: (minimum, {cap: SweepPoint | SameTrim}) per minimum,
-                ascending (backtester.TrimSweep.rise_grid). A run is
+            Iterator: (minimum, {cap: SweepPoint | SameMove}) per minimum,
+                ascending (backtester.RebalanceSweep.move_grid). A run is
                 simulated when its step is read, so reading it may raise.
         """
-        return trim.rise_grid(band, k, tier_floors=not off, add_to_held=add,
-                              caps=source.caps, start=start,
-                              stats=rise_stats.setdefault((add, off), {}))
+        return family.move_grid(band, k, tier_floors=not off, caps=source.caps,
+                                start=start, stats=move_stats.setdefault(off, {}))
 
-    fields = {"trim_cell": trim_cell, "trim_off_cell": trim_off_cell, "trim_sweeps": sweeps,
-              "events": source.events | found, "trim_rises": rises,
-              "trim_rise_cell": trim_rise_cell if rises else None,
-              "trim_rise_stats": rise_stats}
+    fields = {"rebalance_cell": rebalance_cell, "rebalance_off_cell": rebalance_off_cell,
+              "rebalance_sweeps": sweeps, "events": source.events | found, "moves": moves,
+              "move_cell": move_cell if moves else None, "move_stats": move_stats}
     attached = dataclasses.replace(source, **fields)
     if source.off_fallback is None:
         return attached
-    # The walk swaps in off_fallback() when a tier-floors-off cell fails: it
-    # keeps the family, so the trim phase still runs on that grid
+    # The walk swaps in off_fallback() when a tier-floors-off cell fails. That
+    # grid was built before this family was attached, so it is re-wrapped to
+    # keep it: without the family the rebalancing phase would be skipped on it
     return dataclasses.replace(attached, off_fallback=lambda: dataclasses.replace(
         source.off_fallback(), **fields))
 
@@ -7978,7 +7772,7 @@ def _with_sell(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSour
     events, so the bar lists its category and tag before anything is
     simulated (a sale frees cash, and the cash can buy a pair no other
     scenario traded). The grid's off_fallback is re-wrapped to keep it, as
-    _with_add_on keeps its family.
+    _with_rebalance keeps its family.
 
     Args:
         source (_GridSource): The grid, every other family already attached.
@@ -8177,15 +7971,13 @@ def _grid_source(
     calibration falls back to sweep.calibration. A banded shape also carries
     the sweep's tier-floors-off family when the page can show it
     (_with_tier_off: its binding bands' off cells at the run's own cap), so
-    the walk's fallback keeps the Tier floors choice too. It carries the Add
-    to held pairs family (_with_add_on) only when use_cap_sweep is True and the
-    size-cap sweep (when the run has one) was usable, and only if the family's
-    bands, ks and caps are the grid's: a grid that set the size-cap sweep aside,
-    and the walk's cap-axis fallback, never have that view, and each logs a
-    WARNING saying so (_warn_add_on_lost_with_the_cap_sweep). The Trim to
-    Kelly family (_with_trim) is carried under the same conditions, with a
-    WARNING of its own where it is lost
-    (_warn_trim_lost_with_the_cap_sweep). Every banded
+    the walk's fallback keeps the Tier floors choice too. It carries the
+    Rebalance family (_with_rebalance) only when use_cap_sweep is True and
+    the size-cap sweep (when the run has one) was usable, and only if the
+    family's bands, ks and caps are the grid's: a grid that set the size-cap
+    sweep aside, and the walk's cap-axis fallback, never have that view, and
+    each logs a WARNING saying so (_warn_rebalance_lost_with_the_cap_sweep).
+    Every banded
     shape, the walk's fallbacks included, carries the Sell family (_with_sell)
     when its bands and ks are the grid's and its caps include the grid's.
 
@@ -8202,26 +7994,20 @@ def _grid_source(
         equity_df (pd.DataFrame): Their equity curve.
         k_used (float | None): The k the page names (used without a sweep).
         use_cap_sweep (bool): Keyword-only. False ignores sweep.cap_sweep
-            and the Add to held pairs and Trim to Kelly families — the
-            walk's fallback.
+            and the Rebalance family — the walk's fallback.
 
     Returns:
-        _GridSource: The grid (with its tier-floors-off family, its Add to
-            held pairs family and its Trim to Kelly family, when the page can
-            show them).
+        _GridSource: The grid (with its tier-floors-off family and its
+            Rebalance family, when the page can show them).
     """
     if sweep is None or sweep.primary.spread_band is None:
         if use_cap_sweep and sweep is not None and sweep.cap_sweep is not None:
             logging.warning("The size-cap sweep cannot be placed on a run whose primary "
                             "records no spread band; the page offers the run's own cap only")
-        if use_cap_sweep and getattr(sweep, "add_on_cap_sweep", None) is not None:
-            logging.warning("The Add to held pairs simulations cannot be placed on a run "
-                            "whose primary records no spread band; the filter bar's Add to "
-                            "held pairs select stays disabled")
-        if use_cap_sweep and getattr(sweep, "trim_sweep", None) is not None:
-            logging.warning("The Trim to Kelly simulations cannot be placed on a run "
-                            "whose primary records no spread band; the filter bar's Trim "
-                            "to Kelly select stays disabled")
+        if use_cap_sweep and getattr(sweep, "rebalance_sweep", None) is not None:
+            logging.warning("The Rebalance simulations cannot be placed on a run whose "
+                            "primary records no spread band; the filter bar's Rebalance "
+                            "select stays disabled")
         return _unbanded_source(sweep, trades, equity_df, k_used)
     capped = sweep.cap_sweep
     if use_cap_sweep and capped is not None:
@@ -8230,9 +8016,8 @@ def _grid_source(
             bands, ks, caps = tuple(capped.bands), tuple(capped.ks), tuple(capped.caps)
             if primary.spread_band in bands and primary.k in ks and capped.primary_cap in caps:
                 # The tier-floors-off family rides along (_with_tier_off), and
-                # so do the Add to held pairs family (_with_add_on) and the
-                # Trim to Kelly family (_with_trim)
-                return _with_sell(_with_trim(_with_add_on(_with_tier_off(_GridSource(
+                # so does the Rebalance family (_with_rebalance)
+                return _with_sell(_with_rebalance(_with_tier_off(_GridSource(
                     bands=bands, ks=ks, caps=caps,
                     primary=(bands.index(primary.spread_band), ks.index(primary.k),
                              caps.index(capped.primary_cap)),
@@ -8246,34 +8031,28 @@ def _grid_source(
                     checks=bool(capped.checks), cap_sweep=capped,
                     fallback=lambda: _grid_source(sweep, trades, equity_df, k_used,
                                                   use_cap_sweep=False)), sweep), sweep),
-                    sweep), sweep)
+                    sweep)
         except Exception:
             # The cap axis alone is lost, as when a cell cannot be simulated
             # in the walk: the eager points still give the bar every band and k
             logging.warning("The size-cap sweep could not be simulated; the page offers "
                             "the run's own cap only", exc_info=True)
-            if getattr(sweep, "add_on_cap_sweep", None) is not None:
-                _warn_add_on_lost_with_the_cap_sweep()
-            if getattr(sweep, "trim_sweep", None) is not None:
-                _warn_trim_lost_with_the_cap_sweep()
+            if getattr(sweep, "rebalance_sweep", None) is not None:
+                _warn_rebalance_lost_with_the_cap_sweep()
             return _with_sell(_with_tier_off(_eager_source(sweep), sweep), sweep)
         logging.warning(
             "The size-cap sweep does not hold this run's primary scenario (band %s, "
             "k %s, cap %s); the dashboard offers the run's own cap only",
             primary.spread_band, primary.k, capped.primary_cap)
-        if getattr(sweep, "add_on_cap_sweep", None) is not None:
-            _warn_add_on_lost_with_the_cap_sweep()
-        if getattr(sweep, "trim_sweep", None) is not None:
-            _warn_trim_lost_with_the_cap_sweep()
+        if getattr(sweep, "rebalance_sweep", None) is not None:
+            _warn_rebalance_lost_with_the_cap_sweep()
         return _with_sell(_with_tier_off(_eager_source(sweep), sweep), sweep)
     source = _with_tier_off(_eager_source(sweep), sweep)
     # The walk's cap-axis fallback (use_cap_sweep False) never carries the
-    # Add to held pairs view or the Trim to Kelly view: those families' caps
-    # are the size-cap grid's, and the walk logs both the lost cap axis and
-    # the lost views. The Sell family fits the eager grid's one cap, so every
-    # shape keeps it
-    return _with_sell(_with_trim(_with_add_on(source, sweep), sweep)
-                      if use_cap_sweep else source, sweep)
+    # Rebalance view: that family's caps are the size-cap grid's, and the walk
+    # logs both the lost cap axis and the lost view. The Sell family fits the
+    # eager grid's one cap, so every shape keeps it
+    return _with_sell(_with_rebalance(source, sweep) if use_cap_sweep else source, sweep)
 
 
 def _filter_labels(
@@ -8607,24 +8386,37 @@ def _walk_off_cells(source: _GridSource, off_takers: list, axis_end: pd.Timestam
     return None
 
 
-def _walk_add_cells(source: _GridSource, add_takers: list,
-                    axis_end: pd.Timestamp | None) -> Exception | None:
+def _walk_rebalance_cells(source: _GridSource, takers: list,
+                          axis_end: pd.Timestamp | None,
+                          starts: dict | None = None) -> Exception | None:
     """
-    Hand every Add to held pairs scenario of a grid to the visitors that take it.
+    Hand every Rebalance scenario of a grid to the visitors that take it.
 
-    Every (band, k) with the tier floors on (source.add_cell), then, when the
-    grid has a tier-floors-off view and a family over it, every binding
-    band's cell with them off (source.add_off_cell): each is read (the
-    family's CapSweep simulates it here), cut to the page's axis
-    (_cut_to_axis) and handed to each visitor's add(band index, k index, cap
-    index, {population: point}, off=...), one cell alive at a time, the
-    primary cap first. The page's own trades are never substituted: an
-    add-on run is always its own simulation.
+    Two passes: every (band, k) with the tier floors on
+    (source.rebalance_cell); then, when the grid has a tier-floors-off view
+    and a family over it, every binding band's cell with them off
+    (source.rebalance_off_cell). Each cell is read (the family's CapSweep
+    simulates it here), cut to the page's axis (_cut_to_axis) and handed to
+    each visitor's rebalance(band index, k index, cap index, {population:
+    point}, off=...), one cell alive at a time, the primary cap first. The
+    page's own trades are never substituted: a rebalancing run is always
+    its own simulation.
+
+    With `starts`, each cell also leaves behind what its minimum price
+    movements start from: per cap, how far the pair's price had moved before
+    each add-on and each trim that cap's run made (SweepPoint.moves).
+    _walk_move_cells reads the cells back in this order, and hands each
+    cell's entry to RebalanceSweep.move_grid so the run with no minimum is
+    not simulated twice.
 
     Args:
-        source (_GridSource): The grid (its add_cell is not None).
-        add_takers (list): The visitors with an `add` method.
+        source (_GridSource): The grid (its rebalance_cell is not None).
+        takers (list): The visitors with a `rebalance` method.
         axis_end (pd.Timestamp | None): The page's last date.
+        starts (dict | None): Filled, when given, with (tier floors off, band
+            index, k index) -> {cap: the moves of that cap's "all" point} for
+            every cell read, in the order read (a cap without an "all" point
+            is left out). None (default) records nothing.
 
     Returns:
         Exception | None: The exception a cell raised, which stops this
@@ -8632,196 +8424,117 @@ def _walk_add_cells(source: _GridSource, add_takers: list,
     """
     pc = source.primary[2]
     caps = [pc] + [ci for ci in range(len(source.caps)) if ci != pc]
-    phases = [(False, source.add_cell, source.add_cap_sweep,
+    phases = [(False, source.rebalance_cell,
                [(bi, ki) for bi in range(len(source.bands)) for ki in range(len(source.ks))])]
-    if source.tier_binds is not None and source.add_off_cell is not None:
-        phases.append((True, source.add_off_cell, source.add_off_cap_sweep,
+    if source.tier_binds is not None and source.rebalance_off_cell is not None:
+        phases.append((True, source.rebalance_off_cell,
                        [(bi, ki) for bi, binds in enumerate(source.tier_binds) if binds
                         for ki in range(len(source.ks))]))
-    for off, read, capped, cells in phases:
-        every = max(1, math.ceil(len(cells) / _WALK_PROGRESS_LINES))
+    for off, read, cells in phases:
+        capped = source.rebalance_sweeps.get(off)
+        step = max(1, math.ceil(len(cells) / _WALK_PROGRESS_LINES))
         for done, (bi, ki) in enumerate(cells, 1):
             try:
                 by_cap = read(source.bands[bi], source.ks[ki])
             except Exception as exc:
                 return exc
             by_cap = _cut_to_axis(by_cap, axis_end)
-            for ci in caps:
-                pops = by_cap.get(source.caps[ci])
-                if pops:
-                    for visit in add_takers:
-                        visit.add(bi, ki, ci, pops, off=off)
-            del by_cap
-            if done % every == 0 or done == len(cells):
-                logging.info("Dashboard: %d/%d %s (%d cap points simulated, %d shared "
-                             "so far)", done, len(cells),
-                             "binding band x k cells read from the tier-floors-off Add to "
-                             "held pairs size-cap sweep" if off else
-                             "band x k cells read from the Add to held pairs size-cap sweep",
-                             getattr(capped, "simulated", 0), getattr(capped, "reused", 0))
-    return None
-
-
-def _walk_trim_cells(source: _GridSource, trim_takers: list,
-                     axis_end: pd.Timestamp | None,
-                     starts: dict | None = None) -> Exception | None:
-    """
-    Hand every Trim to Kelly scenario of a grid to the visitors that take it.
-
-    Up to four passes, each a setting of (adding to held pairs, tier floors
-    off): trimming alone with the tier floors on; then, when the grid has a
-    tier-floors-off view and a family over it, every binding band's cell
-    with them off; then the same two with adding to held pairs, only when
-    the grid still carries the Add to held pairs view (source.add_cell: the
-    page cannot show adding on without it), and the second of them only
-    when it carries that view's tier-floors-off runs too
-    (source.add_off_cell). Each cell is read (the family's
-    CapSweep simulates it here), cut to the page's axis (_cut_to_axis) and
-    handed to each visitor's trim(band index, k index, cap index,
-    {population: point}, add=..., off=...), one cell alive at a time, the
-    primary cap first.
-
-    With `starts`, each cell also leaves behind what its minimum price rises
-    start from: per cap, how far the pair's price had risen before each trim
-    that cap's run made (SweepPoint.trim_rises). _walk_trim_rise_cells reads
-    the cells back in this order, and hands each cell's entry to
-    TrimSweep.rise_grid so the run with no minimum is not simulated twice.
-
-    Args:
-        source (_GridSource): The grid (its trim_cell is not None).
-        trim_takers (list): The visitors with a `trim` method.
-        axis_end (pd.Timestamp | None): The page's last date.
-        starts (dict | None): Filled, when given, with (add, tier floors
-            off, band index, k index) -> {cap: the trim_rises of that cap's
-            "all" point} for every cell read, in the order read (a cap
-            without an "all" point is left out). None (default) records
-            nothing.
-
-    Returns:
-        Exception | None: The exception a cell raised, which stops this
-            phase; None when every cell was visited.
-    """
-    pc = source.primary[2]
-    caps = [pc] + [ci for ci in range(len(source.caps)) if ci != pc]
-    every = [(bi, ki) for bi in range(len(source.bands)) for ki in range(len(source.ks))]
-    binding = ([] if source.tier_binds is None or source.trim_off_cell is None else
-               [(bi, ki) for bi, binds in enumerate(source.tier_binds) if binds
-                for ki in range(len(source.ks))])
-    phases = []
-    for add in (False, True) if source.add_cell is not None else (False,):
-        phases.append((add, False, source.trim_cell, every))
-        # With adding on, the binding bands' cells only where the page also
-        # has the add-on runs with the tier floors off to show beside them
-        if binding and (not add or source.add_off_cell is not None):
-            phases.append((add, True, source.trim_off_cell, binding))
-    for add, off, read, cells in phases:
-        capped = source.trim_sweeps.get((add, off))
-        step = max(1, math.ceil(len(cells) / _WALK_PROGRESS_LINES))
-        for done, (bi, ki) in enumerate(cells, 1):
-            try:
-                by_cap = read(source.bands[bi], source.ks[ki], add)
-            except Exception as exc:
-                return exc
-            by_cap = _cut_to_axis(by_cap, axis_end)
             if starts is not None:
-                # The rises behind each cap's trims: where its minimums start
-                starts[(add, off, bi, ki)] = {
-                    cap: pops[_ALL_VIEW].trim_rises for cap, pops in by_cap.items()
+                # The moves behind each cap's add-ons and trims: where its
+                # minimums start
+                starts[(off, bi, ki)] = {
+                    cap: pops[_ALL_VIEW].moves for cap, pops in by_cap.items()
                     if pops.get(_ALL_VIEW) is not None}
             for ci in caps:
                 pops = by_cap.get(source.caps[ci])
                 if pops:
-                    for visit in trim_takers:
-                        visit.trim(bi, ki, ci, pops, add=add, off=off)
+                    for visit in takers:
+                        visit.rebalance(bi, ki, ci, pops, off=off)
             del by_cap
             if done % step == 0 or done == len(cells):
-                logging.info("Dashboard: %d/%d %s read from the Trim to Kelly size-cap sweep"
-                             "%s%s (%d cap points simulated, %d shared so far)",
+                logging.info("Dashboard: %d/%d %s read from the Rebalance size-cap sweep%s "
+                             "(%d cap points simulated, %d shared so far)",
                              done, len(cells),
                              "binding band x k cells" if off else "band x k cells",
                              " with the tier floors off" if off else "",
-                             ", adding to held pairs" if add else "",
                              getattr(capped, "simulated", 0), getattr(capped, "reused", 0))
     return None
 
 
-def _walk_trim_rise_cells(source: _GridSource, rise_takers: list,
-                          axis_end: pd.Timestamp | None, starts: dict) -> Exception | None:
+def _walk_move_cells(source: _GridSource, takers: list,
+                     axis_end: pd.Timestamp | None, starts: dict) -> Exception | None:
     """
-    Hand every minimum price rise of every Trim to Kelly scenario to the visitors that take it.
+    Hand every minimum price movement of every Rebalance scenario to the visitors that take it.
 
-    The cells are the ones the Trim to Kelly walk read (the keys of
-    `starts`), in the same order: each (adding to held pairs, tier floors
-    off) setting in turn, one (band, k) at a time. A cell is read one
-    minimum at a time (source.trim_rise_cell — the family simulates the runs
-    that differ as each step is read), ascending. At each minimum every
-    simulated point's curve is cut to the page's axis (_cut_to_axis) and
-    every cap's entry — the cut point, or the SameTrim naming the run that
-    cap repeats — is handed to each visitor's trim_rise(band index, k index,
-    cap index, minimum index, entry, add=..., off=...), the primary cap
-    first. Only one minimum's points are alive at a time. A cell in which
-    the Trim to Kelly walk found no point has no minimum to read and is
+    The cells are the ones the Rebalance walk read (the keys of `starts`),
+    in the same order: each Tier floors setting in turn, one (band, k) at a
+    time. A cell is read one minimum at a time (source.move_cell — the
+    family simulates the runs that differ as each step is read), ascending.
+    At each minimum every simulated point's curve is cut to the page's axis
+    (_cut_to_axis) and every cap's entry — the cut point, or the SameMove
+    naming the run that cap repeats — is handed to each visitor's move(band
+    index, k index, cap index, minimum index, entry, off=...), the primary
+    cap first. Only one minimum's points are alive at a time. A cell in
+    which the Rebalance walk found no point has no minimum to read and is
     passed over.
 
     Args:
-        source (_GridSource): The grid (its trim_rise_cell is not None).
-        rise_takers (list): The visitors with a `trim_rise` method.
+        source (_GridSource): The grid (its move_cell is not None).
+        takers (list): The visitors with a `move` method.
         axis_end (pd.Timestamp | None): The page's last date.
-        starts (dict): (add, tier floors off, band index, k index) -> {cap:
-            the trim_rises of that cell's Trim to Kelly point}, as
-            _walk_trim_cells recorded it.
+        starts (dict): (tier floors off, band index, k index) -> {cap: the
+            moves of that cell's rebalancing point}, as
+            _walk_rebalance_cells recorded it.
 
     Returns:
         Exception | None: The exception reading a cell raised, which stops
             this phase — a run that could not be simulated, a `start` the
             family refuses (a cap with no point, or a point that records no
-            rises), or a minimum the grid does not name; None when every
+            moves), or a minimum the grid does not name; None when every
             cell was visited, or when every visitor had failed and the rest
             were left unread.
     """
     pc = source.primary[2]
     caps = [pc] + [ci for ci in range(len(source.caps)) if ci != pc]
-    places = {rise: ri for ri, rise in enumerate(source.trim_rises)}
-    # Each setting's cells, in the order the Trim to Kelly walk read them
-    settings: dict[tuple[bool, bool], list] = {}
-    for (add, off, bi, ki), start in starts.items():
-        settings.setdefault((add, off), []).append((bi, ki, start))
-    for (add, off), cells in settings.items():
+    places = {move: mi for mi, move in enumerate(source.moves)}
+    # Each setting's cells, in the order the Rebalance walk read them
+    settings: dict[bool, list] = {}
+    for (off, bi, ki), start in starts.items():
+        settings.setdefault(off, []).append((bi, ki, start))
+    for off, cells in settings.items():
         step = max(1, math.ceil(len(cells) / _WALK_PROGRESS_LINES))
         for done, (bi, ki, start) in enumerate(cells, 1):
-            if all(getattr(visit, "failed", False) for visit in rise_takers):
+            if all(getattr(visit, "failed", False) for visit in takers):
                 # A visitor that has failed keeps nothing it is handed, so
                 # no further run is simulated for it
                 return None
             try:
-                steps = (source.trim_rise_cell(source.bands[bi], source.ks[ki], add, off, start)
+                steps = (source.move_cell(source.bands[bi], source.ks[ki], off, start)
                          if start else ())
-                for rise, by_cap in steps:
-                    ri = places[rise]
-                    # A SameTrim holds no curve: only the simulated points are cut
+                for move, by_cap in steps:
+                    mi = places[move]
+                    # A SameMove holds no curve: only the simulated points are cut
                     cut = _cut_to_axis({cap: {_ALL_VIEW: entry} for cap, entry in by_cap.items()
-                                        if not isinstance(entry, SameTrim)}, axis_end)
+                                        if not isinstance(entry, SameMove)}, axis_end)
                     entries = {cap: cut[cap][_ALL_VIEW] if cap in cut else entry
                                for cap, entry in by_cap.items()}
                     del by_cap, cut
                     for ci in caps:
                         if source.caps[ci] in entries:
-                            for visit in rise_takers:
-                                visit.trim_rise(bi, ki, ci, ri, entries[source.caps[ci]],
-                                                add=add, off=off)
+                            for visit in takers:
+                                visit.move(bi, ki, ci, mi, entries[source.caps[ci]], off=off)
                     # One minimum's points at a time: gone before the next is simulated
                     del entries
             except Exception as exc:
                 return exc
             if done % step == 0 or done == len(cells):
-                counts = source.trim_rise_stats.get((add, off), {})
-                logging.info("Dashboard: %d/%d %s read from the Trim to Kelly minimum price "
-                             "rises%s%s (%d cap points simulated, %d shared across caps, %d "
-                             "the same run as a lower minimum or none so far)",
+                counts = source.move_stats.get(off, {})
+                logging.info("Dashboard: %d/%d %s read from the Rebalance minimum price "
+                             "movements%s (%d cap points simulated, %d shared across caps, "
+                             "%d the same run as a lower minimum or none so far)",
                              done, len(cells),
                              "binding band x k cells" if off else "band x k cells",
                              " with the tier floors off" if off else "",
-                             ", adding to held pairs" if add else "",
                              counts.get("simulated", 0), counts.get("reused", 0),
                              counts.get("same", 0))
     return None
@@ -8830,7 +8543,7 @@ def _walk_trim_rise_cells(source: _GridSource, rise_takers: list,
 def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | None
                ) -> tuple[Exception | None, _GridSource]:
     """
-    Hand every scenario of a grid to each visitor: tier-on, tier-off, add-on, trim, price rises, same-title.
+    Hand every scenario of a grid to each visitor: tier-on, tier-off, rebalancing, price movements, same-title.
 
     First the tier-on cells (_walk_cells: the primary cell and cap first, so
     the primary scenario's chunk is always chunk 0, one cell alive at a
@@ -8850,25 +8563,22 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
     how generate_dashboard's header learns it. An off cell that raises
     WITHOUT an off_fallback — or whose fallback raises too — stops the walk
     like a tier-on cell (the caller falls back to the eager grid, as
-    before). Then, when the grid carries the Add to held pairs family
-    (source.add_cell) and some visitor takes it (one with an `add` method),
-    every add-on cell is walked (_walk_add_cells). One that raises costs that
-    choice alone: ONE WARNING (with the traceback), the grid returned without
-    the family, and every add-taker's add-on state dropped (`reset_add(grid)`,
-    on the visitors that define it), so every other choice keeps the chunks
-    and grids it built. Then the Trim to Kelly family (source.trim_cell) is
-    walked the same way for the visitors with a `trim` method
-    (_walk_trim_cells), after the add-on cells, so dropping either family's
-    chunks never cuts into the other's; a cell that raises costs that choice
-    alone (`reset_trim(grid)`), the minimum price rises with it. Then, when
-    the family carries minimum price rises (source.trim_rise_cell) and its
+    before). Then, when the grid carries the Rebalance family
+    (source.rebalance_cell) and some visitor takes it (one with a
+    `rebalance` method that has not failed), every rebalancing cell is
+    walked (_walk_rebalance_cells). One that raises costs that choice alone:
+    ONE WARNING (with the traceback), the grid returned without the family
+    (its minimum price movements with it), and every taker's rebalancing
+    state dropped (`reset_rebalance(grid)`, on the visitors that define it),
+    so every other choice keeps the chunks and grids it built. Then, when
+    the family carries minimum price movements (source.move_cell) and its
     cells were walked, every one of those cells is read again at each
-    minimum for the visitors with a `trim_rise` method
-    (_walk_trim_rise_cells). These are the last cells to pack a chunk, so
-    dropping what they packed cuts into nothing else: a cell that raises
-    there costs the minimum price rises alone — ONE WARNING (with the
-    traceback), the grid returned without them, and `reset_trim_rise(grid)`
-    on each taker — while the Trim to Kelly view keeps its chunks and grids.
+    minimum for the visitors with a `move` method (_walk_move_cells). These
+    are the last cells to pack a chunk, so dropping what they packed cuts
+    into nothing else: a cell that raises there costs the minimum price
+    movements alone — ONE WARNING (with the traceback), the grid returned
+    without them, and `reset_move(grid)` on each taker — while the Rebalance
+    view keeps its chunks and grids.
     Last, when some visitor shows it (one with a
     same_title method), the band- and k-independent same-title population is
     read once
@@ -8885,16 +8595,13 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
             same_title({cap: SweepPoint}) method, an off(band index,
             k index, cap index, {population: SweepPoint}) method taking the
             tier-floors-off cells, with a reset_off(grid) method dropping
-            what off() built, an add(band index, k index, cap index,
-            {population: SweepPoint}, off=bool) method taking the Add to held
-            pairs cells, with a reset_add(grid) method dropping what add()
-            built, and a trim(band index, k index, cap index, {population:
-            SweepPoint}, add=bool, off=bool) method taking the Trim to Kelly
-            cells, with a reset_trim(grid) method dropping what trim() built
-            — and, beside trim, a trim_rise(band index, k index, cap index,
-            minimum index, SweepPoint | SameTrim, add=bool, off=bool) method
-            taking each minimum price rise of those cells, with a
-            reset_trim_rise(grid) method dropping what trim_rise() built.
+            what off() built, a rebalance(band index, k index, cap index,
+            {population: SweepPoint}, off=bool) method taking the Rebalance
+            cells, with a reset_rebalance(grid) method dropping what
+            rebalance() built — and, beside it, a move(band index, k index,
+            cap index, minimum index, SweepPoint | SameMove, off=bool) method
+            taking each minimum price movement of those cells, with a
+            reset_move(grid) method dropping what move() built.
         axis_end (pd.Timestamp | None): The page's last date.
 
     Returns:
@@ -8902,9 +8609,8 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
             an off cell with no fallback to recover it) raised, which stops
             the walk, else None; and the grid walked — the source, its
             off_fallback when the tier-off size-cap sweep could not be read,
-            and without the Add to held pairs family, the Trim to Kelly
-            family, or that family's minimum price rises, when it could not
-            be simulated.
+            and without the Rebalance family, or that family's minimum price
+            movements, when it could not be simulated.
     """
     error = _walk_cells(source, visitors, axis_end)
     if error is not None:
@@ -8926,56 +8632,42 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
             error = _walk_off_cells(source, off_takers, axis_end)
             if error is not None:
                 return error, source
-    add_takers = [visit for visit in visitors if hasattr(visit, "add")]
-    if source.add_cell is not None and add_takers:
-        error = _walk_add_cells(source, add_takers, axis_end)
-        if error is not None:
-            # Costs the add-on view alone: every other choice keeps what it built
-            logging.warning("An Add to held pairs simulation failed; the filter bar's Add "
-                            "to held pairs select stays disabled", exc_info=error)
-            source = dataclasses.replace(source, add_cell=None, add_off_cell=None,
-                                         add_cap_sweep=None, add_off_cap_sweep=None)
-            for visit in add_takers:
-                reset_add = getattr(visit, "reset_add", None)
-                if reset_add is not None:
-                    reset_add(source)
     # A visitor that has already failed keeps nothing more, so its cells are
     # not simulated for it
-    trim_takers = [visit for visit in visitors
-                   if hasattr(visit, "trim") and not getattr(visit, "failed", False)]
-    # What each Trim to Kelly cell's minimum price rises start from, filled as
+    rebalance_takers = [visit for visit in visitors
+                        if hasattr(visit, "rebalance") and not getattr(visit, "failed", False)]
+    # What each Rebalance cell's minimum price movements start from, filled as
     # those cells are walked; None on a grid that carries no minimum
-    starts: dict | None = {} if source.trim_rise_cell is not None else None
-    if source.trim_cell is not None and trim_takers:
-        error = _walk_trim_cells(source, trim_takers, axis_end, starts)
+    starts: dict | None = {} if source.move_cell is not None else None
+    if source.rebalance_cell is not None and rebalance_takers:
+        error = _walk_rebalance_cells(source, rebalance_takers, axis_end, starts)
         if error is not None:
-            # Costs the Trim to Kelly view alone, as an add-on failure costs its
-            # own; the minimum price rises are part of that view and go with it
-            logging.warning("A Trim to Kelly simulation failed; the filter bar's Trim to "
-                            "Kelly select stays disabled", exc_info=error)
-            source = dataclasses.replace(source, trim_cell=None, trim_off_cell=None,
-                                         trim_sweeps={}, trim_rises=(), trim_rise_cell=None,
-                                         trim_rise_stats={})
-            for visit in trim_takers:
-                reset_trim = getattr(visit, "reset_trim", None)
-                if reset_trim is not None:
-                    reset_trim(source)
+            # Costs the Rebalance view alone; the minimum price movements are
+            # part of that view and go with it
+            logging.warning("A Rebalance simulation failed; the filter bar's Rebalance select "
+                            "stays disabled", exc_info=error)
+            source = dataclasses.replace(source, rebalance_cell=None, rebalance_off_cell=None,
+                                         rebalance_sweeps={}, moves=(), move_cell=None,
+                                         move_stats={})
+            for visit in rebalance_takers:
+                reset_rebalance = getattr(visit, "reset_rebalance", None)
+                if reset_rebalance is not None:
+                    reset_rebalance(source)
     # The last cells to pack a chunk, so dropping them cuts into nothing else.
-    # A visitor that failed while it took the Trim to Kelly cells takes none
-    rise_takers = [visit for visit in trim_takers
-                   if hasattr(visit, "trim_rise") and not getattr(visit, "failed", False)]
-    if source.trim_cell is not None and source.trim_rise_cell is not None and rise_takers:
-        error = _walk_trim_rise_cells(source, rise_takers, axis_end, starts)
+    # A visitor that failed while it took the Rebalance cells takes none
+    move_takers = [visit for visit in rebalance_takers
+                   if hasattr(visit, "move") and not getattr(visit, "failed", False)]
+    if source.rebalance_cell is not None and source.move_cell is not None and move_takers:
+        error = _walk_move_cells(source, move_takers, axis_end, starts)
         if error is not None:
-            # Costs the Min. price rise view alone: Trim to Kelly keeps what it built
-            logging.warning("A Trim to Kelly price-rise simulation failed; the filter bar's "
-                            "Min. price rise select stays disabled", exc_info=error)
-            source = dataclasses.replace(source, trim_rises=(), trim_rise_cell=None,
-                                         trim_rise_stats={})
-            for visit in rise_takers:
-                reset_trim_rise = getattr(visit, "reset_trim_rise", None)
-                if reset_trim_rise is not None:
-                    reset_trim_rise(source)
+            # Costs the Min. price movement view alone: Rebalance keeps what it built
+            logging.warning("A Rebalance price-movement simulation failed; the filter bar's "
+                            "Min. price movement select stays disabled", exc_info=error)
+            source = dataclasses.replace(source, moves=(), move_cell=None, move_stats={})
+            for visit in move_takers:
+                reset_move = getattr(visit, "reset_move", None)
+                if reset_move is not None:
+                    reset_move(source)
     takers = [visit for visit in visitors if hasattr(visit, "same_title")]
     if takers:
         # Never raises: a failure falls back to the run's own point
@@ -8996,18 +8688,17 @@ def _walk_grid(source: _GridSource, visitors: list,
     Two layers keep a failure from costing more than the filter bar did
     before the size cap existed. This one: a size-cap cell that raises while
     it is simulated costs the cap axis only — ONE WARNING (with the
-    traceback; one more each says the Add to held pairs view, and the Trim
-    to Kelly view, is lost with it, when the grid carried that family), every
-    visitor reset for the fallback grid,
+    traceback; one more says the Rebalance view is lost with it, when the
+    grid carried that family), every visitor reset for the fallback grid,
     and a second walk over the eager points alone (source.fallback), whose
     cells are lookups.
     A tier-floors-off size-cap cell that raises costs less: only the off
     view's other caps, recovered inside the walk (_walk_once, off_fallback),
     with the tier-on cap axis kept. One walk reads, in order, the tier-on
-    cells, the tier-floors-off ones, the Add to held pairs ones, the Trim to
-    Kelly ones, each Trim to Kelly cell's minimum price rises, and the
-    same-title population (_walk_once); an add-on, Trim to Kelly or
-    price-rise cell that raises costs its own view alone, inside the walk.
+    cells, the tier-floors-off ones, the Rebalance ones, each Rebalance
+    cell's minimum price movements, and the same-title population
+    (_walk_once); a Rebalance or price-movement cell that raises costs its
+    own view alone, inside the walk.
     (The size-cap sweep's same-title
     population costs less still: only the same-title rows at the other caps
     — _same_title_points.) The fallback grid carries the same
@@ -9036,10 +8727,8 @@ def _walk_grid(source: _GridSource, visitors: list,
         raise error
     logging.warning("The size-cap sweep could not be simulated; the page offers the "
                     "run's own cap only", exc_info=error)
-    if source.add_cell is not None:
-        _warn_add_on_lost_with_the_cap_sweep()
-    if source.trim_cell is not None:
-        _warn_trim_lost_with_the_cap_sweep()
+    if source.rebalance_cell is not None:
+        _warn_rebalance_lost_with_the_cap_sweep()
     fallback = source.fallback()
     for visitor in visitors:
         visitor.reset(fallback)
@@ -9854,34 +9543,27 @@ class _ChunkVisitor:
     bands the tiers never bind at with their tier-on chunk ids, so their off
     view is their tier-on run without a second chunk.
 
-    An Add to held pairs cell the walk hands to `add` is packed the same way
-    (again its own run, never the page's trades) and filed in grid_add, or in
-    grid_add_off for a binding band with the tier floors off; it shares a
+    A Rebalance cell the walk hands to `rebalance` is packed the same way
+    (again its own run, never the page's trades) and filed in
+    grids_rebalance under its Tier floors setting (off or not); it shares a
     chunk with any scenario that traded an equal list at an equal k, so a
-    cell where adding traded nothing extra costs one grid entry.
-    add_off_grid() fills a non-binding band's row with its add-on tier-on
-    chunk ids, as off_grid() does. Should an add-on cell fail to simulate,
-    reset_add() drops every chunk and row head packed for the add-on cells
-    and both add-on grids, leaving everything else as it was.
+    cell in which no pair was topped up or sold down shares the chunk of the
+    same scenario without rebalancing. rebalance_off_grid() fills a
+    non-binding band's row with its rebalancing tier-on chunk ids, as
+    off_grid() does. Should a rebalancing cell fail to simulate,
+    reset_rebalance() drops every chunk and row head packed for those cells
+    (and for their minimum price movements, packed after them) and their
+    grids, leaving everything else as it was.
 
-    A Trim to Kelly cell the walk hands to `trim` is packed the same way and
-    filed in grids_trim under (adding to held pairs, tier floors off); a
-    cell in which nothing was trimmed traded the list of the same scenario
-    without trimming, so it shares that scenario's chunk. trim_grid() and
-    trim_off_grid() read the grids as add_grid() and add_off_grid() read
-    the add-on ones, and reset_trim() drops what the trim cells packed,
-    leaving everything else as it was.
-
-    Each minimum price rise of a Trim to Kelly cell the walk hands to
-    `trim_rise` is filed in grids_trim_rise, one chunk id per minimum: a run
-    simulated at that minimum is packed the same way (sharing a chunk with
-    any equal list at an equal k), and a run that repeats another
-    (backtester.SameTrim) stores that run's id with nothing packed.
-    trim_rise_grid() and trim_rise_off_grid() read those grids for the page,
-    a cell null where every minimum shows the Trim to Kelly cell's own
-    chunk. These cells are the last the walk packs, so reset_trim_rise()
-    drops what they packed and leaves everything else, the Trim to Kelly
-    grids included, as it was.
+    Each minimum price movement of a Rebalance cell the walk hands to `move`
+    is filed in grids_move, one chunk id per minimum: a run simulated at
+    that minimum is packed the same way (sharing a chunk with any equal list
+    at an equal k), and a run that repeats another (backtester.SameMove)
+    stores that run's id with nothing packed. move_grid() and
+    move_off_grid() read those grids for the page, a cell null where every
+    minimum shows the Rebalance cell's own chunk. These cells are the last
+    the walk packs, so reset_move() drops what they packed and leaves
+    everything else, the Rebalance grids included, as it was.
 
     A failure while building a chunk is caught here: one WARNING, and the
     visitor marks itself failed and drops what it built — the page is then
@@ -9898,19 +9580,14 @@ class _ChunkVisitor:
         grid_off (list | None): The same for the tier-floors-off cells of
             the bands the tiers bind at (other rows stay None until
             off_grid() aliases them); None when the grid has no family.
-        grid_add (list | None): The same for the Add to held pairs cells
-            (tier floors on); None when the grid has no add-on view.
-        grid_add_off (list | None): The same for the add-on cells of the
-            bands the tiers bind at with the tier floors off (other rows stay
-            None until add_off_grid() aliases them); None without both views.
-        grids_trim (dict): (adding to held pairs, tier floors off) ->
-            [band][k][cap] -> chunk id or None, for the Trim to Kelly cells;
-            empty when the grid has no trim view, and without the tier-off
-            keys when it has no tier-off half.
-        grids_trim_rise (dict): The same keys -> [band][k][cap] -> None
-            until the cell's minimum price rises are read, then one chunk id
-            per minimum of source.trim_rises (None for one not read); empty
-            when the grid carries no minimum.
+        grids_rebalance (dict): Tier floors off (bool) -> [band][k][cap] ->
+            chunk id or None, for the Rebalance cells; empty when the grid
+            has no Rebalance view, and without the True key when it has no
+            tier-off half.
+        grids_move (dict): The same keys -> [band][k][cap] -> None until the
+            cell's minimum price movements are read, then one chunk id per
+            minimum of source.moves (None for one not read); empty when the
+            grid carries no minimum.
         primary_views (dict | None): The primary chunk's view key -> {"n"},
             for the bar's option counts.
         risk_free (RiskFreeRates | None): The rates every view's Sharpe and
@@ -9977,49 +9654,38 @@ class _ChunkVisitor:
         self.grid_off = (None if source.tier_binds is None else
                          [[[None] * len(source.caps) for _ in source.ks]
                           for _ in source.bands])
-        self.grid_add = (None if source.add_cell is None else
-                         [[[None] * len(source.caps) for _ in source.ks]
-                          for _ in source.bands])
-        self.grid_add_off = (None if source.add_off_cell is None else
-                             [[[None] * len(source.caps) for _ in source.ks]
-                              for _ in source.bands])
-        # The Trim to Kelly grids, by (adding to held pairs, tier floors off):
-        # none without the view, and no tier-off ones without that half
-        self.grids_trim: dict[tuple[bool, bool], list] = (
-            {} if source.trim_cell is None else
-            {(add, off): [[[None] * len(source.caps) for _ in source.ks]
-                          for _ in source.bands]
-             for add in (False, True) for off in (False, True)
-             if not off or source.trim_off_cell is not None})
-        # Each Trim to Kelly cell's chunk id at every minimum price rise, under
+        # The Rebalance grids, by Tier floors setting (off or not): none
+        # without the view, and no tier-off one without that half
+        self.grids_rebalance: dict[bool, list] = (
+            {} if source.rebalance_cell is None else
+            {off: [[[None] * len(source.caps) for _ in source.ks] for _ in source.bands]
+             for off in (False, True) if not off or source.rebalance_off_cell is not None})
+        # Each Rebalance cell's chunk id at every minimum price movement, under
         # the same keys: a cell stays None until its minimums are read. Empty
         # on a grid that carries no minimum
-        self.grids_trim_rise: dict[tuple[bool, bool], list] = (
-            {} if source.trim_rise_cell is None else
+        self.grids_move: dict[bool, list] = (
+            {} if source.move_cell is None else
             {key: [[[None] * len(source.caps) for _ in source.ks] for _ in source.bands]
-             for key in self.grids_trim})
+             for key in self.grids_rebalance})
         self.primary_views: dict | None = None
         self.failed = False
         # (phase, band, k) of the cell whose list keys are memoised: a cell's
         # caps at or above its sharing floor share one trade list, so its key is
-        # computed once. The phase ("on", "off", "add" or "add_off") is part
-        # of it: another phase's lists are new objects, whose ids may reuse
-        # those of the cell walked last. The Trim to Kelly cells' phases are
-        # "trim", "trim_off", "trim_add" and "trim_add_off", and each minimum
-        # price rise of such a cell has a phase of its own ("trim_rise<i>"
-        # before the same endings), since one minimum's lists are gone before
-        # the next minimum's are made
+        # computed once. The phase ("on", "off", "rebalance" or
+        # "rebalance_off") is part of it: another phase's lists are new
+        # objects, whose ids may reuse those of the cell walked last. Each
+        # minimum price movement of a Rebalance cell has a phase of its own
+        # ("move<i>", or "move<i>_off"), since one minimum's lists are gone
+        # before the next minimum's are made
         self._cell: tuple[str, int, int] | None = None
         self._keys: dict[tuple[int, float | None], str] = {}
         # (chunks, row heads) held when the first off cell was packed, so
         # reset_off can drop exactly what the off cells added
         self._off_mark: tuple[int, int] | None = None
-        # The same for the first Add to held pairs cell, for reset_add
-        self._add_mark: tuple[int, int] | None = None
-        # ... and for the first Trim to Kelly cell, for reset_trim
-        self._trim_mark: tuple[int, int] | None = None
-        # ... and for the first minimum price rise packed, for reset_trim_rise
-        self._trim_rise_mark: tuple[int, int] | None = None
+        # The same for the first Rebalance cell, for reset_rebalance
+        self._rebalance_mark: tuple[int, int] | None = None
+        # ... and for the first minimum price movement packed, for reset_move
+        self._move_mark: tuple[int, int] | None = None
         # One item per packed list whose tags the page cannot combine into a
         # mix (_list_payload's mix_gaps): generate_dashboard says so once
         self.mix_gaps: list = []
@@ -10060,12 +9726,11 @@ class _ChunkVisitor:
             k (float | None): The k the list is priced at.
             listed (list): The trade list.
             phase (str): Keyword-only. Which kind of cell it is: "on" (a
-                tier-on cell), "off" (tier floors off), "add" (adding to
-                held pairs), "add_off" (both), one of the four Trim to
-                Kelly kinds ("trim", "trim_off", "trim_add", "trim_add_off"),
-                or one of those at one minimum price rise ("trim_rise<i>"
-                with the same endings); each is a separate memo from the
-                others' cell of the same band and k. "on" (default).
+                tier-on cell), "off" (tier floors off), "rebalance" (held
+                pairs rebalanced), "rebalance_off" (both), or a Rebalance
+                cell at one minimum price movement ("move<i>", or
+                "move<i>_off"); each is a separate memo from the others'
+                cell of the same band and k. "on" (default).
 
         Returns:
             str: _list_key(k, listed).
@@ -10146,106 +9811,14 @@ class _ChunkVisitor:
         return [[list(row) for row in (self.grid_off[bi] if binds else self.grid[bi])]
                 for bi, binds in enumerate(self.source.tier_binds)]
 
-    def add(self, bi: int, ki: int, ci: int, pops: dict, *, off: bool = False) -> None:
+    def rebalance(self, bi: int, ki: int, ci: int, pops: dict, *, off: bool = False) -> None:
         """
-        Build (or share) the chunk of one Add to held pairs scenario's "all" point.
+        Build (or share) the chunk of one Rebalance scenario's "all" point.
 
         Its own run, priced at the cell's k (never the page's trades); it
         shares a chunk with any scenario that traded an equal list at an
-        equal k, so a cell where adding traded nothing extra costs one grid
-        entry.
-
-        Args:
-            bi (int): Band index.
-            ki (int): k index.
-            ci (int): Cap index.
-            pops (dict): Population -> SweepPoint; a scenario with no "all"
-                point stays a null cell of the add-on grid.
-            off (bool): Keyword-only. Whether the cell is a binding band's
-                with the tier floors off (filed in grid_add_off). False
-                (default).
-        """
-        point = pops.get(_ALL_VIEW)
-        grid = self.grid_add_off if off else self.grid_add
-        if point is None or self.failed or grid is None:
-            return
-        if self._add_mark is None:
-            self._add_mark = (len(self.chunks), len(self.heads.items))
-        try:
-            grid[bi][ki][ci] = self._chunk(bi, ki, self.source.ks[ki], point.trades,
-                                           point.equity_df, False,
-                                           phase="add_off" if off else "add")
-        except Exception:
-            self._fail()
-
-    def reset_add(self, source: _GridSource) -> None:
-        """
-        Drop every Add to held pairs chunk and both add-on grids.
-
-        Every chunk and row head packed since the first add-on cell is dropped
-        (with its dedup key), so the page ships none an add-on cell no longer
-        needs; the chunks before that mark and the base and tier-floors-off
-        grids are kept, as are the labels.
-
-        Args:
-            source (_GridSource): The grid walked from here on (without the
-                add-on family).
-        """
-        self.source = source
-        if self._add_mark is not None and not self.failed:
-            n_chunks, n_heads = self._add_mark
-            del self.chunks[n_chunks:]
-            self.seen = {key: cid for key, cid in self.seen.items() if cid < n_chunks}
-            self.heads.truncate(n_heads)
-        self._add_mark = None
-        self.grid_add = self.grid_add_off = None
-        self._cell, self._keys = None, {}
-
-    def add_grid(self) -> list | None:
-        """
-        The Add to held pairs grid (tier floors on).
-
-        Returns:
-            list | None: [band][k][cap] -> chunk id or None; None when the
-                grid has no add-on view, none of its cells were simulated
-                (an all-empty grid is never shown as a view) or a chunk
-                failed.
-        """
-        if self.grid_add is None or self.failed:
-            return None
-        if all(cid is None for band in self.grid_add for row in band for cid in row):
-            return None
-        return self.grid_add
-
-    def add_off_grid(self) -> list | None:
-        """
-        The Add to held pairs grid with the tier floors off.
-
-        A binding band's row is its own add-on-with-the-tiers-off chunks (None
-        where the family has no point, or when the grid has no twin family),
-        every other band's its add-on tier-on row — its off view IS its run,
-        as off_grid() has it.
-
-        Returns:
-            list | None: [band][k][cap] -> chunk id or None; None without an
-                add-on view or without a tier-floors-off view to pair it with.
-        """
-        if self.add_grid() is None or self.source.tier_binds is None:
-            return None
-        blank = [[None] * len(self.source.caps) for _ in self.source.ks]
-        return [[list(row) for row in
-                 ((self.grid_add_off[bi] if self.grid_add_off is not None else blank)
-                  if binds else self.grid_add[bi])]
-                for bi, binds in enumerate(self.source.tier_binds)]
-
-    def trim(self, bi: int, ki: int, ci: int, pops: dict, *, add: bool = False,
-             off: bool = False) -> None:
-        """
-        Build (or share) the chunk of one Trim to Kelly scenario's "all" point.
-
-        Its own run, priced at the cell's k (never the page's trades); it
-        shares a chunk with any scenario that traded an equal list at an
-        equal k, so a cell in which nothing was trimmed costs one grid entry.
+        equal k, so a cell in which no pair was topped up or sold down costs
+        one grid entry.
 
         Args:
             bi (int): Band index.
@@ -10253,31 +9826,29 @@ class _ChunkVisitor:
             ci (int): Cap index.
             pops (dict): Population -> SweepPoint; a scenario with no "all"
                 point stays a null cell of its grid.
-            add (bool): Keyword-only. Whether the run also adds to held
-                pairs. False (default).
             off (bool): Keyword-only. Whether the cell is a binding band's
                 with the tier floors off. False (default).
         """
         point = pops.get(_ALL_VIEW)
-        grid = self.grids_trim.get((add, off))
+        grid = self.grids_rebalance.get(off)
         if point is None or self.failed or grid is None:
             return
-        if self._trim_mark is None:
-            self._trim_mark = (len(self.chunks), len(self.heads.items))
+        if self._rebalance_mark is None:
+            self._rebalance_mark = (len(self.chunks), len(self.heads.items))
         try:
-            phase = "trim" + ("_add" if add else "") + ("_off" if off else "")
             grid[bi][ki][ci] = self._chunk(bi, ki, self.source.ks[ki], point.trades,
-                                           point.equity_df, False, phase=phase)
+                                           point.equity_df, False,
+                                           phase="rebalance_off" if off else "rebalance")
         except Exception:
             self._fail()
 
-    def reset_trim(self, source: _GridSource) -> None:
+    def reset_rebalance(self, source: _GridSource) -> None:
         """
-        Drop every Trim to Kelly chunk and grid.
+        Drop every Rebalance chunk and grid.
 
-        Every chunk and row head packed since the first Trim to Kelly cell is
+        Every chunk and row head packed since the first Rebalance cell is
         dropped (with its dedup key); those cells are walked after every
-        other kind but their own minimum price rises, which go with them
+        other kind but their own minimum price movements, which go with them
         (their chunks come later still, and their grids are dropped too), so
         the chunks before that mark and every other grid are kept, as are
         the labels.
@@ -10287,214 +9858,198 @@ class _ChunkVisitor:
                 family).
         """
         self.source = source
-        # The Trim to Kelly cells are packed before their minimum price rises,
+        # The Rebalance cells are packed before their minimum price movements,
         # so the earlier of the two marks covers both
-        mark = self._trim_mark if self._trim_mark is not None else self._trim_rise_mark
+        mark = self._rebalance_mark if self._rebalance_mark is not None else self._move_mark
         if mark is not None and not self.failed:
             n_chunks, n_heads = mark
             del self.chunks[n_chunks:]
             self.seen = {key: cid for key, cid in self.seen.items() if cid < n_chunks}
             self.heads.truncate(n_heads)
-        self._trim_mark = self._trim_rise_mark = None
-        self.grids_trim, self.grids_trim_rise = {}, {}
+        self._rebalance_mark = self._move_mark = None
+        self.grids_rebalance, self.grids_move = {}, {}
         self._cell, self._keys = None, {}
 
-    def trim_grid(self, add: bool = False) -> list | None:
+    def rebalance_grid(self) -> list | None:
         """
-        The Trim to Kelly grid with the tier floors on, adding to held pairs or not.
-
-        Args:
-            add (bool): Whether the runs also add to held pairs. False (default).
+        The Rebalance grid with the tier floors on.
 
         Returns:
             list | None: [band][k][cap] -> chunk id or None; None when the
-                grid has no such view, none of its cells were simulated (an
-                all-empty grid is never shown as a view) or a chunk failed.
+                grid has no Rebalance view, none of its cells were simulated
+                (an all-empty grid is never shown as a view) or a chunk
+                failed.
         """
-        grid = self.grids_trim.get((add, False))
+        grid = self.grids_rebalance.get(False)
         if grid is None or self.failed:
             return None
         if all(cid is None for band in grid for row in band for cid in row):
             return None
         return grid
 
-    def trim_off_grid(self, add: bool = False) -> list | None:
+    def rebalance_off_grid(self) -> list | None:
         """
-        The Trim to Kelly grid with the tier floors off, adding to held pairs or not.
+        The Rebalance grid with the tier floors off.
 
         A binding band's row is its own tier-floors-off chunks (None where
         the family has no point, or when the grid has no tier-off half),
         every other band's its tier-on row — its off view IS its run, as
         off_grid() has it.
 
-        Args:
-            add (bool): Whether the runs also add to held pairs. False (default).
-
         Returns:
             list | None: [band][k][cap] -> chunk id or None; None without the
-                tier-on view of the same setting or without a tier-floors-off
-                view to pair it with.
+                tier-on Rebalance view or without a tier-floors-off view to
+                pair it with.
         """
-        on = self.trim_grid(add)
+        on = self.rebalance_grid()
         if on is None or self.source.tier_binds is None:
             return None
-        own = self.grids_trim.get((add, True))
+        own = self.grids_rebalance.get(True)
         blank = [[None] * len(self.source.caps) for _ in self.source.ks]
         return [[list(row) for row in ((own[bi] if own is not None else blank)
                                        if binds else on[bi])]
                 for bi, binds in enumerate(self.source.tier_binds)]
 
-    def trim_rise(self, bi: int, ki: int, ci: int, ri: int, entry: SweepPoint | SameTrim, *,
-                  add: bool = False, off: bool = False) -> None:
+    def move(self, bi: int, ki: int, ci: int, mi: int, entry: SweepPoint | SameMove, *,
+             off: bool = False) -> None:
         """
-        Keep one minimum price rise of one Trim to Kelly scenario: its own chunk, or the chunk of the run it repeats.
+        Keep one minimum price movement of one Rebalance scenario: its own chunk, or the chunk of the run it repeats.
 
         A run simulated at the minimum is packed like any scenario (priced
         at the cell's k, sharing a chunk with any equal list at an equal k).
-        A SameTrim is a run the page already has, so its chunk id is copied
-        and nothing is packed: the Trim to Kelly cell's own for
-        SameTrim(None), or the id this cell stored at the smaller minimum it
-        names.
+        A SameMove is a run the page already has, so its chunk id is copied
+        and nothing is packed: the Rebalance cell's own for SameMove(None),
+        or the id this cell stored at the smaller minimum it names.
 
         Args:
             bi (int): Band index.
             ki (int): k index.
             ci (int): Cap index.
-            ri (int): The minimum's index in source.trim_rises.
-            entry (SweepPoint | SameTrim): The "all" point of the run
-                trimming only after that rise, or the run it repeats.
-            add (bool): Keyword-only. Whether the run also adds to held
-                pairs. False (default).
+            mi (int): The minimum's index in source.moves.
+            entry (SweepPoint | SameMove): The "all" point of the run
+                rebalancing only after that move, or the run it repeats.
             off (bool): Keyword-only. Whether the cell is a binding band's
                 with the tier floors off. False (default).
 
         Raises:
-            ValueError: If a SameTrim names a minimum the grid does not
-                carry (never from backtester.TrimSweep.rise_grid). The walk
-                reads it as a cell that cannot be read.
+            ValueError: If a SameMove names a minimum the grid does not
+                carry (never from backtester.RebalanceSweep.move_grid). The
+                walk reads it as a cell that cannot be read.
         """
-        grid = self.grids_trim_rise.get((add, off))
+        grid = self.grids_move.get(off)
         if self.failed or grid is None:
             return
         cell = grid[bi][ki][ci]
         if cell is None:
-            cell = grid[bi][ki][ci] = [None] * len(self.source.trim_rises)
-        if isinstance(entry, SameTrim):
-            # The run with no minimum is the Trim to Kelly cell itself
-            cell[ri] = (self.grids_trim[(add, off)][bi][ki][ci] if entry.min_rise is None
-                        else cell[self.source.trim_rises.index(entry.min_rise)])
+            cell = grid[bi][ki][ci] = [None] * len(self.source.moves)
+        if isinstance(entry, SameMove):
+            # The run with no minimum is the Rebalance cell itself
+            cell[mi] = (self.grids_rebalance[off][bi][ki][ci] if entry.min_move is None
+                        else cell[self.source.moves.index(entry.min_move)])
             return
-        if self._trim_rise_mark is None:
-            self._trim_rise_mark = (len(self.chunks), len(self.heads.items))
+        if self._move_mark is None:
+            self._move_mark = (len(self.chunks), len(self.heads.items))
         try:
             # The minimum is part of the phase, so a key memoised for another
             # minimum's list (an object since freed) is never read for this one
-            phase = f"trim_rise{ri}" + ("_add" if add else "") + ("_off" if off else "")
-            cell[ri] = self._chunk(bi, ki, self.source.ks[ki], entry.trades,
+            phase = f"move{mi}" + ("_off" if off else "")
+            cell[mi] = self._chunk(bi, ki, self.source.ks[ki], entry.trades,
                                    entry.equity_df, False, phase=phase)
         except Exception:
             self._fail()
 
-    def reset_trim_rise(self, source: _GridSource) -> None:
+    def reset_move(self, source: _GridSource) -> None:
         """
-        Drop every minimum-price-rise chunk and grid.
+        Drop every minimum-price-movement chunk and grid.
 
-        Every chunk and row head packed since the first minimum price rise
-        is dropped (with its dedup key). Those are the last cells the walk
-        packs, so every chunk before that mark and every other grid — the
-        Trim to Kelly ones included — are kept, as are the labels.
+        Every chunk and row head packed since the first minimum price
+        movement is dropped (with its dedup key). Those are the last cells
+        the walk packs, so every chunk before that mark and every other grid
+        — the Rebalance ones included — are kept, as are the labels.
 
         Args:
             source (_GridSource): The grid walked from here on (without the
                 minimums).
         """
         self.source = source
-        if self._trim_rise_mark is not None and not self.failed:
-            n_chunks, n_heads = self._trim_rise_mark
+        if self._move_mark is not None and not self.failed:
+            n_chunks, n_heads = self._move_mark
             del self.chunks[n_chunks:]
             self.seen = {key: cid for key, cid in self.seen.items() if cid < n_chunks}
             self.heads.truncate(n_heads)
-        self._trim_rise_mark = None
-        self.grids_trim_rise = {}
+        self._move_mark = None
+        self.grids_move = {}
         self._cell, self._keys = None, {}
 
     @staticmethod
-    def _rise_ids(cell: list | None, own: int | None) -> list | None:
+    def _move_ids(cell: list | None, own: int | None) -> list | None:
         """
-        One scenario's chunk ids at every minimum price rise, as the page reads them.
+        One scenario's chunk ids at every minimum price movement, as the page reads them.
 
         Args:
-            cell (list | None): The ids trim_rise stored, one per minimum;
-                None for a cell whose minimums were never read.
-            own (int | None): The chunk id of the same scenario's Trim to
-                Kelly cell.
+            cell (list | None): The ids move() stored, one per minimum; None
+                for a cell whose minimums were never read.
+            own (int | None): The chunk id of the same scenario's Rebalance
+                cell.
 
         Returns:
             list | None: None when the minimums were never read, or every
-                one of them shows the Trim to Kelly cell's own chunk (the
-                page then reads that cell at any minimum); else a copy of
-                the ids.
+                one of them shows the Rebalance cell's own chunk (the page
+                then reads that cell at any minimum); else a copy of the ids.
         """
         if cell is None or all(cid == own for cid in cell):
             return None
         return list(cell)
 
-    def trim_rise_grid(self, add: bool = False) -> list | None:
+    def move_grid(self) -> list | None:
         """
-        The minimum-price-rise grid with the tier floors on, adding to held pairs or not.
-
-        Args:
-            add (bool): Whether the runs also add to held pairs. False (default).
+        The minimum-price-movement grid with the tier floors on.
 
         Returns:
             list | None: [band][k][cap] -> None where every minimum shows
-                the Trim to Kelly cell itself (or the cell was never read),
-                else one chunk id per minimum of source.trim_rises. A grid
-                of nothing but None is still a view: no minimum changed any
-                run. None when the grid carries no minimum, their cells
-                could not be read, a chunk failed, or there is no Trim to
-                Kelly grid of the same setting to read them beside.
+                the Rebalance cell itself (or the cell was never read), else
+                one chunk id per minimum of source.moves. A grid of nothing
+                but None is still a view: no minimum changed any run. None
+                when the grid carries no minimum, their cells could not be
+                read, a chunk failed, or there is no Rebalance grid to read
+                them beside.
         """
-        on = self.trim_grid(add)
-        grid = self.grids_trim_rise.get((add, False))
+        on = self.rebalance_grid()
+        grid = self.grids_move.get(False)
         if on is None or grid is None:
             return None
-        return [[[self._rise_ids(cell, own) for cell, own in zip(cells, owns, strict=True)]
+        return [[[self._move_ids(cell, own) for cell, own in zip(cells, owns, strict=True)]
                  for cells, owns in zip(band, own_band, strict=True)]
                 for band, own_band in zip(grid, on, strict=True)]
 
-    def trim_rise_off_grid(self, add: bool = False) -> list | None:
+    def move_off_grid(self) -> list | None:
         """
-        The minimum-price-rise grid with the tier floors off, adding to held pairs or not.
+        The minimum-price-movement grid with the tier floors off.
 
         A binding band's row is its own tier-floors-off cells (None where
         the grid has no tier-off half), every other band's its tier-on row —
-        its off view IS its run, as trim_off_grid() has it.
-
-        Args:
-            add (bool): Whether the runs also add to held pairs. False (default).
+        its off view IS its run, as rebalance_off_grid() has it.
 
         Returns:
             list | None: [band][k][cap] -> None or one chunk id per minimum,
-                as trim_rise_grid() gives them; None without the tier-on
-                grid of the same setting or without a tier-floors-off view
-                to pair it with.
+                as move_grid() gives them; None without the tier-on grid or
+                without a tier-floors-off view to pair it with.
         """
-        on = self.trim_rise_grid(add)
+        on = self.move_grid()
         if on is None or self.source.tier_binds is None:
             return None
-        own, own_trim = self.grids_trim_rise.get((add, True)), self.grids_trim.get((add, True))
+        own, own_rebalance = self.grids_move.get(True), self.grids_rebalance.get(True)
         blank = [[None] * len(self.source.caps) for _ in self.source.ks]
         rows = []
         for bi, binds in enumerate(self.source.tier_binds):
             if not binds:
                 rows.append(on[bi])
-            elif own is None or own_trim is None:
+            elif own is None or own_rebalance is None:
                 rows.append([list(row) for row in blank])
             else:
-                rows.append([[self._rise_ids(cell, cid)
+                rows.append([[self._move_ids(cell, cid)
                               for cell, cid in zip(cells, cids, strict=True)]
-                             for cells, cids in zip(own[bi], own_trim[bi], strict=True)])
+                             for cells, cids in zip(own[bi], own_rebalance[bi], strict=True)])
         return rows
 
     def _chunk(self, bi: int, ki: int, k: float | None, listed: list,
@@ -10600,7 +10155,8 @@ def _build_filter_grid(
 # has held that share of its potential profit for TAKE_PROFIT_HOLD_DAYS days in
 # a row — and, by the Min. days to maturity choice, only while at least that
 # many days remain before its last market stops trading. It covers every
-# scenario the bar shows. Its cells are simulated after the walk, in worker
+# scenario the bar shows with Rebalance no (the bar sets Sell to "no selling"
+# and shuts it while Rebalance is yes). Its cells are simulated after the walk, in worker
 # processes (_build_sell_grid: one task per spread band and Tier floors
 # setting), and each new trade list is written as a sidecar chunk file beside
 # the page, which the page's script loads through a <script src> element when
@@ -10636,9 +10192,9 @@ class _SellTask:
         tier_floors (bool): The band's runs as simulated (True) or with the
             deadline-gap tier floors off (False, a band they bind at).
         family: The backtester.SellSweep narrowed to this band.
-        cells (frozenset): (adds to held pairs, k index, cap index) of every
-            cell to cover: the cells at this band that the page shows
-            (its non-null chunk ids).
+        cells (frozenset): (k index, cap index) of every cell to cover: the
+            cells at this band that the page shows with Rebalance no (its
+            non-null chunk ids).
         ks (tuple): The page's k axis.
         caps (tuple): The page's size-cap axis.
         axis (pd.DatetimeIndex): The page's date axis.
@@ -10702,10 +10258,10 @@ class _SellResult:
         keys (tuple[str, ...]): Every distinct list key (_list_key) the
             task's rows name, in the order the task first met each: the keys
             of the page's own chunks and of the files this task wrote.
-        rows (dict): (adds to held pairs, k index, cap index) of every cell
-            the task covered -> an array("i") with one entry per (level,
-            minimum of days), level by level and each level's minimums in
-            order (the order of the Sell blocks' rows): the index in keys of
+        rows (dict): (k index, cap index) of every cell the task covered ->
+            an array("i") with one entry per (level, minimum of days), level
+            by level and each level's minimums in order (the order of the
+            Sell blocks' rows): the index in keys of
             that sell run's list key, or -1 where that setting sells nothing
             (no position of the cell's run without selling reaches the level
             with that many days left, backtester._sale_reach), so it is the
@@ -10738,22 +10294,21 @@ class _SellGrid:
     The Sell view's data: the packed blocks the page carries, and the index its base block holds.
 
     The chunk ids of every (sell level, minimum of days) of every scenario
-    are far too many to put in the base block, which the page inflates on
-    load. They are split into one packed block per task (one spread band
-    under one Tier floors setting), which the page's script inflates only
-    when a reader first chooses a level at that band; the base block carries
-    only which block holds which band (index).
+    without adding or trimming are far too many to put in the base block,
+    which the page inflates on load. They are split into one packed block per
+    task (one spread band under one Tier floors setting), which the page's
+    script inflates only when a reader first chooses a level at that band;
+    the base block carries only which block holds which band (index).
 
     Attributes:
         blocks (list[str]): One packed <script> element per task that
             finished, in task order, its id "dash-sell-<i>" for the i-th
-            (_packed_json_script). Each holds [Add to held pairs: 0 off,
-            1 on] -> null for a view the page does not have, else [k][cap]
-            -> null for a cell not covered (the page shows no scenario
-            there), else one entry per (level, minimum of days), level by
-            level and each level's minimums in order: the chunk id of that
-            sell run, or -1 for the scenario's own chunk (it sells nothing:
-            the run without selling).
+            (_packed_json_script). Each holds [k][cap] -> null for a cell
+            not covered (the page shows no scenario there), else one entry
+            per (level, minimum of days), level by level and each level's
+            minimums in order: the chunk id of that sell run, or -1 for the
+            scenario's own chunk (it sells nothing: the run without
+            selling).
         index (list | None): [Tier floors: 0 on, 1 off][band] -> the number
             of the block holding that band's cells, or None where there is
             none (its task failed, or the page has no such view); with the
@@ -10917,10 +10472,11 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
     """
     Read every (sell level, minimum of days) of one task's cells and write each new trade list's chunk.
 
-    For each k and each Add to held pairs setting with a cell to cover, the
-    narrowed family's sold_grid (backtester.SellSweep) yields every (level,
-    minimum of days) at every cap of those cells, simulating only the runs
-    that differ: per cap, a simulated point, a SameSale naming an earlier
+    For each k with a cell to cover, the narrowed family's sold_grid
+    (backtester.SellSweep, whose runs neither add to held pairs nor trim)
+    yields every (level, minimum of days) at every cap of those cells,
+    simulating only the runs that differ: per cap, a simulated point, a
+    SameSale naming an earlier
     (level, minimum) of the same cap that is exactly the same run, or None
     where the setting sells nothing — the run without selling, so the page
     shows its own chunk there. Each point's curve is cut to the page's axis
@@ -10968,55 +10524,54 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
     # Every distinct key the rows name, and each one's place in that list
     keys: list[str] = []
     key_place: dict[str, int] = {}
-    rows: dict[tuple[bool, int, int], array] = {}
+    rows: dict[tuple[int, int], array] = {}
     written: list[str] = []
     done: set[str] = set()
     # Files written whose tags the page cannot combine into a mix
     mix_gaps = 0
     for ki, k in enumerate(task.ks):
-        for add in (False, True):
-            wanted = [ci for ci in range(len(task.caps)) if (add, ki, ci) in task.cells]
-            if not wanted:
-                continue
-            # One row per cell, every setting filled in as sold_grid yields it
-            cell_rows = {ci: array("i", [-1]) * width for ci in wanted}
-            # backtester.SellSweep.sold_grid: only the runs that differ, simulated
-            grid = family.sold_grid(band, k, tier_floors=task.tier_floors, add_to_held=add,
-                                    caps=[task.caps[ci] for ci in wanted], stats=stats)
-            for level, min_days, by_cap in grid:
-                place = level_index[level] * n_days + days_index[min_days]
-                cut = _cut_to_axis({cap: {_ALL_VIEW: cell} for cap, cell in by_cap.items()
-                                    if cell is not None and not isinstance(cell, SameSale)},
-                                   axis_end)
-                # One key per trade list: caps at or above a sharing floor share one
-                listed: dict[int, str] = {}
-                for ci in wanted:
-                    cell = by_cap[task.caps[ci]]
-                    if cell is None:
-                        # Sells nothing: the run without selling
-                        continue
-                    if isinstance(cell, SameSale):
-                        # Exactly the run read at that earlier setting, same cap
-                        cell_rows[ci][place] = cell_rows[ci][
-                            level_index[cell.level] * n_days + days_index[cell.min_days]]
-                        continue
-                    point = cut[task.caps[ci]][_ALL_VIEW]
-                    key = listed.get(id(point.trades))
-                    if key is None:
-                        key = listed[id(point.trades)] = _list_key(k, point.trades)
-                    if key not in task.inline_keys and key not in done:
-                        if not _write_sell_chunk(task, key, k, point):
-                            mix_gaps += 1
-                        done.add(key)
-                        written.append(key)
-                    if key not in key_place:
-                        key_place[key] = len(keys)
-                        keys.append(key)
-                    cell_rows[ci][place] = key_place[key]
-                # Nothing of this yield is kept while the next is simulated
-                by_cap = cut = listed = cell = point = None
-            for ci, row in cell_rows.items():
-                rows[(add, ki, ci)] = row
+        wanted = [ci for ci in range(len(task.caps)) if (ki, ci) in task.cells]
+        if not wanted:
+            continue
+        # One row per cell, every setting filled in as sold_grid yields it
+        cell_rows = {ci: array("i", [-1]) * width for ci in wanted}
+        # backtester.SellSweep.sold_grid: only the runs that differ, simulated
+        grid = family.sold_grid(band, k, tier_floors=task.tier_floors,
+                                caps=[task.caps[ci] for ci in wanted], stats=stats)
+        for level, min_days, by_cap in grid:
+            place = level_index[level] * n_days + days_index[min_days]
+            cut = _cut_to_axis({cap: {_ALL_VIEW: cell} for cap, cell in by_cap.items()
+                                if cell is not None and not isinstance(cell, SameSale)},
+                               axis_end)
+            # One key per trade list: caps at or above a sharing floor share one
+            listed: dict[int, str] = {}
+            for ci in wanted:
+                cell = by_cap[task.caps[ci]]
+                if cell is None:
+                    # Sells nothing: the run without selling
+                    continue
+                if isinstance(cell, SameSale):
+                    # Exactly the run read at that earlier setting, same cap
+                    cell_rows[ci][place] = cell_rows[ci][
+                        level_index[cell.level] * n_days + days_index[cell.min_days]]
+                    continue
+                point = cut[task.caps[ci]][_ALL_VIEW]
+                key = listed.get(id(point.trades))
+                if key is None:
+                    key = listed[id(point.trades)] = _list_key(k, point.trades)
+                if key not in task.inline_keys and key not in done:
+                    if not _write_sell_chunk(task, key, k, point):
+                        mix_gaps += 1
+                    done.add(key)
+                    written.append(key)
+                if key not in key_place:
+                    key_place[key] = len(keys)
+                    keys.append(key)
+                cell_rows[ci][place] = key_place[key]
+            # Nothing of this yield is kept while the next is simulated
+            by_cap = cut = listed = cell = point = None
+        for ci, row in cell_rows.items():
+            rows[(ki, ci)] = row
     return _SellResult(task.index, tuple(keys), rows, tuple(written), stats["simulated"],
                        stats["reused"], stats["same"], stats["pruned"], mix_gaps)
 
@@ -11029,14 +10584,14 @@ def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: da
     Split the Sell select's work into one task per spread band and Tier floors setting.
 
     A band's tier-on task covers its cells the page shows with the tier floors
-    on — adding to held pairs off (the base grid) and, with the Add to held
-    pairs view, on. A band the tiers bind at gets a tier-off task too, over its
-    own tier-floors-off cells (its run with them off, and adding on in the
-    tier-off add-on grid when the page has one). A band the tiers never bind
-    at has no tier-off task: its off view is its tier-on run, so the sell
-    grid aliases those rows as the page's base grid does. A band the family
-    holds no tier-off entries for is left out with one WARNING (never in
-    production, where the family's bands are the binding bands).
+    on and Rebalance no (the base grid; the bar shuts Sell while Rebalance is
+    yes). A band the tiers bind at gets a tier-off task
+    too, over its own tier-floors-off cells (its run with them off). A band
+    the tiers never bind at has no tier-off task: its off view is its tier-on
+    run, so the sell grid aliases those rows as the page's base grid does. A
+    band the family holds no tier-off entries for is left out with one
+    WARNING (never in production, where the family's bands are the binding
+    bands).
 
     Args:
         walked (_GridSource): The grid the walk walked; its sell is not None.
@@ -11051,7 +10606,6 @@ def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: da
         list[_SellTask]: The tasks, tier-on bands first, in band order.
     """
     sell = walked.sell
-    add_grid = chunker.add_grid() if walked.add_cell is not None else None
     off_view = walked.tier_binds is not None and chunker.off_grid() is not None
     common = {"ks": tuple(walked.ks), "caps": tuple(walked.caps), "axis": chunker.axis,
               "start_date": start_date, "initial_balance": initial_balance,
@@ -11065,7 +10619,7 @@ def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: da
               "confirmed_fee_multipliers": _config.CONFIRMED_FEE_MULTIPLIERS}
     tasks: list[_SellTask] = []
 
-    def add(bi: int, band, tier_floors: bool, rows: dict) -> None:
+    def add(bi: int, band, tier_floors: bool, band_rows: list) -> None:
         """
         Queue one band's task, when it has a cell to cover.
 
@@ -11073,12 +10627,11 @@ def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: da
             bi (int): The band's index.
             band: The band.
             tier_floors (bool): The Tier floors setting.
-            rows (dict): Adds to held pairs (bool) -> that grid's [k][cap]
-                rows at this band, or None without that view.
+            band_rows (list): The base grid's [k][cap] chunk ids at this band
+                under that Tier floors setting (None for a cell the page
+                shows no scenario at).
         """
-        cells = frozenset((adds, ki, ci) for adds, band_rows in rows.items()
-                          if band_rows is not None
-                          for ki, row in enumerate(band_rows)
+        cells = frozenset((ki, ci) for ki, row in enumerate(band_rows)
                           for ci, cid in enumerate(row) if cid is not None)
         if cells:
             tasks.append(_SellTask(
@@ -11087,10 +10640,8 @@ def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: da
                 family=sell.for_band(band, tier_floors=tier_floors), cells=cells, **common))
 
     for bi, band in enumerate(walked.bands):
-        add(bi, band, True, {False: chunker.grid[bi],
-                             True: add_grid[bi] if add_grid is not None else None})
+        add(bi, band, True, chunker.grid[bi])
     if off_view:
-        own_add_off = chunker.grid_add_off if add_grid is not None else None
         for bi, band in enumerate(walked.bands):
             if not walked.tier_binds[bi]:
                 continue
@@ -11099,8 +10650,7 @@ def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: da
                                 "%s; with the tier floors off, selling is not shown there",
                                 _band_label(band))
                 continue
-            add(bi, band, False, {False: chunker.grid_off[bi],
-                                  True: own_add_off[bi] if own_add_off is not None else None})
+            add(bi, band, False, chunker.grid_off[bi])
     return tasks
 
 
@@ -11255,12 +10805,7 @@ def _build_sell_grid(
             for n in sell.min_days]
     if not results:
         return _SellGrid(blocks=[], index=None, levels=levels, days=days, sidecars=0)
-    add_grid = chunker.add_grid() if walked.add_cell is not None else None
     off_grid = chunker.off_grid() if walked.tier_binds is not None else None
-    # Which base views the page has: (Tier floors 0 on / 1 off, adding 0 off / 1 on)
-    bases = {(0, 0): chunker.grid, (0, 1): add_grid, (1, 0): off_grid,
-             (1, 1): chunker.add_off_grid() if (off_grid is not None and add_grid is not None)
-             else None}
     index: list = [[None] * len(walked.bands), [None] * len(walked.bands)]
     blocks: list[str] = []
     for task in tasks:
@@ -11268,16 +10813,12 @@ def _build_sell_grid(
         if result is None:
             continue
         t = 0 if task.tier_floors else 1
-        data = [None if bases[(t, a)] is None
-                else [[None] * len(walked.caps) for _ in walked.ks] for a in (0, 1)]
+        data = [[None] * len(walked.caps) for _ in walked.ks]
         # Each key the task's rows name, as a chunk id
         chunk_ids = [ids[key] for key in result.keys]
-        for (adds, ki, ci), row in result.rows.items():
-            rows = data[1 if adds else 0]
-            if rows is None:
-                continue
+        for (ki, ci), row in result.rows.items():
             # -1: sells nothing, so the scenario's own chunk
-            rows[ki][ci] = [-1 if place < 0 else chunk_ids[place] for place in row]
+            data[ki][ci] = [-1 if place < 0 else chunk_ids[place] for place in row]
         index[t][task.band_index] = len(blocks)
         blocks.append(_packed_json_script(f"dash-sell-{len(blocks)}", data))
     if off_grid is not None:
@@ -12330,12 +11871,11 @@ def _filter_payload(
     explorer_caps: bool = True,
     explorer_tiers: bool = True,
     save: dict | None = None,
-    add_on_state: str = "not simulated",
+    rebalance_state: str = "not simulated",
     sell: _SellGrid | None = None,
     sell_state: str = "not simulated",
     sidecar_dir: str | None = None,
-    trim_state: str = "not simulated",
-    trim_rise_state: str = "not simulated",
+    move_state: str = "not simulated",
 ) -> dict:
     """
     Build the base data block the page's filter bar and script read on load.
@@ -12350,10 +11890,12 @@ def _filter_payload(
     grid carries a tier-floors-off family (source.tier_binds), the same for
     the Tier floors choice: the off grid (chunks.off_grid(): a binding band's
     own off chunks, every other band's tier-on ones), each band's off name
-    and phrase, and its off k-hat breakdown. When the grid carries the Add to
-    held pairs family (source.add_cell) and the walk simulated it, the add-on
-    grid (chunks.add_grid()), and with the tier-floors-off view too its
-    tier-off twin (chunks.add_off_grid()). The lists themselves
+    and phrase, and its off k-hat breakdown. When the grid carries the
+    Rebalance family (source.rebalance_cell) and the walk simulated it, the
+    Rebalance grid (chunks.rebalance_grid()), with the tier-floors-off view
+    too its tier-off twin (chunks.rebalance_off_grid()), and, when the walk
+    read its minimum price movements, their grids (chunks.move_grid(),
+    move_off_grid()). The lists themselves
     are the chunks, each its own packed block the script inflates only when
     a reader chooses that scenario, so the page's load cost does not grow
     with the grid.
@@ -12390,13 +11932,12 @@ def _filter_payload(
             besides the scenario on screen (_save_target): the confirmation
             page's address, the run's same-title cap, whether trades are filed
             by Kalshi's series listing, the source note and whether the saved
-            defaults add to held pairs, whether they sell and whether they trim
-            to Kelly. None (default) ships null, and the script then keeps the
-            button disabled.
-        add_on_state (str): Keyword-only. Why the page has no Add to held
-            pairs view when it has none: "not simulated" (the run carried no
-            such family: the note reads "(not simulated in this backtest)")
-            or "unavailable" (it carried one the page could not use or build:
+            defaults rebalance and whether they sell. None (default) ships
+            null, and the script then keeps the button disabled.
+        rebalance_state (str): Keyword-only. Why the page has no Rebalance
+            view when it has none: "not simulated" (the run carried no such
+            family: the note reads "(not simulated in this backtest)") or
+            "unavailable" (it carried one the page could not use or build:
             "(not available on this page; see the log)"). Ignored when the
             page has the view, whose state is then "shown". "not simulated"
             (default).
@@ -12405,22 +11946,18 @@ def _filter_payload(
             Sell view. Its blocks are not part of this payload: the page
             writes them beside it (generate_dashboard).
         sell_state (str): Keyword-only. Why the page has no Sell view when it
-            has none, worded as add_on_state is ("not simulated" or
+            has none, worded as rebalance_state is ("not simulated" or
             "unavailable"); ignored when it has one. "not simulated" (default).
         sidecar_dir (str | None): Keyword-only. The build's sidecar folder,
             relative to the page ("backtest_dashboard_files/<build id>"), which
             the script loads every chunk at or past "inline_chunks" from; None
             (default) for a page with no sidecar chunk.
-        trim_state (str): Keyword-only. Why the page has no Trim to Kelly
-            view when it has none, worded as add_on_state is ("not simulated"
-            or "unavailable"); ignored when it has one. "not simulated"
-            (default).
-        trim_rise_state (str): Keyword-only. Why the page has no view of the
-            Trim to Kelly family's minimum price rises when it has none:
+        move_state (str): Keyword-only. Why the page has no view of the
+            Rebalance family's minimum price movements when it has none:
             "not simulated" (the run's family carried no minimum) or
             "unavailable" (it carried some, and the page could not read
-            them or has no Trim to Kelly view to show them beside); ignored
-            when it has the view. "not simulated" (default).
+            them or has no Rebalance view to show them beside); ignored when
+            it has the view. "not simulated" (default).
 
     Returns:
         dict: "dates" (the shared axis, ISO dates), "bands" ([{label,
@@ -12447,9 +11984,9 @@ def _filter_payload(
             script works a mix of categories and tags out with), "text" (the templates:
             _SUMMARY_TEMPLATES — its "unfiltered" sentence chosen by kd,
             explorer and explorer_caps (_bar_reach), then closed by one
-            sentence per view the page has: _ADD_ON_REACH, _SELL_REACH and
-            _TRIM_REACH, or _TRIM_RISE_REACH in its place when the page also
-            shows the minimum price rises (each one's _NO_EXPLORER twin
+            sentence per view the page has: _REBALANCE_REACH, or
+            _MOVE_REACH in its place when the page also shows the minimum
+            price movements, then _SELL_REACH (each one's _NO_EXPLORER twin
             without the explorer) — _KHAT_TEXT and
             _CALIBRATION_TEXT), "styles" (the trade-type
             lines' and the k-hat bars' drawing, the k-hat chart's height
@@ -12461,38 +11998,31 @@ def _filter_payload(
             table cells of a group with no k-hat), "khat_t" (_khat_t_table:
             the Student-t quantile of the k-hat interval by degrees of
             freedom), "kd" and "save" (both
-            above), "grid_add" (null, or [band][k][cap] -> chunk id or null,
-            the Add to held pairs grid, chunks.add_grid()), "grid_add_off"
-            (null, or the same with the tier floors off, present only with
-            both the add-on and the tier-floors-off views,
-            chunks.add_off_grid()) and "add_state" ("shown" when the page has
-            the add-on view, else add_on_state), and the Sell view's:
+            above), the Rebalance view's: "grid_rebalance" (null, or
+            [band][k][cap] -> chunk id or null: the scenario with held pairs
+            topped up to and sold down to their Kelly size,
+            chunks.rebalance_grid()), "grid_rebalance_off" (the same with the
+            tier floors off, only with both views,
+            chunks.rebalance_off_grid()) and "rebalance_state" ("shown",
+            else rebalance_state); the view of that family's minimum price
+            movements: "moves" ([{label, phrase, value}] per minimum —
+            _move_option's "10c", _move_phrase's words after the Rebalance
+            phrase and the minimum itself in dollars; [] without the view),
+            "grid_move" (null without the view, else [band][k][cap] -> null
+            where every minimum shows that scenario's "grid_rebalance"
+            chunk, else one chunk id per minimum, in "moves" order —
+            chunks.move_grid()), "grid_move_off" (the same beside
+            "grid_rebalance_off", null wherever that grid is) and
+            "move_state" ("shown", else move_state); and the Sell view's:
             "sell_blocks" (null without the view, else [Tier floors 0 on / 1
             off][band] -> the number i of the packed block "dash-sell-<i>"
-            holding that band's chunk ids, or null — _SellGrid.index),
+            holding that band's chunk ids ([k][cap] -> one id per sell level
+            and minimum of days), or null — _SellGrid.index),
             "sell_levels" and "sell_days" ([{label, phrase, value}] per level
             and per minimum of days, [] without the view), "sell_state"
             ("shown", else sell_state), "inline_chunks" (how many chunks the
             page holds itself: every id from there on is a sidecar file) and
-            "sidecar_dir" (above), and the Trim to Kelly view's: "grid_trim"
-            (null, or [band][k][cap] -> chunk id or null: the scenario with
-            held pairs trimmed to their Kelly size, chunks.trim_grid()),
-            "grid_trim_off" (the same with the tier floors off, only with
-            both views), "grid_trim_add" and "grid_trim_add_off" (the same
-            two with adding to held pairs on, only on a page that also has
-            the add-on view) and "trim_state" ("shown", else trim_state),
-            and the view of that family's minimum price rises: "trim_rises"
-            ([{label, phrase, value}] per minimum — _trim_rise_option's
-            "5c", _trim_rise_phrase's words after the Trim to Kelly phrase
-            and the minimum itself in dollars; [] without the view),
-            "grid_trim_rise" (null without the view, else [band][k][cap] ->
-            null where every minimum shows that scenario's "grid_trim"
-            chunk, else one chunk id per minimum, in "trim_rises" order —
-            chunks.trim_rise_grid()), "grid_trim_rise_off",
-            "grid_trim_rise_add" and "grid_trim_rise_add_off" (the same
-            beside "grid_trim_off", "grid_trim_add" and "grid_trim_add_off",
-            each null wherever that grid is) and "trim_rise_state" ("shown",
-            else trim_rise_state).
+            "sidecar_dir" (above).
     """
     axis = chunks.axis
     pb, pk, pc = source.primary
@@ -12505,22 +12035,18 @@ def _filter_payload(
     grid_off = chunks.off_grid()
     # Without an off grid (no family, or no chunk for it) there is no off view
     off_view = binds is not None and grid_off is not None
-    # Only a grid the walk actually walked with the family can show it: a
-    # source the walk stripped of it (an add-on cell failed) has none
-    grid_add = chunks.add_grid() if source.add_cell is not None else None
-    add_view = grid_add is not None
     sell_view = sell is not None and sell.index is not None
-    # The Trim to Kelly view, likewise only from a grid walked with its family;
-    # its adding-on half only on a page that also shows adding on
-    grid_trim = chunks.trim_grid() if source.trim_cell is not None else None
-    trim_view = grid_trim is not None
-    grid_trim_add = chunks.trim_grid(True) if (trim_view and add_view) else None
-    # Each trim scenario at every minimum price rise, only from a grid whose
-    # walk read them: a grid of nothing but nulls is still the view (no
-    # minimum changed any run), while a walk that could not read them has none
-    grid_rise = (chunks.trim_rise_grid()
-                 if (trim_view and source.trim_rise_cell is not None) else None)
-    rise_view = grid_rise is not None
+    # Only a grid the walk actually walked with the Rebalance family can show
+    # it: a source the walk stripped of it (a rebalancing cell failed) has none
+    grid_rebalance = chunks.rebalance_grid() if source.rebalance_cell is not None else None
+    rebalance_view = grid_rebalance is not None
+    # Each rebalancing scenario at every minimum price movement, only from a
+    # grid whose walk read them: a grid of nothing but nulls is still the view
+    # (no minimum changed any run), while a walk that could not read them has
+    # none
+    grid_move = (chunks.move_grid()
+                 if (rebalance_view and source.move_cell is not None) else None)
+    move_view = grid_move is not None
     # Per band, its k-hat population broken down like its trades
     # (_khat_band) — each group with its k-hat − k at every k of the bar,
     # for the performance section's cards
@@ -12579,16 +12105,14 @@ def _filter_payload(
                  "unfiltered": " " + _bar_reach(kd is not None, explorer,
                                                 explorer_caps=explorer_caps,
                                                 explorer_tiers=explorer_tiers)
-                 + ("" if not add_view else
-                    " " + (_ADD_ON_REACH if explorer else _ADD_ON_REACH_NO_EXPLORER))
-                 + ("" if not sell_view else
-                    " " + (_SELL_REACH if explorer else _SELL_REACH_NO_EXPLORER))
-                 # Trim to Kelly alone, or with Min. price rise where the
+                 # Rebalance alone, or with Min. price movement where the
                  # page shows the minimums too
-                 + ("" if not trim_view else " " + (
-                     (_TRIM_RISE_REACH if explorer else _TRIM_RISE_REACH_NO_EXPLORER)
-                     if rise_view else
-                     (_TRIM_REACH if explorer else _TRIM_REACH_NO_EXPLORER)))},
+                 + ("" if not rebalance_view else " " + (
+                     (_MOVE_REACH if explorer else _MOVE_REACH_NO_EXPLORER)
+                     if move_view else
+                     (_REBALANCE_REACH if explorer else _REBALANCE_REACH_NO_EXPLORER)))
+                 + ("" if not sell_view else
+                    " " + (_SELL_REACH if explorer else _SELL_REACH_NO_EXPLORER))},
         "styles": {"types": {label: {"color": color, "width": _TYPE_LINE_WIDTH,
                                      "dash": _TYPE_LINE_DASH}
                              for label, color in _TRADE_TYPE_LINES},
@@ -12619,11 +12143,21 @@ def _filter_payload(
                                        if key != "dates"},
         # The save button's fixed part of the confirmation page's address
         "save": save,
-        # The Add to held pairs view: its grid (null without it; the tier-off
-        # twin null without the tier-off view too) and why a page has none
-        "grid_add": grid_add,
-        "grid_add_off": chunks.add_off_grid() if (add_view and off_view) else None,
-        "add_state": "shown" if add_view else add_on_state,
+        # The Rebalance view: its grid, its tier-floors-off twin (null without
+        # the tier-off view too) and why a page has none
+        "grid_rebalance": grid_rebalance,
+        "grid_rebalance_off": (chunks.rebalance_off_grid()
+                               if (rebalance_view and off_view) else None),
+        "rebalance_state": "shown" if rebalance_view else rebalance_state,
+        # The same scenarios at each minimum price movement: the minimums'
+        # names, each Rebalance grid's chunk ids per minimum (a null cell:
+        # every minimum shows the Rebalance cell; a null grid wherever its
+        # Rebalance grid is null), and why a page has none
+        "moves": ([{"label": _move_option(move), "phrase": _move_phrase(move),
+                    "value": move} for move in source.moves] if move_view else []),
+        "grid_move": grid_move,
+        "grid_move_off": chunks.move_off_grid() if (move_view and off_view) else None,
+        "move_state": "shown" if move_view else move_state,
         # The Sell view: which packed block holds each band's chunk ids
         # (null without the view), the levels' and minimums' names, and why a
         # page has none
@@ -12631,29 +12165,6 @@ def _filter_payload(
         "sell_levels": sell.levels if sell_view else [],
         "sell_days": sell.days if sell_view else [],
         "sell_state": "shown" if sell_view else sell_state,
-        # The Trim to Kelly view: its grid, the one with adding to held
-        # pairs on, their tier-floors-off twins (each null without its
-        # view), and why a page has none
-        "grid_trim": grid_trim,
-        "grid_trim_off": chunks.trim_off_grid() if (trim_view and off_view) else None,
-        "grid_trim_add": grid_trim_add,
-        "grid_trim_add_off": (chunks.trim_off_grid(True)
-                              if (grid_trim_add is not None and off_view) else None),
-        "trim_state": "shown" if trim_view else trim_state,
-        # The same scenarios at each minimum price rise: the minimums' names,
-        # each trim grid's chunk ids per minimum (a null cell: every minimum
-        # shows the Trim to Kelly cell; a null grid wherever its trim grid is
-        # null), and why a page has none
-        "trim_rises": ([{"label": _trim_rise_option(rise), "phrase": _trim_rise_phrase(rise),
-                         "value": rise} for rise in source.trim_rises] if rise_view else []),
-        "grid_trim_rise": grid_rise,
-        "grid_trim_rise_off": (chunks.trim_rise_off_grid()
-                               if (rise_view and off_view) else None),
-        "grid_trim_rise_add": (chunks.trim_rise_grid(True)
-                               if (rise_view and grid_trim_add is not None) else None),
-        "grid_trim_rise_add_off": (chunks.trim_rise_off_grid(True) if (
-            rise_view and grid_trim_add is not None and off_view) else None),
-        "trim_rise_state": "shown" if rise_view else trim_rise_state,
         # Every chunk id from here on is a sidecar file in sidecar_dir
         "inline_chunks": len(chunks.chunks),
         "sidecar_dir": sidecar_dir,
@@ -12739,8 +12250,8 @@ def _tier_off_where(label: str, primary: bool, same_as_tier_on: bool) -> str:
 
 def _filter_summary_text(text: dict, scenario: str, primary: bool,
                          selection: str | None, n: int, n_band: int, *,
-                         note: str | None = None, add_on: bool = False,
-                         mix: bool = False, trim: bool = False) -> str:
+                         note: str | None = None, mix: bool = False,
+                         rebalance: bool = False) -> str:
     """
     Say, under the filter bar, what the page is showing.
 
@@ -12768,18 +12279,14 @@ def _filter_summary_text(text: dict, scenario: str, primary: bool,
             band, k and cap with the tier floors off where they bind. None
             (default) applies the tier-on rule: "other_scenario" on every
             scenario but the primary, nothing on it.
-        add_on (bool): Keyword-only. Whether the Add to held pairs choice is
-            on: the line then gains the "add_on_note" template (what an added
-            purchase counts as) before its closing reach sentence, as the
-            script adds it. False (default).
         mix (bool): Keyword-only. Whether the selection is a mix the page
             worked out itself from several tags' figures: a slice's line then
             gains the "mix_note" template, as the script adds it. False
             (default).
-        trim (bool): Keyword-only. Whether the Trim to Kelly choice is on:
-            the line then gains the "trim_note" template (what a part sold
-            counts as) after any add-on note, as the script adds it. False
-            (default).
+        rebalance (bool): Keyword-only. Whether the Rebalance choice is yes:
+            the line then gains the "rebalance_note" template (what an added
+            purchase and a part sold count as) before its closing reach
+            sentence, as the script adds it. False (default).
 
     Returns:
         str: Plain text — escape it before putting it in HTML.
@@ -12793,8 +12300,7 @@ def _filter_summary_text(text: dict, scenario: str, primary: bool,
         out = text["slice"].format(scenario=scenario, selection=selection, n=n,
                                    band_count=_trade_count(n_band))
         out += text["mix_note"] if mix else ""
-    return (out + (text["add_on_note"] if add_on else "")
-            + (text["trim_note"] if trim else "") + text["unfiltered"])
+    return out + (text["rebalance_note"] if rebalance else "") + text["unfiltered"]
 
 
 def _selection_name(names: list[str], text: dict | None = None) -> str:
@@ -12861,10 +12367,10 @@ def _menu_html(menu_id: str, all_label: str, rows: list[str]) -> str:
 
 def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     """
-    Render the sticky filter bar: nine <select>s, two check-box menus, the save button and a summary line.
+    Render the sticky filter bar: eight <select>s, two check-box menus, the save button and a summary line.
 
-    Spread band, Tier floors, k, Size cap, Add to held pairs, Trim to Kelly,
-    Min. price rise, Sell and Min. days to maturity choose the scenario —
+    Spread band, Tier floors, k, Size cap, Rebalance, Min. price movement,
+    Sell and Min. days to maturity choose the scenario —
     each option one of the grid's axes, the run's own marked
     " (primary)" (a band's option text is the payload's "option", which the
     script swaps for its tier-off one when the Tier floors choice changes) —
@@ -12875,34 +12381,31 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     ("off"), its title spelling out both rules (_TIER_SELECT_TITLE); a payload
     with no tier-floors-off view ("grid_off" null) puts a grey "(not
     simulated for this run)" note beside it, and the script never enables it.
-    The Add to held pairs select offers the run as simulated ("off", selected)
-    or the same scenario with pairs still held bought again ("on (up to the
-    size cap)"), its title carrying the detail (_ADD_ON_SELECT_TITLE); a
-    payload with no add-on view ("grid_add" null) puts a grey note beside it
-    by its "add_state" (_ADD_ON_NOTES), and the script never enables it.
-    The Trim to Kelly select after it offers the run as simulated ("off",
-    selected) or the same scenario with held pairs sold down to their Kelly
-    size ("on (sell down to the Kelly size)"), its title carrying the detail
-    (_trim_select_title); a payload with no trim view ("grid_trim" null)
-    puts a grey note beside it by its "trim_state" (_TRIM_NOTES), and the
-    script never enables it.
-    The "Min. price rise" select after it offers "any" (selected: no
-    minimum, the Trim to Kelly run itself; value "0") and every minimum
-    price rise the payload names (trim_rises: "5c", "10c", ...; an option's
-    value is its place in that list plus one), its title carrying the rule
-    (_TRIM_RISE_TITLE). It is on every page, so the script always finds it;
-    the script opens it only while Trim to Kelly is on, on a page whose
-    payload carries the minimums ("grid_trim_rise"). A payload that shows
-    Trim to Kelly without them puts a grey note beside it by its
-    "trim_rise_state" (_TRIM_RISE_NOTES); where Trim to Kelly itself is not
-    shown, that select's own note says why and this one has none.
+    The Rebalance select offers the run as simulated ("no", selected) or the
+    same scenario with every held pair brought back to its Kelly size at
+    each weekly run, topped up and sold down ("yes"), its title carrying the
+    detail (_rebalance_select_title, at backtester.REBALANCE_MIN_DAYS_SINCE_TRADE
+    as the page's rebalancing runs read it); a payload with no Rebalance
+    view ("grid_rebalance" null) puts a grey note beside it by its
+    "rebalance_state" (_REBALANCE_NOTES), and the script never enables it.
+    The "Min. price movement" select after it offers "any" (selected: no
+    minimum, the rebalancing run itself; value "0") and every minimum price
+    movement the payload names (moves: "5c", "10c", ...; an option's value
+    is its place in that list plus one), its title carrying the rule
+    (_MOVE_TITLE). It is on every page, so the script always finds it; the
+    script opens it only while Rebalance is yes, on a page whose payload
+    carries the minimums ("grid_move"). A payload that shows Rebalance
+    without them puts a grey note beside it by its "move_state"
+    (_MOVE_NOTES); where Rebalance itself is not shown, that select's own
+    note says why and this one has none.
     The Sell select offers "no selling" (selected) and every sell level the
     payload names (sell_levels), its title carrying the rule
     (_sell_select_title, at backtester.TAKE_PROFIT_HOLD_DAYS as the page's
     sell runs read it); a payload with no Sell view ("sell_blocks" null)
     puts a grey note beside it by its "sell_state" (_SELL_NOTES), and the
-    script never enables it. The "Min. days to maturity" select after it
-    offers every minimum of days the payload names (sell_days; its value
+    script never enables it. The script also shuts it, at "no selling",
+    while Rebalance is yes. The "Min. days to
+    maturity" select after it offers every minimum of days the payload names (sell_days; its value
     the option's index, the first selected), its title carrying the rule
     (_SELL_DAYS_TITLE); the script enables it only while Sell names a
     level, since with no selling there is no sale to hold back.
@@ -12922,13 +12425,13 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     _SAVE_TITLE_UNFILED on a page that does not file trades by Kalshi's
     series listing (payload "save"), where a category or tag cannot be
     saved; while the ticks themselves are what cannot be saved, the script
-    shows one of _SAVE_BLOCKED_TEXT's reasons in its place. On a page with the add-on view whose saved live defaults add to
-    held pairs (save["live_adds_to_held_pairs"]), a grey note
-    (_ADD_ON_SAVE_NOTE) follows the button: saving with the Add to held
-    pairs choice off turns that off. _TRIM_SAVE_NOTE (save["live_trims"])
-    and _SELL_SAVE_NOTE (save["live_sells"]) do the same for trimming and
-    selling, in the order of their selects. Then the "Trade using
-    defaults…" link
+    shows one of _SAVE_BLOCKED_TEXT's reasons in its place. On a page with
+    the Rebalance view whose saved live defaults rebalance
+    (save["live_rebalances"]), a grey note (_REBALANCE_SAVE_NOTE) follows
+    the button: saving with Rebalance no turns that off.
+    _SELL_SAVE_NOTE (save["live_sells"]) does the same for selling, after
+    it, in the order of their selects. Then the "Trade using defaults…"
+    link
     (_trade_link_html), which the script never touches, and the note that
     both need the defaults server running.
 
@@ -12983,40 +12486,33 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
                  "(not simulated for this run)</span>")
     # Escaped whole, quotes included, so the attribute can never end early
     tier_title = html.escape(_TIER_SELECT_TITLE)
-    # The Add to held pairs choice: off (the page as rendered) or on; a page
-    # with no add-on view says why beside the select it keeps shut
-    add_opts = (f'<option value="off" selected>{html.escape(_ADD_ON_OPTION_OFF)}</option>'
-                f'<option value="on">{html.escape(_ADD_ON_OPTION_ON)}</option>')
-    add_state = payload.get("add_state", "not simulated")
-    add_note = ("" if add_state == "shown" else
-                '&nbsp;<span id="flt-add-note" style="color:#9E9E9E; font-size:13px;">'
-                f"{html.escape(_ADD_ON_NOTES.get(add_state, _ADD_ON_NOTES['not simulated']))}"
-                "</span>")
-    add_title = html.escape(_ADD_ON_SELECT_TITLE)
-    # The Trim to Kelly choice: off (the page as rendered) or on; a page with
-    # no trim view says why beside the select it keeps shut
-    trim_opts = (f'<option value="off" selected>{html.escape(_TRIM_OPTION_OFF)}</option>'
-                 f'<option value="on">{html.escape(_TRIM_OPTION_ON)}</option>')
-    trim_state = payload.get("trim_state", "not simulated")
-    trim_note = ("" if trim_state == "shown" else
-                 '&nbsp;<span id="flt-trim-note" style="color:#9E9E9E; font-size:13px;">'
-                 f"{html.escape(_TRIM_NOTES.get(trim_state, _TRIM_NOTES['not simulated']))}"
-                 "</span>")
-    # The hover text names the wait after a trade, as the page's trim runs read it
-    trim_title = html.escape(_trim_select_title(_backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE))
-    # The Min. price rise choice: any (no minimum, value "0") or a minimum,
-    # each option's value its place in the payload's trim_rises plus one
-    rise_opts = (f'<option value="0" selected>{html.escape(_TRIM_RISE_OPTION_ANY)}</option>'
+    # The Rebalance choice: no (the page as rendered) or yes; a page with no
+    # Rebalance view says why beside the select it keeps shut
+    rebalance_opts = (f'<option value="no" selected>{html.escape(_REBALANCE_OPTION_NO)}'
+                      f'</option><option value="yes">{html.escape(_REBALANCE_OPTION_YES)}'
+                      '</option>')
+    rebalance_state = payload.get("rebalance_state", "not simulated")
+    rebalance_why = _REBALANCE_NOTES.get(rebalance_state, _REBALANCE_NOTES["not simulated"])
+    rebalance_note = ("" if rebalance_state == "shown" else
+                      '&nbsp;<span id="flt-rebalance-note" style="color:#9E9E9E; '
+                      f'font-size:13px;">{html.escape(rebalance_why)}</span>')
+    # The hover text names the wait after a trade, as the page's rebalancing
+    # runs read it
+    rebalance_title = html.escape(
+        _rebalance_select_title(_backtester.REBALANCE_MIN_DAYS_SINCE_TRADE))
+    # The Min. price movement choice: any (no minimum, value "0") or a
+    # minimum, each option's value its place in the payload's moves plus one
+    move_opts = (f'<option value="0" selected>{html.escape(_MOVE_OPTION_ANY)}</option>'
                  + "".join(f'<option value="{i + 1}">{html.escape(entry["label"])}</option>'
-                           for i, entry in enumerate(payload.get("trim_rises") or [])))
-    rise_state = payload.get("trim_rise_state", "not simulated")
-    # Said only where Trim to Kelly itself is shown: a page without it says
-    # why beside that select, which covers this one too
-    rise_why = _TRIM_RISE_NOTES.get(rise_state, _TRIM_RISE_NOTES["not simulated"])
-    rise_note = ("" if trim_state != "shown" or rise_state == "shown" else
-                 '&nbsp;<span id="flt-rise-note" style="color:#9E9E9E; font-size:13px;">'
-                 f"{html.escape(rise_why)}</span>")
-    rise_title = html.escape(_TRIM_RISE_TITLE)
+                           for i, entry in enumerate(payload.get("moves") or [])))
+    move_state = payload.get("move_state", "not simulated")
+    # Said only where Rebalance itself is shown: a page without it says why
+    # beside that select, which covers this one too
+    move_why = _MOVE_NOTES.get(move_state, _MOVE_NOTES["not simulated"])
+    move_note = ("" if rebalance_state != "shown" or move_state == "shown" else
+                 '&nbsp;<span id="flt-move-note" style="color:#9E9E9E; font-size:13px;">'
+                 f"{html.escape(move_why)}</span>")
+    move_title = html.escape(_MOVE_TITLE)
     # The Sell choice: no selling (the page as rendered) or a level, each
     # option's value its index in the payload's sell_levels; a page with no
     # Sell view says why beside the select it keeps shut
@@ -13043,18 +12539,14 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     # category or tag cannot be saved from it
     save_filed = (payload.get("save") or {}).get("filed_by_listing", False)
     save_title = html.escape(_SAVE_TITLE + ("" if save_filed else _SAVE_TITLE_UNFILED))
-    # Saving from a page with the add-on view sends the choice shown, so when
-    # the saved live defaults add to held pairs, leaving it "off" would turn
-    # that off; the grey note beside the button says so
-    save_adds = (add_state == "shown"
-                 and (payload.get("save") or {}).get("live_adds_to_held_pairs") is True)
-    save_note = ('&nbsp;<span id="flt-add-save-note" style="color:#9E9E9E; font-size:13px;">'
-                 f"{html.escape(_ADD_ON_SAVE_NOTE)}</span>" if save_adds else "")
-    # The same for trimming to Kelly: saving with Trim to Kelly off turns it off
-    save_trims = (trim_state == "shown"
-                  and (payload.get("save") or {}).get("live_trims") is True)
-    save_note += ('&nbsp;<span id="flt-trim-save-note" style="color:#9E9E9E; font-size:13px;">'
-                  f"{html.escape(_TRIM_SAVE_NOTE)}</span>" if save_trims else "")
+    # Saving from a page with the Rebalance view sends the choice shown, so
+    # when the saved live defaults rebalance, leaving it at Rebalance no would
+    # turn that off; the grey note beside the button says so
+    save_rebalances = (rebalance_state == "shown"
+                       and (payload.get("save") or {}).get("live_rebalances") is True)
+    save_note = ('&nbsp;<span id="flt-rebalance-save-note" style="color:#9E9E9E; '
+                 f'font-size:13px;">{html.escape(_REBALANCE_SAVE_NOTE)}</span>'
+                 if save_rebalances else "")
     # The same for selling: saving with "no selling" shown turns it off
     save_sells = (sell_state == "shown"
                   and (payload.get("save") or {}).get("live_sells") is True)
@@ -13087,12 +12579,11 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
         f'{options(payload["ks"], pk)}</select></label>&nbsp;&nbsp;'
         f'<label>Size cap: <select id="flt-cap" disabled autocomplete="off">'
         f'{options(payload["caps"], pc)}</select></label>&nbsp;&nbsp;'
-        f'<label>Add to held pairs: <select id="flt-add" disabled autocomplete="off" '
-        f'title="{add_title}">{add_opts}</select></label>{add_note}&nbsp;&nbsp;'
-        f'<label>Trim to Kelly: <select id="flt-trim" disabled autocomplete="off" '
-        f'title="{trim_title}">{trim_opts}</select></label>{trim_note}&nbsp;&nbsp;'
-        f'<label>Min. price rise: <select id="flt-rise" disabled autocomplete="off" '
-        f'title="{rise_title}">{rise_opts}</select></label>{rise_note}&nbsp;&nbsp;'
+        f'<label>Rebalance: <select id="flt-rebalance" disabled autocomplete="off" '
+        f'title="{rebalance_title}">{rebalance_opts}</select></label>'
+        f'{rebalance_note}&nbsp;&nbsp;'
+        f'<label>Min. price movement: <select id="flt-move" disabled autocomplete="off" '
+        f'title="{move_title}">{move_opts}</select></label>{move_note}&nbsp;&nbsp;'
         f'<label>Sell: <select id="flt-sell" disabled autocomplete="off" '
         f'title="{sell_title}">{sell_opts}</select></label>{sell_note}&nbsp;&nbsp;'
         f'<label>Min. days to maturity: <select id="flt-days" disabled autocomplete="off" '
@@ -13261,62 +12752,56 @@ def _pack_text(raw: str) -> str:
 # a binding band's own off chunks, every other band's tier-on ones) — and the
 # k-hat breakdown and cards between D.khat and D.khat_off; it is enabled only
 # when the base block carries an off grid, and the interval-discount section
-# never follows it (renderKd reads D.kd, tier-on). The Add to held pairs
-# select, appended after the others (SHOWN[6]), picks between the grid as
-# simulated (D.grid) and the same scenario with pairs still held bought again
-# (D.grid_add, or D.grid_add_off with the tier floors off); it is enabled only
-# when the base block carries an add-on grid, its phrase and the summary
-# line's note while it is on are Python's (D.text.add_on, D.text.add_on_note),
-# and neither the k-hat figures, the interval-discount section nor the
-# scenario explorer follow it (renderKhat, renderKhatCards and renderKd read
-# no part of it, and window.dashScenarioSelect still gets four arguments).
-# The Sell select, appended after it (SHOWN[7]), picks between the grids as
-# they stand and a sell level; the "Min. days to maturity" select after it
-# (SHOWN[8]) picks the fewest days before maturity a sale
-# needs, and is enabled only while Sell names a level (refreshDays). A level's
+# never follows it (renderKd reads D.kd, tier-on). The Rebalance select
+# (SHOWN[6]) picks between the grid as simulated (D.grid) and the same
+# scenario with every held pair topped up to and sold down to its Kelly size
+# at each weekly run (D.grid_rebalance, or D.grid_rebalance_off with the tier
+# floors off: gridAt); it is enabled only when the base block carries a
+# Rebalance grid, its phrase and the summary line's note while it is yes are
+# Python's (D.text.rebalance, D.text.rebalance_note), and neither the k-hat
+# figures, the interval-discount section nor the scenario explorer follow it
+# (renderKhat, renderKhatCards and renderKd read no part of it, and
+# window.dashScenarioSelect still gets four arguments). The Sell select
+# (SHOWN[7]) picks between the base grids (D.grid, D.grid_off) as they stand
+# and a sell level; the "Min. days to maturity" select after it (SHOWN[8])
+# picks the fewest days before maturity a sale needs, and is enabled only
+# while Sell names a level (refreshDays). No sell level is built for a run
+# that rebalances, so while Rebalance is yes, Sell is set to "no selling" and
+# shut (refreshSell), and chunkAt answers null for a level there. A level's
 # chunk ids are not in the base block: D.sell_blocks[tier][band] names the
-# packed block "dash-sell-<i>" holding that band's ids ([add][k][cap] -> one
-# id per (level, minimum of days), -1 for the scenario's own chunk), which
-# the script inflates the first time a level is chosen at that band and then
+# packed block "dash-sell-<i>" holding that band's ids ([k][cap] -> one id
+# per (level, minimum of days), -1 for the scenario's own chunk), which the
+# script inflates the first time a level is chosen at that band and then
 # keeps (SELL, loadSell); while it inflates, chunkAt answers undefined and
 # choose() waits for it. Sell is enabled only when the base block names
 # those blocks; the level's and the minimum's phrases and the summary line's
-# note are Python's (D.sell_levels, D.sell_days, D.text.sell_note); the level
-# and the minimum shown go into the save button's address (saveHref), and, like Add
-# to held pairs, neither select reaches the k-hat figures, the
+# note are Python's (D.sell_levels, D.sell_days, D.text.sell_note); the
+# level and the minimum shown go into the save button's address (saveHref),
+# and, like Rebalance, neither select reaches the k-hat figures, the
 # interval-discount section nor the scenario explorer. A Sell block that
 # cannot be inflated puts every select back, as a chunk that cannot be
-# loaded does (putBack). The Trim to Kelly select (SHOWN[9]) picks the same
-# scenario with held pairs sold down to their Kelly
-# size: D.grid_trim, D.grid_trim_add with adding to held pairs on, and their
-# tier-floors-off twins (gridAt); it is enabled only when the base block
-# carries D.grid_trim. While it is on, Sell is set to "no selling" and shut
-# (refreshSell: no sell level is built for a trimming run); the choice goes
-# into the save button's address (saveHref: trim_to_kelly); its phrase
-# and the summary line's note are Python's (D.text.trim, D.text.trim_note),
-# and it reaches neither the k-hat figures, the interval-discount section
-# nor the scenario explorer. The "Min. price rise" select after it
-# (SHOWN[10], appended last, so every other index keeps its meaning) picks
-# the least rise in a held pair's price a trim waits for: "0" is any (the
-# Trim to Kelly run itself), and i names D.trim_rises[i - 1]. It counts, and
-# is open, only while Trim to Kelly is on, on a page whose base block
-# carries D.grid_trim_rise (refreshRise, riseAt); shut, it keeps its value,
-# so trimming switched on again shows the minimum it still names. A
-# scenario's chunk at a minimum is that minimum's entry in the scenario's
-# cell of D.grid_trim_rise (or of its adding-on or tier-floors-off twin, as
-# gridAt picks the trim grid: riseGridAt), and where that cell is null — no
-# minimum changes the run — the Trim to Kelly chunk itself (chunkAt). Its
-# phrase is Python's (D.trim_rises[i - 1].phrase, after D.text.trim). Sell
-# stays shut at any minimum; the minimum goes into the save button's address
-# (saveHref: trim_min_rise, "off" for any or with trimming off), and like
-# Trim to Kelly it reaches neither the k-hat figures, the interval-discount
-# section nor the scenario explorer. A chunk at or past D.inline_chunks is a
-# sidecar file in D.sidecar_dir, loaded through a <script src> element whose
-# one call to window.__dashChunk hands over its packed text (sidecarText),
-# inflated by the same code as a block in the page (inflateText); a file
-# that cannot be loaded, or hands nothing over, is named in Python's words
-# (D.text.sidecar_missing, sidecar_empty), and the selects go back to what
-# is still shown.
+# loaded does (putBack). The "Min. price movement" select (SHOWN[9]) picks
+# the least move, up or down, in a held pair's price an add-on or a trim
+# waits for: "0" is any (the rebalancing run itself), and i names
+# D.moves[i - 1]. It counts, and is open, only while Rebalance is yes, on a
+# page whose base block carries D.grid_move (refreshMove, moveAt); shut, it
+# keeps its value, so Rebalance switched to yes again shows the minimum it
+# still names. A scenario's chunk at a minimum is that minimum's entry in the
+# scenario's cell of D.grid_move (or of D.grid_move_off with the tier floors
+# off: moveGridAt), and where that cell is null — no minimum changes the run
+# — the rebalancing chunk itself (chunkAt). Its phrase is Python's
+# (D.moves[i - 1].phrase, after D.text.rebalance). Sell stays shut at any
+# minimum; the Rebalance choice and the minimum go into the save button's
+# address (saveHref: rebalance, from the Rebalance choice, and
+# min_price_move, "off" for any or with Rebalance no),
+# and like Rebalance it reaches neither the k-hat figures, the
+# interval-discount section nor the scenario explorer. A chunk at or past
+# D.inline_chunks is a sidecar file in D.sidecar_dir, loaded through a
+# <script src> element whose one call to window.__dashChunk hands over its
+# packed text (sidecarText), inflated by the same code as a block in the
+# page (inflateText); a file that cannot be loaded, or hands nothing over,
+# is named in Python's words (D.text.sidecar_missing, sidecar_empty), and
+# the selects go back to what is still shown.
 # Category and Tag are two check-box menus (<details> elements; SHOWN[3] and
 # SHOWN[4] are the ticked indexes). A reader ticks as many boxes as they
 # like, and the ticks follow the live filter's rule (atomsOf, the page's twin
@@ -13362,9 +12847,9 @@ def _pack_text(raw: str) -> str:
 # selects' choice while a chunk loads) can become the live defaults, and a
 # click opens the defaults server's confirmation page for that scenario in a
 # new tab (saveHref: D.save's address and the axes' values, plus each of the
-# Add to held pairs choice, the Sell level and minimum ("off" for both under
-# no selling) and the Trim to Kelly choice with its minimum price rise, on a
-# page with that view; the button's words are Python's — its hover text too,
+# Rebalance choice with its minimum price movement and the Sell level and
+# minimum ("off" for both under no selling), on a page with that view; the
+# button's words are Python's — its hover text too,
 # which reads as Python rendered it except while the ticks themselves cannot
 # be saved: too many names, a category whose name holds the separator, or one
 # that another category repeats in other letter case (ticksBlocked,
@@ -13392,9 +12877,10 @@ _FILTER_JS = r"""
   // "Tier floors": each band's run as simulated (on), or its run with the
   // deadline-gap tier floors not applied (off, D.grid_off)
   var tierSel = document.getElementById('flt-tier');
-  // "Add to held pairs": the runs as simulated (off), or with a held pair
-  // added to (on, D.grid_add)
-  var addSel = document.getElementById('flt-add');
+  // "Rebalance": the runs as simulated (no), or with each held pair topped up
+  // to and sold down to its Kelly size at every weekly run (yes,
+  // D.grid_rebalance)
+  var rebalanceSel = document.getElementById('flt-rebalance');
   // "Sell": the runs as simulated (none), or each position sold whole at a
   // sell level (a value indexing D.sell_levels)
   var sellSel = document.getElementById('flt-sell');
@@ -13402,14 +12888,11 @@ _FILTER_JS = r"""
   // must have left to be sold at its level (a value indexing D.sell_days);
   // it counts only while Sell names a level
   var daysSel = document.getElementById('flt-days');
-  // "Trim to Kelly": the runs as simulated (off), or with each held pair
-  // sold down to its Kelly size at every weekly run (on, D.grid_trim)
-  var trimSel = document.getElementById('flt-trim');
-  // "Min. price rise": the least rise in a held pair's price a trim waits
-  // for ("0": any; i: D.trim_rises[i - 1]); it counts only while Trim to
-  // Kelly is on
-  var riseSel = document.getElementById('flt-rise');
-  if (!dataEl || !bandSel || !tierSel || !kSel || !capSel || !addSel || !trimSel || !riseSel
+  // "Min. price movement": the least move, up or down, in a held pair's
+  // price an add-on or a trim waits for ("0": any; i: D.moves[i - 1]); it
+  // counts only while Rebalance is yes
+  var moveSel = document.getElementById('flt-move');
+  if (!dataEl || !bandSel || !tierSel || !kSel || !capSel || !rebalanceSel || !moveSel
       || !sellSel || !daysSel || !catMenu || !tagMenu || !catAll || !tagAll) {
     return;
   }
@@ -13417,7 +12900,7 @@ _FILTER_JS = r"""
   // (whose reset reads .options); optional, since a page without it has
   // nothing to save from
   var saveBtn = document.getElementById('flt-save');
-  var SELECTS = [bandSel, tierSel, kSel, capSel, addSel, trimSel, riseSel, sellSel, daysSel];
+  var SELECTS = [bandSel, tierSel, kSel, capSel, rebalanceSel, moveSel, sellSel, daysSel];
   // The k-hat chart's own "Group by" select follows the bar's rules
   var khatGroup = document.getElementById('khat-group');
   if (khatGroup) { SELECTS.push(khatGroup); }
@@ -13428,12 +12911,10 @@ _FILTER_JS = r"""
   // is never drawn over it. SHOWN: what is on screen — the [band, k, cap]
   // indexes, the ticked categories and the ticked tags (each a sorted list of
   // indexes into D.categories / D.subcats), the Tier floors choice
-  // ("on" / "off"), the Add to held pairs choice ("off" / "on"), the Sell
-  // choice ("none", or a level's index), the Min. days to maturity choice
-  // (an index into D.sell_days), the Trim to Kelly choice ("off" / "on") and
-  // the Min. price rise choice ("0" for any, or a minimum's place in
-  // D.trim_rises plus one), each appended after the others so the other
-  // indexes keep their meaning.
+  // ("on" / "off"), the Rebalance choice ("no" / "yes"), the Sell choice
+  // ("none", or a level's index), the Min. days to maturity choice (an index
+  // into D.sell_days) and the Min. price movement choice ("0" for any, or a
+  // minimum's place in D.moves plus one).
   // SELL: every Sell block ("dash-sell-<i>")
   // inflated or inflating, by i — one band's chunk ids under one Tier floors
   // setting at every sell level and minimum of days, inflated the first time
@@ -13489,12 +12970,9 @@ _FILTER_JS = r"""
   // The bands and k-hat breakdown as a Tier floors choice reads them
   function bandsAt(t) { return offAt(t) ? D.bands_off : D.bands; }
   function khatAt(t) { return offAt(t) ? D.khat_off : D.khat; }
-  // The Add to held pairs choice reads "on" only on a page whose base block
-  // carries its grid (the select stays disabled on any other)
-  function addOn(a) { return !!(D.grid_add && a === 'on'); }
-  // The Trim to Kelly choice reads "on" only on a page whose base block
-  // carries its grid (the select stays disabled on any other)
-  function trimOn(r) { return !!(D.grid_trim && r === 'on'); }
+  // The Rebalance choice reads "yes" only on a page whose base block carries
+  // its grid (the select stays disabled on any other)
+  function rebalanceOn(r) { return !!(D.grid_rebalance && r === 'yes'); }
   // The Sell choice s as a level's index into D.sell_levels, or null for
   // none (and on a page without the Sell view, whose select stays disabled)
   function sellAt(s) {
@@ -13508,66 +12986,58 @@ _FILTER_JS = r"""
     var id = D.sell_blocks[offAt(t) ? 1 : 0][b];
     return (id === null || id === undefined) ? null : id;
   }
-  // The grid of chunk ids for a Tier floors choice t, an Add to held pairs
-  // choice a and a Trim to Kelly choice r, with no sell level: null when the
-  // page holds none (an add-on view with the tiers off, on a page with no
-  // tier-off add-on runs; trimming with adding on, on a page that built no
-  // such runs)
-  function gridAt(t, a, r) {
-    if (trimOn(r)) {
-      if (addOn(a)) { return offAt(t) ? D.grid_trim_add_off : D.grid_trim_add; }
-      return offAt(t) ? D.grid_trim_off : D.grid_trim;
-    }
-    if (addOn(a)) { return offAt(t) ? D.grid_add_off : D.grid_add; }
+  // The grid of chunk ids for a Tier floors choice t and a Rebalance choice
+  // r, with no sell level: null when the page holds none (rebalancing with
+  // the tiers off, on a page with no tier-off rebalancing runs)
+  function gridAt(t, r) {
+    if (rebalanceOn(r)) { return offAt(t) ? D.grid_rebalance_off : D.grid_rebalance; }
     return offAt(t) ? D.grid_off : D.grid;
   }
-  // The Min. price rise choice m counts only while the Trim to Kelly choice
-  // r is on, on a page whose base block carries the minimums: 0 is "any"
-  // (no minimum), i the i-th entry of D.trim_rises
-  function riseAt(r, m) {
-    if (!trimOn(r) || !D.grid_trim_rise) { return 0; }
+  // The Min. price movement choice m counts only while the Rebalance choice
+  // r is yes, on a page whose base block carries the minimums: 0 is "any"
+  // (no minimum), i the i-th entry of D.moves
+  function moveAt(r, m) {
+    if (!rebalanceOn(r) || !D.grid_move) { return 0; }
     var i = parseInt(m, 10);
-    return (i > 0 && i <= D.trim_rises.length) ? i : 0;
+    return (i > 0 && i <= D.moves.length) ? i : 0;
   }
-  // The grid of per-minimum chunk ids beside the Trim to Kelly grid gridAt
-  // picks for a Tier floors choice t and an Add to held pairs choice a:
-  // [band][k][cap] -> null (every minimum shows the Trim to Kelly cell) or
-  // one id per entry of D.trim_rises; null when the page holds none
-  function riseGridAt(t, a) {
-    if (addOn(a)) { return offAt(t) ? D.grid_trim_rise_add_off : D.grid_trim_rise_add; }
-    return offAt(t) ? D.grid_trim_rise_off : D.grid_trim_rise;
-  }
-  // The chunk id of a scenario: band b, k, cap c, Tier floors choice t, Add
-  // to held pairs choice a, Sell choice s, Min. days choice d, Trim to Kelly
-  // choice r and Min. price rise choice m. Three results: an id; null for a
-  // scenario the run never simulated (a whole grid missing included, and
-  // any sell level of a trimming run, which the page never builds); or
-  // undefined while a sell level's band block is not yet inflated (choose()
-  // inflates it, then asks again). In a Sell block, -1 means the setting
-  // sells nothing: the scenario's own chunk. With trimming on and a minimum
-  // chosen, the id is that minimum's in the scenario's cell of riseGridAt's
-  // grid (null when the page holds no such grid), or the Trim to Kelly
-  // cell's own where that cell is null.
-  function chunkAt(b, k, c, t, a, s, d, r, m) {
-    var g = gridAt(t, a, r), level = sellAt(s);
+  // The grid of per-minimum chunk ids beside the Rebalance grid gridAt picks
+  // for a Tier floors choice t: [band][k][cap] -> null (every minimum shows
+  // the rebalancing cell) or one id per entry of D.moves; null when the page
+  // holds none
+  function moveGridAt(t) { return offAt(t) ? D.grid_move_off : D.grid_move; }
+  // The chunk id of a scenario: band b, k, cap c, Tier floors choice t, Sell
+  // choice s, Min. days choice d, Rebalance choice r and Min. price movement
+  // choice m. Three results: an id; null for a scenario the run never
+  // simulated (a whole grid missing included, and any sell level of a run
+  // that rebalances, which the page never builds); or undefined while a sell
+  // level's band block is not yet inflated (choose() inflates it, then asks
+  // again). In a Sell block, -1 means the setting sells nothing: the
+  // scenario's own chunk. With Rebalance yes and a minimum chosen, the id is
+  // that minimum's in the scenario's cell of moveGridAt's grid (null when
+  // the page holds no such grid), or the rebalancing cell's own where that
+  // cell is null.
+  function chunkAt(b, k, c, t, s, d, r, m) {
+    var g = gridAt(t, r), level = sellAt(s);
     if (level === null) {
       if (!g) { return null; }
-      var ri = riseAt(r, m);
-      if (ri > 0) {
-        var rg = riseGridAt(t, a);
-        if (!rg) { return null; }
-        var ids = rg[b][k][c];
-        if (ids) { return typeof ids[ri - 1] === 'number' ? ids[ri - 1] : null; }
+      var mi = moveAt(r, m);
+      if (mi > 0) {
+        var mg = moveGridAt(t);
+        if (!mg) { return null; }
+        var ids = mg[b][k][c];
+        if (ids) { return typeof ids[mi - 1] === 'number' ? ids[mi - 1] : null; }
       }
       return g[b][k][c];
     }
-    // No base view of the scenario: no sell level of it either
-    if (!g || trimOn(r)) { return null; }
+    // No base view of the scenario: no sell level of it either. Sell runs
+    // never rebalance, so none is built for a run that does
+    if (!g || rebalanceOn(r)) { return null; }
     var id = sellBlockId(t, b);
     if (id === null) { return null; }
     var entry = SELL[id];
     if (!entry || !entry.ready) { return undefined; }
-    var rows = Array.isArray(entry.data) ? entry.data[addOn(a) ? 1 : 0] : null;
+    var rows = Array.isArray(entry.data) ? entry.data : null;
     var cell = rows ? rows[k][c] : null;
     if (!cell) { return null; }
     var v = cell[level * D.sell_days.length + parseInt(d, 10)];
@@ -13575,18 +13045,17 @@ _FILTER_JS = r"""
     return typeof v === 'number' ? v : null;
   }
   function cellChunk() {
-    return chunkAt(bandIndex(), kIndex(), capIndex(), tierSel.value, addSel.value,
-                   sellSel.value, daysSel.value, trimSel.value, riseSel.value);
+    return chunkAt(bandIndex(), kIndex(), capIndex(), tierSel.value, sellSel.value,
+                   daysSel.value, rebalanceSel.value, moveSel.value);
   }
   // The page as rendered: the primary scenario with the tier floors on and
-  // adding to held pairs off
+  // Rebalance no
   function primaryChunk() { var p = D.primary; return D.grid[p[0]][p[1]][p[2]]; }
   // The filter bar's scenario ON SCREEN (SHOWN) as the defaults server's
   // confirmation-page address, or null when it cannot become live settings:
   // nothing drawn yet, no save target on the page (D.save), a scenario the
-  // run never simulated (an Add to held pairs choice, a Sell level, a Trim
-  // to Kelly choice or a minimum price rise the page holds no chunk for
-  // included), a band
+  // run never simulated (a Rebalance choice, a minimum price movement or a
+  // Sell level the page holds no chunk for included), a band
   // the run did not record, a k or size cap the
   // run did not record or that is not above zero, a category or tag on a
   // page that does not file trades by Kalshi's series listing, or ticks
@@ -13607,8 +13076,8 @@ _FILTER_JS = r"""
     if (!D || !D.save || !SHOWN || C === null) { return null; }
     // null: never simulated; undefined: a sell level's block not inflated (a
     // scenario on screen has always inflated its own)
-    var shownId = chunkAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[6], SHOWN[7],
-                          SHOWN[8], SHOWN[9], SHOWN[10]);
+    var shownId = chunkAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[7], SHOWN[8],
+                          SHOWN[6], SHOWN[9]);
     if (shownId === null || shownId === undefined) { return null; }
     var band = D.bands[SHOWN[0]].value, k = D.ks[SHOWN[1]].value, cap = D.caps[SHOWN[2]].value;
     if (!band || !(k > 0) || !(cap > 0)) { return null; }
@@ -13622,9 +13091,18 @@ _FILTER_JS = r"""
     if (typeof D.save.same_title_size_cap === 'number') {
       q.push(['same_title_size_cap', D.save.same_title_size_cap]);
     }
-    // Sent only by a page that simulated the choice: otherwise the server keeps
-    // the saved value (or the seed's), as for an unrecorded same-title cap
-    if (D.grid_add) { q.push(['add_to_held_pairs', addOn(SHOWN[6]) ? 'on' : 'off']); }
+    // Sent only by a page that simulated rebalancing: otherwise the server
+    // keeps the saved values (or the seed's), as for an unrecorded same-title
+    // cap. The Rebalance choice goes as rebalance, and beside it, always, the
+    // minimum price movement shown as min_price_move — its dollars, or off
+    // for any and whenever Rebalance is no (a shut select can still name
+    // one), so the address never asks for a minimum without rebalancing,
+    // which the server refuses
+    if (D.grid_rebalance) {
+      var mi = moveAt(SHOWN[6], SHOWN[9]);
+      q.push(['rebalance', rebalanceOn(SHOWN[6]) ? 'on' : 'off'],
+             ['min_price_move', mi > 0 ? D.moves[mi - 1].value : 'off']);
+    }
     // Likewise sent only by a page with the Sell view: the level shown and the
     // minimum of days shown, or off for both when Sell shows no level (the
     // server refuses a minimum without a level)
@@ -13633,16 +13111,6 @@ _FILTER_JS = r"""
       q.push(['sell_at', level === null ? 'off' : D.sell_levels[level].value],
              ['sell_min_days',
               level === null ? 'off' : D.sell_days[parseInt(SHOWN[8], 10)].value]);
-    }
-    // Likewise sent only by a page with the Trim to Kelly view: the choice
-    // shown, and beside it, always, the minimum price rise it counts with —
-    // the minimum's dollars, or off for any and whenever trimming is off (a
-    // shut Min. price rise select can still name one), so the address never
-    // asks for a minimum without trimming, which the server refuses
-    if (D.grid_trim) {
-      var ri = riseAt(SHOWN[9], SHOWN[10]);
-      q.push(['trim_to_kelly', trimOn(SHOWN[9]) ? 'on' : 'off'],
-             ['trim_min_rise', ri > 0 ? D.trim_rises[ri - 1].value : 'off']);
     }
     cats.forEach(function(c) { q.push(['category', D.categories[c]]); });
     tags.forEach(function(t) { q.push(['tag', subName(t, true)]); });
@@ -13686,10 +13154,10 @@ _FILTER_JS = r"""
   }
   // The run's own scenario: its cell, with the tiers on — or off at a band
   // the tiers do not reach (D.tier_binds false), whose off view IS that run —
-  // adding to held pairs off, trimming off and no sell level (a run that
-  // adds, trims or sells is never the run as rendered)
+  // Rebalance no and no sell level (a run that rebalances or sells is never
+  // the run as rendered)
   function isPrimary() {
-    return isPrimaryCell() && !addOn(addSel.value) && !trimOn(trimSel.value)
+    return isPrimaryCell() && !rebalanceOn(rebalanceSel.value)
       && sellAt(sellSel.value) === null && (!tiersOff() || !D.tier_binds[bandIndex()]);
   }
   function list() { return C ? C.list : null; }
@@ -14255,22 +13723,21 @@ _FILTER_JS = r"""
   }
   // A scenario in the summary's words: Python's _scenario_phrase, its band
   // named as the Tier floors choice t reads it (_band_where, _tier_off_where),
-  // closed by Python's add-on phrase when the Add to held pairs choice a is
-  // on, by its trim phrase when the Trim to Kelly choice r is on — followed
-  // by the phrase of the minimum the Min. price rise choice m names, if any —
-  // and, when the Sell choice s names a level, by that level's phrase and the
-  // phrase of the Min. days choice d
-  function scenarioAt(b, k, c, t, a, s, d, r, m) {
-    var level = sellAt(s), ri = riseAt(r, m);
+  // closed by Python's rebalancing phrase when the Rebalance choice r is yes
+  // — followed by the phrase of the minimum the Min. price movement choice m
+  // names, if any — and, when the Sell choice s names a level, by that
+  // level's phrase and the phrase of the Min. days choice d
+  function scenarioAt(b, k, c, t, s, d, r, m) {
+    var level = sellAt(s), mi = moveAt(r, m);
     return fill(D.text.scenario, {where: bandsAt(t)[b].where, k: D.ks[k].text,
-                                  cap: D.caps[c].text}) + (addOn(a) ? D.text.add_on : '')
-      + (trimOn(r) ? D.text.trim + (ri > 0 ? D.trim_rises[ri - 1].phrase : '') : '')
+                                  cap: D.caps[c].text})
+      + (rebalanceOn(r) ? D.text.rebalance + (mi > 0 ? D.moves[mi - 1].phrase : '') : '')
       + (level !== null ? D.sell_levels[level].phrase
                           + D.sell_days[parseInt(d, 10)].phrase : '');
   }
   function scenario() {
-    return scenarioAt(bandIndex(), kIndex(), capIndex(), tierSel.value, addSel.value,
-                      sellSel.value, daysSel.value, trimSel.value, riseSel.value);
+    return scenarioAt(bandIndex(), kIndex(), capIndex(), tierSel.value, sellSel.value,
+                      daysSel.value, rebalanceSel.value, moveSel.value);
   }
   // The summary line: the templates _filter_summary_text fills for the view
   // Python rendered, filled here for every other one. With categories
@@ -14293,11 +13760,11 @@ _FILTER_JS = r"""
                             n: v.n, band_count: trades(count('all'))})
         + (v.mix ? T.mix_note : '');
     }
-    // While adding is on, Python's note on what an added purchase counts as;
-    // while trimming is on, its note on what a part sold counts as; and while
-    // a sell level is chosen its note on what a sale is
-    setText('flt-summary', text + (addOn(addSel.value) && shown ? T.add_on_note : '')
-            + (trimOn(trimSel.value) && shown ? T.trim_note : '')
+    // While Rebalance is yes, Python's note on what an added purchase and a
+    // part sold count as; and while a sell level is chosen its note on what a
+    // sale is
+    setText('flt-summary', text + (rebalanceOn(rebalanceSel.value) && shown ? T.rebalance_note
+                                   : '')
             + (sellAt(sellSel.value) !== null && shown ? T.sell_note : '') + T.unfiltered);
   }
 
@@ -14655,8 +14122,8 @@ _FILTER_JS = r"""
   // The interval-discount section, at the primary spread band, for the k and
   // size cap ON SCREEN (SHOWN): its two cards, its equity curve and title,
   // and its per-k table at that cap — all from D.kd, which Python built
-  // (_KdVisitor). Its band, Tier floors choice, Add to held pairs choice,
-  // category and tag never reach it: it is the primary band's run with the
+  // (_KdVisitor). Its band, Tier floors choice, Rebalance choice, category
+  // and tag never reach it: it is the primary band's run with the
   // tier floors on. A page whose section is static (no kd: no recorded band,
   // or its data could not be built) is left as Python drew it.
   function renderKd() {
@@ -14848,24 +14315,24 @@ _FILTER_JS = r"""
   function refreshDays() {
     daysSel.disabled = !D || !D.sell_blocks || sellAt(sellSel.value) === null;
   }
-  // The Min. price rise select counts only while Trim to Kelly is on: it is
-  // shut while trimming is off, and on a page whose base block carries no
+  // The Min. price movement select counts only while Rebalance is yes: it is
+  // shut while Rebalance is no, and on a page whose base block carries no
   // minimum. Shut, it keeps its value.
-  function refreshRise() {
-    riseSel.disabled = !D || !D.grid_trim_rise || !trimOn(trimSel.value);
+  function refreshMove() {
+    moveSel.disabled = !D || !D.grid_move || !rebalanceOn(rebalanceSel.value);
   }
-  // No sell level is built for a run that trims to Kelly: while Trim to
-  // Kelly is on, Sell is set to no level and shut, and it opens again when
-  // trimming goes off. A page without the Sell view keeps Sell shut. The
-  // Min. days and Min. price rise selects are opened or shut to match.
+  // No sell level is built for a run that rebalances: while Rebalance is yes,
+  // Sell is set to no level and shut, and it opens again when Rebalance goes
+  // back to no. A page without the Sell view keeps Sell shut. The Min. days
+  // and Min. price movement selects are opened or shut to match.
   function refreshSell() {
     if (D && D.sell_blocks) {
-      var trimming = trimOn(trimSel.value);
-      if (trimming) { sellSel.value = 'none'; }
-      sellSel.disabled = trimming;
+      var shut = rebalanceOn(rebalanceSel.value);
+      if (shut) { sellSel.value = 'none'; }
+      sellSel.disabled = shut;
     }
     refreshDays();
-    refreshRise();
+    refreshMove();
   }
   // Draw the scenario the selects and the menus' ticks name, from a chunk
   // (null for a scenario the run never simulated), and record it as SHOWN
@@ -14878,7 +14345,7 @@ _FILTER_JS = r"""
     C = chunk;
     refreshMenus();
     SHOWN = [bandIndex(), kIndex(), capIndex(), cats, tags, tierSel.value,
-             addSel.value, sellSel.value, daysSel.value, trimSel.value, riseSel.value];
+             rebalanceSel.value, sellSel.value, daysSel.value, moveSel.value];
     render(v, cats, tags);
     refreshSell();
     refreshSave();
@@ -14890,19 +14357,17 @@ _FILTER_JS = r"""
   // included — it reads SHOWN): every select goes back to it, and the menus'
   // ticks too, since ticks made while the chunk was loading were never
   // drawn either — the menus rebuilt for the ticks shown — and the line
-  // says what could not be shown, in Python's words; the Tier floors, Add
-  // to held pairs, Trim to Kelly, Min. price rise, Sell and Min. days
-  // choices go back too, with the band options named for the first, Sell
-  // shut again while trimming is shown, the Min. price rise select shut
-  // again when it is not, and the Min. days select shut again when Sell
-  // names none
+  // says what could not be shown, in Python's words; the Tier floors,
+  // Rebalance, Min. price movement, Sell and Min. days choices go back too,
+  // with the band options named for the first, Sell shut again while a
+  // rebalancing scenario is shown, the Min. price movement select shut again
+  // when one is not, and the Min. days select shut again when Sell names none
   function putBack(err) {
     var tried = scenario(), ticks = selectionName(catTicks(), tagTicks());
     bandSel.value = String(SHOWN[0]);
     tierSel.value = SHOWN[5];
-    addSel.value = SHOWN[6];
-    trimSel.value = SHOWN[9];
-    riseSel.value = SHOWN[10];
+    rebalanceSel.value = SHOWN[6];
+    moveSel.value = SHOWN[9];
     sellSel.value = SHOWN[7];
     daysSel.value = SHOWN[8];
     relabelBands();
@@ -14912,8 +14377,8 @@ _FILTER_JS = r"""
     refreshMenus();
     PICK = pickKey();
     refreshSell();
-    var still = scenarioAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[6], SHOWN[7],
-                           SHOWN[8], SHOWN[9], SHOWN[10]);
+    var still = scenarioAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[7], SHOWN[8],
+                           SHOWN[6], SHOWN[9]);
     // A mix that could not be shown: the ticks tried and the scenario they
     // were tried at, then what is ticked again now — and at which scenario,
     // when the selects went back to another one too
@@ -14980,7 +14445,7 @@ _FILTER_JS = r"""
     if (saveBtn) { saveBtn.disabled = true; }
     if (D) {
       var p = D.primary;
-      var here = scenarioAt(p[0], p[1], p[2], 'on', 'off', 'none', '0', 'off', '0');
+      var here = scenarioAt(p[0], p[1], p[2], 'on', 'none', '0', 'no', '0');
       setText('flt-summary', fill(D.text.unavailable,
                                   {failed: here, reason: reason, scenario: here}));
       return;
@@ -14990,8 +14455,8 @@ _FILTER_JS = r"""
   }
   // A browser can restore a <select>'s last choice, or a box's tick, on a
   // reload, or on going back; the page as rendered is the primary scenario's
-  // unfiltered view with the tier floors on, adding to held pairs off,
-  // trimming off, no minimum price rise and no sell level, so the bar is
+  // unfiltered view with the tier floors on, Rebalance no, no minimum price
+  // movement and no sell level, so the bar is
   // set back to it: every select to its rendered
   // option, both menus to nothing ticked. Python renders the selects and the
   // menus' boxes disabled: they are enabled once the
@@ -15028,17 +14493,17 @@ _FILTER_JS = r"""
     if (SEQ === 0) {
       C = chunk;
       // Nothing ticked: the two empty lists are SHOWN[3] and SHOWN[4]
-      SHOWN = D.primary.concat([[], [], tierSel.value, addSel.value, sellSel.value,
-                                daysSel.value, trimSel.value, riseSel.value]);
+      SHOWN = D.primary.concat([[], [], tierSel.value, rebalanceSel.value, sellSel.value,
+                                daysSel.value, moveSel.value]);
     }
-    // A run with no tier-off (or add-on, or trim, or Sell) view keeps that
-    // select disabled; the Min. days select opens only while Sell names a
-    // level, the Min. price rise select only while trimming is on, and Sell
-    // is shut while a trimming scenario is chosen (refreshSell, just below,
+    // A run with no tier-off (or Rebalance, or Sell) view keeps that select
+    // disabled; the Min. days select opens only while Sell names a level,
+    // the Min. price movement select only while Rebalance is yes, and Sell is
+    // shut while a rebalancing scenario is chosen (refreshSell, just below,
     // shuts what this loop opened)
     SELECTS.forEach(function(s) {
-      s.disabled = (s === tierSel && !D.grid_off) || (s === addSel && !D.grid_add)
-        || (s === trimSel && !D.grid_trim) || (s === sellSel && !D.sell_blocks);
+      s.disabled = (s === tierSel && !D.grid_off) || (s === rebalanceSel && !D.grid_rebalance)
+        || (s === sellSel && !D.sell_blocks);
     });
     menusDisabled(false);
     refreshSell();
@@ -15057,23 +14522,18 @@ _FILTER_JS = r"""
     relabelBands();
     choose();
   });
-  addSel.addEventListener('change', function() {
-    // Nothing to switch to without the add-on view (the select stays shut)
-    if (!D || !D.grid_add) { return; }
-    choose();
-  });
-  trimSel.addEventListener('change', function() {
-    // Nothing to switch to without the trim view (the select stays shut)
-    if (!D || !D.grid_trim) { return; }
-    // Sell goes to no level and shuts while trimming is on, and the Min.
-    // price rise select opens with it
+  rebalanceSel.addEventListener('change', function() {
+    // Nothing to switch to without the Rebalance view (the select stays shut)
+    if (!D || !D.grid_rebalance) { return; }
+    // Sell goes to no level and shuts while Rebalance is yes, and opens again
+    // when it goes back to no; the Min. price movement select opens with yes
     refreshSell();
     choose();
   });
-  riseSel.addEventListener('change', function() {
-    // The minimum counts only while trimming is on, on a page that carries
+  moveSel.addEventListener('change', function() {
+    // The minimum counts only while Rebalance is yes, on a page that carries
     // the minimums (the select is shut otherwise)
-    if (!D || !D.grid_trim_rise || !trimOn(trimSel.value)) { return; }
+    if (!D || !D.grid_move || !rebalanceOn(rebalanceSel.value)) { return; }
     choose();
   });
   sellSel.addEventListener('change', function() {
@@ -15201,7 +14661,7 @@ def generate_dashboard(
     cap the run offers (_grid_source) — is walked ONCE before anything is
     written (_build_filter_grid), because the header needs its result: a
     size-cap sweep's cells are simulated during that walk (the
-    tier-floors-off size-cap sweep's and the Add to held pairs family's too),
+    tier-floors-off size-cap sweep's and the Rebalance family's too),
     a size-cap sweep the walk could
     not use is named on the run-settings line (_run_settings_html's
     cap_sweep_unused, and tier_off_cap_sweep_unused for the tier-floors-off
@@ -15218,12 +14678,13 @@ def generate_dashboard(
     always written). When the sweep carries the Sell family and the walked
     grid fits it (_GridSource.sell), the Sell select is built after the walk
     (_build_sell_grid: every sell level and minimum of days of every cell
-    the bar shows, in up to sell_workers spawned worker processes, each new
-    trade list written as a sidecar chunk file in a new build folder beside
-    the page, DASHBOARD_FILES_DIRNAME / <build id> in the page's folder, and
-    each band's chunk ids under each Tier floors setting as a packed block
-    written after the page's own chunks); a failure costs the Sell select alone, and a folder no chunk
-    was written to is deleted. If the filter's data
+    the bar shows with Rebalance no, in up to
+    sell_workers spawned worker processes, each new trade list written as a
+    sidecar chunk file in a new build folder beside the page,
+    DASHBOARD_FILES_DIRNAME / <build id> in the page's folder, and each
+    band's chunk ids under each Tier floors setting as a packed block
+    written after the page's own chunks); a failure costs the Sell select
+    alone, and a folder no chunk was written to is deleted. If the filter's data
     cannot be built, the page is written without the bar and its script,
     with a notice in the bar's place (and in the k-hat breakdown's, which
     reads the same base block, and in the interval-discount section, which
@@ -15486,8 +14947,8 @@ def generate_dashboard(
             explorer_grid = explorer_data is not None and explorer_data.checks
             if source.sell is not None:
                 # Every sell level and minimum of days of every scenario the
-                # bar shows, in worker processes; a failure costs the Sell
-                # select alone
+                # bar shows with Rebalance no, in worker processes;
+                # a failure costs the Sell select alone
                 try:
                     build_folder = _new_build_folder(out_path)
                     sell_grid = _build_sell_grid(
@@ -15524,13 +14985,13 @@ def generate_dashboard(
                 # confirmation-page address: the run's same-title cap, whether
                 # trades are filed by Kalshi's series listing, the source note
                 save=_save_target(sweep, start_date, today, series_categories),
-                # Why the Add to held pairs select stays shut, should it: a
-                # run that carried the family but shows no view of it could
-                # not use or build it (the log says why); one that carried
-                # none has nothing to show
-                add_on_state=("unavailable"
-                              if getattr(sweep, "add_on_cap_sweep", None) is not None
-                              else "not simulated"),
+                # Why the Rebalance select stays shut, should it: a run that
+                # carried the family but shows no view of it could not use or
+                # build it (the log says why); one that carried none has
+                # nothing to show
+                rebalance_state=("unavailable"
+                                 if getattr(sweep, "rebalance_sweep", None) is not None
+                                 else "not simulated"),
                 # The same for the Sell select, whose chunks past the page's
                 # own are files in this build's folder beside the page
                 sell=sell_grid,
@@ -15538,14 +14999,12 @@ def generate_dashboard(
                             else "not simulated"),
                 sidecar_dir=(None if build_folder is None
                              else f"{DASHBOARD_FILES_DIRNAME}/{build_folder.name}"),
-                # The same for the Trim to Kelly select
-                trim_state=("unavailable" if getattr(sweep, "trim_sweep", None) is not None
-                            else "not simulated"),
-                # ... and for that family's minimum price rises: a run whose
-                # family carried some but whose page shows none could not
-                # read them (the log says why)
-                trim_rise_state=("unavailable" if getattr(
-                    getattr(sweep, "trim_sweep", None), "min_rises", ()) else "not simulated"))
+                # ... and for that family's minimum price movements: a run
+                # whose family carried some but whose page shows none could
+                # not read them (the log says why)
+                move_state=("unavailable" if getattr(
+                    getattr(sweep, "rebalance_sweep", None), "min_moves", ())
+                    else "not simulated"))
             filter_bar = _filter_bar_html(filter_data, chunker.primary_views or {})
             base_block = _packed_json_script("dash-data", filter_data)
             chunks = chunker.chunks

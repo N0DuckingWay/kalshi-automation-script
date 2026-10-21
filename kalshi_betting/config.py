@@ -38,14 +38,20 @@ Notes:
     days_to_maturity) live here, where seller.py may import them, so live
     selling and the backtest apply the same arithmetic. The rule that trims
     a held pair to its Kelly size (held_pair_win_prob, kelly_hold_fraction,
-    kelly_trim_count) lives here too, with the test that can hold a trim
-    back until the pair's price has risen (pair_price_rise,
-    trim_rise_reached) and the test that holds it back until enough days
-    have passed since the pair's last trade (kelly_trim_min_days,
-    kelly_trim_rested). The backtest and seller.plan_trims (live trims) both
-    call them; trade_day and kelly_trim_bids are for live trims only. A live
-    run's switch and minimum are LiveSettings.trim_to_kelly and
-    trim_min_rise.
+    kelly_trim_count) lives here too, with the two tests a rebalance (an
+    add-on to a held pair, or a trim of one) must pass first: that the
+    pair's price has moved far enough, up or down, since its last trade
+    (pair_price_move, price_move_reached), and that enough days have passed
+    since that trade (rebalance_min_days, rebalance_rested). The backtest,
+    seller.plan_trims (live trims) and seller.plan_add_ons (live add-ons)
+    call them; trade_day is for live rebalancing only, and kelly_trim_bids
+    for live trims only. A live run's switch and minimum
+    are LiveSettings.rebalance and min_price_move: with rebalance on, a
+    production run both trims held pairs and may add to them.
+    A saved file written by an older version, which held add_to_held_pairs,
+    trim_to_kelly and trim_min_rise instead, is refused as
+    LiveDefaultsOutdated, which carries what it reads as now (its proposal)
+    for the defaults server to offer for one more save.
 """
 import fcntl
 import json
@@ -521,42 +527,45 @@ TAKE_PROFIT_HOLD_DAYS = 3
 # held each of its trades at every check (trades are bought only at checkpoints).
 TAKE_PROFIT_HOLD_DAYS_MAX = 7
 
-# The price rises the backtest dashboard's "Min. price rise" select offers
-# beside "any": with Trim to Kelly on, a held pair is trimmed only once its
-# total price (the price of the side held on each of its two markets, added)
-# is at least this many dollars above where it stood at the last trade on the
-# pair (its purchase, an add-on or an earlier trim). A fall never counts.
-# Every 5c from 5c to 95c, 19 values, each the float nearest its cents over
-# 100 (so 15c is exactly the float 0.15), all distinct and in (0, 1].
-# Backtest only: read by backtester.run_backtest_sweep(trim_rise_sweep=True),
-# which checks them before its fetch. A live run uses its own saved minimum
-# (LiveSettings.trim_min_rise), which _step_rise holds to the same step,
-# TRIM_PRICE_RISE_STEP_CENTS, from 5c to $1.
-TRIM_PRICE_RISE_STEP_CENTS = 5
-TRIM_MIN_PRICE_RISES = tuple(
-    cents / 100 for cents in range(TRIM_PRICE_RISE_STEP_CENTS, 100, TRIM_PRICE_RISE_STEP_CENTS))
+# The price moves the backtest dashboard's "Min. price movement" select offers
+# beside "any". A rebalance (an add-on to a held pair, or a Kelly trim of one)
+# is made only once the pair's total price (the price of the side held on each
+# of its two markets, added) is at least this many dollars above or below
+# where it stood at the last trade on the pair (its purchase, an add-on or a
+# trim): a move up and a move down count alike. Every 5c from 5c to 95c, 19
+# values, each the float nearest its cents over 100 (so 15c is exactly the
+# float 0.15), all distinct and in (0, 1]. Backtest only: read by
+# backtester.run_backtest_sweep(move_sweep=True), which checks them
+# before its fetch. A live run uses its own saved minimum
+# (LiveSettings.min_price_move), which _step_move holds to the same step,
+# PRICE_MOVE_STEP_CENTS, from 5c to $1.
+PRICE_MOVE_STEP_CENTS = 5
+MIN_PRICE_MOVES = tuple(
+    cents / 100 for cents in range(PRICE_MOVE_STEP_CENTS, 100, PRICE_MOVE_STEP_CENTS))
 
 # Calendar days that must pass after the last trade of any sort on a held
-# pair (on either of its markets) before a Kelly trim may sell part of it.
-# Days are counted on the bot's own clock (trade_day) and kelly_trim_rested
-# reads no schedule, so a pair traded on a Tuesday may be trimmed from the
-# next Tuesday on, however often the bot runs. A whole number from 0 (no
-# wait) to the maximum below. Each module that applies the wait binds this
-# by value and checks its own copy, so a test patches that module's binding,
-# never config's.
-KELLY_TRIM_MIN_DAYS_SINCE_TRADE = 7
+# pair (on either of its markets) before it may be rebalanced: before a Kelly
+# trim may sell part of it, and before an add-on may buy more of it, live and
+# in the backtest alike. Days are counted on the bot's own clock (trade_day) and
+# rebalance_rested reads no schedule, so a pair traded on a Tuesday may be
+# rebalanced from the next Tuesday on, however often the bot runs. A whole
+# number from 0 (no wait) to the maximum below. Each module that applies the
+# wait binds this by value and checks its own copy, so a test patches that
+# module's binding, never config's.
+REBALANCE_MIN_DAYS_SINCE_TRADE = 7
 
 # The longest wait allowed. A live run sees a pair's last trade only as far
 # back as Kalshi's list of the account's fills reaches (Kalshi moves older
 # fills to an archive), so the wait must stay short enough for that list.
-KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX = 30
+REBALANCE_MIN_DAYS_SINCE_TRADE_MAX = 30
 
-# With a minimum price rise set, the oldest (in days) a quote may be for
-# seller.plan_trims to read a held market's price at its pair's last trade
-# (historical.ask_before: the latest usable ask of the side held on an
-# hourly candle that ended at or before then). With no usable quote in that
-# window the price is unknown and the pair is not trimmed.
-TRIM_PRICE_THEN_MAX_AGE_DAYS = 7
+# With a minimum price move set, the oldest (in days) a quote may be for
+# seller.plan_trims and seller.plan_add_ons to read a held market's price at
+# its pair's last trade (historical.ask_before: the latest usable ask of the
+# side held on an hourly candle that ended at or before then). With no usable
+# quote in that window the price is unknown and the pair is neither trimmed
+# nor added to.
+PRICE_THEN_MAX_AGE_DAYS = 7
 
 # How far below a held side's best bid, in dollars, a live Kelly trim may
 # sell. seller.plan_trims sizes and prices a trim only on the bids within
@@ -572,9 +581,9 @@ KELLY_TRIM_MAX_BID_DROP = 0.20
 
 # ── Live trading toggles ──────────────────────────────────────────────────────
 #
-# Twelve live toggles (TIME_SERIES_TIER_FLOORS, TIME_SERIES_SPREAD_BAND, TRADE_CATEGORIES,
-# TRADE_TAGS, ADD_TO_HELD_PAIRS, SELL_AT, SELL_MIN_DAYS, TRIM_TO_KELLY and TRIM_MIN_RISE
-# below; k, BUDGET_FRACTION and SAME_TITLE_SIZE_CAP above). They are NOT the live
+# Eleven live toggles (TIME_SERIES_TIER_FLOORS, TIME_SERIES_SPREAD_BAND, TRADE_CATEGORIES,
+# TRADE_TAGS, REBALANCE, MIN_PRICE_MOVE, SELL_AT and SELL_MIN_DAYS below; k,
+# BUDGET_FRACTION and SAME_TITLE_SIZE_CAP above). They are NOT the live
 # defaults: a live run starts only from the saved ones (LIVE_DEFAULTS_FILE, below) and
 # never falls back to these. They are the backtest's k and caps (backtester and
 # backtest bind them by value), and what live_settings() returns: the settings a live entry point
@@ -628,20 +637,35 @@ TRADE_TAGS: tuple[str, ...] | None = None
 # run page print a category and its tag the same way.
 TAG_SCOPE_SEPARATOR = " · "
 
-# Whether a live run may add to a pair the account already holds: exactly the
-# same two markets, buying the same side on each (scanner.held_pairs: two held
-# markets alone on one ladder, one YES and one NO of equal size, both costs
-# readable). The add-on is judged by every rule a new pair is. Kelly sizes the
-# whole position: the held pair (its worth at today's prices plus the fees
-# paid for it) and the add-on together stake at most min(f*, the pair's cap)
-# of the portfolio value (cash plus open positions), and the new stake is
-# never more than a new pair would stake (held_pair_fraction) nor more than
-# the cash. False: a held market is never traded again (DR-76). A live run
-# reads the saved live defaults' add_to_held_pairs instead (a saved file that
-# leaves the key out reads it as off), which main.py --add-to-held-pairs /
-# --no-add-to-held-pairs overrides for one run. The backtest never reads this
-# constant.
-ADD_TO_HELD_PAIRS = True
+# Whether a live run rebalances the pairs the account holds: on, a production
+# run, before it buys, sells part of each exact held pair (two held markets
+# alone on one question, one held YES and the other NO, in equal counts) worth
+# more than Kelly allows or more than its size cap (a Kelly trim:
+# main._run_prod, through seller.plan_trims), and may add to a pair it holds:
+# exactly the same two markets, buying the same side on each
+# (scanner.held_pairs: two held markets alone on one ladder, one YES and one
+# NO of equal size, both costs readable), or a lone held market whose partner
+# has paid out. An add-on is judged by every rule a new pair is. Kelly sizes
+# the whole position: the held pair (its worth at today's prices plus the
+# fees paid for it) and the add-on together stake at most min(f*, the pair's
+# cap) of the portfolio value (cash plus open positions), and the new stake
+# is never more than a new pair would stake (held_pair_fraction) nor more
+# than the cash. A trim and an add-on each wait REBALANCE_MIN_DAYS_SINCE_TRADE
+# days after the pair's last fill and, with MIN_PRICE_MOVE, for its price to
+# move that far (seller.plan_trims, seller.plan_add_ons).
+# Off: a held pair is neither added to (DR-76) nor trimmed.
+# A live run reads the saved live defaults' rebalance instead (a saved file
+# that leaves the key out reads it as off), which main.py --rebalance /
+# --no-rebalance overrides for one run. The backtest never reads this constant.
+REBALANCE = True
+
+# The least move, in dollars, up or down, in a held pair's total price since
+# its last trade before a live run rebalances it (a Kelly trim sells part of
+# it, or an add-on buys more of it): on the 5c grid
+# from 5c to $1, or None for no minimum. Only with REBALANCE on. A live run
+# reads the saved live defaults' min_price_move instead (main.py
+# --min-price-move CENTS / --no-min-price-move for one run).
+MIN_PRICE_MOVE: float | None = None
 
 # The share of its potential profit at which a held position is sold, on the
 # 1% grid (SELL_AT_STEP) in (0, 1], or None to never sell. A live run reads the
@@ -657,22 +681,6 @@ SELL_MIN_DAYS: int | None = None
 # The sell level's grid: SELL_AT, the saved sell_at and main.py's --sell-at (in
 # whole percent) must each be a multiple of it from 1% to 100%.
 SELL_AT_STEP = 0.01
-
-# The Kelly-trim switch: on, a production run sells, before it buys, part of
-# each exact held pair (two held markets alone on one question, one held YES
-# and the other NO, in equal counts) that is worth more than Kelly allows or
-# more than its size cap (main._run_prod, through seller.plan_trims). A live
-# run reads the saved live defaults' trim_to_kelly instead (missing from the
-# file: off), or main.py --trim-to-kelly / --no-trim-to-kelly for one run.
-# The backtest never reads this constant.
-TRIM_TO_KELLY = False
-
-# The least rise, in dollars, in a held pair's total price since its last
-# trade before a Kelly trim may sell part of it: on the 5c grid from 5c to $1,
-# or None for no minimum. Only with the switch above on. A live run reads the
-# saved live defaults' trim_min_rise instead (main.py --trim-min-rise CENTS /
-# --no-trim-min-rise for one run).
-TRIM_MIN_RISE: float | None = None
 
 # Why a plan sells held contracts (seller.SalePlan.kind): a take-profit sale
 # sells a whole position at its sell level (seller.plan_sales); a Kelly trim
@@ -713,7 +721,7 @@ LIVE_EXPOSURE_WARN_FRACTION = 0.20
 
 # ── Saved live defaults ───────────────────────────────────────────────────────
 
-# The live defaults every live run starts from: one JSON record of the twelve
+# The live defaults every live run starts from: one JSON record of the eleven
 # live toggles (any of _OPTIONAL_TOGGLES may be left out, and then reads as off),
 # saved through defaults_server's confirmation page
 # (python3 -m kalshi_betting.defaults_server; its --seed proposes
@@ -721,10 +729,12 @@ LIVE_EXPOSURE_WARN_FRACTION = 0.20
 # page's Confirm and save (or Confirm and trade, which saves before it runs
 # the bot), and read_saved_live_defaults / live_defaults read it. A live
 # run refuses to start without it; it never falls back to the toggle constants
-# above. main.py's flags still override it for one run. Read at call time
-# through this module's global, so tests can point it elsewhere
-# (tests/conftest.py). Operator state, like scheduler_state.json: gitignored,
-# in the checkout the scheduler runs from.
+# above. A file an older version saved, holding a setting this one replaced
+# (_RETIRED_TOGGLES), is refused too until it is saved again. main.py's flags
+# still override it for one run. Read at call time through this module's
+# global, so tests can point it elsewhere (tests/conftest.py). Operator state,
+# like scheduler_state.json: gitignored, in the checkout the scheduler runs
+# from.
 LIVE_DEFAULTS_FILE = PROJECT_ROOT / "live_defaults.json"
 
 # The format tag the saved file carries; a file with any other is refused.
@@ -903,10 +913,12 @@ BACKTEST_SWEEP_FILENAME = "backtest_sweep.pkl.gz"
 
 # The format the saved sweep file is written in: a gzip stream holding one
 # line of JSON (this tag, the simulator fingerprint, when it was saved,
-# under which Python, and the run's start date) and then the pickled inputs. A rebuild refuses a file
-# with any other tag; change it whenever the line's keys or the pickled
-# inputs' keys change, so an older file is refused rather than misread.
-BACKTEST_SWEEP_FORMAT = "backtest-sweep-v1"
+# under which Python, and the run's start date) and then the pickled inputs.
+# A rebuild refuses a file with any other tag; change it whenever the line's
+# keys, the pickled inputs' keys or the fields of the classes pickled in them
+# (BacktestSweep and the lazy families it holds) change, so an older file is
+# refused rather than misread.
+BACKTEST_SWEEP_FORMAT = "backtest-sweep-v2"
 
 # The most bytes a rebuild reads for the saved sweep file's first line (the
 # JSON one): the real line is a few hundred bytes, so a file that runs past
@@ -2954,12 +2966,12 @@ def _step_share(value, name: str) -> float:
     return round(SELL_AT_STEP * steps, 2)
 
 
-def _step_rise(value, name: str) -> float:
+def _step_move(value, name: str) -> float:
     """
-    Validate a minimum price rise and round it onto the 5c grid.
+    Validate a minimum price move and round it onto the 5c grid.
 
-    The grid (TRIM_PRICE_RISE_STEP_CENTS) is the dashboard's "Min. price
-    rise" step, so a live minimum always equals one of its options, or $1.
+    The grid (PRICE_MOVE_STEP_CENTS) is the dashboard's "Min. price movement"
+    step, so a live minimum always equals one of its options, or $1.
 
     Args:
         value: The minimum in dollars, from one step to 1.
@@ -2973,11 +2985,11 @@ def _step_rise(value, name: str) -> float:
     """
     if isinstance(value, bool) or not isinstance(value, numbers.Real):
         raise ValueError(f"{name} must be a number of dollars, got {value!r}")
-    step = TRIM_PRICE_RISE_STEP_CENTS
+    step = PRICE_MOVE_STEP_CENTS
     # NaN, infinities and values outside (0, 1] count as no steps, so nothing
     # too large to round is ever rounded
     steps = round(value * 100 / step) if 0.0 < value <= 1.0 else 0
-    # steps < 1 also refuses a rise within float noise of 0
+    # steps < 1 also refuses a minimum within float noise of 0
     if steps < 1 or abs(value - steps * step / 100) > PRICE_EPSILON:
         raise ValueError(f"{name} must be a multiple of {step}c from {step}c to $1, "
                          f"got {value!r}")
@@ -3165,24 +3177,25 @@ class LiveSettings:
             tied to a listed category ("Sports · Basketball") narrows that
             category alone (trade_filter is the rule). A tied tag whose
             category is not listed is refused.
-        add_to_held_pairs (bool): Whether a production run may add to a pair
-            the account already holds (exactly the same two markets, the same
-            side on each), with Kelly sizing the whole position; a real bool.
+        rebalance (bool): Whether a production run rebalances the pairs the
+            account holds: before it buys, it sells part of each exact held
+            pair grown past its Kelly size (a Kelly trim), and it may add to
+            a pair the account already holds (exactly the same two markets,
+            the same side on each, or a lone held market whose partner has
+            paid out), with Kelly sizing the whole position. A real bool.
             Default False, which is also what a saved file that leaves it out
             reads as.
+        min_price_move (float | None): The least move, up or down, in a held
+            pair's total price (a lone leg's: its one market's price) since
+            its last trade before it is rebalanced (a Kelly trim, or an
+            add-on), in dollars on the 5c grid from 5c to $1 (0.1 for 10c);
+            None (default) is no minimum. Refused with rebalance off.
         sell_at (float | None): The share of its potential profit at which a
             held position is sold, in (0, 1] on the 1% grid (0.85 for 85%); None
             (default) never sells.
         sell_min_days (int | None): The fewest whole days (an int, 1 or more)
             a position must have left before its last market stops trading to
             be sold; None (default) is no minimum. Refused without sell_at.
-        trim_to_kelly (bool): Whether a production run, before it buys, sells
-            part of each exact held pair grown past its Kelly size; a real
-            bool. Default False, also what a saved file without it reads as.
-        trim_min_rise (float | None): The least rise in a held pair's total
-            price since its last trade before a trim, in dollars on the 5c
-            grid from 5c to $1 (0.1 for 10c); None (default) is no minimum.
-            Refused with trim_to_kelly off.
         origin (str): Where these toggles' defaults were read: the saved defaults
             file with when (and from what) it was saved, or LIVE_DEFAULTS_FROM_CONFIG
             for toggles built from this module's constants (the default).
@@ -3203,11 +3216,10 @@ class LiveSettings:
     same_title_size_cap: float = 1.0
     categories: tuple[str, ...] | None = None
     tags: tuple[str, ...] | None = None
-    add_to_held_pairs: bool = False
+    rebalance: bool = False
+    min_price_move: float | None = None
     sell_at: float | None = None
     sell_min_days: int | None = None
-    trim_to_kelly: bool = False
-    trim_min_rise: float | None = None
     origin: str = field(default=LIVE_DEFAULTS_FROM_CONFIG, compare=False)
 
     def __post_init__(self) -> None:
@@ -3247,9 +3259,15 @@ class LiveSettings:
         _check_category_names(self.categories)
         _check_tied_tags(self.categories, self.tags)
         # A real bool, as tier_floors: a saved file's JSON 1 must be refused
-        if type(self.add_to_held_pairs) is not bool:
-            raise ValueError(
-                f"add_to_held_pairs must be True or False, got {self.add_to_held_pairs!r}")
+        if type(self.rebalance) is not bool:
+            raise ValueError(f"rebalance must be True or False, got {self.rebalance!r}")
+        if self.min_price_move is not None:
+            object.__setattr__(self, "min_price_move",
+                               _step_move(self.min_price_move, "min_price_move"))
+            # A minimum holds a rebalance back, so it means nothing with rebalancing off
+            if not self.rebalance:
+                raise ValueError("min_price_move needs rebalance on, got min_price_move "
+                                 f"{self.min_price_move!r} with rebalance off")
         if self.sell_at is not None:
             object.__setattr__(self, "sell_at", _step_share(self.sell_at, "sell_at"))
         if self.sell_min_days is not None:
@@ -3260,16 +3278,6 @@ class LiveSettings:
             if self.sell_at is None:
                 raise ValueError("sell_min_days needs a sell level (sell_at), got "
                                  f"sell_min_days {self.sell_min_days!r} with sell_at None")
-        # A real bool: a saved file's JSON 1 must be refused
-        if type(self.trim_to_kelly) is not bool:
-            raise ValueError(f"trim_to_kelly must be True or False, got {self.trim_to_kelly!r}")
-        if self.trim_min_rise is not None:
-            object.__setattr__(self, "trim_min_rise",
-                               _step_rise(self.trim_min_rise, "trim_min_rise"))
-            # A minimum holds a trim back, so it means nothing with trimming off
-            if not self.trim_to_kelly:
-                raise ValueError("trim_min_rise needs trim_to_kelly on, got trim_min_rise "
-                                 f"{self.trim_min_rise!r} with trim_to_kelly off")
         # One printable line: no newline, control, zero-width or text-direction
         # character, so it prints on one log line and cannot pass for other
         # text. Printable is not HTML-safe: a web page must still escape it
@@ -3278,31 +3286,36 @@ class LiveSettings:
             raise ValueError(f"origin must be a printable description, got {self.origin!r}")
 
 
-# The twelve toggles by field name: every LiveSettings field except origin
+# The eleven toggles by field name: every LiveSettings field except origin
 LIVE_TOGGLE_FIELDS = tuple(f.name for f in fields(LiveSettings) if f.compare)
 
 # Toggles a saved file may leave out. A missing one reads as its LiveSettings
 # default (all off, whatever config.py ships), since nobody confirmed a value
 # for it in that file. save_live_defaults leaves one out while it is at its
 # default, so code that does not know the toggle can still read the file.
-_OPTIONAL_TOGGLES = ("add_to_held_pairs", "sell_at", "sell_min_days",
-                     "trim_to_kelly", "trim_min_rise")
+_OPTIONAL_TOGGLES = ("rebalance", "min_price_move", "sell_at", "sell_min_days")
 # Each of those toggles' LiveSettings default
 _TOGGLE_DEFAULTS = {f.name: f.default for f in fields(LiveSettings)
                     if f.name in _OPTIONAL_TOGGLES}
+# Settings an older version saved, which rebalance and min_price_move replaced.
+# A saved file holding any of them is refused (LiveDefaultsOutdated) until it
+# is saved again, and the writer never writes them.
+_RETIRED_TOGGLES = ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise")
 
 # The values `python3 -m kalshi_betting.defaults_server --seed` offers for a
 # first save of the live defaults: tier floors off, spread band 0-0.5, k 0.80,
-# a 10% per-trade cap, a 20% same-title cap, any category or tag, no selling, no
-# trimming, and adding to held pairs on. One pair stakes at most 10% of the portfolio value; an
-# add-on to a held pair stakes no more than a new pair would, and keeps the
-# held pair (at today's prices, plus the fees paid for it) and the add-on
-# together within 10% of the portfolio value. Nothing trades on them until
-# they are confirmed and saved to LIVE_DEFAULTS_FILE.
+# a 10% per-trade cap, a 20% same-title cap, any category or tag, rebalancing
+# on with no minimum price movement, and no selling. One pair stakes at most
+# 10% of the portfolio value; an add-on to a held pair stakes no more than a
+# new pair would, and keeps the held pair (at today's prices, plus the fees
+# paid for it) and the add-on together within 10% of the portfolio value, and
+# a Kelly trim sells a held pair down to its Kelly size, at most that share.
+# Nothing trades on them
+# until they are confirmed and saved to LIVE_DEFAULTS_FILE.
 LIVE_DEFAULTS_SEED = LiveSettings(
     tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.80,
     size_cap=0.10, same_title_size_cap=0.20, categories=None, tags=None,
-    add_to_held_pairs=True)
+    rebalance=True)
 
 
 class LiveDefaultsError(ValueError):
@@ -3311,10 +3324,11 @@ class LiveDefaultsError(ValueError):
 
     Reading: something exists at the path but is not a regular file (a link
     to a file that does not exist included), is unreadable, too large, not
-    UTF-8, malformed or too deeply nested, or holds a value LiveSettings
-    refuses. Saving: the source note is refused, the settings would make a
-    file the reader refuses, the write fails, or the file does not read back
-    as what was written. The message names the file. It is a ValueError, so a
+    UTF-8, malformed or too deeply nested, holds a value LiveSettings
+    refuses, or holds settings an older version saved (LiveDefaultsOutdated).
+    Saving: the source note is refused, the settings would make a file the
+    reader refuses, the write fails, or the file does not read back as what
+    was written. The message names the file. It is a ValueError, so a
     caller handling an invalid constant also stops on it.
     """
 
@@ -3323,9 +3337,65 @@ class LiveDefaultsMissing(LiveDefaultsError):
     """No live defaults are saved (LIVE_DEFAULTS_FILE does not exist)."""
 
 
+class LiveDefaultsOutdated(LiveDefaultsError):
+    """
+    The saved file holds settings this version replaced (_RETIRED_TOGGLES).
+
+    An older version saved add_to_held_pairs, trim_to_kelly and
+    trim_min_rise, where this one has rebalance and min_price_move. A live
+    run refuses such a file, as it refuses any other, so it never trades
+    settings nobody confirmed in their new form. The defaults server offers
+    the proposal on its confirmation page, where one Confirm and save
+    replaces the file.
+
+    Attributes:
+        proposal (LiveSettings | None): What the file reads as now: rebalance
+            on only when both old switches were on, min_price_move the old
+            minimum then (otherwise none), every other setting as saved. None
+            when the rest of the file is refused too.
+    """
+
+    def __init__(self, message: str, proposal: "LiveSettings | None") -> None:
+        """
+        Keep the message and the proposal.
+
+        Args:
+            message (str): Names the file, the old settings it holds and the remedy.
+            proposal (LiveSettings | None): The file's settings in their new
+                form, or None when they cannot be read.
+        """
+        super().__init__(message)
+        self.proposal = proposal
+
+
+class _RetiredSettings(ValueError):
+    """
+    _saved_settings found settings this version replaced (_RETIRED_TOGGLES).
+
+    Internal: read_saved_live_defaults turns it into LiveDefaultsOutdated,
+    naming the file. It is a ValueError, so a caller that only parses (the
+    save's own check of the text it is about to write) refuses it like any
+    other bad file.
+
+    Attributes:
+        proposal (LiveSettings | None): As LiveDefaultsOutdated.proposal.
+    """
+
+    def __init__(self, message: str, proposal: "LiveSettings | None") -> None:
+        """
+        Keep the message and the proposal.
+
+        Args:
+            message (str): What the settings hold and the remedy, without the file.
+            proposal (LiveSettings | None): The settings in their new form, or None.
+        """
+        super().__init__(message)
+        self.proposal = proposal
+
+
 def live_settings() -> LiveSettings:
     """
-    Return config.py's own twelve toggle constants as LiveSettings, validated.
+    Return config.py's own eleven toggle constants as LiveSettings, validated.
 
     Read at call time, so a test that monkeypatches a constant here takes
     effect. It is NOT the live defaults: a live run starts only from the saved
@@ -3349,11 +3419,10 @@ def live_settings() -> LiveSettings:
         same_title_size_cap=SAME_TITLE_SIZE_CAP,
         categories=TRADE_CATEGORIES,
         tags=TRADE_TAGS,
-        add_to_held_pairs=ADD_TO_HELD_PAIRS,
+        rebalance=REBALANCE,
+        min_price_move=MIN_PRICE_MOVE,
         sell_at=SELL_AT,
         sell_min_days=SELL_MIN_DAYS,
-        trim_to_kelly=TRIM_TO_KELLY,
-        trim_min_rise=TRIM_MIN_RISE,
     )
 
 
@@ -3452,17 +3521,133 @@ def _filter_names(value, name: str) -> None:
             raise ValueError(f'"{name}" must hold printable names, got {item!r}')
 
 
+def _settings_from_toggles(raw, origin: str) -> LiveSettings:
+    """
+    Turn a saved file's "settings" object into LiveSettings, or refuse it.
+
+    Checks what LiveSettings cannot see in JSON: exactly the eleven toggle
+    names (a toggle in _OPTIONAL_TOGGLES may be left out, and then takes its
+    LiveSettings default, off), a spread band of two real numbers
+    (LiveSettings would read a JSON true as 1), no JSON true or false as a
+    sell level, minimum of days or minimum price move (refused here so the
+    error names the field), and printable filter names. LiveSettings then
+    validates every value.
+
+    Args:
+        raw: The file's "settings" value, as json.loads returned it.
+        origin (str): The origin the settings carry (the file and when it was saved).
+
+    Returns:
+        LiveSettings: The toggles.
+
+    Raises:
+        ValueError: Naming the first rule the settings break.
+    """
+    # Every toggle but the optional ones is required; nothing else is allowed
+    required = set(LIVE_TOGGLE_FIELDS) - set(_OPTIONAL_TOGGLES)
+    if not isinstance(raw, dict) or not required <= set(raw) <= set(LIVE_TOGGLE_FIELDS):
+        raise ValueError(f'"settings" must hold exactly {", ".join(LIVE_TOGGLE_FIELDS)} '
+                         f'({", ".join(_OPTIONAL_TOGGLES)} may be left out, and then '
+                         "each reads as off)")
+    band = raw["spread_band"]
+    if not (isinstance(band, list) and len(band) == 2 and all(
+            isinstance(x, (int, float)) and not isinstance(x, bool) for x in band)):
+        raise ValueError(f'"spread_band" must be [floor, ceiling], got {band!r}')
+    # LiveSettings refuses a JSON true or false too; refusing it here names the field
+    for name in ("sell_at", "sell_min_days", "min_price_move"):
+        if isinstance(raw.get(name), bool):
+            raise ValueError(f'"{name}" must be a number or null, got {raw[name]!r}')
+    for name in ("categories", "tags"):
+        _filter_names(raw[name], name)
+    return LiveSettings(**{**raw, "spread_band": tuple(band)}, origin=origin)
+
+
+def _retired_proposal(raw: dict, origin: str) -> LiveSettings:
+    """
+    Read a "settings" object an older version saved as the settings it means now.
+
+    The older version had two switches and a minimum: add_to_held_pairs,
+    trim_to_kelly and trim_min_rise. Rebalance does both together, so it is
+    on only when both old switches were on, and its minimum (min_price_move)
+    is the old trim minimum then; with either switch off, rebalance is off
+    and there is no minimum. Every other setting is as saved. The old values
+    must be what the older version accepted (real true/false switches, a
+    minimum on the 5c grid only with trim_to_kelly on), and the result must
+    pass every check a saved file does (_settings_from_toggles).
+
+    Args:
+        raw (dict): The file's "settings" object, holding one or more of
+            _RETIRED_TOGGLES.
+        origin (str): The origin the result carries (the file and when it was saved).
+
+    Returns:
+        LiveSettings: The settings in their new form.
+
+    Raises:
+        ValueError: The old values, or the rest of the settings, are refused;
+            or the object also holds rebalance or min_price_move, so it says
+            two things at once.
+    """
+    if "rebalance" in raw or "min_price_move" in raw:
+        raise ValueError("it also holds rebalance or min_price_move")
+    for name in ("add_to_held_pairs", "trim_to_kelly"):
+        if name in raw and type(raw[name]) is not bool:
+            raise ValueError(f'"{name}" must be true or false, got {raw[name]!r}')
+    rise = raw.get("trim_min_rise")
+    if isinstance(rise, bool):
+        raise ValueError(f'"trim_min_rise" must be a number or null, got {rise!r}')
+    if rise is not None:
+        # The older version's own rules: on the 5c grid, and only with trimming on
+        _step_move(rise, "trim_min_rise")
+        if raw.get("trim_to_kelly") is not True:
+            raise ValueError(f'"trim_min_rise" needs trim_to_kelly on, got {rise!r} '
+                             "with trim_to_kelly off")
+    rebalance = raw.get("add_to_held_pairs") is True and raw.get("trim_to_kelly") is True
+    toggles = {name: value for name, value in raw.items() if name not in _RETIRED_TOGGLES}
+    toggles["rebalance"] = rebalance
+    if rebalance and rise is not None:
+        toggles["min_price_move"] = rise
+    return _settings_from_toggles(toggles, origin)
+
+
+def _retired_message(retired: list[str], proposal: LiveSettings | None,
+                     refused: str | None) -> str:
+    """
+    Say what an outdated saved file holds and how to save it again.
+
+    Args:
+        retired (list[str]): The retired settings the file holds, in
+            _RETIRED_TOGGLES' order.
+        proposal (LiveSettings | None): What the file reads as now, or None.
+        refused (str | None): Why the rest of the file is refused, when
+            proposal is None.
+
+    Returns:
+        str: One line, e.g. '"settings" holds add_to_held_pairs, trim_to_kelly
+            and trim_min_rise, which rebalance and min_price_move replaced:
+            save the live defaults again (start ./start_dashboard.sh; its
+            pages offer them as rebalance yes, min price movement 10c)'.
+    """
+    held = retired[0] if len(retired) == 1 else ", ".join(retired[:-1]) + " and " + retired[-1]
+    head = f'"settings" holds {held}, which rebalance and min_price_move replaced'
+    if proposal is None:
+        return (f"{head}, and its other settings are refused too ({refused}): save the "
+                "live defaults again (start ./start_dashboard.sh and save new ones from "
+                "its pages, from the seed values or the backtest dashboard)")
+    offered = ("rebalance yes, min price movement " + _move_text(proposal.min_price_move)
+               if proposal.rebalance else "rebalance no")
+    return (f"{head}: save the live defaults again (start ./start_dashboard.sh; its pages "
+            f"offer them as {offered})")
+
+
 def _saved_settings(record) -> LiveSettings:
     """
     Turn a parsed saved-defaults record into LiveSettings, or refuse it.
 
-    Checks what LiveSettings cannot see in JSON: the file's keys and format, the
-    save time, the source note, exactly the twelve toggle names (a toggle in
-    _OPTIONAL_TOGGLES may be left out, and then takes its LiveSettings
-    default, off), a spread band of two real numbers (LiveSettings would read
-    a JSON true as 1), no JSON true or false as a sell level, minimum of days
-    or minimum price rise (refused here so the error names the field), and
-    printable filter names. LiveSettings then validates every value.
+    Checks the file's keys and format, the save time and the source note,
+    then the settings (_settings_from_toggles). Settings that hold any of
+    _RETIRED_TOGGLES (a file an older version saved) are refused before
+    that check, with what they read as now (_retired_proposal) attached.
 
     Args:
         record: What json.loads returned for the file.
@@ -3472,6 +3657,8 @@ def _saved_settings(record) -> LiveSettings:
             saved and (when there is one) the source note.
 
     Raises:
+        _RetiredSettings: The settings hold a retired setting; it carries the
+            proposal (None when the rest of the settings are refused too).
         ValueError: Naming the first rule the record breaks.
     """
     if not isinstance(record, dict) or set(record) != set(_SAVED_KEYS):
@@ -3491,24 +3678,17 @@ def _saved_settings(record) -> LiveSettings:
                          f"got {saved_at!r}")
     source = live_defaults_source(record["source"])
     raw = record["settings"]
-    # Every toggle but the optional ones is required; nothing else is allowed
-    required = set(LIVE_TOGGLE_FIELDS) - set(_OPTIONAL_TOGGLES)
-    if not isinstance(raw, dict) or not required <= set(raw) <= set(LIVE_TOGGLE_FIELDS):
-        raise ValueError(f'"settings" must hold exactly {", ".join(LIVE_TOGGLE_FIELDS)} '
-                         f'({", ".join(_OPTIONAL_TOGGLES)} may be left out, and then '
-                         "each reads as off)")
-    band = raw["spread_band"]
-    if not (isinstance(band, list) and len(band) == 2 and all(
-            isinstance(x, (int, float)) and not isinstance(x, bool) for x in band)):
-        raise ValueError(f'"spread_band" must be [floor, ceiling], got {band!r}')
-    # LiveSettings refuses a JSON true or false too; refusing it here names the field
-    for name in ("sell_at", "sell_min_days", "trim_min_rise"):
-        if isinstance(raw.get(name), bool):
-            raise ValueError(f'"{name}" must be a number or null, got {raw[name]!r}')
-    for name in ("categories", "tags"):
-        _filter_names(raw[name], name)
     origin = f"{LIVE_DEFAULTS_FILE.name}, saved {saved_at}" + (f" from {source}" if source else "")
-    return LiveSettings(**{**raw, "spread_band": tuple(band)}, origin=origin)
+    retired = [name for name in _RETIRED_TOGGLES if isinstance(raw, dict) and name in raw]
+    if retired:
+        # Never read as the new settings: refused, with what they would read as
+        # attached for the defaults server to offer
+        try:
+            proposal, refused = _retired_proposal(raw, origin), None
+        except (TypeError, ValueError) as exc:
+            proposal, refused = None, str(exc)
+        raise _RetiredSettings(_retired_message(retired, proposal, refused), proposal)
+    return _settings_from_toggles(raw, origin)
 
 
 def _settings_from_bytes(data: bytes) -> LiveSettings:
@@ -3530,7 +3710,8 @@ def _settings_from_bytes(data: bytes) -> LiveSettings:
         ValueError: The bytes are over LIVE_DEFAULTS_MAX_BYTES, are not UTF-8
             or not JSON (UnicodeDecodeError and JSONDecodeError are
             ValueErrors), hold a repeated key or NaN / Infinity, or break a
-            rule of _saved_settings or LiveSettings.
+            rule of _saved_settings or LiveSettings; _RetiredSettings (a
+            ValueError) when the settings hold one of _RETIRED_TOGGLES.
         TypeError: A value's type trips a check that raises TypeError rather
             than ValueError; both callers treat it as a refusal.
         RecursionError: The document is nested too deeply to parse.
@@ -3554,26 +3735,32 @@ def read_saved_live_defaults() -> LiveSettings | None:
     - "format": LIVE_DEFAULTS_FORMAT;
     - "saved_at": UTC, e.g. 2026-09-27T21:05:13Z;
     - "source": a note (live_defaults_source's rules);
-    - "settings": the twelve toggles by LiveSettings field name. tier_floors is
+    - "settings": the eleven toggles by LiveSettings field name. tier_floors is
       true/false, spread_band is [floor, ceiling], interval_discount, size_cap
       and same_title_size_cap are numbers (the caps as fractions),
-      categories and tags are null (any) or a list of names, and
-      add_to_held_pairs is true/false or left out, which reads as off.
-      sell_at (a share, e.g. 0.85) and sell_min_days (whole days) are numbers,
-      or null or left out for off. trim_to_kelly is like add_to_held_pairs,
-      and trim_min_rise is dollars (0.1 for 10c), or null or left out for off.
+      categories and tags are null (any) or a list of names, rebalance is
+      true/false or left out, which reads as off, and min_price_move is
+      dollars (0.1 for 10c), or null or left out for no minimum. sell_at (a
+      share, e.g. 0.85) and sell_min_days (whole days) are numbers, or null
+      or left out for off.
 
     Refused on top of that: a repeated key, NaN or Infinity, a file over
     LIVE_DEFAULTS_MAX_BYTES, any value LiveSettings rejects, and anything at
     the path that is not a regular file (a directory or a FIFO, say, which is
     refused without waiting on it, or a link to a file that does not exist).
-    A link to a regular file is read through.
+    A link to a regular file is read through. Settings that hold any of
+    _RETIRED_TOGGLES (add_to_held_pairs, trim_to_kelly, trim_min_rise: what an
+    older version saved in place of rebalance and min_price_move) are refused
+    as LiveDefaultsOutdated, which carries what they read as now.
 
     Returns:
         LiveSettings | None: The toggles, their origin naming the file and when
             they were saved; None when nothing is at the path.
 
     Raises:
+        LiveDefaultsOutdated: The settings hold a retired setting; the message
+            names the file and the remedy, and .proposal is the settings in
+            their new form (None when the rest of the file is refused too).
         LiveDefaultsError: Something exists at the path but breaks a rule
             above; the message names the file.
     """
@@ -3606,6 +3793,10 @@ def read_saved_live_defaults() -> LiveSettings | None:
             os.close(fd)
     try:
         return _settings_from_bytes(data)
+    except _RetiredSettings as exc:
+        # Saved by an older version: refused like any other bad file, with the
+        # settings it means now attached for the defaults server to offer
+        raise LiveDefaultsOutdated(f"{path}: {exc}", exc.proposal) from exc
     except (TypeError, ValueError, RecursionError) as exc:
         raise LiveDefaultsError(f"{path}: {exc}") from exc
 
@@ -3626,6 +3817,7 @@ def live_defaults() -> LiveSettings:
     Raises:
         LiveDefaultsMissing: No file is saved; the message names the file and
             the two ways to create it.
+        LiveDefaultsOutdated: The file holds settings an older version saved.
         LiveDefaultsError: The file is refused.
     """
     saved = read_saved_live_defaults()
@@ -3707,10 +3899,13 @@ def save_live_defaults(settings: LiveSettings, *, source: str) -> LiveSettings:
     this process id, flushed, and renamed over the file, so a reader at the
     same moment sees the old file or the new one, never part of one. The
     directory is flushed too, so the rename survives a power cut. The file is
-    then read back from disk and must equal settings (the twelve toggles;
+    then read back from disk and must equal settings (the eleven toggles;
     origin is not compared). A toggle in _OPTIONAL_TOGGLES is written only
-    when it is not at its default, so a file with all five off holds only the
+    when it is not at its default, so a file with all four off holds only the
     seven other toggles, which code that does not know them can still read.
+    Only the eleven toggles' names are written, never one of
+    _RETIRED_TOGGLES, so a save replaces a file an older version saved with
+    one every live run reads.
 
     Args:
         settings (LiveSettings): The new defaults.
@@ -3930,7 +4125,7 @@ def max_kelly_fraction(pair_type: str, settings: LiveSettings) -> float:
         and no time-series trade can size.
     same_title: f* = (p - c)/(1 - c) < p = SAME_TITLE_CO_RESOLVE_PROB.
 
-    It bounds an add-on to a held pair too (settings.add_to_held_pairs):
+    It bounds an add-on to a held pair too (with settings.rebalance on):
     held_pair_fraction never gives an add-on more than a new pair would get,
     and keeps the held pair's whole position, old and new together, within
     that same share of the portfolio value (cash plus open positions, the
@@ -4047,10 +4242,11 @@ def days_to_maturity(close_dates, day: date) -> int | None:
 # live here, not in strategy.py, so seller.py may import them. Then:
 # - kelly_trim_bids (live only) drops bids too far below a held side's best
 #   bid (the backtest's modeled ladder already ends there);
-# - pair_price_rise and trim_rise_reached ask whether the pair's price has
-#   risen enough since its last trade for a trim to be considered;
-# - kelly_trim_rested asks whether enough calendar days have passed since
-#   that trade (kelly_trim_min_days checks the number of days; trade_day,
+# - pair_price_move and price_move_reached ask whether the pair's price has
+#   moved far enough, up or down, since its last trade for a rebalance (a
+#   trim or an add-on) to be considered;
+# - rebalance_rested asks whether enough calendar days have passed since
+#   that trade (rebalance_min_days checks the number of days; trade_day,
 #   live only, turns a time into a day on the bot's clock). It compares two
 #   plain dates and reads no schedule, so the answer is the same however
 #   often a run happens.
@@ -4288,17 +4484,18 @@ def kelly_trim_bids(ladder, max_drop: float) -> list:
     return [level for level in ladder if level[0] >= lowest]
 
 
-def pair_price_rise(price_then: float, price_now: float) -> float:
+def pair_price_move(price_then: float, price_now: float) -> float:
     """
-    Return how far a held pair's total price has risen since the last trade on it.
+    Return how far a held pair's total price has moved since the last trade on it (now less then).
 
     A pair's total price is the price of the side held on each of its two
     markets, added: YES on the earlier market plus NO on the later one for a
     time-series pair, NO on the first plus YES on the second for a same-title
-    pair. Both prices must be the same kind of quote (two asks, say), so the
-    gap between a market's bid and ask never reads as a rise. This is the one
-    place the direction is decided: a caller hands in the two prices and never
-    subtracts them itself.
+    pair. (For a lone leg, one held market whose partner has paid out, it is
+    that one market's price.) Both prices must be the same kind of quote (two
+    asks, say), so the gap between a market's bid and ask never reads as a
+    move. This is the one place the sign is decided: a caller hands in the two
+    prices and never subtracts them itself.
 
     Args:
         price_then (float): The pair's total price at the last trade on it
@@ -4312,44 +4509,46 @@ def pair_price_rise(price_then: float, price_now: float) -> float:
     return price_now - price_then
 
 
-def trim_rise_reached(rise: float, min_rise: float | None) -> bool:
+def price_move_reached(move: float, min_move: float | None) -> bool:
     """
-    Return whether a held pair's price has risen far enough for a Kelly trim to be considered.
+    Return whether a held pair's price has moved far enough, up or down, for a rebalance.
 
-    With a minimum set, a pair is looked at for trimming only once its total
-    price is at least that far above where it stood at the last trade on it.
-    A fall never counts, however large. The comparison allows PRICE_EPSILON
-    of float noise, so a rise that is exactly the minimum (0.87 - 0.62
-    against 0.25) passes.
+    A rebalance is an add-on to a held pair or a Kelly trim of one. With a
+    minimum set, a pair is added to or trimmed only once its total price is
+    at least that far above or below where it stood at the last trade on it:
+    a rise and a fall of the same size count alike. The comparison allows
+    PRICE_EPSILON of float noise, so a move that is exactly the minimum
+    (0.87 - 0.62 against 0.25, or 0.62 - 0.87) passes.
 
     Args:
-        rise (float): How far the pair's total price has risen
-            (pair_price_rise), in dollars; negative for a fall.
-        min_rise (float | None): The least rise a trim needs, in dollars; None
-            for no minimum.
+        move (float): How far the pair's total price has moved
+            (pair_price_move), in dollars; negative for a fall.
+        min_move (float | None): The least move a rebalance needs, in
+            dollars; None for no minimum.
 
     Returns:
-        bool: True with no minimum, whatever the rise. With one: whether the
-            rise is at least the minimum. False when the rise or the minimum
-            is not a number.
+        bool: True with no minimum, whatever the move. With one: whether the
+            move's size is at least the minimum. False when the move or the
+            minimum is not a number.
     """
-    if min_rise is None:
+    if min_move is None:
         return True
-    # A rise that is not a number compares False, which holds the trim back
-    return math.isfinite(min_rise) and rise >= min_rise - PRICE_EPSILON
+    # abs of NaN is NaN, which compares False and holds the add-on or trim back
+    return math.isfinite(min_move) and abs(move) >= min_move - PRICE_EPSILON
 
 
-def kelly_trim_min_days(days) -> int:
+def rebalance_min_days(days) -> int:
     """
-    Check the days a held pair must go without a trade before a Kelly trim, and return them.
+    Check the days a held pair must go without a trade before a rebalance, and return them.
 
-    Each module that applies the wait checks its own copy of
-    KELLY_TRIM_MIN_DAYS_SINCE_TRADE here, so a mistyped constant stops the
-    run instead of shortening the wait; kelly_trim_rested checks it too.
+    The wait applies to Kelly trims and to add-ons alike. Each
+    module that applies it checks its own copy of
+    REBALANCE_MIN_DAYS_SINCE_TRADE here, so a mistyped constant stops the
+    run instead of shortening the wait; rebalance_rested checks it too.
 
     Args:
         days: A whole number from 0 (no wait) to
-            KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX. A bool, a float (even 7.0)
+            REBALANCE_MIN_DAYS_SINCE_TRADE_MAX. A bool, a float (even 7.0)
             and a numpy duration (timedelta64) are refused.
 
     Returns:
@@ -4367,9 +4566,9 @@ def kelly_trim_min_days(days) -> int:
             whole = operator.index(days)
         except TypeError:
             whole = None
-    if whole is None or not 0 <= whole <= KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX:
-        raise ValueError("KELLY_TRIM_MIN_DAYS_SINCE_TRADE must be a whole number from 0 to "
-                         f"{KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX}, got {days!r}")
+    if whole is None or not 0 <= whole <= REBALANCE_MIN_DAYS_SINCE_TRADE_MAX:
+        raise ValueError("REBALANCE_MIN_DAYS_SINCE_TRADE must be a whole number from 0 to "
+                         f"{REBALANCE_MIN_DAYS_SINCE_TRADE_MAX}, got {days!r}")
     return whole
 
 
@@ -4379,7 +4578,7 @@ def trade_day(moment: datetime, run: ScheduledRun) -> date:
 
     The bot's clock is its schedule's time zone (Pacific for SCHEDULED_RUN),
     so a trade at 5:01pm Pacific belongs to that Pacific day although it is
-    already the next day in UTC. kelly_trim_rested counts days between two
+    already the next day in UTC. rebalance_rested counts days between two
     of these. Only the zone of `run` is read.
 
     Args:
@@ -4402,21 +4601,22 @@ def trade_day(moment: datetime, run: ScheduledRun) -> date:
     return moment.astimezone(run.zone()).date()
 
 
-def kelly_trim_rested(last_trade: date, day: date, min_days: int) -> bool:
+def rebalance_rested(last_trade: date, day: date, min_days: int) -> bool:
     """
-    Return whether a held pair has gone enough days without a trade for a Kelly trim.
+    Return whether a held pair has gone enough days without a trade for a rebalance.
 
-    With 7, a pair last traded on a Tuesday may be trimmed from the next
-    Tuesday on. It reads only the two dates, so it holds however often runs
-    happen. A last trade dated after `day` never counts as rested. Both dates
-    must be on one clock (live: trade_day of each time). A caller that does
-    not know a pair's last trade must not ask: None is refused, never read
-    as "never traded".
+    A rebalance is a Kelly trim or an add-on. With 7, a pair
+    last traded on a Tuesday may be rebalanced from the next Tuesday on. It
+    reads only the two dates, so it holds however often runs happen. A last
+    trade dated after `day` never counts as rested. Both dates must be on
+    one clock (live: trade_day of each time). A caller that does not know a
+    pair's last trade must not ask: None is refused, never read as "never
+    traded".
 
     Args:
         last_trade (date): The day of the pair's last trade of any sort.
-        day (date): The day the trim would happen.
-        min_days (int): KELLY_TRIM_MIN_DAYS_SINCE_TRADE; 0 for no wait.
+        day (date): The day the trim or add-on would happen.
+        min_days (int): REBALANCE_MIN_DAYS_SINCE_TRADE; 0 for no wait.
 
     Returns:
         bool: True when `day` is at least `min_days` days after `last_trade`.
@@ -4424,13 +4624,13 @@ def kelly_trim_rested(last_trade: date, day: date, min_days: int) -> bool:
     Raises:
         TypeError: Either date is not a plain date (a datetime too: whole
             24-hour spans can be a day short of the calendar days).
-        ValueError: `min_days` is not one kelly_trim_min_days accepts.
+        ValueError: `min_days` is not one rebalance_min_days accepts.
     """
     # Exactly a date: a datetime is a date subclass, and None is refused
     if type(last_trade) is not date or type(day) is not date:
-        raise TypeError("kelly_trim_rested reads two calendar dates (trade_day of each "
+        raise TypeError("rebalance_rested reads two calendar dates (trade_day of each "
                         f"time), got {last_trade!r} and {day!r}")
-    return (day - last_trade).days >= kelly_trim_min_days(min_days)
+    return (day - last_trade).days >= rebalance_min_days(min_days)
 
 
 def _exact_number(value: float) -> str:
@@ -4586,19 +4786,19 @@ def _sell_at_text(level: float | None) -> str:
     return f"{round(level * 100)}% of potential profit"
 
 
-def _rise_text(rise: float | None) -> str:
+def _move_text(move: float | None) -> str:
     """
-    Name a validated minimum price rise on the "Live settings:" line.
+    Name a validated minimum price move on the "Live settings:" line.
 
     Args:
-        rise (float | None): LiveSettings.trim_min_rise (on the 5c grid), or None.
+        move (float | None): LiveSettings.min_price_move (on the 5c grid), or None.
 
     Returns:
         str: "any" for None, else whole cents: "10c" for 0.1, "100c" for 1.0.
     """
-    if rise is None:
+    if move is None:
         return "any"
-    return f"{round(rise * 100)}c"
+    return f"{round(move * 100)}c"
 
 
 # Every live toggle as the "Live settings:" line (describe_live_settings) and
@@ -4613,11 +4813,10 @@ _LIVE_SETTING_FIELDS = (
     ("same-title cap", "same_title_size_cap", lambda v: _cap_text(v, "no extra cap")),
     ("categories", "categories", _names_text),
     ("tags", "tags", _names_text),
-    ("add to held pairs", "add_to_held_pairs", lambda v: "on" if v else "off"),
+    ("rebalance", "rebalance", lambda v: "yes" if v else "no"),
+    ("min price movement", "min_price_move", _move_text),
     ("sell at", "sell_at", _sell_at_text),
     ("min days to maturity", "sell_min_days", lambda v: "any" if v is None else str(v)),
-    ("trim to Kelly", "trim_to_kelly", lambda v: "on" if v else "off"),
-    ("min price rise", "trim_min_rise", _rise_text),
 )
 
 
@@ -4727,8 +4926,8 @@ def describe_live_settings(settings: LiveSettings, reference: LiveSettings | Non
     Returns:
         str: e.g. "tier floors off | spread band 0-0.5 | k 0.8 | per-trade cap
             100% (no cap) | same-title cap 20% | categories any | tags any |
-            add to held pairs on | sell at off | min days to maturity any |
-            trim to Kelly off | min price rise any",
+            rebalance yes | min price movement any | sell at off | min days to
+            maturity any",
             with " (default: X)" after each field that differs from reference's
             when reference is the saved live defaults (its origin is anything
             but LIVE_DEFAULTS_FROM_CONFIG), " (config: X)" when it was built
@@ -4778,7 +4977,7 @@ def live_settings_changes(current: LiveSettings | None,
 
 def live_settings_argv(settings: LiveSettings) -> list[str]:
     """
-    Spell a run's settings as main.py's toggle flags, all twelve toggles.
+    Spell a run's settings as main.py's toggle flags, all eleven toggles.
 
     A program that starts main.py with these flags gets a run that trades
     exactly these settings, whatever the saved live defaults say:
@@ -4788,12 +4987,11 @@ def live_settings_argv(settings: LiveSettings) -> list[str]:
     makes exact. The other numbers are written as their repr, which float()
     reads back exactly. Each category or tag is written as --category=NAME or
     --tag=NAME, so a name that begins with "-" still reads as a name; no
-    filter is written as --any-category or --any-tag. Adding to held pairs is
-    written either way (--add-to-held-pairs / --no-add-to-held-pairs), so a
-    saved value never decides it. So are the sell level and its minimum
-    (--sell-at=85 / --no-sell, --sell-min-days=7 / --no-sell-min-days), the
-    Kelly-trim switch (--trim-to-kelly / --no-trim-to-kelly) and its minimum
-    price rise in whole cents (--trim-min-rise=10 / --no-trim-min-rise).
+    filter is written as --any-category or --any-tag. Rebalancing is written
+    either way (--rebalance / --no-rebalance), so a saved value never decides
+    it, and so is its minimum price move in whole cents (--min-price-move=10
+    / --no-min-price-move), the sell level and its minimum (--sell-at=85 /
+    --no-sell, --sell-min-days=7 / --no-sell-min-days).
 
     Args:
         settings (LiveSettings): The settings to spell.
@@ -4801,9 +4999,9 @@ def live_settings_argv(settings: LiveSettings) -> list[str]:
     Returns:
         list[str]: The flags, in the order main.py lists them: the tier-floor
             switch, --spread-min, --spread-max, --interval-discount,
-            --size-cap, --same-title-size-cap, the add-to-held-pairs switch,
-            the two sell flags, the two trim flags, then the category flags
-            and the tag flags.
+            --size-cap, --same-title-size-cap, the rebalance switch and its
+            minimum, the two sell flags, then the category flags and the tag
+            flags.
     """
     argv = ["--tier-floors" if settings.tier_floors else "--no-tier-floors",
             f"--spread-min={settings.spread_band[0]!r}",
@@ -4811,17 +5009,15 @@ def live_settings_argv(settings: LiveSettings) -> list[str]:
             f"--interval-discount={settings.interval_discount!r}",
             f"--size-cap={round(settings.size_cap * 100)}",
             f"--same-title-size-cap={round(settings.same_title_size_cap * 100)}",
-            "--add-to-held-pairs" if settings.add_to_held_pairs
-            else "--no-add-to-held-pairs"]
+            "--rebalance" if settings.rebalance else "--no-rebalance"]
+    # The minimum price move is a multiple of 5c, so its whole cents are exact
+    argv += ([f"--min-price-move={round(settings.min_price_move * 100)}"]
+             if settings.min_price_move is not None else ["--no-min-price-move"])
     # The sell level is a multiple of 1%, so its whole percent is exact
     argv += ([f"--sell-at={round(settings.sell_at * 100)}"] if settings.sell_at is not None
              else ["--no-sell"])
     argv += ([f"--sell-min-days={settings.sell_min_days}"]
              if settings.sell_min_days is not None else ["--no-sell-min-days"])
-    argv.append("--trim-to-kelly" if settings.trim_to_kelly else "--no-trim-to-kelly")
-    # The minimum price rise is a multiple of 5c, so its whole cents are exact
-    argv += ([f"--trim-min-rise={round(settings.trim_min_rise * 100)}"]
-             if settings.trim_min_rise is not None else ["--no-trim-min-rise"])
     argv += ([f"--category={name}" for name in settings.categories]
              if settings.categories is not None else ["--any-category"])
     argv += ([f"--tag={name}" for name in settings.tags]
@@ -4848,12 +5044,11 @@ def live_rule_warnings(settings: LiveSettings) -> list[str]:
           whole position, as a share of the portfolio value.
       k = 1: max_kelly_fraction("time_series") is 0, so no time-series trade sizes.
 
-    Adding to held pairs (add_to_held_pairs) adds no sentence: Kelly sizes an
-    add-on on the held pair's whole position, which stays within
-    max_kelly_fraction of the portfolio value, the bound EXPOSURE already
-    checks, and the add-on itself never stakes more than a new pair would.
-    Nor does the Kelly trim: it only sells (trim_change_warnings covers what a
-    change of settings makes it sell).
+    Rebalancing (rebalance) adds no sentence. Kelly sizes an add-on on the
+    held pair's whole position, which stays within max_kelly_fraction of the
+    portfolio value, the bound EXPOSURE already checks, and the add-on itself
+    never stakes more than a new pair would; a Kelly trim only sells
+    (rebalance_change_warnings covers what a change of settings makes it sell).
 
     Args:
         settings (LiveSettings): The run's toggles.
@@ -4905,16 +5100,17 @@ def live_rule_warnings(settings: LiveSettings) -> list[str]:
     return out
 
 
-def trim_change_warnings(current: LiveSettings, proposed: LiveSettings) -> list[str]:
+def rebalance_change_warnings(current: LiveSettings,
+                              proposed: LiveSettings) -> list[str]:
     """
     Say when moving from one set of live settings to another also sells held pairs.
 
-    With the trim on, a run sells each exact held pair worth more than its
+    With rebalancing on, a run sells each exact held pair worth more than its
     Kelly size (the lower of its size cap and Kelly's own share, which reads
     k for a time-series pair) down to that size, before anything is bought,
-    once the pair's wait has passed. So with the proposed settings trimming,
-    a lower size cap (as pair_size_cap applies it) or a higher k can sell
-    pairs the current settings would keep.
+    once the pair's wait has passed (a Kelly trim). So with the proposed
+    settings rebalancing, a lower size cap (as pair_size_cap applies it) or a
+    higher k can sell pairs the current settings would keep.
     main._log_live_settings logs the sentence as a WARNING on a real-money
     run whose flags depart from the saved defaults; the defaults server's
     confirmation page shows it in red.
@@ -4925,9 +5121,9 @@ def trim_change_warnings(current: LiveSettings, proposed: LiveSettings) -> list[
 
     Returns:
         list[str]: One sentence naming every such change; empty when the
-            proposed settings do not trim or nothing moves that way.
+            proposed settings do not rebalance or nothing moves that way.
     """
-    if not proposed.trim_to_kelly:
+    if not proposed.rebalance:
         return []
     changes = []
     for pair_type, label in (("time_series", "time-series"), ("same_title", "same-title")):
@@ -4944,7 +5140,7 @@ def trim_change_warnings(current: LiveSettings, proposed: LiveSettings) -> list[
     if not changes:
         return []
     named = changes[0] if len(changes) == 1 else ", ".join(changes[:-1]) + " and " + changes[-1]
-    return [f"with the Kelly trim on, these settings can sell more of the held pairs: {named}; "
+    return [f"with Rebalance yes, these settings can sell more of the held pairs: {named}; "
             "each exact held pair worth more than its new Kelly size is sold down to it before "
             "anything is bought, once the wait since its last trade has passed"]
 
