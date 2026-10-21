@@ -15,11 +15,19 @@ jobs:
   # Pushes to main always run CI. A PR runs it only when it changes more than
   # one file or more than 50 lines (additions + deletions); the numbers come
   # straight from the pull_request event payload, so no checkout is needed.
+  # A PR whose newest commit is a clean pull of main into the branch (a merge
+  # commit titled "Merge branch 'main' into ...", which is what GitHub's
+  # "Update branch" button and `git merge main` write) skips CI too: main
+  # already passed it, and the branch's own changes were tested on earlier
+  # pushes. A PR that changes only this file skips CI as well. "Clean" means replaying the merge gives the same files as the
+  # commit; conflict fixes or extra edits inside it still run CI.
   gate:
     name: Size gate
     runs-on: ubuntu-latest
     outputs:
-      run_ci: ${{ steps.decide.outputs.run_ci }}
+      # verify only runs for a suspected pull of main and, when it does, has
+      # the last word; otherwise the first step's answer stands.
+      run_ci: ${{ steps.verify.outputs.run_ci || steps.decide.outputs.run_ci }}
     steps:
       - id: decide
         env:
@@ -27,8 +35,31 @@ jobs:
           FILES: ${{ github.event.pull_request.changed_files }}
           ADDITIONS: ${{ github.event.pull_request.additions }}
           DELETIONS: ${{ github.event.pull_request.deletions }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           if [ "$EVENT" != "pull_request" ]; then
+            echo "run_ci=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A PR that touches nothing but this workflow file has no code to test.
+          OTHER=$(gh api --paginate "repos/$GH_REPO/pulls/$PR_NUMBER/files" --jq '.[].filename' | grep -vxF '.github/workflows/ci.yml' || true)
+          if [ -z "$OTHER" ]; then
+            echo "PR only changes ci.yml; skipping CI"
+            echo "run_ci=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Two parents plus a "Merge branch 'main'" (or remote-tracking
+          # 'origin/main') title marks a pull of main into this branch.
+          PARENTS=$(gh api "repos/$GH_REPO/commits/$HEAD_SHA" --jq '.parents | length')
+          TITLE=$(gh api "repos/$GH_REPO/commits/$HEAD_SHA" --jq '.commit.message | split("\n")[0]')
+          echo "Head commit has $PARENTS parent(s): $TITLE"
+          if [ "$PARENTS" -ge 2 ] && echo "$TITLE" | grep -Eq "^Merge (remote-tracking )?branch '(origin/)?main'"; then
+            # Looks like a pull of main; the next steps replay it to see if it
+            # was clean. Until they say so, CI runs.
+            echo "main_pull=true" >> "$GITHUB_OUTPUT"
             echo "run_ci=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -39,6 +70,33 @@ jobs:
           else
             echo "run_ci=false" >> "$GITHUB_OUTPUT"
           fi
+
+      # Only for a commit that looks like a pull of main: replay the merge and
+      # compare. The full history is needed so both parents are available.
+      - if: steps.decide.outputs.main_pull == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - id: verify
+        if: steps.decide.outputs.main_pull == 'true'
+        run: |
+          git config user.name ci
+          git config user.email ci@example.invalid
+          git checkout --detach "$HEAD_SHA^1"
+          # A merge git completes by itself, with no conflicts, is a clean one.
+          # Its tree must equal the pushed commit's; any difference means the
+          # author resolved conflicts or changed code inside the merge.
+          if git merge --no-commit --no-ff "$HEAD_SHA^2" >/dev/null 2>&1 \
+             && [ "$(git write-tree)" = "$(git rev-parse "$HEAD_SHA^{tree}")" ]; then
+            echo "Clean pull of main; skipping CI"
+            echo "run_ci=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Merge had conflicts or extra changes; running CI"
+            echo "run_ci=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
 
   lint:
     name: Lint (ruff)
