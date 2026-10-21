@@ -63,6 +63,7 @@ from .config import (
 )
 from .scanner import (
     CandidatePair,
+    leg_fee_multipliers,
     leg_prices,
     leg_sides,
     pair_held,
@@ -96,6 +97,9 @@ class TradeSpec:
         cost_with_fees_b (float): market_b's leg cost with its fee. Both default to 0.0.
         cash_need_cents (int | None): Most cash the two orders can take, in whole cents; None if built by hand.
         interval_discount (float | None): The k (time-series discount) the spec was sized at; None for same-title.
+        fee_multipliers (tuple[float, float]): The fee multiplier each leg was priced at,
+            (market_a's, market_b's) in market order (scanner.leg_fee_multipliers). (1.0, 1.0)
+            is the full fee on both.
     """
     pair: CandidatePair
     x: int
@@ -112,6 +116,7 @@ class TradeSpec:
     cost_with_fees_b: float = 0.0
     cash_need_cents: int | None = None
     interval_discount: float | None = None
+    fee_multipliers: tuple[float, float] = (1.0, 1.0)
 
 
 def _depth_levels(pair: CandidatePair) -> tuple:
@@ -298,8 +303,11 @@ def _evaluate_size(
         if _reachable_contracts(pair, levels, price_a, price_b) < n:
             return None
 
-    # Net edge after the continuous fee approximation
-    fee_approx = fee_per_pair_approx(price_a, price_b)
+    # Net edge after the continuous fee approximation, each leg at its own
+    # market's fee multiplier (market order, as leg_prices)
+    mult_a, mult_b = leg_fee_multipliers(pair)
+    fee_approx = fee_per_pair_approx(price_a, price_b, multiplier_a=mult_a,
+                                     multiplier_b=mult_b)
     net_spread = (1.0 - price_a - price_b) - fee_approx
     if net_spread <= 0:
         return None
@@ -513,14 +521,16 @@ def _order_cash_cents(pair: CandidatePair, n: int, price_a: float, price_b: floa
         int: Whole cents both orders can take together.
     """
     total = 0
-    # Each leg: the side it buys, its fill price and its market
-    for side, price, market in zip(leg_sides(pair.pair_type), (price_a, price_b),
-                                   (pair.market_a, pair.market_b), strict=True):
+    # Each leg: the side it buys, its fill price, its market and that market's
+    # fee multiplier, all in market order
+    for side, price, market, multiplier in zip(
+            leg_sides(pair.pair_type), (price_a, price_b),
+            (pair.market_a, pair.market_b), leg_fee_multipliers(pair), strict=True):
         # The leg's limit price, from the same function the order itself uses
         cap = float(v2_effective_cap(f"buy_{side}", price, market))
         low, high = min(cap, price), max(cap, price)
         # The fee at the price between the two nearest 50c, where the fee is largest
-        fee = fee_leg_exact(n, min(max(0.5, low), high))
+        fee = fee_leg_exact(n, min(max(0.5, low), high), multiplier=multiplier)
         # Rounded up to the cent, as shard funding rounds it
         total += leg_cash_cents(n * high + fee)
     return total
@@ -652,16 +662,18 @@ def compute_trade(
     kelly_fraction_capped = sized.kelly_fraction
     budget_dollars   = sized.budget_dollars
 
+    # Each leg's fee multiplier, in market order (as price_a, price_b)
+    mult_a, mult_b = leg_fee_multipliers(pair)
     # The count the current leg prices are the fill for (unused with no book)
     priced_n = n
     while True:
         # budget_dollars covers contracts only; shrink n until the fees fit too
-        fee_a = fee_leg_exact(n, price_a)
-        fee_b = fee_leg_exact(n, price_b)
+        fee_a = fee_leg_exact(n, price_a, multiplier=mult_a)
+        fee_b = fee_leg_exact(n, price_b, multiplier=mult_b)
         while n > 0 and n * (price_a + price_b) + fee_a + fee_b > budget_dollars:
             n -= 1
-            fee_a = fee_leg_exact(n, price_a)
-            fee_b = fee_leg_exact(n, price_b)
+            fee_a = fee_leg_exact(n, price_a, multiplier=mult_a)
+            fee_b = fee_leg_exact(n, price_b, multiplier=mult_b)
         if n < 1:
             # Fees ate the entire Kelly budget — no contract count fits
             _log_no_add_on(pair, holds_kelly_share=False,
@@ -678,8 +690,8 @@ def compute_trade(
         fills = prefix_fill_prices(levels, n)
         if fills is not None:
             price_a, price_b = fills
-            fee_a = fee_leg_exact(n, price_a)
-            fee_b = fee_leg_exact(n, price_b)
+            fee_a = fee_leg_exact(n, price_a, multiplier=mult_a)
+            fee_b = fee_leg_exact(n, price_b, multiplier=mult_b)
 
         # BACKSTOP: the shrink changed n outside _evaluate_size, and a smaller
         # n is not always reachable, so check it again (TS-08). Keep it even if
@@ -696,8 +708,8 @@ def compute_trade(
             if fills is None:
                 break
             price_a, price_b = fills
-            fee_a = fee_leg_exact(n, price_a)
-            fee_b = fee_leg_exact(n, price_b)
+            fee_a = fee_leg_exact(n, price_a, multiplier=mult_a)
+            fee_b = fee_leg_exact(n, price_b, multiplier=mult_b)
         if n < 1:
             # Nothing the cap can reach
             _log_no_add_on(pair, holds_kelly_share=False,
@@ -749,7 +761,7 @@ def compute_trade(
     logging.log(
         info,
         "Trade computed: %s [%s] | %s(A)@%.2f + %s(B)@%.2f | p=%.2f%s kelly=%.1f%% n=%d "
-        "cost=$%.2f profit_ratio=%.2f%% monthly=%.2f%%%s",
+        "cost=$%.2f profit_ratio=%.2f%% monthly=%.2f%%%s%s",
         pair.canonical_title,
         pair.pair_type,
         side_a.upper(),
@@ -765,6 +777,9 @@ def compute_trade(
         monthly_profit_ratio * 100,
         # Only an add-on's line gains this, so every other line reads as before
         f" | adds to {count_text(held.count)} held" if held is not None else "",
+        # Only a pair priced at a reduced fee gains this, so every other line reads as before
+        (f" | fee multipliers {mult_a:g}/{mult_b:g}"
+         if (mult_a, mult_b) != (1.0, 1.0) else ""),
     )
     if levels:
         # Write the solved prices back through leg_sides, so every reader of
@@ -789,6 +804,7 @@ def compute_trade(
         # Only time-series pricing uses k
         interval_discount=(settings.interval_discount
                            if pair.pair_type == "time_series" else None),
+        fee_multipliers=(mult_a, mult_b),
     )
 
 
@@ -858,9 +874,10 @@ def _spec_at_count(spec: TradeSpec, n: int) -> TradeSpec | None:
         # No book: use the pair's stored leg prices
         price_a, price_b = leg_prices(pair)
 
-    # Each leg's fee, rounded up to the cent
-    fee_a = fee_leg_exact(n, price_a)
-    fee_b = fee_leg_exact(n, price_b)
+    # Each leg's fee, rounded up to the cent, at its own market's fee multiplier
+    mult_a, mult_b = leg_fee_multipliers(pair)
+    fee_a = fee_leg_exact(n, price_a, multiplier=mult_a)
+    fee_b = fee_leg_exact(n, price_b, multiplier=mult_b)
     # Win profit after fees; the tiny tolerance treats float noise above 0 as 0
     min_payoff = n * (1.0 - price_a - price_b) - fee_a - fee_b
     if min_payoff <= PRICE_EPSILON:

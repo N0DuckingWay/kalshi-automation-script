@@ -4780,3 +4780,73 @@ class TestCountText:
         for cents in (*range(-100_000, 100_001, 7), 123_456_789, -98_765_432_105):
             value = float(f"{cents / 100:.2f}")
             assert float(config.count_text(value)) == value, cents
+
+
+class TestFeeMultipliers:
+    """Each leg's fee is scaled by its own market's series fee multiplier, but
+    only for a multiplier config.CONFIRMED_FEE_MULTIPLIERS holds; with the
+    multipliers at 1.0 both fee functions are the formula they always were."""
+
+    @staticmethod
+    def _old_exact(n, p):
+        # The parent commit's fee_leg_exact, verbatim
+        return math.ceil(round(config.TAKER_FEE_RATE * n * p * (1.0 - p) * 100, 6)) / 100
+
+    @staticmethod
+    def _old_approx(price_a, price_b):
+        # The parent commit's fee_per_pair_approx, verbatim
+        return config.TAKER_FEE_RATE * (price_a * (1.0 - price_a) + price_b * (1.0 - price_b))
+
+    def test_only_the_full_fee_ships_confirmed(self):
+        assert config.CONFIRMED_FEE_MULTIPLIERS == frozenset({1.0})
+
+    def test_bit_identical_at_one_over_a_sweep(self):
+        rng = random.Random(406)
+        prices = [i / 10_000 for i in range(1, 10_000, 37)] + [rng.random() for _ in range(500)]
+        for p in prices:
+            for n in (1, 2, 3, 7, 10, 31, 100, 748, 1_000, 25_000):
+                assert config.fee_leg_exact(n, p, multiplier=1.0) == self._old_exact(n, p)
+                assert config.fee_leg_exact(n, p) == self._old_exact(n, p)
+        for _ in range(5_000):
+            a, b = rng.random(), rng.random()
+            assert config.fee_per_pair_approx(a, b, multiplier_a=1.0, multiplier_b=1.0) \
+                == self._old_approx(a, b)
+
+    def test_a_half_multiplier_halves_the_rate(self):
+        # 0.07 x 0.5 x 10 x 0.25 = 0.0875, rounded up to the cent
+        assert config.fee_leg_exact(10, 0.5, multiplier=0.5) == 0.09
+        assert config.fee_leg_exact(10, 0.5) == 0.18
+        assert config.fee_per_pair_approx(0.5, 0.5, multiplier_a=0.5, multiplier_b=1.0) \
+            == pytest.approx(0.07 * (0.5 * 0.25 + 0.25))
+        # Each multiplier goes with its own price, not the other one
+        assert config.fee_per_pair_approx(0.1, 0.5, multiplier_a=0.0, multiplier_b=1.0) \
+            == pytest.approx(0.07 * 0.25)
+        assert config.fee_per_pair_approx(0.1, 0.5, multiplier_a=1.0, multiplier_b=0.0) \
+            == pytest.approx(0.07 * 0.09)
+
+    def test_a_zero_multiplier_charges_nothing(self):
+        assert config.fee_leg_exact(1_000, 0.37, multiplier=0.0) == 0.0
+        assert config.fee_per_pair_approx(0.3, 0.4, multiplier_a=0.0, multiplier_b=0.0) == 0.0
+
+    def test_fee_multiplier_charges_an_unconfirmed_one_in_full(self, monkeypatch):
+        for raw in (0.5, 0, 0.0, 2.0, float("nan"), float("inf"), None, "0.5", True, False,
+                    MagicMock(), [0.5]):
+            assert config.confirmed_fee_multiplier(raw) == 1.0, raw
+        assert config.confirmed_fee_multiplier(1) == 1.0
+        monkeypatch.setattr(config, "CONFIRMED_FEE_MULTIPLIERS", frozenset({1.0, 0.5, 0.0}))
+        assert config.confirmed_fee_multiplier(0.5) == 0.5
+        assert config.confirmed_fee_multiplier(0) == 0.0
+        assert config.confirmed_fee_multiplier(0.25) == 1.0
+        assert config.confirmed_fee_multiplier(False) == 1.0
+
+    def test_the_unconfirmed_count_line(self, monkeypatch):
+        assert config.unconfirmed_fee_multipliers_text([1.0, 1.0, None]) is None
+        assert config.unconfirmed_fee_multipliers_text(
+            [1.0, 0.5, 0.0, 0.0, 0.5, 0.0, "x", True]) == (
+            "Fee multipliers listed but not confirmed (charged in full): 5 markets "
+            "(multipliers: 0.5 x 2, 0 x 3)")
+        # A confirmed multiplier is not counted
+        monkeypatch.setattr(config, "CONFIRMED_FEE_MULTIPLIERS", frozenset({1.0, 0.5}))
+        assert config.unconfirmed_fee_multipliers_text([0.5, 0.0]) == (
+            "Fee multipliers listed but not confirmed (charged in full): 1 markets "
+            "(multipliers: 0 x 1)")

@@ -69,8 +69,9 @@ _SLICE_SUFFIX = ".json.gz"
 # plus ".tmp".
 _SUMMARY_SUFFIX = ".json"
 _TMP_SUFFIX = ".tmp"
-# A candle file's name is "<ticker>" plus this (historical.fetch_candlesticks).
-_CANDLE_SUFFIX = ".json"
+# A candle file's name is "<ticker>" plus this (historical.fetch_candlesticks
+# writes gzipped JSON)
+_CANDLE_SUFFIX = historical._CANDLE_FILE_SUFFIX
 # The week key of a record whose settlement time cannot be read.
 UNKNOWN_WEEK = "unknown"
 # Joins the parts of a key: a summary's "week|combo|series", merge()'s
@@ -266,7 +267,7 @@ def candle_tickers(cache_dir: Path) -> frozenset:
         cache_dir (Path): The cache folder (backtest_cache/).
 
     Returns:
-        frozenset: Each "<ticker>.json" file's ticker; empty when there is no
+        frozenset: Each "<ticker>.json.gz" file's ticker; empty when there is no
             candle folder.
     """
     folder = Path(cache_dir) / historical._CANDLES_DIR.name
@@ -1324,7 +1325,7 @@ def _read_candle_file(path: Path, close_epoch: float | None, leads: tuple) -> di
     has no price.
 
     Args:
-        path (Path): The candle file (historical.fetch_candlesticks' format:
+        path (Path): The gzipped candle file (historical.fetch_candlesticks' format:
             {"open_ts", "close_ts", "period_interval", "fields", "candles"}; a
             bare list is the oldest format; a file with no "fields" key
             predates the traded volume and counts as field version 1).
@@ -1346,7 +1347,7 @@ def _read_candle_file(path: Path, close_epoch: float | None, leads: tuple) -> di
         Exception: When the file cannot be read or is not a candle file; the
             caller counts it as unreadable.
     """
-    data = json.loads(path.read_bytes())
+    data = json.loads(gzip.decompress(path.read_bytes()))
     if isinstance(data, list):
         candles, fields = data, 1
     elif isinstance(data, dict) and isinstance(data.get("candles"), list):
@@ -1533,7 +1534,7 @@ def summarise_candles(cache_dir: Path, candles: dict) -> dict:
     """
     Calibrate the cached candles against how their markets settled.
 
-    Lists <cache_dir>/candlesticks/ once with os.scandir, reads each file
+    Lists <cache_dir>/candlesticks_v3/ once with os.scandir, reads each file
     whose saved facts no longer match (or has none), and adds up, per market
     that merge() joined (`candles`: ticker -> [result, close_time,
     settlement_ts, category, tag, combo]) and is not a combo, for each lead in
@@ -1683,8 +1684,21 @@ INVENTORY_DESCRIPTIONS = {
                      "market was created, kept only up to the archive cutoff."),
     "live_days": ("Markets settled since the archive cutoff, one file per settlement day, "
                   "from Kalshi's live listing."),
-    "candlesticks": ("Hourly price candles (YES and NO ask, hourly volume) for the markets "
-                     "the backtest priced, one file per market."),
+    historical._CANDLES_DIR.name: ("Hourly price candles (each side's open, high, low and close, "
+                                   "hourly volume, open interest) for the markets the backtest "
+                                   "priced, one gzipped file per market."),
+    "candlesticks": ("The older plain-JSON candle cache, which an older checkout of the bot "
+                     "reads and writes; no longer read here."),
+    "market_details.jsonl.gz": ("Each pair market's full record (its timing fields, strikes and "
+                                "rules text), for the backtest's checks and its scheduled close."),
+    "trades": ("Every trade of each pair market, one gzipped file per market, kept only when "
+               "the trades add up to the market's traded volume."),
+    "scheduled_closes": ("Snapshots of open markets' live close times, from which the backtest "
+                         "learns each series' scheduled close."),
+    "event_fee_overrides.json": ("The fee multiplier an event sets in place of its series' one, "
+                                 "for the events of the pair markets."),
+    "event_facts.json": ("Each pair market's event's settlement sources and whether its options "
+                         "are mutually exclusive, reported by the backtest."),
     config.DEPTH_SNAPSHOTS_DIRNAME: ("Saved copies of live order books, used to model how many "
                                      "contracts rest near the best price."),
     config.EDA_SUMMARY_DIRNAME: ("This page's own small summaries of the day slices and "

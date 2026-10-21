@@ -1364,3 +1364,34 @@ class TestRunReportHandler:
         monkeypatch.setattr(logging, "raiseExceptions", False)
         report = self._log(lambda logger: logger.warning("%d", "not a number"))
         assert report.warnings == [] and report.warnings_dropped == 0
+
+
+class TestFeeMultipliersInTheTradeLog:
+    """A trade priced at a reduced fee on either leg says so in its Notes
+    (" fee_mult=A/B", market order); every other row is unchanged."""
+
+    def test_a_full_fee_row_is_unchanged(self):
+        row = reporter._result_to_row(make_result("1"), datetime(2026, 9, 8))
+        assert row[17] == "[time_series: YES A / NO B nB=0.4000 fees=$0.10] "
+
+    def test_a_reduced_fee_row_names_both_multipliers(self):
+        result = make_result("1")
+        result.spec = dataclasses.replace(result.spec, fee_multipliers=(1.0, 0.5))
+        row = reporter._result_to_row(result, datetime(2026, 9, 8))
+        assert row[17] == "[time_series: YES A / NO B nB=0.4000 fees=$0.10 fee_mult=1/0.5] "
+
+    def test_a_spec_without_real_multipliers_adds_nothing(self):
+        for mults in (None, MagicMock(), (1.0,), ("0.5", 1.0), (True, 1.0)):
+            spec = SimpleNamespace(fee_multipliers=mults)
+            assert reporter._fee_mult_note(spec) == "", mults
+
+    def test_a_sale_row_charges_each_market_its_own_multiplier(self, monkeypatch):
+        sale = make_sale()
+        full = reporter._sale_to_row(sale, datetime(2026, 10, 9))
+        assert "fees=$1.04]" in full[17]
+        # Unconfirmed, a listed multiplier is charged in full
+        sale.plan.legs[0].market._fee_multiplier = 0.5
+        assert reporter._sale_to_row(sale, datetime(2026, 10, 9))[17] == full[17]
+        # Confirmed, SELL-A's fee halves (0.52 -> 0.26) and SELL-B's does not
+        monkeypatch.setattr(config, "CONFIRMED_FEE_MULTIPLIERS", frozenset({1.0, 0.5}))
+        assert "fees=$0.78]" in reporter._sale_to_row(sale, datetime(2026, 10, 9))[17]
