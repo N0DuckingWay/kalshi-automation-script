@@ -18619,6 +18619,22 @@ def _mix_kept(kept_cats: list[int], tags: list[int], series: dict = _MIX_SERIES)
     return config.trade_filter_for(tuple(name for name, _ in kept), tuple(tied) or None)
 
 
+def _khat_marked(snap: dict, colors: dict) -> list[str]:
+    """The rows the k-hat chart marks as selected in a snapshot: the labels of
+    its last drawing whose bar has the "selected" colour.
+
+    Args:
+        snap (dict): A snapshot of the page script run.
+        colors (dict): The chart's colours (the base block's styles["khat"]).
+
+    Returns:
+        list[str]: The marked rows' labels, in the order the chart draws them.
+    """
+    trace = _last_react(snap, "khat-fig")["data"][0]
+    return [label for label, color in zip(trace["y"], trace["marker"]["color"], strict=True)
+            if color == colors["selected"]]
+
+
 def _mix_summary(data: dict, kept_cats: list[int], tags: list[int], n: int, n_all: int, *,
                  mix: bool, series: dict = _MIX_SERIES, scenario: tuple = (0, 0, 0)) -> str:
     """The summary line Python words for a set of ticks on a mix page: the
@@ -18897,12 +18913,20 @@ class TestMixedSelection:
         return _steep_rates() if with_rates else None
 
     @staticmethod
-    def _unmixable_page(monkeypatch, tmp_path) -> str:
+    def _unmixable_page(monkeypatch, tmp_path, seed: int = 44) -> str:
         """A mix page whose list cannot be mixed: the slices' curves open two
         days after the page's own dates, so no tag of the list carries the
-        curve a mix adds up (as in
-        test_a_list_that_cannot_be_mixed_says_so_and_puts_the_ticks_back)."""
-        page = _mix_page(monkeypatch, tmp_path, _mix_trades(44, n=44),
+        curve a mix adds up. Building it logs the WARNING that says so.
+
+        Args:
+            monkeypatch: The test's monkeypatch fixture.
+            tmp_path (Path): The test's own folder.
+            seed (int): The seed of the 44 trades the page is built from.
+
+        Returns:
+            str: The page.
+        """
+        page = _mix_page(monkeypatch, tmp_path, _mix_trades(seed, n=44),
                          start=_MIX_START + timedelta(days=2))
         views = TestFilterPage._chunks(page)[0]["list"]["views"]
         assert not any("m" in view for view in views.values())
@@ -19038,8 +19062,7 @@ class TestMixedSelection:
         # No tag of this list carries "m" (the slices' curves open two days
         # after the page's dates), so each keeps the four series Python
         # shipped, and one tag alone is drawn from them as they stand
-        trades = _mix_trades(47, n=44)
-        page = _mix_page(monkeypatch, tmp_path, trades, start=_MIX_START + timedelta(days=2))
+        page = self._unmixable_page(monkeypatch, tmp_path, seed=47)
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
         n, si = len(data["dates"]), 3
         view = chunks[0]["list"]["views"][f"s{si}"]
@@ -19292,35 +19315,56 @@ class TestMixedSelection:
         assert snaps["narrowed"]["menus"]["flt-cat"]["label"] == "None"
         assert snaps["narrowed"]["menus"]["flt-tag"]["label"] == "4 tags"
 
-    def test_as_many_categories_kept_as_excluded_are_named_by_the_ones_kept(
-            self, monkeypatch, tmp_path):
+    # The categories and tags of the boundary test's runs (the tag at index i
+    # of _mix_axes' pairs holds 2**i trades), and each run's cases: name ->
+    # (the categories kept, the tags ticked as (category, tag), the
+    # selection's name, whether that name is made of the categories kept)
+    BOUNDARY_FOUR = {"KXB0": ("Arts", ("Film",)), "KXB1": ("Crypto", ("Coin",)),
+                     "KXB2": ("Health", ("Flu",)), "KXB3": ("Sports", ("Golf",)),
+                     "KXB4": ("Sports", ("Tennis",))}
+    BOUNDARY_RUNS = {
+        "four_categories": (BOUNDARY_FOUR, {
+            # Two kept of four, two left out: as many as are left out
+            "two_of_four": ([0, 3], [], "only Arts, Sports", True),
+            "two_with_a_tag": ([2, 3], [("Sports", "Golf")], "only Health, Sports · Golf",
+                               True),
+            # Three kept of four, one left out
+            "three_of_four": ([0, 2, 3], [], "Crypto excluded", False)}),
+        "five_categories": ({**BOUNDARY_FOUR, "KXB5": ("Tech", ("Chip",))}, {
+            # Two kept of five, three left out: fewer than are left out
+            "two_of_five": ([0, 3], [], "only Arts, Sports", True),
+            # Three kept of five, two left out: one more than are left out,
+            # just past the boundary
+            "three_of_five": ([0, 2, 3], [], "Crypto, Tech excluded", False)})}
+
+    @pytest.mark.parametrize("run", sorted(BOUNDARY_RUNS))
+    def test_the_ones_kept_are_named_only_while_no_more_are_kept_than_left_out(
+            self, monkeypatch, tmp_path, run):
         # The line names the categories kept while no more are kept than are
         # left out, so two kept of four (two left out) is the boundary: still
         # "only ...", with or without a tag ticked, in the script and in
-        # Python's _selection_name alike. One left out of four (three kept)
-        # names the one left out. Tag i holds 2**i trades
-        series = {"KXB0": ("Arts", ("Film",)), "KXB1": ("Crypto", ("Coin",)),
-                  "KXB2": ("Health", ("Flu",)), "KXB3": ("Sports", ("Golf",)),
-                  "KXB4": ("Sports", ("Tennis",))}
+        # Python's _selection_name alike. One more kept than left out (three
+        # of five) is just past it, and names the two left out; so does three
+        # of four. Tag i holds 2**i trades
+        series, cases = self.BOUNDARY_RUNS[run]
         categories, pairs = _mix_axes(series)
-        assert categories == ["Arts", "Crypto", "Health", "Sports"]
+        assert categories[:4] == ["Arts", "Crypto", "Health", "Sports"]
         page = _mix_page(monkeypatch, tmp_path, _counted_trades(series), series=series)
         data = TestFilterPage._data(page)
-        golf = pairs.index(("Sports", "Golf"))
-        # name -> (the categories kept, the tags ticked, the selection's name)
-        cases = {"two_of_four": ([0, 3], [], "only Arts, Sports"),
-                 "two_with_a_tag": ([2, 3], [golf], "only Health, Sports · Golf"),
-                 "three_of_four": ([0, 2, 3], [], "Crypto excluded")}
         steps = [["wait"]]
-        for name, (kept_cats, tags, _) in cases.items():
-            steps += _mix_tick_steps(kept_cats, tags, name)
+        ticks = {}
+        for name, (kept_cats, tag_names, _, _) in cases.items():
+            ticks[name] = [pairs.index(tag) for tag in tag_names]
+            steps += _mix_tick_steps(kept_cats, ticks[name], name)
         snaps = _run_script(tmp_path, page, steps, strict=True)
         n_all = 2 ** len(pairs) - 1
-        for name, (kept_cats, tags, words) in cases.items():
+        for name, (kept_cats, _, words, names_the_kept) in cases.items():
+            tags = ticks[name]
             kept, excluded, _ = _mix_names(kept_cats, tags, series)
-            # Two of four kept is the boundary (as many kept as left out);
-            # three of four is past it
-            assert (len(kept) == len(excluded)) == (name != "three_of_four"), name
+            # The case says which side of the boundary it is on: as many or
+            # fewer kept than left out is named by the ones kept
+            assert (len(kept) <= len(excluded)) == names_the_kept, name
+            assert words.startswith("only ") == names_the_kept, name
             # Python's twin, at the same boundary
             assert dashboard._selection_name(kept, excluded, data["text"]) == words, name
             snap = snaps[name]
@@ -19407,16 +19451,14 @@ class TestMixedSelection:
     def test_a_list_that_cannot_be_mixed_says_so_and_puts_the_ticks_back(
             self, monkeypatch, tmp_path, caplog):
         # The slices' curves open two days after the page's own dates, so no
-        # tag of the list carries the curve a mix adds up
-        trades = _mix_trades(44, n=44)
+        # tag of the list carries the curve a mix adds up (the page is built
+        # inside the log capture: its build logs the warning)
         with caplog.at_level(logging.WARNING):
-            page = _mix_page(monkeypatch, tmp_path, trades,
-                             start=_MIX_START + timedelta(days=2))
+            page = self._unmixable_page(monkeypatch, tmp_path)
         assert [r for r in caplog.records
                 if "cannot combine categories and tags" in r.getMessage()]
-        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        views = chunks[0]["list"]["views"]
-        assert not any("m" in view for view in views.values())
+        data = TestFilterPage._data(page)
+        views = TestFilterPage._chunks(page)[0]["list"]["views"]
         cat1 = [i for i, (name, _) in enumerate(_MIX_SUBCATS) if name == "Cat1"]
         snaps = _run_script(tmp_path, page, [
             ["wait"], *_keep_categories(1), ["settle"], ["snap", "one"],
@@ -19449,11 +19491,13 @@ class TestMixedSelection:
 
     def test_a_mix_refused_with_nothing_ticked_says_the_whole_run_is_still_shown(
             self, monkeypatch, tmp_path):
-        # Nothing is ticked when Cat0 is left out: Cat1 and Cat2 together are
-        # a mix this list cannot give, so the tick goes back and the line says
-        # the page still shows the whole run (mix_still_all), not a selection
+        # Nothing is ticked yet; leaving Cat0 out asks for Cat1 and Cat2
+        # together, a mix this list cannot give, so the tick goes back and the
+        # line says the page still shows the whole run (mix_still_all), not a
+        # selection
         page = self._unmixable_page(monkeypatch, tmp_path)
         data = TestFilterPage._data(page)
+        views = TestFilterPage._chunks(page)[0]["list"]["views"]
         snaps = _run_script(tmp_path, page, [
             ["wait"], _tick_category(0), ["settle"], ["snap", "refused"]], strict=True)
         refused = snaps["refused"]
@@ -19466,6 +19510,10 @@ class TestMixedSelection:
         assert refused["reacts"] == []
         assert refused["menus"]["flt-cat"]["ticked"] == []
         assert refused["menus"]["flt-cat"]["label"] == dashboard._MENU_CAT_NONE
+        # ... and the header still holds the whole run's count: the script
+        # wrote none, so it is the one the page rendered
+        rendered = re.search(r'Trades found: <span id="hdr-trades">(\d+)</span>', page)
+        assert refused["text"].get("hdr-trades", rendered.group(1)) == str(views["all"]["n"])
 
     def test_a_refused_mix_puts_the_tag_ticks_back(self, monkeypatch, tmp_path):
         # With Cat0 alone kept, one of its three tags ticked is Python's own
@@ -19491,9 +19539,11 @@ class TestMixedSelection:
         assert refused["menus"]["flt-tag"]["all"] is False
         assert refused["menus"]["flt-cat"]["ticked"] == [1, 2]
         assert refused["text"]["hdr-trades"] == tag["text"]["hdr-trades"]
-        tried = dashboard._selection_name(*_mix_names([0], cat0[:2])[:2], data["text"])
-        still = dashboard._selection_name(*_mix_names([0], cat0[:1])[:2], data["text"])
-        assert still == f"only Cat0 · {_MIX_SUBCATS[cat0[0]][1]}"
+        kept, excluded, _ = _mix_names([0], cat0[:2])
+        tried = dashboard._selection_name(kept, excluded, data["text"])
+        kept, excluded, _ = _mix_names([0], cat0[:1])
+        still = dashboard._selection_name(kept, excluded, data["text"])
+        assert still == f"only Cat0{config.TAG_SCOPE_SEPARATOR}{_MIX_SUBCATS[cat0[0]][1]}"
         assert refused["text"]["flt-summary"] == data["text"]["mix_unavailable"].format(
             selection=tried, failed=_phrase(data, 0, 0, 0),
             shown=data["text"]["mix_still"].format(selection=still), at="")
@@ -19663,18 +19713,12 @@ class TestMixedSelection:
             ["set", "khat-group", "tag"], ["fire", "khat-group"], ["snap", "by_tag"]],
             strict=True)
         colors = data["styles"]["khat"]
-
-        def marked(snap) -> list[str]:
-            trace = _last_react(snap, "khat-fig")["data"][0]
-            return [label for label, color in zip(trace["y"], trace["marker"]["color"],
-                                                  strict=True) if color == colors["selected"]]
-
-        assert marked(snaps["by_category"]) == ["Cat0", "Cat2"]
+        assert _khat_marked(snaps["by_category"], colors) == ["Cat0", "Cat2"]
         # By tag, with more than one category kept: every tag the ticks
         # cover — the one ticked tag of Cat0 and all of Cat2 — among all tags
         by_tag = _last_react(snaps["by_tag"], "khat-fig")["data"][0]
         assert by_tag["y"][0] == "All tags"
-        assert marked(snaps["by_tag"]) == [
+        assert _khat_marked(snaps["by_tag"], colors) == [
             " · ".join(_MIX_SUBCATS[i]) for i in [cat0[0], *cat2]
             if f"s{i}" in data["khat"][0]["groups"]]
 
@@ -19867,7 +19911,8 @@ class TestMixedSelection:
         # as they leave the trades: the cards are the k-hat of exactly the
         # entries the live filter keeps, and the chart marks what it keeps —
         # grouped by tag Health · Flu alone, never health · Polio; grouped by
-        # category both spellings, the two categories kept
+        # category every category not excluded, even health, whose tag ticks
+        # keep none of its trades
         series = {"KXH0": ("Health", ("Flu",)), "KXH1": ("health", ("Polio",)),
                   "KXA0": ("Arts", ("Glue",)), "KXS0": ("Sports", ("Golf",))}
         categories, pairs = _mix_axes(series)
@@ -19881,14 +19926,14 @@ class TestMixedSelection:
                          observations=observations)
         data = TestFilterPage._data(page)
         health, lower = categories.index("Health"), categories.index("health")
+        arts, sports = categories.index("Arts"), categories.index("Sports")
         flu, polio = pairs.index(("Health", "Flu")), pairs.index(("health", "Polio"))
         assert data["category_twins"] == [[health, lower]]
         kept_cats, tags = [health, lower], [flu]
-        # Arts and Sports each clicked once (clicking a twin's box would take
-        # the other spelling with it), then Flu
+        # Arts and Sports are each clicked once, left out; that keeps both
+        # spellings of Health. Then Flu is ticked
         snaps = _run_script(tmp_path, page, [
-            ["wait"], _tick_category(categories.index("Arts")),
-            _tick_category(categories.index("Sports")), _tick_tag(flu), ["settle"],
+            ["wait"], _tick_category(arts), _tick_category(sports), _tick_tag(flu), ["settle"],
             ["snap", "by_category"],
             ["set", "khat-group", "tag"], ["fire", "khat-group"], ["snap", "by_tag"]],
             strict=True)
@@ -19900,24 +19945,20 @@ class TestMixedSelection:
         stat = dashboard._khat_stat(joined)
         k_shown = data["ks"][data["primary"][1]]["value"]
         colors = data["styles"]["khat"]
-
-        def marked(snap) -> list[str]:
-            trace = _last_react(snap, "khat-fig")["data"][0]
-            return [label for label, color in zip(trace["y"], trace["marker"]["color"],
-                                                  strict=True) if color == colors["selected"]]
-
         for name in ("by_category", "by_tag"):
             snap = snaps[name]
-            assert snap["menus"]["flt-cat"]["ticked"] == [0, 2], name
+            assert snap["menus"]["flt-cat"]["ticked"] == [arts, sports], name
             assert snap["menus"]["flt-tag"]["ticked"] == [flu], name
             assert snap["text"]["kpi-khat"] == stat["cells"][4], name
             assert snap["text"]["kpi-khat_delta"] == \
                 dashboard._khat_delta(stat["k"], k_shown)[0], name
-        assert marked(snaps["by_category"]) == ["Health", "health"]
+        # Grouped by category the chart marks every category not excluded,
+        # even health, whose tag ticks (Flu) keep none of its trades
+        assert _khat_marked(snaps["by_category"], colors) == ["Health", "health"]
         groups = data["khat"][0]["groups"]
         assert f"s{flu}" in groups and f"s{polio}" in groups
         assert _last_react(snaps["by_tag"], "khat-fig")["data"][0]["y"][0] == "All tags"
-        assert marked(snaps["by_tag"]) == ["Health · Flu"]
+        assert _khat_marked(snaps["by_tag"], colors) == ["Health · Flu"]
 
     def test_tags_that_differ_only_in_letter_case_are_ticked_and_unticked_as_one(
             self, monkeypatch, tmp_path):
