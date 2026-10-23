@@ -11068,10 +11068,16 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
     Word the "Live time-series rule (saved live defaults): ..." log line from a built sweep.
 
     Always a line, so a report never silently omits the live rule: with none
-    recorded it says so (_LIVE_RULE_NONE). A recorded rule's line ends with
-    _live_sizing_note when the saved defaults size differently from this
-    run's primary, then _live_rebalance_note and _live_sell_note when they
-    rebalance held pairs or sell.
+    recorded it says so (_LIVE_RULE_NONE). A recorded rule's line reads
+    "<rule>[; category/tag filter (...)] — <where>", then, in this order,
+    [; <filter-bar clause>] for a saved category/tag filter (what the
+    filter bar's Exclude categories and Tag menus tick to show it; the page's
+    own Live rule line names the boxes), [; <ladder note>] when the run's
+    ladder switch departs from config.py's, _live_sizing_note when the saved
+    defaults size differently from this run's primary, then
+    _live_rebalance_note and _live_sell_note when they rebalance held pairs
+    or sell. A rule this run did not simulate has no filter-bar clause or
+    ladder note.
 
     Args:
         sweep (BacktestSweep): The run's sweep.
@@ -11107,10 +11113,13 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
                 "which the dashboard's filter bar shows")
         subject = "that scenario"
     if filtered:
-        # Only the page knows which boxes its menus offer, so it names them
+        # This line names no box: only the page knows which its menus offer, so
+        # its own Live rule line names the categories to tick and the tags
         tail += ("; the dashboard's filter bar shows the live category/tag filter of "
-                 f"{subject} when its Category and Tag menus tick the categories and tags "
-                 "the filter lists (each offered where this run filed a pair under it)")
+                 f"{subject} when its Exclude categories menu ticks every category in "
+                 "which the filter keeps none of this run's pairs and, in each category "
+                 "the filter keeps only in part, its Tag menu ticks the tags it keeps "
+                 "(the page's Live rule line names them)")
     return (f"{prefix}{rule} — {tail}{_live_rule_ladder_note(sweep)}"
             f"{_live_sizing_note(sweep)}{_live_rebalance_note(sweep)}{_live_sell_note(sweep)}")
 
