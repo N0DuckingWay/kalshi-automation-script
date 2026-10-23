@@ -8306,6 +8306,41 @@ class TestSaveLiveDefaultsButton:
             [opened] = snap["opened"]
             self._assert_sends(data, self._query(data, opened), *data["primary"])
 
+    def test_excluding_every_category_with_a_trade_here_shuts_it(self, monkeypatch, tmp_path):
+        # Band 0.3-0.6 trades only Sports and Commodities, while the menu also
+        # lists categories other scenarios trade: excluding those two leaves a
+        # view with no trade, so the button shuts though not every listed
+        # category is excluded. At the primary band the same two exclusions
+        # leave the time-series trades, and it saves
+        page = self._page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        sports = data["categories"].index("Sports")
+        commodities = data["categories"].index("Commodities")
+        assert len(data["categories"]) > 2
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"],
+            _tick_category(sports), ["settle"], _tick_category(commodities), ["settle"],
+            ["click", "flt-save"], ["snap", "empty"],
+            _tick_category(commodities), ["settle"],
+            ["click", "flt-save"], ["snap", "one_back"],
+            _tick_category(commodities), ["settle"],
+            ["set", "flt-band", "0"], ["fire", "flt-band"], ["settle"],
+            ["click", "flt-save"], ["snap", "primary"]], strict=True)
+        empty = snaps["empty"]
+        assert empty["menus"]["flt-cat"]["ticked"] == sorted([sports, commodities])
+        assert empty["buttons"]["flt-save"] is True and empty["opened"] == []
+        assert empty["titles"]["flt-save"] == data["text"]["save_all_excluded"]
+        one_back = snaps["one_back"]
+        assert one_back["buttons"]["flt-save"] is False
+        assert one_back["titles"]["flt-save"] == dashboard._SAVE_TITLE
+        assert len(one_back["opened"]) == 1
+        primary = snaps["primary"]
+        assert primary["buttons"]["flt-save"] is False
+        [opened] = primary["opened"]
+        self._assert_sends(data, self._query(data, opened), *data["primary"],
+                           excluded=tuple(sorted(("Sports", "Commodities"),
+                                                 key=data["categories"].index)))
+
     def test_several_exclusions_and_twins_round_trip_through_the_server(
             self, monkeypatch, tmp_path):
         # Two categories ticked, one of them a letter-case twin pair, which the
@@ -8430,21 +8465,29 @@ class TestSaveLiveDefaultsButton:
         # the page filed it under
         page = self._page(monkeypatch, tmp_path, series=None)
         data = TestFilterPage._data(page)
-        assert data["categories"]
+        # Every trade is filed under "Other"; the k-hat population files one
+        # observation under "Science", which no trade carries
+        assert data["categories"] == ["Other", "Science"]
         title = re.search(r'<button id="flt-save"[^>]*title="([^"]*)"', page).group(1)
         assert html.unescape(title) == dashboard._SAVE_TITLE
         snaps = _run_script(tmp_path, page, [
             ["wait"], ["click", "flt-save"], ["snap", "all"],
-            _tick_category("0"), ["settle"],
+            _tick_category("1"), ["settle"],
             ["click", "flt-save"], ["snap", "category"],
-            _tick_category("0"), ["settle"], ["click", "flt-save"], ["snap", "back"]],
+            _tick_category("0"), ["settle"], ["click", "flt-save"], ["snap", "empty"],
+            _tick_category("0"), ["settle"],
+            _tick_category("1"), ["settle"], ["click", "flt-save"], ["snap", "back"]],
             strict=True)
         [opened] = snaps["all"]["opened"]
         self._assert_sends(data, self._query(data, opened), *data["primary"])
         assert snaps["category"]["buttons"]["flt-save"] is False
         [opened] = snaps["category"]["opened"]
         self._assert_sends(data, self._query(data, opened), *data["primary"],
-                           excluded=(data["categories"][0],))
+                           excluded=("Science",))
+        # Excluding "Other" too leaves no trade: shut, saying why
+        empty = snaps["empty"]
+        assert empty["buttons"]["flt-save"] is True and empty["opened"] == []
+        assert empty["titles"]["flt-save"] == data["text"]["save_all_excluded"]
         # The category let back in leaves nothing ticked: the scenario is
         # saved again, excluding nothing
         back = snaps["back"]
@@ -8453,19 +8496,30 @@ class TestSaveLiveDefaultsButton:
         [opened] = back["opened"]
         self._assert_sends(data, self._query(data, opened), *data["primary"])
 
-    @pytest.mark.parametrize("cats, tags, shown", [
-        (("Sports",), None, False), (None, ("Hockey",), True),
-        (("Politics",), ("Sports · Hockey",), True), (None, None, False)])
+    @pytest.mark.parametrize("cats, tags, text", [
+        (("Sports",), None,
+         "Saving from this page saves the categories excluded here, which replace the "
+         "saved exclusions (Sports)."),
+        (None, ("Hockey",), dashboard._FILTER_SAVE_NOTE),
+        (("Politics", "Weather"), ("Sports · Hockey",),
+         "Saving from this page saves the categories excluded here, which replace the "
+         "saved exclusions (Politics, Weather), and clears the saved tag filter: live "
+         "runs then trade every tag."),
+        (None, None, None)])
     def test_a_note_says_when_saving_clears_a_saved_tag_filter(
-            self, monkeypatch, tmp_path, cats, tags, shown):
-        # The button sends the categories excluded but no tag, so over saved
-        # live defaults that filter by tag, a grey note after it says saving
-        # clears that filter; with no tag filter saved there is no note
+            self, monkeypatch, tmp_path, cats, tags, text):
+        # The button sends the categories excluded here and no tag, so over
+        # saved live defaults that exclude categories or filter by tag, a grey
+        # note after it says saving replaces the exclusions (naming them) or
+        # clears that filter; with neither saved there is no note
+        shown = text is not None
         sweep = dataclasses.replace(_flt_sweep(), live_exclude_categories=cats, live_tags=tags)
         page = self._page(monkeypatch, tmp_path, sweep)
-        assert TestFilterPage._data(page)["save"]["live_tags"] is shown
+        save = TestFilterPage._data(page)["save"]
+        assert save["live_tags"] is (tags is not None)
+        assert save["live_exclusions"] == (None if cats is None else list(cats))
         note = (f'<span id="flt-filter-save-note" style="color:#9E9E9E; font-size:13px;">'
-                f"{html.escape(dashboard._FILTER_SAVE_NOTE)}</span>")
+                f"{html.escape(text or '')}</span>")
         assert (note in page) is shown
         assert ('id="flt-filter-save-note"' in page) is shown
         if shown:
@@ -8473,6 +8527,7 @@ class TestSaveLiveDefaultsButton:
             assert page.index('id="flt-save"') < page.index(note) < page.index('id="flt-trade"')
         # Python's words: the script writes none of them
         assert dashboard._FILTER_SAVE_NOTE not in dashboard._FILTER_JS
+        assert "replace the saved exclusions" not in dashboard._FILTER_JS
 
     def test_a_save_clears_a_saved_exclusion_and_tag_filter(self, monkeypatch, tmp_path):
         # Saved live defaults that exclude Politics and narrow Sports to
@@ -8647,7 +8702,7 @@ class TestSaveLiveDefaultsButton:
         assert target == {"url": _SAVE_URL, "same_title_size_cap": None,
                           "source": "backtest dashboard for 2026-01-05 to 2026-09-28",
                           "live_rebalances": False, "live_sells": False,
-                          "live_tags": False}
+                          "live_tags": False, "live_exclusions": None}
         # "live_rebalances" is True only for a run that recorded saved
         # defaults that rebalance (a minimum price movement alone is not):
         # Rebalance no turns it off
@@ -8669,7 +8724,10 @@ class TestSaveLiveDefaultsButton:
                                  (("Politics",), ("Sports · Hockey",), True),
                                  (None, None, False)):
             swept = dataclasses.replace(sweep, live_exclude_categories=cats, live_tags=tags)
-            assert dashboard._save_target(swept, _FLT_START, today)["live_tags"] is said
+            target = dashboard._save_target(swept, _FLT_START, today)
+            assert target["live_tags"] is said
+            # ... and "live_exclusions" names the saved exclusions, which a save replaces
+            assert target["live_exclusions"] == (None if cats is None else list(cats))
         # Only a recorded setting that differs from a recorded switch is named
         for ladders, configured in ((True, True), (False, None), (None, True)):
             swept = dataclasses.replace(sweep, same_event_ladders=ladders,
@@ -19577,8 +19635,9 @@ class TestMixedSelection:
         # The live filter reads "Health" and "health" as one category, so the
         # page leaves them out and lets them back in together, and their two
         # Flu tags are one tag, ticked together: the tags the page shows are
-        # exactly the ones a live filter keeps that lists the categories kept
-        # and the tags not ticked. Tag i holds 2**i trades, so the trade count
+        # exactly the ones a live filter keeps that excludes the categories
+        # left out and lists the tags not ticked. Tag i holds 2**i trades, so
+        # the trade count
         # names the tags shown
         series = {"KXH0": ("Health", ("Flu",)), "KXH1": ("health", ("Flu",)),
                   "KXH2": ("health", ("Polio",)), "KXH3": ("Sports", ("Golf",))}

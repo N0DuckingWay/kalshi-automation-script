@@ -193,9 +193,10 @@ Purpose:
     tag filter. The live tag filter can only list the tags to trade, and a
     list built from this page's menus would leave out any tag the backtest
     never saw, so the page saves no tag filter for now: while any tag is
-    ticked, or every category excluded, the button stays disabled and its
-    hover text says why; a grey note beside it says when saving clears a
-    saved tag filter. A live tag filter is set on the confirmation page's
+    ticked, or the categories kept hold no trade of the scenario shown
+    (every category excluded, say), the button stays disabled and its hover
+    text says why; a grey note beside it says when saving replaces the saved
+    exclusions or clears a saved tag filter. A live tag filter is set on the confirmation page's
     address or with main.py --tag. That page compares the
     proposal with the live defaults in force and acts only when one of its
     buttons is pressed: Confirm and save saves it, Confirm and trade saves
@@ -7370,30 +7371,58 @@ _SAVE_TITLE = ("Open a confirmation page, in a new tab, that compares the filter
                "Nothing is saved until you press a button there: Confirm and save saves "
                "it; Confirm and trade saves it and then runs the live bot with it, placing "
                "real orders; Dry run runs the live bot with it without placing orders and "
-               "saves nothing. It stays unavailable while any tag is ticked, while every "
-               "category is excluded, while a scenario loads, and for a scenario the run never "
+               "saves nothing. It stays unavailable while any tag is ticked, while the "
+               "categories kept hold no trade of the scenario shown (every category "
+               "excluded, say), while a scenario loads, and for a scenario the run never "
                "simulated, whose band, k or size cap the run did not record, or whose k or "
                "size cap is not above zero.")
 _SAVE_NOTE = "(needs ./start_dashboard.sh running)"
-# Beside the save button when the saved live defaults filter by tag: the
-# button sends the categories excluded on this page and no tag, which the
-# server reads as any tag
-_FILTER_SAVE_NOTE = ("Saving from this page saves the categories excluded here and clears "
-                     "the saved tag filter: live runs then trade every tag.")
+
+
+def _filter_save_note(exclusions: tuple[str, ...] | list[str] | None, tags: bool) -> str | None:
+    """
+    The grey note beside the save button when a save replaces a saved filter.
+
+    The button sends the categories excluded on this page, which replace the
+    saved exclusions, and no tag, which the server reads as any tag.
+
+    Args:
+        exclusions (tuple[str, ...] | list[str] | None): The categories the
+            saved live defaults exclude (save["live_exclusions"]), or None.
+        tags (bool): Whether the saved live defaults filter by tag (save["live_tags"]).
+
+    Returns:
+        str | None: The note, or None when the saved defaults exclude no
+            category and filter by no tag.
+    """
+    if not exclusions and not tags:
+        return None
+    text = "Saving from this page saves the categories excluded here"
+    if exclusions:
+        text += f", which replace the saved exclusions ({', '.join(exclusions)})"
+    if tags:
+        text += ((", and" if exclusions else " and")
+                 + " clears the saved tag filter: live runs then trade every tag")
+    return text + "."
+
+
+# The note over saved live defaults that filter by tag and exclude nothing
+_FILTER_SAVE_NOTE = _filter_save_note(None, True)
 # The save button's hover text while it cannot save because of the menus (the
 # script shows it in place of _SAVE_TITLE and puts _SAVE_TITLE back once the
 # reason is gone): a tag ticked, since saved live defaults can only list the
-# tags to trade for now; or every category excluded, which shows no trade
+# tags to trade for now; or categories excluded such that those kept hold no
+# trade of the scenario shown (every category, say), which shows no trade
 _SAVE_BLOCKED_TEXT = {
     "save_filtered": ("Cannot save while a tag is ticked. Saved live defaults can only "
                       "list the tags to trade, and this page knows only the tags this "
                       "backtest saw, so it cannot save a tag filter. Untick every tag "
-                      "you ticked to save this scenario for every tag (the categories "
-                      "excluded are saved). To filter one live run by tag, use main.py "
-                      "--tag."),
-    "save_all_excluded": ("Cannot save while every category is excluded: this view shows "
-                          "no trade, and live runs would trade only categories this "
-                          "backtest never saw. Untick at least one category to save."),
+                      "to save this scenario. The categories you excluded are saved. "
+                      "To filter one live run by tag, use main.py --tag."),
+    "save_all_excluded": ("Cannot save while the categories kept hold no trade of this "
+                          "scenario: this view shows no trade, and live runs would trade "
+                          "only categories this backtest gave no trade to. Untick at "
+                          "least one category with trades to save."),
 }
 
 # The bar's "Trade using defaults…" link: its label and its hover text. It
@@ -7459,9 +7488,9 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date) -> 
     The button opens the defaults server's confirmation page with the bar's
     scenario in the address (its spread band, Tier floors choice, k, size
     cap, Rebalance choice, Min. price movement, Sell level and Min. days to
-    maturity, and each category excluded; never a tag); this is the rest of
-    that address,
-    fixed when the page is built. The server accepts no source note but one
+    maturity, and each category ticked in the Exclude categories menu as a
+    category live runs must not trade; never a tag); this is the rest of that
+    address, fixed when the page is built. The server accepts no source note but one
     of the shapes config.LIVE_DEFAULTS_SOURCE_PATTERN allows, so the note is
     checked against that pattern here, as the server checks it (whole, ASCII
     digits only), and left out should it ever not match.
@@ -7490,7 +7519,9 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date) -> 
             Rebalance no turns it off);
             "live_sells" (whether they sell: the Sell view's save note shows only then);
             "live_tags" (whether they filter by tag: the note that saving
-            clears that filter shows only then).
+            clears that filter shows only then);
+            "live_exclusions" (the categories they exclude, as a list, or None:
+            the note that saving replaces them names them).
     """
 
     def day(value: date) -> str:
@@ -7522,7 +7553,25 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date) -> 
         "live_rebalances": getattr(sweep, "live_rebalance", None) is True,
         "live_sells": getattr(sweep, "live_sell_at", None) is not None,
         "live_tags": getattr(sweep, "live_tags", None) is not None,
+        "live_exclusions": _recorded_names(getattr(sweep, "live_exclude_categories", None)),
     }
+
+
+def _recorded_names(value) -> list[str] | None:
+    """
+    Read a recorded filter as a list of names, or None.
+
+    Args:
+        value: BacktestSweep.live_exclude_categories as recorded.
+
+    Returns:
+        list[str] | None: Its names, when it is a non-empty tuple or list of
+            strings; None otherwise (none recorded, or not a filter).
+    """
+    if (isinstance(value, (tuple, list)) and value
+            and all(isinstance(name, str) for name in value)):
+        return list(value)
+    return None
 
 # Every compared field of a BacktestTrade, in declaration order: _list_key's
 # identity of a trade list is these values, trade by trade, plus the
@@ -12870,15 +12919,17 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     the live defaults, and a click opens the defaults server's confirmation
     page for that scenario in a new tab, naming each category excluded and
     no tag. Its hover text is _SAVE_TITLE on every page; while any tag is
-    ticked, or every category excluded, the button stays disabled and the
-    script shows _SAVE_BLOCKED_TEXT["save_filtered"] or
+    ticked, or the categories kept hold no trade of the scenario shown, the
+    button stays disabled and the script shows _SAVE_BLOCKED_TEXT["save_filtered"] or
     ["save_all_excluded"] in its place. On a page with
     the Rebalance view whose saved live defaults rebalance
     (save["live_rebalances"]), a grey note (_REBALANCE_SAVE_NOTE) follows
     the button: saving with Rebalance no turns that off.
     _SELL_SAVE_NOTE (save["live_sells"]) does the same for selling, after
-    it, in the order of their selects, and _FILTER_SAVE_NOTE
-    (save["live_tags"]) says that saving clears a saved tag filter. Then the "Trade using defaults…" link
+    it, in the order of their selects, and _filter_save_note's
+    (save["live_exclusions"], save["live_tags"]) says that saving replaces
+    the saved exclusions, naming them, and clears a saved tag filter. Then
+    the "Trade using defaults…" link
     (_trade_link_html), which the script never touches, and the note that
     both need the defaults server running.
 
@@ -12998,12 +13049,14 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
                   and (payload.get("save") or {}).get("live_sells") is True)
     save_note += ('&nbsp;<span id="flt-sell-save-note" style="color:#9E9E9E; font-size:13px;">'
                   f"{html.escape(_SELL_SAVE_NOTE)}</span>" if save_sells else "")
-    # The button sends no tag, so when the saved live defaults filter by tag,
-    # saving clears that filter
-    save_filters = (payload.get("save") or {}).get("live_tags") is True
+    # The button sends the categories excluded here and no tag, so when the
+    # saved live defaults exclude categories or filter by tag, saving
+    # replaces those exclusions or clears that filter
+    save = payload.get("save") or {}
+    filter_note = _filter_save_note(save.get("live_exclusions"), save.get("live_tags") is True)
     save_note += ('&nbsp;<span id="flt-filter-save-note" style="color:#9E9E9E; '
-                  f'font-size:13px;">{html.escape(_FILTER_SAVE_NOTE)}</span>'
-                  if save_filters else "")
+                  f'font-size:13px;">{html.escape(filter_note)}</span>'
+                  if filter_note is not None else "")
 
     # The two check-box menus, nothing ticked (both "All" boxes unticked):
     # every category, and every category's tags named "Category · Tag" (the
@@ -13312,8 +13365,8 @@ def _pack_text(raw: str) -> str:
 # Rebalance choice with its minimum price movement and the Sell level and
 # minimum ("off" for both under no selling), on a page with that view, and
 # each category excluded as exclude_category, but never a tag). The button
-# stays disabled while any tag is ticked or every category is left out
-# (saveBlockedByTicks); its words are Python's, its hover text too, which
+# stays disabled while any tag is ticked or the categories kept hold no trade
+# of the scenario shown (saveBlockedByTicks); its words are Python's, its hover text too, which
 # reads as Python rendered it except while a tick is what stops a save
 # (D.text.save_filtered, D.text.save_all_excluded). On load it inflates the base
 # block and the primary
@@ -13525,7 +13578,8 @@ _FILTER_JS = r"""
   // run never simulated (a Rebalance choice, a minimum price movement or a
   // Sell level the page holds no chunk for included), a band the run did
   // not record, a k or size cap the run did not record or that is not above
-  // zero, any tag ticked, or every category left out (saveBlockedByTicks).
+  // zero, any tag ticked, or categories left out such that those kept hold no
+  // trade here (saveBlockedByTicks).
   // The address names each category left out, by its name on the bar (every
   // letter-case twin included, in the bar's order), as exclude_category, and
   // no tag, which the server reads as any tag. The server refuses, with its
@@ -13584,11 +13638,16 @@ _FILTER_JS = r"""
   // The reason the save button gives while the menus stop a save, in
   // Python's words, or null when they do not: a tag ticked
   // (D.text.save_filtered), since the address names no tag, so a view
-  // narrowed by tags is not what a save would make live; or every category
-  // left out (D.text.save_all_excluded), a view with no trade at all.
+  // narrowed by tags is not what a save would make live; or categories left
+  // out such that the categories kept hold no trade of the scenario shown
+  // (D.text.save_all_excluded) — every category the menu lists, or every
+  // one with a trade here — a view with no trade at all, whose save would
+  // trade only categories this backtest gave no trade to.
   function saveBlockedByTicks() {
     if (SHOWN[4].length) { return D.text.save_filtered; }
-    if (SHOWN[3].length && SHOWN[3].length >= D.categories.length) {
+    if (SHOWN[3].length && keptCats(SHOWN[3]).every(function(i) {
+      return count('c' + i) === 0;
+    })) {
       return D.text.save_all_excluded;
     }
     return null;

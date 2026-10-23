@@ -1554,8 +1554,8 @@ class TestConfirmRefusals:
     def test_a_link_built_before_exclusions_says_how_to_get_a_new_one(self):
         response = _get(_app(), "/confirm?" + _query(category="Sports"))
         assert response.status == 400
-        assert ("this link was built before the category filter became a list of "
-                "categories to exclude (it names category): rebuild the backtest "
+        assert ("this link names category, which exclude_category replaced (the filter "
+                "is now a list of categories NOT to trade): rebuild the backtest "
                 "dashboard, or open this server&#x27;s start page") in response.body
 
     def test_a_tag_needs_no_category(self):
@@ -1728,18 +1728,18 @@ class TestSeveralCategoriesAndTags:
          f"tag is given {_MOST + 1} times, more than {_MOST}"),
         # A tag tied to a category the link excludes, in any letter case
         (_filter_query(("Sports",), ("Sports · Basketball",)),
-         "tags: &#x27;Sports · Basketball&#x27; is tied to Sports, which "
-         "exclude_categories excludes"),
+         "tags: &#x27;Sports · Basketball&#x27; is tied to &#x27;Sports&#x27;, which "
+         "is in exclude_categories"),
         (_filter_query(("Politics", "economics"), ("Sports · Soccer", "Economics · Fed")),
-         "which exclude_categories excludes"),
+         "which is in exclude_categories"),
         # A category written as a tied tag, with tags or without: it would read
         # as "exclude Basketball from Sports" while it excluded nothing
         (_filter_query(("Sports", "Sports · Basketball")),
          "exclude_categories: &#x27;Sports · Basketball&#x27; is a tag tied to a "
-         "category; give it as a tag"),
+         "category; only a whole category can be excluded"),
         (_filter_query(("Politics", "Sports · Basketball"), ("Sports · Basketball",)),
-         "is a tag tied to a category; give it as a tag"),
-        (_filter_query(("Sports ·",)), "is a tag tied to a category; give it as a tag"),
+         "is a tag tied to a category; only a whole category can be excluded"),
+        (_filter_query(("Sports ·",)), "is a tag tied to a category; only a whole category can be excluded"),
         # Two spaces in a row, which a browser would show as one: the name
         # would look like another category's, or like a tag tied to it
         (_filter_query(("Climate and Weather", "Climate  and Weather"),
@@ -2412,19 +2412,94 @@ class TestOutdatedFile:
         assert _post(app, _click(confirm.body, "confirm")).status == 303
         assert config.read_saved_live_defaults() == caught.value.proposal
 
-    def test_a_file_that_listed_categories_to_trade_offers_no_proposal(self):
+    def test_a_file_that_listed_categories_offers_its_values_with_a_warning(self):
+        # The old file traded only Sports and Economics: its values in their
+        # new form exclude no category, so every page that offers them says in
+        # red that saving them as they are trades every category
         self._categories_file(b'["Sports", "Economics"]')
         with pytest.raises(config.LiveDefaultsOutdated) as caught:
             config.read_saved_live_defaults()
-        assert caught.value.proposal is None
-        app = _app()
-        trade = _get(app, "/trade")
+        assert caught.value.old_categories == ("Sports", "Economics")
+        proposal = caught.value.proposal
+        assert proposal == replace(_OLD_VERSION_READS_AS, exclude_categories=None)
+        link = "/confirm?" + defaults_server._settings_query(proposal)
+        starter = _Starter()
+        app = _app(start_process=starter)
+        warning = ("The saved defaults traded only these categories: Sports, Economics. "
+                   "This version saves the categories to EXCLUDE instead, and the values "
+                   "offered here exclude none, so saving them as they are trades every "
+                   "category. To keep the old filter, add <code>&exclude_category=<name></code> to the "
+                   "address for each category to leave out, or save from the backtest "
+                   "dashboard's Save as live defaults… button with those categories ticked "
+                   "in its Exclude categories menu.")
+        index = _get(app, "/")
+        assert index.status == 200
+        for response in (index, _get(app, "/trade"), _get(app, "/saved")):
+            body = html.unescape(response.body)
+            assert warning in body
+            assert "before the category filter became a list of categories to exclude" \
+                in body
+            # The link offered is the file's own values, never the seed's (the
+            # index links the seed page as it always does)
+            assert link in _parse(response.body).links
+            if response is not index:
+                assert ("/confirm?" + defaults_server._seed_query()
+                        not in _parse(response.body).links)
+        assert _get(app, "/trade").status == 409
+        assert _get(app, "/saved").status == 409
+        # The confirmation page the link opens proposes the file's other values
+        confirm = _get(app, link)
+        assert confirm.status == 200
+        assert warning in html.unescape(confirm.body)
+        cells = _parse(confirm.body).cells
+        assert cells["rebalance"][2] == "yes"
+        assert cells["exclude categories"][2] == "none"
+        # A page proposing other values over the file still warns
+        other = _get(app, "/confirm?" + _query(exclude_category="Politics"))
+        assert warning in html.unescape(other.body)
+        # A trade form is still refused, nothing started, the file as it was
+        old = config.LIVE_DEFAULTS_FILE.read_bytes()
+        fingerprint, nonce = defaults_server._fingerprint(None), "3" * 32
+        form = [("fingerprint", fingerprint), ("nonce", nonce),
+                ("token", app._token("trade", fingerprint, nonce, {})), ("action", "trade")]
+        assert _post(app, form, target="/trade").status == 409
+        assert starter.calls == []
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == old
+        # One Confirm and save writes exactly the file's other values
+        assert _post(app, _click(confirm.body, "confirm")).status == 303
+        saved = config.read_saved_live_defaults()
+        assert saved == proposal
+        assert (saved.tier_floors, saved.spread_band, saved.interval_discount,
+                saved.size_cap, saved.same_title_size_cap, saved.rebalance,
+                saved.min_price_move, saved.sell_at, saved.exclude_categories) == (
+            False, (0.0, 0.8), 0.7, 0.15, 0.2, True, 0.1, None, None)
+
+    def test_a_listed_file_s_link_keeps_its_sell_rule_and_tags(self):
+        # The offered link carries every one of the file's other settings
+        config.LIVE_DEFAULTS_FILE.write_bytes(
+            _OLD_VERSION_BYTES
+            .replace(b'"categories": null', b'"categories": ["Sports"]')
+            .replace(b'"tags": null', b'"tags": ["Sports \xc2\xb7 Basketball"]')
+            .replace(b'"trim_min_rise": 0.1\n',
+                     b'"trim_min_rise": 0.1,\n    "sell_at": 0.85,\n    "sell_min_days": 7\n'))
+        with pytest.raises(config.LiveDefaultsOutdated) as caught:
+            config.read_saved_live_defaults()
+        proposal = caught.value.proposal
+        assert (proposal.sell_at, proposal.sell_min_days, proposal.tags) == (
+            0.85, 7, ("Sports · Basketball",))
+        index = _get(_app(), "/")
+        assert "/confirm?" + defaults_server._settings_query(proposal) in _parse(index.body).links
+        assert "traded only these categories: Sports." in html.unescape(index.body)
+
+    def test_a_malformed_categories_value_offers_the_seed(self):
+        self._categories_file(b'"Sports"')
+        with pytest.raises(config.LiveDefaultsOutdated) as caught:
+            config.read_saved_live_defaults()
+        assert caught.value.proposal is None and caught.value.old_categories is None
+        trade = _get(_app(), "/trade")
         assert trade.status == 409
-        body = html.unescape(trade.body)
-        assert ("saved before the category filter became a list of categories to exclude, "
-                "and every live run refuses them") in body
-        assert "choosing the categories to exclude on the defaults server" in body
         assert "/confirm?" + defaults_server._seed_query() in _parse(trade.body).links
+        assert "traded only these categories" not in html.unescape(trade.body)
 
 
 class TestSave:
@@ -2658,8 +2733,8 @@ class TestSave:
         [record] = caplog.records
         assert record.levelno == logging.WARNING
         assert record.getMessage() == (
-            "Refused (400 Bad Request): this link was built before the category filter "
-            "became a list of categories to exclude (it names category): rebuild the "
+            "Refused (400 Bad Request): this link names category, which exclude_category "
+            "replaced (the filter is now a list of categories NOT to trade): rebuild the "
             "backtest dashboard, or open this server's start page")
 
 

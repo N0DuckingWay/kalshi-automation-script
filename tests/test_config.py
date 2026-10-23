@@ -1540,10 +1540,10 @@ class TestTradeFilter:
     @pytest.mark.parametrize("excluded", [("Sports",), ("Economics", "sports"), ("SPORTS",)])
     def test_a_tied_tag_in_an_excluded_category_is_refused(self, excluded):
         with pytest.raises(ValueError, match=r"tags: 'Sports · Basketball' is tied to "
-                                             r"Sports, which exclude_categories excludes"):
+                                             r"'Sports', which is in exclude_categories"):
             _settings(exclude_categories=excluded, tags=("Sports · Basketball",))
         # One bad tag refuses the whole filter, wherever it sits
-        with pytest.raises(ValueError, match="exclude_categories excludes"):
+        with pytest.raises(ValueError, match="is in exclude_categories"):
             _settings(exclude_categories=excluded, tags=("Fed", "Sports · Basketball"))
 
     @pytest.mark.parametrize("excluded", [None, ("Economics",), ("Economics", "Politics")])
@@ -1559,7 +1559,7 @@ class TestTradeFilter:
         assert s.tags == ("SPORTS · Basketball",)
         # main.py lays --exclude-category over saved defaults this way
         for excluded in (("Sports",), ("Economics", "sports")):
-            with pytest.raises(ValueError, match="tags: .*exclude_categories excludes"):
+            with pytest.raises(ValueError, match="tags: .*is in exclude_categories"):
                 dataclasses.replace(s, exclude_categories=excluded)
         assert dataclasses.replace(s, exclude_categories=None).tags == s.tags
         assert dataclasses.replace(s, exclude_categories=("Sports",), tags=None).tags is None
@@ -1612,7 +1612,7 @@ class TestTradeFilter:
         # With tags or without: excluding it would read as "Basketball of Sports
         # excluded" while it excluded nothing
         message = (rf"exclude_categories: {re.escape(repr(bad.strip()))} is a tag tied to a "
-                   r"category; give it as a tag")
+                   r"category; only a whole category can be excluded")
         for tags in (None, ("Basketball",), ("Politics · Fed",)):
             with pytest.raises(ValueError, match=message):
                 _settings(exclude_categories=("Economics", bad), tags=tags)
@@ -1660,9 +1660,9 @@ class TestTradeFilter:
         # A file edited by hand: the reader applies LiveSettings' own check
         record = _with_toggles(exclude_categories=["Sports"], tags=["Sports · Basketball"])
         config.LIVE_DEFAULTS_FILE.write_bytes(_text(record))
-        with pytest.raises(config.LiveDefaultsError, match="exclude_categories excludes"):
+        with pytest.raises(config.LiveDefaultsError, match="is in exclude_categories"):
             config.read_saved_live_defaults()
-        with pytest.raises(config.LiveDefaultsError, match="exclude_categories excludes"):
+        with pytest.raises(config.LiveDefaultsError, match="is in exclude_categories"):
             config.live_defaults()
 
     def test_the_argv_spells_a_tied_tag_as_one_flag(self):
@@ -4822,9 +4822,11 @@ class TestOutdatedSavedFile:
 class TestCategoriesRetirement:
     """A saved file holding "categories" (a list of categories to trade, which
     exclude_categories replaced) is refused as LiveDefaultsOutdated. A null
-    list (any category) reads exactly as no category excluded; a list of names
-    has no proposal, since which categories it leaves out depends on every
-    category Kalshi lists, and a guess could widen live trading."""
+    value (any category) reads exactly as no category excluded; a list of
+    names has no exact reading (which categories it leaves out depends on
+    every category Kalshi lists), so its proposal excludes none too, and
+    old_categories names the list, so every page that offers the proposal
+    can say it widens live trading."""
 
     @staticmethod
     def _current_era(**changes) -> bytes:
@@ -4856,30 +4858,71 @@ class TestCategoriesRetirement:
         assert err.proposal.exclude_categories is None and err.proposal.rebalance is True
         assert err.proposal.min_price_move == 0.10
 
-    @pytest.mark.parametrize("names", [["Sports"], ["Economics", "Politics"], []])
-    def test_a_list_of_names_has_no_proposal(self, names):
-        err = _outdated(self._current_era(tags=None) .replace(
+    @pytest.mark.parametrize("names", [["Sports"], ["Economics", " Politics "]])
+    def test_a_list_of_names_proposes_no_exclusion_and_names_the_old_list(self, names):
+        # A list of categories to trade has no exact reading as categories to
+        # exclude: the proposal is the file's other settings with nothing
+        # excluded, and old_categories says it widens live trading
+        err = _outdated(self._current_era(tags=None).replace(
             b'"categories": null', b'"categories": ' + json.dumps(names).encode()))
-        assert err.proposal is None
-        message = str(err)
-        assert message.startswith(f'{config.LIVE_DEFAULTS_FILE}: "settings" holds '
-                                  "categories, which exclude_categories replaced, and its "
-                                  "categories list the categories to trade (")
-        assert repr(names) in message
-        assert ("cannot be turned into categories to exclude without knowing every "
-                "category") in message
-        assert "choosing the categories to exclude on the defaults server's confirmation " \
-               "page" in message
-        assert "offer them" not in message
+        old = tuple(name.strip() for name in names)
+        assert err.old_categories == old
+        assert err.proposal == dataclasses.replace(
+            config.LIVE_DEFAULTS_SEED, min_price_move=0.1, sell_at=0.9, sell_min_days=2,
+            exclude_categories=None)
+        assert str(err) == (
+            f'{config.LIVE_DEFAULTS_FILE}: "settings" holds categories, which '
+            "exclude_categories replaced: these defaults traded only "
+            f"{', '.join(repr(name) for name in old)}, and this version saves what NOT to "
+            "trade instead. Saved again as offered (no category excluded), they trade "
+            "everything: exclude each category not to trade before saving (start "
+            "./start_dashboard.sh, or the backtest dashboard's \"Save as live "
+            "defaults…\" button)")
 
-    def test_a_list_of_names_beside_the_rebalance_settings_has_no_proposal(self):
+    def test_a_null_list_has_no_old_categories(self):
+        assert _outdated(self._current_era()).old_categories is None
+
+    @pytest.mark.parametrize("value", [
+        b'"Sports"', b"3", b"[]", b'["Sports", "any"]', b'["Sports", ""]', b"[1]",
+        b'["Sports \xc2\xb7 Basketball"]', b"{}",
+    ])
+    def test_a_malformed_list_has_no_proposal(self, value):
+        # What the older version refused has no reading now either
+        err = _outdated(self._current_era(tags=None).replace(
+            b'"categories": null', b'"categories": ' + value))
+        assert err.proposal is None and err.old_categories is None
+        assert "and its other settings are refused too" in str(err)
+
+    def test_a_tied_tag_with_null_categories_has_no_proposal(self):
+        # The older version accepted a tied tag only with its category listed,
+        # so null categories with one was a file it refused
+        err = _outdated(self._current_era(tags=["Sports · Basketball"]))
+        assert err.proposal is None and err.old_categories is None
+        assert "is tied to 'Sports', which its categories did not list" in str(err)
+
+    def test_a_tied_tag_needs_its_category_listed_as_the_old_version_did(self):
+        listed = self._current_era(tags=["sports · Basketball"]).replace(
+            b'"categories": null', b'"categories": ["Sports"]')
+        err = _outdated(listed)
+        assert err.proposal.tags == ("sports · Basketball",)
+        assert err.proposal.exclude_categories is None
+        assert err.old_categories == ("Sports",)
+        unlisted = self._current_era(tags=["Sports · Basketball"]).replace(
+            b'"categories": null', b'"categories": ["Economics"]')
+        assert _outdated(unlisted).proposal is None
+
+    def test_a_list_of_names_beside_the_rebalance_settings_applies_both(self):
         record = json.loads(_OLD_VERSION_BYTES)
         record["settings"]["categories"] = ["Sports"]
         err = _outdated(_text(record))
-        assert err.proposal is None
+        assert err.old_categories == ("Sports",)
+        assert err.proposal.rebalance is True and err.proposal.exclude_categories is None
         assert ('"settings" holds add_to_held_pairs, trim_to_kelly and trim_min_rise, '
                 "which rebalance and min_price_move replaced, and categories, which "
-                "exclude_categories replaced, and its categories list") in str(err)
+                "exclude_categories replaced: these defaults traded only 'Sports'") \
+            in str(err)
+        assert ("Saved again as offered (rebalance yes, min price movement 10c, no "
+                "category excluded), they trade everything") in str(err)
 
     def test_both_filters_together_are_refused_with_no_proposal(self):
         record = _with_toggles()

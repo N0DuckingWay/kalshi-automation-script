@@ -98,6 +98,7 @@ Notes:
 """
 import ast
 import dataclasses
+import html
 import inspect
 import json
 import logging
@@ -942,8 +943,8 @@ class TestLiveSettingsFlags:
         # The tag's category is one this run excludes
         (["--exclude-category", "Economics", "--tag", "Economics · Fed"], {},
          ["invalid live setting for this run (--exclude-category, --tag):",
-          "tags: 'Economics · Fed' is tied to Economics, which exclude_categories "
-          "excludes"]),
+          "tags: 'Economics · Fed' is tied to 'Economics', which is in "
+          "exclude_categories; a category that never trades cannot be narrowed to a tag"]),
         # A blank half is never read as a plain tag
         (["--tag", "Sports · "], {}, ["tags: 'Sports ·' must read 'Category · Tag'"]),
         (["--tag", " · Basketball"], {}, ["must read 'Category · Tag'"]),
@@ -951,7 +952,7 @@ class TestLiveSettingsFlags:
         # rather than the tag read some other way
         (["--exclude-category", "Sports"],
          {"exclude_categories": ("Economics",), "tags": ("Sports · Basketball",)},
-         ["(--exclude-category):", "is tied to Sports, which exclude_categories excludes"]),
+         ["(--exclude-category):", "is tied to 'Sports', which is in exclude_categories"]),
     ])
     def test_a_tied_tag_in_an_excluded_category_is_a_usage_error(
         self, monkeypatch, capsys, mode, argv, saved, words,
@@ -992,7 +993,7 @@ class TestLiveSettingsFlags:
         err = " ".join(capsys.readouterr().err.split())
         # The settings' own message, then the remedy, last
         assert f"invalid live setting for this run ({flags}): tags: " in err, err
-        assert "which exclude_categories excludes" in err, err
+        assert "which is in exclude_categories" in err, err
         assert err.endswith(self._SAVED_TAG_REMEDY.strip()), err
 
     @pytest.mark.parametrize("argv, tags", [
@@ -1052,7 +1053,7 @@ class TestLiveSettingsFlags:
         assert "settings" not in seen
         err = capsys.readouterr().err
         assert ("exclude_categories: 'Sports · Basketball' is a tag tied to a category; "
-                "give it as a tag") in err, err
+                "only a whole category can be excluded") in err, err
         assert "--exclude-category" in err, err
 
     def test_a_saved_tied_tag_survives_a_flag_that_keeps_its_category(self, monkeypatch):
@@ -1115,9 +1116,14 @@ class TestLiveSettingsFlags:
         assert not seen["logging_set_up"] and not seen["client_built"]
         assert "settings" not in seen
         err = " ".join(capsys.readouterr().err.split())
-        assert (f"{flag} was replaced by --exclude-category NAME (repeatable) / "
-                "--no-exclude-category: the category filter is now a list of categories "
-                "NOT to trade, and every other category trades") in err, err
+        if flag == "--category":
+            assert ("--category no longer exists: the category filter is now a list of "
+                    "categories NOT to trade, and every other category trades. Use "
+                    "--exclude-category NAME (repeatable), or --no-exclude-category to "
+                    "exclude none") in err, err
+        else:
+            assert ("--any-category no longer exists: use --no-exclude-category (exclude "
+                    "no category)") in err, err
 
     def test_the_retired_category_flags_are_hidden_from_help(self, monkeypatch, capsys):
         monkeypatch.setattr(sys, "argv", ["kalshi_betting.main", "--help"])
@@ -1156,11 +1162,15 @@ class TestLiveSettingsFlags:
         assert out.count("default: the saved live defaults") == 12
         assert out.count("whatever the saved live defaults say") == 5
         # --exclude-category and --tag each replace the whole saved list, and say so
-        assert "Replaces every saved exclusion for this run" in out
+        assert ("REPLACES the saved exclusions for this run, so a category the saved "
+                "defaults exclude trades this run unless it is listed again") in out
         assert "Replaces every saved tag for this run" in out
-        # ... and the exclude flag names what a saved tied tag then needs
+        # ... and the exclude flag names what a saved tied tag then needs, and
+        # what happens to a series the listing lacks
         assert out.count("the run exits 2 until") == 1
-        assert "under every category this run does not exclude" in out
+        assert ("a pair whose series Kalshi's /series listing lacks is not traded while "
+                "any category is excluded") in out
+        assert "in every category this run does not exclude" in out
         assert "\"Exclude categories\" menu" in out
         assert "config.TIME_SERIES" not in out and "config.TRADE" not in out
         assert "config.BUDGET_FRACTION" not in out and "config.SAME_TITLE" not in out
@@ -1628,18 +1638,61 @@ class TestCategoryFilter:
         _seed_series_listing(self.LISTING)
         with caplog.at_level(logging.INFO):
             out = _filtered(self._pairs(), exclude_categories=("sPoRtS",))
-        assert self._tickers(out) == self.ALL[2:]
-        assert ("Category/tag filter (exclude categories sPoRtS; tags any): kept 8 of 10 "
+        # The four pairs whose series the listing lacks are left out too
+        assert self._tickers(out) == self.ALL[2:6]
+        assert ("Category/tag filter (exclude categories sPoRtS; tags any): kept 4 of 10 "
                 "candidate pairs — dropped ") in caplog.text
         assert "Sports · Basketball 1" in caplog.text and "Sports · Soccer 1" in caplog.text
 
-    def test_a_category_the_listing_never_named_still_trades(self):
-        # The point of an exclude list: every category not excluded trades,
-        # a series no listing files (Crypto by its ticker prefix) included
+    def test_a_listed_category_never_excluded_still_trades(self):
+        # The point of an exclude list: every listed category not excluded
+        # trades, an uncategorised series included
         _seed_series_listing(self.LISTING)
         out = self._tickers(_filtered(self._pairs(), exclude_categories=("Politics", "Sports")))
-        assert out == ["KXBRENTW-26SEP19", "KXMVECROSSCATEGORY-S2026X",
+        assert out == ["KXBRENTW-26SEP19", "KXMVECROSSCATEGORY-S2026X"]
+
+    def test_an_unlisted_series_is_left_out_while_categories_are_excluded(self, caplog):
+        # KXMVECROSSCATEGORY0 and KXBTCD are not in the listing, so their
+        # category would be infer_category's guess and could be one excluded:
+        # fail closed, counted in one WARNING; a blank or missing event ticker too
+        _seed_series_listing(self.LISTING)
+        with caplog.at_level(logging.INFO):
+            out = self._tickers(_filtered(self._pairs(), exclude_categories=("Commodities",)))
+        assert out == ["KXNCAAMBGAME-26JAN13WIUEIU", "KXUCLGAME-26APR14ATMBAR",
+                       "KXFISAEXTEND-26", "KXSCOTUSLAST-26", "KXMVECROSSCATEGORY-S2026X"]
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning == (
+            "Category filter: 4 candidate pairs left out because their series is not in "
+            "Kalshi's /series listing, so their category is not known and may be one this "
+            "run excludes (series: (no event ticker), KXMVECROSSCATEGORY0, KXBTCD)")
+        assert "kept 5 of 10 candidate pairs" in caplog.text
+
+    def test_an_unlisted_series_trades_when_no_category_is_excluded(self, caplog):
+        # With no exclusion, filing by the fallback label is as before: a tag
+        # filter alone never leaves out a pair for its series being unlisted
+        _seed_series_listing(self.LISTING)
+        with caplog.at_level(logging.WARNING):
+            out = self._tickers(_filtered(self._pairs(), tags=("General",)))
+        assert out == ["KXSCOTUSLAST-26", "KXMVECROSSCATEGORY-S2026X",
                        "KXMVECROSSCATEGORY0-S2026Y", "KXBTCD-26SEP1517", "", None]
+        assert "left out because their series is not in" not in caplog.text
+
+    @pytest.mark.parametrize("event", ["", None])
+    def test_a_blank_event_ticker_is_left_out_under_exclusions(self, event, caplog):
+        _seed_series_listing(self.LISTING)
+        with caplog.at_level(logging.WARNING):
+            assert _filtered([_filter_pair(event)], exclude_categories=("Sports",)) == []
+        assert "1 candidate pairs left out" in caplog.text
+        assert "(series: (no event ticker))" in caplog.text
+
+    def test_only_the_first_few_unlisted_series_are_named(self, caplog):
+        _seed_series_listing(self.LISTING)
+        pairs = [_filter_pair(f"KXNEW{i}-26") for i in range(7)]
+        with caplog.at_level(logging.WARNING):
+            assert _filtered(pairs, exclude_categories=("Sports",)) == []
+        assert ("7 candidate pairs left out because their series is not in Kalshi's /series "
+                "listing") in caplog.text
+        assert "(series: KXNEW0, KXNEW1, KXNEW2, KXNEW3, KXNEW4, and 2 more)" in caplog.text
 
     def test_the_first_tag_is_the_one_matched(self):
         _seed_series_listing(self.LISTING)
@@ -1667,21 +1720,26 @@ class TestCategoryFilter:
         _seed_series_listing(self.LISTING)
         out = self._tickers(_filtered(self._pairs(), exclude_categories=("Uncategorised",)))
         assert "KXMVECROSSCATEGORY-S2026X" not in out
-        assert "KXMVECROSSCATEGORY0-S2026Y" in out
-        assert "KXMVECROSSCATEGORY0-S2026Y" not in self._tickers(
-            _filtered(self._pairs(), exclude_categories=("Other",)))
+        # The unlisted one is left out under any exclusion, and is filed by its
+        # own ticker prefix, never as KXMVECROSSCATEGORY's
+        assert "KXMVECROSSCATEGORY0-S2026Y" not in out
+        listing = {t: (c, tuple(tags)) for t, (c, tags) in self.LISTING.items()}
+        assert main._pair_labels(_filter_pair("KXMVECROSSCATEGORY0-S2026Y"), listing) == (
+            infer_category("KXMVECROSSCATEGORY0-S2026Y"), "General")
 
     def test_an_unlisted_series_falls_back_to_the_ticker_prefix_label(self, caplog):
         _seed_series_listing(self.LISTING)
         assert infer_category("KXBTCD-26SEP1517") == "Crypto"
-        with caplog.at_level(logging.WARNING):
-            out = _filtered(self._pairs(), exclude_categories=("crypto",))
-        assert "KXBTCD-26SEP1517" not in self._tickers(out) and len(out) == 9
+        listing = {t: (c, tuple(tags)) for t, (c, tags) in self.LISTING.items()}
+        assert main._pair_labels(_filter_pair("KXBTCD-26SEP1517"), listing) == (
+            "Crypto", "General")
         # A label only a fallback files under is not a typo
+        with caplog.at_level(logging.WARNING):
+            _filtered(self._pairs(), exclude_categories=("crypto",))
         assert "check the spelling" not in caplog.text
         # A missing or empty event ticker files under infer_category's "Other"
-        assert self._tickers(_filtered(self._pairs(), exclude_categories=("Other",)))[-2:] == [
-            "KXMVECROSSCATEGORY-S2026X", "KXBTCD-26SEP1517"]
+        for event in ("", None):
+            assert main._pair_labels(_filter_pair(event), listing) == ("Other", "General")
 
     def test_no_listing_keeps_nothing_and_says_why(self, monkeypatch, caplog):
         # Dev (no client) with no cached copy
@@ -1704,9 +1762,10 @@ class TestCategoryFilter:
     def test_a_name_no_series_carries_is_warned_as_a_typo(self, caplog):
         _seed_series_listing(self.LISTING)
         with caplog.at_level(logging.WARNING):
-            # A misspelt exclusion excludes nothing
+            # A misspelt exclusion excludes nothing (the series the listing
+            # lacks are left out under any exclusion)
             assert self._tickers(_filtered(self._pairs(), exclude_categories=("Sprots",))) == \
-                self.ALL
+                self.ALL[:6]
         assert ("Excluded category 'Sprots' names no category in Kalshi's listing of 6 "
                 "series, nor any this run's pairs were filed under — check the spelling; it "
                 "excludes nothing") in caplog.text
@@ -1716,9 +1775,8 @@ class TestCategoryFilter:
         with caplog.at_level(logging.WARNING):
             assert self._tickers(_filtered(self._pairs(), exclude_categories=("Politics",),
                                            tags=("Sports · Soccer",))) == [
-                "KXUCLGAME-26APR14ATMBAR", "KXBRENTW-26SEP19", "KXMVECROSSCATEGORY-S2026X",
-                "KXMVECROSSCATEGORY0-S2026Y", "KXBTCD-26SEP1517", "", None]
-        assert caplog.text == ""
+                "KXUCLGAME-26APR14ATMBAR", "KXBRENTW-26SEP19", "KXMVECROSSCATEGORY-S2026X"]
+        assert "check the spelling" not in caplog.text
         caplog.clear()
         # A real name draws no warning, even when it matches no pair this run
         with caplog.at_level(logging.WARNING):
@@ -1807,9 +1865,9 @@ class TestCategoryFilter:
         category = infer_category("KXBTCD-26SEP1517")
         pairs = [_filter_pair("KXBTCD-26SEP1517"), _filter_pair("KXUCLGAME-26APR14ATMBAR")]
         with caplog.at_level(logging.WARNING):
-            kept = _filtered(pairs, exclude_categories=("Sports",),
-                             tags=(f"{category} · General",))
-        assert self._tickers(kept) == ["KXBTCD-26SEP1517"]
+            kept = _filtered(pairs, tags=(f"{category} · General",))
+        # (Sports has no tag of the filter, so it trades in full)
+        assert self._tickers(kept) == ["KXBTCD-26SEP1517", "KXUCLGAME-26APR14ATMBAR"]
         assert caplog.text == ""
 
     def test_tied_tags_keep_nothing_without_a_listing(self, caplog):
@@ -1822,7 +1880,8 @@ class TestCategoryFilter:
 
     def test_plain_tags_keep_what_an_exclusion_and_a_tag_list_say(self):
         # Random filters without a tied tag: the category is not excluded AND
-        # the tag is listed (or none is)
+        # the tag is listed (or none is); with any category excluded, a pair
+        # whose series the listing lacks is left out
         listing = {**self.LISTING, **self.TIED_LISTING}
         _seed_series_listing(listing)
         series = {t: (c, tuple(tags)) for t, (c, tags) in listing.items()}
@@ -1845,7 +1904,9 @@ class TestCategoryFilter:
             wanted = None if tags is None else {t.casefold() for t in tags}
             expected = [p for p, (c, t) in zip(pairs, labels, strict=True)
                         if c.casefold() not in out
-                        and (wanted is None or t.casefold() in wanted)]
+                        and (wanted is None or t.casefold() in wanted)
+                        and (excluded is None or historical.series_ticker(
+                            p.market_a.event_ticker) in series)]
             kept = _filtered(pairs, exclude_categories=excluded, tags=tags)
             assert [id(p) for p in kept] == [id(p) for p in expected], (excluded, tags)
             kept_total += len(kept)
@@ -1877,6 +1938,8 @@ class TestCategoryFilter:
         assert "Series category listing unavailable" not in caplog.text
 
     def test_prod_refreshes_a_stale_listing_with_its_own_client(self, monkeypatch):
+        # Stale: KXBRENTW as Sports, KXUCLGAME not listed (so left out under
+        # an exclusion); fresh: KXBRENTW as Commodities, KXUCLGAME as Sports
         _seed_series_listing({"KXBRENTW": ["Sports", ["Soccer"]]},
                              fetched_at=datetime(2020, 1, 1, tzinfo=UTC))
         clients = []
@@ -1884,13 +1947,15 @@ class TestCategoryFilter:
         def fresh(client, path, **params):
             clients.append(client)
             return {"series": [{"ticker": "KXBRENTW", "category": "Commodities",
-                                "tags": ["Oil & Gas"]}]}
+                                "tags": ["Oil & Gas"]},
+                               {"ticker": "KXUCLGAME", "category": "Sports",
+                                "tags": ["Soccer"]}]}
 
         monkeypatch.setattr(historical, "_historical_get", fresh)
         client = MagicMock()
         out = _filtered(self._pairs(), exclude_categories=("Commodities",),
                         listing_client=client)
-        assert "KXBRENTW-26SEP19" not in self._tickers(out) and len(out) == 9
+        assert self._tickers(out) == ["KXUCLGAME-26APR14ATMBAR"]
         assert clients == [client]
 
     # A copy of test_dashboard.py's TestReturnsByCategory.SERIES: importing a
@@ -1934,15 +1999,26 @@ class TestCategoryFilter:
             filed.setdefault((category, subcategory[len(category) + 3:]), []).append(event)
         assert len(filed) >= 6
         categories = {c for c, _ in filed}
+
+        def listed(event):
+            # Under an exclusion a series the listing lacks is left out
+            return historical.series_ticker(event) in self.DASHBOARD_SERIES
+
         for (category, tag), expected in filed.items():
             # Every other category excluded, the tag tied to this one
             others = tuple(sorted(categories - {category}))
             kept = _filtered(pairs, exclude_categories=others or None,
                              tags=(f"{category} · {tag}",))
-            assert self._tickers(kept) == expected, (category, tag)
+            assert self._tickers(kept) == [e for e in expected if not others or listed(e)], (
+                category, tag)
+            # With no exclusion, the tied tag alone keeps its own pairs
+            # (every other category has no tag of the filter, so trades in full)
+            kept = _filtered(pairs, tags=(f"{category} · {tag}",))
+            assert set(expected) <= set(self._tickers(kept)), (category, tag)
         # ... and excluding a category drops exactly its trades, whatever the tag
         for category in categories:
-            expected = [e for (c, _), es in filed.items() if c != category for e in es]
+            expected = [e for (c, _), es in filed.items() if c != category for e in es
+                        if listed(e)]
             kept = _filtered(pairs, exclude_categories=(category,))
             assert sorted(self._tickers(kept)) == sorted(expected), category
 
@@ -1991,8 +2067,8 @@ class TestCategoryFilter:
         with caplog.at_level(logging.INFO):
             out = main._filter_by_category(self._pairs(), settings, MagicMock(),
                                            series_categories=listing)
-        assert self._tickers(out) == self.ALL[2:]
-        assert "kept 8 of 10 candidate pairs" in caplog.text
+        assert self._tickers(out) == self.ALL[2:6]
+        assert "kept 4 of 10 candidate pairs" in caplog.text
         # No filter set: the pairs come back untouched, whatever is handed in
         pairs = self._pairs()
         no_filter = LiveSettings(True, (0.0, 1.0), 0.75, 0.2)
@@ -8006,7 +8082,12 @@ class TestLiveRebalanceTextsSayWhatARunDoes:
         assert remedy in self._text("README.md")
         notice = ("The saved live defaults were saved before Rebalance. Below: their values, "
                   "read as")
-        assert notice in self._source_text(defaults_server._outdated_confirm_html)
+        # Rendered for a file saved before Rebalance, proposing exactly its values
+        proposal = dataclasses.replace(config.LIVE_DEFAULTS_SEED, min_price_move=0.1)
+        outdated = config.LiveDefaultsOutdated(
+            "m", proposal, ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise"))
+        assert notice in html.unescape(
+            defaults_server._outdated_confirm_html(outdated, proposal))
         assert notice in claude
         link = "this link was built before Rebalance (it names"
         assert link in self._source_text(defaults_server._proposal)

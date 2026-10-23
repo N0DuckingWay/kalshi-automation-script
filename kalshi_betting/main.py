@@ -156,6 +156,7 @@ from . import run_lock
 from ._http import api_error_summary
 from .auth import build_client, read_account_balance
 from .config import (
+    CATEGORY_FILTER_MAX_NAMED_SERIES,
     CONTRACT_PAYOUT_DOLLARS,
     EXIT_NO_TRADEABLE_SHARDS,
     EXIT_OK,
@@ -1089,7 +1090,12 @@ def _filter_by_category(pairs: list, settings: LiveSettings, listing_client, *,
 
     Fails CLOSED: with no listing nothing is kept, rather than filing nearly
     every KX ticker as "Other", and its WARNING is the one line saying why,
-    since the run exits EXIT_OK. An excluded category or plain tag that no
+    since the run exits EXIT_OK. With any category excluded, a pair whose
+    market-A series the listing lacks (a series newer than the cached
+    listing, say), or whose event ticker is blank, is not kept either: its
+    category would come from infer_category's ticker-prefix guess, so it
+    could trade through the exclusion of its real category. One WARNING
+    counts them (silent at zero). An excluded category or plain tag that no
     listed series and no pair of this run carries draws a typo WARNING (an
     excluded name of that kind excludes nothing), and so does a tied tag whose
     category and tag are not one series' labels together.
@@ -1126,17 +1132,36 @@ def _filter_by_category(pairs: list, settings: LiveSettings, listing_client, *,
     keeps = trade_filter(settings)
     kept: list = []
     dropped: Counter = Counter()
+    # The series of the pairs left out because the listing does not file them
+    unlisted: Counter = Counter()
     # Every (category, tag) a pair of this run was filed under, case-folded
     filed: set = set()
     for pair in pairs:
         # Filed exactly as the dashboard files a trade of this event
         category, tag = _pair_labels(pair, series_categories)
         filed.add((category.casefold(), tag.casefold()))
+        if settings.exclude_categories is not None:
+            event = pair.market_a.event_ticker
+            # Cross-module: market A's literal series, the key the listing files by
+            series = series_ticker(event) if isinstance(event, str) else ""
+            if not series or series not in series_categories:
+                # Filed by a ticker-prefix guess: its real category is not
+                # known, and may be one this run excludes
+                unlisted[series or "(no event ticker)"] += 1
+                continue
         if keeps(category, tag):
             kept.append(pair)
         else:
             # The pair's category and tag, written as a filter ties a tag
             dropped[f"{category}{TAG_SCOPE_SEPARATOR}{tag}"] += 1
+    if unlisted:
+        named = [name for name, _ in unlisted.most_common(CATEGORY_FILTER_MAX_NAMED_SERIES)]
+        more = len(unlisted) - len(named)
+        logging.warning(
+            "Category filter: %d candidate pairs left out because their series is not in "
+            "Kalshi's /series listing, so their category is not known and may be one this "
+            "run excludes (series: %s%s)", sum(unlisted.values()), ", ".join(named),
+            f", and {more} more" if more else "")
     logging.info(
         "Category/tag filter (%s): kept %d of %d candidate pairs%s", wanted,
         len(kept), len(pairs),
@@ -1468,10 +1493,14 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
     retired = [flag for dest, flag in (("retired_category", "--category"),
                                        ("retired_any_category", "--any-category"))
                if getattr(args, dest, None)]
+    if retired == ["--any-category"]:
+        parser.error("--any-category no longer exists: use --no-exclude-category (exclude "
+                     "no category)")
     if retired:
-        parser.error(f"{retired[0]} was replaced by --exclude-category NAME (repeatable) / "
-                     "--no-exclude-category: the category filter is now a list of "
-                     "categories NOT to trade, and every other category trades")
+        parser.error("--category no longer exists: the category filter is now a list of "
+                     "categories NOT to trade, and every other category trades. Use "
+                     "--exclude-category NAME (repeatable), or --no-exclude-category to "
+                     "exclude none")
     try:
         # The saved live defaults: the reference, and the base the flags lay over.
         # There is no fallback: with none saved, the run does not start
@@ -2530,11 +2559,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--exclude-category", action="append", default=None, metavar="NAME",
         help="Do not trade pairs filed under this Kalshi category, as the backtest "
              "dashboard's \"Exclude categories\" menu names it; every other category "
-             "trades, one the backtest never saw included (repeatable; "
-             "case-insensitive; default: the saved live defaults). Replaces every "
-             "saved exclusion for this run: if the saved defaults tie a tag to a "
-             "category this run excludes, the run exits 2 until --any-tag or this "
-             "run's own --tag is given",
+             "trades, one the backtest never saw included, but a pair whose series "
+             "Kalshi's /series listing lacks is not traded while any category is "
+             "excluded (repeatable; case-insensitive; default: the saved live "
+             "defaults). REPLACES the saved exclusions for this run, so a category the "
+             "saved defaults exclude trades this run unless it is listed again; if the "
+             "saved defaults tie a tag to a category this run excludes, the run exits 2 "
+             "until --any-tag or this run's own --tag is given",
     )
     categories.add_argument(
         "--no-exclude-category", action="store_true", default=None,
@@ -2549,14 +2580,12 @@ def _build_parser() -> argparse.ArgumentParser:
     tags = live.add_mutually_exclusive_group()
     tags.add_argument(
         "--tag", action="append", default=None, metavar="NAME",
-        help="Trade only pairs whose series' FIRST Kalshi tag is NAME, under every "
-             "category this run does not exclude; or give "
-             "\"Category · Tag\" to narrow that one category (which may not be "
-             "excluded) and leave the "
-             "others as they are. Replaces every saved tag for this run, so a "
-             "category the saved tags narrowed trades in full unless this run's "
-             "tags narrow it (repeatable; case-insensitive; default: the saved "
-             "live defaults)",
+        help="Trade only pairs whose series' FIRST Kalshi tag is NAME, in every "
+             "category this run does not exclude. Or give \"Category · Tag\" to "
+             "narrow that one category (it must not be excluded) and leave the others "
+             "as they are. Replaces every saved tag for this run, so a category the "
+             "saved tags narrowed trades in full unless this run's tags narrow it "
+             "(repeatable; case-insensitive; default: the saved live defaults)",
     )
     tags.add_argument(
         "--any-tag", action="store_true", default=None,
