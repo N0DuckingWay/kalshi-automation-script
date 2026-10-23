@@ -814,6 +814,25 @@ DEFAULTS_SERVER_MAX_REQUEST_BYTES = 65_536
 # of most categories still fits.
 DEFAULTS_SERVER_MAX_FILTER_NAMES = 400
 
+# The longest request line the server's HTTP layer reads, "GET <path>
+# HTTP/1.1" and its line break included: http.server's own limit, whatever
+# DEFAULTS_SERVER_MAX_REQUEST_BYTES says. A confirmation address opened with a
+# GET is held to the smaller of the two (the dashboard's Save button)
+DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES = 65_536
+
+# What the confirmation page's form adds, when it is posted back, to the
+# fields of the address it was opened with: "&fingerprint=" and 64 hex
+# digits (77 bytes), "&nonce=" and 32 (39), "&token=" and 64 (71),
+# "&action=dry_run", the longest action (15), and "&ack_attention=1", the box
+# under the attention banner (16). The dashboard's Save button budgets the
+# posted form with it; a test renders a real form and checks the sum
+DEFAULTS_SERVER_CONFIRM_FORM_EXTRA_BYTES = 218
+
+# Bytes the dashboard's Save button leaves unused under both of the defaults
+# server's limits (the request line and the request), in case its form grows
+# by a field
+DASHBOARD_SAVE_HEADROOM_BYTES = 64
+
 # Seconds the server waits on a silent connection before dropping it: it
 # answers one request at a time, and a browser can hold a connection open
 # without sending anything.
@@ -3074,6 +3093,70 @@ def _names(value, name: str) -> tuple[str, ...] | None:
                 f"in {LIVE_DEFAULTS_FILE.name}, {none_flag} on main.py, or None in config.py")
         names.append(item.strip())
     return tuple(names)
+
+
+def check_filter_name(text: str, field: str) -> str:
+    """
+    Check one excluded category or tag as the defaults server reads it from a link.
+
+    A name with two spaces in a row is refused, for categories and tags
+    alike: a browser shows a run of spaces as one, so on the confirmation
+    page such a name would look exactly like the name spelled with single
+    spaces while being a different name to the filter. That also refuses a
+    tied tag written with a doubled space ("Sports ·  Basketball").
+    defaults_server._name reads every exclude_category and exclude_tag field
+    through it, and filter_name_refusal asks it for the dashboard's Save
+    button, so the two never disagree.
+
+    Args:
+        text (str): The name.
+        field (str): The field's name, for the message.
+
+    Returns:
+        str: The name as given.
+
+    Raises:
+        ValueError: If the name is not one printable line (a zero-width or
+            text-direction character, say), has spaces around it, or holds
+            two spaces in a row.
+    """
+    if not text.isprintable() or text != text.strip():
+        raise ValueError(f"{field} must be one printable name with no spaces around it, "
+                         f"got {text!r}")
+    if any(text[i].isspace() and text[i + 1].isspace() for i in range(len(text) - 1)):
+        raise ValueError(f"{field} must not hold two spaces in a row, got {text!r}")
+    return text
+
+
+def filter_name_refusal(field: str, name: str) -> str | None:
+    """
+    Say why one excluded category or tag would be refused, or None.
+
+    The defaults server reads each name of a link through check_filter_name
+    and then LiveSettings, which holds it to _names (no "any" or "none") and
+    to _check_category_names or _check_tied_tags. Each of those judges a name
+    on its own, so one name's verdict is the verdict of any list holding it.
+    The dashboard asks this of every category and tag its menus offer, so its
+    Save button never opens a link the server refuses.
+
+    Args:
+        field (str): "exclude_categories" or "exclude_tags".
+        name (str): The name as the link would send it (a tag as
+            "Category · Tag").
+
+    Returns:
+        str | None: The refusal's message, or None when the name is taken.
+    """
+    try:
+        check_filter_name(name, field)
+        names = _names((name,), field)
+        if field == "exclude_categories":
+            _check_category_names(names)
+        else:
+            _check_tied_tags(names)
+    except ValueError as exc:
+        return str(exc)
+    return None
 
 
 def split_tag(name: str) -> tuple[str | None, str]:

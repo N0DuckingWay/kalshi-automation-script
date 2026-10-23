@@ -185,15 +185,18 @@ Purpose:
     maturity (only on a page that simulated selling), with this run's
     same-title cap when the run recorded one — never for the Scenario
     Explorer's own selects. The address names each category ticked in the
-    Exclude categories menu as a category live runs exclude, and each
-    "Category · Tag" ticked in the Exclude tags menu as a tag live runs
-    exclude in that category (letter-case twins included, as the page ticks
-    them), so every other category and tag trades live, one the backtest
-    never saw included, and a save replaces the saved excluded categories
-    and tags. While the ticks keep none of the scenario's trades, or would
-    name more categories or tags, or make a longer address, than the
-    defaults server takes, the button stays disabled and its hover text
-    says why; a grey note beside it says when saving replaces saved
+    Exclude categories menu as a category live runs exclude, and so each
+    kept category every one of whose tags is ticked in the Exclude tags
+    menu (with its letter-case twins, each ticked or with every tag ticked
+    too), and each other "Category · Tag" ticked as a tag live runs exclude
+    in that category (letter-case twins included, as the page ticks them),
+    so every other category and tag trades live, one the backtest never saw
+    included, and a save replaces the saved excluded categories and tags.
+    While the ticks keep none of the scenario's trades, would send a name
+    the defaults server refuses, or would name more categories or tags, or
+    make a longer address or posted form, than it takes, the button stays
+    disabled and its hover text says why; a grey note beside it says when
+    saving replaces saved
     exclusions, naming them. That page compares the
     proposal with the live defaults in force and acts only when one of its
     buttons is pressed: Confirm and save saves it, Confirm and trade saves
@@ -601,10 +604,13 @@ from .config import (
     DASHBOARD_BUILD_STALE_SECONDS,
     DASHBOARD_FILENAME,
     DASHBOARD_FILES_DIRNAME,
+    DASHBOARD_SAVE_HEADROOM_BYTES,
+    DEFAULTS_SERVER_CONFIRM_FORM_EXTRA_BYTES,
     DEFAULTS_SERVER_HOST,
     DEFAULTS_SERVER_MAX_FILTER_NAMES,
     DEFAULTS_SERVER_MAX_REQUEST_BYTES,
     DEFAULTS_SERVER_PORT,
+    DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES,
     FLAT_RETURN_TOLERANCE,
     KHAT_CONFIDENCE_LEVEL,
     LIVE_DEFAULTS_SOURCE_PATTERN,
@@ -621,6 +627,8 @@ from .config import (
     TRADING_DAYS_PER_YEAR,
     describe_time_series_rule,
     fee_per_pair_approx,
+    filter_name_refusal,
+    split_tag,
     time_series_mid_spread,
     time_series_profit_prob,
     trade_filter_for,
@@ -7367,18 +7375,21 @@ _SAVE_TITLE = ("Open a confirmation page, in a new tab, that compares the filter
                "simulated selling), with this run's same-title cap when the run recorded "
                "one; not the Scenario Explorer's own selects — with the live trading "
                "defaults. It names the categories ticked in the Exclude categories "
-               "menu as the categories live runs exclude, and each Category · Tag "
-               "ticked in the Exclude tags menu as a tag live runs exclude in that "
-               "category (every other category and tag trades, one this backtest never "
-               "saw included), so saving it replaces the excluded categories and tags "
-               "saved before. "
+               "menu, and each category every one of whose tags is ticked in the "
+               "Exclude tags menu, as the categories live runs exclude, and each other "
+               "Category · Tag ticked there as a tag live runs exclude in that category "
+               "(every other category and tag trades, one this backtest never saw "
+               "included), so saving it replaces the excluded categories and tags saved "
+               "before. "
                "Nothing is saved until you press a button there: Confirm and save saves "
                "it; Confirm and trade saves it and then runs the live bot with it, placing "
                "real orders; Dry run runs the live bot with it without placing orders and "
                "saves nothing. It stays unavailable while the categories and tags kept "
                "hold no trade of the scenario shown (every category excluded, say), while "
-               "more categories or tags are ticked than one link may name, while a "
-               "scenario loads, and for a scenario the run never "
+               "more categories or tags are ticked than one link may name or they make an "
+               "address longer than the defaults server reads, while a name ticked is one "
+               "the defaults server would refuse, while a scenario loads, and for a "
+               "scenario the run never "
                "simulated, whose band, k or size cap the run did not record, or whose k or "
                "size cap is not above zero.")
 _SAVE_NOTE = "(needs ./start_dashboard.sh running)"
@@ -7417,28 +7428,59 @@ def _filter_save_note(exclusions: tuple[str, ...] | list[str] | None,
 # The save button's hover text while it cannot save because of the menus (the
 # script shows it in place of _SAVE_TITLE and puts _SAVE_TITLE back once the
 # reason is gone): ticks that keep none of the scenario's trades (every
-# category, say), which shows no trade; or more categories or tags, or a
-# longer address, than the defaults server takes in one link
+# category, say), which shows no trade; or a name the defaults server would
+# refuse as a live exclusion (_save_refused). The third reason, more names or
+# a longer address than the server takes in one link, is worded from the
+# page's own limits (_save_too_long_text)
 _SAVE_BLOCKED_TEXT = {
     "save_all_excluded": ("Cannot save while the categories and tags kept hold no trade "
                           "of this scenario: this view shows no trade, and live runs would "
                           "trade only categories and tags this backtest gave no trade to. "
                           "Untick at least one category or tag with trades to save."),
-    "save_too_long": ("Cannot save these ticks: the defaults server takes at most "
-                      f"{DEFAULTS_SERVER_MAX_FILTER_NAMES} excluded categories and "
-                      f"{DEFAULTS_SERVER_MAX_FILTER_NAMES} excluded tags in one link, "
-                      "letter-case twins counted, and an address of at most "
-                      f"{DEFAULTS_SERVER_MAX_REQUEST_BYTES:,} bytes. Untick some boxes "
-                      "to save."),
+    "save_refused": ("Cannot save these ticks: the defaults server would refuse a category "
+                     f"or tag ticked here as a live exclusion (a name reading any or none, a "
+                     f"category whose name holds “{TAG_SCOPE_SEPARATOR.strip()}”, which a "
+                     "live filter reads as a category and a tag, or a name it cannot show as "
+                     "typed). Untick it to save."),
 }
-# Room the save address leaves, under the defaults server's limit on a
-# request, for what the confirmation page's form adds when it is posted (its
-# fingerprint, nonce, token, action and acknowledgement come to about 250
-# bytes; the rest is margin)
-_SAVE_FORM_HEADROOM_BYTES = 1_024
-# The base class of the defaults server reads a request line of at most this
-# many bytes ("GET <path> HTTP/1.1\r\n"), whatever its own limit
-_HTTP_REQUEST_LINE_MAX_BYTES = 65_536
+
+
+def _save_limits() -> dict:
+    """
+    The defaults server's limits on one confirmation link, as the save button reads them.
+
+    Returns:
+        dict: "max_names" (config.DEFAULTS_SERVER_MAX_FILTER_NAMES: the most
+            excluded categories, and the most excluded tags, one link may
+            name), "max_query_bytes" (_save_max_query_bytes: the longest
+            query the address may carry) and "max_form_bytes"
+            (_save_max_form_bytes: the longest those fields may come to as
+            the confirmation page posts them back).
+    """
+    return {"max_names": DEFAULTS_SERVER_MAX_FILTER_NAMES,
+            "max_query_bytes": _save_max_query_bytes(),
+            "max_form_bytes": _save_max_form_bytes()}
+
+
+def _save_too_long_text(limits: dict) -> str:
+    """
+    The save button's hover text while its ticks name more than one link takes.
+
+    Worded from the limits the page ships (_save_limits, in the save
+    target), so the text states exactly what the script tests.
+
+    Args:
+        limits (dict): "max_names", "max_query_bytes" and "max_form_bytes".
+
+    Returns:
+        str: The text.
+    """
+    return ("Cannot save these ticks: the defaults server takes at most "
+            f"{limits['max_names']} excluded categories and {limits['max_names']} excluded "
+            "tags in one link, letter-case twins counted, and this page sends an address "
+            f"of at most {limits['max_query_bytes']:,} bytes after “/confirm?”, and at most "
+            f"{limits['max_form_bytes']:,} as the confirmation page posts it back (where "
+            "each ! ' ( ) ~ takes three bytes and a space one). Untick some boxes to save.")
 
 
 def _save_max_query_bytes() -> int:
@@ -7447,17 +7489,70 @@ def _save_max_query_bytes() -> int:
 
     The defaults server reads a request of at most
     config.DEFAULTS_SERVER_MAX_REQUEST_BYTES (its path plus its body), and its
-    HTTP layer a request line of at most 65,536 bytes; the confirmation
-    page's form, posted back, repeats the query's fields and adds its own,
-    so _SAVE_FORM_HEADROOM_BYTES is left for them.
+    HTTP layer a request line of at most
+    config.DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES; the address is opened with
+    a GET, so it must fit both, less config.DASHBOARD_SAVE_HEADROOM_BYTES.
 
     Returns:
         int: The most bytes of query (ASCII, as encodeURIComponent writes it).
     """
     path = "/confirm?"
     return min(DEFAULTS_SERVER_MAX_REQUEST_BYTES - len(path),
-               _HTTP_REQUEST_LINE_MAX_BYTES - len(f"GET {path} HTTP/1.1\r\n")
-               ) - _SAVE_FORM_HEADROOM_BYTES
+               DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES - len(f"GET {path} HTTP/1.1\r\n")
+               ) - DASHBOARD_SAVE_HEADROOM_BYTES
+
+
+def _save_max_form_bytes() -> int:
+    """
+    The longest the address's fields may come to as the confirmation page posts them back.
+
+    The confirmation page's form repeats the address's fields and adds its
+    own (config.DEFAULTS_SERVER_CONFIRM_FORM_EXTRA_BYTES), and is posted to
+    "/confirm", whose path and body together the defaults server reads up to
+    config.DEFAULTS_SERVER_MAX_REQUEST_BYTES. A browser encodes a posted form
+    a little differently from encodeURIComponent (each ! ' ( ) ~ as three
+    bytes, a space as "+"), which the script counts (formLength).
+
+    Returns:
+        int: The most bytes the address's fields may take in the posted form,
+            less config.DASHBOARD_SAVE_HEADROOM_BYTES.
+    """
+    return (DEFAULTS_SERVER_MAX_REQUEST_BYTES - len("/confirm")
+            - DEFAULTS_SERVER_CONFIRM_FORM_EXTRA_BYTES - DASHBOARD_SAVE_HEADROOM_BYTES)
+
+
+def _save_refused(categories: list[str], subcats: list[tuple[str, str]]) -> dict:
+    """
+    The categories and tags the save button may not send: the server would refuse them.
+
+    Each category is asked of config.filter_name_refusal as the button would
+    send it (exclude_category), and each tag as "Category · Tag"
+    (exclude_tag); a tag is refused too when the live filter would not read
+    it back as that category and tag (config.split_tag splits at the first
+    separator, so a category whose name holds one is misread). The script
+    keeps the button disabled while it would send one of them, with
+    _SAVE_BLOCKED_TEXT["save_refused"].
+
+    Args:
+        categories (list[str]): The menus' categories, in the bar's order.
+        subcats (list[tuple[str, str]]): The menus' (category, tag) pairs, in
+            the bar's order.
+
+    Returns:
+        dict: "categories" and "tags": the indexes, into those lists, of the
+            names the server would refuse.
+    """
+
+    def tag_refused(category: str, tag: str) -> bool:
+        """Whether this tag, tied to its category, would be refused or misread."""
+        name = f"{category}{TAG_SCOPE_SEPARATOR}{tag}"
+        return (filter_name_refusal("exclude_tags", name) is not None
+                or split_tag(name) != (category, tag))
+
+    return {"categories": [i for i, name in enumerate(categories)
+                           if filter_name_refusal("exclude_categories", name) is not None],
+            "tags": [i for i, (category, tag) in enumerate(subcats)
+                     if tag_refused(category, tag)]}
 
 
 # The bar's "Trade using defaults…" link: its label and its hover text. It
@@ -7557,11 +7652,10 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date) -> 
             "live_exclusions" (the categories they exclude, as a list, or None)
             and "live_tag_exclusions" (the tags they exclude, likewise): the
             note that saving replaces them names them;
-            "max_names" (config.DEFAULTS_SERVER_MAX_FILTER_NAMES: the most
-            categories, and the most tags, one link may name) and
-            "max_query_bytes" (_save_max_query_bytes: the longest query the
-            address may carry), past which the script keeps the button
-            disabled with _SAVE_BLOCKED_TEXT["save_too_long"].
+            and the defaults server's limits on one link (_save_limits:
+            "max_names", "max_query_bytes" and "max_form_bytes"), past
+            which the script keeps the button disabled with the
+            save_too_long text (_save_too_long_text, worded from them).
     """
 
     def day(value: date) -> str:
@@ -7594,8 +7688,7 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date) -> 
         "live_sells": getattr(sweep, "live_sell_at", None) is not None,
         "live_exclusions": _recorded_names(getattr(sweep, "live_exclude_categories", None)),
         "live_tag_exclusions": _recorded_names(getattr(sweep, "live_exclude_tags", None)),
-        "max_names": DEFAULTS_SERVER_MAX_FILTER_NAMES,
-        "max_query_bytes": _save_max_query_bytes(),
+        **_save_limits(),
     }
 
 
@@ -12521,7 +12614,9 @@ def _filter_payload(
         # when that section's data was built (kd), and the scenario explorer's
         # selects only when the page carries its grid (explorer) — its cap
         # select only when its cap axis is this grid's (explorer_caps)
-        "text": {**_SUMMARY_TEMPLATES, **_SAVE_BLOCKED_TEXT, **_KHAT_TEXT,
+        "text": {**_SUMMARY_TEMPLATES, **_SAVE_BLOCKED_TEXT,
+                 "save_too_long": _save_too_long_text(save or _save_limits()),
+                 **_KHAT_TEXT,
                  **_CALIBRATION_TEXT,
                  "unfiltered": " " + _bar_reach(kd is not None, explorer,
                                                 explorer_caps=explorer_caps,
@@ -12564,6 +12659,10 @@ def _filter_payload(
                                        if key != "dates"},
         # The save button's fixed part of the confirmation page's address
         "save": save,
+        # The categories and tags (indexes into "categories" and "subcats")
+        # whose names the defaults server would refuse as live exclusions:
+        # the button never sends one
+        "save_refused": _save_refused(chunks.categories, chunks.subcats),
         # The Rebalance view: its grid, its tier-floors-off twin (null without
         # the tier-off view too) and why a page has none
         "grid_rebalance": grid_rebalance,
@@ -12960,13 +13059,15 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     not show. After the Exclude tags menu comes the save button, rendered disabled
     too: the script enables it whenever the scenario on screen can become
     the live defaults, and a click opens the defaults server's confirmation
-    page for that scenario in a new tab, naming each category excluded and
-    each tag ticked. Its hover text is _SAVE_TITLE on every page; while the
-    categories and tags kept hold no trade of the scenario shown, or the
-    ticks would name more than the defaults server takes in one link, the
-    button stays disabled and the script shows
-    _SAVE_BLOCKED_TEXT["save_all_excluded"] or ["save_too_long"] in its
-    place. On a page with
+    page for that scenario in a new tab, naming each category excluded
+    (one with every tag ticked included) and each other tag ticked. Its
+    hover text is _SAVE_TITLE on every page; while the categories and tags
+    kept hold no trade of the scenario shown, while a name it would send is
+    one the defaults server refuses (_save_refused), or while the ticks
+    would name more, or make a longer address, than the server takes in one
+    link, the button stays disabled and the script shows
+    _SAVE_BLOCKED_TEXT["save_all_excluded"] or ["save_refused"], or the
+    save_too_long text (_save_too_long_text), in its place. On a page with
     the Rebalance view whose saved live defaults rebalance
     (save["live_rebalances"]), a grey note (_REBALANCE_SAVE_NOTE) follows
     the button: saving with Rebalance no turns that off.
@@ -13094,9 +13195,9 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
                   and (payload.get("save") or {}).get("live_sells") is True)
     save_note += ('&nbsp;<span id="flt-sell-save-note" style="color:#9E9E9E; font-size:13px;">'
                   f"{html.escape(_SELL_SAVE_NOTE)}</span>" if save_sells else "")
-    # The button sends the categories excluded here and no tag, so when the
-    # saved live defaults exclude categories or filter by tag, saving
-    # replaces those exclusions or clears that filter
+    # The button sends the categories and the tags excluded here, so when the
+    # saved live defaults exclude categories or tags, saving replaces those
+    # exclusions
     save = payload.get("save") or {}
     filter_note = _filter_save_note(save.get("live_exclusions"),
                                     save.get("live_tag_exclusions"))
@@ -13409,13 +13510,16 @@ def _pack_text(raw: str) -> str:
 # new tab (saveHref: D.save's address and the axes' values, plus each of the
 # Rebalance choice with its minimum price movement and the Sell level and
 # minimum ("off" for both under no selling), on a page with that view, and
-# each category excluded as exclude_category and each tag ticked as
-# exclude_tag). The button stays disabled while the categories and tags kept
-# hold no trade of the scenario shown, or the ticks would name more than the
-# defaults server takes in one link (saveBlockedByTicks); its words are
-# Python's, its hover text too, which reads as Python rendered it except
-# while a tick is what stops a save (D.text.save_all_excluded,
-# D.text.save_too_long). On load it inflates the base
+# each category excluded — a category with every tag ticked included — as
+# exclude_category and each other tag ticked as exclude_tag: saveLists). The
+# button stays disabled while the categories and tags kept hold no trade of
+# the scenario shown, while it would send a name the defaults server refuses
+# (D.save_refused), or while the ticks would name more, or make a longer
+# address or posted form, than the server takes in one link
+# (saveBlockedByTicks); its words are Python's, its hover text too, which
+# reads as Python rendered it except while a tick is what stops a save
+# (D.text.save_all_excluded, D.text.save_refused, D.text.save_too_long). On
+# load it inflates the base
 # block and the primary
 # scenario's chunk, sets the bar back to the view Python rendered and enables
 # it — it redraws nothing until a <select> changes. A chunk is inflated when a
@@ -13634,14 +13738,20 @@ _FILTER_JS = r"""
   }
   // The address's query for the scenario on screen, whatever the menus'
   // ticks (saveHref refuses those that stop a save), or null as saveHref.
-  // It names each category left out, by its name on the bar (every
-  // letter-case twin included, in the bar's order), as exclude_category, and
-  // each tag ticked, as "Category · Tag" (every letter-case twin included,
-  // in the bar's order), as exclude_tag: the categories and the tags live
-  // runs exclude, every other one trading. The server refuses, with its
-  // reason, any other value the live settings reject. Each number is written
-  // by String(), whose shortest form reads back as the same number.
   function saveQuery() {
+    var pairs = savePairs();
+    return pairs === null ? null : pairs.map(function(p) {
+      return encodeURIComponent(p[0]) + '=' + encodeURIComponent(String(p[1]));
+    }).join('&');
+  }
+  // The query's [field, value] pairs, or null as saveHref. It names the
+  // categories and the tags saveLists sends — each category ticked, by its
+  // name on the bar, as exclude_category, and each tag, as
+  // "Category · Tag", as exclude_tag: the categories and the tags live runs
+  // exclude, every other one trading. The server refuses, with its reason,
+  // any other value the live settings reject. Each number is written by
+  // String(), whose shortest form reads back as the same number.
+  function savePairs() {
     if (!D || !D.save || !SHOWN || C === null) { return null; }
     // null: never simulated; undefined: a sell level's block not inflated (a
     // scenario on screen has always inflated its own)
@@ -13678,42 +13788,93 @@ _FILTER_JS = r"""
              ['sell_min_days',
               level === null ? 'off' : D.sell_days[parseInt(SHOWN[8], 10)].value]);
     }
-    // The categories left out and the tags ticked, as the live runs'
-    // excluded categories and tags: every other category and tag trades
-    // live, one this backtest never saw included
-    SHOWN[3].slice().sort(ascending).forEach(function(ci) {
-      q.push(['exclude_category', D.categories[ci]]);
-    });
-    SHOWN[4].slice().sort(ascending).forEach(function(si) {
-      q.push(['exclude_tag', subName(si, true)]);
-    });
+    // The categories and the tags left out, as the live runs' excluded
+    // categories and tags: every other category and tag trades live, one
+    // this backtest never saw included
+    var sent = saveLists(SHOWN[3], SHOWN[4]);
+    sent.cats.forEach(function(ci) { q.push(['exclude_category', D.categories[ci]]); });
+    sent.tags.forEach(function(si) { q.push(['exclude_tag', subName(si, true)]); });
     if (typeof D.save.source === 'string' && D.save.source !== '') {
       q.push(['source', D.save.source]);
     }
-    return q.map(function(p) {
-      return encodeURIComponent(p[0]) + '=' + encodeURIComponent(String(p[1]));
-    }).join('&');
+    return q;
+  }
+  // The categories and the tags the save button sends for a set of ticks, as
+  // indexes in the bar's order. Every category ticked in the Exclude
+  // categories menu goes as a category, and so does a kept category every one
+  // of whose tags is ticked — the page shows it left out, and a tag of it this
+  // backtest never saw must not trade either — but only with its letter-case
+  // twins (CAT_TWINS, one category to the live filter), each of which must be
+  // ticked or have every tag ticked too. Every other tag ticked goes as a tag.
+  // The page's twin of the tests' _save_lists.
+  function saveLists(excluded, tags) {
+    function whole(c) {
+      if (excluded.indexOf(c) >= 0) { return true; }
+      var own = 0, ticked = 0;
+      D.subcats.forEach(function(sc, i) {
+        if (sc[0] === c) { own++; if (tags.indexOf(i) >= 0) { ticked++; } }
+      });
+      return own > 0 && ticked === own;
+    }
+    var cats = excluded.slice();
+    D.categories.forEach(function(_, c) {
+      if (cats.indexOf(c) >= 0) { return; }
+      var group = [c].concat(CAT_TWINS[c] || []);
+      if (group.every(whole)) {
+        group.forEach(function(g) { if (cats.indexOf(g) < 0) { cats.push(g); } });
+      }
+    });
+    cats.sort(ascending);
+    return {cats: cats, tags: tags.filter(function(i) {
+      return cats.indexOf(D.subcats[i][0]) < 0;
+    }).sort(ascending)};
+  }
+  // How many bytes these pairs take as a browser posts them back in a form
+  // (the confirmation page's): what encodeURIComponent writes, but each of
+  // ! ' ( ) ~ as three bytes where it writes one, and a space as "+" where it
+  // writes three
+  function formLength(pairs) {
+    var n = pairs.length - 1;
+    pairs.forEach(function(p) {
+      [p[0], String(p[1])].forEach(function(text) {
+        n += encodeURIComponent(text).length
+          + 2 * (text.match(/[!'()~]/g) || []).length
+          - 2 * (text.match(/ /g) || []).length;
+      });
+      n += 1;
+    });
+    return n;
   }
   // The reason the save button gives while the menus stop a save, in
   // Python's words, or null when they do not: ticks that keep none of the
   // scenario's trades (D.text.save_all_excluded) — every category left out,
   // every tag of those kept ticked, or every category and tag with a trade
   // here — a view with no trade at all, whose save would trade only
-  // categories and tags this backtest gave no trade to; or ticks the
-  // defaults server would not take in one link (D.text.save_too_long): too
-  // many categories, or too many tags, for it (D.save.max_names, each name
-  // and letter-case twin counted as sent), or an address longer than it
-  // reads (D.save.max_query_bytes, which leaves room for its own form).
+  // categories and tags this backtest gave no trade to; a name the defaults
+  // server would refuse among those sent (D.save_refused,
+  // D.text.save_refused); or ticks it would not take in one link
+  // (D.text.save_too_long): too many categories, or too many tags, for it
+  // (D.save.max_names, each name and letter-case twin counted as sent), or an
+  // address longer than it reads, opened (D.save.max_query_bytes) or posted
+  // back by its form (D.save.max_form_bytes, formLength).
   function saveBlockedByTicks() {
     var atoms = atomsOf(SHOWN[3], SHOWN[4]);
     if (atoms !== null && atoms.every(function(i) { return count('s' + i) === 0; })) {
       return D.text.save_all_excluded;
     }
-    if (SHOWN[3].length > D.save.max_names || SHOWN[4].length > D.save.max_names) {
+    var sent = saveLists(SHOWN[3], SHOWN[4]), refused = D.save_refused;
+    if (refused && (sent.cats.some(function(c) { return refused.categories.indexOf(c) >= 0; })
+                    || sent.tags.some(function(t) { return refused.tags.indexOf(t) >= 0; }))) {
+      return D.text.save_refused;
+    }
+    if (sent.cats.length > D.save.max_names || sent.tags.length > D.save.max_names) {
       return D.text.save_too_long;
     }
-    var q = saveQuery();
-    if (q !== null && q.length > D.save.max_query_bytes) { return D.text.save_too_long; }
+    var pairs = savePairs();
+    if (pairs !== null && (saveQuery().length > D.save.max_query_bytes
+                           || formLength(pairs) > D.save.max_form_bytes)) {
+      return D.text.save_too_long;
+    }
     return null;
   }
   // The button is enabled exactly when the scenario on screen can be saved;

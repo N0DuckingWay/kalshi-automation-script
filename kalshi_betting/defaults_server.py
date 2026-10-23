@@ -217,6 +217,7 @@ from .config import (
     LiveDefaultsError,
     LiveDefaultsOutdated,
     LiveSettings,
+    check_filter_name,
     count_text,
     describe_live_settings,
     live_defaults_source,
@@ -800,12 +801,8 @@ def _name(text: str, name: str) -> str:
             text-direction character, say), has spaces around it, or holds
             two spaces in a row.
     """
-    if not text.isprintable() or text != text.strip():
-        raise ValueError(f"{name} must be one printable name with no spaces around it, "
-                         f"got {text!r}")
-    if re.search(r"\s\s", text):
-        raise ValueError(f"{name} must not hold two spaces in a row, got {text!r}")
-    return text
+    # Cross-module: the one check, which the dashboard's Save button asks too
+    return check_filter_name(text, name)
 
 
 def _name_list(params: dict[str, list[str]], field_name: str) -> tuple[str, ...] | None:

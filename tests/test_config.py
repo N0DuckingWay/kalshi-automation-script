@@ -1396,6 +1396,51 @@ _FILED = (("Economics", "Fed"), ("Economics", "Oil"), ("Sports", "Basketball"),
           ("Sports", "Soccer"), ("Politics", "Fed"), ("Politics", "Basketball"))
 
 
+class TestFilterNameRefusal:
+    """
+    config.filter_name_refusal says why one excluded category or tag would be
+    refused — by the form check the defaults server reads every link's names
+    through (config.check_filter_name, which defaults_server._name calls) or by
+    LiveSettings — so the dashboard's Save button can keep such a name out of
+    its link. A name it passes is one LiveSettings takes.
+    """
+
+    @pytest.mark.parametrize("field, name", [
+        ("exclude_categories", "Sports"), ("exclude_categories", "Companies"),
+        ("exclude_tags", "Golf"), ("exclude_tags", "Sports · Golf"),
+        ("exclude_tags", "·Golf"), ("exclude_tags", "Golf (men's) ~ open!")])
+    def test_a_name_it_passes_is_taken(self, field, name):
+        assert config.filter_name_refusal(field, name) is None
+        config.LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.5,
+                            size_cap=1.0, **{field: (name,)})
+
+    @pytest.mark.parametrize("field, name, words", [
+        ("exclude_categories", "Any", "cannot hold the name"),
+        ("exclude_categories", "none", "cannot hold the name"),
+        ("exclude_categories", "Arts · Crafts", "is a tag tied to a category"),
+        ("exclude_categories", " Sports", "no spaces around it"),
+        ("exclude_categories", "Sports\u200b", "one printable name"),
+        ("exclude_tags", "Sports · Any", "names no tag"),
+        ("exclude_tags", "Sports ·", "must read"),
+        ("exclude_tags", "Sports ·  Golf", "two spaces in a row"),
+        ("exclude_tags", "NONE", "cannot hold the name")])
+    def test_a_name_it_refuses_says_why(self, field, name, words):
+        refusal = config.filter_name_refusal(field, name)
+        assert refusal is not None and words in refusal, refusal
+
+    def test_the_server_reads_names_through_the_same_check(self):
+        from kalshi_betting import defaults_server
+        for text in ("Sports ·  Golf", " Golf", "Golf\u200b", "Golf"):
+            try:
+                expected = config.check_filter_name(text, "exclude_tag")
+            except ValueError as exc:
+                with pytest.raises(ValueError) as caught:
+                    defaults_server._name(text, "exclude_tag")
+                assert str(caught.value) == str(exc)
+            else:
+                assert defaults_server._name(text, "exclude_tag") == expected == text
+
+
 class TestTradeFilter:
     """config.trade_filter, the one definition of the category/tag filter: a
     pair trades unless its category is excluded or its first tag is excluded,
