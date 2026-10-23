@@ -4764,18 +4764,19 @@ def _live_filter_ticks(exclude_categories: tuple[str, ...] | None,
     """
     Name what to tick in the filter bar's two menus to show the live filter.
 
-    The live filter lists the categories not to trade and the tags to trade;
-    both menus leave out what is ticked (a category ticked in the Exclude
+    The live filter lists the categories and the tags not to trade, and both
+    menus leave out what is ticked (a category ticked in the Exclude
     categories menu, a "Category · Tag" ticked in the Exclude tags menu), so
     the boxes to tick are what the filter does not keep. Every (category,
     tag) the bar offers is asked of config.trade_filter_for, the one rule the
     live run keeps a pair by (letter case ignored), so an excluded category,
-    a plain tag and a tied "Category · Tag" all read as the live run reads
+    a plain tag (excluded under every category) and a tied "Category · Tag"
+    (excluded in its own category alone) all read as the live run reads
     them. A category the filter keeps with every tag the bar offers for it
     needs nothing. One it keeps with only some of them needs the others
     ticked in the Exclude tags menu. One it keeps with none is excluded,
-    whether the filter excludes it or narrows it to tags this run filed no
-    pair under.
+    whether the filter excludes it or excludes every tag of it this run
+    filed a pair under.
 
     Categories whose names differ only in letter case are one category to
     the filter, and the page leaves them out together (_case_twins), so they
@@ -4791,7 +4792,8 @@ def _live_filter_ticks(exclude_categories: tuple[str, ...] | None,
     Args:
         exclude_categories (tuple[str, ...] | None):
             BacktestSweep.live_exclude_categories; None = none excluded.
-        tags (tuple[str, ...] | None): BacktestSweep.live_tags; None = any.
+        tags (tuple[str, ...] | None): BacktestSweep.live_tags, the saved
+            excluded tags; None = none excluded.
         bar (dict): _filter_payload's base block ("categories", "subcats").
 
     Returns:

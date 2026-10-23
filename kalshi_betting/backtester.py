@@ -10849,7 +10849,7 @@ def _live_rule_fields(live: LiveSettings | None) -> dict:
     if live is None:
         return {}
     return {"live_tier_floors": live.tier_floors, "live_spread_band": live.spread_band,
-            "live_exclude_categories": live.exclude_categories, "live_tags": live.tags,
+            "live_exclude_categories": live.exclude_categories, "live_tags": live.exclude_tags,
             "live_origin": live.origin, "live_interval_discount": live.interval_discount,
             "live_size_cap": live.size_cap,
             "live_same_title_size_cap": live.same_title_size_cap,
@@ -10982,10 +10982,10 @@ def _live_filter_text(exclude_categories: tuple[str, ...] | None,
         tags (tuple[str, ...] | None): BacktestSweep.live_tags.
 
     Returns:
-        str: e.g. "exclude categories Politics, Sports; tags any".
+        str: e.g. "exclude categories Politics, Sports; exclude tags none".
     """
-    return (f"exclude categories {_names_text(exclude_categories, 'none')}; "
-            f"tags {_names_text(tags)}")
+    return (f"exclude categories {_names_text(exclude_categories)}; "
+            f"exclude tags {_names_text(tags)}")
 
 
 # _LiveRuleView.where: this run's primary scenario holds the saved live
@@ -12141,7 +12141,7 @@ def _simulate_at_discount(
     settings = LiveSettings(
         tier_floors=tier_floors is not False, spread_band=(band_lo, band_hi),
         interval_discount=effective_k, size_cap=cap, same_title_size_cap=st_cap,
-        exclude_categories=None, tags=None, rebalance=bool(add_to_held or trim_to_kelly))
+        exclude_categories=None, exclude_tags=None, rebalance=bool(add_to_held or trim_to_kelly))
 
     # ── Pass 1b: score the prepared entries and keep the tradeable ones ──
     candidates = []

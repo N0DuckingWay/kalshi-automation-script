@@ -15247,7 +15247,7 @@ class TestLiveRuleLine:
         monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", tier_floors)
         monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", band)
         monkeypatch.setattr(config, "TRADE_EXCLUDE_CATEGORIES", categories)
-        monkeypatch.setattr(config, "TRADE_TAGS", tags)
+        monkeypatch.setattr(config, "TRADE_EXCLUDE_TAGS", tags)
         monkeypatch.setattr(config, "REBALANCE", rebalance)
         monkeypatch.setattr(config, "MIN_PRICE_MOVE", min_price_move)
         monkeypatch.setattr(config, "SELL_AT", sell_at)
@@ -15832,7 +15832,7 @@ class TestLiveRuleLine:
         self._feasible(monkeypatch, caplog, band_sweep=True)
         assert self._line(caplog) == (
             f"Live time-series rule (saved live defaults): {rule}; category/tag filter "
-            "(exclude categories Economics, Politics; tags Sports · Basketball) — this run's "
+            "(exclude categories Economics, Politics; exclude tags Sports · Basketball) — this run's "
             "primary scenario does not (tier floors on, band 0-1); its grid simulated the "
             "live rule as band 0.35-0.5 with the tier floors on, which the dashboard's "
             "filter bar shows; the dashboard's filter bar shows the live category/tag filter "
@@ -15847,7 +15847,7 @@ class TestLiveRuleLine:
         for categories, tags in [(None, None), (("Economics",), None), (None, ("Fed",)),
                                  (("Oil, Gas", "Sports"), ("a|b",))]:
             settings = config.LiveSettings(True, (0.0, 1.0), 0.75, 0.2,
-                                           exclude_categories=categories, tags=tags)
+                                           exclude_categories=categories, exclude_tags=tags)
             assert backtester._live_filter_text(categories, tags) == \
                 config.describe_trade_filter(settings)
 

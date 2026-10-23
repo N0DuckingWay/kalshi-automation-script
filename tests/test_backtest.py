@@ -1052,13 +1052,13 @@ class TestLiveRuleEcho:
     def test_the_echo_names_a_set_filter(self, cli, monkeypatch, caplog):
         saved = self._save(monkeypatch, TIME_SERIES_TIER_FLOORS=True,
                            TIME_SERIES_SPREAD_BAND=(0.0, 1.0),
-                           TRADE_EXCLUDE_CATEGORIES=("Economics", "Sports"), TRADE_TAGS=("Fed",))
+                           TRADE_EXCLUDE_CATEGORIES=("Economics", "Sports"), TRADE_EXCLUDE_TAGS=("Fed",))
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
         rule = config.describe_time_series_rule(True, (0.0, 1.0))
         assert (f"| live rule={rule}; category/tag filter "
                 f"({config.describe_trade_filter(saved)}) ({saved.origin})") in caplog.text
-        assert "exclude categories Economics, Sports; tags Fed" in caplog.text
+        assert "exclude categories Economics, Sports; exclude tags Fed" in caplog.text
 
     def test_a_cli_argument_never_moves_it(self, cli, monkeypatch, caplog):
         # --spread-min/--spread-max/--interval-discount name a BACKTEST
