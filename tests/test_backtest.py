@@ -2045,7 +2045,8 @@ class TestDashboardOnly:
         assert "dashboard" not in cli and "sweep_kwargs" not in cli
 
     @pytest.mark.parametrize("damage", ["not gzip", "no header line", "header not json",
-                                        "other format", "no fingerprint"])
+                                        "other format", "before tag exclusions",
+                                        "no fingerprint"])
     def test_a_file_whose_header_cannot_be_read_exits_1(self, rebuild, monkeypatch, damage):
         path = rebuild["path"]
         if damage == "not gzip":
@@ -2059,6 +2060,9 @@ class TestDashboardOnly:
         elif damage == "other format":
             # The format a run saved before the one Rebalance family
             _rewrite_header(path, format="backtest-sweep-v1")
+        elif damage == "before tag exclusions":
+            # The format a run saved while BacktestSweep held live_tags
+            _rewrite_header(path, format="backtest-sweep-v3")
         else:
             _rewrite_header(path, fingerprint_parts=None)
         with pytest.raises(SystemExit) as exc:
@@ -2067,10 +2071,11 @@ class TestDashboardOnly:
         assert isinstance(exc.value.code, str)
         assert exc.value.code.startswith(f"backtest: {path} cannot be used: ")
         assert exc.value.code.endswith("run the backtest again to save a new one")
-        if damage == "other format":
-            assert "'backtest-sweep-v1'" in exc.value.code
+        if damage in ("other format", "before tag exclusions"):
+            old = "v1" if damage == "other format" else "v3"
+            assert f"'backtest-sweep-{old}'" in exc.value.code
             assert repr(config.BACKTEST_SWEEP_FORMAT) in exc.value.code
-            assert config.BACKTEST_SWEEP_FORMAT == "backtest-sweep-v3"
+            assert config.BACKTEST_SWEEP_FORMAT == "backtest-sweep-v4"
         assert "dashboard" not in rebuild
 
     @pytest.mark.parametrize("damage", ["cut short", "not the inputs"])

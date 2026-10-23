@@ -939,8 +939,10 @@ BACKTEST_SWEEP_FILENAME = "backtest_sweep.pkl.gz"
 # A rebuild refuses a file with any other tag; change it whenever the line's
 # keys, the pickled inputs' keys or the fields of the classes pickled in them
 # (BacktestSweep and the lazy families it holds) change, so an older file is
-# refused rather than misread.
-BACKTEST_SWEEP_FORMAT = "backtest-sweep-v3"
+# refused rather than misread. v4: BacktestSweep.live_tags became
+# live_exclude_tags (the saved live defaults list the tags NOT to trade); v3
+# files, from before, are refused.
+BACKTEST_SWEEP_FORMAT = "backtest-sweep-v4"
 
 # The most bytes a rebuild reads for the saved sweep file's first line (the
 # JSON one): the real line is a few hundred bytes, so a file that runs past

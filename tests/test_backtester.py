@@ -15294,7 +15294,7 @@ class TestLiveRuleLine:
         assert any(m.startswith("Size-cap sweep:") for m in messages[:-1])
 
     # The twelve fields a saved-defaults read records, all or none
-    _LIVE_FIELDS = ("live_tier_floors", "live_spread_band", "live_exclude_categories", "live_tags",
+    _LIVE_FIELDS = ("live_tier_floors", "live_spread_band", "live_exclude_categories", "live_exclude_tags",
                     "live_origin", "live_interval_discount", "live_size_cap",
                     "live_same_title_size_cap", "live_rebalance", "live_min_price_move",
                     "live_sell_at", "live_sell_min_days")
@@ -15378,7 +15378,7 @@ class TestLiveRuleLine:
         assert len(reads) == 1
         assert {name: getattr(res, name) for name in self._LIVE_FIELDS} == {
             "live_tier_floors": False, "live_spread_band": (0.1, 0.8),
-            "live_exclude_categories": ("Economics",), "live_tags": ("Fed",),
+            "live_exclude_categories": ("Economics",), "live_exclude_tags": ("Fed",),
             "live_origin": saved.origin, "live_interval_discount": 0.6,
             "live_size_cap": 0.35, "live_same_title_size_cap": 0.25,
             "live_rebalance": True, "live_min_price_move": 0.10,
@@ -15434,7 +15434,7 @@ class TestLiveRuleLine:
         assert res.live_tier_floors is False
         assert res.live_spread_band == (0.1, 0.8)
         assert res.live_exclude_categories == ("Economics",)
-        assert res.live_tags == ("Fed", "CPI")
+        assert res.live_exclude_tags == ("Fed", "CPI")
         # ... and a read handed in is recorded as it is, None included
         candidates = backtester._prepare_candidates(MagicMock(), MagicMock(), golden._START,
                                                     True, None)
@@ -15452,7 +15452,7 @@ class TestLiveRuleLine:
             f"Live time-series rule (saved live defaults): {rule} — this run's primary scenario "
             "applies it")
         assert (res.live_tier_floors, res.live_spread_band) == (True, (0.0, 1.0))
-        assert (res.live_exclude_categories, res.live_tags) == (None, None)
+        assert (res.live_exclude_categories, res.live_exclude_tags) == (None, None)
 
     def test_a_primary_other_than_no_band_is_matched_by_its_own_band(self, monkeypatch, caplog):
         # The primary's own band, not the default one, is what "primary" tests
@@ -15822,7 +15822,7 @@ class TestLiveRuleLine:
         assert self._line(caplog) == (
             f"Live time-series rule (saved live defaults): {rule}; category/tag filter ({words}) — "
             f"this run's primary scenario applies its time-series rule{slices}")
-        assert (res.live_exclude_categories, res.live_tags) == (categories, tags)
+        assert (res.live_exclude_categories, res.live_exclude_tags) == (categories, tags)
         assert "never as their union" not in self._line(caplog)
 
     def test_a_grid_cell_names_its_scenario_in_the_filter_line(self, monkeypatch, caplog):

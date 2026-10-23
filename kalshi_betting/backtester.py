@@ -4113,8 +4113,9 @@ class BacktestSweep:
         live_exclude_categories (tuple[str, ...] | None): The saved live
             defaults' exclude_categories; None means no category is excluded
             when live_tier_floors is recorded.
-        live_tags (tuple[str, ...] | None): The saved live defaults' tags,
-            likewise.
+        live_exclude_tags (tuple[str, ...] | None): The saved live defaults'
+            exclude_tags; None means no tag is excluded when live_tier_floors
+            is recorded.
         live_origin (str | None): Where the saved live defaults were read
             (LiveSettings.origin: the file, when and from what it was saved),
             from the same read; reporting only.
@@ -4202,7 +4203,7 @@ class BacktestSweep:
     live_tier_floors: bool | None = None
     live_spread_band: tuple[float, float] | None = None
     live_exclude_categories: tuple[str, ...] | None = None
-    live_tags: tuple[str, ...] | None = None
+    live_exclude_tags: tuple[str, ...] | None = None
     entry_checkpoint: str | None = None
     live_origin: str | None = None
     live_interval_discount: float | None = None
@@ -10849,7 +10850,7 @@ def _live_rule_fields(live: LiveSettings | None) -> dict:
     if live is None:
         return {}
     return {"live_tier_floors": live.tier_floors, "live_spread_band": live.spread_band,
-            "live_exclude_categories": live.exclude_categories, "live_tags": live.exclude_tags,
+            "live_exclude_categories": live.exclude_categories, "live_exclude_tags": live.exclude_tags,
             "live_origin": live.origin, "live_interval_discount": live.interval_discount,
             "live_size_cap": live.size_cap,
             "live_same_title_size_cap": live.same_title_size_cap,
@@ -10969,7 +10970,7 @@ def _live_sell_note(sweep: BacktestSweep) -> str:
 
 
 def _live_filter_text(exclude_categories: tuple[str, ...] | None,
-                      tags: tuple[str, ...] | None) -> str:
+                      exclude_tags: tuple[str, ...] | None) -> str:
     """
     Name a recorded category/tag filter as config.describe_trade_filter does.
 
@@ -10979,13 +10980,13 @@ def _live_filter_text(exclude_categories: tuple[str, ...] | None,
     Args:
         exclude_categories (tuple[str, ...] | None):
             BacktestSweep.live_exclude_categories.
-        tags (tuple[str, ...] | None): BacktestSweep.live_tags.
+        exclude_tags (tuple[str, ...] | None): BacktestSweep.live_exclude_tags.
 
     Returns:
         str: e.g. "exclude categories Politics, Sports; exclude tags none".
     """
     return (f"exclude categories {_names_text(exclude_categories)}; "
-            f"exclude tags {_names_text(tags)}")
+            f"exclude tags {_names_text(exclude_tags)}")
 
 
 # _LiveRuleView.where: this run's primary scenario holds the saved live
@@ -11094,7 +11095,7 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
         return f"Live time-series rule: {_LIVE_RULE_NONE}"
     prefix = f"Live time-series rule ({_LIVE_RULE_LABEL}): "
     rule = describe_time_series_rule(sweep.live_tier_floors, sweep.live_spread_band)
-    excluded, tags = sweep.live_exclude_categories, sweep.live_tags
+    excluded, tags = sweep.live_exclude_categories, sweep.live_exclude_tags
     filtered = excluded is not None or tags is not None
     if filtered:
         rule += f"; category/tag filter ({_live_filter_text(excluded, tags)})"
