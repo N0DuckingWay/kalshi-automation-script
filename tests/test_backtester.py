@@ -15816,8 +15816,8 @@ class TestLiveRuleLine:
         slices = ("; the dashboard's filter bar shows the live category/tag filter of it "
                   "when its Exclude categories menu ticks every category in which the "
                   "filter keeps none of this run's pairs and, in each category the filter "
-                  "keeps only in part, its Tag menu ticks the tags it keeps (the page's "
-                  "Live rule line names them)")
+                  "keeps only in part, its Exclude tags menu ticks the tags the filter "
+                  "leaves out (the page's Live rule line names them)")
         assert self._line(caplog) == (
             f"Live time-series rule (saved live defaults): {rule}; category/tag filter ({words}) — "
             f"this run's primary scenario applies its time-series rule{slices}")
@@ -15837,8 +15837,8 @@ class TestLiveRuleLine:
             "shows; the dashboard's filter bar shows the live category/tag filter of that "
             "scenario when its Exclude categories menu ticks every category in which the "
             "filter keeps none of this run's pairs and, in each category the filter keeps "
-            "only in part, its Tag menu ticks the tags it keeps (the page's Live rule line "
-            "names them)")
+            "only in part, its Exclude tags menu ticks the tags the filter leaves out "
+            "(the page's Live rule line names them)")
 
     def test_the_filter_words_are_describe_trade_filters(self):
         from kalshi_betting import config
