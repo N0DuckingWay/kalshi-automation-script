@@ -31,6 +31,7 @@ page stub dashboard.yf.download and redirect dashboard.PROJECT_ROOT.
 """
 import ast
 import base64
+import collections
 import dataclasses
 import gzip
 import hashlib
@@ -2505,36 +2506,40 @@ class TestLiveRuleHeader:
         return self._text(sweep, self._bar(categories=self._CATS, subcats=self._SUBCATS)
                           if bar else None)
 
-    # What the line says when nothing needs excluding or ticking, after "with"
-    # (the page then has it) or "then leave" (what to do)
-    _NOTHING = ('the Exclude categories menu showing "None" and the Tag menu showing '
-                '"All tags" (the live category/tag filter keeps every category and tag '
+    # What the line says when nothing needs ticking in either menu, after
+    # "with" (the page then has it) or "then leave" (what to do): both menus'
+    # buttons read "None" while nothing is ticked
+    _NOTHING = ('the Exclude categories menu showing "None" and the Exclude tags menu showing '
+                '"None" (the live category/tag filter keeps every category and tag '
                 "this run filed a pair under)")
 
     @pytest.mark.parametrize("categories, tags, tail", [
-        # One category listed of three: said the short way, All categories ticked
-        # and then that one unticked
-        (("economics",), None, "this run's primary, with All categories ticked in the "
-                               "Exclude categories menu and Economics unticked there"),
-        # ... narrowed to one of its two tags: that tag ticked too, named as the Tag
-        # menu names it while one category alone is kept
-        (("Economics",), ("fed",), "this run's primary, with All categories ticked in the "
-                                   "Exclude categories menu and Economics unticked there, "
-                                   "and Fed ticked in the Tag menu"),
-        # A plain tag under every category: Economics is narrowed to it, Oil & Gas has no
-        # other tag so counts in full, and Sports has none of it so is excluded
+        # One category listed of three: the other two ticked (All categories and
+        # then that one unticked would be as many clicks, so the short way is not
+        # used)
+        (("economics",), None, "this run's primary, with Oil &amp; Gas, Sports ticked in "
+                               "the Exclude categories menu"),
+        # ... narrowed to one of its two tags: the other tag ticked too, named as the
+        # Exclude tags menu names it while one category alone is kept
+        (("Economics",), ("fed",), "this run's primary, with Oil &amp; Gas, Sports ticked in "
+                                   "the Exclude categories menu and Inflation ticked in the "
+                                   "Exclude tags menu"),
+        # A plain tag under every category: Economics is narrowed to it (its other tag
+        # ticked), Oil & Gas has no other tag so counts in full, and Sports has none
+        # of it so is excluded
         (None, ("Fed",), "this run's primary, with Sports ticked in the Exclude categories "
-                         "menu and Economics · Fed ticked in the Tag menu"),
+                         "menu and Economics · Inflation ticked in the Exclude tags menu"),
         # Two categories listed, so the third is excluded
         (("Economics", "Sports"), None, "this run's primary, with Oil &amp; Gas ticked in "
                                         "the Exclude categories menu"),
-        # A tied tag narrows its own category; the others count in full
+        # A tied tag narrows its own category (its other tag ticked); the others
+        # count in full
         (("Economics", "Oil & Gas"), ("Economics · Inflation",),
          "this run's primary, with Sports ticked in the Exclude categories menu and "
-         "Economics · Inflation ticked in the Tag menu"),
+         "Economics · Fed ticked in the Exclude tags menu"),
         # Every category listed and one narrowed: only a tag to tick
         (("Economics", "Oil & Gas", "Sports"), ("Economics · Fed",),
-         "this run's primary, with Economics · Fed ticked in the Tag menu"),
+         "this run's primary, with Economics · Inflation ticked in the Exclude tags menu"),
         # Every pair the run filed is kept: the page as rendered shows the filter
         (("Economics", "Oil & Gas", "Sports", "Politics"), None,
          f"this run's primary, with {_NOTHING}"),
@@ -2552,39 +2557,78 @@ class TestLiveRuleHeader:
                         f"({html.escape(words, quote=False)}); {self._CAP} — {tail}")
         assert "never their union" not in text and "one of them at a time" not in text
 
-    @pytest.mark.parametrize("excluded, kept, tags, instruction, description", [
+    _ECON = ("Economics · Fed",)
+
+    @pytest.mark.parametrize("excluded, kept, tags, tags_kept, instruction, description", [
         # More categories kept than excluded: the ones excluded are named
-        (("Politics",), ("Economics", "Sports"), (),
+        (("Politics",), ("Economics", "Sports"), (), _ECON,
          "then tick Politics in the Exclude categories menu",
          "with Politics ticked in the Exclude categories menu"),
-        (("Politics",), ("Economics", "Sports"), ("Sports · Basketball",),
-         "then tick Politics in the Exclude categories menu and tick Sports · Basketball in "
-         "the Tag menu",
-         "with Politics ticked in the Exclude categories menu and Sports · Basketball "
-         "ticked in the Tag menu"),
-        # As many kept as excluded: the short way (the header counts groups of
-        # letter-case twins, of which there are none here)
-        (("Economics", "Politics"), ("Oil & Gas", "Sports"), (),
-         "then tick All categories in the Exclude categories menu and untick Oil & Gas, "
-         "Sports there",
-         "with All categories ticked in the Exclude categories menu and Oil & Gas, Sports "
-         "unticked there"),
-        # Fewer kept than excluded, and a tag: three steps
-        (("Economics", "Politics"), ("Sports",), ("Basketball",),
+        (("Politics",), ("Economics", "Sports"), ("Sports · Hockey", "Sports · Golf"),
+         ("Economics · Fed", "Sports · Basketball"),
+         "then tick Politics in the Exclude categories menu and tick Sports · Hockey, "
+         "Sports · Golf in the Exclude tags menu",
+         "with Politics ticked in the Exclude categories menu and Sports · Hockey, "
+         "Sports · Golf ticked in the Exclude tags menu"),
+        # As many kept as excluded: ticking each one excluded is fewer clicks, so
+        # the short way is not used
+        (("Economics", "Politics"), ("Oil & Gas", "Sports"), (), _ECON,
+         "then tick Economics, Politics in the Exclude categories menu",
+         "with Economics, Politics ticked in the Exclude categories menu"),
+        # Two kept, three excluded: still fewer clicks ticking each, so the short
+        # way is not used (the header counts groups of letter-case twins, of
+        # which there are none here)
+        (("Economics", "Health", "Politics"), ("Oil & Gas", "Sports"), (), _ECON,
+         "then tick Economics, Health, Politics in the Exclude categories menu",
+         "with Economics, Health, Politics ticked in the Exclude categories menu"),
+        # One kept, three excluded: the short way is fewer clicks. With a tag:
+        # three steps
+        (("Economics", "Health", "Politics"), ("Sports",), ("Soccer",), ("Basketball",),
          "then tick All categories in the Exclude categories menu, untick Sports there and "
-         "tick Basketball in the Tag menu",
+         "tick Soccer in the Exclude tags menu",
          "with All categories ticked in the Exclude categories menu and Sports unticked "
-         "there, and Basketball ticked in the Tag menu"),
+         "there, and Soccer ticked in the Exclude tags menu"),
         # Only tags to tick
-        ((), ("Economics", "Sports"), ("Sports · Basketball", "Sports · Soccer"),
-         "then tick Sports · Basketball, Sports · Soccer in the Tag menu",
-         "with Sports · Basketball, Sports · Soccer ticked in the Tag menu"),
+        ((), ("Economics", "Sports"), ("Sports · Golf", "Sports · Soccer"),
+         ("Economics · Fed", "Sports · Basketball"),
+         "then tick Sports · Golf, Sports · Soccer in the Exclude tags menu",
+         "with Sports · Golf, Sports · Soccer ticked in the Exclude tags menu"),
+        # Ticking All tags and unticking the one kept is as many clicks as
+        # ticking the two left out, so the short way is not used: they are named
+        (("Politics",), ("Economics", "Sports"), ("Sports · Golf", "Sports · Hockey"),
+         ("Economics · Fed",),
+         "then tick Politics in the Exclude categories menu and tick Sports · Golf, "
+         "Sports · Hockey in the Exclude tags menu",
+         "with Politics ticked in the Exclude categories menu and Sports · Golf, "
+         "Sports · Hockey ticked in the Exclude tags menu"),
+        # Fewer clicks: All tags, then the one kept unticked
+        (("Politics",), ("Economics", "Sports"),
+         ("Sports · Golf", "Sports · Hockey", "Sports · Soccer"), ("Economics · Fed",),
+         "then tick Politics in the Exclude categories menu, tick All tags in the Exclude "
+         "tags menu and untick Economics · Fed there",
+         "with Politics ticked in the Exclude categories menu, and All tags ticked in the "
+         "Exclude tags menu and Economics · Fed unticked there"),
+        # Both menus the short way: four steps
+        (("Economics", "Health", "Politics"), ("Sports",), ("Golf", "Hockey", "Soccer"),
+         ("Basketball",),
+         "then tick All categories in the Exclude categories menu, untick Sports there, "
+         "tick All tags in the Exclude tags menu and untick Basketball there",
+         "with All categories ticked in the Exclude categories menu and Sports unticked "
+         "there, and All tags ticked in the Exclude tags menu and Basketball unticked there"),
+        # Only tags, the short way
+        ((), ("Sports",), ("Sports · Golf", "Sports · Hockey", "Sports · Soccer"),
+         ("Sports · Basketball",),
+         "then tick All tags in the Exclude tags menu and untick Sports · Basketball there",
+         "with All tags ticked in the Exclude tags menu and Sports · Basketball unticked "
+         "there"),
         # Nothing to exclude or tick
-        ((), ("Economics", "Sports"), (), f"then leave {_NOTHING}", f"with {_NOTHING}"),
+        ((), ("Economics", "Sports"), (), _ECON, f"then leave {_NOTHING}",
+         f"with {_NOTHING}"),
     ])
     def test_the_phrase_says_each_shape_as_an_instruction_and_as_a_description(
-            self, excluded, kept, tags, instruction, description):
-        ticks = dashboard._MenuTicks(excluded=excluded, kept=kept, tags=tags)
+            self, excluded, kept, tags, tags_kept, instruction, description):
+        ticks = dashboard._MenuTicks(excluded=excluded, kept=kept, tags=tags,
+                                     tags_kept=tags_kept)
         assert dashboard._tick_phrase(ticks, as_instruction=True) == instruction
         assert dashboard._tick_phrase(ticks, as_instruction=False) == description
 
@@ -2592,49 +2636,63 @@ class TestLiveRuleHeader:
         # The menus' labels and the words on their boxes and buttons are the
         # constants the bar renders, so a rename reaches the line too
         for name in ("_MENU_CAT_LABEL", "_MENU_TAG_LABEL", "_MENU_CAT_ALL",
-                     "_MENU_CAT_NONE", "_MENU_TAG_ALL"):
+                     "_MENU_CAT_NONE", "_MENU_TAG_ALL", "_MENU_TAG_NONE"):
             monkeypatch.setattr(dashboard, name, f"<{name}>")
-        short = dashboard._MenuTicks(excluded=("A", "B"), kept=("C",), tags=("T",))
+        short = dashboard._MenuTicks(excluded=("A", "B", "D"), kept=("C",), tags=("T",),
+                                     tags_kept=("U",))
         assert dashboard._tick_phrase(short, as_instruction=True) == (
             "then tick <_MENU_CAT_ALL> in the <_MENU_CAT_LABEL> menu, untick C there and "
             "tick T in the <_MENU_TAG_LABEL> menu")
         assert dashboard._tick_phrase(short, as_instruction=False) == (
             "with <_MENU_CAT_ALL> ticked in the <_MENU_CAT_LABEL> menu and C unticked there, "
             "and T ticked in the <_MENU_TAG_LABEL> menu")
-        nothing = dashboard._MenuTicks(excluded=(), kept=("C",), tags=())
+        short_tags = dashboard._MenuTicks(excluded=(), kept=("C",), tags=("T", "V", "W"),
+                                          tags_kept=("U",))
+        assert dashboard._tick_phrase(short_tags, as_instruction=True) == (
+            "then tick <_MENU_TAG_ALL> in the <_MENU_TAG_LABEL> menu and untick U there")
+        nothing = dashboard._MenuTicks(excluded=(), kept=("C",), tags=(), tags_kept=("U",))
         assert dashboard._tick_phrase(nothing, as_instruction=False).startswith(
             'with the <_MENU_CAT_LABEL> menu showing "<_MENU_CAT_NONE>" and the '
-            '<_MENU_TAG_LABEL> menu showing "<_MENU_TAG_ALL>" (')
+            '<_MENU_TAG_LABEL> menu showing "<_MENU_TAG_NONE>" (')
 
     _TICK_CATS = ("Economics", "Sports")
     _TICK_SUBCATS = (("Economics", "Fed"), ("Sports", "Basketball"), ("Sports", "Soccer"))
 
+    # Each answer is (categories to exclude, categories kept, tags to tick in the
+    # Exclude tags menu, the other tags it shows): the live filter lists what to
+    # trade, so the tags to tick are the ones it leaves out
     @pytest.mark.parametrize("categories, tags, ticks", [
-        # The example of the multi-choice filter: one category whole, one narrowed
+        # The example of the multi-choice filter: one category whole, one narrowed,
+        # so the narrowed one's other tag is ticked
         (("Economics", "Sports"), ("Sports · Basketball",),
-         ((), ("Economics", "Sports"), ("Sports · Basketball",))),
+         ((), ("Economics", "Sports"), ("Sports · Soccer",),
+          ("Economics · Fed", "Sports · Basketball"))),
         # Letter case never matters, tied halves included
         (("economics", "SPORTS"), ("sports · BASKETBALL",),
-         ((), ("Economics", "Sports"), ("Sports · Basketball",))),
+         ((), ("Economics", "Sports"), ("Sports · Soccer",),
+          ("Economics · Fed", "Sports · Basketball"))),
         # Every tag of a category kept is the category in full
         (("Sports",), ("Sports · Basketball", "Sports · Soccer"),
-         (("Economics",), ("Sports",), ())),
+         (("Economics",), ("Sports",), (), ("Basketball", "Soccer"))),
         # A plain tag is looked for under each listed category; with one category
-        # kept of the two, the tag is named as the Tag menu then names it
-        (("Economics", "Sports"), ("Soccer",), (("Economics",), ("Sports",), ("Soccer",))),
-        (None, ("Soccer",), (("Economics",), ("Sports",), ("Soccer",))),
+        # kept of the two, the tag is named as the Exclude tags menu then names it
+        (("Economics", "Sports"), ("Soccer",),
+         (("Economics",), ("Sports",), ("Basketball",), ("Soccer",))),
+        (None, ("Soccer",), (("Economics",), ("Sports",), ("Basketball",), ("Soccer",))),
         # No filter keeps everything; a tag no pair carries keeps nothing
-        (None, None, ((), ("Economics", "Sports"), ())),
-        (None, ("Nope",), (("Economics", "Sports"), (), ())),
+        (None, None,
+         ((), ("Economics", "Sports"), (),
+          ("Economics · Fed", "Sports · Basketball", "Sports · Soccer"))),
+        (None, ("Nope",), (("Economics", "Sports"), (), (), ())),
         # A category the bar does not offer changes nothing
-        (("Economics", "Politics"), None, (("Sports",), ("Economics",), ())),
+        (("Economics", "Politics"), None, (("Sports",), ("Economics",), (), ("Fed",))),
     ])
     def test_the_ticks_follow_the_one_live_rule(self, categories, tags, ticks):
         bar = self._bar(categories=self._TICK_CATS, subcats=self._TICK_SUBCATS)
         assert dataclasses.astuple(dashboard._live_filter_ticks(categories, tags, bar)) == ticks
 
-    def test_a_tag_is_named_as_the_tag_menu_names_it(self):
-        # The Tag menu names a tag with its category in front, unless one
+    def test_a_tag_is_named_as_the_exclude_tags_menu_names_it(self):
+        # The Exclude tags menu names a tag with its category in front, unless one
         # category alone is kept of several (the page script's lone)
         def ticks(categories, subcats, live_categories, live_tags):
             bar = self._bar(categories=categories, subcats=subcats)
@@ -2642,14 +2700,14 @@ class TestLiveRuleHeader:
 
         sports = (("Sports", "Basketball"), ("Sports", "Soccer"))
         # A page of one category: nothing is excluded, so the category stays in front
-        assert ticks(("Sports",), sports, None, ("Soccer",)) == ("Sports · Soccer",)
+        assert ticks(("Sports",), sports, None, ("Soccer",)) == ("Sports · Basketball",)
         # One category kept of two: the tag alone
         assert ticks(("Economics", "Sports"), (("Economics", "Fed"), *sports),
-                     ("Sports",), ("Soccer",)) == ("Soccer",)
+                     ("Sports",), ("Soccer",)) == ("Basketball",)
         # Two letter-case twins kept of three are two categories in the menu
         assert ticks(("Health", "Sports", "health"),
                      (("Health", "Flu"), ("Health", "Polio"), ("Sports", "Golf"),
-                      ("health", "Flu")), ("Health",), ("Polio",)) == ("Health · Polio",)
+                      ("health", "Flu")), ("Health",), ("Polio",)) == ("Health · Flu",)
 
     def test_letter_case_twins_are_decided_together_and_named_once(self):
         # The page leaves out "Health" and "health" together and a tag of either
@@ -2664,118 +2722,218 @@ class TestLiveRuleHeader:
         def ticks(categories, tags):
             return dataclasses.astuple(dashboard._live_filter_ticks(categories, tags, bar))
 
+        # Narrowed to Polio: the two Flu tags, one tag to the filter, are left out,
+        # named once by Health's, first in the bar
         assert ticks(("health",), ("Health · Polio",)) == (
-            ("Sports",), ("Health",), ("health · Polio",))
-        assert ticks(("Sports",), None) == (("Health",), ("Sports",), ())
-        assert ticks(("HEALTH",), None) == (("Sports",), ("Health",), ())
-        # The two Flu tags are one tag: Health's, first in the bar, is named
-        assert ticks(None, ("Flu",)) == (("Sports",), ("Health",), ("Health · Flu",))
+            ("Sports",), ("Health",), ("Health · Flu",), ("health · Polio",))
+        assert ticks(("Sports",), None) == (("Health",), ("Sports",), (), ("Golf",))
+        assert ticks(("HEALTH",), None) == (
+            ("Sports",), ("Health",), (), ("Health · Flu", "health · Polio"))
+        # The two Flu tags are one tag, kept: Polio is the one left out
+        assert ticks(None, ("Flu",)) == (
+            ("Sports",), ("Health",), ("health · Polio",), ("Health · Flu",))
         # Tags of one category that differ only in letter case are one tag too
         bar = self._bar(categories=("Health", "Sports"),
                         subcats=(("Health", "COVID"), ("Health", "Covid"), ("Health", "Flu"),
                                  ("Sports", "Covid")))
-        assert ticks(None, ("covid",)) == ((), ("Health", "Sports"), ("Health · COVID",))
+        assert ticks(None, ("covid",)) == (
+            (), ("Health", "Sports"), ("Health · Flu",), ("Health · COVID", "Sports · Covid"))
 
     def test_twins_count_once_toward_the_short_way(self):
-        # Health and health kept, Sports excluded: the header counts groups of
-        # letter-case twins, as the reader clicks them, so one group kept
-        # against one excluded is said the short way. The summary line counts
-        # every name, two kept against one excluded, so it names the one
-        # excluded instead: the two can say one selection different ways
-        bar = self._bar(categories=("Health", "Sports", "health"),
-                        subcats=(("Health", "Flu"), ("Sports", "Golf"), ("health", "Flu")))
+        # Health and health kept, Politics, Sports and Weather excluded: the
+        # header counts groups of letter-case twins, as the reader clicks them,
+        # so one group kept against three excluded is said the short way (two
+        # clicks against three); counting both twins it would not be (three
+        # against three). The summary line counts every name instead, and
+        # names the two kept: the two can say one selection different ways
+        bar = self._bar(categories=("Health", "Politics", "Sports", "Weather", "health"),
+                        subcats=(("Health", "Flu"), ("Politics", "Senate"), ("Sports", "Golf"),
+                                 ("Weather", "Rain"), ("health", "Flu")))
         sweep = self._sweep(live_categories=("health",))
         assert self._text(sweep, bar).endswith(
             "— this run's primary, with All categories ticked in the Exclude categories "
             "menu and Health unticked there")
         assert dashboard._selection_name([("Health", []), ("health", [])],
-                                         ["Sports"]) == "Sports excluded"
+                                         ["Politics", "Sports", "Weather"]) == (
+            "only Health, health")
 
     def test_a_tied_tag_in_the_header_names_the_tag_to_tick(self):
         sweep = self._sweep(live_categories=("Economics", "Sports"),
                             live_tags=("Sports · Basketball",))
         text = self._text(sweep, self._bar(categories=self._TICK_CATS,
                                            subcats=self._TICK_SUBCATS))
-        assert text.endswith("— this run's primary, with Sports · Basketball ticked in the "
-                             "Tag menu")
+        assert text.endswith("— this run's primary, with Sports · Soccer ticked in the "
+                             "Exclude tags menu")
+
+    @staticmethod
+    def _follow_ticks(cats: tuple, subcats: tuple, listed, tags) -> set[str]:
+        """Check one live filter's ticks on one bar by the page's exclude rule.
+
+        Doing what _live_filter_ticks names keeps exactly the pairs the live
+        filter keeps, every one the bar offers. The page's rule is read two
+        ways: as the menus state it — a category ticked in the Exclude
+        categories menu is left out with its letter-case twins, and a tag
+        ticked in the Exclude tags menu leaves out that tag of its category,
+        with the tags that differ from it only in letter case (of its category
+        or a twin's), every other tag counting in full — and as
+        config.trade_filter_for of what remains: per group of kept twins, the
+        group unless every tag of it is ticked, and for a group with tags
+        ticked, its other tags, each tied to it. The short way of saying the
+        tags (All tags, then the tags kept unticked) must leave the same ticks.
+
+        Args:
+            cats (tuple): The bar's categories.
+            subcats (tuple): The bar's (category, tag) pairs.
+            listed: The live filter's categories (None = any).
+            tags: The live filter's tags (None = any).
+
+        Returns:
+            set[str]: The kinds of answer this filter gave, for the caller's
+                coverage check.
+        """
+        sep = config.TAG_SCOPE_SEPARATOR
+        bar = TestLiveRuleHeader._bar(categories=cats, subcats=subcats)
+        keeps = config.trade_filter_for(listed, tags)
+        ticks = dashboard._live_filter_ticks(listed, tags, bar)
+        excluded_keys = {name.casefold() for name in ticks.excluded}
+        kept = tuple(name for name in cats if name.casefold() not in excluded_keys)
+        # Each letter-case group named once, and every category either excluded
+        # or kept
+        assert len(excluded_keys) == len(ticks.excluded)
+        assert [name.casefold() for name in ticks.kept] == list(
+            dict.fromkeys(name.casefold() for name in kept))
+        # A tag named alone exactly while one category is kept of several
+        lone = len(kept) == 1 and len(cats) > 1
+
+        def keys_of(named):
+            """The (category, tag) keys of tags named as the Exclude tags menu names them."""
+            assert all((sep not in tag) == lone for tag in named)
+            pairs = [(kept[0], tag) if lone else config.split_tag(tag) for tag in named]
+            keys = {(c.casefold(), t.casefold()) for c, t in pairs}
+            assert len(keys) == len(pairs)
+            return keys
+
+        ticked_keys = keys_of(ticks.tags)
+        kept_tag_keys = keys_of(ticks.tags_kept)
+        # Every tag row the menu shows once the categories are set is named once,
+        # to tick or to leave: so ticking All tags and unticking the ones kept
+        # leaves exactly the ticks named
+        shown_keys = {(c.casefold(), t.casefold()) for c, t in subcats
+                      if c.casefold() not in excluded_keys}
+        assert ticked_keys | kept_tag_keys == shown_keys
+        assert not ticked_keys & kept_tag_keys
+        # The live rule over what the ticks leave
+        groups = {c for c, _ in ticked_keys}
+        remaining = [name for name in kept
+                     if name.casefold() not in groups
+                     or any(key[0] == name.casefold() for key in kept_tag_keys)]
+        tied = tuple(dict.fromkeys(f"{c}{sep}{t}" for c, t in subcats
+                                   if c.casefold() in groups
+                                   and (c.casefold(), t.casefold()) not in ticked_keys))
+        page_keeps = config.trade_filter_for(tuple(remaining), tied or None)
+        for c, t in subcats:
+            shown = (c.casefold() not in excluded_keys
+                     and (c.casefold(), t.casefold()) not in ticked_keys)
+            assert shown == page_keeps(c, t) == keeps(c, t), (listed, tags, c, t)
+        short = bool(ticks.kept) and 1 + len(ticks.kept) < len(ticks.excluded)
+        short_tags = bool(ticks.tags_kept) and 1 + len(ticks.tags_kept) < len(ticks.tags)
+        tag_keys = [(c.casefold(), t.casefold()) for c, t in subcats]
+
+        def twinned(name: str) -> bool:
+            """Whether another category differs from this one only in letter case."""
+            return sum(other.casefold() == name.casefold() for other in cats) > 1
+
+        return {kind for kind, came in [
+            ("nothing", not ticks.excluded and not ticks.tags),
+            ("excluded", bool(ticks.excluded) and not short),
+            ("short", short), ("tags", bool(ticks.tags)),
+            ("short tags", short_tags),
+            ("lone tag", lone and bool(ticks.tags)),
+            ("twin excluded", any(twinned(name) for name in ticks.excluded)),
+            ("twin kept", short and any(twinned(name) for name in ticks.kept)),
+            ("twin tag", any(tag_keys.count(key) > 1 for key in ticked_keys))] if came}
+
+    @staticmethod
+    def _random_filter(rng, cats, tag_names):
+        """A valid live filter over these names, in random letter case.
+
+        Args:
+            rng (random.Random): The seeded source.
+            cats: Category names to list from ("Politics" is added, a category
+                no bar offers).
+            tag_names: Tag names to draw from.
+
+        Returns:
+            tuple: (categories, tags), each None or a tuple, as LiveSettings holds them.
+        """
+        sep = config.TAG_SCOPE_SEPARATOR
+        cased = [str, str.upper, str.lower]
+        pool = list(dict.fromkeys([*cats, "Politics"]))
+        listed = (None if rng.random() < 0.3 else tuple(
+            rng.choice(cased)(name) for name in rng.sample(pool, rng.randint(1, min(3, len(pool))))))
+        chosen: list[str] = []
+        for _ in range(rng.randint(0, 3)):
+            tag = rng.choice(cased)(rng.choice(tag_names))
+            # A tag tied to a category only where that category is listed
+            if listed and rng.random() < 0.5:
+                tag = f"{rng.choice(listed)}{sep}{tag}"
+            chosen.append(tag)
+        return listed, tuple(dict.fromkeys(chosen)) or None
 
     def test_the_pages_rule_over_the_ticks_is_the_live_rule(self):
-        # Seeded valid live filters over two bars: one of two categories, and one
+        # Seeded valid live filters over three bars: one of two categories, one
         # with plain tags under several categories and names that differ only in
-        # letter case. Doing what the ticks say keeps exactly the pairs the live
-        # filter keeps, every one the bar offers.
-        #
-        # The page's rule is checked two ways. As the menus state it: a category
-        # ticked in the Exclude categories menu is left out with its letter-case
-        # twins, and a kept one counts in full unless a tag of it or of a twin is
-        # ticked, then only the tags ticked and their twins. And as
-        # config.trade_filter_for of the categories kept and the ticked tags
-        sep = config.TAG_SCOPE_SEPARATOR
+        # letter case, and one with a category of many tags (for the short way
+        # of saying the tags). Doing what the ticks say keeps exactly the pairs
+        # the live filter keeps, every one the bar offers (_follow_ticks)
         bars = [(self._TICK_CATS, self._TICK_SUBCATS),
-                (("Health", "Oil & Gas", "Sports", "health"),
+                (("Health", "Oil & Gas", "Politics", "Sports", "Weather", "health"),
                  (("Health", "Flu"), ("Oil & Gas", "Fed"), ("Oil & Gas", "Soccer"),
-                  ("Sports", "Golf"), ("Sports", "SOCCER"), ("Sports", "Soccer"),
-                  ("health", "Flu"), ("health", "Polio")))]
+                  ("Politics", "Senate"), ("Sports", "Golf"), ("Sports", "SOCCER"),
+                  ("Sports", "Soccer"), ("Weather", "Rain"), ("health", "Flu"),
+                  ("health", "Polio"))),
+                (("Economics", "Sports"),
+                 (("Economics", "Fed"), ("Sports", "Basketball"), ("Sports", "Golf"),
+                  ("Sports", "Hockey"), ("Sports", "Soccer"), ("Sports", "Tennis")))]
         rng = random.Random(11)
-        cased = [str, str.upper, str.lower]
-        seen = set()
-
-        def twinned(name: str, names) -> bool:
-            """Whether another of these names differs from this one only in letter case."""
-            return sum(other.casefold() == name.casefold() for other in names) > 1
-
+        seen: set[str] = set()
         for cats, subcats in bars:
-            bar = self._bar(categories=cats, subcats=subcats)
             tag_names = sorted({tag for _, tag in subcats}) + ["Nope"]
-            tag_keys = [(c.casefold(), t.casefold()) for c, t in subcats]
             for _ in range(300):
-                listed = (None if rng.random() < 0.3 else tuple(
-                    rng.choice(cased)(name)
-                    for name in rng.sample([*cats, "Politics"], rng.randint(1, 3))))
-                chosen: list[str] = []
-                for _ in range(rng.randint(0, 3)):
-                    tag = rng.choice(cased)(rng.choice(tag_names))
-                    # A tag tied to a category only where that category is listed
-                    if listed and rng.random() < 0.5:
-                        tag = f"{rng.choice(listed)}{sep}{tag}"
-                    chosen.append(tag)
-                tags = tuple(dict.fromkeys(chosen)) or None
-                keeps = config.trade_filter_for(listed, tags)
-                ticks = dashboard._live_filter_ticks(listed, tags, bar)
-                excluded_keys = {name.casefold() for name in ticks.excluded}
-                kept = tuple(name for name in cats if name.casefold() not in excluded_keys)
-                # Each letter-case group named once, and every category either
-                # excluded or kept
-                assert len(excluded_keys) == len(ticks.excluded)
-                assert [name.casefold() for name in ticks.kept] == list(
-                    dict.fromkeys(name.casefold() for name in kept))
-                # A tag named alone exactly while one category is kept of several
-                lone = len(kept) == 1 and len(cats) > 1
-                assert all((sep not in tag) == lone for tag in ticks.tags)
-                ticked = [(kept[0], tag) if lone else config.split_tag(tag)
-                          for tag in ticks.tags]
-                ticked_keys = {(c.casefold(), t.casefold()) for c, t in ticked}
-                assert len(ticked_keys) == len(ticked)
-                page_keeps = config.trade_filter_for(
-                    kept, tuple(sep.join(pair) for pair in ticked) or None)
-                for c, t in subcats:
-                    narrowed = any(tc.casefold() == c.casefold() for tc, _ in ticked)
-                    shown = (c.casefold() not in excluded_keys
-                             and (not narrowed or (c.casefold(), t.casefold()) in ticked_keys))
-                    assert shown == page_keeps(c, t) == keeps(c, t), (listed, tags)
-                short = bool(ticks.excluded) and len(ticks.kept) <= len(ticks.excluded)
-                seen.update(kind for kind, came in [
-                    ("nothing", not ticks.excluded and not ticks.tags),
-                    ("excluded", bool(ticks.excluded) and not short),
-                    ("short", short), ("tags", bool(ticks.tags)),
-                    ("lone tag", lone and bool(ticks.tags)),
-                    ("twin excluded", any(twinned(name, cats) for name in ticks.excluded)),
-                    ("twin kept", short and any(twinned(name, cats) for name in ticks.kept)),
-                    ("twin tag", any(tag_keys.count(key) > 1 for key in ticked_keys))]
-                    if came)
+                listed, tags = self._random_filter(rng, cats, tag_names)
+                seen |= self._follow_ticks(cats, subcats, listed, tags)
         # Every kind of answer came up
-        assert seen == {"nothing", "excluded", "short", "tags", "lone tag", "twin excluded",
-                        "twin kept", "twin tag"}
+        assert seen == {"nothing", "excluded", "short", "tags", "short tags", "lone tag",
+                        "twin excluded", "twin kept", "twin tag"}
+
+    def test_random_bars_and_filters_keep_what_the_live_filter_keeps(self):
+        # Seeded random bars, with letter-case twins among both the categories
+        # and the tags, and seeded random include filters over their names:
+        # the header's ticks, applied through the page's exclude rule, keep
+        # exactly the pairs config.trade_filter_for keeps (_follow_ticks)
+        rng = random.Random(29)
+        base_cats = ["Economics", "Health", "Oil & Gas", "Sports", "Weather"]
+        base_tags = ["Basketball", "COVID", "Fed", "Flu", "Golf", "Soccer"]
+        seen: set[str] = set()
+        for _ in range(150):
+            cats = rng.sample(base_cats, rng.randint(1, 4))
+            # A letter-case twin of a category, now and then
+            if rng.random() < 0.4:
+                cats.append(rng.choice(cats).lower())
+            cats = list(dict.fromkeys(cats))
+            subcats = []
+            for name in cats:
+                own = rng.sample(base_tags, rng.randint(1, 5))
+                # A letter-case twin of a tag, now and then
+                if rng.random() < 0.3:
+                    own.append(own[0].upper() if own[0] != own[0].upper() else own[0].lower())
+                subcats += [(name, tag) for tag in dict.fromkeys(own)]
+            tag_names = sorted({tag for _, tag in subcats}) + ["Nope"]
+            for _ in range(20):
+                listed, tags = self._random_filter(rng, cats, tag_names)
+                seen |= self._follow_ticks(tuple(cats), tuple(subcats), listed, tags)
+        assert {"nothing", "excluded", "short", "tags", "short tags", "lone tag",
+                "twin excluded", "twin tag"} <= seen
 
     def test_a_filter_on_a_grid_cell_follows_its_band_choice(self):
         sweep = self._sweep(live_spread_band=(0.3, 0.6), live_categories=("Sports",),
@@ -2784,19 +2942,19 @@ class TestLiveRuleHeader:
                         subcats=self._SUBCATS)
         assert self._text(sweep, bar).endswith(
             "— choose Spread band max(tier,0.3)-0.6 and Tier floors on in the filter bar, "
-            "then tick All categories in the Exclude categories menu and untick Sports there")
-        # ... the excluded categories named when fewer than those kept, a tag to
-        # tick after them, and a filter that keeps every pair the run filed needs
-        # the menus left as they are
+            "then tick Economics, Oil &amp; Gas in the Exclude categories menu")
+        # ... the excluded categories named when fewer than those kept, a tag the
+        # filter leaves out to tick after them, and a filter that keeps every pair
+        # the run filed needs the menus left as they are
         for categories, tags, clause in [
                 (("Economics", "Sports"), ("Economics · Fed",),
                  "then tick Oil &amp; Gas in the Exclude categories menu and tick "
-                 "Economics · Fed in the Tag menu"),
+                 "Economics · Inflation in the Exclude tags menu"),
                 (("Economics",), ("Economics · Fed",),
-                 "then tick All categories in the Exclude categories menu, untick Economics "
-                 "there and tick Fed in the Tag menu"),
+                 "then tick Oil &amp; Gas, Sports in the Exclude categories menu and tick "
+                 "Inflation in the Exclude tags menu"),
                 (("Oil & Gas", "Economics", "Sports"), ("Economics · Fed",),
-                 "then tick Economics · Fed in the Tag menu"),
+                 "then tick Economics · Inflation in the Exclude tags menu"),
                 (("Oil & Gas", "Economics", "Sports"), None, f"then leave {self._NOTHING}")]:
             swept = dataclasses.replace(sweep, live_categories=categories, live_tags=tags)
             assert self._text(swept, bar).endswith(
@@ -2868,20 +3026,73 @@ class TestLiveRuleHeader:
     # A page's series for the letter-case case below: Health and health are
     # twins, and so are Health's COVID and Covid, and Health's and health's
     # Flu. Sports' Covid is another category's tag, no twin of Health's
+    # Politics and Weather are there so that one group kept against four
+    # excluded is said the short way
     _TWIN_LIVE_SERIES = {"KXE0": ("Economics", ("Fed",)), "KXH0": ("Health", ("COVID",)),
                          "KXH1": ("Health", ("Covid",)), "KXH2": ("Health", ("Flu",)),
                          "KXH3": ("health", ("Flu",)), "KXH4": ("health", ("Polio",)),
-                         "KXS0": ("Sports", ("Covid",)), "KXS1": ("Sports", ("Golf",))}
+                         "KXP0": ("Politics", ("Senate",)), "KXS0": ("Sports", ("Covid",)),
+                         "KXS1": ("Sports", ("Golf",)), "KXW0": ("Weather", ("Rain",))}
+    # A page with five categories and a category of five tags, two of them
+    # letter-case twins (Golf and GOLF), where the line can say both menus the
+    # short way (All ticked, then the ones kept unticked), a twin group among
+    # the tags unticked
+    _MANY_TAG_LIVE_SERIES = {"KXE0": ("Economics", ("Fed",)), "KXH0": ("Health", ("Flu",)),
+                             "KXP0": ("Politics", ("Senate",)),
+                             "KXS0": ("Sports", ("Basketball",)), "KXS1": ("Sports", ("Golf",)),
+                             "KXS2": ("Sports", ("GOLF",)), "KXS3": ("Sports", ("Hockey",)),
+                             "KXS4": ("Sports", ("Soccer",)), "KXW0": ("Weather", ("Rain",))}
 
-    @pytest.mark.parametrize("twins", [False, True], ids=["plain", "letter-case twins"])
+    @staticmethod
+    def _read_tail(tail: str) -> dict:
+        """
+        Read a live-rule line's tick clause into the boxes it names, menu by menu.
+
+        Args:
+            tail (str): The clause after "— this run's primary, " (unescaped).
+
+        Returns:
+            dict: "nothing" (bool); "excluded" or "kept" (the categories named
+                to tick, or to untick after All categories); "ticked" or
+                "tags_kept" (the tags named to tick, or to untick after All
+                tags); "short" and "short_tags" (which menus were said the
+                short way).
+        """
+        cat_all, tag_all = dashboard._MENU_CAT_ALL, dashboard._MENU_TAG_ALL
+        cat_menu = f"the {dashboard._MENU_CAT_LABEL} menu"
+        tag_menu = f"the {dashboard._MENU_TAG_LABEL} menu"
+        out = {"nothing": False, "excluded": [], "kept": [], "ticked": [], "tags_kept": [],
+               "short": False, "short_tags": False}
+        if tail == f"with {TestLiveRuleHeader._NOTHING}":
+            out["nothing"] = True
+            return out
+        cat = (rf"(?:{re.escape(cat_all)} ticked in {re.escape(cat_menu)} and (?P<kept>.+?) "
+               rf"unticked there|(?P<excluded>.+?) ticked in {re.escape(cat_menu)})")
+        tag = (rf"(?:{re.escape(tag_all)} ticked in {re.escape(tag_menu)} and "
+               rf"(?P<tags_kept>.+?) unticked there|(?P<ticked>.+?) ticked in "
+               rf"{re.escape(tag_menu)})")
+        match = re.fullmatch(rf"with (?:{cat})?(?P<join>,? and )?(?:{tag})?", tail)
+        assert match, tail
+        for key in ("excluded", "kept", "ticked", "tags_kept"):
+            out[key] = match[key].split(", ") if match[key] else []
+        out["short"], out["short_tags"] = bool(match["kept"]), bool(match["tags_kept"])
+        # A part said the short way holds an "and" of its own, so the two
+        # parts are joined by a comma then
+        if match["join"]:
+            assert match["join"] == (", and " if out["short"] or out["short_tags"]
+                                     else " and "), tail
+        return out
+
+    @pytest.mark.parametrize("page_kind", ["plain", "twins", "many tags"])
     def test_doing_what_the_header_says_shows_what_the_live_filter_keeps(
-            self, monkeypatch, tmp_path, twins):
+            self, monkeypatch, tmp_path, page_kind):
         # The page's script, made to do what the header line says, word for
         # word, draws exactly the trades the live filter keeps. The line is
         # read as a reader reads it: each box it names is clicked once, in the
         # order named — the categories ticked in the Exclude categories menu,
-        # or All categories ticked and then the ones named unticked there — and
-        # then the tags ticked in the Tag menu. Every name read must be a box
+        # or All categories ticked and then the ones named unticked there —
+        # and then the tags ticked in the Exclude tags menu, or All tags ticked
+        # and then the ones named unticked there. Every name read must be a box
         # the menu shows. Tag i of the page holds 2**i trades, so the trade
         # count names the tags drawn. The plain page is _MIX_SERIES' (Cat0:
         # Tag0, Tag3, Tag6; Cat1: Tag1, Tag4; Cat2: Tag2, Tag5); on the twins'
@@ -2889,16 +3100,31 @@ class TestLiveRuleHeader:
         # is one the line once got wrong: it said "with every category but
         # Health ticked", so a reader ticked Economics, Sports and health,
         # health took Health with it, and the page showed no trade
-        if twins:
+        if page_kind == "twins":
             series = self._TWIN_LIVE_SERIES
+            everything = ("Economics", "Health", "Politics", "Sports", "Weather")
             filters = [
-                (("Health",), ("covid",)),   # the short way: keep Health, tick COVID
-                (None, ("Flu",)),            # the short way: keep Health, tick Flu
+                (("Health",), ("covid",)),   # the short way: keep Health, tick Flu, Polio
+                (None, ("Flu",)),            # the short way: keep Health, tick COVID, Polio
                 (("Economics", "Sports"), None),  # exclude Health (and health)
-                (("Economics", "Health", "Sports"), ("Health · Covid", "Sports · Golf")),
-                (("Sports",), ("Golf",)),    # one category kept: Golf named alone
+                (everything, ("Health · Covid", "Sports · Golf")),  # tags only
+                (("Sports",), ("Golf",)),    # one category kept: Covid named alone
                 (("health",), None),
-                (("Economics", "Health", "Sports"), None),
+                (everything, None),
+            ]
+        elif page_kind == "many tags":
+            series = self._MANY_TAG_LIVE_SERIES
+            everything = ("Economics", "Health", "Politics", "Sports", "Weather")
+            filters = [
+                # Both menus the short way, the twin group Golf/GOLF unticked
+                # after All tags
+                (("Sports",), ("golf",)),
+                (("Sports",), ("Basketball",)),  # both menus the short way
+                (None, ("Golf", "Hockey")),  # two tags named alone
+                # Both menus named box by box, GOLF ticked taking Golf with it
+                (("Economics", "Health", "Sports"), ("Sports · Hockey",)),
+                (everything, ("Sports · Golf",)),  # tags only
+                (everything, None),
             ]
         else:
             series = _MIX_SERIES
@@ -2935,64 +3161,78 @@ class TestLiveRuleHeader:
             line = dashboard._live_rule_html(
                 dataclasses.replace(sweep, live_categories=cats, live_tags=tags), bar=data)
             tail = html.unescape(line).removesuffix("</p>").split("— this run's primary, ")[1]
-            short = re.fullmatch(rf"with {re.escape(dashboard._MENU_CAT_ALL)} ticked in the "
-                                 r"Exclude categories menu and (.+?) unticked there"
-                                 r"(?:, and (.+) ticked in the Tag menu)?", tail)
-            listed = re.fullmatch(r"with (?:(.+?) ticked in the Exclude categories menu)?"
-                                  r"(?: and )?(?:(.+) ticked in the Tag menu)?", tail)
-            excluded: list[str] = []
-            kept: list[str] = []
-            ticked: list[str] = []
-            if tail == f"with {self._NOTHING}":
+            said = self._read_tail(tail)
+            if said["nothing"]:
                 kinds.add("nothing")
-            elif short:
-                kept = short[1].split(", ")
-                ticked = short[2].split(", ") if short[2] else []
+            elif said["short"]:
                 kinds.add("short")
             else:
-                assert listed, tail
-                excluded = listed[1].split(", ") if listed[1] else []
-                ticked = listed[2].split(", ") if listed[2] else []
-                kinds.add("excluded" if excluded else "tags only")
+                kinds.add("excluded" if said["excluded"] else "tags only")
+            if said["short_tags"]:
+                kinds.add("short tags")
             # A reader can click only the boxes the menu shows
-            for name in kept + excluded:
+            for name in said["kept"] + said["excluded"]:
                 assert name in categories, (
                     f"{name!r} is no box of the Exclude categories menu", filters[i], tail)
-            # A tag named alone belongs to the one category kept
-            pairs = [config.split_tag(t) if config.TAG_SCOPE_SEPARATOR in t else (kept[0], t)
-                     for t in ticked]
-            if any(config.TAG_SCOPE_SEPARATOR not in t for t in ticked):
+            # The categories left after the category clicks, a box taking its
+            # twins with it
+            if said["short"]:
+                kept_keys = {name.casefold() for name in said["kept"]}
+                left = [name for name in categories if name.casefold() in kept_keys]
+            else:
+                out_keys = {name.casefold() for name in said["excluded"]}
+                left = [name for name in categories if name.casefold() not in out_keys]
+            # A tag named alone belongs to the one category left
+            named = said["ticked"] + said["tags_kept"]
+            if any(config.TAG_SCOPE_SEPARATOR not in t for t in named):
+                assert len(left) == 1, (filters[i], tail)
                 kinds.add("lone tag")
+
+            def boxes(names, left=left):
+                """The tag boxes these names name, as the Exclude tags menu names them."""
+                pairs = [config.split_tag(t) if config.TAG_SCOPE_SEPARATOR in t
+                         else (left[0], t) for t in names]
+                return [subcats.index(pair) for pair in pairs]
+
+            tick_boxes, untick_boxes = boxes(said["ticked"]), boxes(said["tags_kept"])
             # The clicks the line names: All categories and then each kept one
             # (_keep_categories), or each excluded one. A snapshot once the
-            # categories are set, before any tag is clicked: each tag row to
-            # click must read the name the line gives it
+            # categories are set, before any tag is clicked: each tag row the
+            # line names must read the name the line gives it. Then the tags:
+            # All tags and each kept one unticked, or each one named ticked
             steps += [*_clear_menus(),
-                      *(_keep_categories(*(categories.index(n) for n in kept)) if kept else []),
-                      *(_tick_category(categories.index(n)) for n in excluded),
+                      *(_keep_categories(*(categories.index(n) for n in said["kept"]))
+                        if said["short"] else []),
+                      *(_tick_category(categories.index(n)) for n in said["excluded"]),
                       ["settle"], ["snap", f"c{i}"],
-                      *(_tick_tag(subcats.index(pair)) for pair in pairs),
+                      *([_tick_tag(""), *(_tick_tag(si) for si in untick_boxes)]
+                        if said["short_tags"] else []),
+                      *(_tick_tag(si) for si in tick_boxes),
                       ["settle"], ["snap", f"f{i}"]]
             keeps = config.trade_filter_for(cats, tags)
-            # The boxes the clicks should leave ticked: each named box with its
-            # letter-case twins, so more boxes than names where a group has two.
-            # A category is out when the filter keeps no pair of it or of a twin
+            # The boxes the clicks should leave ticked: each category with no
+            # pair kept (and its twins), and each tag of a category left that
+            # the filter does not keep (with its twins), so more boxes than
+            # clicks where a group has two
             out = [ci for ci, name in enumerate(categories)
                    if not any(keeps(c, t) for c, t in subcats
                               if c.casefold() == name.casefold())]
-            named = {(c.casefold(), t.casefold()) for c, t in pairs}
-            tag_boxes = [si for si, key in enumerate(tag_keys) if key in named]
-            if excluded and len(out) > len(excluded):
+            left_keys = {name.casefold() for name in left}
+            tag_ticks = [si for si, (c, t) in enumerate(subcats)
+                         if c.casefold() in left_keys and not keeps(c, t)]
+            if said["excluded"] and len(out) > len(said["excluded"]):
                 kinds.add("twin excluded")
-            if kept and len(categories) - len(out) > len(kept):
+            if said["kept"] and len(categories) - len(out) > len(said["kept"]):
                 kinds.add("twin kept")
-            if len(tag_boxes) > len(pairs):
+            if len(tag_ticks) > len(tick_boxes) and not said["short_tags"]:
                 kinds.add("twin tag")
+            if any(tag_keys.count(tag_keys[si]) > 1 for si in untick_boxes):
+                kinds.add("twin untick")
             shown = sum(2 ** si for si, pair in enumerate(subcats) if keeps(*pair))
-            rows = {subcats.index(pair): name for pair, name in zip(pairs, ticked, strict=True)}
-            expected.append((shown, out, tag_boxes, rows))
+            rows = dict(zip(tick_boxes + untick_boxes, named, strict=True))
+            expected.append((shown, out, tag_ticks, rows))
         snaps = _run_script(tmp_path, page, steps, strict=True)
-        for i, (shown, out, tag_boxes, rows) in enumerate(expected):
+        for i, (shown, out, tag_ticks, rows) in enumerate(expected):
             # A row reads its name and its trade count, as the script writes it
             menu_rows = snaps[f"c{i}"]["menus"]["flt-tag"]["rows"]
             for index, name in rows.items():
@@ -3001,15 +3241,20 @@ class TestLiveRuleHeader:
             snap = snaps[f"f{i}"]
             assert int(snap["text"]["hdr-trades"]) == shown, filters[i]
             assert snap["menus"]["flt-cat"]["ticked"] == out, filters[i]
-            assert snap["menus"]["flt-tag"]["ticked"] == tag_boxes, filters[i]
-        # Each kind of instruction was followed: exclusions, the short way (and
-        # a tag named alone), ticks alone, and nothing (the whole run); and on
-        # the twins' page, a box clicked that took its twins with it, in each
-        # menu and when unticking
+            assert snap["menus"]["flt-tag"]["ticked"] == tag_ticks, filters[i]
+        # Each kind of instruction was followed: exclusions, ticks alone (and a
+        # tag named alone), and nothing (the whole run); on the twins' page, the
+        # short way and a box clicked that took its twins with it, in each menu
+        # and when unticking a category; and on the many tags' page, both menus
+        # the short way, a tag twin group unticked after All tags among them
         assert expected[-1][0] == 2 ** len(subcats) - 1
-        assert kinds == ({"nothing", "short", "excluded", "tags only", "lone tag",
-                          "twin excluded", "twin kept", "twin tag"} if twins else
-                         {"nothing", "short", "excluded", "tags only", "lone tag"})
+        assert kinds == {
+            "plain": {"nothing", "excluded", "tags only", "lone tag"},
+            "twins": {"nothing", "short", "excluded", "tags only", "lone tag",
+                      "twin excluded", "twin kept", "twin tag"},
+            "many tags": {"nothing", "short", "excluded", "tags only", "lone tag",
+                          "short tags", "twin tag", "twin untick"},
+        }[page_kind]
 
 
 class TestEntryCheckpointHeader:
@@ -5413,13 +5658,16 @@ class TestMixData:
         # The second sentence says what the page can still show (the whole
         # run, one category kept alone, one tag alone: the views Python ships
         # whole) and that anything else, excluding one category of three or
-        # more included, is refused; it must not claim every single choice
-        # is unaffected
+        # more or ticking one tag while several categories are kept
+        # included, is refused; it must not claim every single choice is
+        # unaffected
         message = said[0].getMessage()
         assert "every single choice is unaffected" not in message
         for words in ("only the whole run", "one category kept alone",
                       "one tag alone", "every other category excluded",
+                      "every other tag of its category ticked",
                       "excluding just one category of three or more",
+                      "ticking a single tag while several categories are kept",
                       "'not available' line"):
             assert words in message
         assert not any("m" in view for chunk in chunks.values()
@@ -5782,12 +6030,13 @@ class TestFilterPage:
             "All categories", "Commodities (1)", "Other (1)", "Science (0)", "Sports (3)"]
         assert cats["label"] == "None" and not cats["all"]["checked"]
         assert not any(row["checked"] or row["hidden"] for row in cats["rows"])
-        # The Tag menu lists every tag with its category in front
+        # The Exclude tags menu lists every tag with its category in front, nothing
+        # ticked (its "All tags" box unticked), so no tag is left out
         tags = _page_elements(page)["menus"]["flt-tag"]
         assert [tags["all"]["text"], *(row["text"] for row in tags["rows"])] == [
             "All tags", "Commodities · Oil & Gas (1)", "Other · General (1)",
             "Science · General (0)", "Sports · Basketball (2)", "Sports · Hockey (1)"]
-        assert tags["label"] == "All tags" and tags["all"]["checked"]
+        assert tags["label"] == "None" and not tags["all"]["checked"]
         assert not any(row["checked"] or row["hidden"] for row in tags["rows"])
         # The summary is escaped into the page (the bar's reach names "the
         # bar's k"), and ends with what the bar reaches beyond the sections
@@ -5850,9 +6099,9 @@ class TestFilterPage:
             "Ticking All categories excludes every category. What remains is those "
             "trades' contribution to the run, not a run of their own.")
         assert dashboard._MENU_TAG_TITLE == (
-            "Tick some of a category's tags to narrow that category to them; every other "
-            "category counts in full. Lists only the tags of categories that are not "
-            "excluded.")
+            "Tick a tag to exclude its trades from the figures this bar re-scopes; every "
+            "other tag counts in full. Ticking All tags excludes every tag listed. Lists "
+            "only the tags of categories that are not excluded.")
 
     @pytest.mark.parametrize("family", [True, False])
     def test_the_tier_floors_select_offers_on_and_off(self, monkeypatch, tmp_path, family):
@@ -6088,55 +6337,83 @@ class TestFilterSummary:
         for figure in ("return", "drawdown", "Sharpe", "Sortino", "median monthly return",
                        "benchmark's strategy row"):
             assert figure in sliced
-        # Every category left out: no trade, said so, and no selection named
+        # Nothing left (every category left out, or every tag of those kept
+        # ticked): no trade, said so, and no selection named
         assert dashboard._filter_summary_text(self.T, where, True, None, 0, 5,
                                               none_kept=True) == (
             "Showing no trades of the run at the primary spread band max(tier,0)-1, "
-            f"k = 0.75, 20% cap per trade: every category is excluded. {dashboard._BAR_REACH}")
+            "k = 0.75, 20% cap per trade: nothing is left after the exclusions. "
+            f"{dashboard._BAR_REACH}")
 
     def test_the_ticks_of_both_menus_are_named_by_what_they_leave_out_or_keep(self):
         name = dashboard._selection_name
-        # Kept ones named while no more are kept than excluded
+        # Kept ones named while no more are kept than excluded: a category
+        # whole, or less the tags ticked in it (joined by "; " then, so a tag
+        # never reads as a category)
         assert name([("Sports", [])], ["Commodities", "Other", "Science"]) == "only Sports"
         assert name([("Sports", ["Hockey"])], ["Commodities", "Other", "Science"]) == \
-            "only Sports · Hockey"
+            "only Sports except Hockey"
         assert name([("Science", []), ("Sports", ["Basketball", "Hockey"])],
                     ["Commodities", "Other"]) == \
-            "only Science, Sports · Basketball, Sports · Hockey"
+            "only Science; Sports except Basketball, Hockey"
         assert name([("E", [])], ["A", "B", "C", "D", "F"]) == "only E"
         assert name([("E", []), ("F", [])], ["A", "B", "C", "D"]) == "only E, F"
-        # Otherwise what is left out, then each kept category a tag narrows
+        # Otherwise what is left out, then each kept category less its ticked tags
         assert name([("Other", []), ("Science", []), ("Sports", [])], ["Commodities"]) == \
             "Commodities excluded"
         assert name([("Commodities", []), ("Other", []), ("Sports", ["Hockey"])],
-                    ["Science"]) == "Science excluded; Sports narrowed to Hockey"
+                    ["Science"]) == "Science excluded; Sports except Hockey"
         assert name([("Commodities", []), ("Other", []), ("Science", []),
                      ("Sports", ["Basketball", "Hockey"])], []) == \
-            "Sports narrowed to Basketball, Hockey"
+            "Sports except Basketball, Hockey"
         assert name([], ["Commodities", "Other", "Science", "Sports"]) == \
             "every category excluded"
         # Past three names, the first three and how many more; past three
-        # parts, the first three and how many more categories are narrowed
+        # parts, the first three and how many more categories lose tags
         assert name([("A", ["1", "2", "3", "4"])], ["B", "C"]) == \
-            "only A · 1, A · 2, A · 3, +1 more"
+            "only A except 1, 2, 3 and 1 more tag"
         assert name([("F", []), ("G", []), ("H", []), ("I", []), ("J", [])],
                     ["A", "B", "C", "D"]) == "A, B, C, +1 more excluded"
         assert name([(c, ["t"]) for c in "ABCDE"], []) == (
-            "A narrowed to t; B narrowed to t; C narrowed to t; and 2 more narrowed")
+            "A except t; B except t; C except t; and 2 more with tags excluded")
         assert name([(c, ["t"]) for c in "ABCD"], ["Q"]) == (
-            "Q excluded; A narrowed to t; B narrowed to t; and 2 more narrowed")
-        # Categories whose names differ only in letter case are one to the
-        # live filter: a tag ticked under one narrows both, so they are named
-        # together, narrowed to the tags ticked in either, and the one only
-        # its twin's tag narrows is never named as counting in full
-        assert name([("Health", ["Flu"]), ("Sports", []), ("health", [])], []) == \
-            "Health, health narrowed to Flu"
+            "Q excluded; A except t; B except t; and 2 more with tags excluded")
+        # A tag ticked counts in its own category only: categories whose
+        # names differ only in letter case are named apart, each less its own
+        # ticks (a twin's tag of the same name is ticked with it, so it is in
+        # both lists)
+        assert name([("Health", ["Flu"]), ("Sports", []), ("health", ["flu"])], []) == \
+            "Health except Flu; health except flu"
         assert name([("Health", ["Flu"]), ("Sports", []), ("health", ["Polio"])],
-                    ["Arts"]) == "Arts excluded; Health, health narrowed to Flu, Polio"
+                    ["Arts"]) == "Arts excluded; Health except Flu; health except Polio"
         assert name([("Health", ["Flu"]), ("health", [])], ["Arts", "Crypto", "Sports"]) == \
-            "only Health · Flu"
+            "only Health except Flu; health"
         assert name([("Health", []), ("health", [])], ["Arts", "Crypto", "Sports"]) == \
             "only Health, health"
+
+    def test_a_category_with_every_tag_ticked_is_named_as_excluded(self):
+        # Told how many tags the Exclude tags menu lists for each category, a kept
+        # category with every one ticked has nothing left: it is named with
+        # the categories left out, after those ticked in the Exclude
+        # categories menu, and counts as left out for the short form
+        name = dashboard._selection_name
+        counts = {"Science": 1, "Sports": 2, "Other": 1, "Commodities": 1, "Health": 1}
+        assert name([("Health", []), ("Other", []), ("Science", []),
+                     ("Sports", ["Basketball", "Hockey"])],
+                    ["Commodities"], tag_counts=counts) == "Commodities, Sports excluded"
+        # Two kept, and two left out with Sports: the ones kept are named
+        assert name([("Other", []), ("Science", []), ("Sports", ["Basketball", "Hockey"])],
+                    ["Commodities"], tag_counts=counts) == "only Other, Science"
+        assert name([("Science", []), ("Sports", ["Basketball", "Hockey"])],
+                    ["Commodities", "Other"], tag_counts=counts) == "only Science"
+        assert name([("Sports", ["Basketball", "Hockey"])], [], tag_counts=counts) == \
+            "every category excluded"
+        # Part of a category ticked is not all of it; without the counts no
+        # category reads as wholly ticked
+        assert name([("Other", []), ("Sports", ["Hockey"])], ["Commodities"],
+                    tag_counts=counts) == "Commodities excluded; Sports except Hockey"
+        assert name([("Other", []), ("Sports", ["Basketball", "Hockey"])],
+                    ["Commodities"]) == "Commodities excluded; Sports except Basketball, Hockey"
 
     def test_every_reach_says_the_interval_discount_ignores_the_tier_choice(self):
         # An explorer with no Tier floors axis while the bar offers a
@@ -6244,8 +6521,9 @@ class TestFilterSummary:
                          "T.mix_note", "D.text.mix_unavailable", "D.text.mix_still_all",
                          "D.text.mix_still", "D.text.mix_still_at", "T.names_join",
                          "T.names_more", "T.sel_none", "T.sel_only", "T.sel_excluded",
-                         "T.sel_narrowed", "T.sel_join", "T.sel_more", "T.menu_cat_none",
-                         "T.menu_cat_every", "T.menu_cat_n",
+                         "T.sel_less", "T.sel_join", "T.sel_more", "T.tag_more", "T.tags_more",
+                         "T.only_more", "T.menu_cat_none",
+                         "T.menu_cat_every", "T.menu_cat_n", "T.menu_tag_none",
                          "T.menu_tag_all", "T.menu_tag_n", "T.cal_title", "T.cal_title_none",
                          "T.cal_bin", "D.text.khat_bar"):
             assert template in js
@@ -6263,7 +6541,9 @@ class TestFilterSummary:
                        "Calibration Curve", "Brier", "LogLoss",
                        # Nor what the ticks leave out, keep or narrow
                        "Exclude categories:", "every category excluded", "Showing no trades",
-                       "every category is excluded", "narrowed to", "the whole run",
+                       "nothing is left after the exclusions", "narrowed to",
+                       "with tags excluded", "more tag", "except some tags",
+                       "the whole run",
                        "the run with"):
             assert phrase not in js, phrase
 
@@ -6426,7 +6706,7 @@ def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
             another script would call it — ["click", id] — a reader clicking
             that element, its click listeners run unless it is disabled —
             ["tick", id] — a reader clicking a check box of the Exclude
-            categories or Tag menu (_tick_category, _tick_tag) — ["open",
+            categories or Exclude tags menu (_tick_category, _tick_tag) — ["open",
             id], ["outside", id] and ["key", name] — a reader opening a
             menu, clicking elsewhere on the page and pressing a key — and
             ["snap", name];
@@ -6564,7 +6844,7 @@ def _clear_menus() -> list:
 
 
 def _tick_tag(index) -> list:
-    """The step of a reader clicking one box of the Tag menu: that tag's (its
+    """The step of a reader clicking one box of the Exclude tags menu: that tag's (its
     index in the base block's subcats), or with "" its "All tags" box."""
     return ["tick", "flt-tag-all" if index == "" else f"flt-tag-{index}"]
 
@@ -6660,41 +6940,45 @@ class TestFilterScript:
         assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
             data["text"], _phrase(data, 1, 1, 0), False, None, n, n)
 
-    def test_a_tag_ticked_narrows_its_own_category_and_ticks_no_category(
+    def test_a_tag_ticked_leaves_out_its_trades_and_ticks_no_category(
             self, monkeypatch, tmp_path):
         page = self._page(monkeypatch, tmp_path)
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
         sports = data["categories"].index("Sports")
         hockey = data["subcats"].index([sports, "Hockey"])
+        basketball = data["subcats"].index([sports, "Basketball"])
         others = ",".join(str(c) for c in range(len(data["categories"])) if c != sports)
         snaps = _run_script(tmp_path, page, [
-            ["wait"], _tick_tag(str(hockey)), ["settle"], ["snap", "narrowed"],
-            # ... and with every other category left out, the tag alone
+            ["wait"], _tick_tag(str(hockey)), ["settle"], ["snap", "less"],
+            # ... and with every other category left out: Sports except Hockey alone
             *_clear_menus(), *_keep_categories(sports), _tick_tag(str(hockey)), ["settle"],
             ["snap", "alone"]])
-        # Sports narrowed to Hockey, every other category in full: no category
+        # Sports except Hockey, every other category in full: no category
         # ticked, every tag listed with its category, and a mix
-        snap = snaps["narrowed"]
+        snap = snaps["less"]
         assert snap["selects"]["flt-cat"]["value"] == ""
         assert snap["selects"]["flt-tag"]["value"] == str(hockey)
+        assert snap["menus"]["flt-tag"]["label"] == "Sports · Hockey"
+        assert not snap["menus"]["flt-tag"]["all"]
         assert [text for _, text in snap["selects"]["flt-tag"]["options"]] == [
             "All tags", "Commodities · Oil & Gas (1)", "Other · General (1)",
             "Science · General (0)", "Sports · Basketball (2)", "Sports · Hockey (1)"]
         assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
-            data["text"], _phrase(data, *_FLT_PRIMARY), True, "Sports narrowed to Hockey",
-            3, 5, mix=True)
-        assert snap["text"]["hdr-trades"] == snap["text"]["kpi-trades"] == "3"
+            data["text"], _phrase(data, *_FLT_PRIMARY), True, "Sports except Hockey",
+            4, 5, mix=True)
+        assert snap["text"]["hdr-trades"] == snap["text"]["kpi-trades"] == "4"
         snap = snaps["alone"]
         assert snap["selects"]["flt-cat"]["value"] == others
         assert snap["selects"]["flt-tag"]["value"] == str(hockey)
         assert [text for _, text in snap["selects"]["flt-tag"]["options"]] == [
             "All tags", "Basketball (2)", "Hockey (1)"]
         assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
-            data["text"], _phrase(data, *_FLT_PRIMARY), True, "only Sports · Hockey", 1, 5)
-        assert snap["text"]["hdr-trades"] == snap["text"]["kpi-trades"] == "1"
+            data["text"], _phrase(data, *_FLT_PRIMARY), True, "only Sports except Hockey",
+            2, 5)
+        assert snap["text"]["hdr-trades"] == snap["text"]["kpi-trades"] == "2"
         # The row-dependent chart's height lands on both boxes, whichever one
         # the page's plotly.py wrote it on
-        h = _view(data, chunks, *_FLT_PRIMARY, f"s{hockey}")["sub"]["h"]
+        h = _view(data, chunks, *_FLT_PRIMARY, f"s{basketball}")["sub"]["h"]
         assert snap["heights"]["dec-sub"] == snap["ownHeights"]["dec-sub"] == f"{h}px"
 
     def test_a_band_without_the_selection_shows_no_trades(self, monkeypatch, tmp_path):
@@ -6769,9 +7053,11 @@ class TestFilterScript:
         page = self._page(monkeypatch, tmp_path)
         data = TestFilterPage._data(page)
         sports = data["categories"].index("Sports")
-        hockey = str(data["subcats"].index([sports, "Hockey"]))
+        basketball = str(data["subcats"].index([sports, "Basketball"]))
+        # Sports alone, less Basketball: its tags under its own total, the
+        # one kept (Hockey; Basketball has no k-hat entry) marked
         snap = _run_script(tmp_path, page, [
-            ["wait"], *_keep_categories(sports), _tick_tag(hockey), ["settle"],
+            ["wait"], *_keep_categories(sports), _tick_tag(basketball), ["settle"],
             ["set", "khat-group", "tag"], ["fire", "khat-group"], ["snap", "s"]])["s"]
         react = _last_react(snap, "khat-fig")
         colors = data["styles"]["khat"]
@@ -7721,17 +8007,17 @@ class TestFilterKAndCap:
             series_categories=_FLT_SERIES).read_text(encoding="utf-8")
         data = TestFilterPage._data(page)
         sports = data["categories"].index("Sports")
-        hockey = str(data["subcats"].index([sports, "Hockey"]))
+        basketball = str(data["subcats"].index([sports, "Basketball"]))
         snap = _run_script(tmp_path, page, [
-            ["wait"], *_keep_categories(sports), _tick_tag(hockey), ["settle"],
+            ["wait"], *_keep_categories(sports), _tick_tag(basketball), ["settle"],
             ["set", "khat-group", "band"], ["fire", "khat-group"],
             ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "s"]],
             strict=True)["s"]
         assert not any(snap["selects"][i]["disabled"] for i in _FLT_SELECTS)
         assert snap["text"]["hdr-trades"] == "1"
         assert snap["text"]["flt-summary"].startswith(
-            "Showing the run with only Sports · Hockey at the primary spread band (not "
-            "recorded), k = 0.75, cap not recorded: 1 of its 5 trades.")
+            "Showing the run with only Sports except Basketball at the primary spread band "
+            "(not recorded), k = 0.75, cap not recorded: 1 of its 5 trades.")
 
 
 # ─── The filter bar's "Save as live defaults…" button ────────────────────────
@@ -7890,7 +8176,7 @@ class TestSaveLiveDefaultsButton:
         assert f'title="{html.escape(dashboard._SAVE_TITLE)}"' in button.group(1)
         assert _page_elements(page)["buttons"] == {"flt-save": {"disabled": True}}
         assert html.escape(dashboard._SAVE_NOTE) in page
-        # After the Tag select, before the summary line
+        # After the Exclude tags menu, before the summary line
         assert page.index('id="flt-tag"') < page.index('id="flt-save"') \
             < page.index('id="flt-summary"')
         data = TestFilterPage._data(page)
@@ -7958,8 +8244,8 @@ class TestSaveLiveDefaultsButton:
             _tick_category(sports), ["settle"],
             ["click", "flt-save"], ["snap", "category"],
             *_clear_menus(), ["settle"],
-            # A "Category · Tag" ticked with nothing ticked narrows its
-            # category and ticks no category
+            # A "Category · Tag" ticked with nothing else ticked leaves out
+            # that tag and ticks no category
             _tick_tag(basketball), ["settle"],
             ["click", "flt-save"], ["snap", "tag"],
             # "All categories" with a tag ticked leaves out every category
@@ -9363,8 +9649,8 @@ def _kd_table(page: str) -> tuple[list, list]:
 
 class TestKhatCards:
     """The Portfolio Performance section's two k-hat cards: the empirical
-    k-hat of the band and of what the bar shows (the categories it does not
-    exclude, narrowed to any tags ticked), and it minus the k selected —
+    k-hat of the band and of what the bar shows (the categories and tags it
+    does not exclude), and it minus the k selected —
     rendered for the primary view from the primary calibration itself,
     rewritten by the script from the k-hat breakdown's own groups."""
 
@@ -9823,8 +10109,8 @@ class TestKhatConfidenceInterval:
         page = _mix_page(monkeypatch, tmp_path, trades, observations=observations)
         data = TestFilterPage._data(page)
         cat0 = [i for i, (name, _) in enumerate(_MIX_SUBCATS) if name == "Cat0"]
-        cases = {"mix": ([0, 1], [cat0[0], cat0[2]]), "two_whole": ([1, 2], []),
-                 "category": ([2], []), "tag": ([0], [cat0[1]])}
+        cases = {"mix": _ticks_keeping([0, 1], [cat0[0], cat0[2]]), "two_whole": ([1, 2], []),
+                 "category": ([2], []), "tag": _ticks_keeping([0], [cat0[1]])}
         steps = [["wait"]]
         for name, (cats, tags) in cases.items():
             steps += _mix_tick_steps(cats, tags, name)
@@ -9894,7 +10180,8 @@ class TestKhatConfidenceInterval:
         data = TestFilterPage._data(page)
         groups = data["khat"][0]["groups"]
         assert "ci_raw" not in groups[dropped] and "ci_raw" in groups[f"s{cat0[1]}"]
-        cases = {"with": ([0, 1], [cat0[0], cat0[2]]), "without": ([0, 1], [cat0[1], cat0[2]])}
+        cases = {"with": _ticks_keeping([0, 1], [cat0[0], cat0[2]]),
+                 "without": _ticks_keeping([0, 1], [cat0[1], cat0[2]])}
         steps = [["wait"]]
         for name, (cats, tags) in cases.items():
             steps += _mix_tick_steps(cats, tags, name)
@@ -12620,7 +12907,7 @@ class TestRebalanceSelect:
         ids = re.findall(r'<select id="(flt-[a-z]+)"', page)
         assert ids == ["flt-band", "flt-tier", "flt-k", "flt-cap", "flt-rebalance", "flt-move",
                        "flt-sell", "flt-days"]
-        # ... and before the Exclude categories and Tag menus
+        # ... and before the Exclude categories and Exclude tags menus
         bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
         assert (bar.index('id="flt-cap"') < bar.index('id="flt-rebalance"')
                 < bar.index('id="flt-cat"') < bar.index('id="flt-tag"'))
@@ -15955,7 +16242,7 @@ class TestFilterPageSize:
     variant re-measured 2026-10-10 (same environment), in the constants
     below — the pages at cost end 5.6% to 7.2% above the page before the mix
     data, and the pages valued at market, whose curves move daily, 4.9% and
-    6.0% BELOW it. The check-box Exclude categories and Tag menus and the
+    6.0% BELOW it. The check-box Exclude categories and Exclude tags menus and the
     script that works a mix out are about 34 KB of every variant, whatever
     its data.
 
@@ -17789,20 +18076,48 @@ def _mix_page(monkeypatch, tmp_path, trades: list[BacktestTrade], *, risk_free=N
 def _mix_tick_sets(seed: int, count: int,
                    series: dict = _MIX_SERIES) -> list[tuple[list[int], list[int]]]:
     """Seeded sets of ticks over a series map: (the indexes of the categories
-    kept, tag indexes), one to three categories kept, each whole or narrowed
-    to some of its tags."""
+    kept, the indexes of the tags ticked, which leaves them out), one to
+    three categories kept, each whole, less some of its tags or less every
+    one of them — but never every tag of every category kept, so each set
+    leaves a trade."""
     rng = random.Random(seed)
     categories, subcats = _mix_axes(series)
     out = []
     for _ in range(count):
         kept_cats = sorted(rng.sample(range(len(categories)), rng.randint(1, 3)))
         tags: list[int] = []
+        full = []
         for c in kept_cats:
             own = [i for i, (name, _) in enumerate(subcats) if name == categories[c]]
             if rng.random() < 0.6:
-                tags += rng.sample(own, rng.randint(1, len(own)))
+                ticked = rng.sample(own, rng.randint(1, len(own)))
+                tags += ticked
+                full.append(len(ticked) == len(own))
+            else:
+                full.append(False)
+        if all(full):
+            # Every tag of every category kept ticked would leave nothing:
+            # the last category keeps its tags
+            last = categories[kept_cats[-1]]
+            tags = [t for t in tags if subcats[t][0] != last]
         out.append((kept_cats, sorted(tags)))
     return out
+
+
+def _ticks_keeping(kept_cats: list[int], keep: list[int], series: dict = _MIX_SERIES
+             ) -> tuple[list[int], list[int]]:
+    """The ticks that leave only the tags in `keep` in their categories:
+    every other tag of such a category is ticked. A category with no tag in
+    `keep` stays whole. The categories given are the ones kept.
+
+    Returns:
+        tuple: (kept_cats, the tag indexes to tick, ascending).
+    """
+    categories, subcats = _mix_axes(series)
+    partial = {subcats[t][0] for t in keep}
+    return list(kept_cats), [si for si, (name, _) in enumerate(subcats)
+                             if name in partial and categories.index(name) in kept_cats
+                             and si not in keep]
 
 
 def _mix_tick_steps(kept_cats: list[int], tags: list[int], name: str) -> list:
@@ -17813,34 +18128,71 @@ def _mix_tick_steps(kept_cats: list[int], tags: list[int], name: str) -> list:
             ["settle"], ["snap", name]]
 
 
+def _with_case_twins(tags: list[int], series: dict = _MIX_SERIES) -> list[int]:
+    """The tags ticked once a box takes its letter-case twins with it: every
+    tag whose category and name, case folded, are those of a tag given,
+    ascending (the page's TAG_TWINS, built from the same fold)."""
+    _, subcats = _mix_axes(series)
+    keys = {(subcats[t][0].casefold(), subcats[t][1].casefold()) for t in tags}
+    return [si for si, (c, t) in enumerate(subcats) if (c.casefold(), t.casefold()) in keys]
+
+
 def _mix_names(kept_cats: list[int], tags: list[int], series: dict = _MIX_SERIES
                ) -> tuple[list[tuple[str, list[str]]], list[str], list[str]]:
     """A set of ticks as _selection_name reads it — each kept category with
     the names of its ticked tags, and the categories left out — and as the
-    live filter reads it: each ticked tag tied to its category.
+    live filter reads it: for each kept category with tags ticked (in it or
+    in a category whose name differs from it only in letter case, which the
+    live filter reads as one), each of its tags NOT ticked, tied to it. The
+    tags ticked are taken with their letter-case twins, as the page ticks
+    them.
 
     Returns:
         tuple: (kept, excluded, tied) — kept: each kept category's name in
-            menu order, with its ticked tags' names in the order given;
-            excluded: the other categories' names, in menu order; tied: each
-            ticked tag as "Category · Tag", in the order given.
+            menu order, with its ticked tags' names in menu order; excluded:
+            the other categories' names, in menu order; tied: each tag of a
+            kept category with ticks that is not ticked, as "Category · Tag",
+            in menu order.
     """
     categories, subcats = _mix_axes(series)
-    kept = [(categories[c], [subcats[t][1] for t in tags if subcats[t][0] == categories[c]])
+    closed = _with_case_twins(tags, series)
+    kept = [(categories[c], [subcats[t][1] for t in closed if subcats[t][0] == categories[c]])
             for c in sorted(kept_cats)]
     excluded = [name for c, name in enumerate(categories) if c not in kept_cats]
-    tied = [config.TAG_SCOPE_SEPARATOR.join(subcats[t]) for t in tags]
+    names = {name for name, _ in kept}
+    groups = {subcats[t][0].casefold() for t in closed}
+    tied = [config.TAG_SCOPE_SEPARATOR.join(pair) for si, pair in enumerate(subcats)
+            if pair[0] in names and pair[0].casefold() in groups and si not in closed]
     return kept, excluded, tied
+
+
+def _mix_selection(kept_cats: list[int], tags: list[int], series: dict = _MIX_SERIES,
+                   text: dict | None = None) -> str:
+    """A set of ticks named as Python names it (_selection_name), told how
+    many tags the Exclude tags menu lists for each category, so a category with every
+    one ticked is named as left out."""
+    _, subcats = _mix_axes(series)
+    kept, excluded, _ = _mix_names(kept_cats, tags, series)
+    counts = collections.Counter(name for name, _ in subcats)
+    return dashboard._selection_name(kept, excluded, text, tag_counts=dict(counts))
 
 
 def _mix_kept(kept_cats: list[int], tags: list[int], series: dict = _MIX_SERIES):
     """The live filter's own test for a set of ticks: config.trade_filter_for
-    of the categories kept and each ticked tag tied to its category (the save
-    button sends neither; this is the live rule the menus' ticks follow).
-    Every category left out lists none, which keeps nothing."""
+    of the categories kept and, for each kept category with tags ticked, its
+    tags not ticked, each tied to it (the save button sends neither; this is
+    the live rule the menus' ticks follow). It reads per group of categories
+    whose names differ only in letter case: a group with every tag ticked
+    keeps nothing, so it is not listed; every category left out lists none,
+    which keeps nothing."""
     kept, _, tied = _mix_names(kept_cats, tags, series)
+    _, subcats = _mix_axes(series)
+    groups = {subcats[t][0].casefold() for t in _with_case_twins(tags, series)}
+    left = {config.split_tag(t)[0].casefold() for t in tied}
+    listed = tuple(name for name, _ in kept
+                   if name.casefold() not in groups or name.casefold() in left)
     # The live rule itself, on exactly these categories and tags
-    return config.trade_filter_for(tuple(name for name, _ in kept), tuple(tied) or None)
+    return config.trade_filter_for(listed, tuple(tied) or None)
 
 
 def _khat_marked(snap: dict, colors: dict) -> list[str]:
@@ -17866,14 +18218,14 @@ def _mix_summary(data: dict, kept_cats: list[int], tags: list[int], n: int, n_al
     category left out, else the selection the ticks name (_selection_name),
     noting a mix when the page combined it itself."""
     phrase = _phrase(data, *scenario)
-    kept, excluded, _ = _mix_names(kept_cats, tags, series)
+    _, excluded, _ = _mix_names(kept_cats, tags, series)
     if not excluded and not tags:
         return dashboard._filter_summary_text(data["text"], phrase, True, None, n_all, n_all)
-    if not kept:
+    if not _mix_covered(kept_cats, tags, series):
         return dashboard._filter_summary_text(data["text"], phrase, True, None, 0, n_all,
                                               none_kept=True)
     return dashboard._filter_summary_text(
-        data["text"], phrase, True, dashboard._selection_name(kept, excluded, data["text"]),
+        data["text"], phrase, True, _mix_selection(kept_cats, tags, series, data["text"]),
         n, n_all, mix=mix)
 
 
@@ -18084,20 +18436,24 @@ def _counted_trades(series: dict) -> list[BacktestTrade]:
 
 def _mix_covered(kept_cats: list[int], tags: list[int],
                  series: dict = _MIX_SERIES) -> list[int]:
-    """The tag indexes a set of ticks covers, by the rule the menus state: per
-    category kept its ticked tags, or every one of its tags."""
+    """The tag indexes a set of ticks covers, by the rule the menus state:
+    every tag of each category kept that is not ticked (a tag's letter-case
+    twins ticked with it)."""
     categories, subcats = _mix_axes(series)
+    closed = _with_case_twins(tags, series)
     return [si for si, (name, _) in enumerate(subcats)
-            if categories.index(name) in kept_cats
-            and (si in tags or not any(subcats[t][0] == name for t in tags))]
+            if categories.index(name) in kept_cats and si not in closed]
 
 
 class TestMixedSelection:
     """
-    The Exclude categories and Tag menus are check-box dropdowns: a ticked
-    category is left out, and a category kept counts in full unless some of
-    its tags are ticked, then only those (the live filter's rule over the
-    categories kept, config.trade_filter_for). A set of ticks that is one of
+    The Exclude categories and Exclude tags menus are check-box dropdowns: a
+    ticked category is left out, and so is a ticked tag, in its own category,
+    every other tag counting in full. That is the live filter's rule
+    (config.trade_filter_for) read per group of categories whose names differ
+    only in letter case: every group not excluded is listed unless every tag
+    of the group is ticked, and a listed group with tags ticked has every tag
+    of the group not ticked listed, tied to the group. A set of ticks that is one of
     Python's views draws that view; any other is a mix, which the page's
     script works out itself from the tags' views. These tests hold a mix to
     what Python computes for the same trades, part by part, on several
@@ -18217,13 +18573,15 @@ class TestMixedSelection:
         steps = [["wait"]]
         for si, (category, _) in enumerate(_MIX_SUBCATS):
             assert "m" in lst["views"][f"s{si}"]
-            steps += _mix_tick_steps([_MIX_CATEGORIES.index(category)], [si], f"tag{si}")
+            steps += _mix_tick_steps(*_ticks_keeping([_MIX_CATEGORIES.index(category)], [si]),
+                                     f"tag{si}")
         snaps = _run_script(tmp_path, page, steps, strict=True)
         exact = {"abs": 1e-9}
         several = 0
         for si, (category, _) in enumerate(_MIX_SUBCATS):
             snap = snaps[f"tag{si}"]
-            ref = _mix_reference(data, trades, [_MIX_CATEGORIES.index(category)], [si],
+            ref = _mix_reference(data, trades,
+                                 *_ticks_keeping([_MIX_CATEGORIES.index(category)], [si]),
                                  risk_free=rates, balance=balance)
             view = ref["view"]
             assert view["n"] == lst["views"][f"s{si}"]["n"] > 0
@@ -18293,7 +18651,7 @@ class TestMixedSelection:
         assert "m" not in view and all(k in view for k in dashboard._MIX_CURVE_SERIES)
         own = _MIX_CATEGORIES.index(_MIX_SUBCATS[si][0])
         snap = _run_script(tmp_path, page, [
-            ["wait"], *_keep_categories(own), _tick_tag(si), ["settle"], ["snap", "tag"]],
+            ["wait"], *_mix_tick_steps(*_ticks_keeping([own], [si]), "tag")],
             strict=True)["tag"]
         perf = _last_react(snap, "perf-cum")["data"]
         assert perf[0]["y"] == _expand(view["total"], n)
@@ -18305,20 +18663,22 @@ class TestMixedSelection:
     @pytest.mark.parametrize("quoted", [False, True], ids=["at-cost", "at-market"])
     def test_a_selection_python_has_a_view_of_is_drawn_alike_by_the_mix(
             self, monkeypatch, tmp_path, quoted):
-        # One category, one tag, every tag of a category and every tag of
-        # every category: each is one of Python's own views, which the page
-        # draws as it stands. Sent through the mix instead, the drawing is
-        # the same. Every category kept with no tag ticked is nothing ticked:
-        # the whole run, never a mix
+        # One category, one tag (every other tag of its category ticked),
+        # one category with every tag of another ticked, and every tag of two
+        # categories ticked: each leaves one of Python's own views, which the
+        # page draws as it stands. Sent through the mix instead, the drawing
+        # is the same. Every category kept with no tag ticked is nothing
+        # ticked: the whole run, never a mix
         trades = _mix_trades(31, n=44, quoted=quoted)
         page = _mix_page(monkeypatch, tmp_path, trades, risk_free=_rates())
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
         views = chunks[0]["list"]["views"]
         own = [i for i, (name, _) in enumerate(_MIX_SUBCATS) if name == _MIX_CATEGORIES[0]]
+        own1 = [i for i, (name, _) in enumerate(_MIX_SUBCATS) if name == _MIX_CATEGORIES[1]]
         every = list(range(len(_MIX_CATEGORIES)))
-        cases = {"category": ([1], []), "tag": ([0], [own[1]]), "every_tag": ([0], own),
-                 "every_category": (every, []),
-                 "every_tag_of_every_category": (every, list(range(len(_MIX_SUBCATS))))}
+        cases = {"category": ([1], []), "tag": _ticks_keeping([0], [own[1]]),
+                 "every_tag_of_one": ([0, 1], own), "every_category": (every, []),
+                 "every_tag_of_two": (every, sorted(own + own1))}
         steps = [["wait"]]
         for name, (cats, tags) in cases.items():
             steps += _mix_tick_steps(cats, tags, name)
@@ -18326,8 +18686,8 @@ class TestMixedSelection:
         mixed = _run_script(tmp_path, page, steps, strict=True, setup_js=_FORCE_MIX)
         note = data["text"]["mix_note"]
         expected = {"category": views["c1"], "tag": views[f"s{own[1]}"],
-                    "every_tag": views["c0"], "every_category": views["all"],
-                    "every_tag_of_every_category": views["all"]}
+                    "every_tag_of_one": views["c1"], "every_category": views["all"],
+                    "every_tag_of_two": views["c2"]}
         for name in cases:
             _assert_same_drawing(plain[name], mixed[name])
             # The page's own drawing is Python's view; only the mix says it combined
@@ -18348,16 +18708,17 @@ class TestMixedSelection:
         cat1 = [i for i, (name, _) in enumerate(_MIX_SUBCATS) if name == "Cat1"]
         snaps = _run_script(tmp_path, page, [
             ["snap", "loaded"], ["wait"], ["snap", "ready"],
-            # A tag ticked narrows its own category, and ticks no category
+            # A tag ticked leaves out its trades in its own category, and
+            # ticks no category
             _tick_tag(cat0[1]), ["settle"], ["snap", "tag"],
             # A category left out
             _tick_category(2), ["settle"], ["snap", "two"],
             # ... a tag of the other category kept, then a second tag of the first
-            _tick_tag(cat1[0]), _tick_tag(cat0[2]), ["settle"], ["snap", "narrowed"],
+            _tick_tag(cat1[0]), _tick_tag(cat0[2]), ["settle"], ["snap", "less"],
             # Leaving a category out unticks its tags: one category kept
             _tick_category(0), ["settle"], ["snap", "dropped"],
-            # The Tag menu's "All" box ticks every tag it shows: the category whole
-            _tick_tag(""), ["settle"], ["snap", "tags_cleared"],
+            # The Exclude tags menu's "All" box ticks every tag it shows: nothing left
+            _tick_tag(""), ["settle"], ["snap", "every_tag"],
             # Clicked again with every tag ticked, it unticks them: whole again
             _tick_tag(""), ["settle"], ["snap", "again"],
             # The Exclude categories menu's "All" box, with some left out,
@@ -18368,9 +18729,8 @@ class TestMixedSelection:
             strict=True, pre=(("flt-cat", "0,2"), ("flt-tag", "1")))
         loaded, ready = snaps["loaded"], snaps["ready"]
         # A browser's restored ticks are cleared before anything is enabled:
-        # no category left out ("All categories" unticked), every tag ("All
-        # tags" ticked)
-        for menu, words, all_box in (("flt-cat", "None", False), ("flt-tag", "All tags", True)):
+        # no category and no tag left out (both "All" boxes unticked)
+        for menu, words, all_box in (("flt-cat", "None", False), ("flt-tag", "None", False)):
             assert loaded["menus"][menu]["ticked"] == []
             assert loaded["menus"][menu]["all"] is all_box
             assert loaded["menus"][menu]["disabled"] and all(loaded["menus"][menu]["boxesDisabled"])
@@ -18403,55 +18763,57 @@ class TestMixedSelection:
         assert shown_tags(tag) == everything
         assert tag_rows(tag, everything) == [f"{tied[i]} ({n[f's{i}']})" for i in everything]
         assert not tag["menus"]["flt-cat"]["all"] and not tag["menus"]["flt-tag"]["all"]
-        # Cat0 narrowed to its one tag, Cat1 and Cat2 whole: a mix, in the
-        # page's words
-        covered = n[f"s{cat0[1]}"] + n["c1"] + n["c2"]
+        # Cat0 less that tag, Cat1 and Cat2 whole: a mix, in the page's words
+        covered = n["all"] - n[f"s{cat0[1]}"]
         assert tag["text"]["hdr-trades"] == str(covered)
         assert tag["text"]["flt-summary"] == dashboard._filter_summary_text(
-            data["text"], phrase, True, f"Cat0 narrowed to {_MIX_SUBCATS[cat0[1]][1]}",
+            data["text"], phrase, True, f"Cat0 except {_MIX_SUBCATS[cat0[1]][1]}",
             covered, n["all"], mix=True)
         two = snaps["two"]
         assert state(two) == ([2], [cat0[1]], "Cat2", tied[cat0[1]])
         # Cat2 left out: its tags are no longer listed
         assert shown_tags(two) == cat0 + cat1
-        covered = n[f"s{cat0[1]}"] + n["c1"]
+        covered = n["c0"] - n[f"s{cat0[1]}"] + n["c1"]
         assert two["text"]["hdr-trades"] == str(covered)
         assert two["text"]["flt-summary"] == dashboard._filter_summary_text(
             data["text"], phrase, True,
-            f"Cat2 excluded; Cat0 narrowed to {_MIX_SUBCATS[cat0[1]][1]}",
+            f"Cat2 excluded; Cat0 except {_MIX_SUBCATS[cat0[1]][1]}",
             covered, n["all"], mix=True)
-        narrowed = snaps["narrowed"]
-        assert state(narrowed) == ([2], sorted([cat0[1], cat0[2], cat1[0]]), "Cat2", "3 tags")
-        assert narrowed["text"]["hdr-trades"] == str(
-            n[f"s{cat0[1]}"] + n[f"s{cat0[2]}"] + n[f"s{cat1[0]}"])
+        less = snaps["less"]
+        assert state(less) == ([2], sorted([cat0[1], cat0[2], cat1[0]]), "Cat2", "3 tags")
+        assert less["text"]["hdr-trades"] == str(n[f"s{cat0[0]}"] + n[f"s{cat1[1]}"])
         dropped = snaps["dropped"]
         assert state(dropped) == ([0, 2], [cat1[0]], "2 categories", _MIX_SUBCATS[cat1[0]][1])
         # One category kept: its tags alone are listed, by their own names
         assert shown_tags(dropped) == cat1
         assert tag_rows(dropped, cat1) == [f"{_MIX_SUBCATS[i][1]} ({n[f's{i}']})" for i in cat1]
-        # One tag alone is Python's own view of it: no word of a mix
+        # One tag left is Python's own view of it: no word of a mix
         assert dropped["text"]["flt-summary"] == dashboard._filter_summary_text(
-            data["text"], phrase, True, f"only {tied[cat1[0]]}", n[f"s{cat1[0]}"], n["all"])
-        cleared = snaps["tags_cleared"]
-        assert state(cleared) == ([0, 2], cat1, "2 categories", f"{len(cat1)} tags")
-        assert cleared["menus"]["flt-tag"]["all"] and cleared["reacts"]
-        assert cleared["text"]["hdr-trades"] == str(n["c1"])
+            data["text"], phrase, True, f"only Cat1 except {_MIX_SUBCATS[cat1[0]][1]}",
+            n[f"s{cat1[1]}"], n["all"])
+        # "All tags" ticks every tag shown: nothing left, said so
+        every_tag = snaps["every_tag"]
+        assert state(every_tag) == ([0, 2], cat1, "2 categories", "All tags")
+        assert every_tag["menus"]["flt-tag"]["all"] and every_tag["reacts"]
+        assert every_tag["text"]["hdr-trades"] == "0"
+        assert every_tag["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], phrase, True, None, 0, n["all"], none_kept=True)
         again = snaps["again"]
-        assert state(again) == ([0, 2], [], "2 categories", "All tags")
-        assert again["menus"]["flt-tag"]["all"]
+        assert state(again) == ([0, 2], [], "2 categories", "None")
+        assert not again["menus"]["flt-tag"]["all"]
         assert again["text"]["hdr-trades"] == str(n["c1"])
         none = snaps["none"]
         assert state(none) == (list(range(len(data["categories"]))), [],
-                               "All categories", "All tags")
-        assert none["menus"]["flt-cat"]["all"] and none["menus"]["flt-tag"]["all"]
+                               "All categories", "None")
+        assert none["menus"]["flt-cat"]["all"] and not none["menus"]["flt-tag"]["all"]
         assert shown_tags(none) == []
         # Every category left out: no trade, said so
         assert none["text"]["hdr-trades"] == "0"
         assert none["text"]["flt-summary"] == dashboard._filter_summary_text(
             data["text"], phrase, True, None, 0, n["all"], none_kept=True)
         back = snaps["back"]
-        assert state(back) == ([], [], "None", "All tags")
-        assert not back["menus"]["flt-cat"]["all"] and back["menus"]["flt-tag"]["all"]
+        assert state(back) == ([], [], "None", "None")
+        assert not back["menus"]["flt-cat"]["all"] and not back["menus"]["flt-tag"]["all"]
         assert shown_tags(back) == everything
         assert back["text"]["hdr-trades"] == str(n["all"])
         assert html.escape(back["text"]["flt-summary"]) in page
@@ -18475,9 +18837,10 @@ class TestMixedSelection:
             _tick_category(1), ["settle"], ["snap", "all_again"],
             # Clicked with every category left out, it lets them all back in
             _tick_category(""), ["settle"], ["snap", "none"],
-            # "All tags" with one category kept ticks every tag it shows
+            # "All tags" with one category kept ticks every tag it shows,
+            # leaving nothing
             *_keep_categories(0), _tick_tag(""), ["settle"], ["snap", "tags"],
-            # Unticking one tag unticks "All tags" and narrows the category
+            # Unticking one tag unticks "All tags" and lets that tag back in
             _tick_tag(cat0[0]), ["settle"], ["snap", "tag_out"]], strict=True)
 
         def menu(snap, which) -> tuple:
@@ -18497,26 +18860,26 @@ class TestMixedSelection:
         assert menu(snaps["none"], "flt-cat") == ([], False, "None")
         assert snaps["none"]["text"]["hdr-trades"] == str(n["all"])
         assert menu(snaps["tags"], "flt-cat") == ([1, 2], False, "2 categories")
-        assert menu(snaps["tags"], "flt-tag")[:2] == (cat0, True)
-        assert snaps["tags"]["text"]["hdr-trades"] == str(n["c0"])
+        assert menu(snaps["tags"], "flt-tag") == (cat0, True, "All tags")
+        assert snaps["tags"]["text"]["hdr-trades"] == "0"
         ticked, all_box, _ = menu(snaps["tag_out"], "flt-tag")
         assert ticked == cat0[1:] and not all_box
-        assert snaps["tag_out"]["text"]["hdr-trades"] == str(n["c0"] - n[f"s{cat0[0]}"])
+        assert snaps["tag_out"]["text"]["hdr-trades"] == str(n[f"s{cat0[0]}"])
 
     def test_more_than_three_names_are_counted_not_listed(self, monkeypatch, tmp_path):
-        # Five categories of four tags each
-        series = {f"KXQ{i:02d}": (f"Cat{i % 5}", (f"Tag{i:02d}",)) for i in range(20)}
-        trades = _mix_trades(42, n=80, series=series)
+        # Five categories of five tags each
+        series = {f"KXQ{i:02d}": (f"Cat{i % 5}", (f"Tag{i:02d}",)) for i in range(25)}
+        trades = _mix_trades(42, n=100, series=series)
         page = _mix_page(monkeypatch, tmp_path, trades, series=series)
         data = TestFilterPage._data(page)
         _, pairs = _mix_axes(series)
         own = {c: [i for i, (name, _) in enumerate(pairs) if name == f"Cat{c}"]
                for c in range(5)}
-        # Two categories kept of five, one narrowed to three of its tags: the
-        # kept ones are named, four names in all; then nothing left out and
-        # four categories narrowed to a tag each: four parts
-        cases = {"kept": ([3, 4], own[3][:3]), "narrowed": (list(range(5)),
-                                                             [own[c][0] for c in range(4)])}
+        # Two categories kept of five, one less four of its tags: the kept
+        # ones are named, the four tags cut to three and how many more; then
+        # nothing left out and four categories less a tag each: four parts
+        cases = {"kept": ([3, 4], own[3][:4]), "less": (list(range(5)),
+                                                        [own[c][0] for c in range(4)])}
         steps = [["wait"]]
         for name, (cats, tags) in cases.items():
             steps += _mix_tick_steps(cats, tags, name)
@@ -18528,16 +18891,16 @@ class TestMixedSelection:
                 data, cats, tags, ref["view"]["n"], n_all, mix=True, series=series)
             assert snaps[name]["text"]["hdr-trades"] == str(ref["view"]["n"])
         tag = {i: pairs[i][1] for i in range(len(pairs))}
-        assert dashboard._selection_name(*_mix_names(*cases["kept"], series)[:2]) == (
-            f"only Cat3 · {tag[own[3][0]]}, Cat3 · {tag[own[3][1]]}, "
-            f"Cat3 · {tag[own[3][2]]}, +1 more")
-        assert dashboard._selection_name(*_mix_names(*cases["narrowed"], series)[:2]) == "; ".join(
-            [*(f"Cat{c} narrowed to {tag[own[c][0]]}" for c in range(3)),
-             "and 1 more narrowed"])
+        assert _mix_selection(*cases["kept"], series) == (
+            f"only Cat3 except {tag[own[3][0]]}, {tag[own[3][1]]}, {tag[own[3][2]]} "
+            "and 1 more tag; Cat4")
+        assert _mix_selection(*cases["less"], series) == "; ".join(
+            [*(f"Cat{c} except {tag[own[c][0]]}" for c in range(3)),
+             "and 1 more with tags excluded"])
         assert snaps["kept"]["menus"]["flt-cat"]["label"] == "3 categories"
-        assert snaps["kept"]["menus"]["flt-tag"]["label"] == "3 tags"
-        assert snaps["narrowed"]["menus"]["flt-cat"]["label"] == "None"
-        assert snaps["narrowed"]["menus"]["flt-tag"]["label"] == "4 tags"
+        assert snaps["kept"]["menus"]["flt-tag"]["label"] == "4 tags"
+        assert snaps["less"]["menus"]["flt-cat"]["label"] == "None"
+        assert snaps["less"]["menus"]["flt-tag"]["label"] == "4 tags"
 
     # The categories and tags of the boundary test's runs (the tag at index i
     # of _mix_axes' pairs holds 2**i trades), and each run's cases: name ->
@@ -18550,7 +18913,7 @@ class TestMixedSelection:
         "four_categories": (BOUNDARY_FOUR, {
             # Two kept of four, two left out: as many as are left out
             "two_of_four": ([0, 3], [], "only Arts, Sports", True),
-            "two_with_a_tag": ([2, 3], [("Sports", "Golf")], "only Health, Sports · Golf",
+            "two_with_a_tag": ([2, 3], [("Sports", "Golf")], "only Health; Sports except Golf",
                                True),
             # Three kept of four, one left out
             "three_of_four": ([0, 2, 3], [], "Crypto excluded", False)}),
@@ -18688,7 +19051,7 @@ class TestMixedSelection:
             ["wait"], *_keep_categories(1), ["settle"], ["snap", "one"],
             # Cat2 let back in: Cat1 and Cat2 together are a mix
             _tick_category(2), ["settle"], ["snap", "refused"],
-            # One tag is still Python's own view
+            # One tag left is still Python's own view
             _tick_tag(cat1[0]), ["settle"], ["snap", "tag"]],
             strict=True)
         one, refused = snaps["one"], snaps["refused"]
@@ -18710,7 +19073,8 @@ class TestMixedSelection:
         # Cat0 and Cat2 are still left out, so the button stays shut and says why
         assert refused["buttons"]["flt-save"]
         assert refused["titles"]["flt-save"] == data["text"]["save_filtered"]
-        assert snaps["tag"]["text"]["hdr-trades"] == str(views[f"s{cat1[0]}"]["n"])
+        assert len(cat1) == 2
+        assert snaps["tag"]["text"]["hdr-trades"] == str(views[f"s{cat1[1]}"]["n"])
         assert snaps["tag"]["menus"]["flt-tag"]["ticked"] == [cat1[0]]
 
     def test_a_mix_refused_with_nothing_ticked_says_the_whole_run_is_still_shown(
@@ -18740,43 +19104,43 @@ class TestMixedSelection:
         assert refused["text"].get("hdr-trades", rendered.group(1)) == str(views["all"]["n"])
 
     def test_a_refused_mix_puts_the_tag_ticks_back(self, monkeypatch, tmp_path):
-        # With Cat0 alone kept, one of its three tags ticked is Python's own
-        # view of that tag; a second one ticked asks for two tags of three, a
-        # mix this list cannot give. The second tag is unticked again: the
-        # Tag menu goes back to the tag still shown, as the category menu
-        # goes back to its ticks
+        # With Cat0 alone kept and two of its three tags ticked, the one tag
+        # left is Python's own view of it; unticking one of the two asks for
+        # two tags of three, a mix this list cannot give. That tag is ticked
+        # again: the Exclude tags menu goes back to the ticks still shown, as the
+        # category menu goes back to its ticks
         page = self._unmixable_page(monkeypatch, tmp_path)
         data = TestFilterPage._data(page)
         views = TestFilterPage._chunks(page)[0]["list"]["views"]
         cat0 = [i for i, (name, _) in enumerate(_MIX_SUBCATS) if name == "Cat0"]
         assert len(cat0) == 3
         snaps = _run_script(tmp_path, page, [
-            ["wait"], *_keep_categories(0), _tick_tag(cat0[0]), ["settle"], ["snap", "tag"],
+            ["wait"], *_keep_categories(0), ["set", "flt-tag", f"{cat0[0]},{cat0[1]}"],
+            ["fire", "flt-tag"], ["settle"], ["snap", "tag"],
             _tick_tag(cat0[1]), ["settle"], ["snap", "refused"]], strict=True)
         tag, refused = snaps["tag"], snaps["refused"]
-        assert tag["menus"]["flt-tag"]["ticked"] == [cat0[0]] and tag["reacts"]
-        assert tag["text"]["hdr-trades"] == str(views[f"s{cat0[0]}"]["n"])
+        assert tag["menus"]["flt-tag"]["ticked"] == cat0[:2] and tag["reacts"]
+        assert tag["text"]["hdr-trades"] == str(views[f"s{cat0[2]}"]["n"])
         assert refused["reacts"] == []
-        assert refused["menus"]["flt-tag"]["ticked"] == [cat0[0]]
-        # One category kept: the tag reads as its own name
-        assert refused["menus"]["flt-tag"]["label"] == _MIX_SUBCATS[cat0[0]][1]
+        assert refused["menus"]["flt-tag"]["ticked"] == cat0[:2]
+        assert refused["menus"]["flt-tag"]["label"] == "2 tags"
         assert refused["menus"]["flt-tag"]["all"] is False
         assert refused["menus"]["flt-cat"]["ticked"] == [1, 2]
         assert refused["text"]["hdr-trades"] == tag["text"]["hdr-trades"]
-        kept, excluded, _ = _mix_names([0], cat0[:2])
-        tried = dashboard._selection_name(kept, excluded, data["text"])
-        kept, excluded, _ = _mix_names([0], cat0[:1])
-        still = dashboard._selection_name(kept, excluded, data["text"])
-        assert still == f"only Cat0{config.TAG_SCOPE_SEPARATOR}{_MIX_SUBCATS[cat0[0]][1]}"
+        tried = _mix_selection([0], cat0[:1], text=data["text"])
+        still = _mix_selection([0], cat0[:2], text=data["text"])
+        assert tried == f"only Cat0 except {_MIX_SUBCATS[cat0[0]][1]}"
+        assert still == (f"only Cat0 except {_MIX_SUBCATS[cat0[0]][1]}, "
+                         f"{_MIX_SUBCATS[cat0[1]][1]}")
         assert refused["text"]["flt-summary"] == data["text"]["mix_unavailable"].format(
             selection=tried, failed=_phrase(data, 0, 0, 0),
             shown=data["text"]["mix_still"].format(selection=still), at="")
 
     def test_a_chunk_that_fails_to_load_puts_the_tag_ticks_back(self, monkeypatch, tmp_path):
-        # Sports narrowed to Basketball at the primary scenario; another band
-        # is chosen and Hockey ticked while its chunk loads, and the chunk
-        # cannot be read: the band and the Tag menu go back to what the
-        # sections still show, Basketball alone
+        # Sports less Basketball at the primary scenario; another band is
+        # chosen and Hockey ticked while its chunk loads, and the chunk cannot
+        # be read: the band and the Exclude tags menu go back to what the sections
+        # still show, Basketball alone ticked
         page = TestFilterPage()._page(monkeypatch, tmp_path)
         data = TestFilterPage._data(page)
         other = data["grid"][1][1][0]
@@ -18804,9 +19168,9 @@ class TestMixedSelection:
     def test_the_page_shows_exactly_what_the_live_filter_keeps(self, monkeypatch, tmp_path):
         # The ticks follow the live filter's rule (config.trade_filter_for):
         # for seeded sets of ticks, the trades the page draws are exactly
-        # those of the category · tag pairs a live filter of the categories
-        # kept and the ticked tags, tied to their categories, keeps, over
-        # every pair the page lists. The save button sends no category or
+        # those of the category · tag pairs a live filter keeps that lists
+        # the categories kept and, for each with tags ticked, its tags NOT
+        # ticked, tied to it, over every pair the page lists. The save button sends no category or
         # tag, so it stays shut, saying why, while anything is ticked; with
         # every category kept and no tag nothing is ticked, so the scenario
         # is saved
@@ -18822,19 +19186,19 @@ class TestMixedSelection:
             steps += _mix_tick_steps(cats, tags, f"drawn{i}")[:-1]
             steps += [["click", "flt-save"], ["snap", f"set{i}"]]
         snaps = _run_script(tmp_path, page, steps, strict=True)
-        narrowed = blocked = 0
+        less = blocked = 0
         for i, (cats, tags) in enumerate(sets):
             snap = snaps[f"set{i}"]
             # The live rule itself, on settings holding exactly these ticks
             keeps = _mix_kept(cats, tags)
             kept = [si for si, pair in enumerate(pairs) if keeps(*pair)]
-            # The page's own resolution of the ticks: per ticked category its
-            # ticked tags, or every one of its tags
+            # The page's own resolution of the ticks: every tag of each
+            # category kept that is not ticked
             assert kept == _mix_covered(cats, tags)
             # ... which is what the page drew
             assert snap["text"]["hdr-trades"] == str(
                 sum(views[f"s{si}"]["n"] for si in kept if f"s{si}" in views))
-            narrowed += bool(tags) and len(kept) < len(pairs)
+            less += bool(tags) and len(kept) < len(pairs)
             if len(cats) == len(_MIX_CATEGORIES) and not tags:
                 # Every category kept and no tag: nothing ticked, so the
                 # scenario is saved with no category or tag
@@ -18846,7 +19210,7 @@ class TestMixedSelection:
                 blocked += 1
                 assert snap["buttons"]["flt-save"] and snap["opened"] == []
                 assert snap["titles"]["flt-save"] == data["text"]["save_filtered"]
-        assert narrowed and blocked
+        assert less and blocked
 
     def test_a_great_many_ticks_shut_it_with_the_same_hover_text(
             self, monkeypatch, tmp_path):
@@ -18878,8 +19242,8 @@ class TestMixedSelection:
         page = _mix_page(monkeypatch, tmp_path, trades, observations=observations)
         data = TestFilterPage._data(page)
         cat0 = [i for i, (name, _) in enumerate(_MIX_SUBCATS) if name == "Cat0"]
-        cases = {"mix": ([0, 1], [cat0[0], cat0[2]]), "two_whole": ([1, 2], []),
-                 "category": ([2], []), "tag": ([0], [cat0[1]])}
+        cases = {"mix": _ticks_keeping([0, 1], [cat0[0], cat0[2]]), "two_whole": ([1, 2], []),
+                 "category": ([2], []), "tag": _ticks_keeping([0], [cat0[1]])}
         steps = [["wait"], ["set", "khat-group", "band"], ["fire", "khat-group"]]
         for name, (cats, tags) in cases.items():
             steps += _mix_tick_steps(cats, tags, name)
@@ -18906,11 +19270,11 @@ class TestMixedSelection:
             react = _last_react(snap, "khat-fig")
             assert react["data"][0]["text"] == [stat["text"]]
             assert react["data"][0]["x"] == pytest.approx([bucket.empirical_k], abs=1e-12)
-            kept, excluded, _ = _mix_names(cats, tags)
             assert react["layout"]["title"]["text"] == (
-                f"Empirical k̂ by spread band — {dashboard._selection_name(kept, excluded)}")
-        # Grouped by tag or category, every ticked row is marked (the last
-        # ticks: one tag of Cat0, which lists that category's tags alone)
+                f"Empirical k̂ by spread band — {_mix_selection(cats, tags)}")
+        # Grouped by tag or category, every row kept is marked (the last
+        # ticks: Cat0 less all its tags but one, which lists that category's
+        # tags alone)
         colors = data["styles"]["khat"]
         by_tag = _last_react(snaps["by_tag"], "khat-fig")["data"][0]
         assert by_tag["y"][0] == "All Cat0"
@@ -18930,16 +19294,16 @@ class TestMixedSelection:
         data = TestFilterPage._data(page)
         cat0 = [i for i, (name, _) in enumerate(_MIX_SUBCATS) if name == "Cat0"]
         cat2 = [i for i, (name, _) in enumerate(_MIX_SUBCATS) if name == "Cat2"]
-        # Cat1 left out, Cat0 narrowed to one tag: Cat0 and Cat2 kept
+        # Cat1 left out, Cat0 less two of its three tags: Cat0 and Cat2 kept
         snaps = _run_script(tmp_path, page, [
-            ["wait"], _tick_category(1), _tick_tag(cat0[0]), ["settle"],
+            ["wait"], _tick_category(1), _tick_tag(cat0[1]), _tick_tag(cat0[2]), ["settle"],
             ["snap", "by_category"],
             ["set", "khat-group", "tag"], ["fire", "khat-group"], ["snap", "by_tag"]],
             strict=True)
         colors = data["styles"]["khat"]
         assert _khat_marked(snaps["by_category"], colors) == ["Cat0", "Cat2"]
         # By tag, with more than one category kept: every tag the ticks
-        # cover — the one ticked tag of Cat0 and all of Cat2 — among all tags
+        # cover — the one tag of Cat0 not ticked and all of Cat2 — among all tags
         by_tag = _last_react(snaps["by_tag"], "khat-fig")["data"][0]
         assert by_tag["y"][0] == "All tags"
         assert _khat_marked(snaps["by_tag"], colors) == [
@@ -18952,7 +19316,7 @@ class TestMixedSelection:
             self, monkeypatch, tmp_path, fixture, forced):
         # A reader leaves out one category, a second, lets one back in so
         # that all but one are left out, then every one, lets one back in and
-        # narrows it to a tag. At each step the page shows exactly the trades
+        # leaves out one of its two tags. At each step the page shows exactly the trades
         # the live rule keeps over the categories kept, every figure
         # Python's own for them — drawn from Python's views where it has one
         # and, sent through the mix, the same
@@ -19030,22 +19394,97 @@ class TestMixedSelection:
         back = snaps["back"]
         assert back["menus"]["flt-cat"]["ticked"] == []
         assert back["menus"]["flt-tag"]["ticked"] == [cat1[0]]
-        # Tag i holds 2**i trades: Cat0 and Cat2 whole, Cat1 narrowed to one tag
+        # Tag i holds 2**i trades: Cat0 and Cat2 whole, Cat1 less one tag
         assert back["text"]["hdr-trades"] == str(sum(
             2 ** si for si, (name, _) in enumerate(_MIX_SUBCATS)
-            if name != "Cat1" or si == cat1[0]))
+            if name != "Cat1" or si != cat1[0]))
         assert back["text"]["flt-summary"] == dashboard._filter_summary_text(
             data["text"], _phrase(data, 0, 0, 0), True,
-            f"Cat1 narrowed to {_MIX_SUBCATS[cat1[0]][1]}", int(back["text"]["hdr-trades"]),
+            f"Cat1 except {_MIX_SUBCATS[cat1[0]][1]}", int(back["text"]["hdr-trades"]),
             2 ** len(_MIX_SUBCATS) - 1, mix=True)
+
+    def test_every_tag_of_a_category_ticked_leaves_nothing_of_it(self, monkeypatch, tmp_path):
+        # Every tag has exactly one category, so ticking every tag of Cat0
+        # leaves out all of Cat0's trades, just as excluding the category
+        # would; the line names it as excluded. Ticking the rest of the tags
+        # too leaves nothing: no trade, said so. Tag i holds 2**i trades
+        page = _mix_page(monkeypatch, tmp_path, _counted_trades(_MIX_SERIES))
+        data = TestFilterPage._data(page)
+        cat0 = [i for i, (name, _) in enumerate(_MIX_SUBCATS) if name == "Cat0"]
+        rest = [i for i in range(len(_MIX_SUBCATS)) if i not in cat0]
+        every = list(range(len(_MIX_CATEGORIES)))
+        n_all = 2 ** len(_MIX_SUBCATS) - 1
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], *(_tick_tag(t) for t in cat0), ["settle"], ["snap", "cat0"],
+            *(_tick_tag(t) for t in rest), ["settle"], ["snap", "every"]], strict=True)
+        snap = snaps["cat0"]
+        shown = sum(2 ** si for si in rest)
+        assert snap["text"]["hdr-trades"] == str(shown)
+        assert snap["menus"]["flt-cat"]["ticked"] == []
+        assert snap["menus"]["flt-tag"]["ticked"] == cat0
+        assert snap["menus"]["flt-tag"]["label"] == f"{len(cat0)} tags"
+        assert not snap["menus"]["flt-tag"]["all"]
+        assert _mix_selection(every, cat0, text=data["text"]) == "Cat0 excluded"
+        assert snap["text"]["flt-summary"] == _mix_summary(
+            data, every, cat0, shown, n_all, mix=True)
+        # The same trades as Cat0 excluded in the other menu
+        assert _mix_covered(every, cat0) == _mix_covered([1, 2], [])
+        snap = snaps["every"]
+        assert snap["text"]["hdr-trades"] == "0"
+        assert snap["menus"]["flt-tag"]["all"]
+        assert snap["menus"]["flt-tag"]["label"] == dashboard._MENU_TAG_ALL
+        assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], _phrase(data, 0, 0, 0), True, None, 0, n_all, none_kept=True)
+
+    @pytest.mark.parametrize("forced", [False, True], ids=["drawn", "mixed"])
+    def test_random_tag_exclusions_match_python_and_the_live_filter(
+            self, monkeypatch, tmp_path, forced):
+        # Seeded sets of ticks — categories left out, and tags left out of the
+        # ones kept, a whole category's at times — drawn as the page draws
+        # them (Python's own view where the trades left are one of its views,
+        # else a mix) and, forced, every one through the mix: each is exactly
+        # what Python computes for the trades the live rule keeps, and the
+        # line names it as Python does
+        trades = _mix_trades(53, n=60, quoted=True)
+        page = _mix_page(monkeypatch, tmp_path, trades)
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        lst = chunks[0]["list"]
+        n_all = lst["views"]["all"]["n"]
+        sets = _mix_tick_sets(53, 12)
+        assert any(len([t for t in tags if _MIX_SUBCATS[t][0] == _MIX_CATEGORIES[c]])
+                   == len([1 for name, _ in _MIX_SUBCATS if name == _MIX_CATEGORIES[c]])
+                   for cats, tags in sets for c in cats), "no category wholly ticked"
+        steps = [["wait"]]
+        for i, (cats, tags) in enumerate(sets):
+            steps += _mix_tick_steps(cats, tags, f"set{i}")
+        snaps = _run_script(tmp_path, page, steps, strict=True,
+                            setup_js=_FORCE_MIX if forced else "")
+        views = lst["views"]
+        for i, (cats, tags) in enumerate(sets):
+            snap = snaps[f"set{i}"]
+            ref = _mix_reference(data, trades, cats, tags)
+            assert ref["view"]["n"] > 0, (cats, tags)
+            _assert_mix_is_pythons(snap, ref, data, lst)
+            # Python's own view wherever the tags left are exactly one of its
+            # views (one tag, one whole category, everything)
+            covered = [si for si in _mix_covered(cats, tags) if f"s{si}" in views]
+            own = {c: [si for si, (name, _) in enumerate(_MIX_SUBCATS)
+                       if name == _MIX_CATEGORIES[c] and f"s{si}" in views]
+                   for c in range(len(_MIX_CATEGORIES))}
+            plain = (len(covered) == 1
+                     or len(covered) == sum(len(v) for v in own.values())
+                     or any(covered == own[c] and f"c{c}" in views for c in own))
+            assert snap["text"]["flt-summary"] == _mix_summary(
+                data, cats, tags, ref["view"]["n"], n_all, mix=forced or not plain), (cats, tags)
 
     def test_categories_that_differ_only_in_letter_case_are_left_out_as_one(
             self, monkeypatch, tmp_path):
         # The live filter reads "Health" and "health" as one category, so the
-        # page leaves them out and lets them back in together, and a tag of
-        # either narrows both: the tags the page shows are exactly the ones a
-        # live filter of the categories kept and the ticked tags keeps. Tag i
-        # holds 2**i trades, so the trade count names the tags shown
+        # page leaves them out and lets them back in together, and their two
+        # Flu tags are one tag, ticked together: the tags the page shows are
+        # exactly the ones a live filter keeps that lists the categories kept
+        # and the tags not ticked. Tag i holds 2**i trades, so the trade count
+        # names the tags shown
         series = {"KXH0": ("Health", ("Flu",)), "KXH1": ("health", ("Flu",)),
                   "KXH2": ("health", ("Polio",)), "KXH3": ("Sports", ("Golf",))}
         categories, pairs = _mix_axes(series)
@@ -19077,21 +19516,21 @@ class TestMixedSelection:
             shown = {si for si in range(len(pairs))
                      if int(snap["text"]["hdr-trades"]) >> si & 1}
             assert shown == {si for si, pair in enumerate(pairs) if keeps(*pair)}, name
-        # Narrowed to Flu, health's Polio is left out; with Polio ticked too
-        # the category counts every tag again
+        # Flu ticked leaves out both spellings' Flu, health's Polio stays;
+        # with Polio ticked too nothing of either is left, Sports' Golf alone
         assert int(snaps["flu"]["text"]["hdr-trades"]) == \
-            2 ** len(pairs) - 1 - 2 ** polio
-        assert int(snaps["both"]["text"]["hdr-trades"]) == 2 ** len(pairs) - 1
+            2 ** len(pairs) - 1 - 2 ** flu - 2 ** flu_lower
+        assert int(snaps["both"]["text"]["hdr-trades"]) == 2 ** pairs.index(("Sports", "Golf"))
         # Both spellings left out count as two; the button says so
         assert snaps["out"]["menus"]["flt-cat"]["label"] == "2 categories"
         assert snaps["every"]["menus"]["flt-cat"]["label"] == dashboard._MENU_CAT_ALL
 
-    def test_a_category_narrowed_only_by_its_twins_tag_is_named_with_it(
+    def test_a_tag_ticked_in_one_case_twin_leaves_the_other_whole(
             self, monkeypatch, tmp_path):
-        # A tag ticked under "Health" narrows "health" too (one category to
-        # the live filter), so health, which has no Flu tag, shows nothing:
-        # the summary names the two together, narrowed to Flu, and never
-        # names health as counting in full. Python's _selection_name and the
+        # "Health" and "health" are one category to the live filter, but a tag
+        # ticked leaves out only that tag's trades: Flu, Health's one tag,
+        # ticked leaves nothing of Health — named as excluded — while health,
+        # which has no Flu, keeps its Polio. Python's _selection_name and the
         # script word it the same. Tag i holds 2**i trades
         series = {"KXH0": ("Health", ("Flu",)), "KXH1": ("health", ("Polio",)),
                   "KXA0": ("Arts", ("Glue",)), "KXC0": ("Crypto", ("Coin",)),
@@ -19103,7 +19542,7 @@ class TestMixedSelection:
         health, lower = categories.index("Health"), categories.index("health")
         flu = pairs.index(("Health", "Flu"))
         assert data["category_twins"] == [[health, lower]] and data["tag_twins"] == []
-        cases = {"narrowed": (list(range(len(categories))), [flu]),
+        cases = {"every_category": (list(range(len(categories))), [flu]),
                  "only": ([health, lower], [flu])}
         # Each category left out is clicked once (clicking a twin's box
         # would take Health with it), then Flu
@@ -19114,29 +19553,27 @@ class TestMixedSelection:
                         if c not in kept_cats),
                       *(_tick_tag(t) for t in tags), ["settle"], ["snap", name]]
         snaps = _run_script(tmp_path, page, steps, strict=True)
-        expected = {"narrowed": "Health, health narrowed to Flu", "only": "only Health · Flu"}
+        expected = {"every_category": "Health excluded", "only": "only health"}
         for name, (kept_cats, tags) in cases.items():
-            kept, excluded, _ = _mix_names(kept_cats, tags, series)
-            assert dashboard._selection_name(kept, excluded, data["text"]) == \
-                expected[name], name
+            assert _mix_selection(kept_cats, tags, series, data["text"]) == expected[name], name
             snap = snaps[name]
-            # What the live filter keeps, and never health's Polio, which
-            # Health's Flu narrows away
+            # What the live filter keeps: health's Polio, never Health's Flu
             keeps = _mix_kept(kept_cats, tags, series)
             shown = sum(2 ** si for si, pair in enumerate(pairs) if keeps(*pair))
-            assert not shown >> pairs.index(("health", "Polio")) & 1
+            assert shown >> pairs.index(("health", "Polio")) & 1
+            assert not shown >> flu & 1
             assert snap["text"]["hdr-trades"] == str(shown), name
             assert snap["text"]["flt-summary"].startswith(
                 f"Showing the run with {expected[name]} at {_phrase(data, 0, 0, 0)}: "), name
 
     def test_the_khat_figures_follow_a_twins_tag_too(self, monkeypatch, tmp_path):
-        # A tag ticked under "Health" narrows "health" too (one category to
-        # the live filter), so health's Polio entries leave the k-hat figures
-        # as they leave the trades: the cards are the k-hat of exactly the
-        # entries the live filter keeps, and the chart marks what it keeps —
-        # grouped by tag Health · Flu alone, never health · Polio; grouped by
-        # category every category not excluded, even health, whose tag ticks
-        # keep none of its trades
+        # Flu ticked under "Health" leaves out Health's one tag, while
+        # "health" (one category to the live filter) keeps its Polio: the
+        # k-hat figures follow the trades — the cards are the k-hat of exactly
+        # the entries the live filter keeps, and the chart marks what it
+        # keeps: grouped by tag health · Polio alone, never Health · Flu;
+        # grouped by category health alone, since Health keeps none of its
+        # trades
         series = {"KXH0": ("Health", ("Flu",)), "KXH1": ("health", ("Polio",)),
                   "KXA0": ("Arts", ("Glue",)), "KXS0": ("Sports", ("Golf",))}
         categories, pairs = _mix_axes(series)
@@ -19155,7 +19592,7 @@ class TestMixedSelection:
         assert data["category_twins"] == [[health, lower]]
         kept_cats, tags = [health, lower], [flu]
         # Arts and Sports are each clicked once, left out; that keeps both
-        # spellings of Health. Then Flu is ticked
+        # spellings of Health. Then Flu is ticked, leaving it out
         snaps = _run_script(tmp_path, page, [
             ["wait"], _tick_category(arts), _tick_category(sports), _tick_tag(flu), ["settle"],
             ["snap", "by_category"],
@@ -19164,8 +19601,8 @@ class TestMixedSelection:
         keeps = _mix_kept(kept_cats, tags, series)
         joined = [o for o in observations if keeps(*dashboard._series_labels(
             o.event_ticker, o.category, series))]
-        # Health's Flu entries alone: health's Polio entries are narrowed away
-        assert joined and {o.event_ticker.split("-")[0] for o in joined} == {"KXH0"}
+        # health's Polio entries alone: Health's Flu entries are left out
+        assert joined and {o.event_ticker.split("-")[0] for o in joined} == {"KXH1"}
         stat = dashboard._khat_stat(joined)
         k_shown = data["ks"][data["primary"][1]]["value"]
         colors = data["styles"]["khat"]
@@ -19176,13 +19613,13 @@ class TestMixedSelection:
             assert snap["text"]["kpi-khat"] == stat["cells"][4], name
             assert snap["text"]["kpi-khat_delta"] == \
                 dashboard._khat_delta(stat["k"], k_shown)[0], name
-        # Grouped by category the chart marks every category not excluded,
-        # even health, whose tag ticks (Flu) keep none of its trades
-        assert _khat_marked(snaps["by_category"], colors) == ["Health", "health"]
+        # Grouped by category the chart marks the categories that keep a
+        # trade: health, not Health, whose one tag is ticked
+        assert _khat_marked(snaps["by_category"], colors) == ["health"]
         groups = data["khat"][0]["groups"]
         assert f"s{flu}" in groups and f"s{polio}" in groups
         assert _last_react(snaps["by_tag"], "khat-fig")["data"][0]["y"][0] == "All tags"
-        assert _khat_marked(snaps["by_tag"], colors) == ["Health · Flu"]
+        assert _khat_marked(snaps["by_tag"], colors) == ["health · Polio"]
 
     def test_tags_that_differ_only_in_letter_case_are_ticked_and_unticked_as_one(
             self, monkeypatch, tmp_path):
@@ -19261,14 +19698,13 @@ class TestMixedSelection:
             assert shown == kept, cases[i]
             seen.add(frozenset(shown))
         # One click on either spelling ticks both; the label counts both; a
-        # click on either unticks both. Health then counts its twins alone,
-        # every other category in full
+        # click on either unticks both. Health then counts Flu alone, every
+        # other category in full
         rest = sum(2 ** si for si, (name, _) in enumerate(pairs) if name != "Health")
         for i in (0, 1):
             assert expected[i] == ([], [upper, lower])
             assert snaps[f"case{i}"]["menus"]["flt-tag"]["label"] == "2 tags"
-            assert snaps[f"case{i}"]["text"]["hdr-trades"] == str(
-                2 ** upper + 2 ** lower + rest)
+            assert snaps[f"case{i}"]["text"]["hdr-trades"] == str(2 ** flu + rest)
         assert expected[2] == ([], [])
         # Leaving Health out unticks its tags
         assert expected[3] == ([health], [])
@@ -19302,21 +19738,21 @@ class TestMixedSelection:
         categories, pairs = _mix_axes(_TIE_SERIES)
         cat0 = [i for i, (name, _) in enumerate(pairs) if name == "Cat0"]
         every = list(range(len(categories)))
-        # Every category with Cat0 narrowed (23 tags), four categories, three
-        sets = [(every, cat0[:-1]), ([0, 1, 2, 3], []), ([2, 3, 4], [])]
+        # Every category with one tag of Cat0 left out (23 tags), four
+        # categories, three
+        sets = [(every, cat0[-1:]), ([0, 1, 2, 3], []), ([2, 3, 4], [])]
         steps = [["wait"]]
         for i, (cats, tags) in enumerate(sets):
             steps += _mix_tick_steps(cats, tags, f"mix{i}")
         snaps = _run_script(tmp_path, page, steps, strict=True)
-        # ... and the whole list, sent through the mix: every tag ticked (with
+        # ... and all but another tag of the list, sent through the mix (with
         # nothing ticked the page shows Python's whole-run view, never a mix)
-        all_tags = list(range(len(pairs)))
         forced = _run_script(tmp_path, page,
-                             [["wait"], *_mix_tick_steps(every, all_tags, "all")],
-                             strict=True, setup_js=_FORCE_MIX)["all"]
+                             [["wait"], *_mix_tick_steps(every, cat0[:1], "most")],
+                             strict=True, setup_js=_FORCE_MIX)["most"]
         tied = 0
         for snap, (cats, tags) in [*((snaps[f"mix{i}"], ticks) for i, ticks in enumerate(sets)),
-                                   (forced, (every, all_tags))]:
+                                   (forced, (every, cat0[:1]))]:
             ref = _mix_reference(data, trades, cats, tags, balance=1000.0, series=_TIE_SERIES)
             sums = ref["view"]["sub"]["x"]
             assert len(sums) > 12 and len(set(sums)) <= 4

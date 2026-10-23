@@ -1576,7 +1576,7 @@ class TestCategoryFilter:
 
     def test_the_first_tag_is_the_one_matched(self):
         _seed_series_listing(self.LISTING)
-        # Only KXBRENTW's first tag files it, as on the dashboard's Tag select
+        # Only KXBRENTW's first tag files it, as the dashboard files a trade by its first tag
         assert self._tickers(_filtered(self._pairs(), tags=("oil & gas",))) == [
             "KXBRENTW-26SEP19"]
         assert _filtered(self._pairs(), tags=("Energy",)) == []
