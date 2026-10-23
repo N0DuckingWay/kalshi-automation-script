@@ -156,7 +156,7 @@ function __select(id, spec) {
   return el;
 }
 
-// A check-box menu (the filter bar's Exclude categories and Tag menus: a
+// A check-box menu (the filter bar's Exclude categories and Exclude tags menus: a
 // <details> element) with the boxes, texts and attributes Python rendered:
 // its button (<summary>, "<id>-label"), its "All" box ("<id>-all") and, per
 // row i, the box ("<id>-<i>"), its text ("<id>-<i>-text") and the row itself
@@ -167,9 +167,8 @@ function __select(id, spec) {
 // itself and its parts. For the tests' sake it also reads like a <select>:
 // "disabled" is its "All" box's, and "value" is the ticked row indexes
 // joined by commas ("" for none) — setting it ticks exactly those rows, as a
-// browser restoring a reader's old ticks would, and leaves the "All" box as
-// Python rendered it when no row is ticked (unticked in both menus),
-// unticked otherwise.
+// browser restoring a reader's old ticks would, and leaves the "All" box
+// unticked.
 var __MENUS = {};
 function __checkbox(id, spec) {
   var el = __element(id, 'input');
