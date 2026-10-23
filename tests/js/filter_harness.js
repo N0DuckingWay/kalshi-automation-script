@@ -168,8 +168,8 @@ function __select(id, spec) {
 // "disabled" is its "All" box's, and "value" is the ticked row indexes
 // joined by commas ("" for none) — setting it ticks exactly those rows, as a
 // browser restoring a reader's old ticks would, and leaves the "All" box as
-// Python rendered it when no row is ticked (ticked in the Tag menu,
-// unticked in the Exclude categories one), unticked otherwise.
+// Python rendered it when no row is ticked (unticked in both menus),
+// unticked otherwise.
 var __MENUS = {};
 function __checkbox(id, spec) {
   var el = __element(id, 'input');
