@@ -24,8 +24,8 @@
 // window.open records each call — {url, target, features} — in __opened and
 // opens nothing (it returns null, as a "noopener" open does).
 //
-// Check-box menus (page.menus): the filter bar's Exclude categories and Tag
-// menus, each a <details> element of check boxes (__menu below). A ["tick",
+// Check-box menus (page.menus): the filter bar's Exclude categories and
+// Exclude tags menus, each a <details> element of check boxes (__menu below). A ["tick",
 // id] step is a reader clicking a box: it flips, and its change event runs
 // the box's listeners and then the menu's, unless the box is disabled.
 // ["open", id] opens a menu, ["outside", id] is a click somewhere on the
