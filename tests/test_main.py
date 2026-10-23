@@ -98,6 +98,7 @@ Notes:
 """
 import ast
 import dataclasses
+import html
 import inspect
 import json
 import logging
@@ -348,9 +349,9 @@ class TestNoPairsMsg:
         # A filter alone can empty the list: named when set, unmentioned when not
         plain = main._no_pairs_msg(settings=LiveSettings(True, (0.0, 1.0), 0.75, 0.2))
         assert "category/tag filter" not in plain
-        for categories, tags in ((("Economics",), None), (None, ("Oil & Gas",))):
+        for excluded, tags in ((("Economics",), None), (None, ("Oil & Gas",))):
             settings = LiveSettings(True, (0.0, 1.0), 0.75, 0.2,
-                                    categories=categories, tags=tags)
+                                    exclude_categories=excluded, tags=tags)
             msg = main._no_pairs_msg(settings=settings)
             assert (f"among pairs filed under the run's category/tag filter "
                     f"({config.describe_trade_filter(settings)})") in msg
@@ -506,9 +507,9 @@ class TestLiveSettingsFlags:
         (["--interval-discount", "0.6"], "interval_discount", 0.6),
         (["--size-cap", "35"], "size_cap", 0.35),
         (["--same-title-size-cap", "25"], "same_title_size_cap", 0.25),
-        (["--category", "Economics"], "categories", ("Economics",)),
-        (["--category", "Economics", "--category", " Sports "], "categories",
-         ("Economics", "Sports")),
+        (["--exclude-category", "Economics"], "exclude_categories", ("Economics",)),
+        (["--exclude-category", "Economics", "--exclude-category", " Sports "],
+         "exclude_categories", ("Economics", "Sports")),
         (["--tag", "Oil & Gas"], "tags", ("Oil & Gas",)),
         (["--rebalance"], "rebalance", True),
         (["--sell-at", "85"], "sell_at", 0.85),
@@ -847,18 +848,23 @@ class TestLiveSettingsFlags:
                                                           "spread_band"], False),
         (["--spread-max", "0"], ["--spread-max", "spread_band"], False),
         # An empty name would match nothing: refused, never "any"
-        (["--category", ""], ["--category", "categories"], False),
+        (["--exclude-category", ""], ["--exclude-category", "exclude_categories"], False),
         (["--tag", "Soccer", "--tag", "  "], ["--tag", "tags"], False),
-        # "any" is the --any-* switch, not a name: it would print like no filter (config._names)
-        (["--category", "any"], ["--category", "categories", "--any-category / --any-tag"],
+        # "none" and "any" are the switches, not names: each would print like no
+        # filter (config._names)
+        (["--exclude-category", "none"],
+         ["--exclude-category", "exclude_categories", "--no-exclude-category on main.py"],
          False),
-        (["--tag", "ANY"], ["--tag", "tags", "--any-category / --any-tag"], False),
+        (["--exclude-category", "Any"],
+         ["--exclude-category", "exclude_categories", "--no-exclude-category on main.py"],
+         False),
+        (["--tag", "ANY"], ["--tag", "tags", "--any-tag on main.py"], False),
         # The error names exactly the flags given, --no-tier-floors and --any-* included
         (["--no-tier-floors", "--spread-max", "0"],
          ["invalid live setting for this run (--tier-floors/--no-tier-floors, "
           "--spread-max):", "spread_band"], False),
-        (["--any-category", "--spread-max", "0"],
-         ["invalid live setting for this run (--spread-max, --any-category):"], False),
+        (["--no-exclude-category", "--spread-max", "0"],
+         ["invalid live setting for this run (--spread-max, --no-exclude-category):"], False),
     ])
     def test_an_invalid_flag_is_a_usage_error_before_anything_runs(
         self, monkeypatch, capsys, argv, words, percent,
@@ -877,23 +883,26 @@ class TestLiveSettingsFlags:
         else:
             assert "whole percent" not in err, err
 
-    @pytest.mark.parametrize("field, flag", [
-        ("categories", "--any-category"),
-        ("tags", "--any-tag"),
+    @pytest.mark.parametrize("field, flag, label", [
+        ("exclude_categories", "--no-exclude-category", "exclude categories none"),
+        ("tags", "--any-tag", "tags any"),
     ])
-    def test_an_any_flag_clears_the_saved_filter_for_one_run(self, monkeypatch, field, flag):
+    def test_a_clearing_flag_clears_the_saved_filter_for_one_run(
+        self, monkeypatch, field, flag, label,
+    ):
         _save_live_defaults(**{field: ("Sports",)})
         seen = _main_with(monkeypatch, ["--mode", "prod", flag])
         assert getattr(seen["reference"], field) == ("Sports",)
         assert getattr(seen["settings"], field) is None
         line = describe_live_settings(seen["settings"], seen["reference"])
-        assert f"{field} any (default: Sports)" in line and line.count("(default:") == 1
+        assert f"{label} (default: Sports)" in line and line.count("(default:") == 1
         # No flag keeps the saved filter
         seen = _main_with(monkeypatch, ["--mode", "prod"])
         assert getattr(seen["settings"], field) == ("Sports",)
 
     @pytest.mark.parametrize("argv, words", [
-        (["--category", "Sports", "--any-category"], ["--any-category", "--category"]),
+        (["--exclude-category", "Sports", "--no-exclude-category"],
+         ["--no-exclude-category", "--exclude-category"]),
         (["--any-tag", "--tag", "Soccer"], ["--tag", "--any-tag"]),
     ])
     def test_a_filter_and_its_any_twin_are_mutually_exclusive(
@@ -908,39 +917,44 @@ class TestLiveSettingsFlags:
             assert word in err, (word, err)
 
     @pytest.mark.parametrize("mode", ["dev", "prod"])
-    def test_a_tag_flag_can_be_tied_to_a_listed_category(self, monkeypatch, mode):
+    def test_a_tag_flag_can_be_tied_to_a_category_not_excluded(self, monkeypatch, mode):
         seen = _main_with(monkeypatch, [
-            "--mode", mode, "--category", "Economics", "--category", "Sports",
+            "--mode", mode, "--exclude-category", "Economics", "--exclude-category", "Politics",
             "--tag", "Sports · Basketball", "--tag", "sports · Pro Football"])
         assert seen["code"] == EXIT_OK
-        assert seen["settings"].categories == ("Economics", "Sports")
+        assert seen["settings"].exclude_categories == ("Economics", "Politics")
         assert seen["settings"].tags == ("Sports · Basketball", "sports · Pro Football")
         keeps = config.trade_filter(seen["settings"])
-        assert keeps("Economics", "Fed") and keeps("Sports", "Basketball")
+        assert keeps("Sports", "Basketball") and keeps("World", "General")
         assert not keeps("Sports", "Soccer") and not keeps("Politics", "Basketball")
+        assert not keeps("Economics", "Fed")
+
+    @pytest.mark.parametrize("mode", ["dev", "prod"])
+    def test_a_tied_tag_needs_no_category_flag(self, monkeypatch, mode):
+        # Nothing excluded: a tied tag narrows its own category, every other trades
+        seen = _main_with(monkeypatch, ["--mode", mode, "--tag", "Sports · Basketball"])
+        assert seen["code"] == EXIT_OK
+        keeps = config.trade_filter(seen["settings"])
+        assert keeps("Sports", "Basketball") and keeps("Economics", "Fed")
+        assert not keeps("Sports", "Soccer")
 
     @pytest.mark.parametrize("mode", ["dev", "prod"])
     @pytest.mark.parametrize("argv, saved, words", [
-        # The tag's category is not one of this run's categories
-        (["--category", "Sports", "--tag", "Economics · Fed"], {},
-         ["invalid live setting for this run (--category, --tag):",
-          "tags: 'Economics · Fed' names the category 'Economics', which categories "
-          "does not list"]),
-        # No category at all, given or saved
-        (["--tag", "Sports · Basketball"], {}, ["(--tag):", "categories does not list"]),
+        # The tag's category is one this run excludes
+        (["--exclude-category", "Economics", "--tag", "Economics · Fed"], {},
+         ["invalid live setting for this run (--exclude-category, --tag):",
+          "tags: 'Economics · Fed' is tied to 'Economics', which is in "
+          "exclude_categories; a category that never trades cannot be narrowed to a tag"]),
         # A blank half is never read as a plain tag
-        (["--category", "Sports", "--tag", "Sports · "], {},
-         ["tags: 'Sports ·' must read 'Category · Tag'"]),
-        (["--category", "Sports", "--tag", " · Basketball"], {}, ["must read 'Category · Tag'"]),
-        # A saved tied tag loses its category for this run: the flag is refused
+        (["--tag", "Sports · "], {}, ["tags: 'Sports ·' must read 'Category · Tag'"]),
+        (["--tag", " · Basketball"], {}, ["must read 'Category · Tag'"]),
+        # A saved tied tag's category is excluded this run: the flag is refused
         # rather than the tag read some other way
-        (["--any-category"], {"categories": ("Sports",), "tags": ("Sports · Basketball",)},
-         ["(--any-category):", "categories does not list"]),
-        (["--category", "Economics"],
-         {"categories": ("Sports",), "tags": ("Sports · Basketball",)},
-         ["(--category):", "names the category 'Sports'"]),
+        (["--exclude-category", "Sports"],
+         {"exclude_categories": ("Economics",), "tags": ("Sports · Basketball",)},
+         ["(--exclude-category):", "is tied to 'Sports', which is in exclude_categories"]),
     ])
-    def test_a_tied_tag_without_its_category_is_a_usage_error(
+    def test_a_tied_tag_in_an_excluded_category_is_a_usage_error(
         self, monkeypatch, capsys, mode, argv, saved, words,
     ):
         if saved:
@@ -954,24 +968,24 @@ class TestLiveSettingsFlags:
         for word in words:
             assert word in err, (word, err)
 
-    _SAVED_TAG_REMEDY = (" — the saved defaults tie a tag to a category this run does not "
-                         "list: add --any-tag, or give this run's tags with --tag")
+    _SAVED_TAG_REMEDY = (" — the saved defaults tie a tag to a category this run "
+                         "excludes: add --any-tag, or give this run's tags with --tag")
 
     @pytest.mark.parametrize("mode", ["dev", "prod"])
     @pytest.mark.parametrize("argv, flags", [
-        (["--category", "Economics"], "--category"),
-        (["--any-category"], "--any-category"),
-        # One of two saved tied tags still has its category: the other does not
-        (["--category", "Sports"], "--category"),
+        (["--exclude-category", "Sports"], "--exclude-category"),
+        # In any letter case
+        (["--exclude-category", "POLITICS"], "--exclude-category"),
+        (["--exclude-category", "Economics", "--exclude-category", "sports"],
+         "--exclude-category"),
         # Another flag beside it changes nothing
-        (["--category", "Economics", "--interval-discount", "0.6"],
-         "--interval-discount, --category"),
+        (["--exclude-category", "Sports", "--interval-discount", "0.6"],
+         "--interval-discount, --exclude-category"),
     ])
-    def test_a_categories_flag_that_drops_a_saved_tied_category_names_the_remedy(
+    def test_an_exclude_flag_that_excludes_a_saved_tied_category_names_the_remedy(
         self, monkeypatch, capsys, mode, argv, flags,
     ):
-        _save_live_defaults(categories=("Sports", "Politics"),
-                            tags=("Sports · Basketball", "politics · Fed"))
+        _save_live_defaults(tags=("Sports · Basketball", "politics · Fed"))
         seen = _main_with(monkeypatch, ["--mode", mode, *argv])
         assert seen["code"] == 2
         assert not seen["logging_set_up"] and not seen["client_built"]
@@ -979,17 +993,16 @@ class TestLiveSettingsFlags:
         err = " ".join(capsys.readouterr().err.split())
         # The settings' own message, then the remedy, last
         assert f"invalid live setting for this run ({flags}): tags: " in err, err
-        assert "which categories does not list" in err, err
+        assert "which is in exclude_categories" in err, err
         assert err.endswith(self._SAVED_TAG_REMEDY.strip()), err
 
     @pytest.mark.parametrize("argv, tags", [
-        (["--category", "Economics", "--any-tag"], None),
-        (["--any-category", "--any-tag"], None),
-        (["--category", "Economics", "--tag", "Fed"], ("Fed",)),
-        (["--category", "Economics", "--tag", "Economics · Fed"], ("Economics · Fed",)),
+        (["--exclude-category", "Sports", "--any-tag"], None),
+        (["--exclude-category", "Sports", "--tag", "Fed"], ("Fed",)),
+        (["--exclude-category", "Sports", "--tag", "Economics · Fed"], ("Economics · Fed",)),
     ])
     def test_either_remedy_lets_the_run_start(self, monkeypatch, argv, tags):
-        _save_live_defaults(categories=("Sports",), tags=("Sports · Basketball",))
+        _save_live_defaults(tags=("Sports · Basketball",))
         seen = _main_with(monkeypatch, ["--mode", "prod", *argv])
         assert seen["code"] == EXIT_OK
         assert seen["settings"].tags == tags
@@ -997,21 +1010,19 @@ class TestLiveSettingsFlags:
 
     @pytest.mark.parametrize("argv, saved", [
         # This run's own tag is the one refused: a --tag flag was given
-        (["--category", "Economics", "--tag", "Sports · Basketball"],
-         {"categories": ("Sports",), "tags": ("Sports · Basketball",)}),
-        (["--category", "Sports", "--tag", "Economics · Fed"], {}),
-        (["--tag", "Sports · Basketball"], {}),
-        # The saved tied tag keeps its category (in another letter case): the
-        # error is another field's
-        (["--category", "SPORTS", "--category", "Economics", "--spread-max", "0"],
-         {"categories": ("Sports",), "tags": ("Sports · Basketball",)}),
-        # No categories flag at all
-        (["--spread-max", "0"], {"categories": ("Sports",), "tags": ("Sports · Basketball",)}),
+        (["--exclude-category", "Sports", "--tag", "Sports · Basketball"],
+         {"tags": ("Sports · Basketball",)}),
+        (["--exclude-category", "Economics", "--tag", "Economics · Fed"], {}),
+        # The saved tied tag's category is not excluded: the error is another field's
+        (["--exclude-category", "Economics", "--spread-max", "0"],
+         {"tags": ("Sports · Basketball",)}),
+        # No exclude flag at all
+        (["--spread-max", "0"],
+         {"exclude_categories": ("Economics",), "tags": ("Sports · Basketball",)}),
         # A saved plain tag is tied to no category
-        (["--category", "Economics", "--spread-max", "0"],
-         {"categories": ("Sports",), "tags": ("Basketball",)}),
-        # The category flag is itself the mistake, and no tag is saved
-        (["--category", "Sports", "--category", "Sports · Basketball"], {}),
+        (["--exclude-category", "Sports", "--spread-max", "0"], {"tags": ("Basketball",)}),
+        # The exclude flag is itself the mistake, and no tag is saved
+        (["--exclude-category", "Sports", "--exclude-category", "Sports · Basketball"], {}),
     ])
     def test_the_remedy_is_named_only_for_a_saved_tied_tag(
         self, monkeypatch, capsys, argv, saved,
@@ -1027,11 +1038,11 @@ class TestLiveSettingsFlags:
 
     @pytest.mark.parametrize("mode", ["dev", "prod"])
     @pytest.mark.parametrize("argv", [
-        # With --any-tag this listed all of Sports while reading as if narrowed
-        ["--category", "Sports", "--category", "Sports · Basketball", "--any-tag"],
-        ["--category", "Sports · Basketball"],
-        ["--category", "Sports", "--category", "Sports · Basketball",
-         "--tag", "Sports · Basketball"],
+        ["--exclude-category", "Sports", "--exclude-category", "Sports · Basketball",
+         "--any-tag"],
+        ["--exclude-category", "Sports · Basketball"],
+        ["--exclude-category", "Economics", "--exclude-category", "Sports · Basketball",
+         "--tag", "Politics · Fed"],
     ])
     def test_a_category_written_as_a_tied_tag_is_a_usage_error(
         self, monkeypatch, capsys, mode, argv,
@@ -1041,29 +1052,45 @@ class TestLiveSettingsFlags:
         assert not seen["logging_set_up"] and not seen["client_built"]
         assert "settings" not in seen
         err = capsys.readouterr().err
-        assert ("categories: 'Sports · Basketball' is a tag tied to a category; "
-                "give it as a tag") in err, err
-        assert "--category" in err, err
+        assert ("exclude_categories: 'Sports · Basketball' is a tag tied to a category; "
+                "only a whole category can be excluded") in err, err
+        assert "--exclude-category" in err, err
 
     def test_a_saved_tied_tag_survives_a_flag_that_keeps_its_category(self, monkeypatch):
-        saved = _save_live_defaults(categories=("Sports",), tags=("Sports · Basketball",))
+        saved = _save_live_defaults(exclude_categories=("Politics",),
+                                    tags=("Sports · Basketball",))
         # No filter flag: the saved filter itself
         assert _main_with(monkeypatch, ["--mode", "prod"])["settings"] == saved
-        # A wider --category that still lists the tag's category
-        seen = _main_with(monkeypatch, ["--mode", "prod", "--category", "Economics",
-                                        "--category", "SPORTS"])
-        assert seen["settings"].categories == ("Economics", "SPORTS")
+        # Another exclusion that leaves the tag's category trading
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--exclude-category", "Economics",
+                                        "--exclude-category", "WORLD"])
+        assert seen["settings"].exclude_categories == ("Economics", "WORLD")
         assert seen["settings"].tags == ("Sports · Basketball",)
-        # --any-tag beside --any-category clears both
-        seen = _main_with(monkeypatch, ["--mode", "prod", "--any-category", "--any-tag"])
-        assert seen["settings"].categories is None and seen["settings"].tags is None
+        # --no-exclude-category keeps the tag too, and --any-tag clears it
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--no-exclude-category"])
+        assert seen["settings"].exclude_categories is None
+        assert seen["settings"].tags == ("Sports · Basketball",)
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--no-exclude-category",
+                                        "--any-tag"])
+        assert seen["settings"].exclude_categories is None and seen["settings"].tags is None
+
+    def test_an_exclude_flag_replaces_every_saved_exclusion(self, monkeypatch):
+        # One --exclude-category is this run's whole exclusion list
+        _save_live_defaults(exclude_categories=("Sports", "Economics"))
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--exclude-category", "Politics"])
+        assert seen["settings"].exclude_categories == ("Politics",)
+        keeps = config.trade_filter(seen["settings"])
+        assert keeps("Sports", "Soccer") and keeps("Economics", "Fed")
+        assert not keeps("Politics", "Fed")
+        line = describe_live_settings(seen["settings"], seen["reference"])
+        assert "exclude categories Politics (default: Sports, Economics)" in line
 
     def test_a_tag_flag_replaces_every_saved_tag(self, monkeypatch):
         # One --tag is this run's whole tag list: the saved tag that narrowed
         # Sports is gone, so Sports trades in full this run
-        _save_live_defaults(categories=("Sports", "Economics"), tags=("Sports · Basketball",))
+        _save_live_defaults(exclude_categories=("Politics",), tags=("Sports · Basketball",))
         seen = _main_with(monkeypatch, ["--mode", "prod", "--tag", "Economics · Fed"])
-        assert seen["settings"].categories == ("Sports", "Economics")
+        assert seen["settings"].exclude_categories == ("Politics",)
         assert seen["settings"].tags == ("Economics · Fed",)
         keeps = config.trade_filter(seen["settings"])
         assert keeps("Sports", "Soccer") and keeps("Sports", "Basketball")
@@ -1071,6 +1098,40 @@ class TestLiveSettingsFlags:
         # ... and the run marks the field against the saved one
         line = describe_live_settings(seen["settings"], seen["reference"])
         assert "tags Economics · Fed (default: Sports · Basketball)" in line
+
+    @pytest.mark.parametrize("mode", ["dev", "prod"])
+    @pytest.mark.parametrize("argv, flag", [
+        (["--category", "Economics"], "--category"),
+        (["--category", "Economics", "--category", "Sports"], "--category"),
+        (["--any-category"], "--any-category"),
+        # Beside the new flags too: the retired one is named first
+        (["--any-category", "--exclude-category", "Sports"], "--any-category"),
+    ])
+    def test_the_retired_category_flags_name_their_replacement(
+        self, monkeypatch, capsys, mode, argv, flag,
+    ):
+        seen = _main_with(monkeypatch, ["--mode", mode, *argv])
+        assert seen["code"] == 2
+        # Refused before logging, the client and either run mode, never read the old way
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "settings" not in seen
+        err = " ".join(capsys.readouterr().err.split())
+        if flag == "--category":
+            assert ("--category no longer exists: the category filter is now a list of "
+                    "categories NOT to trade, and every other category trades. Use "
+                    "--exclude-category NAME (repeatable), or --no-exclude-category to "
+                    "exclude none") in err, err
+        else:
+            assert ("--any-category no longer exists: use --no-exclude-category (exclude "
+                    "no category)") in err, err
+
+    def test_the_retired_category_flags_are_hidden_from_help(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["kalshi_betting.main", "--help"])
+        with pytest.raises(SystemExit):
+            main.main()
+        out = capsys.readouterr().out
+        assert "--category" not in out.replace("--exclude-category", "")
+        assert "--any-category" not in out
 
     def test_two_cap_flags_share_one_unit_note(self, monkeypatch, capsys):
         seen = _main_with(monkeypatch, ["--mode", "prod", "--size-cap", "37",
@@ -1092,7 +1153,7 @@ class TestLiveSettingsFlags:
                      "--rebalance", "--no-rebalance", "--min-price-move",
                      "--no-min-price-move",
                      "--sell-at", "--no-sell", "--sell-min-days", "--no-sell-min-days",
-                     "--category", "--any-category", "--tag", "--any-tag"):
+                     "--exclude-category", "--no-exclude-category", "--tag", "--any-tag"):
             assert flag in out, flag
         # None of the flags the rebalance flags replaced is left
         for gone in ("--add-to-held-pairs", "--trim-to-kelly", "--trim-min-rise"):
@@ -1100,12 +1161,17 @@ class TestLiveSettingsFlags:
         # Every value flag defaults to the saved live defaults, never a config.py constant
         assert out.count("default: the saved live defaults") == 12
         assert out.count("whatever the saved live defaults say") == 5
-        # --category and --tag each replace the whole saved list, and say so
-        assert "Replaces every saved category for this run" in out
+        # --exclude-category and --tag each replace the whole saved list, and say so
+        assert ("REPLACES the saved exclusions for this run, so a category the saved "
+                "defaults exclude trades this run unless it is listed again") in out
         assert "Replaces every saved tag for this run" in out
-        # ... and both categories flags name what a saved tied tag then needs
-        assert out.count("the run exits 2 until") == 2
-        assert "under every category this run lists (its" in out
+        # ... and the exclude flag names what a saved tied tag then needs, and
+        # what happens to a series the listing lacks
+        assert out.count("the run exits 2 until") == 1
+        assert ("a pair whose series Kalshi's /series listing lacks is not traded while "
+                "any category is excluded") in out
+        assert "in every category this run does not exclude" in out
+        assert "\"Exclude categories\" menu" in out
         assert "config.TIME_SERIES" not in out and "config.TRADE" not in out
         assert "config.BUDGET_FRACTION" not in out and "config.SAME_TITLE" not in out
         assert ("Override one live default for THIS run only, in either mode "
@@ -1216,7 +1282,8 @@ class TestLogLiveSettings:
         "size_cap": (["--size-cap", "35"], "per-trade cap 35% (default: 20%)"),
         "same_title_size_cap": (["--same-title-size-cap", "15"],
                                 "same-title cap 15% (default: 100% (no extra cap))"),
-        "categories": (["--category", "Economics"], "categories Economics (default: any)"),
+        "exclude_categories": (["--exclude-category", "Economics"],
+                               "exclude categories Economics (default: none)"),
         "tags": (["--tag", "Oil & Gas"], "tags Oil & Gas (default: any)"),
         "rebalance": (["--rebalance"], "rebalance yes (default: no)"),
         "min_price_move": (["--min-price-move", "10"],
@@ -1518,19 +1585,20 @@ def _filter_pair(event_ticker: str) -> SimpleNamespace:
                            market_b=SimpleNamespace(event_ticker="IGNORED-B"))
 
 
-def _filtered(pairs: list, categories=None, tags=None, listing_client=None) -> list:
+def _filtered(pairs: list, exclude_categories=None, tags=None, listing_client=None) -> list:
     """Run main._filter_by_category with only the category/tag fields set."""
-    settings = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, categories=categories, tags=tags)
+    settings = LiveSettings(True, (0.0, 1.0), 0.75, 0.2,
+                            exclude_categories=exclude_categories, tags=tags)
     return main._filter_by_category(pairs, settings, listing_client)
 
 
 class TestCategoryFilter:
-    """main._filter_by_category keeps the pairs filed under the run's categories
-    and tags by historical.series_labels (the dashboard's rule), through
-    config.trade_filter: case-insensitive; a listed category in full unless a
-    tag narrows it, a plain tag under every listed category and a tied tag
-    ("Sports · Soccer") under its own; no filter, no request; no listing, no
-    pair (fail closed)."""
+    """main._filter_by_category drops the pairs filed under an excluded category,
+    or outside the run's tags, by historical.series_labels (the dashboard's
+    rule), through config.trade_filter: case-insensitive; every category not
+    excluded in full unless a tag narrows it, a plain tag under every category
+    and a tied tag ("Sports · Soccer") under its own; no filter, no request;
+    no listing, no pair (fail closed)."""
 
     # Kalshi's /series listing as cached: series ticker -> [category, tags]
     LISTING = {
@@ -1541,13 +1609,13 @@ class TestCategoryFilter:
         "KXSCOTUSLAST": ["Politics", []],
         "KXMVECROSSCATEGORY": ["", []],
     }
+    # The pairs of _pairs, in order
+    ALL = ["KXNCAAMBGAME-26JAN13WIUEIU", "KXUCLGAME-26APR14ATMBAR", "KXBRENTW-26SEP19",
+           "KXFISAEXTEND-26", "KXSCOTUSLAST-26", "KXMVECROSSCATEGORY-S2026X",
+           "KXMVECROSSCATEGORY0-S2026Y", "KXBTCD-26SEP1517", "", None]
 
     def _pairs(self) -> list:
-        return [_filter_pair(t) for t in (
-            "KXNCAAMBGAME-26JAN13WIUEIU", "KXUCLGAME-26APR14ATMBAR", "KXBRENTW-26SEP19",
-            "KXFISAEXTEND-26", "KXSCOTUSLAST-26", "KXMVECROSSCATEGORY-S2026X",
-            "KXMVECROSSCATEGORY0-S2026Y", "KXBTCD-26SEP1517", "", None,
-        )]
+        return [_filter_pair(t) for t in self.ALL]
 
     @staticmethod
     def _tickers(pairs: list) -> list:
@@ -1566,13 +1634,65 @@ class TestCategoryFilter:
         assert out is pairs
         assert "Category/tag filter" not in caplog.text
 
-    def test_a_category_matches_case_insensitively(self, caplog):
+    def test_an_excluded_category_is_dropped_case_insensitively(self, caplog):
         _seed_series_listing(self.LISTING)
         with caplog.at_level(logging.INFO):
-            out = _filtered(self._pairs(), categories=("sPoRtS",))
-        assert self._tickers(out) == ["KXNCAAMBGAME-26JAN13WIUEIU", "KXUCLGAME-26APR14ATMBAR"]
-        assert "kept 2 of 10 candidate pairs — dropped " in caplog.text
-        assert "Politics · General 1" in caplog.text and "Other · General 3" in caplog.text
+            out = _filtered(self._pairs(), exclude_categories=("sPoRtS",))
+        # The four pairs whose series the listing lacks are left out too
+        assert self._tickers(out) == self.ALL[2:6]
+        assert ("Category/tag filter (exclude categories sPoRtS; tags any): kept 4 of 10 "
+                "candidate pairs — dropped ") in caplog.text
+        assert "Sports · Basketball 1" in caplog.text and "Sports · Soccer 1" in caplog.text
+
+    def test_a_listed_category_never_excluded_still_trades(self):
+        # The point of an exclude list: every listed category not excluded
+        # trades, an uncategorised series included
+        _seed_series_listing(self.LISTING)
+        out = self._tickers(_filtered(self._pairs(), exclude_categories=("Politics", "Sports")))
+        assert out == ["KXBRENTW-26SEP19", "KXMVECROSSCATEGORY-S2026X"]
+
+    def test_an_unlisted_series_is_left_out_while_categories_are_excluded(self, caplog):
+        # KXMVECROSSCATEGORY0 and KXBTCD are not in the listing, so their
+        # category would be infer_category's guess and could be one excluded:
+        # fail closed, counted in one WARNING; a blank or missing event ticker too
+        _seed_series_listing(self.LISTING)
+        with caplog.at_level(logging.INFO):
+            out = self._tickers(_filtered(self._pairs(), exclude_categories=("Commodities",)))
+        assert out == ["KXNCAAMBGAME-26JAN13WIUEIU", "KXUCLGAME-26APR14ATMBAR",
+                       "KXFISAEXTEND-26", "KXSCOTUSLAST-26", "KXMVECROSSCATEGORY-S2026X"]
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning == (
+            "Category filter: 4 candidate pairs left out because their series is not in "
+            "Kalshi's /series listing, so their category is not known and may be one this "
+            "run excludes (series: (no event ticker), KXMVECROSSCATEGORY0, KXBTCD)")
+        assert "kept 5 of 10 candidate pairs" in caplog.text
+
+    def test_an_unlisted_series_trades_when_no_category_is_excluded(self, caplog):
+        # With no exclusion, filing by the fallback label is as before: a tag
+        # filter alone never leaves out a pair for its series being unlisted
+        _seed_series_listing(self.LISTING)
+        with caplog.at_level(logging.WARNING):
+            out = self._tickers(_filtered(self._pairs(), tags=("General",)))
+        assert out == ["KXSCOTUSLAST-26", "KXMVECROSSCATEGORY-S2026X",
+                       "KXMVECROSSCATEGORY0-S2026Y", "KXBTCD-26SEP1517", "", None]
+        assert "left out because their series is not in" not in caplog.text
+
+    @pytest.mark.parametrize("event", ["", None])
+    def test_a_blank_event_ticker_is_left_out_under_exclusions(self, event, caplog):
+        _seed_series_listing(self.LISTING)
+        with caplog.at_level(logging.WARNING):
+            assert _filtered([_filter_pair(event)], exclude_categories=("Sports",)) == []
+        assert "1 candidate pairs left out" in caplog.text
+        assert "(series: (no event ticker))" in caplog.text
+
+    def test_only_the_first_few_unlisted_series_are_named(self, caplog):
+        _seed_series_listing(self.LISTING)
+        pairs = [_filter_pair(f"KXNEW{i}-26") for i in range(7)]
+        with caplog.at_level(logging.WARNING):
+            assert _filtered(pairs, exclude_categories=("Sports",)) == []
+        assert ("7 candidate pairs left out because their series is not in Kalshi's /series "
+                "listing") in caplog.text
+        assert "(series: KXNEW0, KXNEW1, KXNEW2, KXNEW3, KXNEW4, and 2 more)" in caplog.text
 
     def test_the_first_tag_is_the_one_matched(self):
         _seed_series_listing(self.LISTING)
@@ -1582,41 +1702,49 @@ class TestCategoryFilter:
         assert _filtered(self._pairs(), tags=("Energy",)) == []
         assert self._tickers(_filtered(self._pairs(), tags=("Europe",))) == []
 
-    def test_categories_and_tags_combine_by_and(self):
+    def test_an_exclusion_and_tags_combine_by_and(self):
         _seed_series_listing(self.LISTING)
-        assert self._tickers(_filtered(self._pairs(), categories=("Sports",),
+        # The tag keeps Soccer anywhere not excluded
+        assert self._tickers(_filtered(self._pairs(), exclude_categories=("Politics",),
                                        tags=("Soccer",))) == ["KXUCLGAME-26APR14ATMBAR"]
-        # A tag of another category keeps nothing
-        assert _filtered(self._pairs(), categories=("Politics",), tags=("Soccer",)) == []
-        # Several names on one axis are an OR within it
-        assert self._tickers(_filtered(self._pairs(), categories=("Politics", "Commodities"),
+        # ... and nothing where its only category is excluded
+        assert _filtered(self._pairs(), exclude_categories=("Sports",), tags=("Soccer",)) == []
+        # Several names on one axis
+        assert self._tickers(_filtered(self._pairs(), exclude_categories=("Politics", "Sports"),
                                        tags=("Congress", "Oil & Gas"))) == [
-            "KXBRENTW-26SEP19", "KXFISAEXTEND-26"]
+            "KXBRENTW-26SEP19"]
 
     def test_a_combo_series_is_looked_up_literally(self):
         # The literal series, not scanner.event_series (which folds KXMVE*):
         # KXMVECROSSCATEGORY is listed uncategorised, KXMVECROSSCATEGORY0 not at all
         _seed_series_listing(self.LISTING)
-        assert self._tickers(_filtered(self._pairs(), categories=("Uncategorised",))) == [
-            "KXMVECROSSCATEGORY-S2026X"]
-        assert "KXMVECROSSCATEGORY0-S2026Y" in self._tickers(
-            _filtered(self._pairs(), categories=("Other",)))
+        out = self._tickers(_filtered(self._pairs(), exclude_categories=("Uncategorised",)))
+        assert "KXMVECROSSCATEGORY-S2026X" not in out
+        # The unlisted one is left out under any exclusion, and is filed by its
+        # own ticker prefix, never as KXMVECROSSCATEGORY's
+        assert "KXMVECROSSCATEGORY0-S2026Y" not in out
+        listing = {t: (c, tuple(tags)) for t, (c, tags) in self.LISTING.items()}
+        assert main._pair_labels(_filter_pair("KXMVECROSSCATEGORY0-S2026Y"), listing) == (
+            infer_category("KXMVECROSSCATEGORY0-S2026Y"), "General")
 
     def test_an_unlisted_series_falls_back_to_the_ticker_prefix_label(self, caplog):
         _seed_series_listing(self.LISTING)
         assert infer_category("KXBTCD-26SEP1517") == "Crypto"
-        with caplog.at_level(logging.WARNING):
-            out = _filtered(self._pairs(), categories=("crypto",), tags=("General",))
-        assert self._tickers(out) == ["KXBTCD-26SEP1517"]
+        listing = {t: (c, tuple(tags)) for t, (c, tags) in self.LISTING.items()}
+        assert main._pair_labels(_filter_pair("KXBTCD-26SEP1517"), listing) == (
+            "Crypto", "General")
         # A label only a fallback files under is not a typo
+        with caplog.at_level(logging.WARNING):
+            _filtered(self._pairs(), exclude_categories=("crypto",))
         assert "check the spelling" not in caplog.text
         # A missing or empty event ticker files under infer_category's "Other"
-        assert self._tickers(_filtered(self._pairs(), categories=("Other",)))[-2:] == ["", None]
+        for event in ("", None):
+            assert main._pair_labels(_filter_pair(event), listing) == ("Other", "General")
 
     def test_no_listing_keeps_nothing_and_says_why(self, monkeypatch, caplog):
         # Dev (no client) with no cached copy
         with caplog.at_level(logging.WARNING):
-            assert _filtered(self._pairs(), categories=("Sports",)) == []
+            assert _filtered(self._pairs(), exclude_categories=("Sports",)) == []
         assert "no cached copy exists (a dev run reads the cached copy only" in caplog.text
         assert "this run trades none" in caplog.text
         # Prod: the request fails and there is no cached copy
@@ -1634,21 +1762,26 @@ class TestCategoryFilter:
     def test_a_name_no_series_carries_is_warned_as_a_typo(self, caplog):
         _seed_series_listing(self.LISTING)
         with caplog.at_level(logging.WARNING):
-            assert _filtered(self._pairs(), categories=("Sprots",)) == []
-        assert "Category 'Sprots' names no category in Kalshi's listing of 6 series" in (
-            caplog.text)
+            # A misspelt exclusion excludes nothing (the series the listing
+            # lacks are left out under any exclusion)
+            assert self._tickers(_filtered(self._pairs(), exclude_categories=("Sprots",))) == \
+                self.ALL[:6]
+        assert ("Excluded category 'Sprots' names no category in Kalshi's listing of 6 "
+                "series, nor any this run's pairs were filed under — check the spelling; it "
+                "excludes nothing") in caplog.text
         caplog.clear()
-        # A dashboard Tag option ("category · tag") is a tag tied to its category:
-        # it keeps that slice and draws no warning
+        # A dashboard Exclude tags option ("category · tag") is a tag tied to its
+        # category: it narrows that category and draws no warning
         with caplog.at_level(logging.WARNING):
-            assert self._tickers(_filtered(self._pairs(), categories=("Sports",),
+            assert self._tickers(_filtered(self._pairs(), exclude_categories=("Politics",),
                                            tags=("Sports · Soccer",))) == [
-                "KXUCLGAME-26APR14ATMBAR"]
-        assert caplog.text == ""
+                "KXUCLGAME-26APR14ATMBAR", "KXBRENTW-26SEP19", "KXMVECROSSCATEGORY-S2026X"]
+        assert "check the spelling" not in caplog.text
         caplog.clear()
         # A real name draws no warning, even when it matches no pair this run
         with caplog.at_level(logging.WARNING):
-            _filtered([_filter_pair("KXBRENTW-1")], categories=("Politics",), tags=("congress",))
+            _filtered([_filter_pair("KXBRENTW-1")], exclude_categories=("Politics",),
+                      tags=("congress",))
         assert "check the spelling" not in caplog.text
 
     # A listing with two categories that share a first tag, and one more category
@@ -1663,55 +1796,48 @@ class TestCategoryFilter:
     TIED_EVENTS = ("KXFEDDECISION-26DEC", "KXBRENTW-26SEP19", "KXNCAAMBGAME-26JAN13WIUEIU",
                    "KXUCLGAME-26APR14ATMBAR", "KXHKANE-26", "KXFISAEXTEND-26")
 
-    def _tied(self, categories, tags) -> list:
+    def _tied(self, excluded, tags) -> list:
         """The TIED_EVENTS tickers the filter keeps over TIED_LISTING."""
         _seed_series_listing(self.TIED_LISTING)
         pairs = [_filter_pair(e) for e in self.TIED_EVENTS]
-        return self._tickers(_filtered(pairs, categories=categories, tags=tags))
+        return self._tickers(_filtered(pairs, exclude_categories=excluded, tags=tags))
 
     def test_a_tied_tag_narrows_its_category_and_leaves_the_others_whole(self, caplog):
-        # Economics in full, Sports only Basketball; Politics is not listed
+        # Economics in full, Sports only Basketball; Politics is excluded
         with caplog.at_level(logging.INFO):
-            kept = self._tied(("Economics", "Sports"), ("Sports · Basketball",))
+            kept = self._tied(("Politics",), ("Sports · Basketball",))
         assert kept == ["KXFEDDECISION-26DEC", "KXBRENTW-26SEP19",
                         "KXNCAAMBGAME-26JAN13WIUEIU", "KXHKANE-26"]
-        assert ("Category/tag filter (categories Economics, Sports; tags Sports · Basketball): "
+        assert ("Category/tag filter (exclude categories Politics; tags Sports · Basketball): "
                 "kept 4 of 6 candidate pairs — dropped Sports · Soccer 1, "
                 "Politics · Congress 1") in caplog.text
         assert "check the spelling" not in caplog.text
-        # Case does not matter in either half, nor in the categories
-        assert self._tied(("ECONOMICS", "sports"), ("SPORTS · basketball",)) == kept
+        # Case does not matter in either half, nor in the excluded categories
+        assert self._tied(("POLITICS",), ("SPORTS · basketball",)) == kept
+        # With nothing excluded, a tied tag narrows its own category alone
+        assert self._tied(None, ("Sports · Basketball",)) == [
+            "KXFEDDECISION-26DEC", "KXBRENTW-26SEP19", "KXNCAAMBGAME-26JAN13WIUEIU",
+            "KXHKANE-26", "KXFISAEXTEND-26"]
         # Two tags tied to one category
-        assert self._tied(("Sports",), ("Sports · Basketball", "Sports · Soccer")) == [
+        assert self._tied(("Economics", "Politics"),
+                          ("Sports · Basketball", "Sports · Soccer")) == [
             "KXNCAAMBGAME-26JAN13WIUEIU", "KXUCLGAME-26APR14ATMBAR"]
         # A tag tied to one category keeps nothing under another that shares it
-        assert self._tied(("Economics", "Sports"), ("Sports · Soccer", "Economics · Fed")) == [
+        assert self._tied(("Politics",), ("Sports · Soccer", "Economics · Fed")) == [
             "KXFEDDECISION-26DEC", "KXUCLGAME-26APR14ATMBAR"]
 
     def test_a_plain_tag_and_a_tied_tag_together(self):
-        # The plain tag applies under every listed category; the tied one adds
-        # to its own category alone
-        assert self._tied(("Economics", "Sports", "Politics"),
-                          ("Soccer", "Sports · Basketball")) == [
+        # The plain tag applies under every category not excluded; the tied one
+        # adds to its own category alone
+        assert self._tied(None, ("Soccer", "Sports · Basketball")) == [
             "KXNCAAMBGAME-26JAN13WIUEIU", "KXUCLGAME-26APR14ATMBAR", "KXHKANE-26"]
-        assert self._tied(("Economics", "Politics"), ("Congress", "Economics · Fed")) == [
+        assert self._tied(("Sports",), ("Congress", "Economics · Fed")) == [
             "KXFEDDECISION-26DEC", "KXFISAEXTEND-26"]
-
-    def test_a_plain_tag_under_one_category_is_that_category_s_tied_tag(self):
-        # --category Sports --tag Soccer and --category Sports --tag "Sports · Soccer"
-        assert (self._tied(("Sports",), ("Soccer",))
-                == self._tied(("Sports",), ("Sports · Soccer",))
-                == ["KXUCLGAME-26APR14ATMBAR"])
-        # ... but not with a second category listed: the plain tag narrows both
-        assert self._tied(("Sports", "Economics"), ("Soccer",)) == [
-            "KXUCLGAME-26APR14ATMBAR", "KXHKANE-26"]
-        assert self._tied(("Sports", "Economics"), ("Sports · Soccer",)) == [
-            "KXFEDDECISION-26DEC", "KXBRENTW-26SEP19", "KXUCLGAME-26APR14ATMBAR", "KXHKANE-26"]
 
     def test_a_tied_tag_no_series_carries_is_warned_as_a_typo(self, caplog):
         # A misspelt tag half: its category then trades nothing
         with caplog.at_level(logging.WARNING):
-            assert self._tied(("Economics", "Sports"), ("Sports · Baskteball",)) == [
+            assert self._tied(("Politics",), ("Sports · Baskteball",)) == [
                 "KXFEDDECISION-26DEC", "KXBRENTW-26SEP19", "KXHKANE-26"]
         assert ("Tag 'Sports · Baskteball' is no series' category and first tag in Kalshi's "
                 "listing of 6 series, nor any this run's pairs were filed under — check the "
@@ -1720,7 +1846,7 @@ class TestCategoryFilter:
         caplog.clear()
         # A real tag tied to a category that has no such tag is a typo too
         with caplog.at_level(logging.WARNING):
-            assert self._tied(("Politics", "Sports"), ("Politics · Soccer",)) == [
+            assert self._tied(("Economics",), ("Politics · Soccer",)) == [
                 "KXNCAAMBGAME-26JAN13WIUEIU", "KXUCLGAME-26APR14ATMBAR"]
         assert "Tag 'Politics · Soccer' is no series' category and first tag" in caplog.text
         assert caplog.text.count("check the spelling") == 1
@@ -1728,7 +1854,7 @@ class TestCategoryFilter:
         # A real pair of labels draws none, in any case, even when no pair is filed there
         with caplog.at_level(logging.WARNING):
             _seed_series_listing(self.TIED_LISTING)
-            _filtered([_filter_pair("KXFISAEXTEND-26")], categories=("sports",),
+            _filtered([_filter_pair("KXFISAEXTEND-26")], exclude_categories=("economics",),
                       tags=("SPORTS · soccer", "Basketball"))
         assert caplog.text == ""
 
@@ -1739,21 +1865,23 @@ class TestCategoryFilter:
         category = infer_category("KXBTCD-26SEP1517")
         pairs = [_filter_pair("KXBTCD-26SEP1517"), _filter_pair("KXUCLGAME-26APR14ATMBAR")]
         with caplog.at_level(logging.WARNING):
-            kept = _filtered(pairs, categories=(category,), tags=(f"{category} · General",))
-        assert self._tickers(kept) == ["KXBTCD-26SEP1517"]
+            kept = _filtered(pairs, tags=(f"{category} · General",))
+        # (Sports has no tag of the filter, so it trades in full)
+        assert self._tickers(kept) == ["KXBTCD-26SEP1517", "KXUCLGAME-26APR14ATMBAR"]
         assert caplog.text == ""
 
     def test_tied_tags_keep_nothing_without_a_listing(self, caplog):
         with caplog.at_level(logging.WARNING):
-            assert _filtered(self._pairs(), categories=("Sports",),
+            assert _filtered(self._pairs(), exclude_categories=("Politics",),
                              tags=("Sports · Soccer",)) == []
-        assert ("Category/tag filter (categories Sports; tags Sports · Soccer) is set but "
-                "no cached copy exists") in caplog.text
+        assert ("Category/tag filter (exclude categories Politics; tags Sports · Soccer) is set "
+                "but no cached copy exists") in caplog.text
         assert "this run trades none" in caplog.text
 
-    def test_plain_tags_keep_what_the_two_axis_rule_kept(self):
-        # Random filters without a tied tag, against the rule the filter applied
-        # before tied tags: the category is listed (or none is) AND the tag is
+    def test_plain_tags_keep_what_an_exclusion_and_a_tag_list_say(self):
+        # Random filters without a tied tag: the category is not excluded AND
+        # the tag is listed (or none is); with any category excluded, a pair
+        # whose series the listing lacks is left out
         listing = {**self.LISTING, **self.TIED_LISTING}
         _seed_series_listing(listing)
         series = {t: (c, tuple(tags)) for t, (c, tags) in listing.items()}
@@ -1771,14 +1899,16 @@ class TestCategoryFilter:
 
         kept_total = 0
         for _ in range(300):
-            categories, tags = draw(cat_pool), draw(tag_pool)
-            cats = None if categories is None else {c.casefold() for c in categories}
+            excluded, tags = draw(cat_pool), draw(tag_pool)
+            out = {c.casefold() for c in excluded or ()}
             wanted = None if tags is None else {t.casefold() for t in tags}
             expected = [p for p, (c, t) in zip(pairs, labels, strict=True)
-                        if (cats is None or c.casefold() in cats)
-                        and (wanted is None or t.casefold() in wanted)]
-            kept = _filtered(pairs, categories=categories, tags=tags)
-            assert [id(p) for p in kept] == [id(p) for p in expected], (categories, tags)
+                        if c.casefold() not in out
+                        and (wanted is None or t.casefold() in wanted)
+                        and (excluded is None or historical.series_ticker(
+                            p.market_a.event_ticker) in series)]
+            kept = _filtered(pairs, exclude_categories=excluded, tags=tags)
+            assert [id(p) for p in kept] == [id(p) for p in expected], (excluded, tags)
             kept_total += len(kept)
         assert 0 < kept_total < 300 * len(pairs)
 
@@ -1802,12 +1932,14 @@ class TestCategoryFilter:
         monkeypatch.setattr(historical, "_historical_get", no_request)
         _seed_series_listing(self.LISTING, fetched_at=datetime(2020, 1, 1, tzinfo=UTC))
         with caplog.at_level(logging.WARNING):
-            assert self._tickers(_filtered(self._pairs(), categories=("Commodities",))) == [
-                "KXBRENTW-26SEP19"]
+            assert "KXBRENTW-26SEP19" not in self._tickers(
+                _filtered(self._pairs(), exclude_categories=("Commodities",)))
         assert requests == []
         assert "Series category listing unavailable" not in caplog.text
 
     def test_prod_refreshes_a_stale_listing_with_its_own_client(self, monkeypatch):
+        # Stale: KXBRENTW as Sports, KXUCLGAME not listed (so left out under
+        # an exclusion); fresh: KXBRENTW as Commodities, KXUCLGAME as Sports
         _seed_series_listing({"KXBRENTW": ["Sports", ["Soccer"]]},
                              fetched_at=datetime(2020, 1, 1, tzinfo=UTC))
         clients = []
@@ -1815,12 +1947,15 @@ class TestCategoryFilter:
         def fresh(client, path, **params):
             clients.append(client)
             return {"series": [{"ticker": "KXBRENTW", "category": "Commodities",
-                                "tags": ["Oil & Gas"]}]}
+                                "tags": ["Oil & Gas"]},
+                               {"ticker": "KXUCLGAME", "category": "Sports",
+                                "tags": ["Soccer"]}]}
 
         monkeypatch.setattr(historical, "_historical_get", fresh)
         client = MagicMock()
-        out = _filtered(self._pairs(), categories=("Commodities",), listing_client=client)
-        assert self._tickers(out) == ["KXBRENTW-26SEP19"]
+        out = _filtered(self._pairs(), exclude_categories=("Commodities",),
+                        listing_client=client)
+        assert self._tickers(out) == ["KXUCLGAME-26APR14ATMBAR"]
         assert clients == [client]
 
     # A copy of test_dashboard.py's TestReturnsByCategory.SERIES: importing a
@@ -1863,19 +1998,35 @@ class TestCategoryFilter:
             assert subcategory.startswith(f"{category} · ")
             filed.setdefault((category, subcategory[len(category) + 3:]), []).append(event)
         assert len(filed) >= 6
+        categories = {c for c, _ in filed}
+
+        def listed(event):
+            # Under an exclusion a series the listing lacks is left out
+            return historical.series_ticker(event) in self.DASHBOARD_SERIES
+
         for (category, tag), expected in filed.items():
-            kept = _filtered(pairs, categories=(category,), tags=(tag,))
-            assert self._tickers(kept) == expected, (category, tag)
-        # ... and each category alone keeps exactly its trades, whatever the tag
-        for category in {c for c, _ in filed}:
-            expected = [e for (c, _), es in filed.items() if c == category for e in es]
-            kept = _filtered(pairs, categories=(category,))
+            # Every other category excluded, the tag tied to this one
+            others = tuple(sorted(categories - {category}))
+            kept = _filtered(pairs, exclude_categories=others or None,
+                             tags=(f"{category} · {tag}",))
+            assert self._tickers(kept) == [e for e in expected if not others or listed(e)], (
+                category, tag)
+            # With no exclusion, the tied tag alone keeps its own pairs
+            # (every other category has no tag of the filter, so trades in full)
+            kept = _filtered(pairs, tags=(f"{category} · {tag}",))
+            assert set(expected) <= set(self._tickers(kept)), (category, tag)
+        # ... and excluding a category drops exactly its trades, whatever the tag
+        for category in categories:
+            expected = [e for (c, _), es in filed.items() if c != category for e in es
+                        if listed(e)]
+            kept = _filtered(pairs, exclude_categories=(category,))
             assert sorted(self._tickers(kept)) == sorted(expected), category
 
     def test_a_tag_is_matched_under_every_category_and_in_any_case(self):
-        # A plain tag is matched under every listed category, where a dashboard
-        # Tag option belongs to one category; and every tag, plain or tied, is
-        # matched in any letter case, where the options are case-exact
+        # A plain tag is matched under every category not excluded, where a
+        # dashboard Exclude tags option belongs to one category; and every tag,
+        # plain or tied, is matched in any letter case, where the options are
+        # case-exact
         listing = {"KXCLUBWC": ["Sports", ["Soccer"]], "KXHKANE": ["Economics", ["Soccer"]],
                    "KXANIMEB": ["Entertainment", ["Anime Awards"]],
                    "ANIMEB": ["Entertainment", ["Anime awards"]]}
@@ -1883,22 +2034,22 @@ class TestCategoryFilter:
         events = ["KXCLUBWC-1", "KXHKANE-1", "KXANIMEB-1", "ANIMEB-1"]
         pairs = [_filter_pair(e) for e in events]
         series = {t: (c, tuple(tags)) for t, (c, tags) in listing.items()}
-        # Four Tag options on the page ...
+        # Four Exclude tags options on the page ...
         assert [dashboard._trade_category(self._trade(e), series)[1] for e in events] == [
             "Sports · Soccer", "Economics · Soccer", "Entertainment · Anime Awards",
             "Entertainment · Anime awards"]
-        # ... "Sports · Soccer" is --category Sports --tag Soccer; --tag Soccer
-        # alone keeps every category's Soccer series
-        assert self._tickers(_filtered(pairs, categories=("Sports",), tags=("Soccer",))) == [
-            "KXCLUBWC-1"]
+        # ... --tag "Sports · Soccer" narrows Sports alone; --tag Soccer alone
+        # keeps every category's Soccer series
+        assert self._tickers(_filtered(pairs, exclude_categories=("Economics",),
+                                       tags=("Soccer",))) == ["KXCLUBWC-1"]
         assert self._tickers(_filtered(pairs, tags=("Soccer",))) == ["KXCLUBWC-1", "KXHKANE-1"]
         # ... and either spelling of one tag keeps both options' series
         for spelling in ("Anime Awards", "Anime awards"):
-            assert self._tickers(_filtered(pairs, categories=("Entertainment",),
+            assert self._tickers(_filtered(pairs, exclude_categories=("Sports", "Economics"),
                                            tags=(spelling,))) == ["KXANIMEB-1", "ANIMEB-1"]
             # ... tied to its category too
             assert self._tickers(_filtered(
-                pairs, categories=("Entertainment",),
+                pairs, exclude_categories=("Sports", "Economics"),
                 tags=(f"entertainment · {spelling}",))) == ["KXANIMEB-1", "ANIMEB-1"]
 
     def test_dashboard_and_live_filter_share_one_filing_rule(self):
@@ -1912,12 +2063,12 @@ class TestCategoryFilter:
 
         monkeypatch.setattr(main, "load_series_categories", no_read)
         listing = {t: (c, tuple(tags)) for t, (c, tags) in self.LISTING.items()}
-        settings = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, categories=("sports",))
+        settings = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, exclude_categories=("sports",))
         with caplog.at_level(logging.INFO):
             out = main._filter_by_category(self._pairs(), settings, MagicMock(),
                                            series_categories=listing)
-        assert self._tickers(out) == ["KXNCAAMBGAME-26JAN13WIUEIU", "KXUCLGAME-26APR14ATMBAR"]
-        assert "kept 2 of 10 candidate pairs" in caplog.text
+        assert self._tickers(out) == self.ALL[2:6]
+        assert "kept 4 of 10 candidate pairs" in caplog.text
         # No filter set: the pairs come back untouched, whatever is handed in
         pairs = self._pairs()
         no_filter = LiveSettings(True, (0.0, 1.0), 0.75, 0.2)
@@ -3659,7 +3810,7 @@ class TestLiveSettingsReachEverySite:
 
     _SETTINGS = LiveSettings(tier_floors=False, spread_band=(0.05, 0.9),
                              interval_discount=0.6, size_cap=0.35, same_title_size_cap=0.25,
-                             categories=("economics", "POLITICS"),
+                             exclude_categories=("sports", "WORLD"),
                              tags=("Inflation", "elections"), rebalance=True,
                              min_price_move=0.10, sell_at=0.85, sell_min_days=3)
 
@@ -7931,7 +8082,12 @@ class TestLiveRebalanceTextsSayWhatARunDoes:
         assert remedy in self._text("README.md")
         notice = ("The saved live defaults were saved before Rebalance. Below: their values, "
                   "read as")
-        assert notice in self._source_text(defaults_server._outdated_confirm_html)
+        # Rendered for a file saved before Rebalance, proposing exactly its values
+        proposal = dataclasses.replace(config.LIVE_DEFAULTS_SEED, min_price_move=0.1)
+        outdated = config.LiveDefaultsOutdated(
+            "m", proposal, ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise"))
+        assert notice in html.unescape(
+            defaults_server._outdated_confirm_html(outdated, proposal))
         assert notice in claude
         link = "this link was built before Rebalance (it names"
         assert link in self._source_text(defaults_server._proposal)
@@ -9576,7 +9732,7 @@ class TestResultFile:
             caplog (pytest.LogCaptureFixture): Captures the run's log lines.
             dry_run (bool): Pass --dry-run.
             status (str): The status execute_trades gives each pair.
-            argv (tuple): More command-line flags, e.g. ("--category", "Sports").
+            argv (tuple): More command-line flags, e.g. ("--exclude-category", "Sports").
             result_file (bool): Pass --result-file; without it no file is read back.
             **stubs: main's names to replace, e.g. read_account_balance=...
 
@@ -10127,7 +10283,7 @@ class TestResultFile:
                   and r.getMessage().startswith("Could not describe a pair for the run result")]
         assert len(errors) == 2
 
-    @pytest.mark.parametrize("argv", [(), ("--category", "Climate and Weather")],
+    @pytest.mark.parametrize("argv", [(), ("--exclude-category", "Sports")],
                              ids=["no-filter", "category-filter"])
     def test_the_listing_is_read_once_before_any_book(self, monkeypatch, tmp_path, caplog,
                                                        argv):
@@ -10178,7 +10334,7 @@ class TestResultFile:
         filtered = [r.getMessage() for r in records
                     if r.getMessage().startswith("Category/tag filter (")]
         assert filtered == ([] if not argv else [
-            "Category/tag filter (categories Climate and Weather; tags any): kept 1 of 1 "
+            "Category/tag filter (exclude categories Sports; tags any): kept 1 of 1 "
             "candidate pairs"])
 
     def test_with_no_listing_a_trade_has_no_category(self, monkeypatch, tmp_path, caplog):
@@ -10350,7 +10506,7 @@ def _other_toggles(target: LiveSettings) -> LiveSettings:
         interval_discount=0.55 if target.interval_discount != 0.55 else 0.65,
         size_cap=0.5 if target.size_cap != 0.5 else 0.6,
         same_title_size_cap=0.25 if target.same_title_size_cap != 0.25 else 0.3,
-        categories=None if target.categories is not None else ("Saved",),
+        exclude_categories=None if target.exclude_categories is not None else ("Saved",),
         tags=None if target.tags is not None else ("Saved",),
         # The opposite rebalance switch; a 25c minimum when rebalancing here
         rebalance=not target.rebalance,
@@ -10374,25 +10530,25 @@ _ARGV_TARGETS = {
     "seed": config.LIVE_DEFAULTS_SEED,
     "k-with-many-decimals-tier-floors-on": LiveSettings(
         tier_floors=True, spread_band=(0.15, 0.85), interval_discount=0.7123456789012345,
-        size_cap=0.05, same_title_size_cap=1.0, categories=("Economics",), tags=None,
+        size_cap=0.05, same_title_size_cap=1.0, exclude_categories=("Economics",), tags=None,
         rebalance=True),
     "tier-floors-off-caps-100-and-5": LiveSettings(
         tier_floors=False, spread_band=(0.0, 1.0), interval_discount=1.0,
         size_cap=1.0, same_title_size_cap=0.05,
-        categories=("Economics", "Sports", "Climate and Weather"), tags=("Soccer",)),
+        exclude_categories=("Economics", "Sports", "Climate and Weather"), tags=("Soccer",)),
     "names-starting-with-a-dash": LiveSettings(
         tier_floors=True, spread_band=(0.1234567, 0.6543210987654321),
         interval_discount=1 / 3, size_cap=0.35, same_title_size_cap=0.45,
-        categories=("-Minus", "Politics"), tags=("-Dash", "Basketball", "Pro Football")),
-    "several-tags-any-category": LiveSettings(
+        exclude_categories=("-Minus", "Politics"), tags=("-Dash", "Basketball", "Pro Football")),
+    "several-tags-no-excluded-category": LiveSettings(
         tier_floors=False, spread_band=(0.05, 0.5), interval_discount=0.8,
-        size_cap=0.2, same_title_size_cap=0.2, categories=None,
+        size_cap=0.2, same_title_size_cap=0.2, exclude_categories=None,
         tags=("Soccer", "Basketball", "--double dash")),
     # Tags tied to a category ("Category · Tag"), beside a plain one
     "tags-tied-to-a-category": LiveSettings(
         tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
         size_cap=0.1, same_title_size_cap=0.2,
-        categories=("Economics", "Sports", "Climate and Weather"),
+        exclude_categories=("Economics", "Politics"),
         tags=("Sports · Basketball", "Sports · Pro Football",
               "climate and weather · Hurricanes", "Fed")),
     # Selling on: a level and a minimum, the smallest and the largest level, and
@@ -10446,7 +10602,7 @@ class TestLiveSettingsArgv:
         assert args.spread_min is not None and args.spread_max is not None
         assert args.interval_discount is not None
         assert args.size_cap is not None and args.same_title_size_cap is not None
-        assert (args.category is not None) or args.any_category
+        assert (args.exclude_category is not None) or args.no_exclude_category
         assert (args.tag is not None) or args.any_tag
         # The rebalance settings are given either way: the switch on or off,
         # whole cents or --no-min-price-move
@@ -10473,7 +10629,7 @@ class TestLiveSettingsArgv:
             "--no-tier-floors", "--spread-min=0.0", "--spread-max=0.5",
             "--interval-discount=0.8", "--size-cap=10", "--same-title-size-cap=20",
             "--rebalance", "--no-min-price-move", "--no-sell", "--no-sell-min-days",
-            "--any-category", "--any-tag"]
+            "--no-exclude-category", "--any-tag"]
 
     def test_rebalancing_is_spelled_as_a_switch_and_whole_cents(self):
         argv = config.live_settings_argv(_ARGV_TARGETS["rebalancing-after-a-15c-move"])
@@ -10525,9 +10681,9 @@ class TestLiveSettingsArgv:
     def test_a_name_that_begins_with_a_dash_is_read_as_a_name(self):
         target = _ARGV_TARGETS["names-starting-with-a-dash"]
         argv = config.live_settings_argv(target)
-        assert "--category=-Minus" in argv and "--tag=-Dash" in argv
+        assert "--exclude-category=-Minus" in argv and "--tag=-Dash" in argv
         args = main._build_parser().parse_args(["--mode", "prod", *argv])
-        assert args.category == ["-Minus", "Politics"]
+        assert args.exclude_category == ["-Minus", "Politics"]
         assert args.tag == ["-Dash", "Basketball", "Pro Football"]
 
     def test_main_trades_the_spelled_settings(self, monkeypatch):

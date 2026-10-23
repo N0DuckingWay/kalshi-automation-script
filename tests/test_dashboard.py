@@ -2156,7 +2156,7 @@ class TestLiveRuleHeader:
     def _sweep(*, live_tier_floors=True, live_spread_band=(0.0, 1.0),
                primary_band=(0.0, 1.0), size_cap=0.2, same_title_size_cap=1.0,
                calibrations_by_band=None, tier_off_calibrations_by_band=None,
-               tier_off_scenarios=None, live_categories=None, live_tags=None,
+               tier_off_scenarios=None, live_exclude_categories=None, live_tags=None,
                same_event_ladders=None, config_same_event_ladders=None,
                live_sizing=(None, None, None)) -> BacktestSweep:
         """A sweep at k 0.75 recording these live_* fields; live_sizing is the
@@ -2173,7 +2173,7 @@ class TestLiveRuleHeader:
             same_event_ladders=same_event_ladders,
             config_same_event_ladders=config_same_event_ladders,
             live_tier_floors=live_tier_floors, live_spread_band=live_spread_band,
-            live_categories=live_categories, live_tags=live_tags,
+            live_exclude_categories=live_exclude_categories, live_tags=live_tags,
             live_interval_discount=live_k, live_size_cap=live_cap,
             live_same_title_size_cap=live_st,
         )
@@ -2502,7 +2502,7 @@ class TestLiveRuleHeader:
                 ("Sports", "Basketball"))
 
     def _filtered(self, categories, tags, *, bar=True, **kw) -> str:
-        sweep = self._sweep(live_categories=categories, live_tags=tags, **kw)
+        sweep = self._sweep(live_exclude_categories=categories, live_tags=tags, **kw)
         return self._text(sweep, self._bar(categories=self._CATS, subcats=self._SUBCATS)
                           if bar else None)
 
@@ -2514,40 +2514,44 @@ class TestLiveRuleHeader:
                 "this run filed a pair under)")
 
     @pytest.mark.parametrize("categories, tags, tail", [
-        # One category listed of three: the other two ticked (All categories and
-        # then that one unticked would be as many clicks, so the short way is not
-        # used)
-        (("economics",), None, "this run's primary, with Oil &amp; Gas, Sports ticked in "
-                               "the Exclude categories menu"),
-        # ... narrowed to one of its two tags: the other tag ticked too, named as the
-        # Exclude tags menu names it while one category alone is kept
-        (("Economics",), ("fed",), "this run's primary, with Oil &amp; Gas, Sports ticked in "
-                                   "the Exclude categories menu and Inflation ticked in the "
-                                   "Exclude tags menu"),
+        # Two categories excluded of three, in any letter case: those two ticked
+        # (All categories and then the third unticked would be as many clicks, so
+        # the short way is not used)
+        (("oil & gas", "SPORTS"), None, "this run's primary, with Oil &amp; Gas, Sports "
+                                        "ticked in the Exclude categories menu"),
+        # ... the one kept narrowed to one of its two tags: the other tag ticked
+        # too, named as the Exclude tags menu names it while one category alone
+        # is kept
+        (("Oil & Gas", "Sports"), ("fed",), "this run's primary, with Oil &amp; Gas, Sports "
+                                            "ticked in the Exclude categories menu and "
+                                            "Inflation ticked in the Exclude tags menu"),
         # A plain tag under every category: Economics is narrowed to it (its other tag
         # ticked), Oil & Gas has no other tag so counts in full, and Sports has none
         # of it so is excluded
         (None, ("Fed",), "this run's primary, with Sports ticked in the Exclude categories "
                          "menu and Economics · Inflation ticked in the Exclude tags menu"),
-        # Two categories listed, so the third is excluded
-        (("Economics", "Sports"), None, "this run's primary, with Oil &amp; Gas ticked in "
-                                        "the Exclude categories menu"),
+        # One category excluded
+        (("Oil & Gas",), None, "this run's primary, with Oil &amp; Gas ticked in "
+                               "the Exclude categories menu"),
         # A tied tag narrows its own category (its other tag ticked); the others
         # count in full
-        (("Economics", "Oil & Gas"), ("Economics · Inflation",),
+        (("Sports",), ("Economics · Inflation",),
          "this run's primary, with Sports ticked in the Exclude categories menu and "
          "Economics · Fed ticked in the Exclude tags menu"),
-        # Every category listed and one narrowed: only a tag to tick
-        (("Economics", "Oil & Gas", "Sports"), ("Economics · Fed",),
+        # Nothing excluded and one category narrowed: only a tag to tick
+        (None, ("Economics · Fed",),
          "this run's primary, with Economics · Inflation ticked in the Exclude tags menu"),
-        # Every pair the run filed is kept: the page as rendered shows the filter
-        (("Economics", "Oil & Gas", "Sports", "Politics"), None,
-         f"this run's primary, with {_NOTHING}"),
-        (("Politics",), None, "this run's primary; no scenario of this run has a pair filed "
-                              "under the live category/tag filter"),
-        # A tag no pair of the run carries under that category
-        (("Economics",), ("Basketball",), "this run's primary; no scenario of this run has a "
-                                          "pair filed under the live category/tag filter"),
+        # Only a category the run never filed a pair under is excluded: every
+        # pair the run filed is kept, so the page as rendered shows the filter
+        (("Politics",), None, f"this run's primary, with {_NOTHING}"),
+        # Every category excluded
+        (("Economics", "Oil & Gas", "Sports"), None,
+         "this run's primary; no scenario of this run has a pair filed under the live "
+         "category/tag filter"),
+        # A tag no pair of the run carries under the one category kept
+        (("Oil & Gas", "Sports"), ("Basketball",),
+         "this run's primary; no scenario of this run has a pair filed under the live "
+         "category/tag filter"),
     ])
     def test_a_filter_names_what_to_exclude_and_tick(self, categories, tags, tail):
         text = self._filtered(categories, tags)
@@ -2659,24 +2663,27 @@ class TestLiveRuleHeader:
     _TICK_SUBCATS = (("Economics", "Fed"), ("Sports", "Basketball"), ("Sports", "Soccer"))
 
     # Each answer is (categories to exclude, categories kept, tags to tick in the
-    # Exclude tags menu, the other tags it shows): the live filter lists what to
-    # trade, so the tags to tick are the ones it leaves out
+    # Exclude tags menu, the other tags it shows): the live filter lists the
+    # categories not to trade and the tags to trade, so the tags to tick are the
+    # ones it leaves out
     @pytest.mark.parametrize("categories, tags, ticks", [
         # The example of the multi-choice filter: one category whole, one narrowed,
         # so the narrowed one's other tag is ticked
-        (("Economics", "Sports"), ("Sports · Basketball",),
+        (None, ("Sports · Basketball",),
          ((), ("Economics", "Sports"), ("Sports · Soccer",),
           ("Economics · Fed", "Sports · Basketball"))),
-        # Letter case never matters, tied halves included
-        (("economics", "SPORTS"), ("sports · BASKETBALL",),
+        # Letter case never matters, tied halves and exclusions included
+        (("POLITICS",), ("sports · BASKETBALL",),
          ((), ("Economics", "Sports"), ("Sports · Soccer",),
           ("Economics · Fed", "Sports · Basketball"))),
+        (("economics",), None, (("Economics",), ("Sports",), (), ("Basketball", "Soccer"))),
         # Every tag of a category kept is the category in full
-        (("Sports",), ("Sports · Basketball", "Sports · Soccer"),
+        (("Economics",), ("Sports · Basketball", "Sports · Soccer"),
          (("Economics",), ("Sports",), (), ("Basketball", "Soccer"))),
-        # A plain tag is looked for under each listed category; with one category
-        # kept of the two, the tag is named as the Exclude tags menu then names it
-        (("Economics", "Sports"), ("Soccer",),
+        # A plain tag is looked for under each category not excluded; with one
+        # category kept of the two, the tag is named as the Exclude tags menu then
+        # names it
+        (("Politics",), ("Soccer",),
          (("Economics",), ("Sports",), ("Basketball",), ("Soccer",))),
         (None, ("Soccer",), (("Economics",), ("Sports",), ("Basketball",), ("Soccer",))),
         # No filter keeps everything; a tag no pair carries keeps nothing
@@ -2685,7 +2692,7 @@ class TestLiveRuleHeader:
           ("Economics · Fed", "Sports · Basketball", "Sports · Soccer"))),
         (None, ("Nope",), (("Economics", "Sports"), (), (), ())),
         # A category the bar does not offer changes nothing
-        (("Economics", "Politics"), None, (("Sports",), ("Economics",), (), ("Fed",))),
+        (("Sports", "Politics"), None, (("Sports",), ("Economics",), (), ("Fed",))),
     ])
     def test_the_ticks_follow_the_one_live_rule(self, categories, tags, ticks):
         bar = self._bar(categories=self._TICK_CATS, subcats=self._TICK_SUBCATS)
@@ -2694,20 +2701,20 @@ class TestLiveRuleHeader:
     def test_a_tag_is_named_as_the_exclude_tags_menu_names_it(self):
         # The Exclude tags menu names a tag with its category in front, unless one
         # category alone is kept of several (the page script's lone)
-        def ticks(categories, subcats, live_categories, live_tags):
+        def ticks(categories, subcats, live_exclude_categories, live_tags):
             bar = self._bar(categories=categories, subcats=subcats)
-            return dashboard._live_filter_ticks(live_categories, live_tags, bar).tags
+            return dashboard._live_filter_ticks(live_exclude_categories, live_tags, bar).tags
 
         sports = (("Sports", "Basketball"), ("Sports", "Soccer"))
         # A page of one category: nothing is excluded, so the category stays in front
         assert ticks(("Sports",), sports, None, ("Soccer",)) == ("Sports · Basketball",)
         # One category kept of two: the tag alone
         assert ticks(("Economics", "Sports"), (("Economics", "Fed"), *sports),
-                     ("Sports",), ("Soccer",)) == ("Basketball",)
+                     ("Economics",), ("Soccer",)) == ("Basketball",)
         # Two letter-case twins kept of three are two categories in the menu
         assert ticks(("Health", "Sports", "health"),
                      (("Health", "Flu"), ("Health", "Polio"), ("Sports", "Golf"),
-                      ("health", "Flu")), ("Health",), ("Polio",)) == ("Health · Flu",)
+                      ("health", "Flu")), ("Sports",), ("Polio",)) == ("Health · Flu",)
 
     def test_letter_case_twins_are_decided_together_and_named_once(self):
         # The page leaves out "Health" and "health" together and a tag of either
@@ -2724,10 +2731,10 @@ class TestLiveRuleHeader:
 
         # Narrowed to Polio: the two Flu tags, one tag to the filter, are left out,
         # named once by Health's, first in the bar
-        assert ticks(("health",), ("Health · Polio",)) == (
+        assert ticks(("Sports",), ("Health · Polio",)) == (
             ("Sports",), ("Health",), ("Health · Flu",), ("health · Polio",))
-        assert ticks(("Sports",), None) == (("Health",), ("Sports",), (), ("Golf",))
-        assert ticks(("HEALTH",), None) == (
+        assert ticks(("HEALTH",), None) == (("Health",), ("Sports",), (), ("Golf",))
+        assert ticks(("sports",), None) == (
             ("Sports",), ("Health",), (), ("Health · Flu", "health · Polio"))
         # The two Flu tags are one tag, kept: Polio is the one left out
         assert ticks(None, ("Flu",)) == (
@@ -2749,7 +2756,7 @@ class TestLiveRuleHeader:
         bar = self._bar(categories=("Health", "Politics", "Sports", "Weather", "health"),
                         subcats=(("Health", "Flu"), ("Politics", "Senate"), ("Sports", "Golf"),
                                  ("Weather", "Rain"), ("health", "Flu")))
-        sweep = self._sweep(live_categories=("health",))
+        sweep = self._sweep(live_exclude_categories=("Politics", "Sports", "Weather"))
         assert self._text(sweep, bar).endswith(
             "— this run's primary, with All categories ticked in the Exclude categories "
             "menu and Health unticked there")
@@ -2758,7 +2765,7 @@ class TestLiveRuleHeader:
             "only Health, health")
 
     def test_a_tied_tag_in_the_header_names_the_tag_to_tick(self):
-        sweep = self._sweep(live_categories=("Economics", "Sports"),
+        sweep = self._sweep(live_exclude_categories=None,
                             live_tags=("Sports · Basketball",))
         text = self._text(sweep, self._bar(categories=self._TICK_CATS,
                                            subcats=self._TICK_SUBCATS))
@@ -2784,7 +2791,7 @@ class TestLiveRuleHeader:
         Args:
             cats (tuple): The bar's categories.
             subcats (tuple): The bar's (category, tag) pairs.
-            listed: The live filter's categories (None = any).
+            listed: The live filter's excluded categories (None = none).
             tags: The live filter's tags (None = any).
 
         Returns:
@@ -2830,7 +2837,8 @@ class TestLiveRuleHeader:
         tied = tuple(dict.fromkeys(f"{c}{sep}{t}" for c, t in subcats
                                    if c.casefold() in groups
                                    and (c.casefold(), t.casefold()) not in ticked_keys))
-        page_keeps = config.trade_filter_for(tuple(remaining), tied or None)
+        page_keeps = config.trade_filter_for(
+            tuple(name for name in cats if name not in remaining) or None, tied or None)
         for c, t in subcats:
             shown = (c.casefold() not in excluded_keys
                      and (c.casefold(), t.casefold()) not in ticked_keys)
@@ -2859,8 +2867,8 @@ class TestLiveRuleHeader:
 
         Args:
             rng (random.Random): The seeded source.
-            cats: Category names to list from ("Politics" is added, a category
-                no bar offers).
+            cats: Category names to exclude from ("Politics" is added, a
+                category no bar offers).
             tag_names: Tag names to draw from.
 
         Returns:
@@ -2870,13 +2878,15 @@ class TestLiveRuleHeader:
         cased = [str, str.upper, str.lower]
         pool = list(dict.fromkeys([*cats, "Politics"]))
         listed = (None if rng.random() < 0.3 else tuple(
-            rng.choice(cased)(name) for name in rng.sample(pool, rng.randint(1, min(3, len(pool))))))
+            rng.choice(cased)(name) for name in rng.sample(pool, rng.randint(1, len(pool)))))
+        out = {name.casefold() for name in listed or ()}
+        open_cats = [name for name in pool if name.casefold() not in out]
         chosen: list[str] = []
         for _ in range(rng.randint(0, 3)):
             tag = rng.choice(cased)(rng.choice(tag_names))
-            # A tag tied to a category only where that category is listed
-            if listed and rng.random() < 0.5:
-                tag = f"{rng.choice(listed)}{sep}{tag}"
+            # A tag tied to a category only where that category is not excluded
+            if open_cats and rng.random() < 0.5:
+                tag = f"{rng.choice(cased)(rng.choice(open_cats))}{sep}{tag}"
             chosen.append(tag)
         return listed, tuple(dict.fromkeys(chosen)) or None
 
@@ -2908,7 +2918,7 @@ class TestLiveRuleHeader:
 
     def test_random_bars_and_filters_keep_what_the_live_filter_keeps(self):
         # Seeded random bars, with letter-case twins among both the categories
-        # and the tags, and seeded random include filters over their names:
+        # and the tags, and seeded random exclude filters over their names:
         # the header's ticks, applied through the page's exclude rule, keep
         # exactly the pairs config.trade_filter_for keeps (_follow_ticks)
         rng = random.Random(29)
@@ -2936,7 +2946,8 @@ class TestLiveRuleHeader:
                 "twin excluded", "twin tag"} <= seen
 
     def test_a_filter_on_a_grid_cell_follows_its_band_choice(self):
-        sweep = self._sweep(live_spread_band=(0.3, 0.6), live_categories=("Sports",),
+        sweep = self._sweep(live_spread_band=(0.3, 0.6),
+                            live_exclude_categories=("Economics", "Oil & Gas"),
                             calibrations_by_band={(0.0, 1.0): None, (0.3, 0.6): None})
         bar = self._bar(bands=[(0.0, 1.0), (0.3, 0.6)], categories=self._CATS,
                         subcats=self._SUBCATS)
@@ -2947,16 +2958,16 @@ class TestLiveRuleHeader:
         # filter leaves out to tick after them, and a filter that keeps every pair
         # the run filed needs the menus left as they are
         for categories, tags, clause in [
-                (("Economics", "Sports"), ("Economics · Fed",),
+                (("Oil & Gas",), ("Economics · Fed",),
                  "then tick Oil &amp; Gas in the Exclude categories menu and tick "
                  "Economics · Inflation in the Exclude tags menu"),
-                (("Economics",), ("Economics · Fed",),
+                (("Oil & Gas", "Sports"), ("Economics · Fed",),
                  "then tick Oil &amp; Gas, Sports in the Exclude categories menu and tick "
                  "Inflation in the Exclude tags menu"),
-                (("Oil & Gas", "Economics", "Sports"), ("Economics · Fed",),
+                (None, ("Economics · Fed",),
                  "then tick Economics · Inflation in the Exclude tags menu"),
-                (("Oil & Gas", "Economics", "Sports"), None, f"then leave {self._NOTHING}")]:
-            swept = dataclasses.replace(sweep, live_categories=categories, live_tags=tags)
+                (("Politics",), None, f"then leave {self._NOTHING}")]:
+            swept = dataclasses.replace(sweep, live_exclude_categories=categories, live_tags=tags)
             assert self._text(swept, bar).endswith(
                 "— choose Spread band max(tier,0.3)-0.6 and Tier floors on in the filter bar, "
                 f"{clause}")
@@ -3102,40 +3113,40 @@ class TestLiveRuleHeader:
         # health took Health with it, and the page showed no trade
         if page_kind == "twins":
             series = self._TWIN_LIVE_SERIES
-            everything = ("Economics", "Health", "Politics", "Sports", "Weather")
+            others = ("Economics", "Politics", "Sports", "Weather")
             filters = [
-                (("Health",), ("covid",)),   # the short way: keep Health, tick Flu, Polio
+                (others, ("covid",)),        # the short way: keep Health, tick Flu, Polio
                 (None, ("Flu",)),            # the short way: keep Health, tick COVID, Polio
-                (("Economics", "Sports"), None),  # exclude Health (and health)
-                (everything, ("Health · Covid", "Sports · Golf")),  # tags only
-                (("Sports",), ("Golf",)),    # one category kept: Covid named alone
-                (("health",), None),
-                (everything, None),
+                (("Health", "Politics", "Weather"), None),  # exclude Health (and health)
+                (None, ("Health · Covid", "Sports · Golf")),  # tags only
+                (("Economics", "Health", "Politics", "Weather"), ("Golf",)),  # Covid alone
+                (("economics", "POLITICS", "sports", "Weather"), None),
+                (("Elections",), None),      # a category no pair was filed under
             ]
         elif page_kind == "many tags":
             series = self._MANY_TAG_LIVE_SERIES
-            everything = ("Economics", "Health", "Politics", "Sports", "Weather")
+            others = ("Economics", "Health", "Politics", "Weather")
             filters = [
                 # Both menus the short way, the twin group Golf/GOLF unticked
                 # after All tags
-                (("Sports",), ("golf",)),
-                (("Sports",), ("Basketball",)),  # both menus the short way
+                (others, ("golf",)),
+                (others, ("Basketball",)),   # both menus the short way
                 (None, ("Golf", "Hockey")),  # two tags named alone
                 # Both menus named box by box, GOLF ticked taking Golf with it
-                (("Economics", "Health", "Sports"), ("Sports · Hockey",)),
-                (everything, ("Sports · Golf",)),  # tags only
-                (everything, None),
+                (("Politics", "Weather"), ("Sports · Hockey",)),
+                (None, ("Sports · Golf",)),  # tags only
+                (("Elections",), None),      # a category no pair was filed under
             ]
         else:
             series = _MIX_SERIES
             filters = [
-                (("Cat0", "Cat2"), ("Cat2 · Tag5",)),
+                (("Cat1",), ("Cat2 · Tag5",)),
                 (None, ("Tag0", "Tag4")),
-                (("cat1",), None),
-                (("Cat0", "Cat1", "Cat2"), ("cat0 · tag3", "Cat0 · Tag6")),
-                (("Cat1",), ("Cat1 · Tag1", "Cat1 · Tag4")),
-                (("Cat2",), ("Cat2 · Tag5",)),
-                (("Cat0", "Cat1", "Cat2", "Politics"), None),
+                (("cat0", "CAT2"), None),
+                (None, ("cat0 · tag3", "Cat0 · Tag6")),
+                (("Cat0", "Cat2"), ("Cat1 · Tag1", "Cat1 · Tag4")),
+                (("Cat0", "Cat1"), ("Cat2 · Tag5",)),
+                (("Politics",), None),
             ]
         trades = _counted_trades(series)
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
@@ -3143,7 +3154,7 @@ class TestLiveRuleHeader:
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
         sweep = dataclasses.replace(
             _mix_sweep(trades), live_tier_floors=True, live_spread_band=(0.0, 1.0),
-            live_categories=filters[0][0], live_tags=filters[0][1])
+            live_exclude_categories=filters[0][0], live_tags=filters[0][1])
         page = dashboard.generate_dashboard(
             trades, sweep.primary.equity_df, _MIX_START, _MIX_BALANCE, sweep=sweep,
             interval_discount=0.75, series_categories=series).read_text(encoding="utf-8")
@@ -3159,7 +3170,7 @@ class TestLiveRuleHeader:
         expected, kinds = [], set()
         for i, (cats, tags) in enumerate(filters):
             line = dashboard._live_rule_html(
-                dataclasses.replace(sweep, live_categories=cats, live_tags=tags), bar=data)
+                dataclasses.replace(sweep, live_exclude_categories=cats, live_tags=tags), bar=data)
             tail = html.unescape(line).removesuffix("</p>").split("— this run's primary, ")[1]
             said = self._read_tail(tail)
             if said["nothing"]:
@@ -8033,9 +8044,10 @@ class TestSaveLiveDefaultsButton:
     enabled by the script only while the bar's scenario on screen can become
     the live settings, and opening the defaults server's confirmation page for
     exactly that scenario — never the selects' choice while a chunk loads, and
-    never the Scenario Explorer's own selects. The address names no category
-    or tag, and the button stays disabled while either menu has a tick. The
-    address it opens is checked against the server's own parser. Its script
+    never the Scenario Explorer's own selects. The address names each category
+    ticked in the Exclude categories menu as a category to exclude, and no tag;
+    the button stays disabled while a tag is ticked or every category is
+    excluded. The address it opens is checked against the server's own parser. Its script
     tests are skipped without a JavaScript runtime; its render and
     _save_target tests are not."""
 
@@ -8087,27 +8099,31 @@ class TestSaveLiveDefaultsButton:
 
         The call must open a new tab with "noopener", the address before its
         query must be the save target's (the defaults server's confirmation
-        page), and every field of the query must appear exactly once.
+        page), and every field of the query but exclude_category must appear
+        exactly once.
 
         Args:
             data (dict): The page's base block.
             opened (dict): One recorded window.open call: url, target, features.
 
         Returns:
-            dict[str, str]: The query's fields and their one value each.
+            dict: The query's fields and their one value each; exclude_category,
+                when sent, maps to the list of its values in the address's order.
 
         Raises:
             AssertionError: If the target, the features or the address differ
                 from those above, the query cannot be parsed strictly, or a
-                field repeats.
+                field other than exclude_category repeats.
         """
         assert opened["target"] == "_blank" and opened["features"] == "noopener"
         url = opened["url"]
         base, _, query = url.partition("?")
         assert base == data["save"]["url"] == _SAVE_URL
         fields = parse_qs(query, keep_blank_values=True, strict_parsing=True)
-        assert all(len(values) == 1 for values in fields.values()), fields
-        return {name: values[0] for name, values in fields.items()}
+        assert all(len(values) == 1 for name, values in fields.items()
+                   if name != "exclude_category"), fields
+        return {name: values if name == "exclude_category" else values[0]
+                for name, values in fields.items()}
 
     @staticmethod
     def _expected(data: dict, bi: int, ki: int, ci: int, tier: str = "on") -> dict:
@@ -8130,15 +8146,16 @@ class TestSaveLiveDefaultsButton:
                 "k": data["ks"][ki]["value"], "size_cap": data["caps"][ci]["value"]}
 
     def _assert_sends(self, data: dict, query: dict, bi: int, ki: int, ci: int,
-                      tier: str = "on") -> None:
+                      tier: str = "on", excluded: tuple = ()) -> None:
         """
         Check that a query names scenario [bi, ki, ci] exactly, and nothing else.
 
         Each number must read back as the base block's own value, and the
-        query must carry the run's same-title cap and the source note, no
-        category or tag (the button saves no category or tag filter), and no
-        other field. The rebalancing and selling fields may also be present
-        (pages with those views send them); the caller checks their values.
+        query must carry the run's same-title cap and the source note, the
+        categories excluded on screen (one exclude_category each, in the
+        menu's order), no tag (the button saves no tag filter), and no other
+        field. The rebalancing and selling fields may also be present (pages
+        with those views send them); the caller checks their values.
 
         Args:
             data (dict): The page's base block.
@@ -8147,10 +8164,13 @@ class TestSaveLiveDefaultsButton:
             ki (int): The k's index.
             ci (int): The size cap's index.
             tier (str): The Tier floors choice on screen, "on" or "off".
+            excluded (tuple): The category names the address must exclude, in
+                order.
 
         Raises:
-            AssertionError: If a field differs, a category or tag is sent, or
-                an unknown field is sent.
+            AssertionError: If a field differs, the exclusions differ, a tag
+                or the retired category field is sent, or an unknown field is
+                sent.
         """
         expected = self._expected(data, bi, ki, ci, tier)
         assert query["tier_floors"] == expected.pop("tier_floors")
@@ -8158,9 +8178,10 @@ class TestSaveLiveDefaultsButton:
             assert float(query[name]) == value, name
         assert float(query["same_title_size_cap"]) == data["save"]["same_title_size_cap"]
         assert query["source"] == data["save"]["source"]
+        assert query.get("exclude_category", []) == list(excluded)
         assert "category" not in query and "tag" not in query
         known = {"tier_floors", "spread_min", "spread_max", "k", "size_cap",
-                 "same_title_size_cap", "source", "rebalance",
+                 "same_title_size_cap", "source", "exclude_category", "rebalance",
                  "min_price_move", "sell_at", "sell_min_days"}
         assert set(query) <= known
         # Rebalance's two fields are always sent together: the server refuses
@@ -8189,7 +8210,8 @@ class TestSaveLiveDefaultsButton:
         assert save["source"].startswith(f"backtest dashboard for {_FLT_START.isoformat()} to ")
         # Every word about the button is Python's: the script writes none
         for words in (dashboard._SAVE_LABEL, dashboard._SAVE_TITLE, dashboard._SAVE_NOTE,
-                      dashboard._SAVE_BLOCKED_TEXT["save_filtered"]):
+                      dashboard._SAVE_BLOCKED_TEXT["save_filtered"],
+                      dashboard._SAVE_BLOCKED_TEXT["save_all_excluded"]):
             assert words not in dashboard._FILTER_JS
         # ... and the address comes from config, never spelled on the page's side
         assert config.DEFAULTS_SERVER_HOST not in dashboard._FILTER_JS
@@ -8229,12 +8251,13 @@ class TestSaveLiveDefaultsButton:
         [opened] = snaps["cap"]["opened"]
         assert float(self._query(data, opened)["size_cap"]) == 1.0
 
-    def test_a_tick_shuts_it_and_nothing_ticked_opens_it_again(self, monkeypatch, tmp_path):
-        # The button saves no category or tag filter: a category left out, a
-        # ticked tag (which ticks no category) or every category left out
-        # keeps it disabled with the reason as its hover text, and a click
-        # opens nothing. Once every box is unticked it saves the scenario
-        # again, naming no category or tag
+    def test_categories_are_saved_as_exclusions_and_a_tag_shuts_it(
+            self, monkeypatch, tmp_path):
+        # A category ticked in the Exclude categories menu is saved as a
+        # category to exclude. A ticked tag (which ticks no category), or
+        # every category left out, keeps the button disabled with the reason
+        # as its hover text, and a click opens nothing. Once every box is
+        # unticked it saves the scenario again, excluding nothing
         page = self._page(monkeypatch, tmp_path)
         data = TestFilterPage._data(page)
         sports = data["categories"].index("Sports")
@@ -8257,13 +8280,19 @@ class TestSaveLiveDefaultsButton:
             ["click", "flt-save"], ["snap", "back"],
             _tick_category(sports), ["settle"], *_clear_menus(), ["settle"],
             ["click", "flt-save"], ["snap", "none"]], strict=True)
-        why = data["text"]["save_filtered"]
         assert snaps["category"]["menus"]["flt-cat"]["ticked"] == [sports]
+        snap = snaps["category"]
+        assert snap["reacts"] and snap["buttons"]["flt-save"] is False
+        assert snap["titles"]["flt-save"] == dashboard._SAVE_TITLE
+        [opened] = snap["opened"]
+        self._assert_sends(data, self._query(data, opened), *data["primary"],
+                           excluded=("Sports",))
         assert snaps["tag"]["menus"]["flt-cat"]["ticked"] == []
         assert snaps["tag"]["menus"]["flt-tag"]["ticked"] == [basketball]
         assert snaps["all"]["menus"]["flt-cat"]["ticked"] == list(range(len(data["categories"])))
         assert snaps["all"]["menus"]["flt-tag"]["ticked"] == []
-        for name in ("category", "tag", "all"):
+        for name, why in (("tag", data["text"]["save_filtered"]),
+                          ("all", data["text"]["save_all_excluded"])):
             snap = snaps[name]
             # Drawn, and shut through it
             assert snap["reacts"], name
@@ -8276,6 +8305,76 @@ class TestSaveLiveDefaultsButton:
             assert snap["titles"]["flt-save"] == dashboard._SAVE_TITLE, name
             [opened] = snap["opened"]
             self._assert_sends(data, self._query(data, opened), *data["primary"])
+
+    def test_excluding_every_category_with_a_trade_here_shuts_it(self, monkeypatch, tmp_path):
+        # Band 0.3-0.6 trades only Sports and Commodities, while the menu also
+        # lists categories other scenarios trade: excluding those two leaves a
+        # view with no trade, so the button shuts though not every listed
+        # category is excluded. At the primary band the same two exclusions
+        # leave the time-series trades, and it saves
+        page = self._page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        sports = data["categories"].index("Sports")
+        commodities = data["categories"].index("Commodities")
+        assert len(data["categories"]) > 2
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"],
+            _tick_category(sports), ["settle"], _tick_category(commodities), ["settle"],
+            ["click", "flt-save"], ["snap", "empty"],
+            _tick_category(commodities), ["settle"],
+            ["click", "flt-save"], ["snap", "one_back"],
+            _tick_category(commodities), ["settle"],
+            ["set", "flt-band", "0"], ["fire", "flt-band"], ["settle"],
+            ["click", "flt-save"], ["snap", "primary"]], strict=True)
+        empty = snaps["empty"]
+        assert empty["menus"]["flt-cat"]["ticked"] == sorted([sports, commodities])
+        assert empty["buttons"]["flt-save"] is True and empty["opened"] == []
+        assert empty["titles"]["flt-save"] == data["text"]["save_all_excluded"]
+        one_back = snaps["one_back"]
+        assert one_back["buttons"]["flt-save"] is False
+        assert one_back["titles"]["flt-save"] == dashboard._SAVE_TITLE
+        assert len(one_back["opened"]) == 1
+        primary = snaps["primary"]
+        assert primary["buttons"]["flt-save"] is False
+        [opened] = primary["opened"]
+        self._assert_sends(data, self._query(data, opened), *data["primary"],
+                           excluded=tuple(sorted(("Sports", "Commodities"),
+                                                 key=data["categories"].index)))
+
+    def test_several_exclusions_and_twins_round_trip_through_the_server(
+            self, monkeypatch, tmp_path):
+        # Two categories ticked, one of them a letter-case twin pair, which the
+        # page ticks together: each name the menu shows ticked is sent, in the
+        # menu's order, and the server reads them as exactly those exclusions
+        series = {**_FLT_SERIES, "KXNHLHART": ("sports", ("Hockey",))}
+        page = self._page(monkeypatch, tmp_path, series=series)
+        data = TestFilterPage._data(page)
+        names = data["categories"]
+        assert "sports" in names and "Sports" in names
+        sports, commodities = names.index("Sports"), names.index("Commodities")
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], _tick_category(sports), _tick_category(commodities), ["settle"],
+            ["click", "flt-save"], ["snap", "s"]], strict=True)
+        snap = snaps["s"]
+        ticked = snap["menus"]["flt-cat"]["ticked"]
+        assert set(ticked) == {commodities, sports, names.index("sports")}
+        excluded = tuple(names[i] for i in sorted(ticked))
+        [opened] = snap["opened"]
+        self._assert_sends(data, self._query(data, opened), *data["primary"],
+                           excluded=excluded)
+        query = opened["url"].partition("?")[2]
+        response = defaults_server._App(config.DEFAULTS_SERVER_PORT).handle(
+            defaults_server._Request("GET", f"/confirm?{query}", _SAVE_HOST))
+        assert response.status == 200, response.body
+        settings, _ = defaults_server._proposal(defaults_server._params(query), None)
+        # The second spelling of Sports is left out by the server: one category
+        # to the filter
+        assert {c.casefold() for c in settings.exclude_categories} == {"commodities",
+                                                                        "sports"}
+        assert settings.tags is None
+        keeps = config.trade_filter(settings)
+        assert not keeps("Sports", "Basketball") and not keeps("sports", "Hockey")
+        assert not keeps("Commodities", "Oil & Gas") and keeps("Politics", "Senate")
 
     def test_it_follows_the_tier_floors_choice(self, monkeypatch, tmp_path):
         page = self._kc(monkeypatch, tmp_path, _kc_sweep_tiers())
@@ -8358,48 +8457,69 @@ class TestSaveLiveDefaultsButton:
             ["wait"], ["click", "flt-save"], ["snap", "s"]], no_decompression=True)["s"]
         assert snap["buttons"]["flt-save"] is True and snap["opened"] == []
 
-    def test_without_a_series_listing_no_category_or_tag_is_saved(self, monkeypatch, tmp_path):
-        # Trades filed by ticker prefix: the button saves no category or tag
-        # from any page, so this one has the same hover text as a page filed
-        # by Kalshi's listing, saves the scenario with nothing ticked, and
-        # shuts for a tick, saying why
+    def test_without_a_series_listing_categories_are_still_excluded(
+            self, monkeypatch, tmp_path):
+        # Trades filed by ticker prefix: the page has the same hover text as a
+        # page filed by Kalshi's listing, saves the scenario with nothing
+        # ticked, and saves a category ticked as one to exclude, by the name
+        # the page filed it under
         page = self._page(monkeypatch, tmp_path, series=None)
         data = TestFilterPage._data(page)
-        assert data["categories"]
+        # Every trade is filed under "Other"; the k-hat population files one
+        # observation under "Science", which no trade carries
+        assert data["categories"] == ["Other", "Science"]
         title = re.search(r'<button id="flt-save"[^>]*title="([^"]*)"', page).group(1)
         assert html.unescape(title) == dashboard._SAVE_TITLE
         snaps = _run_script(tmp_path, page, [
             ["wait"], ["click", "flt-save"], ["snap", "all"],
-            _tick_category("0"), ["settle"],
+            _tick_category("1"), ["settle"],
             ["click", "flt-save"], ["snap", "category"],
-            _tick_category("0"), ["settle"], ["click", "flt-save"], ["snap", "back"]],
+            _tick_category("0"), ["settle"], ["click", "flt-save"], ["snap", "empty"],
+            _tick_category("0"), ["settle"],
+            _tick_category("1"), ["settle"], ["click", "flt-save"], ["snap", "back"]],
             strict=True)
         [opened] = snaps["all"]["opened"]
         self._assert_sends(data, self._query(data, opened), *data["primary"])
-        assert snaps["category"]["buttons"]["flt-save"] is True
-        assert snaps["category"]["opened"] == []
-        assert snaps["category"]["titles"]["flt-save"] == data["text"]["save_filtered"]
+        assert snaps["category"]["buttons"]["flt-save"] is False
+        [opened] = snaps["category"]["opened"]
+        self._assert_sends(data, self._query(data, opened), *data["primary"],
+                           excluded=("Science",))
+        # Excluding "Other" too leaves no trade: shut, saying why
+        empty = snaps["empty"]
+        assert empty["buttons"]["flt-save"] is True and empty["opened"] == []
+        assert empty["titles"]["flt-save"] == data["text"]["save_all_excluded"]
         # The category let back in leaves nothing ticked: the scenario is
-        # saved again, with no category or tag
+        # saved again, excluding nothing
         back = snaps["back"]
         assert back["buttons"]["flt-save"] is False
         assert back["titles"]["flt-save"] == dashboard._SAVE_TITLE
         [opened] = back["opened"]
         self._assert_sends(data, self._query(data, opened), *data["primary"])
 
-    @pytest.mark.parametrize("cats, tags, shown", [
-        (("Sports",), None, True), (None, ("Hockey",), True),
-        (("Sports",), ("Sports · Hockey",), True), (None, None, False)])
-    def test_a_note_says_when_saving_clears_a_saved_category_or_tag_filter(
-            self, monkeypatch, tmp_path, cats, tags, shown):
-        # The button sends no category or tag, so over saved live defaults
-        # that filter by one, a grey note after it says saving clears that
-        # filter; with no filter saved there is no note
-        sweep = dataclasses.replace(_flt_sweep(), live_categories=cats, live_tags=tags)
+    @pytest.mark.parametrize("cats, tags, text", [
+        (("Sports",), None,
+         "Saving from this page saves the categories excluded here, which replace the "
+         "saved exclusions (Sports)."),
+        (None, ("Hockey",), dashboard._FILTER_SAVE_NOTE),
+        (("Politics", "Weather"), ("Sports · Hockey",),
+         "Saving from this page saves the categories excluded here, which replace the "
+         "saved exclusions (Politics, Weather), and clears the saved tag filter: live "
+         "runs then trade every tag."),
+        (None, None, None)])
+    def test_a_note_says_when_saving_clears_a_saved_tag_filter(
+            self, monkeypatch, tmp_path, cats, tags, text):
+        # The button sends the categories excluded here and no tag, so over
+        # saved live defaults that exclude categories or filter by tag, a grey
+        # note after it says saving replaces the exclusions (naming them) or
+        # clears that filter; with neither saved there is no note
+        shown = text is not None
+        sweep = dataclasses.replace(_flt_sweep(), live_exclude_categories=cats, live_tags=tags)
         page = self._page(monkeypatch, tmp_path, sweep)
-        assert TestFilterPage._data(page)["save"]["live_filters"] is shown
+        save = TestFilterPage._data(page)["save"]
+        assert save["live_tags"] is (tags is not None)
+        assert save["live_exclusions"] == (None if cats is None else list(cats))
         note = (f'<span id="flt-filter-save-note" style="color:#9E9E9E; font-size:13px;">'
-                f"{html.escape(dashboard._FILTER_SAVE_NOTE)}</span>")
+                f"{html.escape(text or '')}</span>")
         assert (note in page) is shown
         assert ('id="flt-filter-save-note"' in page) is shown
         if shown:
@@ -8407,21 +8527,25 @@ class TestSaveLiveDefaultsButton:
             assert page.index('id="flt-save"') < page.index(note) < page.index('id="flt-trade"')
         # Python's words: the script writes none of them
         assert dashboard._FILTER_SAVE_NOTE not in dashboard._FILTER_JS
+        assert "replace the saved exclusions" not in dashboard._FILTER_JS
 
-    def test_a_save_clears_a_saved_category_and_tag_filter(self, monkeypatch, tmp_path):
-        # Saved live defaults that trade only Sports, narrowed to Hockey: the
-        # page with nothing ticked saves its scenario naming no category or
-        # tag, which the defaults server reads as any category and tag
+    def test_a_save_clears_a_saved_exclusion_and_tag_filter(self, monkeypatch, tmp_path):
+        # Saved live defaults that exclude Politics and narrow Sports to
+        # Hockey: the page with nothing ticked saves its scenario naming no
+        # category or tag, which the defaults server reads as nothing excluded
+        # and any tag
         config.save_live_defaults(dataclasses.replace(
-            config.live_settings(), categories=("Sports",), tags=("Sports · Hockey",)),
-            source="")
+            config.live_settings(), exclude_categories=("Politics",),
+            tags=("Sports · Hockey",)), source="")
         current = config.read_saved_live_defaults()
-        assert current.categories == ("Sports",) and current.tags == ("Sports · Hockey",)
-        sweep = dataclasses.replace(_flt_sweep(), live_categories=current.categories,
+        assert current.exclude_categories == ("Politics",)
+        assert current.tags == ("Sports · Hockey",)
+        sweep = dataclasses.replace(_flt_sweep(),
+                                    live_exclude_categories=current.exclude_categories,
                                     live_tags=current.tags)
         page = self._page(monkeypatch, tmp_path, sweep)
         data = TestFilterPage._data(page)
-        assert data["save"]["live_filters"] is True
+        assert data["save"]["live_tags"] is True
         snap = _run_script(tmp_path, page, [
             ["wait"], ["click", "flt-save"], ["snap", "s"]], strict=True)["s"]
         assert snap["buttons"]["flt-save"] is False
@@ -8433,7 +8557,7 @@ class TestSaveLiveDefaultsButton:
             defaults_server._Request("GET", f"/confirm?{query}", _SAVE_HOST))
         assert response.status == 200, response.body
         settings, _ = defaults_server._proposal(defaults_server._params(query), current)
-        assert settings.categories is None and settings.tags is None
+        assert settings.exclude_categories is None and settings.tags is None
         # Nothing was written by showing the page
         assert config.read_saved_live_defaults() == current
 
@@ -8500,8 +8624,8 @@ class TestSaveLiveDefaultsButton:
     def test_a_band_the_run_did_not_record_cannot_be_saved(self, monkeypatch, tmp_path):
         # A sweep whose primary records no band but does record its k and
         # cap: the band alone is what keeps the button disabled, on load and
-        # after a category is ticked and unticked again (a category change
-        # redraws at once, its chunk being the one on screen)
+        # after a tag is ticked and unticked again (a tag change redraws at
+        # once, its chunk being the one on screen)
         base = _flt_sweep()
         primary = dataclasses.replace(base.primary, spread_band=None)
         sweep = dataclasses.replace(base, primary=primary, points=[primary], scenarios=[])
@@ -8511,30 +8635,30 @@ class TestSaveLiveDefaultsButton:
         assert data["bands"][pb]["value"] is None
         assert data["ks"][pk]["value"] == 0.75 and data["caps"][pc]["value"] == 0.2
         assert data["save"]["same_title_size_cap"] == 0.5
-        sports = str(data["categories"].index("Sports"))
+        tag = str(data["subcats"].index([data["categories"].index("Sports"), "Basketball"]))
         snaps = _run_script(tmp_path, page, [
             ["wait"], ["click", "flt-save"], ["snap", "ready"],
-            _tick_category(sports), ["settle"],
+            _tick_tag(tag), ["settle"],
             ["click", "flt-save"], ["snap", "category"],
-            _tick_category(sports), ["settle"],
+            _tick_tag(tag), ["settle"],
             ["click", "flt-save"], ["snap", "back"]], strict=True)
         ready, category, back = snaps["ready"], snaps["category"], snaps["back"]
         assert not ready["selects"]["flt-band"]["disabled"]
         assert ready["buttons"]["flt-save"] is True and ready["opened"] == []
-        # The category was drawn, and the button stayed disabled through it,
-        # its hover text naming the tick
-        assert category["selects"]["flt-cat"]["value"] == sports and category["reacts"]
+        # The tag was drawn, and the button stayed disabled through it, its
+        # hover text naming the tick
+        assert category["selects"]["flt-tag"]["value"] == tag and category["reacts"]
         assert category["buttons"]["flt-save"] is True and category["opened"] == []
         assert category["titles"]["flt-save"] == data["text"]["save_filtered"]
         # Unticked and drawn again: the band alone keeps it shut
-        assert back["selects"]["flt-cat"]["value"] == "" and back["reacts"]
+        assert back["selects"]["flt-tag"]["value"] == "" and back["reacts"]
         assert back["buttons"]["flt-save"] is True and back["opened"] == []
         assert back["titles"]["flt-save"] == dashboard._SAVE_TITLE
 
     def test_a_size_cap_the_run_did_not_record_cannot_be_saved(self, monkeypatch, tmp_path):
         # A sweep whose points record their band and k but no size cap: the
         # cap alone is what keeps the button disabled, on load and after a
-        # category is ticked and unticked again (the server would refuse a
+        # tag is ticked and unticked again (the server would refuse a
         # size_cap of null, so the page must not offer it)
         page = self._page(monkeypatch, tmp_path, _flt_sweep(size_cap=None))
         data = TestFilterPage._data(page)
@@ -8542,23 +8666,23 @@ class TestSaveLiveDefaultsButton:
         assert data["bands"][pb]["value"] == [0.0, 1.0]
         assert data["ks"][pk]["value"] == 0.75 and data["caps"][pc]["value"] is None
         assert data["save"]["same_title_size_cap"] == 0.5
-        sports = str(data["categories"].index("Sports"))
+        tag = str(data["subcats"].index([data["categories"].index("Sports"), "Basketball"]))
         snaps = _run_script(tmp_path, page, [
             ["wait"], ["click", "flt-save"], ["snap", "ready"],
-            _tick_category(sports), ["settle"],
+            _tick_tag(tag), ["settle"],
             ["click", "flt-save"], ["snap", "category"],
-            _tick_category(sports), ["settle"],
+            _tick_tag(tag), ["settle"],
             ["click", "flt-save"], ["snap", "back"]], strict=True)
         ready, category, back = snaps["ready"], snaps["category"], snaps["back"]
         assert not ready["selects"]["flt-band"]["disabled"]
         assert ready["buttons"]["flt-save"] is True and ready["opened"] == []
-        # The category was drawn, and the button stayed disabled through it,
-        # its hover text naming the tick
-        assert category["selects"]["flt-cat"]["value"] == sports and category["reacts"]
+        # The tag was drawn, and the button stayed disabled through it, its
+        # hover text naming the tick
+        assert category["selects"]["flt-tag"]["value"] == tag and category["reacts"]
         assert category["buttons"]["flt-save"] is True and category["opened"] == []
         assert category["titles"]["flt-save"] == data["text"]["save_filtered"]
         # Unticked and drawn again: the size cap alone keeps it shut
-        assert back["selects"]["flt-cat"]["value"] == "" and back["reacts"]
+        assert back["selects"]["flt-tag"]["value"] == "" and back["reacts"]
         assert back["buttons"]["flt-save"] is True and back["opened"] == []
         assert back["titles"]["flt-save"] == dashboard._SAVE_TITLE
 
@@ -8578,7 +8702,7 @@ class TestSaveLiveDefaultsButton:
         assert target == {"url": _SAVE_URL, "same_title_size_cap": None,
                           "source": "backtest dashboard for 2026-01-05 to 2026-09-28",
                           "live_rebalances": False, "live_sells": False,
-                          "live_filters": False}
+                          "live_tags": False, "live_exclusions": None}
         # "live_rebalances" is True only for a run that recorded saved
         # defaults that rebalance (a minimum price movement alone is not):
         # Rebalance no turns it off
@@ -8594,12 +8718,16 @@ class TestSaveLiveDefaultsButton:
                                   (None, 3, False)):
             swept = dataclasses.replace(sweep, live_sell_at=level, live_sell_min_days=days)
             assert dashboard._save_target(swept, _FLT_START, today)["live_sells"] is said
-        # ... and "live_filters" only for saved defaults with a category or tag
-        # filter (either alone is a filter)
-        for cats, tags, said in ((("Sports",), None, True), (None, ("Hockey",), True),
-                                 (("Sports",), ("Sports · Hockey",), True), (None, None, False)):
-            swept = dataclasses.replace(sweep, live_categories=cats, live_tags=tags)
-            assert dashboard._save_target(swept, _FLT_START, today)["live_filters"] is said
+        # ... and "live_tags" only for saved defaults with a tag filter: the
+        # button saves the categories excluded, so only a tag filter is cleared
+        for cats, tags, said in ((("Sports",), None, False), (None, ("Hockey",), True),
+                                 (("Politics",), ("Sports · Hockey",), True),
+                                 (None, None, False)):
+            swept = dataclasses.replace(sweep, live_exclude_categories=cats, live_tags=tags)
+            target = dashboard._save_target(swept, _FLT_START, today)
+            assert target["live_tags"] is said
+            # ... and "live_exclusions" names the saved exclusions, which a save replaces
+            assert target["live_exclusions"] == (None if cats is None else list(cats))
         # Only a recorded setting that differs from a recorded switch is named
         for ladders, configured in ((True, True), (False, None), (None, True)):
             swept = dataclasses.replace(sweep, same_event_ladders=ladders,
@@ -18179,20 +18307,21 @@ def _mix_selection(kept_cats: list[int], tags: list[int], series: dict = _MIX_SE
 
 def _mix_kept(kept_cats: list[int], tags: list[int], series: dict = _MIX_SERIES):
     """The live filter's own test for a set of ticks: config.trade_filter_for
-    of the categories kept and, for each kept category with tags ticked, its
-    tags not ticked, each tied to it (the save button sends neither; this is
-    the live rule the menus' ticks follow). It reads per group of categories
-    whose names differ only in letter case: a group with every tag ticked
-    keeps nothing, so it is not listed; every category left out lists none,
-    which keeps nothing."""
+    excluding every category not kept and, for each kept category with tags
+    ticked, listing its tags not ticked, each tied to it (the save button
+    sends the exclusions but no tag; this is the live rule the menus' ticks
+    follow). It reads per group of categories whose names differ only in
+    letter case: a group with every tag ticked keeps nothing, so it is
+    excluded too; every category left out keeps nothing."""
     kept, _, tied = _mix_names(kept_cats, tags, series)
-    _, subcats = _mix_axes(series)
+    categories, subcats = _mix_axes(series)
     groups = {subcats[t][0].casefold() for t in _with_case_twins(tags, series)}
     left = {config.split_tag(t)[0].casefold() for t in tied}
-    listed = tuple(name for name, _ in kept
-                   if name.casefold() not in groups or name.casefold() in left)
-    # The live rule itself, on exactly these categories and tags
-    return config.trade_filter_for(listed, tuple(tied) or None)
+    listed = {name for name, _ in kept
+              if name.casefold() not in groups or name.casefold() in left}
+    excluded = tuple(name for name in categories if name not in listed)
+    # The live rule itself, on exactly these exclusions and tags
+    return config.trade_filter_for(excluded or None, tuple(tied) or None)
 
 
 def _khat_marked(snap: dict, colors: dict) -> list[str]:
@@ -19070,9 +19199,9 @@ class TestMixedSelection:
         assert refused["menus"]["flt-cat"]["ticked"] == [0, 2]
         assert refused["menus"]["flt-cat"]["label"] == "2 categories"
         assert refused["text"]["hdr-trades"] == str(views["c1"]["n"])
-        # Cat0 and Cat2 are still left out, so the button stays shut and says why
-        assert refused["buttons"]["flt-save"]
-        assert refused["titles"]["flt-save"] == data["text"]["save_filtered"]
+        # Cat0 and Cat2 are still left out, which is what the button saves
+        assert not refused["buttons"]["flt-save"]
+        assert refused["titles"]["flt-save"] == dashboard._SAVE_TITLE
         assert len(cat1) == 2
         assert snaps["tag"]["text"]["hdr-trades"] == str(views[f"s{cat1[1]}"]["n"])
         assert snaps["tag"]["menus"]["flt-tag"]["ticked"] == [cat1[0]]
@@ -19168,12 +19297,12 @@ class TestMixedSelection:
     def test_the_page_shows_exactly_what_the_live_filter_keeps(self, monkeypatch, tmp_path):
         # The ticks follow the live filter's rule (config.trade_filter_for):
         # for seeded sets of ticks, the trades the page draws are exactly
-        # those of the category · tag pairs a live filter keeps that lists
-        # the categories kept and, for each with tags ticked, its tags NOT
-        # ticked, tied to it, over every pair the page lists. The save button sends no category or
-        # tag, so it stays shut, saying why, while anything is ticked; with
-        # every category kept and no tag nothing is ticked, so the scenario
-        # is saved
+        # those of the category · tag pairs a live filter keeps that excludes
+        # the categories not kept and lists, for each kept one with tags
+        # ticked, its tags NOT ticked, tied to it, over every pair the page
+        # lists. With no tag ticked that is trade_filter_for(the categories
+        # ticked, None), and the save button sends exactly those categories
+        # as exclusions; with a tag ticked it stays shut, saying why
         trades = _mix_trades(51, n=44)
         page = _mix_page(monkeypatch, tmp_path, trades)
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
@@ -19186,7 +19315,7 @@ class TestMixedSelection:
             steps += _mix_tick_steps(cats, tags, f"drawn{i}")[:-1]
             steps += [["click", "flt-save"], ["snap", f"set{i}"]]
         snaps = _run_script(tmp_path, page, steps, strict=True)
-        less = blocked = 0
+        less = blocked = saved = 0
         for i, (cats, tags) in enumerate(sets):
             snap = snaps[f"set{i}"]
             # The live rule itself, on settings holding exactly these ticks
@@ -19199,24 +19328,31 @@ class TestMixedSelection:
             assert snap["text"]["hdr-trades"] == str(
                 sum(views[f"s{si}"]["n"] for si in kept if f"s{si}" in views))
             less += bool(tags) and len(kept) < len(pairs)
-            if len(cats) == len(_MIX_CATEGORIES) and not tags:
-                # Every category kept and no tag: nothing ticked, so the
-                # scenario is saved with no category or tag
+            if not tags:
+                # Only categories ticked: the categories left out, and
+                # nothing else, decide what is shown, and they are what the
+                # button saves
+                excluded = [name for ci, name in enumerate(data["categories"])
+                            if ci not in cats]
+                plain = config.trade_filter_for(tuple(excluded) or None, None)
+                assert kept == [si for si, pair in enumerate(pairs) if plain(*pair)]
+                saved += 1
                 assert not snap["buttons"]["flt-save"]
                 [opened] = snap["opened"]
                 sent = parse_qs(opened["url"].partition("?")[2], strict_parsing=True)
+                assert sent.get("exclude_category", []) == excluded
                 assert "category" not in sent and "tag" not in sent
             else:
                 blocked += 1
                 assert snap["buttons"]["flt-save"] and snap["opened"] == []
                 assert snap["titles"]["flt-save"] == data["text"]["save_filtered"]
-        assert less and blocked
+        assert less and blocked and saved
 
-    def test_a_great_many_ticks_shut_it_with_the_same_hover_text(
+    def test_more_exclusions_than_a_link_takes_are_refused_by_the_server(
             self, monkeypatch, tmp_path):
-        # More names than the confirmation page takes
-        # (config.DEFAULTS_SERVER_MAX_FILTER_NAMES) are ticks like any other:
-        # the button stays shut with the same reason, not a reason of their own
+        # More categories excluded than the confirmation page takes
+        # (config.DEFAULTS_SERVER_MAX_FILTER_NAMES): the button opens the
+        # page, which refuses the link and says why
         most = config.DEFAULTS_SERVER_MAX_FILTER_NAMES
         series = {f"KXN{i:02d}": (f"Area{i:02d}", ("Main",)) for i in range(most + 2)}
         trades = []
@@ -19233,8 +19369,16 @@ class TestMixedSelection:
             ["wait"], *(_tick_category(i) for i in range(most + 1)), ["settle"],
             ["click", "flt-save"], ["snap", "s"]], strict=True)["s"]
         assert snap["menus"]["flt-cat"]["ticked"] == list(range(most + 1))
-        assert snap["buttons"]["flt-save"] and snap["opened"] == []
-        assert snap["titles"]["flt-save"] == data["text"]["save_filtered"]
+        assert not snap["buttons"]["flt-save"]
+        [opened] = snap["opened"]
+        query = opened["url"].partition("?")[2]
+        sent = parse_qs(query, strict_parsing=True)
+        assert sent["exclude_category"] == data["categories"][:most + 1]
+        response = defaults_server._App(config.DEFAULTS_SERVER_PORT).handle(
+            defaults_server._Request("GET", f"/confirm?{query}", _SAVE_HOST))
+        assert response.status == 400
+        assert (f"exclude_category is given {most + 1} times, more than {most}"
+                in response.body)
 
     def test_the_khat_figures_of_a_mix_are_its_groups_pooled(self, monkeypatch, tmp_path):
         observations = _mix_observations(61)
@@ -19355,9 +19499,18 @@ class TestMixedSelection:
             # Python's own
             assert snap["text"]["flt-summary"] == _mix_summary(
                 data, kept, tags, ref["view"]["n"], n_all, mix=forced or name == "one")
-            # Nothing can be saved while a category is left out
-            assert snap["buttons"]["flt-save"] and snap["opened"] == [], name
-            assert snap["titles"]["flt-save"] == data["text"]["save_filtered"], name
+            # The categories left out are saved as exclusions; a ticked tag,
+            # or every category left out, shuts the button, saying why
+            if tags or not kept:
+                why = data["text"]["save_filtered" if tags else "save_all_excluded"]
+                assert snap["buttons"]["flt-save"] and snap["opened"] == [], name
+                assert snap["titles"]["flt-save"] == why, name
+            else:
+                assert not snap["buttons"]["flt-save"], name
+                [opened] = snap["opened"]
+                sent = parse_qs(opened["url"].partition("?")[2], strict_parsing=True)
+                assert sent["exclude_category"] == [data["categories"][c]
+                                                    for c in excluded], name
         # Every category left out: no trade, every section empty, said so
         none = snaps["every"]
         assert _mix_reference(data, trades, [], [], risk_free=rates,
@@ -19482,8 +19635,9 @@ class TestMixedSelection:
         # The live filter reads "Health" and "health" as one category, so the
         # page leaves them out and lets them back in together, and their two
         # Flu tags are one tag, ticked together: the tags the page shows are
-        # exactly the ones a live filter keeps that lists the categories kept
-        # and the tags not ticked. Tag i holds 2**i trades, so the trade count
+        # exactly the ones a live filter keeps that excludes the categories
+        # left out and lists the tags not ticked. Tag i holds 2**i trades, so
+        # the trade count
         # names the tags shown
         series = {"KXH0": ("Health", ("Flu",)), "KXH1": ("health", ("Flu",)),
                   "KXH2": ("health", ("Polio",)), "KXH3": ("Sports", ("Golf",))}
@@ -19799,18 +19953,19 @@ class TestMixedSelection:
             f"Not available: the run with Cat0 excluded at {tried} cannot be shown (the "
             f"page's build log says why). The page still shows the run with Cat0 excluded "
             f"at {still}.")
-        # A category is still left out: the button stays shut and says why
-        assert refused["buttons"]["flt-save"]
-        assert refused["titles"]["flt-save"] == data["text"]["save_filtered"]
+        # The scenario still shown, with Cat0 left out, is what the button saves
+        assert not refused["buttons"]["flt-save"]
+        assert refused["titles"]["flt-save"] == dashboard._SAVE_TITLE
 
-    def test_any_tick_shuts_the_save_button_and_says_why(self, monkeypatch, tmp_path):
-        # The button sends no category or tag, so whatever is ticked — a
-        # category left out, one tag, a category left out beside a tag, a
-        # category with a namesake in other letter case (both are left out),
-        # one whose name holds the mark that ties a tag to its category, every
-        # category — it stays shut, its hover text saying why in Python's
-        # words, and a click opens nothing. Unticking every box saves the
-        # scenario, naming no category or tag
+    def test_which_ticks_shut_the_save_button_and_what_it_sends(self, monkeypatch, tmp_path):
+        # The button sends the categories left out but no tag: one tag, or a
+        # category left out beside a tag, or every category left out, keeps
+        # it shut, its hover text saying why in Python's words, and a click
+        # opens nothing. A category left out, a category with a namesake in
+        # other letter case (both are left out and both sent), and one whose
+        # name holds the mark that ties a tag to its category (which the
+        # defaults server then refuses as a tag) are sent as exclusions.
+        # Unticking every box saves the scenario, excluding nothing
         series = {"KXD0": ("Health", ("Flu",)), "KXD1": ("health", ("Flu",)),
                   "KXD2": ("Arts · Crafts", ("Glue",)), "KXD3": ("Sports", ("Golf",)),
                   "KXD4": ("Sports", ("Tennis",))}
@@ -19831,7 +19986,7 @@ class TestMixedSelection:
         steps += [*_clear_menus(), ["settle"], ["click", "flt-save"], ["snap", "cleared"]]
         snaps = _run_script(tmp_path, page, steps, strict=True)
         why = data["text"]["save_filtered"]
-        assert why.startswith("Cannot save while a category is excluded or a tag is ticked.")
+        assert why.startswith("Cannot save while a tag is ticked.")
         for name in ("loaded", "ready"):
             assert snaps[name]["titles"]["flt-save"] == dashboard._SAVE_TITLE, name
         assert not snaps["ready"]["buttons"]["flt-save"]
@@ -19841,12 +19996,27 @@ class TestMixedSelection:
                                            categories.index("health")]]
         assert snaps["tag"]["menus"]["flt-cat"]["ticked"] == []
         assert snaps["twin"]["menus"]["flt-cat"]["ticked"] == [1, 3]
-        for name in cases:
+        for name, reason in (("tag", why), ("mix", why),
+                             ("every", data["text"]["save_all_excluded"])):
             snap = snaps[name]
             # Drawn, and shut through it
             assert snap["reacts"], name
             assert snap["buttons"]["flt-save"] and snap["opened"] == [], name
-            assert snap["titles"]["flt-save"] == why, name
+            assert snap["titles"]["flt-save"] == reason, name
+        for name, sent_names in (("category", ["Sports"]), ("twin", ["Health", "health"]),
+                                 ("separator", ["Arts · Crafts"])):
+            snap = snaps[name]
+            assert snap["reacts"], name
+            assert not snap["buttons"]["flt-save"], name
+            assert snap["titles"]["flt-save"] == dashboard._SAVE_TITLE, name
+            [opened] = snap["opened"]
+            query = opened["url"].partition("?")[2]
+            sent = parse_qs(query, strict_parsing=True)
+            assert sent["exclude_category"] == sent_names, name
+            assert "tag" not in sent, name
+            status = defaults_server._App(config.DEFAULTS_SERVER_PORT).handle(
+                defaults_server._Request("GET", f"/confirm?{query}", _SAVE_HOST)).status
+            assert status == (400 if name == "separator" else 200), name
         # Every category left out shows nothing, and is still shut
         assert snaps["every"]["menus"]["flt-cat"]["ticked"] == list(range(len(categories)))
         assert snaps["every"]["text"]["hdr-trades"] == "0"
@@ -19934,7 +20104,7 @@ class TestMixedSelection:
             ties += abs(Decimal(x)).scaleb(digits) % 1 == Decimal("0.5")
         assert ties >= 100
 
-    def test_sums_medians_and_rounding_are_numpys_and_pandas(self, tmp_path):
+    def test_sums_medians_and_rounding_are_numpys_and_the_pages(self, tmp_path):
         rng = random.Random(8)
         lists = [[rng.gauss(0, 1e3) * 10 ** rng.randint(-6, 6) for _ in range(n)]
                  for n in (0, 1, 2, 7, 8, 9, 15, 16, 17, 127, 128, 129, 130, 255, 300, 1000)]
@@ -19945,10 +20115,11 @@ class TestMixedSelection:
         for values, (total, grouped, middle) in zip(lists, got, strict=True):
             # numpy's own pairwise sum, bit for bit: a mean here is Python's mean
             assert total == float(np.sum(np.array(values, dtype=float))), len(values)
+            # the page's own sum within a group, bit for bit: the decomposition's
+            # bars (pandas 3.1 adds a sorted group with numpy's reduceat, so the
+            # page no longer leaves this sum to pandas)
+            assert grouped == dashboard._compensated_sum(values), len(values)
             if values:
-                # pandas' sum within a group, bit for bit: the decomposition's bars
-                frame = pd.DataFrame({"g": ["a"] * len(values), "v": values})
-                assert grouped == float(frame.groupby("g")["v"].sum().iloc[0]), len(values)
                 assert middle == float(np.median(values)), len(values)
         points = [0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 0.125, 0.135, 2.675, 1e-7, -1e-7,
                   *(rng.uniform(-50, 50) for _ in range(200)),
@@ -19958,6 +20129,73 @@ class TestMixedSelection:
                           "roundTo(x, 2), roundTo(x, 4)]; })")
         for x, drawn in zip(points, rounded, strict=True):
             assert drawn == [float(np.round(x, digits)) for digits in (0, 2, 4)], x
+
+
+class TestGroupSumsAreThePagesOwn:
+    """The decomposition's bars and the category table add each group with
+    dashboard._compensated_sum, the sum the page script's groupSum repeats,
+    never with pandas' group kernel: pandas 3.1 adds a group whose rows are
+    already sorted by key with numpy's reduceat, which can differ from it in
+    the last bit, and a mix drawn by the script would then differ from the
+    same trades drawn by Python."""
+
+    @staticmethod
+    def _frame(sort_by: str | None, seed: int) -> pd.DataFrame:
+        rng = random.Random(seed)
+        rows = [{"profit": rng.gauss(0, 1e3) * 10 ** rng.randint(-6, 6),
+                 "profit_ratio": rng.gauss(0, 1) * 10 ** rng.randint(-6, 6),
+                 "category": rng.choice(["Sports", "Politics"]),
+                 "subcategory": rng.choice(["Sports · Golf", "Politics · US"]),
+                 "entry_pA": rng.random(), "month": rng.choice(["2026-01", "2026-02"])}
+                for _ in range(rng.randint(2, 300))]
+        if sort_by:
+            # pandas 3.1 takes its other path only for a key the rows are
+            # sorted by, so each key gets a run with its rows sorted
+            rows.sort(key=lambda r: r[sort_by])
+        return pd.DataFrame(rows)
+
+    @staticmethod
+    def _by_hand(df: pd.DataFrame, key: str, column: str = "profit") -> dict:
+        groups: dict = {}
+        for k, v in zip(df[key], df[column], strict=True):
+            groups.setdefault(k, []).append(v)
+        return {k: dashboard._compensated_sum(v) for k, v in groups.items()}
+
+    def test_the_helper_is_the_compensated_sum(self):
+        # 1e16 + 1 + 1 loses both ones to rounding when added plainly; the
+        # running correction keeps them
+        assert dashboard._compensated_sum([1e16, 1.0, 1.0]) == 1e16 + 2.0
+        plain = 0.0
+        for value in (1e16, 1.0, 1.0):
+            plain += value
+        assert plain == 1e16
+        assert dashboard._compensated_sum([]) == 0.0
+        assert dashboard._compensated_mean([1.0, 2.0, 4.0]) == 7.0 / 3
+
+    @pytest.mark.parametrize("sort_by", [None, "month", "category", "subcategory", "entry_pA"])
+    @pytest.mark.parametrize("seed", range(20))
+    def test_every_bar_and_row_is_the_helpers_sum(self, sort_by, seed):
+        df = self._frame(sort_by, seed)
+        agg = dashboard._decomposition_aggregates(df)
+        assert dict(zip(agg["monthly"]["month"], agg["monthly"]["profit"], strict=True)) \
+            == self._by_hand(df, "month")
+        assert agg["category"].to_dict() == self._by_hand(df, "category")
+        assert agg["subcategory"].to_dict() == self._by_hand(df, "subcategory")
+        buckets = pd.cut(df["entry_pA"], bins=dashboard._PRICE_BUCKET_BINS,
+                         labels=dashboard._PRICE_BUCKET_LABELS)
+        assert agg["price"].to_dict() == self._by_hand(df.assign(b=buckets), "b")
+        grouped = dashboard._category_groups(df)
+        assert grouped["pnl"].to_dict() == self._by_hand(df, "subcategory")
+        ratios = self._by_hand(df, "subcategory", "profit_ratio")
+        counts = df["subcategory"].value_counts()
+        assert grouped["mean_ret"].to_dict() == {k: v / counts[k] for k, v in ratios.items()}
+
+    def test_an_empty_frame_keeps_pandas_shape(self):
+        df = pd.DataFrame(columns=["profit", "profit_ratio", "category", "subcategory",
+                                   "entry_pA", "month"])
+        agg = dashboard._decomposition_aggregates(df)
+        assert agg["category"].dtype == df.groupby("category")["profit"].sum().dtype
+        assert agg["monthly"].empty and agg["price"].empty
 
 
 class TestExtraDataHeader:

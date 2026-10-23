@@ -112,15 +112,16 @@ Notes:
     one of the two shapes config.LIVE_DEFAULTS_SOURCE_PATTERN allows, or be
     left out, and the seed's note may label only the seed values, so a
     crafted link cannot choose the note's words. A link may name several
-    categories and several tags (a category or tag field given more than
-    once, at most config.DEFAULTS_SERVER_MAX_FILTER_NAMES of each, no name
-    twice; a second spelling of one name in another letter case is left
-    out). They are checked for form only (each one printable name with no
-    two spaces in a row, which a browser would show as one; a category never
-    written as a tied tag; a tag tied to a category, "Sports · Basketball",
-    only with that category named), so a link can still put words of its
-    own there: the page shows them as a highlighted change, and a name no
-    Kalshi series is filed under matches no pair. The headers never
+    categories to exclude and several tags (an exclude_category or tag
+    field given more than once, at most config.DEFAULTS_SERVER_MAX_FILTER_NAMES
+    of each, no name twice; a second spelling of one name in another letter
+    case is left out). They are checked for form only (each one printable
+    name with no two spaces in a row, which a browser would show as one; a
+    category never written as a tied tag; a tag tied to a category,
+    "Sports · Basketball", never to an excluded one), so a link can still
+    put words of its own there: the page shows them as a highlighted change,
+    and a name no Kalshi series is filed under matches no pair (an excluded
+    one excludes nothing). The headers never
     include "Referrer-Policy: no-referrer": under it a browser sends a POST's
     Origin as "null", and every honest save would be refused.
 
@@ -231,14 +232,16 @@ from .config import (
 # the POST body; the signed text is built from exactly these, as raw strings
 _FIELDS = ("tier_floors", "spread_min", "spread_max", "k", "size_cap",
            "same_title_size_cap", "rebalance", "min_price_move", "sell_at",
-           "sell_min_days", "category", "tag", "source")
-# The fields a link built by an older version could carry, which rebalance and
-# min_price_move replaced: a link naming one is refused with a message that says so
-_RETIRED_FIELDS = ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise")
+           "sell_min_days", "exclude_category", "tag", "source")
+# The fields a link built by an older version could carry: add_to_held_pairs,
+# trim_to_kelly and trim_min_rise, which rebalance and min_price_move replaced,
+# and category (a category to trade), which exclude_category replaced. A link
+# naming one is refused with a message that says which change it predates
+_RETIRED_FIELDS = ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise", "category")
 # The fields a proposal must carry; every other one may be left out
 _REQUIRED = ("tier_floors", "spread_min", "spread_max", "k", "size_cap")
 # The fields a request may give more than once: one per category or tag named
-_REPEATABLE = ("category", "tag")
+_REPEATABLE = ("exclude_category", "tag")
 # The largest number of fields a query or form may hold: its thirteen fields, the
 # fingerprint, nonce, token, action and acknowledgement (with room to spare),
 # plus the most categories and tags a link may name; more is refused unread
@@ -806,7 +809,7 @@ def _name(text: str, name: str) -> str:
 
 def _name_list(params: dict[str, list[str]], field_name: str) -> tuple[str, ...] | None:
     """
-    Read every category, or every tag, a request names.
+    Read every excluded category, or every tag, a request names.
 
     The live filter compares names without regard to letter case, so a name
     that repeats an earlier one in another case adds nothing and is left out
@@ -817,12 +820,12 @@ def _name_list(params: dict[str, list[str]], field_name: str) -> tuple[str, ...]
 
     Args:
         params (dict[str, list[str]]): The request's fields (_params).
-        field_name (str): "category" or "tag".
+        field_name (str): "exclude_category" or "tag".
 
     Returns:
         tuple[str, ...] | None: The names in the order given, each once in
-            any letter case, or None when the request has no such field (any
-            category, or any tag).
+            any letter case, or None when the request has no such field (no
+            category excluded, or any tag).
 
     Raises:
         ValueError: If a name is not one printable name (_name), or the very
@@ -923,15 +926,18 @@ def _proposal(params: dict[str, list[str]],
     seed's note, so such a link still proposes exactly the seed.
     LiveSettings refuses a minimum price movement with rebalancing off, as it
     refuses a minimum of days with no sell level. A link that names one of
-    _RETIRED_FIELDS (built before rebalance and min_price_move replaced them)
-    is refused, with a message saying how to get a new one.
+    _RETIRED_FIELDS (built before rebalance and min_price_move replaced the
+    first three, or before exclude_category replaced category) is refused,
+    with a message saying how to get a new one.
 
-    category and tag may each repeat, one name per field, at most
+    exclude_category and tag may each repeat, one name per field, at most
     config.DEFAULTS_SERVER_MAX_FILTER_NAMES of each as sent; a missing one
-    means any, whatever is saved. The same name twice is refused; a second
-    spelling in another letter case is left out. A tag needs a category, and
-    a tag tied to one ("Sports · Basketball") needs that category named;
-    LiveSettings checks this, and refuses a category written as a tied tag.
+    means none excluded, or any tag, whatever is saved. The same name twice
+    is refused; a second spelling in another letter case is left out. A tag
+    tied to a category ("Sports · Basketball") must not name an excluded
+    one; LiveSettings checks this, and refuses a category written as a tied
+    tag.
+
     source is the note the saved file keeps: empty when left out, else one of
     the two shapes config.LIVE_DEFAULTS_SOURCE_PATTERN allows (ASCII digits
     only); the seed's note may label only the seed values.
@@ -950,11 +956,16 @@ def _proposal(params: dict[str, list[str]],
         ValueError: Naming the first rule the request breaks: a retired,
             unknown, blank or missing field; a field given more than once (a category
             or tag only past the cap); a malformed value (two spaces in a row
-            included); the same category or tag twice; a tag with no
-            category; a source of another shape; anything LiveSettings
-            refuses; or the seed's note on other values.
+            included); the same category or tag twice; a source of another
+            shape; anything LiveSettings refuses; or the seed's note on other
+            values.
     """
     retired = [field_name for field_name in _RETIRED_FIELDS if field_name in params]
+    if retired == ["category"]:
+        # A category to trade, where a link now names the categories to exclude
+        raise ValueError("this link names category, which exclude_category replaced (the "
+                         "filter is now a list of categories NOT to trade): rebuild the "
+                         "backtest dashboard, or open this server's start page")
     if retired:
         raise ValueError(f"this link was built before Rebalance (it names {retired[0]}): "
                          "rebuild the backtest dashboard, or open this server's start page")
@@ -1007,9 +1018,7 @@ def _proposal(params: dict[str, list[str]],
                          else _whole_number(value["sell_min_days"], "sell_min_days"))
     else:
         sell_min_days = _kept("sell_min_days", current, source)
-    if "tag" in params and "category" not in params:
-        raise ValueError("a tag needs a category")
-    categories = _name_list(params, "category")
+    exclude_categories = _name_list(params, "exclude_category")
     tags = _name_list(params, "tag")
     # re.ASCII: the pattern's digits are 0-9 only, never a digit of another
     # script (which could show a date out of order on the page)
@@ -1021,7 +1030,7 @@ def _proposal(params: dict[str, list[str]],
     if live_defaults_source(source) != source:
         raise ValueError(f"source must have no spaces around it, got {source!r}")
     # LiveSettings checks every value (the band, k, each cap on its grid, the
-    # names and a tied tag's category, a minimum without its switch) and names
+    # names and a tied tag's category not excluded, a minimum without its switch) and names
     # the field it refuses
     settings = LiveSettings(
         tier_floors=value["tier_floors"] == "on",
@@ -1030,7 +1039,7 @@ def _proposal(params: dict[str, list[str]],
         interval_discount=_number(value["k"], "k"),
         size_cap=_number(value["size_cap"], "size_cap"),
         same_title_size_cap=same_title,
-        categories=categories,
+        exclude_categories=exclude_categories,
         tags=tags,
         rebalance=rebalance,
         min_price_move=min_price_move,
@@ -1051,7 +1060,7 @@ def _settings_query(values: LiveSettings, *, source: str = "") -> str:
     The fields come in _FIELDS order. Numbers are written as their repr (the
     exact float, which _proposal reads back as the same number), switches as
     on or off, an unset minimum price movement, sell level or minimum of days
-    as off, and each category and each tag as a field of its own, in the
+    as off, and each excluded category and each tag as a field of its own, in the
     values' order. Every field is named, so the page proposes these
     settings whatever is saved.
 
@@ -1076,7 +1085,7 @@ def _settings_query(values: LiveSettings, *, source: str = "") -> str:
         ("sell_min_days",
          "off" if values.sell_min_days is None else str(values.sell_min_days)),
     ]
-    pairs += [("category", name) for name in values.categories or ()]
+    pairs += [("exclude_category", name) for name in values.exclude_categories or ()]
     pairs += [("tag", name) for name in values.tags or ()]
     if source:
         pairs.append(("source", source))
@@ -1087,8 +1096,9 @@ def _seed_query() -> str:
     """
     Build the confirmation page's query that proposes LIVE_DEFAULTS_SEED.
 
-    The seed's settings as _settings_query spells them (it sets no category
-    or tag: any), with LIVE_DEFAULTS_SEED_SOURCE as the source note.
+    The seed's settings as _settings_query spells them (it excludes no
+    category and sets no tag: any), with LIVE_DEFAULTS_SEED_SOURCE as the
+    source note.
 
     Returns:
         str: The query string, without the "?".
@@ -1362,23 +1372,129 @@ def _settings_table(settings: LiveSettings) -> str:
     return "".join(table)
 
 
-def _outdated_reading(proposal: LiveSettings) -> str:
+def _outdated_when(outdated: LiveDefaultsOutdated) -> str:
+    """
+    Say which change an outdated saved file was saved before.
+
+    A file saved before Rebalance also holds the old categories key. When
+    that key was null (any category) the file still reads as it did, with no
+    category excluded, so only Rebalance is named; the category change is
+    named when it is the only one, when the old key listed categories to
+    trade (its values in their new form trade every category), or when the
+    file cannot be read in its new form.
+
+    Args:
+        outdated (LiveDefaultsOutdated): Why the saved file is refused; its
+            retired names the old settings it holds.
+
+    Returns:
+        str: "before Rebalance", "before the category filter became a list of
+            categories to exclude", both joined by "and", or "by an older
+            version" when the refusal names no retired setting.
+    """
+    rebalance, categories = _outdated_changes(outdated)
+    changes = []
+    if rebalance:
+        changes.append("before Rebalance")
+    if categories:
+        changes.append("before the category filter became a list of categories to exclude")
+    return " and ".join(changes) if changes else "by an older version"
+
+
+def _outdated_changes(outdated: LiveDefaultsOutdated) -> tuple[bool, bool]:
+    """
+    Say which of the two retirements an outdated saved file's notice names.
+
+    Args:
+        outdated (LiveDefaultsOutdated): Why the saved file is refused.
+
+    Returns:
+        tuple[bool, bool]: Whether to name Rebalance, and whether to name the
+            change of the category filter (see _outdated_when).
+    """
+    retired = getattr(outdated, "retired", ()) or ()
+    rebalance = any(name != "categories" for name in retired)
+    categories = "categories" in retired and (
+        _old_categories(outdated) is not None
+        or not (rebalance and outdated.proposal is not None))
+    return rebalance, categories
+
+
+def _old_categories(outdated: LiveDefaultsOutdated) -> tuple[str, ...] | None:
+    """
+    Name the categories an outdated saved file traded only, when it listed some.
+
+    Args:
+        outdated (LiveDefaultsOutdated): Why the saved file is refused.
+
+    Returns:
+        tuple[str, ...] | None: Its old categories list (its values in their
+            new form then trade every category), or None.
+    """
+    return getattr(outdated, "old_categories", None)
+
+
+def _widening_html(outdated: LiveDefaultsOutdated) -> str:
+    """
+    Warn, as HTML, that an outdated file's values in their new form trade every category.
+
+    An older version saved the categories to TRADE; this one saves the
+    categories to exclude, and a list of categories to trade has no exact
+    reading as one, so the values offered exclude none. Every page that
+    offers them shows this, so one Confirm and save never widens live
+    trading unseen.
+
+    Args:
+        outdated (LiveDefaultsOutdated): Why the saved file is refused.
+
+    Returns:
+        str: One red paragraph naming the old categories and how to keep the
+            old filter; "" when the file listed none.
+    """
+    old = _old_categories(outdated)
+    if old is None:
+        return ""
+    names = ", ".join(html.escape(name) for name in old)
+    return ("<p class=\"banner\">The saved defaults traded only these categories: "
+            f"{names}. This version saves the categories to EXCLUDE instead, and the "
+            "values offered here exclude none, so saving them as they are trades every "
+            "category. To keep the old filter, add <code>&amp;exclude_category=&lt;name&gt;"
+            "</code> to the address for each category to leave out, or save from the "
+            "backtest dashboard's Save as live defaults… button with those categories "
+            "ticked in its Exclude categories menu.</p>")
+
+
+def _outdated_reading(outdated: LiveDefaultsOutdated) -> str:
     """
     Say how an outdated saved file's settings read now, in the dashboard's words.
 
+    Names only what the retired settings became: the Rebalance choice and
+    its minimum for a file saved before Rebalance, and "no category
+    excluded" when the category change is named (_outdated_changes).
+
     Args:
-        proposal (LiveSettings): LiveDefaultsOutdated.proposal: the file's
-            settings in their new form.
+        outdated (LiveDefaultsOutdated): Why the saved file is refused; its
+            proposal (the file's settings in their new form) must not be None.
 
     Returns:
-        str: "Rebalance yes and Min. price movement 10c" ("any" with no
-            minimum), or "Rebalance no".
+        str: e.g. "Rebalance yes and Min. price movement 10c" ("any" with no
+            minimum), "Rebalance no", "no category excluded" or "Rebalance no
+            and no category excluded".
     """
-    if not proposal.rebalance:
-        return "Rebalance no"
-    move = ("any" if proposal.min_price_move is None
-            else f"{round(proposal.min_price_move * 100)}c")
-    return f"Rebalance yes and Min. price movement {move}"
+    proposal = outdated.proposal
+    rebalance, categories = _outdated_changes(outdated)
+    parts = []
+    # A refusal naming neither change reads as the Rebalance choice, as before
+    if rebalance or not categories:
+        if not proposal.rebalance:
+            parts.append("Rebalance no")
+        else:
+            move = ("any" if proposal.min_price_move is None
+                    else f"{round(proposal.min_price_move * 100)}c")
+            parts.append(f"Rebalance yes and Min. price movement {move}")
+    if categories:
+        parts.append("no category excluded")
+    return " and ".join(parts)
 
 
 def _outdated_notice_html(outdated: LiveDefaultsOutdated) -> str:
@@ -1388,27 +1504,31 @@ def _outdated_notice_html(outdated: LiveDefaultsOutdated) -> str:
     The pages that cannot use such a file (/, /trade, /saved) show it. With a
     proposal, the link opens the confirmation page holding the file's values
     in their new form (every field named, no source note), where one Confirm
-    and save replaces the file. With none (the file's other settings are
-    refused too), it links to the seed values and names the dashboard.
+    and save replaces the file; when the file listed categories to trade, a
+    second red paragraph says those values trade every category
+    (_widening_html). With none (the file's other settings are refused too),
+    it links to the seed values and names the dashboard.
 
     Args:
         outdated (LiveDefaultsOutdated): Why the saved file is refused, with
             what it reads as now.
 
     Returns:
-        str: One red notice paragraph.
+        str: One red notice paragraph, or two.
     """
+    when = html.escape(_outdated_when(outdated))
     if outdated.proposal is None:
         seed = html.escape("/confirm?" + _seed_query())
-        return ("<p class=\"banner\">The saved live defaults were saved before Rebalance, and "
-                f"every live run refuses them: {html.escape(str(outdated))}. Save new ones from "
+        return (f"<p class=\"banner\">The saved live defaults were saved {when}, and every "
+                f"live run refuses them: {html.escape(str(outdated))}. Save new ones from "
                 f"<a href=\"{seed}\">the seed values</a> or the backtest dashboard's Save as "
                 "live defaults… button; a save replaces the file.</p>")
     link = html.escape("/confirm?" + _settings_query(outdated.proposal))
-    reading = html.escape(_outdated_reading(outdated.proposal))
-    return ("<p class=\"banner\">The saved live defaults were saved before Rebalance, so every "
+    reading = html.escape(_outdated_reading(outdated))
+    return (f"<p class=\"banner\">The saved live defaults were saved {when}, so every "
             f"live run refuses them until they are saved again. <a href=\"{link}\">Review their "
-            f"values, read as {reading}</a>: one Confirm and save there replaces the file.</p>")
+            f"values, read as {reading}</a>: one Confirm and save there replaces the file.</p>"
+            + _widening_html(outdated))
 
 
 def _outdated_confirm_html(outdated: LiveDefaultsOutdated, proposed: LiveSettings) -> str:
@@ -1417,7 +1537,9 @@ def _outdated_confirm_html(outdated: LiveDefaultsOutdated, proposed: LiveSetting
 
     When the page proposes exactly the file's values in their new form, it
     says so; otherwise it says the save replaces the file with the settings
-    below, and links to the file's own values when they can be read.
+    below, and links to the file's own values when they can be read. When
+    the file listed categories to trade, a second red paragraph says its
+    values in their new form trade every category (_widening_html).
 
     Args:
         outdated (LiveDefaultsOutdated): Why the saved file is refused, with
@@ -1425,22 +1547,23 @@ def _outdated_confirm_html(outdated: LiveDefaultsOutdated, proposed: LiveSetting
         proposed (LiveSettings): The settings the page proposes.
 
     Returns:
-        str: One red notice paragraph.
+        str: One red notice paragraph, or two.
     """
     proposal = outdated.proposal
+    when = html.escape(_outdated_when(outdated))
     if proposal is not None and proposed == proposal:
-        reading = html.escape(_outdated_reading(proposal))
-        return ("<p class=\"banner\">The saved live defaults were saved before Rebalance. "
+        reading = html.escape(_outdated_reading(outdated))
+        return (f"<p class=\"banner\">The saved live defaults were saved {when}. "
                 f"Below: their values, read as {reading}. Confirm and save to replace the "
-                "file.</p>")
+                "file.</p>" + _widening_html(outdated))
     if proposal is not None:
         link = html.escape("/confirm?" + _settings_query(proposal))
-        reading = html.escape(_outdated_reading(proposal))
-        return ("<p class=\"banner\">The saved live defaults were saved before Rebalance, so "
+        reading = html.escape(_outdated_reading(outdated))
+        return (f"<p class=\"banner\">The saved live defaults were saved {when}, so "
                 "every live run refuses them. Confirm and save replaces the file with the "
                 f"settings below; <a href=\"{link}\">their own values</a> read as {reading}."
-                "</p>")
-    return ("<p class=\"banner\">The saved live defaults were saved before Rebalance, and every "
+                "</p>" + _widening_html(outdated))
+    return (f"<p class=\"banner\">The saved live defaults were saved {when}, and every "
             f"live run refuses them: {html.escape(str(outdated))}. Confirm and save replaces "
             "the file with the settings below.</p>")
 
@@ -1500,8 +1623,9 @@ def _confirm_html(current: LiveSettings | None, settings: LiveSettings, source: 
     if current is not None:
         in_force = html.escape(current.origin)
     elif outdated is not None:
-        in_force = ("none — the saved file was saved before Rebalance, and live runs refuse "
-                    "it until it is saved again")
+        in_force = ("none — the saved file was saved "
+                    f"{html.escape(_outdated_when(outdated))}, and live runs refuse it "
+                    "until it is saved again")
     else:
         in_force = "none saved — live runs refuse to start until defaults are saved"
     parts.append(f"<p>Live defaults in force: {in_force}</p>")
@@ -2791,8 +2915,8 @@ class _App:
         Returns:
             _Response: A 409 page with the notice and no form.
         """
-        logging.warning("Refused (409 Conflict): the saved live defaults were saved before "
-                        "Rebalance: %s", _log_safe(str(exc)))
+        logging.warning("Refused (409 Conflict): the saved live defaults were saved %s: %s",
+                        _outdated_when(exc), _log_safe(str(exc)))
         body = "\n".join((_outdated_notice_html(exc), _where_html(saving=False),
                           "<p class=\"note\">HTTP 409 Conflict</p>"))
         return _Response(409, _page("The saved live defaults must be saved again", body))
@@ -3015,7 +3139,7 @@ class _App:
         try:
             current = _current_defaults()
         except LiveDefaultsOutdated as exc:
-            # Saved before Rebalance: nothing is in force, and a save here replaces it
+            # Saved by an older version: nothing is in force, and a save here replaces it
             current, outdated = None, exc
         except LiveDefaultsError as exc:
             return self._refused_file(exc)
@@ -3242,7 +3366,7 @@ class _App:
         try:
             current = _current_defaults()
         except LiveDefaultsOutdated as exc:
-            # Saved before Rebalance: nothing is in force, and a save here
+            # Saved by an older version: nothing is in force, and a save here
             # replaces it; a run still needs every check below (a dry run
             # needs saved defaults, so it is refused until the save)
             current, outdated = None, exc
@@ -4016,17 +4140,22 @@ def main(argv: list[str] | None = None) -> None:
     try:
         settings = _current_defaults()
     except LiveDefaultsOutdated as exc:
-        # Saved before Rebalance: every live run refuses it, and a page here saves it again
+        # Saved by an older version: every live run refuses it, and a page here saves it again
         if exc.proposal is None:
-            logging.warning("The saved live defaults were saved before Rebalance, and every "
+            logging.warning("The saved live defaults were saved %s, and every "
                             "live run refuses them (%s): open %s/ and save new ones; a save "
-                            "replaces the file", exc, base)
+                            "replaces the file", _outdated_when(exc), exc, base)
         else:
-            logging.warning("The saved live defaults were saved before Rebalance, and every "
+            old = _old_categories(exc)
+            logging.warning("The saved live defaults were saved %s, and every "
                             "live run refuses them until they are saved again: open %s/confirm?%s "
                             "to review their values (read as %s) and save them; do not delete "
-                            "the file", base, _settings_query(exc.proposal),
-                            _outdated_reading(exc.proposal))
+                            "the file%s", _outdated_when(exc), base, _settings_query(exc.proposal),
+                            _outdated_reading(exc),
+                            "" if old is None else (
+                                ". They traded only " + ", ".join(old) + ": saved as offered "
+                                "they trade every category, so add an exclude_category= "
+                                "field for each category to leave out"))
     except LiveDefaultsError as exc:
         logging.warning("The saved live defaults are refused (%s): fix or delete the file "
                         "before saving new ones here", exc)

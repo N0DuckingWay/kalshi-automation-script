@@ -186,24 +186,26 @@ Purpose:
     a minimum is never sent with Rebalance no), Sell level and Min. days to
     maturity (only on a page that simulated selling), with this run's
     same-title cap when the run recorded one — never for the Scenario
-    Explorer's own selects. The address names no category or tag, which the
-    server reads as any category and tag, so a save made from it clears a
-    saved category or tag filter. The live filter can only list the
-    categories to trade, and a list built from this page's menus would
-    leave out any category the backtest never saw, so the page saves no
-    category or tag filter for now: while any category is excluded or any
-    tag ticked the button stays disabled and its hover text says why;
-    a grey note beside it says when saving clears a saved filter. A live
-    filter is set on the confirmation page's address or with main.py
-    --category / --tag. That page compares the
+    Explorer's own selects. The address names each category ticked in the
+    Exclude categories menu as a category live runs exclude (every other
+    category trades live, one the backtest never saw included), and no tag,
+    which the server reads as any tag, so a save made from it clears a saved
+    tag filter. The live tag filter can only list the tags to trade, and a
+    list built from this page's menus would leave out any tag the backtest
+    never saw, so the page saves no tag filter for now: while any tag is
+    ticked, or the categories kept hold no trade of the scenario shown
+    (every category excluded, say), the button stays disabled and its hover
+    text says why; a grey note beside it says when saving replaces the saved
+    exclusions or clears a saved tag filter. A live tag filter is set on the confirmation page's
+    address or with main.py --tag. That page compares the
     proposal with the live defaults in force and acts only when one of its
     buttons is pressed: Confirm and save saves it, Confirm and trade saves
     it and then runs the live bot with it, and Dry run runs the bot with it
     without placing orders; this page writes nothing. The button is
     rendered disabled; the script enables it only while the scenario on
     screen can become live settings (it was simulated, its band was
-    recorded, its k and size cap were recorded and are above zero, and no
-    category is excluded and no tag ticked), and keeps it disabled while
+    recorded, its k and size cap were recorded and are above zero, no tag
+    is ticked and not every category is excluded), and keeps it disabled while
     another scenario's chunk loads. Beside it, a plain
     "Trade using defaults…" link opens the server's trade page (the saved
     defaults, with Dry run and Confirm and trade) in a new tab; it needs no
@@ -1737,9 +1739,85 @@ _CATEGORY_TABLE_FOOT = "</table></div>"
 _NO_FIGURE = "—"
 
 
+def _compensated_sum(values) -> float:
+    """
+    Add a group's values with a running correction for lost low digits.
+
+    For finite values this is the compensated (Kahan) sum pandas' group
+    kernel used for every group sum and mean through pandas 3.0, and the sum
+    the page script's groupSum repeats in the same order, so a mix of
+    categories and tags draws the bars Python draws. pandas 3.1 adds those
+    values with numpy's reduceat instead when the rows are already sorted by
+    group, which can differ in the last bit, so this module adds them itself
+    rather than leave it to pandas.
+
+    Args:
+        values: The group's values, in row order (a Series or any iterable of
+            floats).
+
+    Returns:
+        float: Their compensated sum; 0.0 for no values.
+    """
+    total = 0.0
+    lost = 0.0
+    for value in values:
+        y = float(value) - lost
+        t = total + y
+        lost = (t - total) - y
+        total = t
+    return total
+
+
+def _compensated_mean(values) -> float:
+    """
+    Average a group's values as pandas' group mean did, for finite values, through pandas 3.0.
+
+    Args:
+        values: The group's values, in row order; at least one.
+
+    Returns:
+        float: _compensated_sum of them divided by how many there are.
+    """
+    return _compensated_sum(values) / len(values)
+
+
+def _group_sums(grouped) -> pd.Series:
+    """
+    Sum each group of a grouped column with _compensated_sum.
+
+    Args:
+        grouped: A pandas SeriesGroupBy.
+
+    Returns:
+        pd.Series: grouped.sum() (its index, name and dtype) with each value
+            replaced by that group's _compensated_sum.
+    """
+    sums = grouped.sum()
+    if not len(sums):
+        return sums
+    # One pass over the rows in their order, a running total and correction
+    # per group (the group number of a dropped row is -1)
+    ids = grouped.ngroup().fillna(-1).astype(int).to_numpy().tolist()
+    values = grouped.obj.to_numpy(dtype=float).tolist()
+    totals = [0.0] * len(sums)
+    lost = [0.0] * len(sums)
+    for group, value in zip(ids, values, strict=True):
+        if group < 0:
+            continue
+        y = value - lost[group]
+        t = totals[group] + y
+        lost[group] = (t - totals[group]) - y
+        totals[group] = t
+    return pd.Series(totals, index=sums.index, name=sums.name, dtype=sums.dtype)
+
+
 def _category_groups(df: pd.DataFrame) -> pd.DataFrame:
     """
     Sum the decomposition frame per category · tag, largest P&L first.
+
+    The P&L adds with _compensated_sum, the sum the page script repeats, and
+    the mean return is _compensated_mean, so neither depends on pandas'
+    version; the median is pandas' own.
 
     Args:
         df (pd.DataFrame): One row per trade with columns subcategory, profit
@@ -1754,8 +1832,8 @@ def _category_groups(df: pd.DataFrame) -> pd.DataFrame:
     return df.groupby("subcategory").agg(
         trades=("profit", "size"),
         wins=("profit", lambda p: int((p > 0).sum())),
-        pnl=("profit", "sum"),
-        mean_ret=("profit_ratio", "mean"),
+        pnl=("profit", _compensated_sum),
+        mean_ret=("profit_ratio", _compensated_mean),
         median_ret=("profit_ratio", "median"),
     ).sort_values("pnl", ascending=False, kind="stable")
 
@@ -1897,6 +1975,9 @@ def _decomposition_aggregates(df: pd.DataFrame) -> dict:
     """
     Sum the decomposition frame's P&L four ways, for the section's bar charts.
 
+    Each group is added with _compensated_sum, the sum the page script repeats
+    for a mix of categories and tags.
+
     Entry price buckets read entry_pA, market A's YES ask at entry, for both
     pair types. It is a quote, not what the trade paid: the leg a trade buys
     on market A (the YES leg of a time_series trade, the NO leg of a
@@ -1915,11 +1996,12 @@ def _decomposition_aggregates(df: pd.DataFrame) -> dict:
     """
     buckets = pd.cut(df["entry_pA"], bins=_PRICE_BUCKET_BINS, labels=_PRICE_BUCKET_LABELS)
     return {
-        "monthly": df.groupby("month")["profit"].sum().reset_index(),
-        "category": df.groupby("category")["profit"].sum().sort_values(kind="stable"),
-        "subcategory": df.groupby("subcategory")["profit"].sum().sort_values(kind="stable"),
-        "price": (df.assign(price_bucket=buckets)
-                  .groupby("price_bucket", observed=True)["profit"].sum()),
+        "monthly": _group_sums(df.groupby("month")["profit"]).reset_index(),
+        "category": _group_sums(df.groupby("category")["profit"]).sort_values(kind="stable"),
+        "subcategory": _group_sums(df.groupby("subcategory")["profit"]).sort_values(
+            kind="stable"),
+        "price": _group_sums(df.assign(price_bucket=buckets)
+                             .groupby("price_bucket", observed=True)["profit"]),
     }
 
 
@@ -4676,23 +4758,24 @@ def _one_per_twin_group(items: list, key: Callable) -> tuple:
     return tuple(out)
 
 
-def _live_filter_ticks(categories: tuple[str, ...] | None,
+def _live_filter_ticks(exclude_categories: tuple[str, ...] | None,
                        tags: tuple[str, ...] | None,
                        bar: dict) -> _MenuTicks:
     """
     Name what to tick in the filter bar's two menus to show the live filter.
 
-    The live filter lists what to trade; both menus leave out what is ticked
-    (a category ticked in the Exclude categories menu, a "Category · Tag"
-    ticked in the Exclude tags menu), so the boxes to tick are what the
-    filter does not keep. Every (category, tag) the bar offers is asked of
-    config.trade_filter_for, the one rule the live run keeps a pair by
-    (letter case ignored), so a plain tag, a tied "Category · Tag" and a
-    list of categories all read as the live run reads them. A category the
-    filter keeps with every tag the bar offers for it needs nothing. One it
-    keeps with only some of them needs the others ticked in the Exclude tags
-    menu. One it keeps with none is excluded, whether the filter does not
-    list it or narrows it to tags this run filed no pair under.
+    The live filter lists the categories not to trade and the tags to trade;
+    both menus leave out what is ticked (a category ticked in the Exclude
+    categories menu, a "Category · Tag" ticked in the Exclude tags menu), so
+    the boxes to tick are what the filter does not keep. Every (category,
+    tag) the bar offers is asked of config.trade_filter_for, the one rule the
+    live run keeps a pair by (letter case ignored), so an excluded category,
+    a plain tag and a tied "Category · Tag" all read as the live run reads
+    them. A category the filter keeps with every tag the bar offers for it
+    needs nothing. One it keeps with only some of them needs the others
+    ticked in the Exclude tags menu. One it keeps with none is excluded,
+    whether the filter excludes it or narrows it to tags this run filed no
+    pair under.
 
     Categories whose names differ only in letter case are one category to
     the filter, and the page leaves them out together (_case_twins), so they
@@ -4706,7 +4789,8 @@ def _live_filter_ticks(categories: tuple[str, ...] | None,
     all come from its pairs) is kept or excluded as a whole.
 
     Args:
-        categories (tuple[str, ...] | None): BacktestSweep.live_categories; None = any.
+        exclude_categories (tuple[str, ...] | None):
+            BacktestSweep.live_exclude_categories; None = none excluded.
         tags (tuple[str, ...] | None): BacktestSweep.live_tags; None = any.
         bar (dict): _filter_payload's base block ("categories", "subcats").
 
@@ -4718,7 +4802,7 @@ def _live_filter_ticks(categories: tuple[str, ...] | None,
             bar offers; none is kept when it keeps none.
     """
     # Cross-module: the same rule the live run decides every pair by
-    keeps = trade_filter_for(categories, tags)
+    keeps = trade_filter_for(exclude_categories, tags)
     names = bar["categories"]
     pairs = [(names[ci], tag) for ci, tag in bar["subcats"]]
     tagged = {name for name, _ in pairs}
@@ -5107,10 +5191,10 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     if view is None:
         return style + html.escape(f"Live rule: {_LIVE_RULE_NONE}", quote=False) + "</p>"
     rule = describe_time_series_rule(sweep.live_tier_floors, sweep.live_spread_band)
-    categories, tags = sweep.live_categories, sweep.live_tags
-    filtered = categories is not None or tags is not None
+    excluded, tags = sweep.live_exclude_categories, sweep.live_tags
+    filtered = excluded is not None or tags is not None
     if filtered:
-        rule += f"; category/tag filter ({_live_filter_text(categories, tags)})"
+        rule += f"; category/tag filter ({_live_filter_text(excluded, tags)})"
     run_cap, st_cap = sweep.primary.size_cap, sweep.same_title_size_cap
     if run_cap is None or st_cap is None:
         cap_clause = "same-title cap not recorded"
@@ -5129,7 +5213,7 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
         slices = ("; this page's filter bar could not be built, so the live category/tag "
                   "filter cannot be shown")
     elif filtered:
-        ticks = _live_filter_ticks(categories, tags, bar)
+        ticks = _live_filter_ticks(excluded, tags, bar)
         if not ticks.kept:
             # Every category excluded: the filter keeps no pair this run filed
             ticks = None
@@ -7279,31 +7363,66 @@ _SAVE_TITLE = ("Open a confirmation page, in a new tab, that compares the filter
                "rebalancing) and its Sell level and Min. days to maturity (when this page "
                "simulated selling), with this run's same-title cap when the run recorded "
                "one; not the Scenario Explorer's own selects — with the live trading "
-               "defaults. It names no category or tag, so saving it leaves live runs "
-               "trading every category and tag, replacing any category or tag filter "
-               "saved before. "
+               "defaults. It names the categories ticked in the Exclude categories "
+               "menu as the categories live runs exclude (every other category trades, "
+               "one this backtest never saw included), and no tag, so saving it "
+               "replaces the excluded categories saved before and leaves live runs "
+               "trading every tag. "
                "Nothing is saved until you press a button there: Confirm and save saves "
                "it; Confirm and trade saves it and then runs the live bot with it, placing "
                "real orders; Dry run runs the live bot with it without placing orders and "
-               "saves nothing. It stays unavailable while any category is excluded or any "
-               "tag is ticked, while a scenario loads, and for a scenario the run never "
+               "saves nothing. It stays unavailable while any tag is ticked, while the "
+               "categories kept hold no trade of the scenario shown (every category "
+               "excluded, say), while a scenario loads, and for a scenario the run never "
                "simulated, whose band, k or size cap the run did not record, or whose k or "
                "size cap is not above zero.")
 _SAVE_NOTE = "(needs ./start_dashboard.sh running)"
-# Beside the save button when the saved live defaults filter by category or
-# tag: the button sends no category or tag, which the server reads as any
-_FILTER_SAVE_NOTE = ("Saving from this page clears the saved category and tag filter: live "
-                     "runs then trade every category and tag.")
-# The save button's hover text while any category is excluded or any tag
-# ticked, since the button saves no category or tag filter (the script shows
-# it in place of _SAVE_TITLE and puts _SAVE_TITLE back when nothing is ticked)
+
+
+def _filter_save_note(exclusions: tuple[str, ...] | list[str] | None, tags: bool) -> str | None:
+    """
+    The grey note beside the save button when a save replaces a saved filter.
+
+    The button sends the categories excluded on this page, which replace the
+    saved exclusions, and no tag, which the server reads as any tag.
+
+    Args:
+        exclusions (tuple[str, ...] | list[str] | None): The categories the
+            saved live defaults exclude (save["live_exclusions"]), or None.
+        tags (bool): Whether the saved live defaults filter by tag (save["live_tags"]).
+
+    Returns:
+        str | None: The note, or None when the saved defaults exclude no
+            category and filter by no tag.
+    """
+    if not exclusions and not tags:
+        return None
+    text = "Saving from this page saves the categories excluded here"
+    if exclusions:
+        text += f", which replace the saved exclusions ({', '.join(exclusions)})"
+    if tags:
+        text += ((", and" if exclusions else " and")
+                 + " clears the saved tag filter: live runs then trade every tag")
+    return text + "."
+
+
+# The note over saved live defaults that filter by tag and exclude nothing
+_FILTER_SAVE_NOTE = _filter_save_note(None, True)
+# The save button's hover text while it cannot save because of the menus (the
+# script shows it in place of _SAVE_TITLE and puts _SAVE_TITLE back once the
+# reason is gone): a tag ticked, since saved live defaults can only list the
+# tags to trade for now; or categories excluded such that those kept hold no
+# trade of the scenario shown (every category, say), which shows no trade
 _SAVE_BLOCKED_TEXT = {
-    "save_filtered": ("Cannot save while a category is excluded or a tag is ticked. Saved "
-                      "live defaults can only list the categories to trade, and this page "
-                      "knows only the categories this backtest saw, so it cannot save a "
-                      "category or tag filter. Untick every category and tag you ticked "
-                      "to save this scenario for every category and tag. To "
-                      "filter one live run, use main.py --category / --tag."),
+    "save_filtered": ("Cannot save while a tag is ticked. Saved live defaults can only "
+                      "list the tags to trade, and this page knows only the tags this "
+                      "backtest saw, so it cannot save a tag filter. Untick every tag "
+                      "to save this scenario. The categories you excluded are saved. "
+                      "To filter one live run by tag, use main.py --tag."),
+    "save_all_excluded": ("Cannot save while the categories kept hold no trade of this "
+                          "scenario: this view shows no trade, and live runs would trade "
+                          "only categories this backtest gave no trade to. Untick at "
+                          "least one category with trades to save."),
 }
 
 # The bar's "Trade using defaults…" link: its label and its hover text. It
@@ -7369,8 +7488,9 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date) -> 
     The button opens the defaults server's confirmation page with the bar's
     scenario in the address (its spread band, Tier floors choice, k, size
     cap, Rebalance choice, Min. price movement, Sell level and Min. days to
-    maturity; never a category or tag); this is the rest of that address,
-    fixed when the page is built. The server accepts no source note but one
+    maturity, and each category ticked in the Exclude categories menu as a
+    category live runs must not trade; never a tag); this is the rest of that
+    address, fixed when the page is built. The server accepts no source note but one
     of the shapes config.LIVE_DEFAULTS_SOURCE_PATTERN allows, so the note is
     checked against that pattern here, as the server checks it (whole, ASCII
     digits only), and left out should it ever not match.
@@ -7398,8 +7518,10 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date) -> 
             with the Rebalance view shows only then, since saving with
             Rebalance no turns it off);
             "live_sells" (whether they sell: the Sell view's save note shows only then);
-            "live_filters" (whether they filter by category or tag: the note
-            that saving clears that filter shows only then).
+            "live_tags" (whether they filter by tag: the note that saving
+            clears that filter shows only then);
+            "live_exclusions" (the categories they exclude, as a list, or None:
+            the note that saving replaces them names them).
     """
 
     def day(value: date) -> str:
@@ -7430,9 +7552,26 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date) -> 
         "source": source,
         "live_rebalances": getattr(sweep, "live_rebalance", None) is True,
         "live_sells": getattr(sweep, "live_sell_at", None) is not None,
-        "live_filters": (getattr(sweep, "live_categories", None) is not None
-                         or getattr(sweep, "live_tags", None) is not None),
+        "live_tags": getattr(sweep, "live_tags", None) is not None,
+        "live_exclusions": _recorded_names(getattr(sweep, "live_exclude_categories", None)),
     }
+
+
+def _recorded_names(value) -> list[str] | None:
+    """
+    Read a recorded filter as a list of names, or None.
+
+    Args:
+        value: BacktestSweep.live_exclude_categories as recorded.
+
+    Returns:
+        list[str] | None: Its names, when it is a non-empty tuple or list of
+            strings; None otherwise (none recorded, or not a filter).
+    """
+    if (isinstance(value, (tuple, list)) and value
+            and all(isinstance(name, str) for name in value)):
+        return list(value)
+    return None
 
 # Every compared field of a BacktestTrade, in declaration order: _list_key's
 # identity of a trade list is these values, trade by trade, plus the
@@ -12778,17 +12917,19 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     not show. After the Exclude tags menu comes the save button, rendered disabled
     too: the script enables it whenever the scenario on screen can become
     the live defaults, and a click opens the defaults server's confirmation
-    page for that scenario in a new tab, naming no category or tag. Its
-    hover text is _SAVE_TITLE on every page; while any category is
-    excluded or any tag ticked the button stays disabled and the script
-    shows _SAVE_BLOCKED_TEXT["save_filtered"] in its place. On a page with
+    page for that scenario in a new tab, naming each category excluded and
+    no tag. Its hover text is _SAVE_TITLE on every page; while any tag is
+    ticked, or the categories kept hold no trade of the scenario shown, the
+    button stays disabled and the script shows _SAVE_BLOCKED_TEXT["save_filtered"] or
+    ["save_all_excluded"] in its place. On a page with
     the Rebalance view whose saved live defaults rebalance
     (save["live_rebalances"]), a grey note (_REBALANCE_SAVE_NOTE) follows
     the button: saving with Rebalance no turns that off.
     _SELL_SAVE_NOTE (save["live_sells"]) does the same for selling, after
-    it, in the order of their selects, and _FILTER_SAVE_NOTE
-    (save["live_filters"]) says that saving clears a saved category or tag
-    filter. Then the "Trade using defaults…" link
+    it, in the order of their selects, and _filter_save_note's
+    (save["live_exclusions"], save["live_tags"]) says that saving replaces
+    the saved exclusions, naming them, and clears a saved tag filter. Then
+    the "Trade using defaults…" link
     (_trade_link_html), which the script never touches, and the note that
     both need the defaults server running.
 
@@ -12908,12 +13049,14 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
                   and (payload.get("save") or {}).get("live_sells") is True)
     save_note += ('&nbsp;<span id="flt-sell-save-note" style="color:#9E9E9E; font-size:13px;">'
                   f"{html.escape(_SELL_SAVE_NOTE)}</span>" if save_sells else "")
-    # The button sends no category or tag, so when the saved live defaults
-    # filter by one, saving clears that filter
-    save_filters = (payload.get("save") or {}).get("live_filters") is True
+    # The button sends the categories excluded here and no tag, so when the
+    # saved live defaults exclude categories or filter by tag, saving
+    # replaces those exclusions or clears that filter
+    save = payload.get("save") or {}
+    filter_note = _filter_save_note(save.get("live_exclusions"), save.get("live_tags") is True)
     save_note += ('&nbsp;<span id="flt-filter-save-note" style="color:#9E9E9E; '
-                  f'font-size:13px;">{html.escape(_FILTER_SAVE_NOTE)}</span>'
-                  if save_filters else "")
+                  f'font-size:13px;">{html.escape(filter_note)}</span>'
+                  if filter_note is not None else "")
 
     # The two check-box menus, nothing ticked (both "All" boxes unticked):
     # every category, and every category's tags named "Category · Tag" (the
@@ -13220,11 +13363,12 @@ def _pack_text(raw: str) -> str:
 # click opens the defaults server's confirmation page for that scenario in a
 # new tab (saveHref: D.save's address and the axes' values, plus each of the
 # Rebalance choice with its minimum price movement and the Sell level and
-# minimum ("off" for both under no selling), on a page with that view, but
-# never a category or tag). The button stays disabled while any category is
-# left out or any tag ticked (saveBlockedByTicks); its words are Python's,
-# its hover text too, which reads as Python rendered it except while a tick
-# is what stops a save (D.text.save_filtered). On load it inflates the base
+# minimum ("off" for both under no selling), on a page with that view, and
+# each category excluded as exclude_category, but never a tag). The button
+# stays disabled while any tag is ticked or the categories kept hold no trade
+# of the scenario shown (saveBlockedByTicks); its words are Python's, its hover text too, which
+# reads as Python rendered it except while a tick is what stops a save
+# (D.text.save_filtered, D.text.save_all_excluded). On load it inflates the base
 # block and the primary
 # scenario's chunk, sets the bar back to the view Python rendered and enables
 # it — it redraws nothing until a <select> changes. A chunk is inflated when a
@@ -13434,12 +13578,13 @@ _FILTER_JS = r"""
   // run never simulated (a Rebalance choice, a minimum price movement or a
   // Sell level the page holds no chunk for included), a band the run did
   // not record, a k or size cap the run did not record or that is not above
-  // zero, or any category left out or tag ticked (saveBlockedByTicks). The
-  // address names no category or tag, which the server reads as any
-  // category and tag, so the scenario it saves is the one shown with
-  // nothing ticked. The server refuses, with its reason, any other value the
-  // live settings reject. Each number is written by String(), whose
-  // shortest form reads back as the same number.
+  // zero, any tag ticked, or categories left out such that those kept hold no
+  // trade here (saveBlockedByTicks).
+  // The address names each category left out, by its name on the bar (every
+  // letter-case twin included, in the bar's order), as exclude_category, and
+  // no tag, which the server reads as any tag. The server refuses, with its
+  // reason, any other value the live settings reject. Each number is written
+  // by String(), whose shortest form reads back as the same number.
   function saveHref() {
     if (!D || !D.save || !SHOWN || C === null) { return null; }
     // null: never simulated; undefined: a sell level's block not inflated (a
@@ -13478,6 +13623,11 @@ _FILTER_JS = r"""
              ['sell_min_days',
               level === null ? 'off' : D.sell_days[parseInt(SHOWN[8], 10)].value]);
     }
+    // The categories left out, as the live runs' excluded categories: every
+    // other category trades live, one this backtest never saw included
+    SHOWN[3].slice().sort(function(a, b) { return a - b; }).forEach(function(ci) {
+      q.push(['exclude_category', D.categories[ci]]);
+    });
     if (typeof D.save.source === 'string' && D.save.source !== '') {
       q.push(['source', D.save.source]);
     }
@@ -13485,13 +13635,22 @@ _FILTER_JS = r"""
       return encodeURIComponent(p[0]) + '=' + encodeURIComponent(String(p[1]));
     }).join('&');
   }
-  // The reason the save button gives while any category is left out or any
-  // tag is ticked, in Python's words (D.text.save_filtered), or null when
-  // nothing is ticked: the address names no category or tag, so a view of
-  // some trades only is not what a save would make live. Every category
-  // left out counts too: that view shows no trade at all.
+  // The reason the save button gives while the menus stop a save, in
+  // Python's words, or null when they do not: a tag ticked
+  // (D.text.save_filtered), since the address names no tag, so a view
+  // narrowed by tags is not what a save would make live; or categories left
+  // out such that the categories kept hold no trade of the scenario shown
+  // (D.text.save_all_excluded) — every category the menu lists, or every
+  // one with a trade here — a view with no trade at all, whose save would
+  // trade only categories this backtest gave no trade to.
   function saveBlockedByTicks() {
-    return (SHOWN[3].length || SHOWN[4].length) ? D.text.save_filtered : null;
+    if (SHOWN[4].length) { return D.text.save_filtered; }
+    if (SHOWN[3].length && keptCats(SHOWN[3]).every(function(i) {
+      return count('c' + i) === 0;
+    })) {
+      return D.text.save_all_excluded;
+    }
+    return null;
   }
   // The button is enabled exactly when the scenario on screen can be saved;
   // while a tick in either menu is what stops it, its hover text says why
@@ -13753,7 +13912,7 @@ _FILTER_JS = r"""
     return pairSum(a, lo, half) + pairSum(a, lo + half, n - half);
   }
   function npSum(a) { return pairSum(a, 0, a.length); }
-  // pandas' sum within a group (compensated): the decomposition's bars
+  // _compensated_sum's sum within a group: the decomposition's bars
   function groupSum(values) {
     var sum = 0, comp = 0;
     values.forEach(function(v) {

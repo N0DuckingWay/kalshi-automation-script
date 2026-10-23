@@ -2941,7 +2941,7 @@ class TestTimeSeriesKellyParity:
             "TIME_SERIES_INTERVAL_PROB_DISCOUNT",
             "BUDGET_FRACTION",
             "SAME_TITLE_SIZE_CAP",
-            "TRADE_CATEGORIES",
+            "TRADE_EXCLUDE_CATEGORIES",
             "TRADE_TAGS",
             "REBALANCE",
             "MIN_PRICE_MOVE",
@@ -4545,7 +4545,7 @@ class TestTimeSeriesKellyParity:
         assert {k.arg: ast.unparse(k.value) for k in built.keywords} == {
             "tier_floors": "tier_floors is not False", "spread_band": "(band_lo, band_hi)",
             "interval_discount": "effective_k", "size_cap": "cap",
-            "same_title_size_cap": "st_cap", "categories": "None", "tags": "None",
+            "same_title_size_cap": "st_cap", "exclude_categories": "None", "tags": "None",
             "rebalance": "bool(add_to_held or trim_to_kelly)"}
         assert _bound_from(func, built) == ["settings"]
         # The cap a simulation shares from reads the live bound on the search

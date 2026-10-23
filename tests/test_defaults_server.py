@@ -102,7 +102,7 @@ _REAL_POPEN = subprocess.Popen
 DASHBOARD_NOTE = "backtest dashboard for 2025-09-24 to 2026-09-27"
 # The eleven rows of a comparison, in their order on the page
 LABELS = ["tier floors", "spread band", "k", "per-trade cap", "same-title cap",
-          "categories", "tags", "rebalance", "min price movement", "sell at",
+          "exclude categories", "tags", "rebalance", "min price movement", "sell at",
           "min days to maturity"]
 # A proposal's fields: the seed's values, spelled as the dashboard spells them
 _BASE = {"tier_floors": "off", "spread_min": "0", "spread_max": "0.5", "k": "0.8",
@@ -1110,11 +1110,11 @@ class TestConfirmPage:
         assert "min_price_move must be a multiple of 5c from 5c to $1" in html.unescape(
             response.body)
 
-    def test_a_missing_category_or_tag_proposes_any(self):
+    def test_a_missing_exclusion_or_tag_proposes_none_and_any(self):
         _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, ("Sports",), ("Basketball",)))
         page = _parse(_get(_app(), "/confirm?" + _query(same_title_size_cap="0.2")).body)
-        assert page.rows["categories"] == page.rows["tags"] == "changed"
-        assert page.cells["categories"][1:3] == ["Sports", "any"]
+        assert page.rows["exclude categories"] == page.rows["tags"] == "changed"
+        assert page.cells["exclude categories"][1:3] == ["Sports", "none"]
         assert page.cells["tags"][1:3] == ["Basketball", "any"]
 
     def test_confirm_is_there_and_disabled_when_something_changes(self):
@@ -1191,14 +1191,15 @@ class TestConfirmPage:
 
     def test_a_hostile_category_is_escaped(self):
         hostile = "<script>alert(1)</script>"
-        response = _get(_app(), "/confirm?" + _query(category=hostile, tag='"><b>x'))
+        response = _get(_app(), "/confirm?" + _query(exclude_category=hostile, tag='"><b>x'))
         assert response.status == 200
         assert "<script>alert" not in response.body
         assert "&lt;script&gt;alert(1)&lt;/script&gt;" in response.body
         page = _parse(response.body)
         assert len(page.scripts) == 1
-        assert ("category", hostile) in page.hidden and ("tag", '"><b>x') in page.hidden
-        assert page.cells["categories"][2] == hostile
+        assert ("exclude_category", hostile) in page.hidden
+        assert ("tag", '"><b>x') in page.hidden
+        assert page.cells["exclude categories"][2] == hostile
 
 
 class TestTradePage:
@@ -1514,9 +1515,13 @@ class TestConfirmRefusals:
         _query(k="1e400"), _query(k="０.8"), _query(k=" 0.8"), _query(k="0"),
         _query(k="1.5"), _query(k="0x1"),
         _query(size_cap="0.33"), _query(same_title_size_cap="0"),
-        _query(tag="Basketball"),                         # a tag without its category
-        _query(category="any"), _query(category="Any"), _query(category=" Sports"),
-        _query(category="Sports​"), _query(category="Sports", tag="Bask‮etball"),
+        # A field a link built before the category filter became a list of
+        # categories to exclude carries, which exclude_category replaced
+        _query(category="Sports"), _query(category="Sports", exclude_category="Politics"),
+        _query(exclude_category="any"), _query(exclude_category="Any"),
+        _query(exclude_category="none"), _query(exclude_category="None"),
+        _query(exclude_category=" Sports"), _query(exclude_category="Sports​"),
+        _query(exclude_category="Sports", tag="Bask‮etball"),
         _query(spread_min="0.5", spread_max="0.5"),
         _query(spread_min="0.6"),
         _query(spread_min="1e-400"),                      # would read as 0: refused, not rounded
@@ -1527,7 +1532,7 @@ class TestConfirmRefusals:
         _query(k="0.75", source=config.LIVE_DEFAULTS_SEED_SOURCE),  # not the seed's values
         _query(source=DASHBOARD_NOTE.translate(_ARABIC_INDIC)),     # other scripts' digits
         _query(source=DASHBOARD_NOTE.translate(_FULL_WIDTH)),
-        _query() + "&category=Fútbol",                # not percent-encoded
+        _query() + "&exclude_category=Fútbol",        # not percent-encoded
         _query(nonce="0" * 32), _query(action="trade"),  # not proposal fields
         # More fields than a request may hold
         "k", "&&", _query() + "&" + "&".join(
@@ -1546,9 +1551,20 @@ class TestConfirmRefusals:
         assert response.status == 400
         assert f"{field} is missing" in response.body
 
-    def test_the_refusal_names_the_rule(self):
-        body = _get(_app(), "/confirm?" + _query(tag="Basketball")).body
-        assert "a tag needs a category" in body
+    def test_a_link_built_before_exclusions_says_how_to_get_a_new_one(self):
+        response = _get(_app(), "/confirm?" + _query(category="Sports"))
+        assert response.status == 400
+        assert ("this link names category, which exclude_category replaced (the filter "
+                "is now a list of categories NOT to trade): rebuild the backtest "
+                "dashboard, or open this server&#x27;s start page") in response.body
+
+    def test_a_tag_needs_no_category(self):
+        # Nothing excluded and one plain tag: every category, only that tag
+        response = _get(_app(), "/confirm?" + _query(tag="Basketball"))
+        assert response.status == 200
+        page = _parse(response.body)
+        assert page.cells["exclude categories"][2] == "none"
+        assert page.cells["tags"][2] == "Basketball"
 
     def test_the_seed_note_labels_the_seed_values_only(self):
         # The seed's values under its note are shown ...
@@ -1614,33 +1630,37 @@ class TestConfirmRefusals:
 
 def _filter_query(categories=(), tags=(), **changes) -> str:
     """
-    Build a confirmation query that names several categories and tags.
+    Build a confirmation query that names several excluded categories and tags.
 
     Args:
-        categories: The category names, one field each, in order.
+        categories: The excluded category names, one exclude_category field
+            each, in order.
         tags: The tag names, one field each, in order.
         **changes: Other fields to set or (with None) remove, as _query takes them.
 
     Returns:
         str: The query string.
     """
-    names = [("category", name) for name in categories] + [("tag", name) for name in tags]
+    names = [("exclude_category", name) for name in categories] + [("tag", name) for name in tags]
     return _query(**changes) + ("&" + urlencode(names) if names else "")
 
 
-# The most names a link may carry: 40 categories, and one tag tied to each
+# The most names a link may carry: 40 excluded categories, and 40 tags each
+# tied to a category that is not excluded
 _MOST = config.DEFAULTS_SERVER_MAX_FILTER_NAMES
 _MOST_CATEGORIES = tuple(f"Climate and Weather {i:02d}" for i in range(_MOST))
-_MOST_TAGS = tuple(f"{name} · Hurricanes and Storms" for name in _MOST_CATEGORIES)
+_MOST_TAGS = tuple(f"Climate and Storms {i:02d} · Hurricanes and Storms"
+                   for i in range(_MOST))
 
 
 class TestSeveralCategoriesAndTags:
-    """A link may name several categories and tags, one field each: the page
-    proposes exactly them, a save writes them and a run gets one flag each."""
+    """A link may name several excluded categories and tags, one field each:
+    the page proposes exactly them, a save writes them and a run gets one flag
+    each."""
 
-    _CATEGORIES = ("Economics", "Sports", "Climate and Weather")
-    _TAGS = ("Sports · Basketball", "Sports · Pro Football", "climate and weather · Hurricanes")
-    _SETTINGS = replace(_BASE_SETTINGS, categories=_CATEGORIES, tags=_TAGS)
+    _CATEGORIES = ("Economics", "Politics", "Climate and Weather")
+    _TAGS = ("Sports · Basketball", "Sports · Pro Football", "science and technology · AI")
+    _SETTINGS = replace(_BASE_SETTINGS, exclude_categories=_CATEGORIES, tags=_TAGS)
 
     def test_the_page_proposes_every_name_in_order(self):
         query = _filter_query(self._CATEGORIES, self._TAGS)
@@ -1649,97 +1669,98 @@ class TestSeveralCategoriesAndTags:
         response = _get(_app(), f"/confirm?{query}")
         assert response.status == 200
         page = _parse(response.body)
-        assert page.cells["categories"][:3] == [
-            "categories", "—", "Economics, Sports, Climate and Weather"]
+        assert page.cells["exclude categories"][:3] == [
+            "exclude categories", "—", "Economics, Politics, Climate and Weather"]
         assert page.cells["tags"][:3] == [
             "tags", "—", "Sports · Basketball, Sports · Pro Football, "
-            "climate and weather · Hurricanes"]
+            "science and technology · AI"]
         # The form carries one hidden field per name, in the link's order
-        assert [v for n, v in page.hidden if n == "category"] == list(self._CATEGORIES)
+        assert [v for n, v in page.hidden if n == "exclude_category"] == list(self._CATEGORIES)
         assert [v for n, v in page.hidden if n == "tag"] == list(self._TAGS)
 
     def test_the_filter_it_proposes_is_the_rule_s(self):
         settings, _ = defaults_server._proposal(defaults_server._params(
-            _filter_query(("Economics", "Sports"), ("Sports · Basketball",))), None)
+            _filter_query(("Economics", "Politics"), ("Sports · Basketball",))), None)
         keeps = config.trade_filter(settings)
-        assert keeps("Economics", "Fed") and keeps("Sports", "Basketball")
-        assert not keeps("Sports", "Soccer") and not keeps("Politics", "Basketball")
+        assert keeps("Sports", "Basketball") and keeps("Climate and Weather", "Hurricanes")
+        assert not keeps("Sports", "Soccer") and not keeps("Economics", "Fed")
+        assert not keeps("Politics", "Basketball")
 
-    def test_a_link_with_one_category_and_one_plain_tag_still_means_the_same(self):
-        # The address a dashboard built before several names could be sent
-        for query in (_query(category="Sports", tag="Basketball"),
+    def test_a_link_with_one_exclusion_and_one_plain_tag(self):
+        for query in (_query(exclude_category="Sports", tag="Basketball"),
                       _filter_query(("Sports",), ("Basketball",))):
             settings, _ = defaults_server._proposal(defaults_server._params(query), None)
-            assert settings == replace(_BASE_SETTINGS, categories=("Sports",),
+            assert settings == replace(_BASE_SETTINGS, exclude_categories=("Sports",),
                                        tags=("Basketball",))
             assert _get(_app(), f"/confirm?{query}").status == 200
-        # Categories alone, and a plain tag beside a tied one
+        # Exclusions alone, and a plain tag beside a tied one
         settings, _ = defaults_server._proposal(defaults_server._params(
             _filter_query(("Sports", "Economics"))), None)
-        assert (settings.categories, settings.tags) == (("Sports", "Economics"), None)
+        assert (settings.exclude_categories, settings.tags) == (("Sports", "Economics"), None)
         settings, _ = defaults_server._proposal(defaults_server._params(
-            _filter_query(("Sports", "Economics"), ("Fed", "Sports · Soccer"))), None)
+            _filter_query(("Politics", "Economics"), ("Fed", "Sports · Soccer"))), None)
         assert settings.tags == ("Fed", "Sports · Soccer")
 
-    def test_a_missing_filter_still_means_any_whatever_is_saved(self):
+    def test_a_missing_filter_still_means_none_and_any_whatever_is_saved(self):
         _save(self._SETTINGS)
         settings, _ = defaults_server._proposal(defaults_server._params(_query()),
                                                 config.read_saved_live_defaults())
-        assert settings.categories is None and settings.tags is None
+        assert settings.exclude_categories is None and settings.tags is None
 
     @pytest.mark.parametrize("query, why", [
         # The very same name twice (another letter case is left out instead:
         # test_a_second_spelling_in_another_letter_case_is_left_out)
-        (_filter_query(("Sports", "Economics", "Sports")), "category &#x27;Sports&#x27; "
-                                                           "is given twice"),
+        (_filter_query(("Sports", "Economics", "Sports")),
+         "exclude_category &#x27;Sports&#x27; is given twice"),
         (_filter_query(("Sports",), ("Basketball", "Soccer", "Basketball")),
          "tag &#x27;Basketball&#x27; is given twice"),
         (_filter_query(("Sports",), ("Sports · Soccer", "Sports · Soccer")), "is given twice"),
         # ... even when it repeats a spelling that was itself left out
-        (_filter_query(("Sports", "sports", "sports")), "category &#x27;sports&#x27; "
-                                                        "is given twice"),
+        (_filter_query(("Sports", "sports", "sports")),
+         "exclude_category &#x27;sports&#x27; is given twice"),
         # A blank value among several
-        (_filter_query(("Sports",)) + "&category=", "category is blank"),
+        (_filter_query(("Sports",)) + "&exclude_category=", "exclude_category is blank"),
         (_filter_query(("Sports",), ("Soccer",)) + "&tag=&tag=Basketball", "tag is blank"),
         # More names than a link may carry
         (_filter_query([f"C{i}" for i in range(_MOST + 1)]),
-         f"category is given {_MOST + 1} times, more than {_MOST}"),
+         f"exclude_category is given {_MOST + 1} times, more than {_MOST}"),
         (_filter_query(("Sports",), [f"T{i}" for i in range(_MOST + 1)]),
          f"tag is given {_MOST + 1} times, more than {_MOST}"),
-        # A tag tied to a category the link does not name
-        (_filter_query(("Sports",), ("Economics · Fed",)),
-         "names the category &#x27;Economics&#x27;, which categories does not list"),
-        (_filter_query(("Sports", "Politics"), ("Sports · Soccer", "Economics · Fed")),
-         "which categories does not list"),
-        # Tags, tied or plain, with no category at all
-        (_filter_query((), ("Sports · Basketball",)), "a tag needs a category"),
-        (_filter_query((), ("Basketball", "Soccer")), "a tag needs a category"),
+        # A tag tied to a category the link excludes, in any letter case
+        (_filter_query(("Sports",), ("Sports · Basketball",)),
+         "tags: &#x27;Sports · Basketball&#x27; is tied to &#x27;Sports&#x27;, which "
+         "is in exclude_categories"),
+        (_filter_query(("Politics", "economics"), ("Sports · Soccer", "Economics · Fed")),
+         "which is in exclude_categories"),
         # A category written as a tied tag, with tags or without: it would read
-        # as "Sports narrowed to Basketball" while all of Sports traded
+        # as "exclude Basketball from Sports" while it excluded nothing
         (_filter_query(("Sports", "Sports · Basketball")),
-         "categories: &#x27;Sports · Basketball&#x27; is a tag tied to a category; "
-         "give it as a tag"),
-        (_filter_query(("Sports", "Sports · Basketball"), ("Sports · Basketball",)),
-         "is a tag tied to a category; give it as a tag"),
-        (_filter_query(("Sports ·",)), "is a tag tied to a category; give it as a tag"),
+         "exclude_categories: &#x27;Sports · Basketball&#x27; is a tag tied to a "
+         "category; only a whole category can be excluded"),
+        (_filter_query(("Politics", "Sports · Basketball"), ("Sports · Basketball",)),
+         "is a tag tied to a category; only a whole category can be excluded"),
+        (_filter_query(("Sports ·",)), "is a tag tied to a category; only a whole category can be excluded"),
         # Two spaces in a row, which a browser would show as one: the name
         # would look like another category's, or like a tag tied to it
         (_filter_query(("Climate and Weather", "Climate  and Weather"),
                        ("Climate  and Weather · Hurricanes",)),
-         "category must not hold two spaces in a row, got &#x27;Climate  and Weather&#x27;"),
-        (_filter_query(("Climate and Weather",), ("Climate  and Weather · Hurricanes",)),
+         "exclude_category must not hold two spaces in a row, "
+         "got &#x27;Climate  and Weather&#x27;"),
+        (_filter_query(("Politics",), ("Climate  and Weather · Hurricanes",)),
          "tag must not hold two spaces in a row"),
-        (_filter_query(("Sports",), ("Sports ·  Basketball",)),
+        (_filter_query(("Politics",), ("Sports ·  Basketball",)),
          "tag must not hold two spaces in a row"),
         (_filter_query(("Sports",), ("Pro  Football",)), "tag must not hold two spaces in a row"),
         # A tied tag with a blank half is never read as a plain tag
-        (_filter_query(("Sports",), ("Sports · ",)), "tag must be one printable name"),
-        (_filter_query(("Sports",), (" · Basketball",)), "tag must be one printable name"),
-        (_filter_query(("Sports",), ("Sports ·",)), "must read &#x27;Category · Tag&#x27;"),
-        (_filter_query(("Sports",), ("· Basketball",)), "must read &#x27;Category · Tag&#x27;"),
+        (_filter_query(("Politics",), ("Sports · ",)), "tag must be one printable name"),
+        (_filter_query(("Politics",), (" · Basketball",)), "tag must be one printable name"),
+        (_filter_query(("Politics",), ("Sports ·",)), "must read &#x27;Category · Tag&#x27;"),
+        (_filter_query(("Politics",), ("· Basketball",)),
+         "must read &#x27;Category · Tag&#x27;"),
         # One bad name refuses the whole link
-        (_filter_query(("Sports", "any")), "categories cannot hold the name"),
-        (_filter_query(("Sports", " Economics")), "category must be one printable name"),
+        (_filter_query(("Sports", "any")), "exclude_categories cannot hold the name"),
+        (_filter_query(("Sports", "None")), "exclude_categories cannot hold the name"),
+        (_filter_query(("Sports", " Economics")), "exclude_category must be one printable name"),
         (_filter_query(("Sports",), ("Soccer", "Bask‮etball")),
          "tag must be one printable name"),
         # A single-valued field still may not repeat
@@ -1757,24 +1778,28 @@ class TestSeveralCategoriesAndTags:
         # lists both may send both: the live filter ignores letter case, so the
         # first spelling is kept and the link is not refused
         query = _filter_query(("Health", "Sports", "health"),
-                              ("Health · COVID", "Health · Covid", "Basketball", "BASKETBALL"))
+                              ("Science · COVID", "Science · Covid", "Basketball", "BASKETBALL"))
         settings, _ = defaults_server._proposal(defaults_server._params(query), None)
-        assert settings.categories == ("Health", "Sports")
-        assert settings.tags == ("Health · COVID", "Basketball")
+        assert settings.exclude_categories == ("Health", "Sports")
+        assert settings.tags == ("Science · COVID", "Basketball")
         app = _app()
         response = _get(app, f"/confirm?{query}")
         assert response.status == 200
         page = _parse(response.body)
-        assert page.cells["categories"][:3] == ["categories", "—", "Health, Sports"]
-        assert page.cells["tags"][:3] == ["tags", "—", "Health · COVID, Basketball"]
-        # The filter keeps either spelling's pairs
+        assert page.cells["exclude categories"][:3] == [
+            "exclude categories", "—", "Health, Sports"]
+        assert page.cells["tags"][:3] == ["tags", "—", "Science · COVID, Basketball"]
+        # The filter excludes either spelling's category and keeps either
+        # spelling's tag
         keeps = config.trade_filter(settings)
-        assert keeps("Health", "Covid") and keeps("Health", "COVID")
-        assert keeps("Sports", "Basketball") and not keeps("Health", "Flu")
+        assert keeps("Science", "Covid") and keeps("Science", "COVID")
+        assert keeps("Economics", "Basketball") and not keeps("Science", "Flu")
+        assert not keeps("health", "Basketball") and not keeps("SPORTS", "Basketball")
         # Saving the page's own form writes each name once
         assert _post(app, _click(page, "confirm")).status == 303
         saved = config.read_saved_live_defaults()
-        assert (saved.categories, saved.tags) == (settings.categories, settings.tags)
+        assert (saved.exclude_categories, saved.tags) == (settings.exclude_categories,
+                                                          settings.tags)
 
     def test_the_cap_counts_the_names_sent(self):
         # 41 spellings of one name are over the cap, though one would be kept
@@ -1782,11 +1807,12 @@ class TestSeveralCategoriesAndTags:
         assert len({s.casefold() for s in spellings}) == 1 and len(set(spellings)) == _MOST + 1
         response = _get(_app(), "/confirm?" + _filter_query(spellings))
         assert response.status == 400
-        assert f"category is given {_MOST + 1} times, more than {_MOST}" in response.body
+        assert (f"exclude_category is given {_MOST + 1} times, more than {_MOST}"
+                in response.body)
         # ... while 40 of them are one category
         settings, _ = defaults_server._proposal(defaults_server._params(
             _filter_query(spellings[:_MOST])), None)
-        assert settings.categories == (spellings[0],)
+        assert settings.exclude_categories == (spellings[0],)
 
     @pytest.mark.parametrize("button_id", ["confirm", "confirm-trade", "confirm-dry-run"])
     def test_a_form_with_several_names_posted_twice_does_its_work_once(self, monkeypatch,
@@ -1830,7 +1856,7 @@ class TestSeveralCategoriesAndTags:
                 self._SETTINGS)
 
     def test_the_most_names_a_link_may_carry_fit_one_request(self):
-        # 40 categories and 40 tags, each tag tied to its category
+        # 40 excluded categories and 40 tags, each tied to a category not excluded
         query = _filter_query(_MOST_CATEGORIES, _MOST_TAGS, source=DASHBOARD_NOTE)
         app = _app()
         target = f"/confirm?{query}"
@@ -1844,7 +1870,7 @@ class TestSeveralCategoriesAndTags:
         assert len(form) <= defaults_server._MAX_FIELDS - 2
         assert _post(app, form).status == 303
         saved = config.read_saved_live_defaults()
-        assert saved.categories == _MOST_CATEGORIES and saved.tags == _MOST_TAGS
+        assert saved.exclude_categories == _MOST_CATEGORIES and saved.tags == _MOST_TAGS
 
     def test_the_field_limit_covers_the_fullest_form(self):
         # Every proposal field once, the most categories and tags, the three
@@ -1863,19 +1889,19 @@ class TestSeveralCategoriesAndTags:
         assert response.status == 303
         saved = config.read_saved_live_defaults()
         assert saved == self._SETTINGS
-        assert (saved.categories, saved.tags) == (self._CATEGORIES, self._TAGS)
+        assert (saved.exclude_categories, saved.tags) == (self._CATEGORIES, self._TAGS)
         stored = json.loads(config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8"))["settings"]
-        assert stored["categories"] == list(self._CATEGORIES)
+        assert stored["exclude_categories"] == list(self._CATEGORIES)
         assert stored["tags"] == list(self._TAGS)
         # The saved page names them
         body = _get(app, "/saved").body
-        assert "Economics, Sports, Climate and Weather" in body
+        assert "Economics, Politics, Climate and Weather" in body
         assert "Sports · Basketball, Sports · Pro Football" in body
 
     @pytest.mark.parametrize("button, dry_run", [("confirm-dry-run", True),
                                                  ("confirm-trade", False)])
     def test_a_run_gets_one_flag_per_name(self, button, dry_run):
-        # A dry run needs saved defaults; these name no category or tag
+        # A dry run needs saved defaults; these exclude no category and name no tag
         _save(_BASE_SETTINGS)
         starter = _Starter()
         app = _app(start_process=starter)
@@ -1883,10 +1909,12 @@ class TestSeveralCategoriesAndTags:
         _run_id(_post(app, form))
         [(argv, _)] = starter.calls
         assert ("--dry-run" in argv) is dry_run
-        assert [a for a in argv if a.startswith(("--category", "--tag", "--any"))] == [
-            "--category=Economics", "--category=Sports", "--category=Climate and Weather",
+        assert [a for a in argv if a.startswith(
+                ("--exclude-category", "--no-exclude-category", "--tag", "--any"))] == [
+            "--exclude-category=Economics", "--exclude-category=Politics",
+            "--exclude-category=Climate and Weather",
             "--tag=Sports · Basketball", "--tag=Sports · Pro Football",
-            "--tag=climate and weather · Hurricanes"]
+            "--tag=science and technology · AI"]
         flags = argv[5:argv.index("--result-file")]
         assert flags == config.live_settings_argv(self._SETTINGS)
         # A dry run saves nothing; Confirm and trade saved before it started
@@ -1900,11 +1928,11 @@ class TestSeveralCategoriesAndTags:
         _run_id(_post(app, _trade_form(app, "confirm-dry-run"), target="/trade"))
         [(argv, _)] = starter.calls
         assert argv[5:argv.index("--result-file")] == config.live_settings_argv(saved)
-        assert "--tag=Sports · Basketball" in argv and "--category=Economics" in argv
+        assert "--tag=Sports · Basketball" in argv and "--exclude-category=Economics" in argv
 
     def test_the_token_covers_every_name_and_its_place(self):
         app = _app(start_process=_Starter())
-        form = _page_form(app, _filter_query(("Economics", "Sports"), ("Sports · Soccer",)))
+        form = _page_form(app, _filter_query(("Economics", "Politics"), ("Sports · Soccer",)))
 
         def changed(edit):
             """A copy of the form with its (name, value) pairs passed through edit."""
@@ -1915,14 +1943,15 @@ class TestSeveralCategoriesAndTags:
             return pairs
 
         def swapped(pairs):
-            a, b = pairs.index(("category", "Economics")), pairs.index(("category", "Sports"))
+            a = pairs.index(("exclude_category", "Economics"))
+            b = pairs.index(("exclude_category", "Politics"))
             pairs[a], pairs[b] = pairs[b], pairs[a]
             return pairs
 
         for tampered in (
-            changed(lambda p: without(p, ("category", "Economics"))),
+            changed(lambda p: without(p, ("exclude_category", "Economics"))),
             changed(lambda p: without(p, ("tag", "Sports · Soccer"))),
-            changed(lambda p: p + [("category", "Politics")]),
+            changed(lambda p: p + [("exclude_category", "Health")]),
             changed(lambda p: p + [("tag", "Sports · Basketball")]),
             changed(swapped),
         ):
@@ -1930,7 +1959,8 @@ class TestSeveralCategoriesAndTags:
         assert config.read_saved_live_defaults() is None
         # The page's own form is still good afterwards
         assert _post(app, form).status == 303
-        assert config.read_saved_live_defaults().categories == ("Economics", "Sports")
+        assert config.read_saved_live_defaults().exclude_categories == ("Economics",
+                                                                        "Politics")
 
     def test_a_stale_page_is_shown_again_with_every_name(self):
         app = _app()
@@ -1939,7 +1969,7 @@ class TestSeveralCategoriesAndTags:
         response = _post(app, form)
         assert response.status == 409
         page = _parse(response.body)
-        assert [v for n, v in page.hidden if n == "category"] == list(self._CATEGORIES)
+        assert [v for n, v in page.hidden if n == "exclude_category"] == list(self._CATEGORIES)
         assert [v for n, v in page.hidden if n == "tag"] == list(self._TAGS)
         # The fresh page's form saves them
         assert _post(app, _click(page, "confirm")).status == 303
@@ -2035,7 +2065,7 @@ class TestOutdatedFile:
         params = defaults_server._params(_outdated_link().split("?", 1)[1])
         assert "source" not in params
         assert [name for name in defaults_server._FIELDS
-                if name not in ("category", "tag", "source")] == list(params)
+                if name not in ("exclude_category", "tag", "source")] == list(params)
         assert params["rebalance"] == ["on"] and params["min_price_move"] == ["0.1"]
         # It proposes exactly those values, whatever is saved
         assert defaults_server._proposal(params, None) == (_OLD_VERSION_READS_AS, "")
@@ -2345,6 +2375,133 @@ class TestOutdatedFile:
                 "delete the file") in log
 
 
+    @staticmethod
+    def _categories_file(categories: bytes) -> None:
+        """
+        Write a file the version before exclusions saved: rebalancing on, the given categories.
+
+        Args:
+            categories (bytes): The JSON text of its categories value.
+        """
+        config.LIVE_DEFAULTS_FILE.write_bytes(
+            _OLD_VERSION_BYTES
+            .replace(b'    "add_to_held_pairs": true,\n    "trim_to_kelly": true,\n'
+                     b'    "trim_min_rise": 0.1\n',
+                     b'    "rebalance": true,\n    "min_price_move": 0.1\n')
+            .replace(b'"categories": null', b'"categories": ' + categories))
+
+    def test_a_file_with_no_category_filter_reads_as_excluding_none(self):
+        self._categories_file(b"null")
+        with pytest.raises(config.LiveDefaultsOutdated) as caught:
+            config.read_saved_live_defaults()
+        assert caught.value.proposal == replace(_OLD_VERSION_READS_AS, exclude_categories=None)
+        app = _app()
+        index = _get(app, "/")
+        assert index.status == 200
+        assert ("The saved live defaults were saved before the category filter became a "
+                "list of categories to exclude, so every live run refuses them until they "
+                "are saved again.") in index.body
+        assert "read as no category excluded" in index.body
+        link = "/confirm?" + defaults_server._settings_query(caught.value.proposal)
+        assert link in _parse(index.body).links
+        confirm = _get(app, link)
+        assert confirm.status == 200
+        assert ("The saved live defaults were saved before the category filter became a "
+                "list of categories to exclude. Below: their values, read as no category "
+                "excluded. Confirm and save to replace the file.") in html.unescape(confirm.body)
+        assert _post(app, _click(confirm.body, "confirm")).status == 303
+        assert config.read_saved_live_defaults() == caught.value.proposal
+
+    def test_a_file_that_listed_categories_offers_its_values_with_a_warning(self):
+        # The old file traded only Sports and Economics: its values in their
+        # new form exclude no category, so every page that offers them says in
+        # red that saving them as they are trades every category
+        self._categories_file(b'["Sports", "Economics"]')
+        with pytest.raises(config.LiveDefaultsOutdated) as caught:
+            config.read_saved_live_defaults()
+        assert caught.value.old_categories == ("Sports", "Economics")
+        proposal = caught.value.proposal
+        assert proposal == replace(_OLD_VERSION_READS_AS, exclude_categories=None)
+        link = "/confirm?" + defaults_server._settings_query(proposal)
+        starter = _Starter()
+        app = _app(start_process=starter)
+        warning = ("The saved defaults traded only these categories: Sports, Economics. "
+                   "This version saves the categories to EXCLUDE instead, and the values "
+                   "offered here exclude none, so saving them as they are trades every "
+                   "category. To keep the old filter, add <code>&exclude_category=<name></code> to the "
+                   "address for each category to leave out, or save from the backtest "
+                   "dashboard's Save as live defaults… button with those categories ticked "
+                   "in its Exclude categories menu.")
+        index = _get(app, "/")
+        assert index.status == 200
+        for response in (index, _get(app, "/trade"), _get(app, "/saved")):
+            body = html.unescape(response.body)
+            assert warning in body
+            assert "before the category filter became a list of categories to exclude" \
+                in body
+            # The link offered is the file's own values, never the seed's (the
+            # index links the seed page as it always does)
+            assert link in _parse(response.body).links
+            if response is not index:
+                assert ("/confirm?" + defaults_server._seed_query()
+                        not in _parse(response.body).links)
+        assert _get(app, "/trade").status == 409
+        assert _get(app, "/saved").status == 409
+        # The confirmation page the link opens proposes the file's other values
+        confirm = _get(app, link)
+        assert confirm.status == 200
+        assert warning in html.unescape(confirm.body)
+        cells = _parse(confirm.body).cells
+        assert cells["rebalance"][2] == "yes"
+        assert cells["exclude categories"][2] == "none"
+        # A page proposing other values over the file still warns
+        other = _get(app, "/confirm?" + _query(exclude_category="Politics"))
+        assert warning in html.unescape(other.body)
+        # A trade form is still refused, nothing started, the file as it was
+        old = config.LIVE_DEFAULTS_FILE.read_bytes()
+        fingerprint, nonce = defaults_server._fingerprint(None), "3" * 32
+        form = [("fingerprint", fingerprint), ("nonce", nonce),
+                ("token", app._token("trade", fingerprint, nonce, {})), ("action", "trade")]
+        assert _post(app, form, target="/trade").status == 409
+        assert starter.calls == []
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == old
+        # One Confirm and save writes exactly the file's other values
+        assert _post(app, _click(confirm.body, "confirm")).status == 303
+        saved = config.read_saved_live_defaults()
+        assert saved == proposal
+        assert (saved.tier_floors, saved.spread_band, saved.interval_discount,
+                saved.size_cap, saved.same_title_size_cap, saved.rebalance,
+                saved.min_price_move, saved.sell_at, saved.exclude_categories) == (
+            False, (0.0, 0.8), 0.7, 0.15, 0.2, True, 0.1, None, None)
+
+    def test_a_listed_file_s_link_keeps_its_sell_rule_and_tags(self):
+        # The offered link carries every one of the file's other settings
+        config.LIVE_DEFAULTS_FILE.write_bytes(
+            _OLD_VERSION_BYTES
+            .replace(b'"categories": null', b'"categories": ["Sports"]')
+            .replace(b'"tags": null', b'"tags": ["Sports \xc2\xb7 Basketball"]')
+            .replace(b'"trim_min_rise": 0.1\n',
+                     b'"trim_min_rise": 0.1,\n    "sell_at": 0.85,\n    "sell_min_days": 7\n'))
+        with pytest.raises(config.LiveDefaultsOutdated) as caught:
+            config.read_saved_live_defaults()
+        proposal = caught.value.proposal
+        assert (proposal.sell_at, proposal.sell_min_days, proposal.tags) == (
+            0.85, 7, ("Sports · Basketball",))
+        index = _get(_app(), "/")
+        assert "/confirm?" + defaults_server._settings_query(proposal) in _parse(index.body).links
+        assert "traded only these categories: Sports." in html.unescape(index.body)
+
+    def test_a_malformed_categories_value_offers_the_seed(self):
+        self._categories_file(b'"Sports"')
+        with pytest.raises(config.LiveDefaultsOutdated) as caught:
+            config.read_saved_live_defaults()
+        assert caught.value.proposal is None and caught.value.old_categories is None
+        trade = _get(_app(), "/trade")
+        assert trade.status == 409
+        assert "/confirm?" + defaults_server._seed_query() in _parse(trade.body).links
+        assert "traded only these categories" not in html.unescape(trade.body)
+
+
 class TestSave:
     """POST /confirm with Confirm and save writes exactly what its page showed, after every check."""
 
@@ -2360,7 +2517,7 @@ class TestSave:
     def test_it_overwrites_the_defaults_in_force(self):
         _save(LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0))
         app = _app()
-        form = _page_form(app, _query(category="Sports", tag="Basketball",
+        form = _page_form(app, _query(exclude_category="Sports", tag="Basketball",
                                       same_title_size_cap="0.5"))
         assert _post(app, form).status == 303
         assert config.read_saved_live_defaults() == LiveSettings(
@@ -2472,13 +2629,13 @@ class TestSave:
 
     @pytest.mark.parametrize("tamper", [
         lambda f: [(n, "0.4" if n == "k" else v) for n, v in f],
-        lambda f: f + [("category", "Sports")],
+        lambda f: f + [("exclude_category", "Economics")],
         lambda f: [(n, v) for n, v in f if n != "tag"],
         lambda f: [(n, v) for n, v in f if n != "same_title_size_cap"],
     ])
     def test_a_field_changed_after_signing_is_refused(self, tamper):
         app = _app()
-        form = _page_form(app, _query(category="Sports", tag="Basketball",
+        form = _page_form(app, _query(exclude_category="Sports", tag="Basketball",
                                       same_title_size_cap="0.5"))
         assert _post(app, tamper(form)).status == 403
         assert config.read_saved_live_defaults() is None
@@ -2535,7 +2692,7 @@ class TestSave:
 
     def test_a_zero_floor_and_a_non_ascii_tag_round_trip(self):
         app = _app()
-        form = _page_form(app, _query(spread_min="0", category="Deportes", tag="Fútbol"))
+        form = _page_form(app, _query(spread_min="0", exclude_category="Deportes", tag="Fútbol"))
         assert ("tag", "Fútbol") in form
         assert _post(app, form).status == 303
         saved = config.read_saved_live_defaults()
@@ -2572,10 +2729,13 @@ class TestSave:
 
     def test_a_refusal_is_logged_as_one_warning(self, caplog):
         with caplog.at_level(logging.WARNING):
-            _get(_app(), "/confirm?" + _query(tag="Basketball"))
+            _get(_app(), "/confirm?" + _query(category="Sports"))
         [record] = caplog.records
         assert record.levelno == logging.WARNING
-        assert record.getMessage() == "Refused (400 Bad Request): a tag needs a category"
+        assert record.getMessage() == (
+            "Refused (400 Bad Request): this link names category, which exclude_category "
+            "replaced (the filter is now a list of categories NOT to trade): rebuild the "
+            "backtest dashboard, or open this server's start page")
 
 
 class TestSavedPage:
@@ -2749,40 +2909,42 @@ class TestHelpers:
             replace(a, interval_discount=0.75))
 
     def test_the_signed_text_is_the_purpose_fingerprint_nonce_and_raw_fields_sorted(self):
-        params = {"k": ["0.80"], "tier_floors": ["off"], "token": ["x"], "category": ["A B"],
-                  "action": ["trade"], "nonce": ["y"]}
+        params = {"k": ["0.80"], "tier_floors": ["off"], "token": ["x"],
+                  "exclude_category": ["A B"], "action": ["trade"], "nonce": ["y"]}
         assert defaults_server._signed_text("confirm", "f" * 64, "n" * 32, params) == (
-            "confirm\n" + "f" * 64 + "\n" + "n" * 32 + "\ncategory=A+B&k=0.80&tier_floors=off")
+            "confirm\n" + "f" * 64 + "\n" + "n" * 32
+            + "\nexclude_category=A+B&k=0.80&tier_floors=off")
         assert defaults_server._signed_text("trade", "f" * 64, "n" * 32, {}) == (
             "trade\n" + "f" * 64 + "\n" + "n" * 32 + "\n")
 
     def test_the_signed_text_keeps_a_repeated_field_s_values_in_order(self):
         # Field names are sorted; the categories and tags stay as the page listed them
         params = {"tag": ["Sports · Soccer", "Fed"], "k": ["0.8"],
-                  "category": ["Sports", "Economics"]}
+                  "exclude_category": ["Sports", "Economics"]}
         assert defaults_server._signed_text("confirm", "f" * 64, "n" * 32, params) == (
             "confirm\n" + "f" * 64 + "\n" + "n" * 32
-            + "\ncategory=Sports&category=Economics&k=0.8&tag=Sports+%C2%B7+Soccer&tag=Fed")
-        other = {**params, "category": ["Economics", "Sports"]}
+            + "\nexclude_category=Sports&exclude_category=Economics&k=0.8"
+            + "&tag=Sports+%C2%B7+Soccer&tag=Fed")
+        other = {**params, "exclude_category": ["Economics", "Sports"]}
         assert defaults_server._signed_text("confirm", "f" * 64, "n" * 32, other) != (
             defaults_server._signed_text("confirm", "f" * 64, "n" * 32, params))
 
     def test_a_name_list_reads_each_name_once(self):
-        params = {"category": ["Sports", "Economics"], "tag": ["Sports · Soccer"]}
-        assert defaults_server._name_list(params, "category") == ("Sports", "Economics")
+        params = {"exclude_category": ["Sports", "Economics"], "tag": ["Sports · Soccer"]}
+        assert defaults_server._name_list(params, "exclude_category") == ("Sports", "Economics")
         assert defaults_server._name_list(params, "tag") == ("Sports · Soccer",)
-        assert defaults_server._name_list({"category": ["Sports"]}, "tag") is None
+        assert defaults_server._name_list({"exclude_category": ["Sports"]}, "tag") is None
         # Another letter case of an earlier name is left out; the first is kept
         assert defaults_server._name_list(
-            {"category": ["Sports", "SPORTS", "Economics", "sports"]}, "category") == (
+            {"exclude_category": ["Sports", "SPORTS", "Economics", "sports"]}, "exclude_category") == (
                 "Sports", "Economics")
         assert defaults_server._name_list(
             {"tag": ["Health · Covid", "Health · COVID"]}, "tag") == ("Health · Covid",)
         # The very same name twice is refused, a left-out spelling included
-        with pytest.raises(ValueError, match="category 'Sports' is given twice"):
-            defaults_server._name_list({"category": ["Sports", "Sports"]}, "category")
-        with pytest.raises(ValueError, match="category 'SPORTS' is given twice"):
-            defaults_server._name_list({"category": ["Sports", "SPORTS", "SPORTS"]}, "category")
+        with pytest.raises(ValueError, match="exclude_category 'Sports' is given twice"):
+            defaults_server._name_list({"exclude_category": ["Sports", "Sports"]}, "exclude_category")
+        with pytest.raises(ValueError, match="exclude_category 'SPORTS' is given twice"):
+            defaults_server._name_list({"exclude_category": ["Sports", "SPORTS", "SPORTS"]}, "exclude_category")
         with pytest.raises(ValueError, match="tag must be one printable name"):
             defaults_server._name_list({"tag": ["Soccer", " Fed"]}, "tag")
         with pytest.raises(ValueError, match="tag must not hold two spaces in a row"):
@@ -2790,15 +2952,15 @@ class TestHelpers:
 
     def test_a_name_may_hold_single_spaces_only(self):
         for name in ("Climate and Weather", "Sports · Pro Football", "Oil & Gas", "A"):
-            assert defaults_server._name(name, "category") == name
+            assert defaults_server._name(name, "exclude_category") == name
         for bad in ("Climate  and Weather", "Sports ·  Basketball", "Sports  · Basketball",
                     "a   b"):
-            with pytest.raises(ValueError, match="category must not hold two spaces in a row"):
-                defaults_server._name(bad, "category")
+            with pytest.raises(ValueError, match="exclude_category must not hold two spaces in a row"):
+                defaults_server._name(bad, "exclude_category")
         # A tab or a no-break space is not printable, so it never gets that far
         for bad in ("a\tb", "a b", "a  b"):
-            with pytest.raises(ValueError, match="category must be one printable name"):
-                defaults_server._name(bad, "category")
+            with pytest.raises(ValueError, match="exclude_category must be one printable name"):
+                defaults_server._name(bad, "exclude_category")
 
     def test_a_number_reads_plainly(self):
         assert defaults_server._number("-0", "k") == 0.0
@@ -3216,7 +3378,7 @@ class TestActions:
     def test_trade_saves_then_starts_exactly_the_page_s_settings(self):
         starter = _Starter()
         app = _app(start_process=starter)
-        form = _page_form(app, _query(k="0.75", category="Sports"), "confirm-trade")
+        form = _page_form(app, _query(k="0.75", exclude_category="Sports"), "confirm-trade")
         run_id = _run_id(_post(app, form))
         saved = config.read_saved_live_defaults()
         # Nothing was saved before, so rebalancing is the seed's (on)
@@ -4586,7 +4748,7 @@ class TestOverASocket:
         assert config.read_saved_live_defaults() == _BASE_SETTINGS
 
     def test_the_most_categories_and_tags_fit_a_page_and_its_save(self, live_server):
-        # 40 categories and 40 tied tags, through the handler's request-size limit
+        # 40 excluded categories and 40 tied tags, through the handler's request-size limit
         port = live_server.server_address[1]
         query = _filter_query(_MOST_CATEGORIES, _MOST_TAGS, source=DASHBOARD_NOTE)
         status, _, body = _request(port, "GET", f"/confirm?{query}")
@@ -4596,7 +4758,7 @@ class TestOverASocket:
             "Origin": f"http://127.0.0.1:{port}", "Content-Type": FORM})
         assert status == 303 and headers["Location"] == "/saved"
         saved = config.read_saved_live_defaults()
-        assert saved.categories == _MOST_CATEGORIES and saved.tags == _MOST_TAGS
+        assert saved.exclude_categories == _MOST_CATEGORIES and saved.tags == _MOST_TAGS
 
     def test_a_dry_run_round_trip_starts_a_process_and_shows_its_result(self, live_server):
         port = live_server.server_address[1]
