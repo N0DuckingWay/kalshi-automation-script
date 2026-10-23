@@ -1081,8 +1081,8 @@ def _filter_by_category(pairs: list, settings: LiveSettings, listing_client, *,
     Files each pair by MARKET A's series through historical.series_labels,
     the dashboard's filing rule, and keeps it by config.trade_filter, the one
     definition of the filter: the pair's category is not excluded, and its
-    first tag is excluded neither plainly ("Basketball", under every
-    category) nor tied to its category ("Sports · Basketball", in that
+    first tag is not excluded, either plainly ("Basketball", under every
+    category) or tied to its category ("Sports · Basketball", in that
     category alone). So every category and tag not excluded trades, one the
     backtest never saw included. Names are compared without regard to case.
 
@@ -1096,8 +1096,8 @@ def _filter_by_category(pairs: list, settings: LiveSettings, listing_client, *,
     category or tag. One WARNING counts them (silent at zero). An excluded
     category or plain tag that no listed series and no pair of this run
     carries draws a typo WARNING (an excluded name of that kind excludes
-    nothing), and so does a tied tag whose category and tag are not one
-    series' labels together.
+    nothing), and so does an excluded tied tag whose category and tag are
+    not one series' labels together.
 
     Args:
         pairs (list): CandidatePairs after dedup, before enrichment.
@@ -1435,12 +1435,12 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
 
     The run's one read of the saved defaults (config.live_defaults; the AST
     pin test_ast_live_path_reads_toggles_only_through_live_settings allows no
-    other caller); there is no fallback to config.py's toggle constants. LiveSettings re-validates the
-    result, so a flag meets the same rules as a saved value, and the result
-    keeps the defaults' origin. --exclude-category and --exclude-tag each
-    replace the whole saved list. --category, --any-category, --tag and
-    --any-tag, which the exclude flags replaced, are refused with the
-    replacement named.
+    other caller); there is no fallback to config.py's toggle constants.
+    LiveSettings re-validates the result, so a flag meets the same rules as a
+    saved value, and the result keeps the defaults' origin.
+    --exclude-category and --exclude-tag each replace the whole saved list.
+    --category, --any-category, --tag and --any-tag, which the exclude flags
+    replaced, are refused with the replacement named, in that order.
     --no-sell also clears the minimum of days, and --no-rebalance the minimum
     price move, since neither minimum is allowed without its switch. A saved
     file an older version wrote (holding add_to_held_pairs, trim_to_kelly,
@@ -1470,13 +1470,13 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
                      "categories NOT to trade, and every other category trades. Use "
                      "--exclude-category NAME (repeatable), or --no-exclude-category to "
                      "exclude none")
+    if getattr(args, "retired_any_category", None):
+        parser.error("--any-category no longer exists: use --no-exclude-category (exclude "
+                     "no category)")
     if getattr(args, "retired_tag", None):
         parser.error("--tag no longer exists: the tag filter is now a list of tags NOT "
                      "to trade, and every other tag trades. Use --exclude-tag NAME "
                      "(repeatable), or --no-exclude-tag to exclude none")
-    if getattr(args, "retired_any_category", None):
-        parser.error("--any-category no longer exists: use --no-exclude-category (exclude "
-                     "no category)")
     if getattr(args, "retired_any_tag", None):
         parser.error("--any-tag no longer exists: use --no-exclude-tag (exclude no tag)")
     try:

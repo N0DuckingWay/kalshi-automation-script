@@ -241,7 +241,7 @@ _FIELDS = ("tier_floors", "spread_min", "spread_max", "k", "size_cap",
 _RETIRED_FIELDS = ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise", "category", "tag")
 # The fields a proposal must carry; every other one may be left out
 _REQUIRED = ("tier_floors", "spread_min", "spread_max", "k", "size_cap")
-# The fields a request may give more than once: one per category or tag named
+# The fields a request may give more than once: one per excluded category or tag named
 _REPEATABLE = ("exclude_category", "exclude_tag")
 # The largest number of fields a query or form may hold: its thirteen fields, the
 # fingerprint, nonce, token, action and acknowledgement (with room to spare),
@@ -962,16 +962,17 @@ def _proposal(params: dict[str, list[str]],
             values.
     """
     retired = [field_name for field_name in _RETIRED_FIELDS if field_name in params]
-    if retired and retired[0] == "category":
-        # A category to trade, where a link now names the categories to exclude
-        raise ValueError("this link names category, which exclude_category replaced (the "
-                         "filter is now a list of categories NOT to trade): rebuild the "
-                         "backtest dashboard, or open this server's start page")
-    if retired and retired[0] == "tag":
-        # A tag to trade, where a link now names the tags to exclude
-        raise ValueError("this link names tag, which exclude_tag replaced (the tag filter "
-                         "is now a list of tags NOT to trade): rebuild the backtest "
-                         "dashboard, or open this server's start page")
+    if retired and set(retired) <= {"category", "tag"}:
+        # Categories or tags to trade, where a link now names the ones to exclude;
+        # a link naming both is told about both
+        plural = {"category": "categories", "tag": "tags"}
+        kinds = " and ".join(plural[name] for name in retired)
+        filters = (f"the {retired[0]} filter is now a list of {kinds}" if len(retired) == 1
+                   else f"the category and tag filters are now lists of {kinds}")
+        raise ValueError(f"this link names {' and '.join(retired)}, which "
+                         f"{' and '.join('exclude_' + name for name in retired)} replaced "
+                         f"({filters} NOT to trade): rebuild the backtest dashboard, or "
+                         "open this server's start page")
     if retired:
         raise ValueError(f"this link was built before Rebalance (it names {retired[0]}): "
                          "rebuild the backtest dashboard, or open this server's start page")
@@ -1461,7 +1462,7 @@ def _old_categories(outdated: LiveDefaultsOutdated) -> tuple[str, ...] | None:
 
 def _old_tags(outdated: LiveDefaultsOutdated) -> tuple[str, ...] | None:
     """
-    Name the tags an outdated saved file traded only, when it listed some.
+    Name the tags an outdated saved file limited trading to, when it listed some.
 
     Args:
         outdated (LiveDefaultsOutdated): Why the saved file is refused.
@@ -1507,8 +1508,8 @@ def _widening_html(outdated: LiveDefaultsOutdated) -> str:
     if old is not None:
         names = ", ".join(html.escape(name) for name in old)
         parts.append(
-            "<p class=\"banner\">The saved defaults traded only these tags: "
-            f"{names}. This version saves the tags to EXCLUDE instead, and the values "
+            "<p class=\"banner\">The saved defaults limited trading to these tags: "
+            f"{names} (a \"Category · Tag\" limited that category alone). This version saves the tags to EXCLUDE instead, and the values "
             "offered here exclude none, so saving them as they are trades every tag. To "
             "keep the old filter, add <code>&amp;exclude_tag=&lt;name&gt;</code> to the "
             "address for each tag to leave out (\"Category · Tag\" for a tag of one "
@@ -1536,8 +1537,9 @@ def _widening_log_text(outdated: LiveDefaultsOutdated) -> str:
                  "leave out")
     old = _old_tags(outdated)
     if old is not None:
-        text += (". They traded only the tags " + ", ".join(old) + ": saved as offered they "
-                 "trade every tag, so add an exclude_tag= field for each tag to leave out")
+        text += (". They limited trading to the tags " + ", ".join(old) + " (a \"Category · "
+                 "Tag\" limited that category alone): saved as offered they trade every "
+                 "tag, so add an exclude_tag= field for each tag to leave out")
     return text
 
 

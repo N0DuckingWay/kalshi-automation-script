@@ -5045,8 +5045,9 @@ class TestTagsRetirement:
             exclude_tags=None)
         assert str(err) == (
             f'{config.LIVE_DEFAULTS_FILE}: "settings" holds tags, which exclude_tags '
-            "replaced: these defaults traded only the tags "
-            f"{', '.join(repr(name) for name in old)}, and this version saves what NOT to "
+            "replaced: these defaults limited trading to the tags "
+            f"{', '.join(repr(name) for name in old)} (a 'Category · Tag' limited that "
+            "category alone), and this version saves what NOT to "
             "trade instead. Saved again as offered (no tag excluded), they trade "
             "everything: exclude each tag not to trade before saving (start "
             "./start_dashboard.sh, or the backtest dashboard's \"Save as live "
@@ -5093,8 +5094,9 @@ class TestTagsRetirement:
         assert err.old_categories == ("Sports", "Economics")
         assert err.old_tags == ("Sports · Basketball", "Fed")
         assert err.proposal.exclude_categories is None and err.proposal.exclude_tags is None
-        assert ("these defaults traded only the categories 'Sports', 'Economics' and the "
-                "tags 'Sports · Basketball', 'Fed', and this version saves what NOT to "
+        assert ("these defaults traded only the categories 'Sports', 'Economics' and "
+                "limited trading to the tags 'Sports · Basketball', 'Fed' (a 'Category · "
+                "Tag' limited that category alone), and this version saves what NOT to "
                 "trade instead") in str(err)
         assert "exclude each category and tag not to trade before saving" in str(err)
 

@@ -756,7 +756,7 @@ LIVE_DEFAULTS_FILE = PROJECT_ROOT / "live_defaults.json"
 LIVE_DEFAULTS_FORMAT = "live-defaults-v1"
 
 # The largest saved file read; its record is well under 1 KB with a short
-# category/tag filter, and a few KB with a long one.
+# category/tag filter, and tens of KB with hundreds of excluded tags.
 LIVE_DEFAULTS_MAX_BYTES = 65_536
 
 # LiveSettings.origin for toggles built from this module's constants.
@@ -3129,7 +3129,7 @@ def _check_category_names(exclude_categories: tuple[str, ...] | None) -> None:
     ("Sports · Basketball"), or is a tie with a blank half ("·",
     "· Basketball", "Sports ·"), would match no pair, so it would exclude
     nothing while reading as if it excluded part of a category: only a whole
-    category can be excluded. Checked whether or not any tag is set.
+    category can be excluded. Checked on every construction.
 
     Args:
         exclude_categories (tuple[str, ...] | None): The excluded categories,
@@ -3147,7 +3147,7 @@ def _check_category_names(exclude_categories: tuple[str, ...] | None) -> None:
 
 def _check_tied_tags(exclude_tags: tuple[str, ...] | None) -> None:
     """
-    Refuse an excluded tag tied to a category that names no category or no tag.
+    Refuse an excluded tag whose tie to a category has a blank half or names no tag.
 
     A tied tag ("Sports · Basketball") excludes one tag of one category, so it
     is refused when either half is blank, or when its tag half reads "any"
@@ -3215,8 +3215,8 @@ class LiveSettings:
             refused.
         exclude_tags (tuple[str, ...] | None): Series first tags not to trade;
             None (default) excludes none. A plain name is excluded under every
-            category; a name tied to a category ("Sports · Basketball") in
-            that category alone (trade_filter is the rule). A tied tag whose
+            category; a name tied to a category ("Sports · Basketball") is
+            excluded in that category alone (trade_filter is the rule). A tied tag whose
             category is excluded too is allowed (it excludes nothing more).
         rebalance (bool): Whether a production run rebalances the pairs the
             account holds: before it buys, it sells part of each exact held
@@ -3296,7 +3296,7 @@ class LiveSettings:
         object.__setattr__(self, "exclude_categories",
                            _names(self.exclude_categories, "exclude_categories"))
         object.__setattr__(self, "exclude_tags", _names(self.exclude_tags, "exclude_tags"))
-        # With or without tags: a category written as a tied tag excludes nothing
+        # Whatever tags are excluded: a category written as a tied tag excludes nothing
         _check_category_names(self.exclude_categories)
         _check_tied_tags(self.exclude_tags)
         # A real bool, as tier_floors: a saved file's JSON 1 must be refused
@@ -3418,9 +3418,9 @@ class LiveDefaultsOutdated(LiveDefaultsError):
             to trade has no exact reading as categories to exclude), so every
             page that offers it must say so. None when the old categories was
             null or absent, or there is no proposal.
-        old_tags (tuple[str, ...] | None): The tags the file traded only (as
-            saved, a tied one as "Category · Tag"), when its old tags listed
-            some. The proposal then WIDENS live trading to every tag, for the
+        old_tags (tuple[str, ...] | None): The tags the file limited trading
+            to (as saved; a tied "Category · Tag" limited that category
+            alone), when its old tags listed some. The proposal then WIDENS live trading to every tag, for the
             same reason, so every page that offers it must say so too. None
             when the old tags was null or absent, or there is no proposal.
     """
@@ -3439,8 +3439,8 @@ class LiveDefaultsOutdated(LiveDefaultsError):
             retired (tuple[str, ...]): The retired settings the file holds.
             old_categories (tuple[str, ...] | None): The categories the file
                 traded only, or None.
-            old_tags (tuple[str, ...] | None): The tags the file traded only,
-                or None.
+            old_tags (tuple[str, ...] | None): The tags the file limited
+                trading to, or None.
         """
         super().__init__(message)
         self.proposal = proposal
@@ -3478,8 +3478,8 @@ class _RetiredSettings(ValueError):
             retired (tuple[str, ...]): The retired settings the file holds.
             old_categories (tuple[str, ...] | None): The categories the old
                 file traded only, or None.
-            old_tags (tuple[str, ...] | None): The tags the old file traded
-                only, or None.
+            old_tags (tuple[str, ...] | None): The tags the old file limited
+                trading to, or None.
         """
         super().__init__(message)
         self.proposal = proposal
@@ -3804,7 +3804,8 @@ def _retired_proposal(raw: dict, origin: str
         tuple[LiveSettings, tuple[str, ...] | None, tuple[str, ...] | None]:
             The settings in their new form, the categories the old file traded
             only (None when it held no categories, or a null one), and the tags
-            the old file traded only (None when it held no tags, or a null one).
+            the old file limited trading to (None when it held no tags, or a
+            null one).
 
     Raises:
         ValueError: The old values, or the rest of the settings, are refused;
@@ -3867,7 +3868,8 @@ def _retired_message(retired: list[str], proposal: LiveSettings | None,
         old_categories (tuple[str, ...] | None): The categories the old file
             traded only, when it listed some; the proposal then trades every
             category.
-        old_tags (tuple[str, ...] | None): The tags the old file traded only,
+        old_tags (tuple[str, ...] | None): The tags the old file limited
+            trading to (a tied "Category · Tag" limited that category alone),
             when it listed some; the proposal then trades every tag.
 
     Returns:
@@ -3881,9 +3883,10 @@ def _retired_message(retired: list[str], proposal: LiveSettings | None,
             instead. Saved again as offered (no category excluded), they trade
             everything: exclude each category not to trade before saving
             (start ./start_dashboard.sh, or the backtest dashboard's "Save as
-            live defaults…" button)'. A file that listed tags to trade is
-            worded the same way ("traded only the tags 'Basketball'", "exclude
-            each tag not to trade"), and one that listed both names both.
+            live defaults…" button)'. A file that listed tags to trade says
+            "limited trading to the tags 'Basketball' (a 'Category · Tag'
+            limited that category alone)" and "exclude each tag not to
+            trade", and one that listed both names both.
     """
     parts = []
     for old_names, replaced_by in _RETIREMENTS:
@@ -3909,13 +3912,18 @@ def _retired_message(retired: list[str], proposal: LiveSettings | None,
     if old_categories is not None:
         names = ", ".join(repr(name) for name in old_categories)
         # A file that listed only categories keeps the wording it always had
-        widened.append(names if old_tags is None else f"the categories {names}")
+        widened.append(f"traded only {names}" if old_tags is None
+                       else f"traded only the categories {names}")
         kinds.append("category")
     if old_tags is not None:
-        widened.append("the tags " + ", ".join(repr(name) for name in old_tags))
+        # The old rule narrowed every category to a plain tag, but only its own
+        # category to a tied one
+        widened.append("limited trading to the tags "
+                       + ", ".join(repr(name) for name in old_tags)
+                       + f" (a 'Category{TAG_SCOPE_SEPARATOR}Tag' limited that category alone)")
         kinds.append("tag")
     if widened:
-        return (f"{head}: these defaults traded only {' and '.join(widened)}, and this "
+        return (f"{head}: these defaults {' and '.join(widened)}, and this "
                 f"version saves what NOT to trade instead. Saved again as offered "
                 f"({', '.join(offered)}), they trade everything: exclude each "
                 f"{' and '.join(kinds)} not to trade before saving (start "

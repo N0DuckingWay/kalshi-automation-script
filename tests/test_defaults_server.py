@@ -1554,8 +1554,8 @@ class TestConfirmRefusals:
     def test_a_link_built_before_exclusions_says_how_to_get_a_new_one(self):
         response = _get(_app(), "/confirm?" + _query(category="Sports"))
         assert response.status == 400
-        assert ("this link names category, which exclude_category replaced (the filter "
-                "is now a list of categories NOT to trade): rebuild the backtest "
+        assert ("this link names category, which exclude_category replaced (the category "
+                "filter is now a list of categories NOT to trade): rebuild the backtest "
                 "dashboard, or open this server&#x27;s start page") in response.body
 
     def test_a_link_built_before_tag_exclusions_says_how_to_get_a_new_one(self):
@@ -1567,6 +1567,14 @@ class TestConfirmRefusals:
                     "now a list of tags NOT to trade): rebuild the backtest dashboard, or "
                     "open this server&#x27;s start page") in response.body
             assert "<form" not in response.body
+
+    def test_a_link_naming_both_retired_filter_fields_names_both(self):
+        response = _get(_app(), "/confirm?" + _query(category="Sports") + "&tag=Basketball")
+        assert response.status == 400
+        assert ("this link names category and tag, which exclude_category and exclude_tag "
+                "replaced (the category and tag filters are now lists of categories and "
+                "tags NOT to trade): rebuild the backtest dashboard, or open this "
+                "server&#x27;s start page") in response.body
 
     def test_a_tied_tag_in_an_excluded_category_is_proposed(self):
         # Excluding a tag of a category that is excluded anyway changes
@@ -2549,7 +2557,8 @@ class TestOutdatedFile:
         body = html.unescape(index.body)
         assert "traded only these categories: Sports." in body
         # The old tags are named too: their new form excludes no tag
-        assert "traded only these tags: Sports · Basketball." in body
+        assert ("limited trading to these tags: Sports · Basketball (a \"Category · Tag\" "
+                "limited that category alone).") in body
         assert "before the tag filter became a list of tags to exclude" in body
 
     @staticmethod
@@ -2581,7 +2590,7 @@ class TestOutdatedFile:
                 "of tags to exclude, so every live run refuses them until they are saved "
                 "again.") in index.body
         assert "read as no tag excluded" in index.body
-        assert "traded only these tags" not in html.unescape(index.body)
+        assert "limited trading to these tags" not in html.unescape(index.body)
         link = "/confirm?" + defaults_server._settings_query(caught.value.proposal)
         confirm = _get(app, link)
         assert ("The saved live defaults were saved before the tag filter became a list of "
@@ -2601,8 +2610,8 @@ class TestOutdatedFile:
         proposal = caught.value.proposal
         assert proposal.exclude_tags is None and proposal.exclude_categories == ("Politics",)
         link = "/confirm?" + defaults_server._settings_query(proposal)
-        warning = ("The saved defaults traded only these tags: Basketball, Sports · Soccer. "
-                   "This version saves the tags to EXCLUDE instead, and the values offered "
+        warning = ("The saved defaults limited trading to these tags: Basketball, Sports · "
+                   "Soccer (a \"Category · Tag\" limited that category alone). This version saves the tags to EXCLUDE instead, and the values offered "
                    "here exclude none, so saving them as they are trades every tag. To keep "
                    "the old filter, add <code>&exclude_tag=<name></code> to the address for "
                    "each tag to leave out (\"Category · Tag\" for a tag of one category), or "
@@ -2638,7 +2647,7 @@ class TestOutdatedFile:
             "excluded")
         body = html.unescape(_get(_app(), "/").body)
         assert "traded only these categories: Sports." in body
-        assert "traded only these tags: Basketball." in body
+        assert "limited trading to these tags: Basketball (" in body
 
     def test_a_malformed_tags_value_offers_the_seed(self):
         self._tags_file(b'"Basketball"')
@@ -2650,13 +2659,13 @@ class TestOutdatedFile:
         assert "/confirm?" + defaults_server._seed_query() in _parse(trade.body).links
         assert "before the tag filter became a list of tags to exclude" in html.unescape(
             trade.body)
-        assert "traded only these tags" not in html.unescape(trade.body)
+        assert "limited trading to these tags" not in html.unescape(trade.body)
 
     def test_a_start_logs_the_old_tags(self, run_main):
         self._tags_file(b'["Basketball"]')
         log = run_main["run"](["--no-browser"])
-        assert ("They traded only the tags Basketball: saved as offered they trade every "
-                "tag, so add an exclude_tag= field for each tag to leave out") in log
+        assert ("They limited trading to the tags Basketball (a \"Category · Tag\" limited "
+                "that category alone): saved as offered they trade every tag, so add an exclude_tag= field for each tag to leave out") in log
 
     def test_a_malformed_categories_value_offers_the_seed(self):
         self._categories_file(b'"Sports"')
@@ -2901,8 +2910,8 @@ class TestSave:
         assert record.levelno == logging.WARNING
         assert record.getMessage() == (
             "Refused (400 Bad Request): this link names category, which exclude_category "
-            "replaced (the filter is now a list of categories NOT to trade): rebuild the "
-            "backtest dashboard, or open this server's start page")
+            "replaced (the category filter is now a list of categories NOT to trade): "
+            "rebuild the backtest dashboard, or open this server's start page")
 
 
 class TestSavedPage:
