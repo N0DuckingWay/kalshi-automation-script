@@ -4623,7 +4623,7 @@ class _MenuTicks:
 
     Built by _live_filter_ticks and worded by _tick_phrase. Both menus leave
     out what is ticked, while the live filter lists what to trade, so the
-    boxes named are what the filter does not keep. Each name stands for its
+    boxes to tick are what the filter does not keep. Each name stands for its
     letter-case twins too: it is the first of them in the bar's order, and
     the page ticks and unticks a box's twins with it, so a reader who
     clicked every twin in turn would undo the first click with the second.
@@ -4634,20 +4634,18 @@ class _MenuTicks:
             keeps no pair.
         kept (tuple[str, ...]): The categories the filter keeps, in the bar's
             order: the ones to untick after ticking All categories, the way
-            the exclusions are said while no more categories are kept than
-            excluded, each group of letter-case twins counted once. Empty
-            when the filter keeps no pair this run filed.
+            the exclusions are said when that takes fewer clicks, each group
+            of letter-case twins counted once. Empty when the filter keeps no
+            pair this run filed.
         tags (tuple[str, ...]): The tags to tick in the Exclude tags menu, in
             the bar's order: in each category the filter keeps only in part,
             the tags it leaves out. Each is named as that menu names it once
             the categories are set: "Category · Tag", or the tag alone while
             exactly one box of the Exclude categories menu is left unticked
             (the menu then leaves the category's name out).
-        tags_kept (tuple[str, ...]): The other tags the Exclude tags menu shows
-            once the categories are set (every tag of the categories kept that
-            the filter keeps), named the same way: the ones to untick after
-            ticking All tags, the way the tags are said when that takes fewer
-            clicks.
+        tags_kept (tuple[str, ...]): The tags the filter keeps that the Exclude
+            tags menu shows once the categories are set: the ones to untick
+            after ticking All tags. Named like `tags`.
     """
 
     excluded: tuple[str, ...]
@@ -4771,17 +4769,18 @@ def _tick_phrase(ticks: _MenuTicks, *, as_instruction: bool) -> str:
     _MENU_TAG_LABEL), and the words a menu shows by its own constants
     (_MENU_CAT_ALL, _MENU_CAT_NONE, _MENU_TAG_ALL, _MENU_TAG_NONE). Each list
     of names is joined by commas alone, in the bar's order (a Kalshi category
-    can hold "and"). While no more categories are kept than are excluded,
-    the exclusions are said the short way: All categories ticked, then the
-    ones kept unticked. A box unticked takes its twins with it, as a box
-    ticked does, so the count here is of groups of letter-case twins, each
-    counted once, as the reader clicks them. The summary line counts every
-    name instead (_selection_name's "only ..."), so the two can say one
-    selection different ways. The tags are said the short way too, All tags
-    ticked and then the tags kept unticked, when that takes fewer clicks than
-    ticking the tags left out one by one: All tags ticks every tag the menu
-    shows, which once the categories are set is every tag of the categories
-    kept, so unticking the ones the filter keeps leaves exactly the others.
+    can hold "and"). When it takes fewer clicks than ticking each one
+    excluded (1 + the categories kept < the categories excluded), the
+    exclusions are said the short way: All categories ticked, then the ones
+    kept unticked. A box unticked takes its twins with it, as a box ticked
+    does, so the count here is of groups of letter-case twins, each counted
+    once, as the reader clicks them. The summary line counts every name
+    instead (_selection_name's "only ..."), so the two can say one selection
+    different ways. The tags are said the short way by the same rule, All
+    tags ticked and then the tags kept unticked: All tags ticks every tag the
+    menu shows, which once the categories are set is every tag of the
+    categories kept, so unticking the ones the filter keeps leaves exactly
+    the others.
 
     As an instruction and as a description alike, the line names only boxes
     to click, one per group of twins, in the order to click them (the
@@ -4826,9 +4825,12 @@ def _tick_phrase(ticks: _MenuTicks, *, as_instruction: bool) -> str:
         return f"then leave {state}" if as_instruction else f"with {state}"
     excluded, kept = ", ".join(ticks.excluded), ", ".join(ticks.kept)
     tags, tags_kept = ", ".join(ticks.tags), ", ".join(ticks.tags_kept)
-    short = bool(ticks.excluded) and len(ticks.kept) <= len(ticks.excluded)
-    # All tags and then each tag kept, only when that is fewer clicks
-    short_tags = bool(ticks.tags) and 1 + len(ticks.tags_kept) < len(ticks.tags)
+    # All categories (or All tags) and then each one kept, only when that is
+    # fewer clicks than ticking each one left out, and only with one to untick
+    short = (bool(ticks.excluded) and bool(ticks.kept)
+             and 1 + len(ticks.kept) < len(ticks.excluded))
+    short_tags = (bool(ticks.tags) and bool(ticks.tags_kept)
+                  and 1 + len(ticks.tags_kept) < len(ticks.tags))
     if as_instruction:
         if short:
             steps = [f"tick {_MENU_CAT_ALL} in {cat_menu}", f"untick {kept} there"]
@@ -4842,7 +4844,7 @@ def _tick_phrase(ticks: _MenuTicks, *, as_instruction: bool) -> str:
         said = steps[0] if len(steps) == 1 else f"{', '.join(steps[:-1])} and {steps[-1]}"
         return f"then {said}"
     # The clicks the instruction names, in the order a reader makes them
-    # (never "every category but ...", which a reader would follow by
+    # (categories first, then tags; never "every category but ...", which a reader would follow by
     # ticking a kept category's twin)
     parts = []
     if short:
@@ -13242,7 +13244,7 @@ _FILTER_JS = r"""
   // ("flt-tag-<i>": ticked, that tag's trades in its category are left
   // out). The first menu's "All" box ("flt-cat-all") leaves out every
   // category, or none when every one is left out already, and reads ticked
-  // while every one is; the Tag one ("flt-tag-all") ticks every tag it
+  // while every one is; the Exclude tags one ("flt-tag-all") ticks every tag it
   // shows, or unticks them when every one is ticked already, and reads
   // ticked while every tag it shows is ticked
   var catMenu = document.getElementById('flt-cat'), tagMenu = document.getElementById('flt-tag');

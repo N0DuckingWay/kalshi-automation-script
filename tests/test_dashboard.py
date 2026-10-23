@@ -2514,15 +2514,16 @@ class TestLiveRuleHeader:
                 "this run filed a pair under)")
 
     @pytest.mark.parametrize("categories, tags, tail", [
-        # One category listed of three: said the short way, All categories ticked
-        # and then that one unticked
-        (("economics",), None, "this run's primary, with All categories ticked in the "
-                               "Exclude categories menu and Economics unticked there"),
+        # One category listed of three: the other two ticked (All categories and
+        # then that one unticked would be as many clicks, so the short way is not
+        # used)
+        (("economics",), None, "this run's primary, with Oil &amp; Gas, Sports ticked in "
+                               "the Exclude categories menu"),
         # ... narrowed to one of its two tags: the other tag ticked too, named as the
         # Exclude tags menu names it while one category alone is kept
-        (("Economics",), ("fed",), "this run's primary, with All categories ticked in the "
-                                   "Exclude categories menu and Economics unticked there, "
-                                   "and Inflation ticked in the Exclude tags menu"),
+        (("Economics",), ("fed",), "this run's primary, with Oil &amp; Gas, Sports ticked in "
+                                   "the Exclude categories menu and Inflation ticked in the "
+                                   "Exclude tags menu"),
         # A plain tag under every category: Economics is narrowed to it (its other tag
         # ticked), Oil & Gas has no other tag so counts in full, and Sports has none
         # of it so is excluded
@@ -2569,15 +2570,20 @@ class TestLiveRuleHeader:
          "Sports · Golf in the Exclude tags menu",
          "with Politics ticked in the Exclude categories menu and Sports · Hockey, "
          "Sports · Golf ticked in the Exclude tags menu"),
-        # As many kept as excluded: the short way (the header counts groups of
-        # letter-case twins, of which there are none here)
+        # As many kept as excluded: ticking each one excluded is fewer clicks, so
+        # the short way is not used
         (("Economics", "Politics"), ("Oil & Gas", "Sports"), (), _ECON,
-         "then tick All categories in the Exclude categories menu and untick Oil & Gas, "
-         "Sports there",
-         "with All categories ticked in the Exclude categories menu and Oil & Gas, Sports "
-         "unticked there"),
-        # Fewer kept than excluded, and a tag: three steps
-        (("Economics", "Politics"), ("Sports",), ("Soccer",), ("Basketball",),
+         "then tick Economics, Politics in the Exclude categories menu",
+         "with Economics, Politics ticked in the Exclude categories menu"),
+        # Two kept, three excluded: still fewer clicks ticking each, so the short
+        # way is not used (the header counts groups of letter-case twins, of
+        # which there are none here)
+        (("Economics", "Health", "Politics"), ("Oil & Gas", "Sports"), (), _ECON,
+         "then tick Economics, Health, Politics in the Exclude categories menu",
+         "with Economics, Health, Politics ticked in the Exclude categories menu"),
+        # One kept, three excluded: the short way is fewer clicks. With a tag:
+        # three steps
+        (("Economics", "Health", "Politics"), ("Sports",), ("Soccer",), ("Basketball",),
          "then tick All categories in the Exclude categories menu, untick Sports there and "
          "tick Soccer in the Exclude tags menu",
          "with All categories ticked in the Exclude categories menu and Sports unticked "
@@ -2588,7 +2594,7 @@ class TestLiveRuleHeader:
          "then tick Sports · Golf, Sports · Soccer in the Exclude tags menu",
          "with Sports · Golf, Sports · Soccer ticked in the Exclude tags menu"),
         # Ticking All tags and unticking the one kept is as many clicks as
-        # ticking the two left out: they are named
+        # ticking the two left out, so the short way is not used: they are named
         (("Politics",), ("Economics", "Sports"), ("Sports · Golf", "Sports · Hockey"),
          ("Economics · Fed",),
          "then tick Politics in the Exclude categories menu and tick Sports · Golf, "
@@ -2603,7 +2609,7 @@ class TestLiveRuleHeader:
          "with Politics ticked in the Exclude categories menu, and All tags ticked in the "
          "Exclude tags menu and Economics · Fed unticked there"),
         # Both menus the short way: four steps
-        (("Economics", "Politics"), ("Sports",), ("Golf", "Hockey", "Soccer"),
+        (("Economics", "Health", "Politics"), ("Sports",), ("Golf", "Hockey", "Soccer"),
          ("Basketball",),
          "then tick All categories in the Exclude categories menu, untick Sports there, "
          "tick All tags in the Exclude tags menu and untick Basketball there",
@@ -2632,7 +2638,7 @@ class TestLiveRuleHeader:
         for name in ("_MENU_CAT_LABEL", "_MENU_TAG_LABEL", "_MENU_CAT_ALL",
                      "_MENU_CAT_NONE", "_MENU_TAG_ALL", "_MENU_TAG_NONE"):
             monkeypatch.setattr(dashboard, name, f"<{name}>")
-        short = dashboard._MenuTicks(excluded=("A", "B"), kept=("C",), tags=("T",),
+        short = dashboard._MenuTicks(excluded=("A", "B", "D"), kept=("C",), tags=("T",),
                                      tags_kept=("U",))
         assert dashboard._tick_phrase(short, as_instruction=True) == (
             "then tick <_MENU_CAT_ALL> in the <_MENU_CAT_LABEL> menu, untick C there and "
@@ -2685,7 +2691,7 @@ class TestLiveRuleHeader:
         bar = self._bar(categories=self._TICK_CATS, subcats=self._TICK_SUBCATS)
         assert dataclasses.astuple(dashboard._live_filter_ticks(categories, tags, bar)) == ticks
 
-    def test_a_tag_is_named_as_the_tag_menu_names_it(self):
+    def test_a_tag_is_named_as_the_exclude_tags_menu_names_it(self):
         # The Exclude tags menu names a tag with its category in front, unless one
         # category alone is kept of several (the page script's lone)
         def ticks(categories, subcats, live_categories, live_tags):
@@ -2734,19 +2740,22 @@ class TestLiveRuleHeader:
             (), ("Health", "Sports"), ("Health · Flu",), ("Health · COVID", "Sports · Covid"))
 
     def test_twins_count_once_toward_the_short_way(self):
-        # Health and health kept, Sports excluded: the header counts groups of
-        # letter-case twins, as the reader clicks them, so one group kept
-        # against one excluded is said the short way. The summary line counts
-        # every name, two kept against one excluded, so it names the one
-        # excluded instead: the two can say one selection different ways
-        bar = self._bar(categories=("Health", "Sports", "health"),
-                        subcats=(("Health", "Flu"), ("Sports", "Golf"), ("health", "Flu")))
+        # Health and health kept, Politics, Sports and Weather excluded: the
+        # header counts groups of letter-case twins, as the reader clicks them,
+        # so one group kept against three excluded is said the short way (two
+        # clicks against three); counting both twins it would not be (three
+        # against three). The summary line counts every name instead, and
+        # names the two kept: the two can say one selection different ways
+        bar = self._bar(categories=("Health", "Politics", "Sports", "Weather", "health"),
+                        subcats=(("Health", "Flu"), ("Politics", "Senate"), ("Sports", "Golf"),
+                                 ("Weather", "Rain"), ("health", "Flu")))
         sweep = self._sweep(live_categories=("health",))
         assert self._text(sweep, bar).endswith(
             "— this run's primary, with All categories ticked in the Exclude categories "
             "menu and Health unticked there")
         assert dashboard._selection_name([("Health", []), ("health", [])],
-                                         ["Sports"]) == "Sports excluded"
+                                         ["Politics", "Sports", "Weather"]) == (
+            "only Health, health")
 
     def test_a_tied_tag_in_the_header_names_the_tag_to_tick(self):
         sweep = self._sweep(live_categories=("Economics", "Sports"),
@@ -2826,8 +2835,8 @@ class TestLiveRuleHeader:
             shown = (c.casefold() not in excluded_keys
                      and (c.casefold(), t.casefold()) not in ticked_keys)
             assert shown == page_keeps(c, t) == keeps(c, t), (listed, tags, c, t)
-        short = bool(ticks.excluded) and len(ticks.kept) <= len(ticks.excluded)
-        short_tags = bool(ticks.tags) and 1 + len(ticks.tags_kept) < len(ticks.tags)
+        short = bool(ticks.kept) and 1 + len(ticks.kept) < len(ticks.excluded)
+        short_tags = bool(ticks.tags_kept) and 1 + len(ticks.tags_kept) < len(ticks.tags)
         tag_keys = [(c.casefold(), t.casefold()) for c, t in subcats]
 
         def twinned(name: str) -> bool:
@@ -2878,10 +2887,11 @@ class TestLiveRuleHeader:
         # of saying the tags). Doing what the ticks say keeps exactly the pairs
         # the live filter keeps, every one the bar offers (_follow_ticks)
         bars = [(self._TICK_CATS, self._TICK_SUBCATS),
-                (("Health", "Oil & Gas", "Sports", "health"),
+                (("Health", "Oil & Gas", "Politics", "Sports", "Weather", "health"),
                  (("Health", "Flu"), ("Oil & Gas", "Fed"), ("Oil & Gas", "Soccer"),
-                  ("Sports", "Golf"), ("Sports", "SOCCER"), ("Sports", "Soccer"),
-                  ("health", "Flu"), ("health", "Polio"))),
+                  ("Politics", "Senate"), ("Sports", "Golf"), ("Sports", "SOCCER"),
+                  ("Sports", "Soccer"), ("Weather", "Rain"), ("health", "Flu"),
+                  ("health", "Polio"))),
                 (("Economics", "Sports"),
                  (("Economics", "Fed"), ("Sports", "Basketball"), ("Sports", "Golf"),
                   ("Sports", "Hockey"), ("Sports", "Soccer"), ("Sports", "Tennis")))]
@@ -2932,7 +2942,7 @@ class TestLiveRuleHeader:
                         subcats=self._SUBCATS)
         assert self._text(sweep, bar).endswith(
             "— choose Spread band max(tier,0.3)-0.6 and Tier floors on in the filter bar, "
-            "then tick All categories in the Exclude categories menu and untick Sports there")
+            "then tick Economics, Oil &amp; Gas in the Exclude categories menu")
         # ... the excluded categories named when fewer than those kept, a tag the
         # filter leaves out to tick after them, and a filter that keeps every pair
         # the run filed needs the menus left as they are
@@ -2941,8 +2951,8 @@ class TestLiveRuleHeader:
                  "then tick Oil &amp; Gas in the Exclude categories menu and tick "
                  "Economics · Inflation in the Exclude tags menu"),
                 (("Economics",), ("Economics · Fed",),
-                 "then tick All categories in the Exclude categories menu, untick Economics "
-                 "there and tick Inflation in the Exclude tags menu"),
+                 "then tick Oil &amp; Gas, Sports in the Exclude categories menu and tick "
+                 "Inflation in the Exclude tags menu"),
                 (("Oil & Gas", "Economics", "Sports"), ("Economics · Fed",),
                  "then tick Economics · Inflation in the Exclude tags menu"),
                 (("Oil & Gas", "Economics", "Sports"), None, f"then leave {self._NOTHING}")]:
@@ -3016,16 +3026,22 @@ class TestLiveRuleHeader:
     # A page's series for the letter-case case below: Health and health are
     # twins, and so are Health's COVID and Covid, and Health's and health's
     # Flu. Sports' Covid is another category's tag, no twin of Health's
+    # Politics and Weather are there so that one group kept against four
+    # excluded is said the short way
     _TWIN_LIVE_SERIES = {"KXE0": ("Economics", ("Fed",)), "KXH0": ("Health", ("COVID",)),
                          "KXH1": ("Health", ("Covid",)), "KXH2": ("Health", ("Flu",)),
                          "KXH3": ("health", ("Flu",)), "KXH4": ("health", ("Polio",)),
-                         "KXS0": ("Sports", ("Covid",)), "KXS1": ("Sports", ("Golf",))}
-    # A page with a category of five tags, where the line can say the tags the
-    # short way (All tags ticked, then the ones kept unticked)
-    _MANY_TAG_LIVE_SERIES = {"KXE0": ("Economics", ("Fed",)),
+                         "KXP0": ("Politics", ("Senate",)), "KXS0": ("Sports", ("Covid",)),
+                         "KXS1": ("Sports", ("Golf",)), "KXW0": ("Weather", ("Rain",))}
+    # A page with five categories and a category of five tags, two of them
+    # letter-case twins (Golf and GOLF), where the line can say both menus the
+    # short way (All ticked, then the ones kept unticked), a twin group among
+    # the tags unticked
+    _MANY_TAG_LIVE_SERIES = {"KXE0": ("Economics", ("Fed",)), "KXH0": ("Health", ("Flu",)),
+                             "KXP0": ("Politics", ("Senate",)),
                              "KXS0": ("Sports", ("Basketball",)), "KXS1": ("Sports", ("Golf",)),
-                             "KXS2": ("Sports", ("Hockey",)), "KXS3": ("Sports", ("Soccer",)),
-                             "KXS4": ("Sports", ("Tennis",))}
+                             "KXS2": ("Sports", ("GOLF",)), "KXS3": ("Sports", ("Hockey",)),
+                             "KXS4": ("Sports", ("Soccer",)), "KXW0": ("Weather", ("Rain",))}
 
     @staticmethod
     def _read_tail(tail: str) -> dict:
@@ -3086,22 +3102,29 @@ class TestLiveRuleHeader:
         # health took Health with it, and the page showed no trade
         if page_kind == "twins":
             series = self._TWIN_LIVE_SERIES
+            everything = ("Economics", "Health", "Politics", "Sports", "Weather")
             filters = [
                 (("Health",), ("covid",)),   # the short way: keep Health, tick Flu, Polio
                 (None, ("Flu",)),            # the short way: keep Health, tick COVID, Polio
                 (("Economics", "Sports"), None),  # exclude Health (and health)
-                (("Economics", "Health", "Sports"), ("Health · Covid", "Sports · Golf")),
+                (everything, ("Health · Covid", "Sports · Golf")),  # tags only
                 (("Sports",), ("Golf",)),    # one category kept: Covid named alone
                 (("health",), None),
-                (("Economics", "Health", "Sports"), None),
+                (everything, None),
             ]
         elif page_kind == "many tags":
             series = self._MANY_TAG_LIVE_SERIES
+            everything = ("Economics", "Health", "Politics", "Sports", "Weather")
             filters = [
-                (("Economics", "Sports"), ("Sports · Basketball",)),  # All tags, untick two
-                (("Sports",), ("Golf",)),    # both menus the short way
-                (None, ("Golf", "Hockey")),  # three tags named alone
-                (("Economics", "Sports"), None),
+                # Both menus the short way, the twin group Golf/GOLF unticked
+                # after All tags
+                (("Sports",), ("golf",)),
+                (("Sports",), ("Basketball",)),  # both menus the short way
+                (None, ("Golf", "Hockey")),  # two tags named alone
+                # Both menus named box by box, GOLF ticked taking Golf with it
+                (("Economics", "Health", "Sports"), ("Sports · Hockey",)),
+                (everything, ("Sports · Golf",)),  # tags only
+                (everything, None),
             ]
         else:
             series = _MIX_SERIES
@@ -3131,6 +3154,7 @@ class TestLiveRuleHeader:
         assert f"<span>{dashboard._MENU_CAT_LABEL}: </span>" in page
         assert f"<span>{dashboard._MENU_TAG_LABEL}: </span>" in page
         categories, subcats = _mix_axes(series)
+        tag_keys = [(c.casefold(), t.casefold()) for c, t in subcats]
         steps: list = [["wait"]]
         expected, kinds = [], set()
         for i, (cats, tags) in enumerate(filters):
@@ -3202,6 +3226,8 @@ class TestLiveRuleHeader:
                 kinds.add("twin kept")
             if len(tag_ticks) > len(tick_boxes) and not said["short_tags"]:
                 kinds.add("twin tag")
+            if any(tag_keys.count(tag_keys[si]) > 1 for si in untick_boxes):
+                kinds.add("twin untick")
             shown = sum(2 ** si for si, pair in enumerate(subcats) if keeps(*pair))
             rows = dict(zip(tick_boxes + untick_boxes, named, strict=True))
             expected.append((shown, out, tag_ticks, rows))
@@ -3216,16 +3242,18 @@ class TestLiveRuleHeader:
             assert int(snap["text"]["hdr-trades"]) == shown, filters[i]
             assert snap["menus"]["flt-cat"]["ticked"] == out, filters[i]
             assert snap["menus"]["flt-tag"]["ticked"] == tag_ticks, filters[i]
-        # Each kind of instruction was followed: exclusions, the short way (and
-        # a tag named alone), ticks alone, and nothing (the whole run); on the
-        # twins' page, a box clicked that took its twins with it, in each menu
-        # and when unticking; and on the many tags' page, the tags the short way
+        # Each kind of instruction was followed: exclusions, ticks alone (and a
+        # tag named alone), and nothing (the whole run); on the twins' page, the
+        # short way and a box clicked that took its twins with it, in each menu
+        # and when unticking a category; and on the many tags' page, both menus
+        # the short way, a tag twin group unticked after All tags among them
         assert expected[-1][0] == 2 ** len(subcats) - 1
         assert kinds == {
-            "plain": {"nothing", "short", "excluded", "tags only", "lone tag"},
+            "plain": {"nothing", "excluded", "tags only", "lone tag"},
             "twins": {"nothing", "short", "excluded", "tags only", "lone tag",
                       "twin excluded", "twin kept", "twin tag"},
-            "many tags": {"nothing", "short", "tags only", "lone tag", "short tags"},
+            "many tags": {"nothing", "short", "excluded", "tags only", "lone tag",
+                          "short tags", "twin tag", "twin untick"},
         }[page_kind]
 
 
@@ -8148,7 +8176,7 @@ class TestSaveLiveDefaultsButton:
         assert f'title="{html.escape(dashboard._SAVE_TITLE)}"' in button.group(1)
         assert _page_elements(page)["buttons"] == {"flt-save": {"disabled": True}}
         assert html.escape(dashboard._SAVE_NOTE) in page
-        # After the Tag select, before the summary line
+        # After the Exclude tags menu, before the summary line
         assert page.index('id="flt-tag"') < page.index('id="flt-save"') \
             < page.index('id="flt-summary"')
         data = TestFilterPage._data(page)
