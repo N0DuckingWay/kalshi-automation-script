@@ -52,12 +52,10 @@ Purpose:
     in full; names that differ only in letter case are one name to the live
     filter, so the page ticks and unticks such tags, and leaves out or keeps
     such categories, together, _case_twins. What is left is what the live
-    filter's rule, config.trade_filter_for, keeps when it lists, for each
-    group of categories kept whose names differ only in letter case, the
-    group's categories — none, when every tag of the group is ticked — and,
-    when some of the group's tags are ticked, every tag of the group not
-    ticked, tied to its category; what a view shows is those trades'
-    contribution to the run, not a run of their own),
+    filter's rule, config.trade_filter_for, keeps when it excludes the
+    categories ticked and each "Category · Tag" ticked, which is what the
+    Save button sends; what a view shows is those trades' contribution to
+    the run, not a run of their own),
     and moves the k-hat breakdown and the performance section's k-hat cards
     to the same band, tier setting and selection (the breakdown's reference
     line to the same k), the interval-discount section to the same k and
@@ -203,9 +201,9 @@ Purpose:
     without placing orders; this page writes nothing. The button is
     rendered disabled; the script enables it only while the scenario on
     screen can become live settings (it was simulated, its band was
-    recorded, its k and size cap were recorded and are above zero, no tag
-    is ticked and not every category is excluded), and keeps it disabled while
-    another scenario's chunk loads. Beside it, a plain
+    recorded, its k and size cap were recorded and are above zero, and the
+    ticks keep some of its trades and make a link the defaults server takes),
+    and keeps it disabled while another scenario's chunk loads. Beside it, a plain
     "Trade using defaults…" link opens the server's trade page (the saved
     defaults, with Dry run and Confirm and trade) in a new tab; it needs no
     script. A page whose filter bar could not be built has no save button,
