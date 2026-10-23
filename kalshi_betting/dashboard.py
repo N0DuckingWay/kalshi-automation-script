@@ -1741,12 +1741,13 @@ def _compensated_sum(values) -> float:
     """
     Add a group's values with a running correction for lost low digits.
 
-    This is the compensated (Kahan) sum pandas' group kernel used for every
-    group sum and mean through pandas 3.0, and the sum the page script's
-    groupSum repeats in the same order, so a mix of categories and tags draws
-    the bars Python draws. pandas 3.1 adds those values with numpy's reduceat
-    instead when the rows are already sorted by group, which can differ in the
-    last bit, so the page adds them itself rather than leave it to pandas.
+    For finite values this is the compensated (Kahan) sum pandas' group
+    kernel used for every group sum and mean through pandas 3.0, and the sum
+    the page script's groupSum repeats in the same order, so a mix of
+    categories and tags draws the bars Python draws. pandas 3.1 adds those
+    values with numpy's reduceat instead when the rows are already sorted by
+    group, which can differ in the last bit, so this module adds them itself
+    rather than leave it to pandas.
 
     Args:
         values: The group's values, in row order (a Series or any iterable of
@@ -1767,7 +1768,7 @@ def _compensated_sum(values) -> float:
 
 def _compensated_mean(values) -> float:
     """
-    Average a group's values as pandas' group mean did through pandas 3.0.
+    Average a group's values as pandas' group mean did, for finite values, through pandas 3.0.
 
     Args:
         values: The group's values, in row order; at least one.
@@ -1790,17 +1791,31 @@ def _group_sums(grouped) -> pd.Series:
             replaced by that group's _compensated_sum.
     """
     sums = grouped.sum()
-    if len(sums):
-        sums = grouped.agg(_compensated_sum).astype(sums.dtype)
-    return sums
+    if not len(sums):
+        return sums
+    # One pass over the rows in their order, a running total and correction
+    # per group (the group number of a dropped row is -1)
+    ids = grouped.ngroup().fillna(-1).astype(int).to_numpy().tolist()
+    values = grouped.obj.to_numpy(dtype=float).tolist()
+    totals = [0.0] * len(sums)
+    lost = [0.0] * len(sums)
+    for group, value in zip(ids, values, strict=True):
+        if group < 0:
+            continue
+        y = value - lost[group]
+        t = totals[group] + y
+        lost[group] = (t - totals[group]) - y
+        totals[group] = t
+    return pd.Series(totals, index=sums.index, name=sums.name, dtype=sums.dtype)
 
 
 def _category_groups(df: pd.DataFrame) -> pd.DataFrame:
     """
     Sum the decomposition frame per category · tag, largest P&L first.
 
-    The P&L and the mean return add with _compensated_sum, as the page script
-    does; the median is pandas' own.
+    The P&L adds with _compensated_sum, the sum the page script repeats, and
+    the mean return is _compensated_mean, so neither depends on pandas'
+    version; the median is pandas' own.
 
     Args:
         df (pd.DataFrame): One row per trade with columns subcategory, profit

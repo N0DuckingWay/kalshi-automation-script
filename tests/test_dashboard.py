@@ -19970,7 +19970,7 @@ class TestGroupSumsAreThePagesOwn:
     same trades drawn by Python."""
 
     @staticmethod
-    def _frame(sorted_rows: bool, seed: int) -> pd.DataFrame:
+    def _frame(sort_by: str | None, seed: int) -> pd.DataFrame:
         rng = random.Random(seed)
         rows = [{"profit": rng.gauss(0, 1e3) * 10 ** rng.randint(-6, 6),
                  "profit_ratio": rng.gauss(0, 1) * 10 ** rng.randint(-6, 6),
@@ -19978,8 +19978,10 @@ class TestGroupSumsAreThePagesOwn:
                  "subcategory": rng.choice(["Sports · Golf", "Politics · US"]),
                  "entry_pA": rng.random(), "month": rng.choice(["2026-01", "2026-02"])}
                 for _ in range(rng.randint(2, 300))]
-        if sorted_rows:
-            rows.sort(key=lambda r: (r["month"], r["subcategory"], r["category"]))
+        if sort_by:
+            # pandas 3.1 takes its other path only for a key the rows are
+            # sorted by, so each key gets a run with its rows sorted
+            rows.sort(key=lambda r: r[sort_by])
         return pd.DataFrame(rows)
 
     @staticmethod
@@ -20000,10 +20002,10 @@ class TestGroupSumsAreThePagesOwn:
         assert dashboard._compensated_sum([]) == 0.0
         assert dashboard._compensated_mean([1.0, 2.0, 4.0]) == 7.0 / 3
 
-    @pytest.mark.parametrize("sorted_rows", [True, False])
-    @pytest.mark.parametrize("seed", range(40))
-    def test_every_bar_and_row_is_the_helpers_sum(self, sorted_rows, seed):
-        df = self._frame(sorted_rows, seed)
+    @pytest.mark.parametrize("sort_by", [None, "month", "category", "subcategory", "entry_pA"])
+    @pytest.mark.parametrize("seed", range(20))
+    def test_every_bar_and_row_is_the_helpers_sum(self, sort_by, seed):
+        df = self._frame(sort_by, seed)
         agg = dashboard._decomposition_aggregates(df)
         assert dict(zip(agg["monthly"]["month"], agg["monthly"]["profit"], strict=True)) \
             == self._by_hand(df, "month")
