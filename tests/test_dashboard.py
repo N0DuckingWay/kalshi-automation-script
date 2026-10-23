@@ -19934,7 +19934,7 @@ class TestMixedSelection:
             ties += abs(Decimal(x)).scaleb(digits) % 1 == Decimal("0.5")
         assert ties >= 100
 
-    def test_sums_medians_and_rounding_are_numpys_and_pandas(self, tmp_path):
+    def test_sums_medians_and_rounding_are_numpys_and_the_pages(self, tmp_path):
         rng = random.Random(8)
         lists = [[rng.gauss(0, 1e3) * 10 ** rng.randint(-6, 6) for _ in range(n)]
                  for n in (0, 1, 2, 7, 8, 9, 15, 16, 17, 127, 128, 129, 130, 255, 300, 1000)]
@@ -19945,10 +19945,11 @@ class TestMixedSelection:
         for values, (total, grouped, middle) in zip(lists, got, strict=True):
             # numpy's own pairwise sum, bit for bit: a mean here is Python's mean
             assert total == float(np.sum(np.array(values, dtype=float))), len(values)
+            # the page's own sum within a group, bit for bit: the decomposition's
+            # bars (pandas 3.1 adds a sorted group with numpy's reduceat, so the
+            # page no longer leaves this sum to pandas)
+            assert grouped == dashboard._compensated_sum(values), len(values)
             if values:
-                # pandas' sum within a group, bit for bit: the decomposition's bars
-                frame = pd.DataFrame({"g": ["a"] * len(values), "v": values})
-                assert grouped == float(frame.groupby("g")["v"].sum().iloc[0]), len(values)
                 assert middle == float(np.median(values)), len(values)
         points = [0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 0.125, 0.135, 2.675, 1e-7, -1e-7,
                   *(rng.uniform(-50, 50) for _ in range(200)),
@@ -19958,6 +19959,71 @@ class TestMixedSelection:
                           "roundTo(x, 2), roundTo(x, 4)]; })")
         for x, drawn in zip(points, rounded, strict=True):
             assert drawn == [float(np.round(x, digits)) for digits in (0, 2, 4)], x
+
+
+class TestGroupSumsAreThePagesOwn:
+    """The decomposition's bars and the category table add each group with
+    dashboard._compensated_sum, the sum the page script's groupSum repeats,
+    never with pandas' group kernel: pandas 3.1 adds a group whose rows are
+    already sorted by key with numpy's reduceat, which can differ from it in
+    the last bit, and a mix drawn by the script would then differ from the
+    same trades drawn by Python."""
+
+    @staticmethod
+    def _frame(sorted_rows: bool, seed: int) -> pd.DataFrame:
+        rng = random.Random(seed)
+        rows = [{"profit": rng.gauss(0, 1e3) * 10 ** rng.randint(-6, 6),
+                 "profit_ratio": rng.gauss(0, 1) * 10 ** rng.randint(-6, 6),
+                 "category": rng.choice(["Sports", "Politics"]),
+                 "subcategory": rng.choice(["Sports · Golf", "Politics · US"]),
+                 "entry_pA": rng.random(), "month": rng.choice(["2026-01", "2026-02"])}
+                for _ in range(rng.randint(2, 300))]
+        if sorted_rows:
+            rows.sort(key=lambda r: (r["month"], r["subcategory"], r["category"]))
+        return pd.DataFrame(rows)
+
+    @staticmethod
+    def _by_hand(df: pd.DataFrame, key: str, column: str = "profit") -> dict:
+        groups: dict = {}
+        for k, v in zip(df[key], df[column], strict=True):
+            groups.setdefault(k, []).append(v)
+        return {k: dashboard._compensated_sum(v) for k, v in groups.items()}
+
+    def test_the_helper_is_the_compensated_sum(self):
+        # 1e16 + 1 + 1 loses both ones to rounding when added plainly; the
+        # running correction keeps them
+        assert dashboard._compensated_sum([1e16, 1.0, 1.0]) == 1e16 + 2.0
+        plain = 0.0
+        for value in (1e16, 1.0, 1.0):
+            plain += value
+        assert plain == 1e16
+        assert dashboard._compensated_sum([]) == 0.0
+        assert dashboard._compensated_mean([1.0, 2.0, 4.0]) == 7.0 / 3
+
+    @pytest.mark.parametrize("sorted_rows", [True, False])
+    @pytest.mark.parametrize("seed", range(40))
+    def test_every_bar_and_row_is_the_helpers_sum(self, sorted_rows, seed):
+        df = self._frame(sorted_rows, seed)
+        agg = dashboard._decomposition_aggregates(df)
+        assert dict(zip(agg["monthly"]["month"], agg["monthly"]["profit"], strict=True)) \
+            == self._by_hand(df, "month")
+        assert agg["category"].to_dict() == self._by_hand(df, "category")
+        assert agg["subcategory"].to_dict() == self._by_hand(df, "subcategory")
+        buckets = pd.cut(df["entry_pA"], bins=dashboard._PRICE_BUCKET_BINS,
+                         labels=dashboard._PRICE_BUCKET_LABELS)
+        assert agg["price"].to_dict() == self._by_hand(df.assign(b=buckets), "b")
+        grouped = dashboard._category_groups(df)
+        assert grouped["pnl"].to_dict() == self._by_hand(df, "subcategory")
+        ratios = self._by_hand(df, "subcategory", "profit_ratio")
+        counts = df["subcategory"].value_counts()
+        assert grouped["mean_ret"].to_dict() == {k: v / counts[k] for k, v in ratios.items()}
+
+    def test_an_empty_frame_keeps_pandas_shape(self):
+        df = pd.DataFrame(columns=["profit", "profit_ratio", "category", "subcategory",
+                                   "entry_pA", "month"])
+        agg = dashboard._decomposition_aggregates(df)
+        assert agg["category"].dtype == df.groupby("category")["profit"].sum().dtype
+        assert agg["monthly"].empty and agg["price"].empty
 
 
 class TestExtraDataHeader:

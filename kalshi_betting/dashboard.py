@@ -1737,9 +1737,70 @@ _CATEGORY_TABLE_FOOT = "</table></div>"
 _NO_FIGURE = "—"
 
 
+def _compensated_sum(values) -> float:
+    """
+    Add a group's values with a running correction for lost low digits.
+
+    This is the compensated (Kahan) sum pandas' group kernel used for every
+    group sum and mean through pandas 3.0, and the sum the page script's
+    groupSum repeats in the same order, so a mix of categories and tags draws
+    the bars Python draws. pandas 3.1 adds those values with numpy's reduceat
+    instead when the rows are already sorted by group, which can differ in the
+    last bit, so the page adds them itself rather than leave it to pandas.
+
+    Args:
+        values: The group's values, in row order (a Series or any iterable of
+            floats).
+
+    Returns:
+        float: Their compensated sum; 0.0 for no values.
+    """
+    total = 0.0
+    lost = 0.0
+    for value in values:
+        y = float(value) - lost
+        t = total + y
+        lost = (t - total) - y
+        total = t
+    return total
+
+
+def _compensated_mean(values) -> float:
+    """
+    Average a group's values as pandas' group mean did through pandas 3.0.
+
+    Args:
+        values: The group's values, in row order; at least one.
+
+    Returns:
+        float: _compensated_sum of them divided by how many there are.
+    """
+    return _compensated_sum(values) / len(values)
+
+
+def _group_sums(grouped) -> pd.Series:
+    """
+    Sum each group of a grouped column with _compensated_sum.
+
+    Args:
+        grouped: A pandas SeriesGroupBy.
+
+    Returns:
+        pd.Series: grouped.sum() (its index, name and dtype) with each value
+            replaced by that group's _compensated_sum.
+    """
+    sums = grouped.sum()
+    if len(sums):
+        sums = grouped.agg(_compensated_sum).astype(sums.dtype)
+    return sums
+
+
 def _category_groups(df: pd.DataFrame) -> pd.DataFrame:
     """
     Sum the decomposition frame per category · tag, largest P&L first.
+
+    The P&L and the mean return add with _compensated_sum, as the page script
+    does; the median is pandas' own.
 
     Args:
         df (pd.DataFrame): One row per trade with columns subcategory, profit
@@ -1754,8 +1815,8 @@ def _category_groups(df: pd.DataFrame) -> pd.DataFrame:
     return df.groupby("subcategory").agg(
         trades=("profit", "size"),
         wins=("profit", lambda p: int((p > 0).sum())),
-        pnl=("profit", "sum"),
-        mean_ret=("profit_ratio", "mean"),
+        pnl=("profit", _compensated_sum),
+        mean_ret=("profit_ratio", _compensated_mean),
         median_ret=("profit_ratio", "median"),
     ).sort_values("pnl", ascending=False, kind="stable")
 
@@ -1897,6 +1958,9 @@ def _decomposition_aggregates(df: pd.DataFrame) -> dict:
     """
     Sum the decomposition frame's P&L four ways, for the section's bar charts.
 
+    Each group is added with _compensated_sum, the sum the page script repeats
+    for a mix of categories and tags.
+
     Entry price buckets read entry_pA, market A's YES ask at entry, for both
     pair types. It is a quote, not what the trade paid: the leg a trade buys
     on market A (the YES leg of a time_series trade, the NO leg of a
@@ -1915,11 +1979,12 @@ def _decomposition_aggregates(df: pd.DataFrame) -> dict:
     """
     buckets = pd.cut(df["entry_pA"], bins=_PRICE_BUCKET_BINS, labels=_PRICE_BUCKET_LABELS)
     return {
-        "monthly": df.groupby("month")["profit"].sum().reset_index(),
-        "category": df.groupby("category")["profit"].sum().sort_values(kind="stable"),
-        "subcategory": df.groupby("subcategory")["profit"].sum().sort_values(kind="stable"),
-        "price": (df.assign(price_bucket=buckets)
-                  .groupby("price_bucket", observed=True)["profit"].sum()),
+        "monthly": _group_sums(df.groupby("month")["profit"]).reset_index(),
+        "category": _group_sums(df.groupby("category")["profit"]).sort_values(kind="stable"),
+        "subcategory": _group_sums(df.groupby("subcategory")["profit"]).sort_values(
+            kind="stable"),
+        "price": _group_sums(df.assign(price_bucket=buckets)
+                             .groupby("price_bucket", observed=True)["profit"]),
     }
 
 
@@ -13753,7 +13818,7 @@ _FILTER_JS = r"""
     return pairSum(a, lo, half) + pairSum(a, lo + half, n - half);
   }
   function npSum(a) { return pairSum(a, 0, a.length); }
-  // pandas' sum within a group (compensated): the decomposition's bars
+  // _compensated_sum's sum within a group: the decomposition's bars
   function groupSum(values) {
     var sum = 0, comp = 0;
     values.forEach(function(v) {
