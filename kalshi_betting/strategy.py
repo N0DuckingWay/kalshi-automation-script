@@ -34,10 +34,10 @@ Notes:
     each call is handed, or config.py's when none is.
     An add-on is a candidate that buys more of a pair the account already holds
     (CandidatePair.held, read through scanner.pair_held). Kelly sizes the whole
-    position: the add-on takes only what the held pair's stake (its worth at
-    today's prices plus the fees paid for it) is missing of its Kelly share of
-    the portfolio value, and never more than a new pair would
-    (config.held_pair_fraction).
+    position: the add-on takes only what the held pair's stake (the larger of
+    what it cost and its worth at today's prices, each with the fees paid for
+    it) is missing of its Kelly share of the portfolio value, and never more
+    than a new pair would (config.held_pair_fraction).
 """
 import logging
 from dataclasses import dataclass
@@ -262,9 +262,10 @@ def _evaluate_size(
     (_kelly_p_at) is the same at every n. With no book, the pair's stored
     leg prices are used and n is ignored. For an add-on
     (scanner.pair_held), Kelly sizes the whole position: the capped fraction
-    becomes config.held_pair_fraction's, what the held pair's stake (its
-    worth at today's prices plus the fees paid for it, HeldPair.stake_dollars)
-    is missing of that share of the portfolio value.
+    becomes config.held_pair_fraction's, what the held pair's stake (the
+    larger of what it cost and its worth at today's prices, each with the
+    fees paid for it, HeldPair.stake_dollars) is missing of that share of the
+    portfolio value.
 
     Args:
         pair (CandidatePair): The pair being sized.
@@ -342,10 +343,11 @@ def _evaluate_size(
     held = pair_held(pair)
     if held is not None:
         # An add-on: Kelly sizes the whole position, so this trade takes only
-        # what the held pair's stake (its worth at today's prices plus the
-        # fees paid for it) is missing of that share of the portfolio value,
-        # and never more than a new pair would (the one definition). The
-        # budget below then also keeps it within the cash.
+        # what the held pair's stake (the larger of its cost and its worth at
+        # today's prices, each with the fees paid for it) is missing of that
+        # share of the portfolio value, and never more than a new pair would
+        # (the one definition). The budget below then also keeps it within
+        # the cash.
         kelly_fraction_capped = held_pair_fraction(
             kelly_fraction_capped, held.stake_dollars, portfolio_value_cents / 100.0)
         if kelly_fraction_capped <= 0:
@@ -441,9 +443,9 @@ def _holds_kelly_share(
             got it; None means it is all cash.
 
     Returns:
-        bool: True only for an add-on whose held pair's stake (its worth at today's prices
-            plus the fees paid for it) is at least its Kelly share of the portfolio value
-            at the smallest size's price.
+        bool: True only for an add-on whose held pair's stake (the larger of what it cost
+            and its worth at today's prices, each with the fees paid for it) is at least
+            its Kelly share of the portfolio value at the smallest size's price.
     """
     if pair_held(pair) is None:
         return False
@@ -463,9 +465,9 @@ def _log_no_add_on(pair: CandidatePair, holds_kelly_share: bool, *,
     one line (INFO unless the caller passes level), so a run that found a
     held pair and added nothing says why. compute_trade calls this once, at
     the return that refuses the pair; the sizes its search tries on the way
-    are never logged. The Kelly-share line names the two parts of the pair's
-    stake, its worth at today's prices and the fees paid for it, beside the
-    portfolio value.
+    are never logged. The Kelly-share line names what the pair's stake is
+    the larger of, its cost (with fees) and its worth at today's prices plus
+    the fees paid for it, beside the portfolio value.
 
     Args:
         pair (CandidatePair): The pair compute_trade was asked to size.
@@ -487,10 +489,10 @@ def _log_no_add_on(pair: CandidatePair, holds_kelly_share: bool, *,
         logging.log(
             level,
             "Not adding to held pair '%s': it already holds its Kelly share "
-            "(%g contracts each, worth $%.2f at today's prices, fees paid $%.2f, "
-            "portfolio value $%.2f)",
-            pair.canonical_title, held.count, held.value_dollars, held.fees_dollars,
-            portfolio_value_cents / 100,
+            "(%g contracts each, cost $%.2f with fees, worth $%.2f at today's prices "
+            "plus fees paid $%.2f, portfolio value $%.2f)",
+            pair.canonical_title, held.count, held.cost_dollars, held.value_dollars,
+            held.fees_dollars, portfolio_value_cents / 100,
         )
     elif no_forecast:
         logging.log(level, "Not adding to held pair '%s': no forecast (no usable "
@@ -585,9 +587,10 @@ def compute_trade(
 
     An add-on to a held pair (pair.held, read through scanner.pair_held) is
     sized on its whole position: the capped Kelly fraction becomes
-    config.held_pair_fraction's, what the held pair's stake (its worth at
-    today's prices plus the fees paid for it) is missing of that share of the
-    portfolio value, never more than a new pair would get. When compute_trade
+    config.held_pair_fraction's, what the held pair's stake (the larger of
+    what it cost and its worth at today's prices, each with the fees paid for
+    it) is missing of that share of the portfolio value, never more than a
+    new pair would get. When compute_trade
     returns None for an add-on it logs one INFO line saying why (DEBUG when quiet).
 
     Args:

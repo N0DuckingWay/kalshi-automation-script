@@ -4839,8 +4839,9 @@ class TestRunProdAddsToHeldPairs:
 
     def test_the_cap_check_counts_the_fees_paid_for_the_pair(self, monkeypatch, caplog):
         """
-        Pins that the at-cap check reads the held pair's stake, its worth at
-        today's prices plus the fees paid for it, and not its worth alone.
+        Pins that the at-cap check reads the held pair's stake, which counts
+        the fees paid for it (here its cost and its worth plus fees are both
+        $2,565.00), and not its worth alone.
 
         The pair (NO on HELD-A, YES on HELD-B, 3900 contracts each) is worth
         $2,535.00 at today's asks (0.45 and 0.20), which is Kalshi's value of
@@ -4881,23 +4882,84 @@ class TestRunProdAddsToHeldPairs:
         assert not legs & {_TICKER_HELD_A, _TICKER_HELD_B}, traded
         assert "adds to" not in caplog.text
 
-    def test_the_cap_check_reads_the_portfolio_value_and_the_worth_at_todays_prices(
+    def test_the_cap_check_reads_the_portfolio_value_not_the_cash(
             self, monkeypatch, caplog):
         """
-        Pins that the at-cap check weighs the held pair's stake (its worth at
-        today's prices plus the fees paid for it) against the portfolio value
-        (cash plus Kalshi's value of the open positions), not its cost and not
+        Pins that the at-cap check weighs the held pair's stake against the
+        portfolio value (cash plus Kalshi's value of the open positions), not
         the cash alone.
 
         The pair (NO on HELD-A, YES on HELD-B, 1700 contracts each, the only
-        two markets of their group) cost $1,200.00, $20.00 of it fees, but is
-        worth $1,105.00 at today's asks (0.45 and 0.20), which is Kalshi's
-        value of the positions too, so the portfolio value is $11,354.00 and
-        the pair's stake $1,125.00. At a 10% cap it has $10.40 of room
-        ($1,135.40 less its stake), so it is handed on and added to within
-        that room. Weighed at its cost ($1,200.00) against the same value, or
-        at its stake against the cash alone ($1,024.90), it would have been
-        left out as full.
+        two markets of their group) was bought at today's asks (0.45 and
+        0.20): it cost $1,125.00, $20.00 of it fees, and is worth $1,105.00,
+        which is Kalshi's value of the positions too, so the portfolio value
+        is $11,354.00 and the pair's stake (its cost, and its worth plus
+        fees, both $1,125.00) is $1,125.00. At a 10% cap it has $10.40 of
+        room ($1,135.40 less its stake), so it is handed on and added to
+        within that room. Weighed against the cash alone ($1,024.90 at 10%),
+        it would have been left out as full.
+        """
+        held_rows = (
+            {"ticker": _TICKER_HELD_A, "position_fp": "-1700.00",
+             "market_exposure_dollars": "765.00", "fees_paid_dollars": "10.00"},
+            {"ticker": _TICKER_HELD_B, "position_fp": "1700.00",
+             "market_exposure_dollars": "340.00", "fees_paid_dollars": "10.00"},
+        )
+        client = self._client(monkeypatch, include_held_position=False, held_rows=held_rows,
+                              positions_value=110_500)
+        books = {**_ORDERBOOK_PAYLOADS, **_HELD_GROUP_BOOKS}
+        client.get_market_orderbook_without_preload_content = MagicMock(
+            side_effect=lambda ticker: _raw_json_response(books.get(
+                ticker, {"orderbook_fp": {"yes_dollars": [], "no_dollars": []}})))
+        results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True,
+                                      size_cap=0.10)
+        value = 11_354.0
+        assert ("Sizing on portfolio value $11354.00 = cash $10249.00 + open positions "
+                "$1105.00") in caplog.text
+        assert ("Held pair to add to: NO HELD-A / YES HELD-B, 1700 contracts each, "
+                "cost $1125.00 (fees $20.00), worth $1105.00 at today's prices") in caplog.text
+        assert "Held pairs already at their size cap" not in caplog.text
+        key = frozenset((_TICKER_HELD_A, _TICKER_HELD_B))
+        assert [set(pairs) for pairs in seen["st"]] == [{key}]
+        # Its stake on the cash alone has no room at 10%
+        assert config.held_pair_fraction(0.10, 1_125.0, 10_249.0) <= 0
+        # The add-on takes at most the room left: the stake and the new cost
+        # within 10% of the portfolio value
+        [add_on] = [r for r in results
+                    if {r.spec.pair.market_a.ticker, r.spec.pair.market_b.ticker}
+                    == {_TICKER_HELD_A, _TICKER_HELD_B}]
+        held = scanner_mod.pair_held(add_on.spec.pair)
+        assert held.value_dollars == 1700 * 0.45 + 1700 * 0.20
+        assert held.fees_dollars == pytest.approx(20.0)
+        assert held.cost_dollars == pytest.approx(1_125.0)
+        assert held.stake_dollars == pytest.approx(1_125.0)
+        assert add_on.spec.kelly_fraction == config.held_pair_fraction(
+            0.10, held.stake_dollars, value)
+        # That leaves $10.40 to spend, where the worth alone, without the
+        # fees, would have left $30.40
+        budget = config.kelly_budget(value, add_on.spec.kelly_fraction, 10_249.0)
+        assert budget == pytest.approx(10.40)
+        assert config.kelly_budget(value, config.held_pair_fraction(
+            0.10, held.value_dollars, value), 10_249.0) == pytest.approx(30.40)
+        assert add_on.spec.total_cost_with_fees <= budget
+        assert held.stake_dollars + add_on.spec.total_cost_with_fees <= 0.10 * value + 1e-9
+        # The $10.40 of room buys 15 pairs at 0.45 + 0.20 with $0.26 + $0.17
+        # of fees ($10.18 in all); 16 would cost $10.86
+        assert (add_on.spec.x, add_on.spec.y) == (15, 15)
+        assert add_on.spec.total_cost_with_fees == pytest.approx(10.18)
+
+    def test_the_cap_check_counts_a_pair_that_lost_value_at_its_cost(
+            self, monkeypatch, caplog):
+        """
+        Pins that the at-cap check counts a held pair that has lost value at
+        what it cost, so a losing pair is never topped back up past its cap.
+
+        The same pair as above, but bought dearer: it cost $1,200.00, $20.00
+        of it fees, and is worth only $1,105.00 at today's asks. The
+        portfolio value is $11,354.00 and a 10% cap allows $1,135.40. Its
+        worth plus fees ($1,125.00) would leave $10.40 of room, but its cost
+        is over the cap, so it is left out as full: nothing is handed on and
+        neither held market is traded.
         """
         held_rows = (
             {"ticker": _TICKER_HELD_A, "position_fp": "-1700.00",
@@ -4918,35 +4980,14 @@ class TestRunProdAddsToHeldPairs:
                 "$1105.00") in caplog.text
         assert ("Held pair to add to: NO HELD-A / YES HELD-B, 1700 contracts each, "
                 "cost $1200.00 (fees $20.00), worth $1105.00 at today's prices") in caplog.text
-        assert "Held pairs already at their size cap" not in caplog.text
-        key = frozenset((_TICKER_HELD_A, _TICKER_HELD_B))
-        assert [set(pairs) for pairs in seen["st"]] == [{key}]
-        # By cost, or its stake on the cash alone, the same pair has no room at 10%
+        # By its worth plus fees it has room; by its cost it does not
+        assert config.held_pair_fraction(0.10, 1_105.0 + 20.0, value) > 0
         assert config.held_pair_fraction(0.10, 1_200.0, value) <= 0
-        assert config.held_pair_fraction(0.10, 1_125.0, 10_249.0) <= 0
-        # The add-on takes at most the room left: the stake and the new cost
-        # within 10% of the portfolio value
-        [add_on] = [r for r in results
-                    if {r.spec.pair.market_a.ticker, r.spec.pair.market_b.ticker}
-                    == {_TICKER_HELD_A, _TICKER_HELD_B}]
-        held = scanner_mod.pair_held(add_on.spec.pair)
-        assert held.value_dollars == 1700 * 0.45 + 1700 * 0.20
-        assert held.fees_dollars == pytest.approx(20.0)
-        assert held.stake_dollars == pytest.approx(1_125.0)
-        assert add_on.spec.kelly_fraction == config.held_pair_fraction(
-            0.10, held.stake_dollars, value)
-        # That leaves $10.40 to spend, where the worth alone, without the
-        # fees, would have left $30.40
-        budget = config.kelly_budget(value, add_on.spec.kelly_fraction, 10_249.0)
-        assert budget == pytest.approx(10.40)
-        assert config.kelly_budget(value, config.held_pair_fraction(
-            0.10, held.value_dollars, value), 10_249.0) == pytest.approx(30.40)
-        assert add_on.spec.total_cost_with_fees <= budget
-        assert held.stake_dollars + add_on.spec.total_cost_with_fees <= 0.10 * value + 1e-9
-        # The $10.40 of room buys 15 pairs at 0.45 + 0.20 with $0.26 + $0.17
-        # of fees ($10.18 in all); 16 would cost $10.86
-        assert (add_on.spec.x, add_on.spec.y) == (15, 15)
-        assert add_on.spec.total_cost_with_fees == pytest.approx(10.18)
+        assert "Held pairs already at their size cap, not added to this run: 1" in caplog.text
+        assert seen["ts"] == seen["st"] == [{}]
+        legs = {ticker for _, a, b in self._traded(results) for ticker in (a, b)}
+        assert not legs & {_TICKER_HELD_A, _TICKER_HELD_B}
+        assert "adds to" not in caplog.text
 
     @pytest.mark.parametrize("positions_value, why, cause", [
         (None, "Kalshi's balance reply carried no readable portfolio_value — sizing on "

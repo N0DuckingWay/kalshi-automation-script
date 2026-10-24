@@ -884,21 +884,26 @@ class TestForecastReadsTheMidSpread:
         assert as_crossed > 1000 and would_breach > 300, (as_crossed, would_breach)
 
 
-def _held_pair(value: float, count: float = 30.0, fees: float = 0.90) -> HeldPair:
+def _held_pair(value: float, count: float = 30.0, fees: float = 0.90,
+               cost: float | None = None) -> HeldPair:
     """A held pair the account holds on A1 (YES) / B1 (NO), worth `value` at
-    today's prices, whose two markets paid `fees` in fees: its stake is
-    value + fees. It cost $18.90, fees included."""
+    today's prices, whose two markets paid `fees` in fees. It cost `cost`,
+    fees included; by default value + fees (bought at today's prices), so
+    its stake, the larger of its cost and its worth plus fees, is value +
+    fees unless a test gives it another cost."""
     return HeldPair(sides=(("A1", "yes"), ("B1", "no")), count=count,
-                    cost_dollars=18.9, value_dollars=value, fees_dollars=fees)
+                    cost_dollars=value + fees if cost is None else cost,
+                    value_dollars=value, fees_dollars=fees)
 
 
 class TestComputeTradeAddsToHeldPair:
     """An add-on to a held pair (CandidatePair.held) is sized on its whole
-    position: the held pair's stake (its worth at today's prices plus the
-    fees paid for it) plus the new trade stays within min(f*, cap) of the
-    portfolio value, and the new trade alone within what a new pair would
-    get, never more than the cash. Both sizing paths, the bookless one and
-    the book search, read it through config.held_pair_fraction."""
+    position: the held pair's stake (the larger of its cost and its worth at
+    today's prices, each with the fees paid for it) plus the new trade stays
+    within min(f*, cap) of the portfolio value, and the new trade alone
+    within what a new pair would get, never more than the cash. Both sizing
+    paths, the bookless one and the book search, read it through
+    config.held_pair_fraction."""
 
     # k 0.75, a 10% cap: the time-series fixture's f* (about 0.16) is capped
     _SETTINGS = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0),
@@ -1008,8 +1013,8 @@ class TestComputeTradeAddsToHeldPair:
         # One line, however many sizes the book search tried
         assert lines == [
             f"Not adding to held pair '{pair.canonical_title}': it already holds its "
-            "Kelly share (30 contracts each, worth $30.00 at today's prices, fees paid "
-            "$0.90, portfolio value $211.00)"]
+            "Kelly share (30 contracts each, cost $30.90 with fees, worth $30.00 at "
+            "today's prices plus fees paid $0.90, portfolio value $211.00)"]
 
     @pytest.mark.parametrize("path", ["bookless", "booked"])
     def test_a_pair_that_bought_its_share_adds_nothing_at_unchanged_prices(
@@ -1038,13 +1043,14 @@ class TestComputeTradeAddsToHeldPair:
         assert [r.getMessage() for r in caplog.records
                 if r.getMessage().startswith("Not adding to held pair")] == [
             f"Not adding to held pair '{pair.canonical_title}': it already holds its "
-            "Kelly share (28 contracts each, worth $19.60 at today's prices, fees paid "
-            "$0.90, portfolio value $204.10)"]
-        # Non-vacuous: with the fees left out of the stake ($19.60 against
-        # $20.41) the same pair would buy one more contract pair, $0.74 with
-        # its own fees
-        fee_free = compute_trade(build(dataclasses.replace(held, fees_dollars=0.0)), 20_410,
-                                 settings=self._SETTINGS, cash_cents=18_450)
+            "Kelly share (28 contracts each, cost $20.50 with fees, worth $19.60 at "
+            "today's prices plus fees paid $0.90, portfolio value $204.10)"]
+        # Non-vacuous: with the fees left out of the stake (cost and worth both
+        # $19.60, against $20.41) the same pair would buy one more contract
+        # pair, $0.74 with its own fees
+        fee_free = compute_trade(build(dataclasses.replace(
+            held, fees_dollars=0.0, cost_dollars=held.value_dollars)), 20_410,
+            settings=self._SETTINGS, cash_cents=18_450)
         assert (fee_free.x, fee_free.total_cost_with_fees) == (1, pytest.approx(0.74))
 
     def test_at_unchanged_prices_no_new_pair_is_topped_up_next_run(self):
@@ -1075,8 +1081,11 @@ class TestComputeTradeAddsToHeldPair:
             add = compute_trade(real_bookless(held), value, settings=self._SETTINGS,
                                 cash_cents=cash)
             assert add is None, (start, n, add.x)
-            fee_free = compute_trade(real_bookless(dataclasses.replace(held, fees_dollars=0.0)),
-                                     value, settings=self._SETTINGS, cash_cents=cash)
+            # The stake without the fees: cost and worth both the contracts alone
+            fee_free = compute_trade(
+                real_bookless(dataclasses.replace(held, fees_dollars=0.0,
+                                                  cost_dollars=held.value_dollars)),
+                value, settings=self._SETTINGS, cash_cents=cash)
             tried += 1
             fee_free_adds += fee_free is not None
         assert tried == 777
@@ -1117,24 +1126,66 @@ class TestComputeTradeAddsToHeldPair:
         # Non-vacuous: with cash the same pair adds to the held one
         assert self._size(pair) is not None
 
-    def test_a_held_pair_worth_more_adds_less(self):
-        # The same held pair (it cost $18.90, $0.90 of it fees), valued at
-        # today's prices: worth $4 it has lost value, worth $12 it has
-        # gained. The add-on buys what the $21.10 share is missing of the
-        # stake (worth plus fees), so it shrinks as the pair's worth grows,
-        # and is never more than a new pair (28 pairs) nor more than the cash
+    @pytest.mark.parametrize("path", ["bookless", "booked"])
+    def test_a_held_pair_counts_at_the_larger_of_its_cost_and_its_worth(self, path):
+        # The same held pair, which cost $12.90 ($0.90 of it fees), valued at
+        # today's prices. Worth $4, $8 or $12 it has lost value (or kept it):
+        # it counts at its $12.90 cost, so the add-on is the same whatever
+        # the loss. Worth $16 it has gained: it counts at $16.90, its worth
+        # plus fees, and the add-on shrinks. Never more than a new pair (28
+        # pairs) nor more than the cash
+        build = self._bookless if path == "bookless" else self._booked
         sizes = {}
-        for worth in (4.0, 8.0, 12.0):
-            held = _held_pair(value=worth)
-            spec = self._size(self._bookless(held))
-            fraction = config.held_pair_fraction(0.10, worth + 0.90, 211.0)
+        for worth in (4.0, 8.0, 12.0, 16.0):
+            held = _held_pair(value=worth, cost=12.90)
+            assert held.stake_dollars == max(12.90, worth + 0.90)
+            spec = self._size(build(held))
+            fraction = config.held_pair_fraction(0.10, held.stake_dollars, 211.0)
             assert spec.kelly_fraction == fraction
             assert spec.total_cost_with_fees <= config.kelly_budget(211.0, fraction, 150.0)
             assert held.stake_dollars + spec.total_cost_with_fees <= 0.10 * 211.0 + 1e-9
             sizes[worth] = spec.x
-        plain = self._size(self._bookless(None))
-        assert sizes == {4.0: 22, 8.0: 16, 12.0: 11}
+        plain = self._size(build(None))
+        assert sizes == {4.0: 11, 8.0: 11, 12.0: 11, 16.0: 5}
         assert plain.x == 28 and plain.total_cost_with_fees <= 150.0
+
+    @pytest.mark.parametrize("path", ["bookless", "booked"])
+    def test_a_pair_that_lost_value_is_not_topped_up_past_its_cap(self, path, caplog):
+        # It cost $30.90 with its fees, more than the $21.10 a 10% cap of the
+        # $211 portfolio value allows, but is worth only $15 at today's prices
+        # ($15.90 with the fees). Counted at its cost it has no room, so
+        # nothing is added and the line names both figures
+        held = _held_pair(value=15.0, cost=30.90)
+        assert held.stake_dollars == 30.90
+        pair = self._bookless(held) if path == "bookless" else self._booked(held, qty=1000)
+        with caplog.at_level(logging.INFO):
+            assert self._size(pair) is None
+        assert [r.getMessage() for r in caplog.records
+                if r.getMessage().startswith("Not adding to held pair")] == [
+            f"Not adding to held pair '{pair.canonical_title}': it already holds its "
+            "Kelly share (30 contracts each, cost $30.90 with fees, worth $15.00 at "
+            "today's prices plus fees paid $0.90, portfolio value $211.00)"]
+        # Non-vacuous: counted at its worth plus fees ($15.90) it would have
+        # $5.20 of room and buy 7 more pairs ($5.13), topping a losing pair up
+        worth_only = _held_pair(value=15.0)
+        spec = self._size(self._bookless(worth_only) if path == "bookless"
+                          else self._booked(worth_only, qty=1000))
+        assert (spec.x, spec.total_cost_with_fees) == (7, pytest.approx(5.13))
+
+    def test_the_anthropic_pair_of_2026_10_23_has_no_room(self):
+        # The live run of 2026-10-23 15:40 PDT held 250 pairs of
+        # KXIPOANTHROPIC-DATE (YES Nov 1 / NO Dec 1) that cost $103.81 with
+        # $5.79 of fees, worth $62.50 at that run's asks, on a $738.78
+        # portfolio value at a 10% cap ($73.88). Counted at its worth plus
+        # fees ($68.29) it had 0.76% of room, which bought 21 more pairs;
+        # counted at its cost it has none
+        held = HeldPair(sides=(("KXIPOANTHROPIC-DATE-26NOV01", "yes"),
+                               ("KXIPOANTHROPIC-DATE-26DEC01", "no")), count=250.0,
+                        cost_dollars=103.81, value_dollars=62.50, fees_dollars=5.79)
+        assert held.stake_dollars == 103.81
+        assert config.held_pair_fraction(0.10, held.stake_dollars, 738.78) <= 0
+        assert config.held_pair_fraction(0.10, 62.50 + 5.79, 738.78) == pytest.approx(
+            0.10 - 68.29 / 738.78)
 
     def test_an_ordinary_pair_it_refuses_logs_nothing_new(self, caplog):
         with caplog.at_level(logging.INFO):
@@ -1585,9 +1636,10 @@ def _add_on_sizing_problems(source: str) -> list[str]:
     Check how strategy._evaluate_size sizes an add-on to a held pair.
 
     The capped Kelly fraction becomes held_pair_fraction's, fed the held
-    pair's stake (HeldPair.stake_dollars: its worth at today's prices plus the
-    fees paid for it; never its cost, never the worth alone) and the
-    portfolio value (never the cash), and only then does the budget read it:
+    pair's stake (HeldPair.stake_dollars: the larger of its cost and its worth
+    at today's prices, each with the fees paid for it; never the cost alone,
+    never the worth alone) and the portfolio value (never the cash), and only
+    then does the budget read it:
     kelly_budget and max_affordable_pairs both take that fraction, so an
     add-on spends at most what the whole position is missing and at most the
     cash. An add-on step after the budget, or fed the wrong base, sizes a
@@ -1775,20 +1827,20 @@ def _backtest_add_on_problems(source: str) -> list[str]:
 
     Each Monday's portfolio value is the cash plus every open trade through
     _open_value, the one valuation (at market; at cost for a trade with no
-    quotes). Each candidate starts from its capped Kelly fraction; an
-    add-on's becomes held_pair_fraction(fraction, stake, checkpoint_value),
-    the open pair's stake against that value, which refuses a pair already
-    at its share. The add-on then reaches the live sizer as a HeldPair whose
-    stake is that same stake (_held_pair(c, stake, ...)), and every
-    candidate is sized once, after that check, by
+    quotes). Each candidate starts from its capped Kelly fraction. An
+    add-on's held pair is built first, from the open pair's worth
+    (_held_pair(c, worth, ...)), and its fraction then becomes
+    held_pair_fraction(fraction, held_pair.stake_dollars, checkpoint_value):
+    the live stake, the larger of what the pair paid and that worth, against
+    that value, which refuses a pair already at its share. Every candidate is
+    sized once, after that check, by
     _size_trade(c, d, checkpoint_value, cash, settings, held_pair, markets):
     the live code budgets it at its share of the value, never more than the
     cash. The trade records the fraction the sizer sized at, and the cash it
-    spent, the spec's own. The stake counts the fees, as the live stake
-    (HeldPair.stake_dollars) does: the pair's record keeps each trade with
-    what it paid (its contracts plus fees, `invested`), and the stake adds,
-    for each, what it paid moved by what its contracts gained or lost since
-    (_open_value less their cost).
+    spent, the spec's own. The worth counts the fees, as the live worth does:
+    the pair's record keeps each trade with what it paid (its contracts plus
+    fees, `invested`), and the worth adds, for each, what it paid moved by
+    what its contracts gained or lost since (_open_value less their cost).
 
     Args:
         source (str): Source text holding def _simulate_at_discount
@@ -1806,7 +1858,7 @@ def _backtest_add_on_problems(source: str) -> list[str]:
                 f"{len(sizings)} times, not once each"]
     [share], [sizing] = shares, sizings
     if share.keywords or [ast.unparse(a) for a in share.args] != [
-            "fraction", "stake", "checkpoint_value"]:
+            "fraction", "held_pair.stake_dollars", "checkpoint_value"]:
         problems.append(f"held_pair_fraction is called as {ast.unparse(share)}")
     if _bound_from(func, share) != ["fraction"]:
         problems.append("held_pair_fraction's result is not the fraction")
@@ -1815,13 +1867,12 @@ def _backtest_add_on_problems(source: str) -> list[str]:
         problems.append(f"the trade is sized as {ast.unparse(sizing)}")
     if sizing.lineno <= share.lineno:
         problems.append("the trade is sized before held_pair_fraction")
-    # The add-on reaches the sizer as a HeldPair whose stake is the stake
+    # The add-on's HeldPair is built from the worth, before its stake is read
     helds = _calls_to(func, "_held_pair")
-    if not helds or any(len(h.args) < 2 or ast.unparse(h.args[1]) != "stake"
-                        or h.lineno <= share.lineno or h.lineno >= sizing.lineno
-                        for h in helds):
-        problems.append("the held pair handed to the sizer is not built from the stake, "
-                        "between held_pair_fraction and the sizing")
+    if not helds or any(len(h.args) < 2 or ast.unparse(h.args[1]) != "worth"
+                        or h.lineno >= share.lineno for h in helds):
+        problems.append("the held pair is not built from the worth, before "
+                        "held_pair_fraction reads its stake")
     if not any(isinstance(n, ast.Assign) and ast.unparse(n.value).startswith("_held_pair(")
                and [ast.unparse(t) for t in n.targets] == ["held_pair"]
                for n in ast.walk(func)):
@@ -1849,18 +1900,18 @@ def _backtest_add_on_problems(source: str) -> list[str]:
     if values != [value_sum]:
         problems.append(f"the portfolio value is {values}, not the cash plus every open "
                         "trade through _open_value")
-    # The stake: what each held trade paid, moved by its change in value
+    # The worth: what each held trade paid, moved by its change in value
     moved = ast.unparse(ast.parse(
         "paid + (_open_value(held_trade, d) - held_trade.total_cost)", mode="eval").body)
     stakes = [n for n in ast.walk(func) if isinstance(n, ast.AugAssign)
-              and ast.unparse(n.target) == "stake"]
+              and ast.unparse(n.target) == "worth"]
     loops = [n for n in ast.walk(func) if isinstance(n, ast.For)
              and ast.unparse(n.target) in ("held_trade, paid", "(held_trade, paid)")
              and ast.unparse(n.iter) == "held['trades']"]
     if (len(stakes) != 1 or not isinstance(stakes[0].op, ast.Add)
             or ast.unparse(stakes[0].value) != moved
             or not any(stakes[0] in ast.walk(loop) for loop in loops)):
-        problems.append("the stake is not what each held trade paid moved by its change "
+        problems.append("the worth is not what each held trade paid moved by its change "
                         "in value (_open_value less its cost)")
     # The pair's record keeps each trade with what it paid, contracts plus fees
     grows = [n for n in ast.walk(func) if isinstance(n, ast.Call)
@@ -3689,15 +3740,16 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(strategy, "_evaluate_size", "pair_held")
         # ... and the backtest sizes its add-ons through the same definition:
         # its own check of a pair already at its share, then the live sizer
-        # itself, handed the held pair (the backtest's stake) on the pair
+        # itself, handed the held pair (its cost, and its worth at market with
+        # its fees, of which the stake is the larger) on the pair
         assert _function_calls(backtester, "_simulate_at_discount", "held_pair_fraction")
         assert _function_calls(backtester, "_size_trade", "_candidate_pair")
         [candidate] = _call_nodes(backtester, "_candidate_pair", "CandidatePair")
         assert [ast.unparse(k.value) for k in candidate.keywords if k.arg == "held"] == ["held"]
         [held_pair] = _call_nodes(backtester, "_held_pair", "HeldPair")
         assert {k.arg: ast.unparse(k.value) for k in held_pair.keywords
-                if k.arg in ("value_dollars", "fees_dollars")} == {
-            "value_dollars": "stake", "fees_dollars": "0.0"}
+                if k.arg in ("cost_dollars", "value_dollars", "fees_dollars")} == {
+            "cost_dollars": "cost", "value_dollars": "worth", "fees_dollars": "0.0"}
         # The portfolio step tells an add-on by the same reader, and only one
         # whose held pair is the spec's own markets and sides ...
         assert _function_calls(strategy, "select_portfolio", "pair_held")
@@ -3793,8 +3845,9 @@ class TestTimeSeriesKellyParity:
 
     def test_ast_add_ons_size_on_the_portfolio_value_before_the_budget(self):
         # The sizer turns the capped fraction into held_pair_fraction's (the
-        # held pair's stake, its worth at today's prices plus the fees paid
-        # for it, against the portfolio value) BEFORE the budget reads it,
+        # held pair's stake, the larger of its cost and its worth at today's
+        # prices with its fees, against the portfolio value) BEFORE the budget
+        # reads it,
         # and names every refusal once
         assert _add_on_sizing_problems(inspect.getsource(strategy)) == []
         assert _refusal_line_problems(inspect.getsource(strategy)) == []
@@ -4602,11 +4655,10 @@ class TestTimeSeriesKellyParity:
     def test_ast_the_backtest_sizes_add_ons_on_the_checkpoint_value(self):
         # backtester._simulate_at_discount: each Monday's portfolio value is
         # the cash plus every open trade through _open_value (at market); an
-        # add-on's fraction is held_pair_fraction(fraction, stake,
-        # checkpoint_value), read by the walk's one kelly_budget(
-        # checkpoint_value, fraction, cash), and the stake is what each held
-        # trade paid, fees included, moved by its change in value, as the
-        # live stake counts its worth today plus its fees
+        # add-on's fraction is held_pair_fraction(fraction,
+        # held_pair.stake_dollars, checkpoint_value), the live stake (the
+        # larger of what the pair paid and its worth), and the worth is what
+        # each held trade paid, fees included, moved by its change in value
         assert _backtest_add_on_problems(inspect.getsource(backtester)) == []
 
     def test_ast_the_backtest_check_catches_its_mutants(self):
@@ -4623,13 +4675,14 @@ class TestTimeSeriesKellyParity:
             "        fraction = c['kelly_f_capped']\n"
             "        held_pair = None\n"
             "        if held is not None:\n"
-            "            stake = 0.0\n"
+            "            worth = 0.0\n"
             "            for held_trade, paid in held['trades']:\n"
-            "                stake += paid + (_open_value(held_trade, d) - held_trade.total_cost)\n"
-            "            fraction = held_pair_fraction(fraction, stake, checkpoint_value)\n"
+            "                worth += paid + (_open_value(held_trade, d) - held_trade.total_cost)\n"
+            "            held_pair = _held_pair(c, worth, [t for t, _p in held['trades']], None)\n"
+            "            fraction = held_pair_fraction(fraction, held_pair.stake_dollars,\n"
+            "                                          checkpoint_value)\n"
             "            if fraction <= 0:\n"
             "                continue\n"
-            "            held_pair = _held_pair(c, stake, [t for t, _p in held['trades']], None)\n"
             "        spec, refusal = _size_trade(c, d, checkpoint_value, cash, settings,\n"
             "                                    held_pair, markets)\n"
             "        invested = spec.total_cost_with_fees\n"
@@ -4637,27 +4690,35 @@ class TestTimeSeriesKellyParity:
             "        held = open_pairs.setdefault(c['key'], {'trades': []})\n"
             "        held['trades'].append((trade, invested))\n")
         assert _backtest_add_on_problems(shape) == []
-        share_line = ("            fraction = held_pair_fraction(fraction, stake, "
-                      "checkpoint_value)\n")
+        share_lines = ("            fraction = held_pair_fraction(fraction, held_pair.stake_dollars,\n"
+                       "                                          checkpoint_value)\n")
         sizing = ("        spec, refusal = _size_trade(c, d, checkpoint_value, cash, settings,\n"
                   "                                    held_pair, markets)\n")
-        stake_line = ("                stake += paid + (_open_value(held_trade, d) - "
+        worth_line = ("                worth += paid + (_open_value(held_trade, d) - "
                       "held_trade.total_cost)\n")
         record_line = "        held['trades'].append((trade, invested))\n"
-        held_line = ("            held_pair = _held_pair(c, stake, [t for t, _p in "
+        held_line = ("            held_pair = _held_pair(c, worth, [t for t, _p in "
                      "held['trades']], None)\n")
+        assert all(shape.count(part) == 1
+                   for part in (share_lines, sizing, worth_line, record_line, held_line))
         mutants = {
-            "on the cash": shape.replace("stake, checkpoint_value)", "stake, cash)"),
-            "the stake at cost": shape.replace(stake_line, "                stake += paid\n"),
-            "the stake set, not added to": shape.replace(
-                stake_line, stake_line.replace("+=", "=")),
-            "the stake without the fees": shape.replace(
+            "on the cash": shape.replace("                                          checkpoint_value)",
+                                         "                                          cash)"),
+            "the stake at its worth alone": shape.replace(
+                "held_pair_fraction(fraction, held_pair.stake_dollars,",
+                "held_pair_fraction(fraction, worth,"),
+            "the stake at its cost alone": shape.replace(
+                "held_pair.stake_dollars,", "held_pair.cost_dollars,"),
+            "the worth at cost": shape.replace(worth_line, "                worth += paid\n"),
+            "the worth set, not added to": shape.replace(
+                worth_line, worth_line.replace("+=", "=")),
+            "the worth without the fees": shape.replace(
                 record_line, record_line.replace("invested", "total_cost")),
             "the record never grows": shape.replace(record_line, ""),
             "the value at cost": shape.replace(
                 "sum(_open_value(t, d) for t in open_trades)",
                 "sum(t.total_cost for t in open_trades)"),
-            "result unused": shape.replace(share_line, share_line.replace(
+            "result unused": shape.replace(share_lines, share_lines.replace(
                 "fraction = held_pair_fraction", "share = held_pair_fraction")),
             "sized before the share": shape.replace(sizing, "").replace(
                 "        held = open_pairs.get", sizing + "        held = open_pairs.get"),
@@ -4667,7 +4728,9 @@ class TestTimeSeriesKellyParity:
                 "                                    held_pair, markets)",
                 "                                    None, markets)"),
             "the held pair on the cash": shape.replace(held_line, held_line.replace(
-                "_held_pair(c, stake,", "_held_pair(c, cash,")),
+                "_held_pair(c, worth,", "_held_pair(c, cash,")),
+            "the held pair built after the share": shape.replace(held_line, "").replace(
+                share_lines, share_lines + held_line),
             "no held pair built": shape.replace(held_line, ""),
             "no start from the capped fraction": shape.replace(
                 "fraction = c['kelly_f_capped']", "fraction = c['kelly_f']"),

@@ -173,9 +173,11 @@ Notes:
     later passing Monday, while both of its markets are unpaid, the pair
     trades again as a new trade of its own, sized through
     config.held_pair_fraction (the live sizer's rule: Kelly sizes the whole
-    position as a share of the portfolio value, counting the pair's open
-    trades at market plus the fees paid for them, and an add-on never stakes
-    more than a new pair would). It is refused while any other
+    position as a share of the portfolio value, counting the pair at the
+    larger of what its open trades paid and their value at market, each with
+    the fees paid for them, so a pair that has lost value is never topped
+    back up past its cap, and an add-on never stakes more than a new pair
+    would). It is refused while any other
     open trade shares one of its ladders, as live adds only to a held pair no
     other held market shares a ladder with.
 
@@ -4427,16 +4429,18 @@ def _trade_fee_multipliers(trade: BacktestTrade) -> tuple[float, float]:
 
 def _open_leg_stake(trade: BacktestTrade, ticker: str, day: date) -> float:
     """
-    What one leg of an open trade stakes at the checkpoint on `day`: its value at market plus its fee.
+    What one leg of an open trade is worth at the checkpoint on `day`: its value at market plus its fee.
 
     Read for a lone leg: once an open trade's other market has paid out, only
     this leg is still held, as live's scanner.held_pairs counts a lone held
-    leg at its own worth plus its own fees (the other leg's payout is already
-    cash). The leg counts at the latest usable ask of the side it holds
-    (LegQuotes.at_checkpoint), or at the price it paid when the trade has no
-    quotes, plus the exact fee on it (config.fee_leg_exact at the price
-    paid: the fee the trade was charged for that leg, or, for a trade a
-    Kelly trim has split, the fee a trade of what is left would be charged).
+    leg on its own (the other leg's payout is already cash). This is the
+    worth half of the leg's stake; _held_pair adds the cost half, and the
+    stake is the larger of the two (HeldPair.stake_dollars). The leg counts
+    at the latest usable ask of the side it holds (LegQuotes.at_checkpoint),
+    or at the price it paid when the trade has no quotes, plus the exact fee
+    on it (config.fee_leg_exact at the price paid: the fee the trade was
+    charged for that leg, or, for a trade a Kelly trim has split, the fee a
+    trade of what is left would be charged).
 
     Args:
         trade (BacktestTrade): An open trade with a leg on `ticker`.
@@ -4444,7 +4448,7 @@ def _open_leg_stake(trade: BacktestTrade, ticker: str, day: date) -> float:
         day (date): A checkpoint date on the leg's weekly grid.
 
     Returns:
-        float: The leg's stake in dollars.
+        float: The leg's worth with its fee, in dollars.
     """
     index = 0 if trade.ticker_a == ticker else 1
     # What the leg paid per contract, for the exact fee it was charged (at the
@@ -11732,24 +11736,27 @@ def _size_trade(c: dict, d: date, checkpoint_value: float, cash: float,
     return spec, None
 
 
-def _held_pair(c: dict, stake: float, trades: list[BacktestTrade],
+def _held_pair(c: dict, worth: float, trades: list[BacktestTrade],
                lone_ticker: str | None) -> HeldPair:
     """
     What an add-on adds to, as the live sizer reads it.
 
-    compute_trade reads only its stake (stake_dollars), here the backtest's
-    own: the held pair's open trades at market plus the fees paid for them,
-    or a lone leg's alone.
+    compute_trade and the cash walk's at-cap check read only its stake
+    (HeldPair.stake_dollars, the live rule): the larger of what the held
+    trades cost with their fees (cost_dollars) and their worth at market plus
+    those fees (carried here as value_dollars, with fees_dollars 0). For a
+    lone leg both figures are that one leg's alone.
 
     Args:
         c (dict): The add-on's candidate.
-        stake (float): The held stake, in dollars.
+        worth (float): The held trades' worth at market plus the fees paid
+            for them, in dollars.
         trades (list[BacktestTrade]): The held trades.
         lone_ticker (str | None): The held market of a lone leg; None for an exact pair.
 
     Returns:
         HeldPair: Its sides (one for a lone leg), contracts held, what they
-            cost with their fees, and the stake.
+            cost with their fees, and their worth with their fees.
     """
     sides = dict(zip((c["mA"]["ticker"], c["mB"]["ticker"]), leg_sides(c["pair_type"]),
                      strict=True))
@@ -11766,7 +11773,7 @@ def _held_pair(c: dict, stake: float, trades: list[BacktestTrade],
             cost += t.n * price + fee_leg_exact(
                 t.n, price, multiplier=_trade_fee_multipliers(t)[index])
     return HeldPair(sides=tuple(held), count=float(sum(t.n for t in trades)),
-                    cost_dollars=cost, value_dollars=stake, fees_dollars=0.0)
+                    cost_dollars=cost, value_dollars=worth, fees_dollars=0.0)
 
 
 def _lone_leg_records(open_legs: dict, active_tickers: set, market_a: dict,
@@ -11924,9 +11931,10 @@ def _simulate_at_discount(
     own. An add-on with no quotes to read a move from is held back by any
     minimum. Checkpoints are a week apart, so the shipped 7 days hold no
     add-on back here. It is then sized by config.held_pair_fraction on what
-    is held (open trades at market plus their fees; a lone leg alone,
-    _open_leg_stake), so it never stakes more than a new pair would, and is
-    skipped when that is already a full share. Neither gate reads the cap,
+    is held (the larger of what its open trades paid and their worth at
+    market, each with their fees; a lone leg alone, _open_leg_stake), so it
+    never stakes more than a new pair would, and is skipped when that is
+    already a full share. Neither gate reads the cap,
     which reaches an add-on only through min(pair cap, f*) (and, with a
     walked book, the live search's bound), so cap_free_from still marks the
     cap above which the walk is the same. The move behind every add-on made
@@ -13052,32 +13060,34 @@ def _simulate_at_discount(
         held_pair = None
         if held is not None or lone_legs is not None:
             if lone_legs is not None:
-                # A lone leg's stake: that one leg, at market plus its fee, in
+                # A lone leg's worth: that one leg, at market plus its fee, in
                 # each of its open trades (_open_leg_stake); its partner's
                 # payout is already cash
-                stake = sum(_open_leg_stake(leg["trade"], leg["ticker"], d)
+                worth = sum(_open_leg_stake(leg["trade"], leg["ticker"], d)
                             for leg in lone_legs)
+                held_pair = _held_pair(c, worth, [leg["trade"] for leg in lone_legs],
+                                       lone_legs[0]["ticker"])
             else:
-                # The pair's stake: what each of its open trades paid
+                # The pair's worth: what each of its open trades paid
                 # (contracts plus fees), moved by what its contracts have
                 # gained or lost since (_open_value less their cost, zero for
                 # a trade with no quotes) — their value at market plus the
                 # fees paid for them
-                stake = 0.0
+                worth = 0.0
                 for held_trade, paid in held["trades"]:
-                    stake += paid + (_open_value(held_trade, d) - held_trade.total_cost)
+                    worth += paid + (_open_value(held_trade, d) - held_trade.total_cost)
+                held_pair = _held_pair(c, worth, [t for t, _paid in held["trades"]], None)
             # Kelly sizes the whole position: buy what the pair is missing of
             # its Kelly share of the portfolio value (config.held_pair_fraction,
-            # the live sizer's own rule). Checked here, at the top of the book,
-            # so a pair already at its share is counted on its own line
-            fraction = held_pair_fraction(fraction, stake, checkpoint_value)
+            # the live sizer's own rule), the pair counted at the larger of
+            # what it paid and that worth (HeldPair.stake_dollars, the live
+            # stake), so a pair that has lost value is never topped back up
+            # past its cap. Checked here, at the top of the book, so a pair
+            # already at its share is counted on its own line
+            fraction = held_pair_fraction(fraction, held_pair.stake_dollars, checkpoint_value)
             if fraction <= 0:
                 add_on_cap_skips += 1
                 continue
-            held_pair = (_held_pair(c, stake, [t for t, _paid in held["trades"]], None)
-                         if lone_legs is None else
-                         _held_pair(c, stake, [leg["trade"] for leg in lone_legs],
-                                    lone_legs[0]["ticker"]))
 
         # Sized by the live code: a share of the portfolio value, never more
         # than the cash left, over a walked synthetic book when there is one

@@ -139,7 +139,8 @@ TERMS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
      _BACKTEST),
     ("Rebalance",
      "Yes: at each weekly run a held pair is topped up to its Kelly size (its Kelly "
-     "fraction of the portfolio value, held to the size cap) when it has room, and "
+     "fraction of the portfolio value, held to the size cap) when it has room, the "
+     "pair counted at the larger of what it cost and what it is worth, and "
      "sold down to it when it has grown past it, once 7 days have passed since its "
      "last trade. No: a pair is bought once and held. Live runs follow the saved "
      "setting.",

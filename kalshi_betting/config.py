@@ -646,9 +646,11 @@ TAG_SCOPE_SEPARATOR = " · "
 # (scanner.held_pairs: two held markets alone on one ladder, one YES and one
 # NO of equal size, both costs readable), or a lone held market whose partner
 # has paid out. An add-on is judged by every rule a new pair is. Kelly sizes
-# the whole position: the held pair (its worth at today's prices plus the
-# fees paid for it) and the add-on together stake at most min(f*, the pair's
-# cap) of the portfolio value (cash plus open positions), and the new stake
+# the whole position: the held pair (the larger of what it cost and its worth
+# at today's prices, each with the fees paid for it) and the add-on together
+# stake at most min(f*, the pair's cap) of the portfolio value (cash plus
+# open positions), so a pair that has lost value is never topped back up past
+# its cap of what was paid, and the new stake
 # is never more than a new pair would stake (held_pair_fraction) nor more
 # than the cash. A trim and an add-on each wait REBALANCE_MIN_DAYS_SINCE_TRADE
 # days after the pair's last fill and, with MIN_PRICE_MOVE, for its price to
@@ -3307,8 +3309,9 @@ _RETIRED_TOGGLES = ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise")
 # a 10% per-trade cap, a 20% same-title cap, any category or tag, rebalancing
 # on with no minimum price movement, and no selling. One pair stakes at most
 # 10% of the portfolio value; an add-on to a held pair stakes no more than a
-# new pair would, and keeps the held pair (at today's prices, plus the fees
-# paid for it) and the add-on together within 10% of the portfolio value, and
+# new pair would, and keeps the held pair (the larger of its cost and its
+# worth at today's prices, each with the fees paid for it) and the add-on
+# together within 10% of the portfolio value, and
 # a Kelly trim sells a held pair down to its Kelly size, at most that share.
 # Nothing trades on them
 # until they are confirmed and saved to LIVE_DEFAULTS_FILE.
@@ -4064,20 +4067,25 @@ def held_pair_fraction(fraction: float, held_stake: float, portfolio_value: floa
     part of its share. The one definition, read by strategy._evaluate_size,
     backtester._simulate_at_discount and main._run_prod's at-cap check.
 
-    The held stake counts the fees paid for the pair, while the portfolio
-    value does not hold them (they are spent). That leans safe: a pair that
-    bought its whole share adds nothing more while prices stay where they
-    were, where a stake without the fees would let it buy about one more
+    The held stake is the larger of what the pair cost and what it is worth,
+    each counting the fees paid for it, while the portfolio value does not
+    hold those fees (they are spent). Both lean safe: a pair that has lost
+    value still counts at what was paid, so the cap limits the money put into
+    one pair and a losing pair is never topped back up past it; and a pair
+    that bought its whole share adds nothing more while prices stay where
+    they were, where a stake without the fees would let it buy about one more
     contract every run, each paying a fee rounded up to the cent.
 
     Args:
         fraction (float): The share of the portfolio value a new pair would
             stake: min(f*, pair_size_cap(...)), in (0, 1].
-        held_stake (float): What the held pair already stakes, in dollars: its
-            worth plus the fees paid for it (live: HeldPair.stake_dollars, the
-            worth at today's prices plus its held markets' fees, one market's
-            for a lone leg; the backtest: the pair's open trades, or the lone
-            leg alone, at market plus their fees).
+        held_stake (float): What the held pair already stakes, in dollars: the
+            larger of its cost and its worth, each with the fees paid for it
+            (HeldPair.stake_dollars; live, the worth at today's prices and the
+            listing's exposure, with its held markets' fees, one market's
+            for a lone leg; the backtest: what the pair's open trades, or the
+            lone leg alone, paid and their worth at market, each with their
+            fees).
         portfolio_value (float): The value the run sizes on, in dollars: cash
             plus open positions.
 

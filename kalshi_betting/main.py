@@ -1797,8 +1797,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     on the whole position (config.held_pair_fraction); only when the
     positions listing was read to its end, every held market was identified
     and Kalshi's value of the open positions was read and kept, and never to
-    a pair whose stake (its worth at today's prices plus the fees paid for
-    it) already fills its per-trade cap of the portfolio value. Like a trim,
+    a pair whose stake (the larger of its cost and its worth at today's
+    prices, each with the fees paid for it) already fills its per-trade cap
+    of the portfolio value. Like a trim,
     an add-on waits (seller.plan_add_ons): enough calendar days since the
     last fill on the pair's markets and, with min_price_move, a price move
     of that much, up or down, since that fill; a pair held back, or one
@@ -2141,9 +2142,10 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
             # partner paid out), valued at today's prices from this run's
             # market list
             add_on_pairs = held_pairs(held_positions, held_labels, markets_by_ticker)
-            # A pair whose stake (its worth at today's prices plus the fees
-            # paid for it) already fills its per-trade cap of the portfolio
-            # value can add nothing whatever Kelly says: it would only take
+            # A pair whose stake (the larger of its cost and its worth at
+            # today's prices, each with the fees paid for it) already fills
+            # its per-trade cap of the portfolio value can add nothing
+            # whatever Kelly says: it would only take
             # its group's one slot and size to nothing, so its markets stay
             # blocked like any other held market's
             full = {key for key, pair in add_on_pairs.items()

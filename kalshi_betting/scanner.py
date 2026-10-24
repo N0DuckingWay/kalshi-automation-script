@@ -850,8 +850,8 @@ class HeldPair:
       hold (matches); the finders also check that the new market sits on no
       other held ladder.
 
-    Its stake (stake_dollars, the worth plus the fees) is what sizing and the
-    at-cap check subtract.
+    Its stake (stake_dollars: the larger of its cost and its worth plus the
+    fees) is what sizing and the at-cap check subtract.
 
     Attributes:
         sides (tuple[tuple[str, str], ...]): (ticker, "yes" | "no") per held
@@ -890,18 +890,33 @@ class HeldPair:
     @property
     def stake_dollars(self) -> float:
         """
-        Return what the held markets already stake: their worth at today's prices plus the fees paid.
+        Return what the held markets count as already staked: the larger of what they cost and what they are worth.
 
         What sizing and the at-cap check subtract from the pair's Kelly share
         (config.held_pair_fraction): an add-on tops the pair up to that share
-        of the portfolio value. The fees count because they were spent on the
-        pair and the portfolio value no longer holds them, so a pair that
-        bought its whole share adds nothing more at unchanged prices.
+        of the portfolio value. Both figures include the fees paid, since they
+        were spent on the pair and the portfolio value no longer holds them:
+
+        - cost_dollars: what the account paid, its exposure plus the fees.
+        - value_dollars + fees_dollars: its worth at today's prices plus the
+          fees.
+
+        Taking the larger makes the per-trade cap a limit on the money put
+        into one pair. A pair that has lost value still counts at what was
+        paid for it, so it is never topped back up past its cap; a pair that
+        has gained value counts at its worth, so it is not topped up while
+        that worth fills its share. Either way, a pair that bought its whole
+        share adds nothing more at unchanged prices.
 
         Returns:
-            float: value_dollars plus fees_dollars.
+            float: max(cost_dollars, value_dollars + fees_dollars); NaN when
+                either is not a finite number, which held_pair_fraction reads
+                as no room (max() alone would drop a NaN in second place).
         """
-        return self.value_dollars + self.fees_dollars
+        worth = self.value_dollars + self.fees_dollars
+        if not (math.isfinite(self.cost_dollars) and math.isfinite(worth)):
+            return math.nan
+        return max(self.cost_dollars, worth)
 
     def matches(self, market_a: Any, market_b: Any, pair_type: str) -> bool:
         """
@@ -4059,10 +4074,10 @@ def held_pairs(positions: dict, labels_by_ticker: dict, markets_by_ticker: dict,
     partial unwind), one side held twice, an unreadable count or cost. Each
     is valued at today's prices (_held_leg_worth): each market's contracts at
     the ask of the side held there, or at their exposure when the market has
-    no usable ask this run. Its stake, what sizing subtracts, is that worth
-    plus the fees paid on its held markets (HeldPair.stake_dollars); a lone
-    leg's stake is that one market's alone, since its partner's payout is
-    already cash.
+    no usable ask this run. Its stake, what sizing subtracts, is the larger
+    of what its held markets cost (exposure plus fees) and that worth plus
+    the fees paid on them (HeldPair.stake_dollars); a lone leg's stake is
+    that one market's alone, since its partner's payout is already cash.
 
     The ladder of every held market must be known. When any held market is
     missing from labels_by_ticker, or has no labels, nothing is returned: a

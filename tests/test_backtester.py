@@ -17455,10 +17455,11 @@ class TestSameTitleFlipAtMarket:
 
 
 class TestAddOnStakeAtMarket:
-    """An add-on's held stake is its pair's open trades at market plus the
-    fees paid for them: what each paid, moved by what its contracts gained or
-    lost since. A pair whose value rose past its Kelly share is skipped where
-    at cost it would add; one whose value fell gets a larger add-on. Monday 1
+    """An add-on's held stake is the larger of what its pair's open trades
+    paid (contracts plus fees) and their worth at market plus those fees:
+    what each paid, moved by what its contracts gained or lost since. A pair
+    whose value rose past its Kelly share is skipped where at cost it would
+    add; one whose value fell still counts at its cost. Monday 1
     quotes pA 0.20 / pB 0.45 / nB 0.55; Monday 2 pA 0.20 / pB 0.47 / nB 0.53
     (a little wider, so at cost the pair adds a little)."""
 
@@ -17497,20 +17498,28 @@ class TestAddOnStakeAtMarket:
         assert held_pair_fraction(f2, first.total_cost + first.fees,
                                   cash + first.total_cost) > 0
 
-    def test_a_pair_whose_value_fell_adds_more(self):
+    def test_a_pair_whose_value_fell_counts_at_its_cost(self):
+        # Its value at market fell, so it counts at what it paid (contracts
+        # plus fees), the live rule (HeldPair.stake_dollars): the add-on is
+        # sized on that cost against the portfolio value at market, so it is
+        # no larger than the add-on to the same pair valued at cost
         at_cost = self._sim(self._pair())
         fell = self._sim(self._pair(pa_m2=0.10))
         assert [t.add_on for t in fell.trades] == [False, True]
         first, add = fell.trades
-        assert add.n > at_cost.trades[1].n
+        assert add.n <= at_cost.trades[1].n
         value = first.n * (0.10 + 0.53)
         cash = 10_000.0 - (first.total_cost + first.fees)
-        stake = (first.total_cost + first.fees) + (value - first.total_cost)
+        paid = first.total_cost + first.fees
+        worth = paid + (value - first.total_cost)
+        assert worth < paid
         f2 = _uncapped_kelly({"pair_type": "time_series", "entry": self._pair()["entry"]["later"][0]},
                              0.85)
         assert add.balance_at_entry == pytest.approx(cash + value, abs=1e-9)
-        assert add.kelly_fraction == pytest.approx(held_pair_fraction(f2, stake, cash + value),
+        assert add.kelly_fraction == pytest.approx(held_pair_fraction(f2, paid, cash + value),
                                                    abs=1e-12)
+        # Not vacuous: counted at its worth it would have added more
+        assert held_pair_fraction(f2, worth, cash + value) > add.kelly_fraction
 
 
 _MOVING_EXTRA = {
@@ -21494,13 +21503,19 @@ class TestTrimToKelly:
         assert part.sold and part.exit_date == _LADDER_M2
         assert added.add_on and added.entry_date == _M4
         # What the add-on may take is the pair's share less what is left of
-        # the trimmed trade stakes: its contracts at Monday 4's asks (YES
-        # 0.12, NO 0.32) plus its share of the fees paid
-        stake = kept.n * (0.12 + 0.32) + kept.fees
+        # the trimmed trade stakes: the larger of its cost (its share of the
+        # contracts and fees paid) and its worth at Monday 4's asks (YES 0.12,
+        # NO 0.32) plus those fees. Prices fell, so its cost
+        worth = kept.n * (0.12 + 0.32) + kept.fees
+        stake = kept.total_cost + kept.fees
+        assert stake > worth
         assert added.kelly_fraction == pytest.approx(
             config.held_pair_fraction(0.10, stake, added.balance_at_entry), abs=1e-9)
-        # ... not what the whole purchase staked before it was trimmed
-        whole = stake + part.fees + part.n * (0.12 + 0.32)
+        # ... not its worth, which would leave more room ...
+        assert config.held_pair_fraction(
+            0.10, worth, added.balance_at_entry) > added.kelly_fraction + 1e-4
+        # ... and not what the whole purchase cost before it was trimmed
+        whole = stake + part.total_cost + part.fees
         assert added.kelly_fraction > config.held_pair_fraction(
             0.10, whole, added.balance_at_entry) + 1e-4
 
@@ -21561,31 +21576,35 @@ class TestTrimToKelly:
         assert f"contract pairs sold: {sold.n})" in caplog.text
 
     def test_with_adding_on_the_latest_contracts_are_sold_first(self):
-        # The pair is bought on Monday 1 and added to on Monday 2, when its
-        # quotes widen; on Monday 3 its bids are up and it is past its cap
+        # At a 25% cap the pair is bought on Monday 1 at Kelly's whole share
+        # (about 0.19) and added to on Monday 2, when its quotes widen and
+        # Kelly asks for more; on Monday 3 its bids are up and it is past its
+        # share, and again on Monday 4
         candles = {"SA": [_candle(_ck(_LADDER_M1), 0.20, 0.82), *_held(_LADDER_M2, 0.15, 0.87),
                           *_held(_LADDER_M3, 0.34, 0.68), *_held(_M4, 0.36, 0.66)],
                    "SB": [_candle(_ck(_LADDER_M1), 0.60, 0.42), *_held(_LADDER_M2, 0.65, 0.37),
                           *_held(_LADDER_M3, 0.40, 0.62), *_held(_M4, 0.38, 0.64)]}
         mondays = (_LADDER_M1, (_LADDER_M2, 0.15, 0.65, 0.35), (_LADDER_M3, 0.34, 0.40, 0.62))
         records = self._records(mondays, candles)
-        base = self._sim(records, cap=0.10, add_to_held=True)
+        base = self._sim(records, cap=0.25, add_to_held=True)
         bought, added = base.trades
         assert added.add_on and added.entry_date == _LADDER_M2
-        point = self._sim(records, cap=0.10, add_to_held=True, trim_to_kelly=True)
-        kept, add_on, part, later = point.trades
-        # Monday 3: the add-on goes whole, then part of the first purchase
-        assert add_on.add_on and add_on.sold and add_on.exit_date == _LADDER_M3
-        assert add_on.n == added.n
-        assert part.sold and not part.add_on and part.exit_date == _LADDER_M3
+        point = self._sim(records, cap=0.25, add_to_held=True, trim_to_kelly=True)
+        kept, add_rest, add_part, later = point.trades
+        # Monday 3 sells only add-on contracts, the latest bought
+        assert add_part.add_on and add_part.sold and add_part.exit_date == _LADDER_M3
+        assert [t.exit_date for t in point.trades if t.sold and not t.add_on] == [_M4]
+        # Monday 4: the rest of the add-on goes whole, then part of the first purchase
+        assert add_rest.add_on and add_rest.sold and add_rest.exit_date == _M4
+        assert add_rest.n + add_part.n == added.n
         assert later.sold and not later.add_on and later.exit_date == _M4
-        assert not kept.sold and kept.n + part.n + later.n == bought.n
+        assert not kept.sold and kept.n + later.n == bought.n
         # One price a market for everything sold that Monday
-        assert (add_on.sale_price_a, add_on.sale_price_b) == (
-            part.sale_price_a, part.sale_price_b)
+        assert (add_rest.sale_price_a, add_rest.sale_price_b) == (
+            later.sale_price_a, later.sale_price_b)
         # Nothing was added at the checkpoints it was trimmed at
         assert [t.entry_date for t in point.trades] == [
-            _LADDER_M1, _LADDER_M2, _LADDER_M1, _LADDER_M1]
+            _LADDER_M1, _LADDER_M2, _LADDER_M2, _LADDER_M1]
         assert point.equity_df["portfolio_value"].iloc[-1] == pytest.approx(
             self._BALANCE + sum(t.profit for t in point.trades), abs=1e-9)
 
@@ -21879,9 +21898,12 @@ class TestTrimMinMove:
                           *_held(_LADDER_M3, 0.40, 0.62), *_held(_M4, 0.38, 0.64)]}
         mondays = (_LADDER_M1, (_LADDER_M2, 0.15, 0.65, 0.35), (_LADDER_M3, 0.34, 0.40, 0.62))
 
+        # At a 25% cap, where Monday 1 buys Kelly's whole share (about 0.19)
+        # and Monday 2's wider quotes ask for more, so the pair is added to
+        # though its price fell (counted at its cost, the fall alone adds nothing)
         def run(**kw):
-            return self._sim(self._records(mondays, candles), cap=0.10, add_to_held=True, **kw)
-        bought, added = self._plain(self._records(mondays, candles), cap=0.10,
+            return self._sim(self._records(mondays, candles), cap=0.25, add_to_held=True, **kw)
+        bought, added = self._plain(self._records(mondays, candles), cap=0.25,
                                     add_to_held=True).trades
         assert added.add_on and added.entry_date == _LADDER_M2
         prices = [backtester._pair_price(bought, day)
@@ -21891,18 +21913,21 @@ class TestTrimMinMove:
         # then trims on Monday 3 (44c above the add-on) and Monday 4 (4c above
         # that trim). The record holds the add-on's move first, then the trims'
         base = run()
-        assert self._sold_on(base) == [_LADDER_M3, _LADDER_M3, _M4]
+        assert sorted(self._sold_on(base)) == [_LADDER_M3, _M4, _M4]
         assert base.moves == pytest.approx(
             (0.52 - 0.62, 0.96 - 0.52, 1.00 - 0.96), abs=1e-12)
         # At 10c the add-on (a 10c fall) is bought, and Monday 3's trim reads
         # 44c, measured from the add-on (from the purchase it would read 34c).
         # Monday 4 (+4c since that trim) is held back
         at_10 = run(min_move=0.10)
-        assert self._sold_on(at_10) == [_LADDER_M3, _LADDER_M3]
+        assert self._sold_on(at_10) == [_LADDER_M3]
         assert at_10.moves == pytest.approx((-0.10, 0.44), abs=1e-12)
-        add_on = next(t for t in at_10.trades if t.add_on)
-        assert (add_on.n, add_on.entry_date, add_on.total_cost, add_on.fees) == (
-            added.n, added.entry_date, added.total_cost, added.fees)
+        # The add-on bought is the plain run's (Monday 3's trim split it)
+        add_ons = [t for t in at_10.trades if t.add_on]
+        assert {t.entry_date for t in add_ons} == {added.entry_date}
+        assert sum(t.n for t in add_ons) == added.n
+        assert sum(t.total_cost for t in add_ons) == pytest.approx(added.total_cost)
+        assert sum(t.fees for t in add_ons) == pytest.approx(added.fees)
         # At 40c the add-on is held back too (the same minimum gates it), so
         # the pair is measured from its purchase: 34c on Monday 3 and 38c on
         # Monday 4, never trimmed
@@ -22381,19 +22406,22 @@ class TestMoveGrid:
         assert 0 < kinds["point"] < cells // 10
 
     def test_add_on_moves_decide_which_runs_are_one_and_equal_a_fresh_simulation(self):
-        # With no minimum the pair is added to on Monday 2 after a 10c fall,
+        # At a 25% cap, Monday 1 buys Kelly's whole share (about 0.19) and
+        # Monday 2's wider spread asks for more (about 0.21), so with no
+        # minimum the pair is added to on Monday 2, after a 10c fall (the
+        # pair counts at its cost, so the fall alone would add nothing), then
         # trimmed 44c above that add-on and again 4c above that trim: the
         # record holds the add-on's move first. At 5c the second trim is held
         # back; 10c lets through all that the 5c run made (the add-on's 10c
         # fall too); 40c holds the add-on back as well, though both of the 5c
         # run's trims would pass it, so it is another run, which trims nothing
         entries = self._add_on_entries()
-        family = self._family(entries, (0.05, 0.10, 0.40, 0.45, 0.50), caps=(0.10, 0.20))
-        base = self._fresh(entries, 0.75, 0.10, None)
+        family = self._family(entries, (0.05, 0.10, 0.40, 0.45, 0.50), caps=(0.25, 0.30))
+        base = self._fresh(entries, 0.75, 0.25, None)
         assert base.moves == pytest.approx((-0.10, 0.44, 0.04), abs=1e-12)
         assert any(t.add_on for t in base.trades)
         grid = dict(family.move_grid(self._BAND, 0.75))
-        cells = [grid[minimum][0.10] for minimum in family.min_moves]
+        cells = [grid[minimum][0.25] for minimum in family.min_moves]
         assert [type(cell).__name__ for cell in cells] == [
             "SweepPoint", "SameMove", "SweepPoint", "SameMove", "SameMove"]
         assert cells[1] == backtester.SameMove(0.05)
@@ -22430,7 +22458,7 @@ class TestMoveGrid:
         exec(compile(source.replace(self._ADD_ON_RECORD, "                pass"),
                      "<_simulate_at_discount mutant>", "exec"), namespace)
         entries = self._add_on_entries()
-        family = self._family(entries, (0.05, 0.40), caps=(0.10,))
+        family = self._family(entries, (0.05, 0.40), caps=(0.25,))
         with monkeypatch.context() as mp:
             mp.setattr(backtester, "_simulate_at_discount", namespace["_simulate_at_discount"])
             with pytest.raises(AssertionError):
@@ -22718,6 +22746,12 @@ class TestTrimWait:
              _M[3]: ((0.30, 0.72), (0.50, 0.52)), _M[4]: ((0.32, 0.70), (0.47, 0.55)),
              _M[5]: ((0.34, 0.68), (0.44, 0.58))}
     _DIP3_MONDAYS = (_M[0], (_M[2], 0.15, 0.65, 0.35))
+    # The same dip, but up to 1.00 on Mondays 4 and 5 (bids 0.38 + 0.58) and
+    # 1.02 on Monday 6: at a 25% cap the first purchase is Kelly's whole share
+    # (about 0.19), Monday 3's wider quotes ask for more, so the pair is added
+    # to there, and from Monday 4 on it is past its share
+    _DIP3_UP = {**_DIP3, _M[3]: ((0.40, 0.62), (0.42, 0.60)),
+                _M[4]: ((0.40, 0.62), (0.42, 0.60)), _M[5]: ((0.41, 0.61), (0.41, 0.61))}
 
     @staticmethod
     def _wait(monkeypatch, days) -> None:
@@ -22956,26 +22990,30 @@ class TestTrimWait:
 
     def test_an_add_on_restarts_the_wait_and_so_does_a_trim_that_sells_it_whole(
             self, monkeypatch, caplog):
-        # The _DIP3 prices: an adding run buys more at Monday 3's dip, 14 days
-        # after the purchase, so an 8-day wait lets the add-on through too
+        # The _DIP3 prices at the 10% cap, with no wait: trimmed on Mondays 2,
+        # 4, 5 and 6, adding or not. With adding, the pair is added to at
+        # Monday 3's dip: the Monday 2 trim cut what it cost, so it has room
+        # again. The add-on's move is measured from that trim (0.52 is 20c
+        # below the trim's 0.72, though only 10c below the purchase)
         def run(**kw):
             return self._sim(self._records(self._DIP3_MONDAYS, self._DIP3), **kw)
 
-        # With no wait: trimmed on Mondays 2, 4, 5 and 6, adding or not. With
-        # adding, the add-on's move is measured from Monday 2's trim (0.52 is
-        # 20c below that trim's 0.72, though only 10c below the purchase)
         self._wait(monkeypatch, 0)
         expected = [self._M[1], *self._M[3:]]
         assert self._sold_on(run()) == expected
         both = run(add_to_held=True)
         assert self._sold_on(both) == expected
         assert both.moves[:2] == pytest.approx((0.72 - 0.62, 0.52 - 0.72), abs=1e-12)
+
+        # The _DIP3_UP prices at a 25% cap, with an 8-day wait
+        def run_up(**kw):
+            return self._sim(self._records(self._DIP3_MONDAYS, self._DIP3_UP), cap=0.25, **kw)
+
         self._wait(monkeypatch, 8)
-        # Without adding: Monday 2 waits (7 days on), Monday 3's dip is not
-        # past its size, Monday 4 trims, Monday 5 waits and Monday 6 trims
-        assert self._sold_on(run()) == [self._M[3], self._M[5]]
+        # Without adding: Monday 4, 21 days after the purchase, trims
+        assert self._sold_on(run_up()) == [self._M[3]]
         with caplog.at_level(logging.INFO):
-            point = run(add_to_held=True)
+            point = run_up(add_to_held=True)
         kept, add_on, part = point.trades
         assert add_on.add_on and add_on.entry_date == self._M[2]
         # The add-on on Monday 3 blocks Monday 4. Monday 5's trim sells the
@@ -22985,9 +23023,9 @@ class TestTrimWait:
         # That trim is now the last trade: Monday 6 is blocked
         assert not kept.sold and kept.entry_date == self._M[0]
         assert self._sold_on(point) == [self._M[4]]
-        # The add-on's move (10c below the purchase), then the trim's (35c
+        # The add-on's move (10c below the purchase), then the trim's (48c
         # above the add-on)
-        assert point.moves == pytest.approx((0.52 - 0.62, 0.87 - 0.52), abs=1e-12)
+        assert point.moves == pytest.approx((0.52 - 0.62, 1.00 - 0.52), abs=1e-12)
         # The trim waited on Mondays 2, 4 and 6
         assert [line.rsplit(": ", 1)[1] for line in self._waiting(caplog)] == ["3"]
         # The add-on, 14 days on, did not wait: it is the one the run that only
@@ -22995,8 +23033,8 @@ class TestTrimWait:
         assert not [r for r in caplog.records
                     if r.getMessage().startswith(_ADD_ON_WAIT_LINE)]
         adding = backtester._simulate_at_discount(
-            self._records(self._DIP3_MONDAYS, self._DIP3), self._START, 10_000.0, k=0.75,
-            size_cap=0.10, end_date=self._END, add_to_held=True)
+            self._records(self._DIP3_MONDAYS, self._DIP3_UP), self._START, 10_000.0, k=0.75,
+            size_cap=0.25, end_date=self._END, add_to_held=True)
         added = next(t for t in adding.trades if t.add_on)
         assert (add_on.n, add_on.entry_date, add_on.total_cost, add_on.fees) == (
             added.n, added.entry_date, added.total_cost, added.fees)

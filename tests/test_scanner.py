@@ -2,6 +2,7 @@
 import dataclasses
 import json
 import logging
+import math
 import random
 import re
 import sys
@@ -9725,9 +9726,44 @@ class TestHeldPairs:
         # Each market at the ask of the side held there: YES at 0.30, NO at 0.45
         assert pair.value_dollars == 30.0 * 0.30 + 30.0 * 0.45 == 22.5
         # Both markets' fees paid, $0.40 and $0.50, and the stake sizing
-        # subtracts: the worth plus those fees
+        # subtracts: the larger of its cost ($18.90) and its worth plus those
+        # fees ($23.40), here the worth plus fees
         assert pair.fees_dollars == 0.40 + 0.50
         assert pair.stake_dollars == 22.5 + (0.40 + 0.50) == pytest.approx(23.40)
+
+    def test_a_pair_that_lost_value_stakes_what_it_cost(self):
+        # Bought dearer than today's asks: $12.00 for the early YES (worth
+        # 30 x 0.30 = $9.00 now) and $18.00 for the late NO (worth 30 x 0.45
+        # = $13.50). Its cost with fees ($30.90) is more than its worth plus
+        # fees ($23.40), so it stakes its cost: the per-trade cap limits what
+        # was put into the pair, and a losing pair is not topped back up
+        positions = {_RUNG_EARLY: _held(_RUNG_EARLY, 30.0, 12.00, 0.40),
+                     _RUNG_LATE: _held(_RUNG_LATE, -30.0, 18.00, 0.50)}
+        [pair] = held_pairs(positions, self._ladder(), self._rung_markets()).values()
+        assert pair.cost_dollars == pytest.approx(30.90)
+        assert pair.value_dollars + pair.fees_dollars == pytest.approx(23.40)
+        assert pair.stake_dollars == pair.cost_dollars
+
+    def test_the_stake_compares_the_whole_pair_not_each_leg(self):
+        # The early YES gained ($3.00 paid, $9.00 now) and the late NO lost
+        # ($18.00 paid, $13.50 now). The pair as a whole is worth more than it
+        # cost ($23.40 against $21.90, fees in both), so it stakes its worth;
+        # taking the larger of each leg's own cost and worth would read
+        # $9.00 + $18.00 + $0.90 = $27.90
+        positions = {_RUNG_EARLY: _held(_RUNG_EARLY, 30.0, 3.00, 0.40),
+                     _RUNG_LATE: _held(_RUNG_LATE, -30.0, 18.00, 0.50)}
+        [pair] = held_pairs(positions, self._ladder(), self._rung_markets()).values()
+        assert pair.cost_dollars == pytest.approx(21.90)
+        assert pair.stake_dollars == pytest.approx(23.40)
+
+    def test_a_lone_leg_that_lost_value_stakes_what_it_cost(self):
+        # The late NO alone (its partner paid out), bought for $15.00 and
+        # worth 30 x 0.45 = $13.50 now: it stakes its own cost plus its own
+        # fee, $15.50, not $14.00
+        positions = {_RUNG_LATE: _held(_RUNG_LATE, -30.0, 15.00, 0.50)}
+        [leg] = held_pairs(positions, self._ladder(), self._rung_markets()).values()
+        assert leg.lone
+        assert leg.stake_dollars == leg.cost_dollars == pytest.approx(15.50)
 
     def test_a_same_title_pair_is_joined_by_its_shared_question(self):
         # Two events of two series asking one question
@@ -9777,8 +9813,9 @@ class TestHeldPairs:
 
     def test_a_lone_leg_whose_partner_paid_out_is_added_to(self):
         # The early rung paid out and left the positions listing; the late
-        # rung, alone on its ladder, may be added to, staked at its own worth
-        # at today's NO ask plus its own fee (its partner's payout is cash)
+        # rung, alone on its ladder, may be added to, staked at the larger of
+        # its own cost ($12.50 with its fee) and its own worth at today's NO
+        # ask plus its own fee (its partner's payout is cash)
         positions = {_RUNG_LATE: _held(_RUNG_LATE, -30.0, 12.0, 0.5)}
         [(key, leg)] = held_pairs(positions, self._ladder(), self._rung_markets()).items()
         assert key == frozenset({_RUNG_LATE})
@@ -10647,6 +10684,37 @@ class TestHeldPairKind:
 def _named(ticker: str) -> SimpleNamespace:
     """A market with just a ticker, as HeldPair.matches reads one."""
     return SimpleNamespace(ticker=ticker)
+
+
+class TestHeldPairStake:
+    """HeldPair.stake_dollars, what sizing and the at-cap check subtract from
+    a pair's Kelly share: the larger of what it cost (with fees) and what it
+    is worth at today's prices plus the fees, so a pair that lost value
+    counts at its cost and one that gained counts at its worth."""
+
+    @staticmethod
+    def _pair(cost, value, fees=1.0) -> HeldPair:
+        """A held pair with these figures, in dollars."""
+        return HeldPair(sides=(("A", "yes"), ("B", "no")), count=10.0,
+                        cost_dollars=cost, value_dollars=value, fees_dollars=fees)
+
+    @pytest.mark.parametrize("cost, value, stake", [
+        (20.0, 10.0, 20.0),   # lost value: its cost
+        (20.0, 19.0, 20.0),   # worth plus fees equals its cost
+        (20.0, 25.0, 26.0),   # gained value: its worth plus fees
+    ])
+    def test_the_larger_of_cost_and_worth_plus_fees(self, cost, value, stake):
+        assert self._pair(cost, value).stake_dollars == stake
+
+    @pytest.mark.parametrize("cost, value", [
+        (float("nan"), 10.0), (20.0, float("nan")),
+        (float("inf"), 10.0), (20.0, float("inf"))])
+    def test_a_figure_that_is_not_a_number_gives_no_room(self, cost, value):
+        # NaN, which held_pair_fraction reads as no room: max() alone would
+        # drop a NaN in second place and read the other figure
+        stake = self._pair(cost, value).stake_dollars
+        assert math.isnan(stake)
+        assert config.held_pair_fraction(0.10, stake, 1_000.0) == 0.0
 
 
 class TestHeldPairMatches:
