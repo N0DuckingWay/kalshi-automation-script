@@ -1685,7 +1685,7 @@ def main() -> None:
         _live = live_defaults()
         live_rule_echo = describe_time_series_rule(_live.tier_floors, _live.spread_band)
         # The category/tag filter only when one is set, in the live run's words
-        if _live.exclude_categories is not None or _live.tags is not None:
+        if _live.exclude_categories is not None or _live.exclude_tags is not None:
             live_rule_echo += f"; category/tag filter ({describe_trade_filter(_live)})"
         # Which saved file, when and from what
         live_rule_echo += f" ({_live.origin})"

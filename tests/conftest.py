@@ -346,7 +346,7 @@ def apply_pre_toggle_defaults(mp) -> None:
     mp.setattr(config, "BUDGET_FRACTION", 0.20)
     mp.setattr(config, "SAME_TITLE_SIZE_CAP", 1.0)
     mp.setattr(config, "TRADE_EXCLUDE_CATEGORIES", None)
-    mp.setattr(config, "TRADE_TAGS", None)
+    mp.setattr(config, "TRADE_EXCLUDE_TAGS", None)
     mp.setattr(config, "REBALANCE", False)
     mp.setattr(config, "MIN_PRICE_MOVE", None)
     mp.setattr(config, "SELL_AT", None)

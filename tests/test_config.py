@@ -70,14 +70,14 @@ from .conftest import apply_pre_toggle_defaults
 
 
 def _settings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20,
-              same_title_size_cap=1.0, exclude_categories=None, tags=None, rebalance=False,
+              same_title_size_cap=1.0, exclude_categories=None, exclude_tags=None, rebalance=False,
               min_price_move=None, sell_at=None, sell_min_days=None):
     """A LiveSettings with every toggle named, defaulting to the pre-toggle
     values conftest's apply_pre_toggle_defaults pins (no rebalancing, no selling)."""
     return LiveSettings(tier_floors=tier_floors, spread_band=spread_band,
                         interval_discount=interval_discount, size_cap=size_cap,
                         same_title_size_cap=same_title_size_cap,
-                        exclude_categories=exclude_categories, tags=tags,
+                        exclude_categories=exclude_categories, exclude_tags=exclude_tags,
                         rebalance=rebalance, min_price_move=min_price_move,
                         sell_at=sell_at, sell_min_days=sell_min_days)
 
@@ -1260,7 +1260,7 @@ class TestLiveSettings:
         monkeypatch.setattr(config, "BUDGET_FRACTION", 0.35)
         monkeypatch.setattr(config, "SAME_TITLE_SIZE_CAP", 0.25)
         monkeypatch.setattr(config, "TRADE_EXCLUDE_CATEGORIES", ("Economics",))
-        monkeypatch.setattr(config, "TRADE_TAGS", ["Oil & Gas"])
+        monkeypatch.setattr(config, "TRADE_EXCLUDE_TAGS", ["Oil & Gas"])
         monkeypatch.setattr(config, "REBALANCE", True)
         monkeypatch.setattr(config, "MIN_PRICE_MOVE", 0.10)
         monkeypatch.setattr(config, "SELL_AT", 0.85)
@@ -1296,7 +1296,7 @@ class TestLiveSettings:
             size_cap=config.BUDGET_FRACTION,
             same_title_size_cap=config.SAME_TITLE_SIZE_CAP,
             exclude_categories=config.TRADE_EXCLUDE_CATEGORIES,
-            tags=config.TRADE_TAGS,
+            exclude_tags=config.TRADE_EXCLUDE_TAGS,
             rebalance=config.REBALANCE,
             min_price_move=config.MIN_PRICE_MOVE,
             sell_at=config.SELL_AT,
@@ -1342,7 +1342,7 @@ class TestLiveSettings:
         with pytest.raises(ValueError, match="same_title_size_cap"):
             dataclasses.replace(_settings(), same_title_size_cap=0.37)
 
-    @pytest.mark.parametrize("field", ["exclude_categories", "tags"])
+    @pytest.mark.parametrize("field", ["exclude_categories", "exclude_tags"])
     @pytest.mark.parametrize("bad", [
         "Sports",            # a bare str would filter on its characters
         (), [],              # matches nothing: None is "any"
@@ -1360,7 +1360,7 @@ class TestLiveSettings:
         with pytest.raises(ValueError, match=field):
             dataclasses.replace(_settings(), **{field: bad})
 
-    @pytest.mark.parametrize("field", ["exclude_categories", "tags"])
+    @pytest.mark.parametrize("field", ["exclude_categories", "exclude_tags"])
     def test_a_filter_is_normalised_to_a_tuple_of_stripped_names(self, field):
         s = _settings(**{field: [" Sports ", "Oil & Gas"]})
         assert getattr(s, field) == ("Sports", "Oil & Gas")
@@ -1371,23 +1371,23 @@ class TestLiveSettings:
 
     def test_a_construction_without_the_filters_filters_nothing(self):
         s = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0)
-        assert s.exclude_categories is None and s.tags is None
+        assert s.exclude_categories is None and s.exclude_tags is None
         assert s.rebalance is False and s.min_price_move is None
         assert s.sell_at is None and s.sell_min_days is None
         # Defaulted and last of the toggles: the first five fields keep their
         # positions, so a positional construction of up to seven still builds;
         # origin, not a toggle, comes after them
         assert list(config.LIVE_TOGGLE_FIELDS)[-6:] == [
-            "exclude_categories", "tags", "rebalance", "min_price_move", "sell_at", "sell_min_days"]
+            "exclude_categories", "exclude_tags", "rebalance", "min_price_move", "sell_at", "sell_min_days"]
         assert [f.name for f in dataclasses.fields(LiveSettings)][-1] == "origin"
         assert LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0, ("Sports",),
-                            ("Hockey",)).tags == ("Hockey",)
+                            ("Hockey",)).exclude_tags == ("Hockey",)
 
     @pytest.mark.parametrize("name, value", [("TRADE_EXCLUDE_CATEGORIES", "Sports"),
-                                             ("TRADE_TAGS", ())])
+                                             ("TRADE_EXCLUDE_TAGS", ())])
     def test_live_settings_refuses_an_invalid_filter(self, monkeypatch, name, value):
         monkeypatch.setattr(config, name, value)
-        with pytest.raises(ValueError, match="exclude_categories" if "CATEG" in name else "tags"):
+        with pytest.raises(ValueError, match="exclude_categories" if "CATEG" in name else "exclude_tags"):
             live_settings()
 
 
@@ -1396,16 +1396,61 @@ _FILED = (("Economics", "Fed"), ("Economics", "Oil"), ("Sports", "Basketball"),
           ("Sports", "Soccer"), ("Politics", "Fed"), ("Politics", "Basketball"))
 
 
+class TestFilterNameRefusal:
+    """
+    config.filter_name_refusal says why one excluded category or tag would be
+    refused — by the form check the defaults server reads every link's names
+    through (config.check_filter_name, which defaults_server._name calls) or by
+    LiveSettings — so the dashboard's Save button can keep such a name out of
+    its link. A name it passes is one LiveSettings takes.
+    """
+
+    @pytest.mark.parametrize("field, name", [
+        ("exclude_categories", "Sports"), ("exclude_categories", "Companies"),
+        ("exclude_tags", "Golf"), ("exclude_tags", "Sports · Golf"),
+        ("exclude_tags", "·Golf"), ("exclude_tags", "Golf (men's) ~ open!")])
+    def test_a_name_it_passes_is_taken(self, field, name):
+        assert config.filter_name_refusal(field, name) is None
+        config.LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.5,
+                            size_cap=1.0, **{field: (name,)})
+
+    @pytest.mark.parametrize("field, name, words", [
+        ("exclude_categories", "Any", "cannot hold the name"),
+        ("exclude_categories", "none", "cannot hold the name"),
+        ("exclude_categories", "Arts · Crafts", "is a tag tied to a category"),
+        ("exclude_categories", " Sports", "no spaces around it"),
+        ("exclude_categories", "Sports\u200b", "one printable name"),
+        ("exclude_tags", "Sports · Any", "names no tag"),
+        ("exclude_tags", "Sports ·", "must read"),
+        ("exclude_tags", "Sports ·  Golf", "two spaces in a row"),
+        ("exclude_tags", "NONE", "cannot hold the name")])
+    def test_a_name_it_refuses_says_why(self, field, name, words):
+        refusal = config.filter_name_refusal(field, name)
+        assert refusal is not None and words in refusal, refusal
+
+    def test_the_server_reads_names_through_the_same_check(self):
+        from kalshi_betting import defaults_server
+        for text in ("Sports ·  Golf", " Golf", "Golf\u200b", "Golf"):
+            try:
+                expected = config.check_filter_name(text, "exclude_tag")
+            except ValueError as exc:
+                with pytest.raises(ValueError) as caught:
+                    defaults_server._name(text, "exclude_tag")
+                assert str(caught.value) == str(exc)
+            else:
+                assert defaults_server._name(text, "exclude_tag") == expected == text
+
+
 class TestTradeFilter:
-    """config.trade_filter, the one definition of the category/tag filter:
-    every category not excluded trades in full unless a tag narrows it, where
-    a plain tag narrows every category and a tag tied to a category
-    ("Sports · Basketball") narrows that one alone."""
+    """config.trade_filter, the one definition of the category/tag filter: a
+    pair trades unless its category is excluded or its first tag is excluded,
+    where a plain excluded tag applies under every category and a tag tied to
+    a category ("Sports · Basketball") under that one alone."""
 
     @staticmethod
     def _kept(excluded, tags):
         """The pairs of _FILED the filter keeps, in order."""
-        keeps = config.trade_filter(_settings(exclude_categories=excluded, tags=tags))
+        keeps = config.trade_filter(_settings(exclude_categories=excluded, exclude_tags=tags))
         return [pair for pair in _FILED if keeps(*pair)]
 
     def test_the_separator_is_a_spaced_middle_dot(self):
@@ -1432,51 +1477,62 @@ class TestTradeFilter:
         # Excluded categories only: every other category in full
         (("Economics",), None, list(_FILED[2:])),
         (("Economics", "Sports"), None, list(_FILED[4:])),
-        # Plain tags only: that tag under every category
-        (None, ("Basketball",), [("Sports", "Basketball"), ("Politics", "Basketball")]),
+        # Plain excluded tags only: that tag left out under every category
+        (None, ("Basketball",),
+         [("Economics", "Fed"), ("Economics", "Oil"), ("Sports", "Soccer"),
+          ("Politics", "Fed")]),
         (None, ("Fed", "Soccer"),
-         [("Economics", "Fed"), ("Sports", "Soccer"), ("Politics", "Fed")]),
-        # A plain tag narrows every category not excluded
-        (("Politics",), ("Basketball",), [("Sports", "Basketball")]),
-        (("Sports",), ("Fed",), [("Economics", "Fed"), ("Politics", "Fed")]),
-        # Tied tags with nothing excluded narrow their own category alone
+         [("Economics", "Oil"), ("Sports", "Basketball"), ("Politics", "Basketball")]),
+        # An excluded category and an excluded plain tag both leave pairs out
+        (("Politics",), ("Basketball",),
+         [("Economics", "Fed"), ("Economics", "Oil"), ("Sports", "Soccer")]),
+        (("Sports",), ("Fed",), [("Economics", "Oil"), ("Politics", "Basketball")]),
+        # A tied tag leaves out that tag in its own category alone
         (None, ("Sports · Basketball",),
-         [("Economics", "Fed"), ("Economics", "Oil"), ("Sports", "Basketball"),
+         [("Economics", "Fed"), ("Economics", "Oil"), ("Sports", "Soccer"),
           ("Politics", "Fed"), ("Politics", "Basketball")]),
-        (("Economics", "Politics"), ("Sports · Basketball", "Sports · Soccer"),
-         [("Sports", "Basketball"), ("Sports", "Soccer")]),
+        (("Economics", "Politics"), ("Sports · Basketball",), [("Sports", "Soccer")]),
+        # Every tag of a category left out leaves nothing of it
+        (None, ("Sports · Basketball", "Sports · Soccer"),
+         [("Economics", "Fed"), ("Economics", "Oil"), ("Politics", "Fed"),
+          ("Politics", "Basketball")]),
         # A tied tag never applies under another category
         (("Economics",), ("Sports · Basketball", "Politics · Fed"),
-         [("Sports", "Basketball"), ("Politics", "Fed")]),
-        # Plain and tied together: the plain tag applies under every category
-        # not excluded, the tied one adds to its own category alone
+         [("Sports", "Soccer"), ("Politics", "Basketball")]),
+        # Plain and tied together: each leaves out its own pairs
         (None, ("Fed", "Sports · Basketball"),
-         [("Economics", "Fed"), ("Sports", "Basketball"), ("Politics", "Fed")]),
-        (("Politics",), ("Soccer", "Sports · Basketball"),
-         [("Sports", "Basketball"), ("Sports", "Soccer")]),
+         [("Economics", "Oil"), ("Sports", "Soccer"), ("Politics", "Basketball")]),
+        # A tied tag in an excluded category is allowed, and leaves out nothing more
+        (("Sports",), ("Sports · Basketball",), [pair for pair in _FILED if pair[0] != "Sports"]),
         # Excluding every category keeps nothing
         (("Economics", "Sports", "Politics"), None, []),
         # An excluded name no pair is filed under excludes nothing
         (("World",), None, list(_FILED)),
+        (None, ("Hockey", "World · Fed"), list(_FILED)),
     ])
     def test_the_truth_table(self, excluded, tags, expected):
         assert self._kept(excluded, tags) == expected
 
-    def test_a_category_never_seen_trades(self):
-        # The point of an exclude list: a category nobody listed still trades
-        keeps = config.trade_filter(_settings(exclude_categories=("Politics", "Sports")))
+    def test_a_category_or_tag_never_seen_trades(self):
+        # The point of an exclude list: a category or tag nobody listed still trades
+        keeps = config.trade_filter(_settings(exclude_categories=("Politics", "Sports"),
+                                              exclude_tags=("Fed", "Economics · Oil")))
         assert keeps("Mentions", "Earnings") and keeps("A brand-new category", "General")
+        assert keeps("Economics", "A brand-new tag")
         assert not keeps("Politics", "Fed") and not keeps("sports", "Soccer")
+        assert not keeps("World", "fed") and not keeps("ECONOMICS", "oil")
 
     @pytest.mark.parametrize("excluded, tags", [
         (None, None), (("Economics",), None), (None, ("Basketball",)),
         (("Economics",), ("Sports · Basketball", "Politics · Fed")),
         (("economics", "POLITICS"), ("Fed", "sports · soccer")),
+        (("Sports",), ("sports · Soccer", "Basketball")),
     ])
     def test_the_two_field_entry_point_is_the_same_rule(self, excluded, tags):
         # The dashboard holds the recorded fields only; it asks the very rule a run's
         # settings are kept by
-        by_settings = config.trade_filter(_settings(exclude_categories=excluded, tags=tags))
+        by_settings = config.trade_filter(_settings(exclude_categories=excluded,
+                                                    exclude_tags=tags))
         by_fields = config.trade_filter_for(excluded, tags)
         assert all(by_fields(*pair) is by_settings(*pair) for pair in _FILED)
         assert [pair for pair in _FILED if by_fields(*pair)] == self._kept(excluded, tags)
@@ -1492,21 +1548,21 @@ class TestTradeFilter:
     def test_names_are_compared_without_regard_to_case(self):
         # Both halves of a tied tag, the excluded categories, and the pair's own labels
         assert self._kept(("pOLITICS",), ("SPORTS · basketBALL",)) == [
-            ("Economics", "Fed"), ("Economics", "Oil"), ("Sports", "Basketball")]
+            ("Economics", "Fed"), ("Economics", "Oil"), ("Sports", "Soccer")]
         keeps = config.trade_filter(
-            _settings(exclude_categories=("Politics",), tags=("Sports · Basketball",)))
-        assert keeps("sports", "BASKETBALL") and keeps("SPORTS", "basketball")
-        assert keeps("ECONOMICS", "anything")
-        assert not keeps("sports", "SOCCER") and not keeps("POLITICS", "basketball")
+            _settings(exclude_categories=("Politics",), exclude_tags=("Sports · Basketball",)))
+        assert not keeps("sports", "BASKETBALL") and not keeps("SPORTS", "basketball")
+        assert keeps("ECONOMICS", "anything") and keeps("sports", "SOCCER")
+        assert keeps("economics", "basketball")
         assert not keeps("politics", "anything")
         # Casefold, as the filter always compared: "ß" matches "SS"
-        assert config.trade_filter(_settings(tags=("Fußball",)))("Sports", "FUSSBALL")
+        assert not config.trade_filter(_settings(exclude_tags=("Fußball",)))("Sports", "FUSSBALL")
         assert not config.trade_filter(
             _settings(exclude_categories=("Fußball",)))("FUSSBALL", "x")
 
-    def test_plain_tags_keep_what_an_exclusion_and_a_tag_list_say(self):
-        # With no tied tag the filter is two tests: the category is not
-        # excluded AND the tag is listed (or none is), in any case
+    def test_plain_tags_keep_what_two_exclusions_say(self):
+        # With no tied tag the filter is two tests: neither the category nor
+        # the tag is excluded, in any case
         rng = random.Random(20261023)
         categories = ("Economics", "Sports", "Politics", "World", "Climate and Weather")
         tags = ("Basketball", "Soccer", "Fed", "General", "Oil & Gas", "Sports", "COVID")
@@ -1522,47 +1578,74 @@ class TestTradeFilter:
         filters = 0
         kept = 0
         for _ in range(2000):
-            settings = _settings(exclude_categories=draw(categories), tags=draw(tags))
+            settings = _settings(exclude_categories=draw(categories), exclude_tags=draw(tags))
             keeps = config.trade_filter(settings)
             out = {c.casefold() for c in settings.exclude_categories or ()}
-            wanted = None if settings.tags is None else {t.casefold() for t in settings.tags}
+            out_tags = {t.casefold() for t in settings.exclude_tags or ()}
             for c in categories:
                 for t in tags:
                     for category, tag in ((c, t), (recase(c), recase(t))):
                         expected = (category.casefold() not in out
-                                    and (wanted is None or tag.casefold() in wanted))
+                                    and tag.casefold() not in out_tags)
                         assert keeps(category, tag) is expected, (settings, category, tag)
                         kept += expected
             filters += 1
         # Both verdicts were exercised
         assert filters == 2000 and 0 < kept < 2000 * len(categories) * len(tags) * 2
 
+    def test_tied_tags_keep_what_a_category_by_category_exclusion_says(self):
+        # Tied and plain tags, drawn at random, against the rule read per pair:
+        # out when its category is excluded, its tag is excluded plainly, or
+        # its (category, tag) is excluded tied
+        rng = random.Random(20261024)
+        categories = ("Economics", "Sports", "Politics", "World")
+        tags = ("Basketball", "Soccer", "Fed", "General")
+        tied_pool = [f"{c}{config.TAG_SCOPE_SEPARATOR}{t}" for c in categories for t in tags]
+        for _ in range(500):
+            excluded = (tuple(rng.sample(categories, rng.randint(1, 2)))
+                        if rng.random() < 0.5 else None)
+            names = rng.sample(tied_pool + list(tags), rng.randint(1, 6))
+            names = tuple(rng.choice((n, n.upper(), n.lower())) for n in names)
+            keeps = config.trade_filter(_settings(exclude_categories=excluded,
+                                                  exclude_tags=names))
+            out = {c.casefold() for c in excluded or ()}
+            plain = {n.casefold() for n in names if config.split_tag(n)[0] is None}
+            tied = {(c.casefold(), t.casefold()) for c, t in map(config.split_tag, names)
+                    if c is not None}
+            for c in categories:
+                for t in tags:
+                    expected = not (c.casefold() in out or t.casefold() in plain
+                                    or (c.casefold(), t.casefold()) in tied)
+                    assert keeps(c, t) is expected, (excluded, names, c, t)
+
     @pytest.mark.parametrize("excluded", [("Sports",), ("Economics", "sports"), ("SPORTS",)])
-    def test_a_tied_tag_in_an_excluded_category_is_refused(self, excluded):
-        with pytest.raises(ValueError, match=r"tags: 'Sports · Basketball' is tied to "
-                                             r"'Sports', which is in exclude_categories"):
-            _settings(exclude_categories=excluded, tags=("Sports · Basketball",))
-        # One bad tag refuses the whole filter, wherever it sits
-        with pytest.raises(ValueError, match="is in exclude_categories"):
-            _settings(exclude_categories=excluded, tags=("Fed", "Sports · Basketball"))
+    def test_a_tied_tag_in_an_excluded_category_is_allowed(self, excluded):
+        # Redundant, never an error: it can leave out nothing the category does not
+        s = _settings(exclude_categories=excluded, exclude_tags=("Sports · Basketball",))
+        assert s.exclude_tags == ("Sports · Basketball",)
+        assert not config.trade_filter(s)("Sports", "Soccer")
+        s = _settings(exclude_categories=excluded, exclude_tags=("Fed", "Sports · Basketball"))
+        assert s.exclude_tags == ("Fed", "Sports · Basketball")
 
     @pytest.mark.parametrize("excluded", [None, ("Economics",), ("Economics", "Politics")])
-    def test_a_tied_tag_with_its_category_not_excluded_is_allowed(self, excluded):
-        # With nothing excluded too: a tied tag no longer needs its category listed
-        s = _settings(exclude_categories=excluded, tags=("Sports · Basketball",))
-        assert s.tags == ("Sports · Basketball",)
+    def test_a_tied_tag_with_its_category_not_excluded_excludes_that_tag(self, excluded):
+        s = _settings(exclude_categories=excluded, exclude_tags=("Sports · Basketball",))
+        assert s.exclude_tags == ("Sports · Basketball",)
         keeps = config.trade_filter(s)
-        assert keeps("Sports", "Basketball") and not keeps("Sports", "Soccer")
+        assert not keeps("Sports", "Basketball") and keeps("Sports", "Soccer")
 
-    def test_a_tied_tag_is_checked_again_when_a_field_is_replaced(self):
-        s = _settings(exclude_categories=("economics",), tags=("SPORTS · Basketball",))
-        assert s.tags == ("SPORTS · Basketball",)
-        # main.py lays --exclude-category over saved defaults this way
-        for excluded in (("Sports",), ("Economics", "sports")):
-            with pytest.raises(ValueError, match="tags: .*is in exclude_categories"):
-                dataclasses.replace(s, exclude_categories=excluded)
-        assert dataclasses.replace(s, exclude_categories=None).tags == s.tags
-        assert dataclasses.replace(s, exclude_categories=("Sports",), tags=None).tags is None
+    def test_a_tied_tag_is_kept_when_a_field_is_replaced(self):
+        s = _settings(exclude_categories=("economics",), exclude_tags=("SPORTS · Basketball",))
+        assert s.exclude_tags == ("SPORTS · Basketball",)
+        # main.py lays --exclude-category over saved defaults this way: excluding
+        # the tied tag's category too is allowed
+        for excluded in (("Sports",), ("Economics", "sports"), None):
+            assert (dataclasses.replace(s, exclude_categories=excluded).exclude_tags
+                    == s.exclude_tags)
+        assert dataclasses.replace(s, exclude_tags=None).exclude_tags is None
+        # ... and a bad tag is still refused when the field is replaced
+        with pytest.raises(ValueError, match="exclude_tags: .* names no tag"):
+            dataclasses.replace(s, exclude_tags=("Sports · any",))
 
     @pytest.mark.parametrize("bad", [
         "Sports · ", " · Basketball", "Sports ·", "· Basketball", " · ", "·",
@@ -1571,38 +1654,39 @@ class TestTradeFilter:
     def test_a_tied_tag_with_a_blank_half_is_refused(self, bad):
         # Never read as a plain tag, with a category excluded or not
         for excluded in (("Economics",), None):
-            with pytest.raises(ValueError, match="tags: .* must read 'Category · Tag'"):
-                _settings(exclude_categories=excluded, tags=(bad,))
+            with pytest.raises(ValueError, match="exclude_tags: .* must read 'Category · Tag'"):
+                _settings(exclude_categories=excluded, exclude_tags=(bad,))
             with pytest.raises(ValueError, match="must read 'Category · Tag'"):
-                _settings(exclude_categories=excluded, tags=("Basketball", bad))
+                _settings(exclude_categories=excluded, exclude_tags=("Basketball", bad))
 
     @pytest.mark.parametrize("bad", ["Sports · any", "Sports · ANY", "Sports ·  Any "])
     def test_a_tied_tag_cannot_name_any(self, bad):
-        with pytest.raises(ValueError, match="tags: .* names no tag"):
-            _settings(tags=(bad,))
+        with pytest.raises(ValueError, match="exclude_tags: .* names no tag; to exclude every "
+                                             "tag of 'Sports', exclude the category"):
+            _settings(exclude_tags=(bad,))
 
     def test_a_dot_inside_a_plain_name_is_not_a_tie(self):
         # A tie with a blank half is the dot alone, or a name that starts with
         # the dot and a space or ends with a space and the dot; any other dot
         # is part of a plain tag's name
-        s = _settings(tags=("A·B", "U.S.·ish", "Q·R S"))
-        assert s.tags == ("A·B", "U.S.·ish", "Q·R S")
-        assert config.trade_filter(s)("Sports", "a·b")
-        assert not config.trade_filter(s)("Sports", "a")
+        s = _settings(exclude_tags=("A·B", "U.S.·ish", "Q·R S"))
+        assert s.exclude_tags == ("A·B", "U.S.·ish", "Q·R S")
+        assert not config.trade_filter(s)("Sports", "a·b")
+        assert config.trade_filter(s)("Sports", "a")
 
     @pytest.mark.parametrize("plain", ["·Basketball", "Sports·", "·Sports·", "··", "a ·b", "a· b"])
     def test_a_dot_with_no_space_beside_it_at_either_end_is_a_plain_tag(self, plain):
         # The boundary of the blank-half refusal: these have no category
         for excluded in (None, ("Economics",)):
-            s = _settings(exclude_categories=excluded, tags=(plain,))
-            assert s.tags == (plain,)
+            s = _settings(exclude_categories=excluded, exclude_tags=(plain,))
+            assert s.exclude_tags == (plain,)
             assert config.split_tag(plain) == (None, plain)
             keeps = config.trade_filter(s)
-            assert keeps("Sports", plain.upper()) and not keeps("Sports", "Basketball")
+            assert not keeps("Sports", plain.upper()) and keeps("Sports", "Basketball")
         # ... while one more space makes each a tie with a blank half
         for bad in ("· Basketball", "Sports ·"):
             with pytest.raises(ValueError, match="must read 'Category · Tag'"):
-                _settings(tags=(bad,))
+                _settings(exclude_tags=(bad,))
 
     @pytest.mark.parametrize("bad", [
         "Sports · Basketball", "Sports · ", " · Basketball", "Sports ·", "· Basketball",
@@ -1615,9 +1699,9 @@ class TestTradeFilter:
                    r"category; only a whole category can be excluded")
         for tags in (None, ("Basketball",), ("Politics · Fed",)):
             with pytest.raises(ValueError, match=message):
-                _settings(exclude_categories=("Economics", bad), tags=tags)
+                _settings(exclude_categories=("Economics", bad), exclude_tags=tags)
             with pytest.raises(ValueError, match=message):
-                _settings(exclude_categories=(bad,), tags=tags)
+                _settings(exclude_categories=(bad,), exclude_tags=tags)
         # ... and when a field is replaced, as main.py lays --exclude-category over saved
         # defaults
         with pytest.raises(ValueError, match=message):
@@ -1634,7 +1718,7 @@ class TestTradeFilter:
     def test_a_saved_file_with_a_category_written_as_a_tied_tag_is_refused(self):
         # A file edited by hand, with no tags at all
         record = _with_toggles(exclude_categories=["Economics", "Sports · Basketball"],
-                               tags=None)
+                               exclude_tags=None)
         config.LIVE_DEFAULTS_FILE.write_bytes(_text(record))
         for read in (config.read_saved_live_defaults, config.live_defaults):
             with pytest.raises(config.LiveDefaultsError,
@@ -1643,40 +1727,41 @@ class TestTradeFilter:
 
     def test_a_save_round_trips_tied_tags(self):
         settings = _settings(exclude_categories=("Economics", "Politics"),
-                             tags=("Sports · Basketball", "Sports · Pro Football"))
+                             exclude_tags=("Sports · Basketball", "Sports · Pro Football"))
         saved = config.save_live_defaults(settings, source="")
-        assert saved == settings and saved.tags == settings.tags
+        assert saved == settings and saved.exclude_tags == settings.exclude_tags
         again = config.read_saved_live_defaults()
         assert again == settings
         # The file still holds a plain list of names, the tie written as text
         stored = json.loads(config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8"))["settings"]
         assert stored["exclude_categories"] == ["Economics", "Politics"]
-        assert stored["tags"] == ["Sports · Basketball", "Sports · Pro Football"]
+        assert stored["exclude_tags"] == ["Sports · Basketball", "Sports · Pro Football"]
         # The read-back filter is the same test
         keeps = config.trade_filter(again)
-        assert [pair for pair in _FILED if keeps(*pair)] == [("Sports", "Basketball")]
+        assert [pair for pair in _FILED if keeps(*pair)] == [("Sports", "Soccer")]
 
-    def test_a_saved_file_with_a_tied_tag_in_an_excluded_category_is_refused(self):
-        # A file edited by hand: the reader applies LiveSettings' own check
-        record = _with_toggles(exclude_categories=["Sports"], tags=["Sports · Basketball"])
+    def test_a_saved_file_with_a_tied_tag_in_an_excluded_category_is_read(self):
+        # Redundant, so allowed in a file too
+        record = _with_toggles(exclude_categories=["Sports"],
+                               exclude_tags=["Sports · Basketball"])
         config.LIVE_DEFAULTS_FILE.write_bytes(_text(record))
-        with pytest.raises(config.LiveDefaultsError, match="is in exclude_categories"):
-            config.read_saved_live_defaults()
-        with pytest.raises(config.LiveDefaultsError, match="is in exclude_categories"):
-            config.live_defaults()
+        saved = config.read_saved_live_defaults()
+        assert saved.exclude_categories == ("Sports",)
+        assert saved.exclude_tags == ("Sports · Basketball",)
+        assert config.live_defaults() == saved
 
     def test_the_argv_spells_a_tied_tag_as_one_flag(self):
         settings = _settings(exclude_categories=("Economics", "Politics"),
-                             tags=("Sports · Basketball", "Fed"))
+                             exclude_tags=("Sports · Basketball", "Fed"))
         assert config.live_settings_argv(settings)[-4:] == [
             "--exclude-category=Economics", "--exclude-category=Politics",
-            "--tag=Sports · Basketball", "--tag=Fed"]
+            "--exclude-tag=Sports · Basketball", "--exclude-tag=Fed"]
         assert config.describe_trade_filter(settings) == (
-            "exclude categories Economics, Politics; tags Sports · Basketball, Fed")
+            "exclude categories Economics, Politics; exclude tags Sports · Basketball, Fed")
         assert config.live_settings_argv(_settings())[-2:] == [
-            "--no-exclude-category", "--any-tag"]
+            "--no-exclude-category", "--no-exclude-tag"]
         assert config.describe_trade_filter(_settings()) == (
-            "exclude categories none; tags any")
+            "exclude categories none; exclude tags none")
 
 
 class TestTimeSeriesSpreadRefusal:
@@ -3021,7 +3106,7 @@ class TestDescribeLiveSettings:
         s = _settings()
         assert config.describe_live_settings(s, s) == (
             "tier floors on | spread band none | k 0.75 | per-trade cap 20% | "
-            "same-title cap 100% (no extra cap) | exclude categories none | tags any | "
+            "same-title cap 100% (no extra cap) | exclude categories none | exclude tags none | "
             "rebalance no | min price movement any | sell at off | "
             "min days to maturity any")
         assert config.describe_live_settings(s) == config.describe_live_settings(s, s)
@@ -3043,7 +3128,7 @@ class TestDescribeLiveSettings:
         "size_cap": (0.35, "per-trade cap 35% (config: 20%)"),
         "same_title_size_cap": (0.25, "same-title cap 25% (config: 100% (no extra cap))"),
         "exclude_categories": (("Economics",), "exclude categories Economics (config: none)"),
-        "tags": (("Oil & Gas", "Energy"), "tags Oil & Gas, Energy (config: any)"),
+        "exclude_tags": (("Oil & Gas", "Energy"), "exclude tags Oil & Gas, Energy (config: none)"),
         "rebalance": (False, "rebalance no (config: yes)"),
         "min_price_move": (0.10, "min price movement 10c (config: any)"),
         "sell_at": (None, "sell at off (config: 85% of potential profit)"),
@@ -3059,7 +3144,7 @@ class TestDescribeLiveSettings:
         assert config.describe_live_settings(s, ref) == (
             "tier floors off (config: on) | spread band 0-0.5 (config: none) | "
             "k 0.8 (config: 0.75) | per-trade cap 100% (no cap) (config: 20%) | "
-            "same-title cap 20% (config: 100% (no extra cap)) | exclude categories none | tags any | "
+            "same-title cap 20% (config: 100% (no extra cap)) | exclude categories none | exclude tags none | "
             "rebalance no | min price movement any | sell at off | "
             "min days to maturity any")
         for name in config.LIVE_TOGGLE_FIELDS:
@@ -3122,17 +3207,17 @@ class TestDescribeLiveSettings:
         assert "(config:" not in line
         assert line == ("tier floors off | spread band 0-0.5 | k 0.8 | "
                         "per-trade cap 100% (no cap) | same-title cap 20% | "
-                        "exclude categories none | tags any | rebalance no | "
+                        "exclude categories none | exclude tags none | rebalance no | "
                         "min price movement any | sell at off | "
                         "min days to maturity any")
 
-    def test_a_filter_renders_its_names_and_any_for_none(self):
+    def test_a_filter_renders_its_names_and_none_for_none(self):
         # Each field renders the run's value, then config's in the mark; None is
-        # "none" for the excluded categories and "any" for the tags
+        # "none" for the excluded categories and the excluded tags alike
         ref = _settings(exclude_categories=("Sports",))
-        line = config.describe_live_settings(_settings(tags=("Basketball", "Soccer")), ref)
+        line = config.describe_live_settings(_settings(exclude_tags=("Basketball", "Soccer")), ref)
         assert "exclude categories none (config: Sports)" in line
-        assert "tags Basketball, Soccer (config: any)" in line
+        assert "exclude tags Basketball, Soccer (config: none)" in line
         # Case is part of the raw value: a case-only change departs and shows
         line = config.describe_live_settings(_settings(exclude_categories=("sports",)), ref)
         assert "exclude categories sports (config: Sports)" in line
@@ -3145,15 +3230,15 @@ class TestDescribeLiveSettings:
         assert "exclude categories a, b |" in two
         assert one != two
         for sep in (";", "|"):
-            line = config.describe_live_settings(_settings(tags=(f"x{sep}y", "z")))
-            assert f"tags 'x{sep}y', 'z'" in line
+            line = config.describe_live_settings(_settings(exclude_tags=(f"x{sep}y", "z")))
+            assert f"exclude tags 'x{sep}y', 'z'" in line
 
-    @pytest.mark.parametrize("field", ["exclude_categories", "tags"])
+    @pytest.mark.parametrize("field", ["exclude_categories", "exclude_tags"])
     def test_only_the_name_any_is_refused_never_a_name_containing_it(self, field):
         # Only the name "any" is refused, never one containing it ("Any Awards")
         s = _settings(**{field: ("Companies", "Any Awards")})
         assert getattr(s, field) == ("Companies", "Any Awards")
-        label = {"exclude_categories": "exclude categories", "tags": "tags"}[field]
+        label = {"exclude_categories": "exclude categories", "exclude_tags": "exclude tags"}[field]
         assert f"{label} Companies, Any Awards" in config.describe_live_settings(s)
         assert config.describe_live_settings(s) != config.describe_live_settings(_settings())
 
@@ -3165,7 +3250,7 @@ class TestDescribeLiveSettings:
         assert line == (
             "tier floors off (default: on) | spread band 0-0.5 (default: none) | "
             "k 0.8 (default: 0.75) | per-trade cap 100% (no cap) (default: 20%) | "
-            "same-title cap 20% (default: 100% (no extra cap)) | exclude categories none | tags any | "
+            "same-title cap 20% (default: 100% (no extra cap)) | exclude categories none | exclude tags none | "
             "rebalance no | min price movement any | sell at off | "
             "min days to maturity any")
         assert "(config:" not in line
@@ -3189,12 +3274,12 @@ class TestDescribeLiveSettings:
         assert "k 0.6 (config: 0.75)" in line and "(default:" not in line
 
     def test_describe_trade_filter_names_the_filter_in_the_same_words(self):
-        assert config.describe_trade_filter(_settings()) == "exclude categories none; tags any"
-        s = _settings(exclude_categories=("Economics", "Sports"), tags=("Oil & Gas",))
+        assert config.describe_trade_filter(_settings()) == "exclude categories none; exclude tags none"
+        s = _settings(exclude_categories=("Economics", "Sports"), exclude_tags=("Oil & Gas",))
         assert config.describe_trade_filter(s) == (
-            "exclude categories Economics, Sports; tags Oil & Gas")
+            "exclude categories Economics, Sports; exclude tags Oil & Gas")
         line = config.describe_live_settings(s)
-        assert "exclude categories Economics, Sports" in line and "tags Oil & Gas" in line
+        assert "exclude categories Economics, Sports" in line and "exclude tags Oil & Gas" in line
 
 
 class TestLiveRuleWarnings:
@@ -3383,7 +3468,7 @@ class TestShippedLiveToggles:
     means re-pinning this class."""
 
     _SHIPPED = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                            size_cap=1.0, same_title_size_cap=0.2, exclude_categories=None, tags=None,
+                            size_cap=1.0, same_title_size_cap=0.2, exclude_categories=None, exclude_tags=None,
                             rebalance=True)
     # The values conftest's apply_pre_toggle_defaults pins, for the controls
     _BEFORE = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
@@ -3393,7 +3478,7 @@ class TestShippedLiveToggles:
         assert live_settings() == self._SHIPPED
         assert (config.TIME_SERIES_TIER_FLOORS, config.TIME_SERIES_SPREAD_BAND,
                 config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, config.BUDGET_FRACTION,
-                config.SAME_TITLE_SIZE_CAP, config.TRADE_EXCLUDE_CATEGORIES, config.TRADE_TAGS,
+                config.SAME_TITLE_SIZE_CAP, config.TRADE_EXCLUDE_CATEGORIES, config.TRADE_EXCLUDE_TAGS,
                 config.REBALANCE, config.MIN_PRICE_MOVE, config.SELL_AT,
                 config.SELL_MIN_DAYS) == (
             False, (0.0, 0.5), 0.80, 1.0, 0.20, None, None, True, None, None, None)
@@ -3546,7 +3631,7 @@ class TestPreToggleDefaults:
     _TOGGLES = frozenset({
         "TIME_SERIES_TIER_FLOORS", "TIME_SERIES_SPREAD_BAND",
         "TIME_SERIES_INTERVAL_PROB_DISCOUNT", "BUDGET_FRACTION", "SAME_TITLE_SIZE_CAP",
-        "TRADE_EXCLUDE_CATEGORIES", "TRADE_TAGS", "REBALANCE", "MIN_PRICE_MOVE", "SELL_AT",
+        "TRADE_EXCLUDE_CATEGORIES", "TRADE_EXCLUDE_TAGS", "REBALANCE", "MIN_PRICE_MOVE", "SELL_AT",
         "SELL_MIN_DAYS"})
 
     @classmethod
@@ -3571,7 +3656,7 @@ class TestPreToggleDefaults:
         apply_pre_toggle_defaults(monkeypatch)
         assert live_settings() == LiveSettings(
             tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20,
-            same_title_size_cap=1.0, exclude_categories=None, tags=None, rebalance=False,
+            same_title_size_cap=1.0, exclude_categories=None, exclude_tags=None, rebalance=False,
             min_price_move=None, sell_at=None, sell_min_days=None)
         for module, bound, toggle in binders:
             assert getattr(importlib.import_module(f"kalshi_betting.{module}"), bound) == (
@@ -3761,7 +3846,7 @@ class TestLiveSettingsOrigin:
     def test_the_toggle_fields_are_the_eleven(self):
         assert config.LIVE_TOGGLE_FIELDS == (
             "tier_floors", "spread_band", "interval_discount", "size_cap",
-            "same_title_size_cap", "exclude_categories", "tags", "rebalance", "min_price_move",
+            "same_title_size_cap", "exclude_categories", "exclude_tags", "rebalance", "min_price_move",
             "sell_at", "sell_min_days")
         assert len(config.LIVE_TOGGLE_FIELDS) == 11
         # The four a saved file may leave out, in field order, at the end
@@ -3772,7 +3857,7 @@ class TestLiveSettingsOrigin:
             "sell_min_days": None}
         # The settings an older version saved in their place, refused when read
         assert config._RETIRED_TOGGLES == ("add_to_held_pairs", "trim_to_kelly",
-                                           "trim_min_rise", "categories")
+                                           "trim_min_rise", "categories", "tags")
         assert [f.name for f in dataclasses.fields(LiveSettings)] == [
             *config.LIVE_TOGGLE_FIELDS, "origin"]
 
@@ -3839,7 +3924,7 @@ def _valid_record(**changes) -> dict:
         "source": "",
         "settings": {
             "tier_floors": False, "spread_band": [0.0, 0.5], "interval_discount": 0.8,
-            "size_cap": 0.1, "same_title_size_cap": 0.2, "exclude_categories": None, "tags": None,
+            "size_cap": 0.1, "same_title_size_cap": 0.2, "exclude_categories": None, "exclude_tags": None,
         },
     }
     for key, value in changes.items():
@@ -3892,7 +3977,7 @@ _SEVEN_TOGGLE_BYTES = (
     b'    "size_cap": 0.1,\n'
     b'    "same_title_size_cap": 0.2,\n'
     b'    "exclude_categories": null,\n'
-    b'    "tags": null\n'
+    b'    "exclude_tags": null\n'
     b'  }\n'
     b'}\n')
 
@@ -3931,7 +4016,7 @@ class TestSavedLiveDefaults:
 
     _SETTINGS = LiveSettings(
         tier_floors=True, spread_band=(0.1, 0.6), interval_discount=0.6, size_cap=0.35,
-        same_title_size_cap=0.5, exclude_categories=("Sports",), tags=("Basketball",))
+        same_title_size_cap=0.5, exclude_categories=("Sports",), exclude_tags=("Basketball",))
 
     def test_the_path_is_this_test_s_own(self, tmp_path):
         # conftest's per-test redirect, never the repo's own file
@@ -3960,7 +4045,7 @@ class TestSavedLiveDefaults:
         again = config.read_saved_live_defaults()
         assert again == self._SETTINGS and again.origin == saved.origin
         text = config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8")
-        assert '"exclude_categories": ["Sports"],' in text and '"tags": ["Basketball"]\n' in text
+        assert '"exclude_categories": ["Sports"],' in text and '"exclude_tags": ["Basketball"]\n' in text
 
     def test_the_written_text_is_pinned(self, monkeypatch):
         # With rebalancing off, the key is left out, byte for byte, so code
@@ -3976,8 +4061,8 @@ class TestSavedLiveDefaults:
         config.save_live_defaults(config.LIVE_DEFAULTS_SEED,
                                   source=config.LIVE_DEFAULTS_SEED_SOURCE)
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES.replace(
-            b'    "tags": null\n',
-            b'    "tags": null,\n    "rebalance": true\n')
+            b'    "exclude_tags": null\n',
+            b'    "exclude_tags": null,\n    "rebalance": true\n')
         assert config.read_saved_live_defaults() == config.LIVE_DEFAULTS_SEED
 
     def test_selling_off_writes_exactly_the_bytes_written_before_it_existed(self, monkeypatch):
@@ -3989,7 +4074,7 @@ class TestSavedLiveDefaults:
             text = config.LIVE_DEFAULTS_FILE.read_text()
             assert "sell_at" not in text and "sell_min_days" not in text
         assert config.LIVE_DEFAULTS_FILE.read_bytes().endswith(
-            b'    "tags": null,\n    "rebalance": true\n  }\n}\n')
+            b'    "exclude_tags": null,\n    "rebalance": true\n  }\n}\n')
 
     def test_a_selling_save_writes_its_keys_last_in_field_order(self, monkeypatch):
         monkeypatch.setattr(config, "datetime", _FrozenDatetime)
@@ -3997,15 +4082,15 @@ class TestSavedLiveDefaults:
         both = dataclasses.replace(config.LIVE_DEFAULTS_SEED, sell_at=0.85, sell_min_days=3)
         config.save_live_defaults(both, source=config.LIVE_DEFAULTS_SEED_SOURCE)
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES.replace(
-            b'    "tags": null\n',
-            b'    "tags": null,\n    "rebalance": true,\n'
+            b'    "exclude_tags": null\n',
+            b'    "exclude_tags": null,\n    "rebalance": true,\n'
             b'    "sell_at": 0.85,\n    "sell_min_days": 3\n')
         assert config.read_saved_live_defaults() == both
         # A level alone leaves the minimum out; rebalancing off leaves its key out too
         level = dataclasses.replace(_SEED_REBALANCE_OFF, sell_at=0.5)
         config.save_live_defaults(level, source=config.LIVE_DEFAULTS_SEED_SOURCE)
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES.replace(
-            b'    "tags": null\n', b'    "tags": null,\n    "sell_at": 0.5\n')
+            b'    "exclude_tags": null\n', b'    "exclude_tags": null,\n    "sell_at": 0.5\n')
         assert config.read_saved_live_defaults() == level
         # Every level of the grid round-trips as the same float
         for percent in range(1, 101):
@@ -4047,8 +4132,8 @@ class TestSavedLiveDefaults:
                                          sell_at=0.85, sell_min_days=3)
         config.save_live_defaults(everything, source=config.LIVE_DEFAULTS_SEED_SOURCE)
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES.replace(
-            b'    "tags": null\n',
-            b'    "tags": null,\n    "rebalance": true,\n    "min_price_move": 0.1,\n'
+            b'    "exclude_tags": null\n',
+            b'    "exclude_tags": null,\n    "rebalance": true,\n    "min_price_move": 0.1,\n'
             b'    "sell_at": 0.85,\n    "sell_min_days": 3\n')
         assert config.read_saved_live_defaults() == everything
         # Every 5c step round-trips as the same float
@@ -4260,7 +4345,7 @@ class TestSavedLiveDefaults:
 
     @pytest.mark.parametrize("changes, words", [
         ({"exclude_categories": ("Sports\u200b",)}, "printable"),
-        ({"tags": ("Basket\u202eball",)}, "printable"),
+        ({"exclude_tags": ("Basket\u202eball",)}, "printable"),
         ({"exclude_categories": tuple(f"Category {i:05d}" for i in range(5000))},
          f"over {config.LIVE_DEFAULTS_MAX_BYTES} bytes"),
     ], ids=["zero-width category", "text-direction tag", "a filter over the size limit"])
@@ -4408,9 +4493,9 @@ class TestSavedLiveDefaults:
         # The settings block
         # A toggle that was always there may not be left out; only one added
         # later (rebalance, say) may
-        ("a missing toggle", _text(_with_toggles(tags=_DROP))),
+        ("a missing toggle", _text(_with_toggles(exclude_tags=_DROP))),
         ("a missing toggle beside the later one",
-         _text(_with_toggles(tags=_DROP, rebalance=False))),
+         _text(_with_toggles(exclude_tags=_DROP, rebalance=False))),
         ("an extra toggle", _text(_with_toggles(origin="config.py"))),
         ("an extra toggle beside the later one",
          _text(_with_toggles(rebalance=True, sell_held_pairs=True))),
@@ -4475,9 +4560,9 @@ class TestSavedLiveDefaults:
          _text(_with_toggles(rebalance=False, min_price_move=0.10))),
         # Category and tag names
         ("the name any", _text(_with_toggles(exclude_categories=["any"]))),
-        ("an empty name", _text(_with_toggles(tags=[""]))),
+        ("an empty name", _text(_with_toggles(exclude_tags=[""]))),
         ("a zero-width name", _text(_with_toggles(exclude_categories=["Sports\u200b"]))),
-        ("a bare string filter", _text(_with_toggles(tags="Basketball"))),
+        ("a bare string filter", _text(_with_toggles(exclude_tags="Basketball"))),
     ]
 
     @pytest.mark.parametrize("label, data", _REFUSED, ids=[label for label, _ in _REFUSED])
@@ -4506,7 +4591,7 @@ class TestSavedLiveDefaults:
             (_text(_with_toggles(spread_band=[0.0, True])),
              '"spread_band" must be [floor, ceiling]'),
             (_text(_with_toggles(rebalance=1)), "rebalance must be True or False"),
-            (_text(_with_toggles(tags=_DROP)),
+            (_text(_with_toggles(exclude_tags=_DROP)),
              "(rebalance, min_price_move, sell_at, sell_min_days may be left out, and then "
              "each reads as off)"),
             (_text(_with_toggles(sell_at=True)), '"sell_at" must be a number or null'),
@@ -4607,7 +4692,7 @@ class TestSavedLiveDefaults:
         # Whole numbers and names with surrounding spaces are normalised by LiveSettings
         config.LIVE_DEFAULTS_FILE.write_bytes(_text(_with_toggles(
             spread_band=[0, 1], interval_discount=1, size_cap=1,
-            exclude_categories=[" Sports "], tags=["Basketball"])))
+            exclude_categories=[" Sports "], exclude_tags=["Basketball"])))
         saved = config.read_saved_live_defaults()
         assert saved == LiveSettings(False, (0.0, 1.0), 1.0, 1.0, 0.2, ("Sports",),
                                      ("Basketball",))
@@ -4698,16 +4783,16 @@ class TestOutdatedSavedFile:
         err = _outdated(_OLD_VERSION_BYTES)
         assert isinstance(err, config.LiveDefaultsError)
         assert not isinstance(err, config.LiveDefaultsMissing)
-        # The previous writer's file holds categories too (null: any category),
-        # which exclude_categories replaced
+        # The previous writer's file holds categories and tags too (null: any
+        # category, any tag), which exclude_categories and exclude_tags replaced
         assert str(err) == (
             f'{config.LIVE_DEFAULTS_FILE}: "settings" holds add_to_held_pairs, trim_to_kelly '
             "and trim_min_rise, which rebalance and min_price_move replaced, and categories, "
-            "which exclude_categories replaced: save the live defaults again (start "
-            "./start_dashboard.sh; its pages offer them as rebalance yes, min price "
-            "movement 10c, no category excluded)")
+            "which exclude_categories replaced, and tags, which exclude_tags replaced: save "
+            "the live defaults again (start ./start_dashboard.sh; its pages offer them as "
+            "rebalance yes, min price movement 10c, no category excluded, no tag excluded)")
         assert err.retired == ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise",
-                               "categories")
+                               "categories", "tags")
         # Every other setting as saved; the origin names the file as a read would
         assert err.proposal == LiveSettings(False, (0.0, 0.8), 0.7, 0.15, 0.2,
                                             rebalance=True, min_price_move=0.10)
@@ -4748,10 +4833,10 @@ class TestOutdatedSavedFile:
         # Selling and the filter come through unchanged
         err = _outdated(_text(_with_toggles(
             add_to_held_pairs=True, trim_to_kelly=True, trim_min_rise=0.25, sell_at=0.85,
-            sell_min_days=3, exclude_categories=["Politics"], tags=["Sports · Basketball"])))
+            sell_min_days=3, exclude_categories=["Politics"], exclude_tags=["Sports · Basketball"])))
         assert err.proposal == dataclasses.replace(
             config.LIVE_DEFAULTS_SEED, min_price_move=0.25, sell_at=0.85, sell_min_days=3,
-            exclude_categories=("Politics",), tags=("Sports · Basketball",))
+            exclude_categories=("Politics",), exclude_tags=("Sports · Basketball",))
 
     @pytest.mark.parametrize("old, held", [
         ({"trim_to_kelly": False}, "trim_to_kelly"),
@@ -4766,7 +4851,7 @@ class TestOutdatedSavedFile:
     @pytest.mark.parametrize("label, old, reason", [
         ("a cap off the grid", {"add_to_held_pairs": True, "size_cap": 0.07},
          "size_cap must be a multiple of 5%"),
-        ("a missing setting", {"add_to_held_pairs": True, "tags": _DROP},
+        ("a missing setting", {"add_to_held_pairs": True, "exclude_tags": _DROP},
          '"settings" must hold exactly'),
         ("an unknown setting", {"add_to_held_pairs": True, "sell_held_pairs": True},
          '"settings" must hold exactly'),
@@ -4836,18 +4921,23 @@ class TestCategoriesRetirement:
                                sell_min_days=2, **changes)
         settings = record["settings"]
         settings["categories"] = settings.pop("exclude_categories")
+        # That version's tags were tags to trade, under the old key
+        settings["tags"] = settings.pop("exclude_tags")
         return _text(record)
 
     def test_a_null_list_proposes_no_category_excluded_and_everything_else(self):
+        # That version's file holds tags too (null: any tag), which exclude_tags
+        # replaced: both retirements at once
         err = _outdated(self._current_era())
-        assert err.retired == ("categories",)
+        assert err.retired == ("categories", "tags")
         assert err.proposal == dataclasses.replace(
             config.LIVE_DEFAULTS_SEED, min_price_move=0.1, sell_at=0.9, sell_min_days=2,
             exclude_categories=None)
         assert str(err) == (
             f'{config.LIVE_DEFAULTS_FILE}: "settings" holds categories, which '
-            "exclude_categories replaced: save the live defaults again (start "
-            "./start_dashboard.sh; its pages offer them as no category excluded)")
+            "exclude_categories replaced, and tags, which exclude_tags replaced: save the "
+            "live defaults again (start ./start_dashboard.sh; its pages offer them as no "
+            "category excluded, no tag excluded)")
         # live_defaults refuses it too: no run trades the proposal
         with pytest.raises(config.LiveDefaultsOutdated):
             config.live_defaults()
@@ -4863,7 +4953,7 @@ class TestCategoriesRetirement:
         # A list of categories to trade has no exact reading as categories to
         # exclude: the proposal is the file's other settings with nothing
         # excluded, and old_categories says it widens live trading
-        err = _outdated(self._current_era(tags=None).replace(
+        err = _outdated(self._current_era(exclude_tags=None).replace(
             b'"categories": null', b'"categories": ' + json.dumps(names).encode()))
         old = tuple(name.strip() for name in names)
         assert err.old_categories == old
@@ -4872,12 +4962,12 @@ class TestCategoriesRetirement:
             exclude_categories=None)
         assert str(err) == (
             f'{config.LIVE_DEFAULTS_FILE}: "settings" holds categories, which '
-            "exclude_categories replaced: these defaults traded only "
-            f"{', '.join(repr(name) for name in old)}, and this version saves what NOT to "
-            "trade instead. Saved again as offered (no category excluded), they trade "
-            "everything: exclude each category not to trade before saving (start "
-            "./start_dashboard.sh, or the backtest dashboard's \"Save as live "
-            "defaults…\" button)")
+            "exclude_categories replaced, and tags, which exclude_tags replaced: these "
+            f"defaults traded only {', '.join(repr(name) for name in old)}, and this "
+            "version saves what NOT to trade instead. Saved again as offered (no category "
+            "excluded, no tag excluded), they trade everything: exclude each category not "
+            "to trade before saving (start ./start_dashboard.sh, or the backtest "
+            "dashboard's \"Save as live defaults…\" button)")
 
     def test_a_null_list_has_no_old_categories(self):
         assert _outdated(self._current_era()).old_categories is None
@@ -4888,7 +4978,7 @@ class TestCategoriesRetirement:
     ])
     def test_a_malformed_list_has_no_proposal(self, value):
         # What the older version refused has no reading now either
-        err = _outdated(self._current_era(tags=None).replace(
+        err = _outdated(self._current_era(exclude_tags=None).replace(
             b'"categories": null', b'"categories": ' + value))
         assert err.proposal is None and err.old_categories is None
         assert "and its other settings are refused too" in str(err)
@@ -4896,18 +4986,20 @@ class TestCategoriesRetirement:
     def test_a_tied_tag_with_null_categories_has_no_proposal(self):
         # The older version accepted a tied tag only with its category listed,
         # so null categories with one was a file it refused
-        err = _outdated(self._current_era(tags=["Sports · Basketball"]))
+        err = _outdated(self._current_era(exclude_tags=["Sports · Basketball"]))
         assert err.proposal is None and err.old_categories is None
         assert "is tied to 'Sports', which its categories did not list" in str(err)
 
     def test_a_tied_tag_needs_its_category_listed_as_the_old_version_did(self):
-        listed = self._current_era(tags=["sports · Basketball"]).replace(
+        listed = self._current_era(exclude_tags=["sports · Basketball"]).replace(
             b'"categories": null', b'"categories": ["Sports"]')
         err = _outdated(listed)
-        assert err.proposal.tags == ("sports · Basketball",)
+        # Tags to trade too, which exclude_tags replaced: offered as excluding none
+        assert err.proposal.exclude_tags is None
         assert err.proposal.exclude_categories is None
         assert err.old_categories == ("Sports",)
-        unlisted = self._current_era(tags=["Sports · Basketball"]).replace(
+        assert err.old_tags == ("sports · Basketball",)
+        unlisted = self._current_era(exclude_tags=["Sports · Basketball"]).replace(
             b'"categories": null', b'"categories": ["Economics"]')
         assert _outdated(unlisted).proposal is None
 
@@ -4919,18 +5011,18 @@ class TestCategoriesRetirement:
         assert err.proposal.rebalance is True and err.proposal.exclude_categories is None
         assert ('"settings" holds add_to_held_pairs, trim_to_kelly and trim_min_rise, '
                 "which rebalance and min_price_move replaced, and categories, which "
-                "exclude_categories replaced: these defaults traded only 'Sports'") \
-            in str(err)
+                "exclude_categories replaced, and tags, which exclude_tags replaced: these "
+                "defaults traded only 'Sports'") in str(err)
         assert ("Saved again as offered (rebalance yes, min price movement 10c, no "
-                "category excluded), they trade everything") in str(err)
+                "category excluded, no tag excluded), they trade everything") in str(err)
 
     def test_both_filters_together_are_refused_with_no_proposal(self):
         record = _with_toggles()
         record["settings"]["categories"] = None
         err = _outdated(_text(record))
         assert err.proposal is None
-        assert "and its other settings are refused too (it also holds exclude_categories)" \
-            in str(err)
+        assert ("and its other settings are refused too (it also holds exclude_categories, "
+                "which no version saved beside categories)") in str(err)
 
     def test_the_rebalance_conflict_applies_only_to_the_rebalance_settings(self):
         # A file of the version before this one holds rebalance beside categories:
@@ -4946,6 +5038,164 @@ class TestCategoriesRetirement:
         assert config.read_saved_live_defaults() == proposal
 
 
+class TestTagsRetirement:
+    """A saved file holding "tags" (a list of tags to trade, which exclude_tags
+    replaced) is refused as LiveDefaultsOutdated, as categories was. A null
+    value (any tag) reads exactly as no tag excluded; a list of names has no
+    exact reading (which tags it leaves out depends on every tag Kalshi
+    lists), so its proposal excludes none too, and old_tags names the list,
+    so every page that offers the proposal can say it widens live trading.
+    Every file the version before this one saved holds "tags", since it was
+    required."""
+
+    @staticmethod
+    def _current_era(**changes) -> bytes:
+        """A file the version before this one wrote: exclude_categories, and
+        tags (tags to trade) in place of exclude_tags, with rebalance and
+        selling saved."""
+        record = _with_toggles(rebalance=True, min_price_move=0.1, sell_at=0.9,
+                               sell_min_days=2, **changes)
+        settings = record["settings"]
+        settings["tags"] = settings.pop("exclude_tags")
+        return _text(record)
+
+    @staticmethod
+    def _with_tags(value: bytes, **changes) -> bytes:
+        """That file with its tags set to value (raw JSON)."""
+        return TestTagsRetirement._current_era(**changes).replace(
+            b'"tags": null', b'"tags": ' + value)
+
+    def test_a_null_list_proposes_no_tag_excluded_and_everything_else(self):
+        err = _outdated(self._current_era(exclude_categories=["Politics"]))
+        assert err.retired == ("tags",)
+        assert err.proposal == dataclasses.replace(
+            config.LIVE_DEFAULTS_SEED, min_price_move=0.1, sell_at=0.9, sell_min_days=2,
+            exclude_categories=("Politics",), exclude_tags=None)
+        assert err.old_tags is None and err.old_categories is None
+        assert str(err) == (
+            f'{config.LIVE_DEFAULTS_FILE}: "settings" holds tags, which exclude_tags '
+            "replaced: save the live defaults again (start ./start_dashboard.sh; its pages "
+            "offer them as no tag excluded)")
+        # live_defaults refuses it too: no run trades the proposal
+        with pytest.raises(config.LiveDefaultsOutdated):
+            config.live_defaults()
+
+    @pytest.mark.parametrize("names", [["Basketball"], ["Sports · Basketball", " Fed "]])
+    def test_a_list_of_names_proposes_no_exclusion_and_names_the_old_list(self, names):
+        err = _outdated(self._with_tags(json.dumps(names).encode()))
+        old = tuple(name.strip() for name in names)
+        assert err.old_tags == old and err.old_categories is None
+        assert err.proposal == dataclasses.replace(
+            config.LIVE_DEFAULTS_SEED, min_price_move=0.1, sell_at=0.9, sell_min_days=2,
+            exclude_tags=None)
+        assert str(err) == (
+            f'{config.LIVE_DEFAULTS_FILE}: "settings" holds tags, which exclude_tags '
+            "replaced: these defaults limited trading to the tags "
+            f"{', '.join(repr(name) for name in old)} (a 'Category · Tag' limited that "
+            "category alone), and this version saves what NOT to "
+            "trade instead. Saved again as offered (no tag excluded), they trade "
+            "everything: exclude each tag not to trade before saving (start "
+            "./start_dashboard.sh, or the backtest dashboard's \"Save as live "
+            "defaults…\" button)")
+
+    @pytest.mark.parametrize("value", [
+        b'"Basketball"', b"3", b"[]", b'["Basketball", "any"]', b'["Basketball", "NONE"]',
+        b'["Basketball", ""]', b"[1]", b"{}", b'["Sports \xc2\xb7 any"]',
+        b'["Sports \xc2\xb7 "]', b'["\xc2\xb7 Basketball"]', b'["\xc2\xb7"]',
+        b'["Basket\\u202eball"]',
+    ])
+    def test_a_malformed_list_has_no_proposal(self, value):
+        # What the older version refused has no reading now either
+        err = _outdated(self._with_tags(value))
+        assert err.proposal is None and err.old_tags is None
+        assert "and its other settings are refused too" in str(err)
+
+    def test_a_tied_tag_in_an_excluded_category_has_no_proposal(self):
+        # The older version refused a tied tag whose category it excluded
+        err = _outdated(self._with_tags(b'["sports \xc2\xb7 Basketball"]',
+                                        exclude_categories=["Sports"]))
+        assert err.proposal is None and err.old_tags is None
+        assert "is tied to 'sports', which its exclude_categories excluded" in str(err)
+        # ... while one in a category it did not exclude was a file it read
+        err = _outdated(self._with_tags(b'["Sports \xc2\xb7 Basketball"]',
+                                        exclude_categories=["Politics"]))
+        assert err.old_tags == ("Sports · Basketball",)
+        assert err.proposal.exclude_categories == ("Politics",)
+
+    def test_an_older_file_with_categories_took_the_name_none(self):
+        # The version with categories refused only "any"; its tied-tag rule
+        # is categories' own (_old_categories)
+        record = json.loads(_OLD_VERSION_BYTES)
+        record["settings"]["tags"] = ["None", "Fed"]
+        err = _outdated(_text(record))
+        assert err.old_tags == ("None", "Fed")
+        assert err.proposal.exclude_tags is None
+
+    def test_both_old_lists_are_named(self):
+        record = json.loads(_OLD_VERSION_BYTES)
+        record["settings"]["categories"] = ["Sports", "Economics"]
+        record["settings"]["tags"] = ["Sports · Basketball", "Fed"]
+        err = _outdated(_text(record))
+        assert err.old_categories == ("Sports", "Economics")
+        assert err.old_tags == ("Sports · Basketball", "Fed")
+        assert err.proposal.exclude_categories is None and err.proposal.exclude_tags is None
+        assert ("these defaults traded only the categories 'Sports', 'Economics' and "
+                "limited trading to the tags 'Sports · Basketball', 'Fed' (a 'Category · "
+                "Tag' limited that category alone), and this version saves what NOT to "
+                "trade instead") in str(err)
+        assert "exclude each category and tag not to trade before saving" in str(err)
+
+    def test_both_filters_together_are_refused_with_no_proposal(self):
+        record = _with_toggles()
+        record["settings"]["tags"] = None
+        err = _outdated(_text(record))
+        assert err.proposal is None
+        assert ("and its other settings are refused too (it also holds exclude_tags, "
+                "which no version saved beside tags)") in str(err)
+
+    @pytest.mark.parametrize("null", [True, False])
+    def test_categories_beside_exclude_tags_is_refused_with_no_proposal(self, null):
+        # No version saved categories (the oldest filter) beside exclude_tags,
+        # as none saved tags beside exclude_tags: such a file says two things
+        # at once and is offered nothing, whatever its categories says
+        record = _with_toggles(exclude_tags=["Sports · Basketball"])
+        record["settings"]["categories"] = None if null else ["Sports"]
+        del record["settings"]["exclude_categories"]
+        err = _outdated(_text(record))
+        assert err.retired == ("categories",)
+        assert err.proposal is None and err.old_categories is None
+        assert ("and its other settings are refused too (it also holds exclude_tags, "
+                "which no version saved beside categories)") in str(err)
+
+    def test_every_filter_era_a_version_saved_still_has_its_proposal(self):
+        # categories beside tags (the oldest filter): both retirements
+        record = json.loads(_OLD_VERSION_BYTES)
+        record["settings"]["categories"] = ["Sports"]
+        record["settings"]["tags"] = ["Basketball"]
+        err = _outdated(_text(record))
+        assert err.retired == ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise",
+                               "categories", "tags")
+        assert err.proposal is not None
+        assert err.old_categories == ("Sports",) and err.old_tags == ("Basketball",)
+        # exclude_categories beside tags (the version before this one)
+        err = _outdated(self._with_tags(b'["Basketball"]', exclude_categories=["Politics"]))
+        assert err.retired == ("tags",)
+        assert err.proposal.exclude_categories == ("Politics",)
+        assert err.old_tags == ("Basketball",)
+        # The Rebalance settings are not part of the filter: beside this
+        # version's filter keys they still read as saved
+        err = _outdated(_text(_with_toggles(add_to_held_pairs=True, trim_to_kelly=True,
+                                            exclude_tags=["Sports · Basketball"])))
+        assert err.proposal.exclude_tags == ("Sports · Basketball",)
+
+    def test_one_save_of_the_proposal_replaces_the_file(self):
+        proposal = _outdated(self._with_tags(b'["Basketball"]')).proposal
+        assert config.save_live_defaults(proposal, source="") == proposal
+        stored = json.loads(config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8"))["settings"]
+        assert "tags" not in stored and stored["exclude_tags"] is None
+        assert config.read_saved_live_defaults() == proposal
+
+
 class TestLiveDefaultsSeed:
     """LIVE_DEFAULTS_SEED, the starting values offered for a first save."""
 
@@ -4953,7 +5203,7 @@ class TestLiveDefaultsSeed:
         seed = config.LIVE_DEFAULTS_SEED
         assert seed == LiveSettings(False, (0.0, 0.5), 0.8, 0.10, 0.20, rebalance=True)
         assert seed.min_price_move is None
-        assert seed.exclude_categories is None and seed.tags is None
+        assert seed.exclude_categories is None and seed.exclude_tags is None
         assert seed.origin == config.LIVE_DEFAULTS_FROM_CONFIG
 
     def test_the_seed_warns_nothing(self):
@@ -5018,7 +5268,7 @@ class TestLiveSettingsChanges:
     by toggle, in the "Live settings:" line's order and words."""
 
     def test_labels_and_values_match_describe_live_settings(self):
-        current = _settings(exclude_categories=("Sports",), tags=("Basketball",))
+        current = _settings(exclude_categories=("Sports",), exclude_tags=("Basketball",))
         proposed = _settings(False, (0.0, 0.5), 0.8, 1.0, 0.2)
         rows = config.live_settings_changes(current, proposed)
         assert [f"{label} {new}" for label, _, new, _ in rows] == \
@@ -5032,7 +5282,7 @@ class TestLiveSettingsChanges:
             ("per-trade cap", "20%", "100% (no cap)", True),
             ("same-title cap", "100% (no extra cap)", "20%", True),
             ("exclude categories", "Sports", "none", True),
-            ("tags", "Basketball", "any", True),
+            ("exclude tags", "Basketball", "none", True),
             ("rebalance", "no", "no", False),
             ("min price movement", "any", "any", False),
             ("sell at", "off", "off", False),
@@ -5059,7 +5309,7 @@ class TestLiveSettingsChanges:
         assert len(rows) == len(config.LIVE_TOGGLE_FIELDS) == 11
         assert all(old == "—" and changed for _, old, _, changed in rows)
         assert [new for _, _, new, _ in rows] == [
-            "off", "0-0.5", "0.8", "10%", "20%", "none", "any", "yes", "any", "off", "any"]
+            "off", "0-0.5", "0.8", "10%", "20%", "none", "none", "yes", "any", "off", "any"]
 
     def test_turning_selling_on_shows_as_the_two_sell_rows(self):
         on = dataclasses.replace(config.LIVE_DEFAULTS_SEED, sell_at=0.85, sell_min_days=3)

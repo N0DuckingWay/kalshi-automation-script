@@ -112,16 +112,16 @@ Notes:
     one of the two shapes config.LIVE_DEFAULTS_SOURCE_PATTERN allows, or be
     left out, and the seed's note may label only the seed values, so a
     crafted link cannot choose the note's words. A link may name several
-    categories to exclude and several tags (an exclude_category or tag
-    field given more than once, at most config.DEFAULTS_SERVER_MAX_FILTER_NAMES
-    of each, no name twice; a second spelling of one name in another letter
-    case is left out). They are checked for form only (each one printable
-    name with no two spaces in a row, which a browser would show as one; a
-    category never written as a tied tag; a tag tied to a category,
-    "Sports · Basketball", never to an excluded one), so a link can still
-    put words of its own there: the page shows them as a highlighted change,
-    and a name no Kalshi series is filed under matches no pair (an excluded
-    one excludes nothing). The headers never
+    categories and several tags to exclude (an exclude_category or
+    exclude_tag field given more than once, at most
+    config.DEFAULTS_SERVER_MAX_FILTER_NAMES of each, no name twice; a second
+    spelling of one name in another letter case is left out). They are
+    checked for form only (each one printable name with no two spaces in a
+    row, which a browser would show as one; a category never written as a
+    tied tag; a tag tied to a category, "Sports · Basketball", with both
+    halves), so a link can still put words of its own there: the page shows
+    them as a highlighted change, and a name no Kalshi series is filed under
+    matches no pair (it excludes nothing). The headers never
     include "Referrer-Policy: no-referrer": under it a browser sends a POST's
     Origin as "null", and every honest save would be refused.
 
@@ -217,6 +217,7 @@ from .config import (
     LiveDefaultsError,
     LiveDefaultsOutdated,
     LiveSettings,
+    check_filter_name,
     count_text,
     describe_live_settings,
     live_defaults_source,
@@ -232,16 +233,17 @@ from .config import (
 # the POST body; the signed text is built from exactly these, as raw strings
 _FIELDS = ("tier_floors", "spread_min", "spread_max", "k", "size_cap",
            "same_title_size_cap", "rebalance", "min_price_move", "sell_at",
-           "sell_min_days", "exclude_category", "tag", "source")
+           "sell_min_days", "exclude_category", "exclude_tag", "source")
 # The fields a link built by an older version could carry: add_to_held_pairs,
-# trim_to_kelly and trim_min_rise, which rebalance and min_price_move replaced,
-# and category (a category to trade), which exclude_category replaced. A link
-# naming one is refused with a message that says which change it predates
-_RETIRED_FIELDS = ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise", "category")
+# trim_to_kelly and trim_min_rise, which rebalance and min_price_move replaced;
+# category (a category to trade), which exclude_category replaced; and tag (a
+# tag to trade), which exclude_tag replaced. A link naming one is refused with
+# a message that says which change it predates
+_RETIRED_FIELDS = ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise", "category", "tag")
 # The fields a proposal must carry; every other one may be left out
 _REQUIRED = ("tier_floors", "spread_min", "spread_max", "k", "size_cap")
-# The fields a request may give more than once: one per category or tag named
-_REPEATABLE = ("exclude_category", "tag")
+# The fields a request may give more than once: one per excluded category or tag named
+_REPEATABLE = ("exclude_category", "exclude_tag")
 # The largest number of fields a query or form may hold: its thirteen fields, the
 # fingerprint, nonce, token, action and acknowledgement (with room to spare),
 # plus the most categories and tags a link may name; more is refused unread
@@ -799,17 +801,13 @@ def _name(text: str, name: str) -> str:
             text-direction character, say), has spaces around it, or holds
             two spaces in a row.
     """
-    if not text.isprintable() or text != text.strip():
-        raise ValueError(f"{name} must be one printable name with no spaces around it, "
-                         f"got {text!r}")
-    if re.search(r"\s\s", text):
-        raise ValueError(f"{name} must not hold two spaces in a row, got {text!r}")
-    return text
+    # Cross-module: the one check, which the dashboard's Save button asks too
+    return check_filter_name(text, name)
 
 
 def _name_list(params: dict[str, list[str]], field_name: str) -> tuple[str, ...] | None:
     """
-    Read every excluded category, or every tag, a request names.
+    Read every excluded category, or every excluded tag, a request names.
 
     The live filter compares names without regard to letter case, so a name
     that repeats an earlier one in another case adds nothing and is left out
@@ -820,12 +818,12 @@ def _name_list(params: dict[str, list[str]], field_name: str) -> tuple[str, ...]
 
     Args:
         params (dict[str, list[str]]): The request's fields (_params).
-        field_name (str): "exclude_category" or "tag".
+        field_name (str): "exclude_category" or "exclude_tag".
 
     Returns:
         tuple[str, ...] | None: The names in the order given, each once in
             any letter case, or None when the request has no such field (no
-            category excluded, or any tag).
+            category or tag excluded).
 
     Raises:
         ValueError: If a name is not one printable name (_name), or the very
@@ -927,16 +925,16 @@ def _proposal(params: dict[str, list[str]],
     LiveSettings refuses a minimum price movement with rebalancing off, as it
     refuses a minimum of days with no sell level. A link that names one of
     _RETIRED_FIELDS (built before rebalance and min_price_move replaced the
-    first three, or before exclude_category replaced category) is refused,
-    with a message saying how to get a new one.
+    first three, before exclude_category replaced category, or before
+    exclude_tag replaced tag) is refused, with a message saying how to get a
+    new one.
 
-    exclude_category and tag may each repeat, one name per field, at most
-    config.DEFAULTS_SERVER_MAX_FILTER_NAMES of each as sent; a missing one
-    means none excluded, or any tag, whatever is saved. The same name twice
-    is refused; a second spelling in another letter case is left out. A tag
-    tied to a category ("Sports · Basketball") must not name an excluded
-    one; LiveSettings checks this, and refuses a category written as a tied
-    tag.
+    exclude_category and exclude_tag may each repeat, one name per field, at
+    most config.DEFAULTS_SERVER_MAX_FILTER_NAMES of each as sent; a missing
+    one means none excluded, whatever is saved. The same name twice is
+    refused; a second spelling in another letter case is left out. A tag
+    tied to a category ("Sports · Basketball") needs both halves, and a
+    category may not be written as a tied tag; LiveSettings checks both.
 
     source is the note the saved file keeps: empty when left out, else one of
     the two shapes config.LIVE_DEFAULTS_SOURCE_PATTERN allows (ASCII digits
@@ -961,11 +959,17 @@ def _proposal(params: dict[str, list[str]],
             values.
     """
     retired = [field_name for field_name in _RETIRED_FIELDS if field_name in params]
-    if retired == ["category"]:
-        # A category to trade, where a link now names the categories to exclude
-        raise ValueError("this link names category, which exclude_category replaced (the "
-                         "filter is now a list of categories NOT to trade): rebuild the "
-                         "backtest dashboard, or open this server's start page")
+    if retired and set(retired) <= {"category", "tag"}:
+        # Categories or tags to trade, where a link now names the ones to exclude;
+        # a link naming both is told about both
+        plural = {"category": "categories", "tag": "tags"}
+        kinds = " and ".join(plural[name] for name in retired)
+        filters = (f"the {retired[0]} filter is now a list of {kinds}" if len(retired) == 1
+                   else f"the category and tag filters are now lists of {kinds}")
+        raise ValueError(f"this link names {' and '.join(retired)}, which "
+                         f"{' and '.join('exclude_' + name for name in retired)} replaced "
+                         f"({filters} NOT to trade): rebuild the backtest dashboard, or "
+                         "open this server's start page")
     if retired:
         raise ValueError(f"this link was built before Rebalance (it names {retired[0]}): "
                          "rebuild the backtest dashboard, or open this server's start page")
@@ -1019,7 +1023,7 @@ def _proposal(params: dict[str, list[str]],
     else:
         sell_min_days = _kept("sell_min_days", current, source)
     exclude_categories = _name_list(params, "exclude_category")
-    tags = _name_list(params, "tag")
+    exclude_tags = _name_list(params, "exclude_tag")
     # re.ASCII: the pattern's digits are 0-9 only, never a digit of another
     # script (which could show a date out of order on the page)
     if source and not re.fullmatch(LIVE_DEFAULTS_SOURCE_PATTERN, source, re.ASCII):
@@ -1030,7 +1034,7 @@ def _proposal(params: dict[str, list[str]],
     if live_defaults_source(source) != source:
         raise ValueError(f"source must have no spaces around it, got {source!r}")
     # LiveSettings checks every value (the band, k, each cap on its grid, the
-    # names and a tied tag's category not excluded, a minimum without its switch) and names
+    # names and a tied tag's two halves, a minimum without its switch) and names
     # the field it refuses
     settings = LiveSettings(
         tier_floors=value["tier_floors"] == "on",
@@ -1040,7 +1044,7 @@ def _proposal(params: dict[str, list[str]],
         size_cap=_number(value["size_cap"], "size_cap"),
         same_title_size_cap=same_title,
         exclude_categories=exclude_categories,
-        tags=tags,
+        exclude_tags=exclude_tags,
         rebalance=rebalance,
         min_price_move=min_price_move,
         sell_at=sell_at,
@@ -1060,7 +1064,7 @@ def _settings_query(values: LiveSettings, *, source: str = "") -> str:
     The fields come in _FIELDS order. Numbers are written as their repr (the
     exact float, which _proposal reads back as the same number), switches as
     on or off, an unset minimum price movement, sell level or minimum of days
-    as off, and each excluded category and each tag as a field of its own, in the
+    as off, and each excluded category and each excluded tag as a field of its own, in the
     values' order. Every field is named, so the page proposes these
     settings whatever is saved.
 
@@ -1086,7 +1090,7 @@ def _settings_query(values: LiveSettings, *, source: str = "") -> str:
          "off" if values.sell_min_days is None else str(values.sell_min_days)),
     ]
     pairs += [("exclude_category", name) for name in values.exclude_categories or ()]
-    pairs += [("tag", name) for name in values.tags or ()]
+    pairs += [("exclude_tag", name) for name in values.exclude_tags or ()]
     if source:
         pairs.append(("source", source))
     return urlencode(pairs)
@@ -1097,7 +1101,7 @@ def _seed_query() -> str:
     Build the confirmation page's query that proposes LIVE_DEFAULTS_SEED.
 
     The seed's settings as _settings_query spells them (it excludes no
-    category and sets no tag: any), with LIVE_DEFAULTS_SEED_SOURCE as the
+    category or tag), with LIVE_DEFAULTS_SEED_SOURCE as the
     source note.
 
     Returns:
@@ -1374,14 +1378,17 @@ def _settings_table(settings: LiveSettings) -> str:
 
 def _outdated_when(outdated: LiveDefaultsOutdated) -> str:
     """
-    Say which change an outdated saved file was saved before.
+    Say which changes an outdated saved file was saved before.
 
-    A file saved before Rebalance also holds the old categories key. When
-    that key was null (any category) the file still reads as it did, with no
-    category excluded, so only Rebalance is named; the category change is
-    named when it is the only one, when the old key listed categories to
-    trade (its values in their new form trade every category), or when the
-    file cannot be read in its new form.
+    The changes came in this order: Rebalance, the category filter becoming a
+    list of categories to exclude, then the tag filter becoming a list of
+    tags to exclude. A file saved before one of them also holds the old keys
+    of every later one. A later change whose old key was null (any category,
+    any tag) still reads as it did, with nothing excluded, so only the
+    earliest change is named; a later one is named too when its old key
+    listed names to trade (its values in their new form then trade every
+    category or every tag), or when the file cannot be read in its new form
+    (_outdated_changes).
 
     Args:
         outdated (LiveDefaultsOutdated): Why the saved file is refused; its
@@ -1389,35 +1396,51 @@ def _outdated_when(outdated: LiveDefaultsOutdated) -> str:
 
     Returns:
         str: "before Rebalance", "before the category filter became a list of
-            categories to exclude", both joined by "and", or "by an older
+            categories to exclude", "before the tag filter became a list of
+            tags to exclude", or several joined by "and"; "by an older
             version" when the refusal names no retired setting.
     """
-    rebalance, categories = _outdated_changes(outdated)
+    rebalance, categories, tags = _outdated_changes(outdated)
     changes = []
     if rebalance:
         changes.append("before Rebalance")
     if categories:
         changes.append("before the category filter became a list of categories to exclude")
+    if tags:
+        changes.append("before the tag filter became a list of tags to exclude")
     return " and ".join(changes) if changes else "by an older version"
 
 
-def _outdated_changes(outdated: LiveDefaultsOutdated) -> tuple[bool, bool]:
+# The retired settings each filter change replaced; every other retired
+# setting is one Rebalance replaced
+_FILTER_RETIREMENTS = ("categories", "tags")
+
+
+def _outdated_changes(outdated: LiveDefaultsOutdated) -> tuple[bool, bool, bool]:
     """
-    Say which of the two retirements an outdated saved file's notice names.
+    Say which of the three retirements an outdated saved file's notice names.
+
+    The earliest change the file was saved before is always named; a later
+    filter change is named when the file's old list named names to trade, or
+    when the file has no reading in its new form.
 
     Args:
         outdated (LiveDefaultsOutdated): Why the saved file is refused.
 
     Returns:
-        tuple[bool, bool]: Whether to name Rebalance, and whether to name the
-            change of the category filter (see _outdated_when).
+        tuple[bool, bool, bool]: Whether to name Rebalance, the change of the
+            category filter and the change of the tag filter (see
+            _outdated_when).
     """
     retired = getattr(outdated, "retired", ()) or ()
-    rebalance = any(name != "categories" for name in retired)
+    rebalance = any(name not in _FILTER_RETIREMENTS for name in retired)
+    unreadable = outdated.proposal is None
     categories = "categories" in retired and (
-        _old_categories(outdated) is not None
-        or not (rebalance and outdated.proposal is not None))
-    return rebalance, categories
+        _old_categories(outdated) is not None or unreadable or not rebalance)
+    tags = "tags" in retired and (
+        _old_tags(outdated) is not None or unreadable
+        or not (rebalance or "categories" in retired))
+    return rebalance, categories, tags
 
 
 def _old_categories(outdated: LiveDefaultsOutdated) -> tuple[str, ...] | None:
@@ -1434,13 +1457,27 @@ def _old_categories(outdated: LiveDefaultsOutdated) -> tuple[str, ...] | None:
     return getattr(outdated, "old_categories", None)
 
 
+def _old_tags(outdated: LiveDefaultsOutdated) -> tuple[str, ...] | None:
+    """
+    Name the tags an outdated saved file limited trading to, when it listed some.
+
+    Args:
+        outdated (LiveDefaultsOutdated): Why the saved file is refused.
+
+    Returns:
+        tuple[str, ...] | None: Its old tags list (its values in their new
+            form then trade every tag), or None.
+    """
+    return getattr(outdated, "old_tags", None)
+
+
 def _widening_html(outdated: LiveDefaultsOutdated) -> str:
     """
-    Warn, as HTML, that an outdated file's values in their new form trade every category.
+    Warn, as HTML, that an outdated file's values in their new form trade every category or tag.
 
-    An older version saved the categories to TRADE; this one saves the
-    categories to exclude, and a list of categories to trade has no exact
-    reading as one, so the values offered exclude none. Every page that
+    An older version saved the categories, and the tags, to TRADE; this one
+    saves the ones to exclude, and a list to trade has no exact reading as
+    one to exclude, so the values offered exclude none. Every page that
     offers them shows this, so one Confirm and save never widens live
     trading unseen.
 
@@ -1449,19 +1486,58 @@ def _widening_html(outdated: LiveDefaultsOutdated) -> str:
 
     Returns:
         str: One red paragraph naming the old categories and how to keep the
-            old filter; "" when the file listed none.
+            old filter, and one naming the old tags; "" when the file listed
+            neither.
     """
+    parts = []
     old = _old_categories(outdated)
-    if old is None:
-        return ""
-    names = ", ".join(html.escape(name) for name in old)
-    return ("<p class=\"banner\">The saved defaults traded only these categories: "
+    if old is not None:
+        names = ", ".join(html.escape(name) for name in old)
+        parts.append(
+            "<p class=\"banner\">The saved defaults traded only these categories: "
             f"{names}. This version saves the categories to EXCLUDE instead, and the "
             "values offered here exclude none, so saving them as they are trades every "
             "category. To keep the old filter, add <code>&amp;exclude_category=&lt;name&gt;"
             "</code> to the address for each category to leave out, or save from the "
             "backtest dashboard's Save as live defaults… button with those categories "
             "ticked in its Exclude categories menu.</p>")
+    old = _old_tags(outdated)
+    if old is not None:
+        names = ", ".join(html.escape(name) for name in old)
+        parts.append(
+            "<p class=\"banner\">The saved defaults limited trading to these tags: "
+            f"{names} (a \"Category · Tag\" limited that category alone). This version saves the tags to EXCLUDE instead, and the values "
+            "offered here exclude none, so saving them as they are trades every tag. To "
+            "keep the old filter, add <code>&amp;exclude_tag=&lt;name&gt;</code> to the "
+            "address for each tag to leave out (\"Category · Tag\" for a tag of one "
+            "category), or save from the backtest dashboard's Save as live defaults… "
+            "button with those tags ticked in its Exclude tags menu.</p>")
+    return "".join(parts)
+
+
+def _widening_log_text(outdated: LiveDefaultsOutdated) -> str:
+    """
+    Say, for the start-up WARNING, what an outdated file's values in their new form widen.
+
+    Args:
+        outdated (LiveDefaultsOutdated): Why the saved file is refused.
+
+    Returns:
+        str: One sentence per old list the file named (its categories, its
+            tags), each starting ". "; "" when it named neither.
+    """
+    text = ""
+    old = _old_categories(outdated)
+    if old is not None:
+        text += (". They traded only " + ", ".join(old) + ": saved as offered they trade "
+                 "every category, so add an exclude_category= field for each category to "
+                 "leave out")
+    old = _old_tags(outdated)
+    if old is not None:
+        text += (". They limited trading to the tags " + ", ".join(old) + " (a \"Category · "
+                 "Tag\" limited that category alone): saved as offered they trade every "
+                 "tag, so add an exclude_tag= field for each tag to leave out")
+    return text
 
 
 def _outdated_reading(outdated: LiveDefaultsOutdated) -> str:
@@ -1469,8 +1545,9 @@ def _outdated_reading(outdated: LiveDefaultsOutdated) -> str:
     Say how an outdated saved file's settings read now, in the dashboard's words.
 
     Names only what the retired settings became: the Rebalance choice and
-    its minimum for a file saved before Rebalance, and "no category
-    excluded" when the category change is named (_outdated_changes).
+    its minimum for a file saved before Rebalance, "no category excluded"
+    when the category change is named and "no tag excluded" when the tag
+    change is named (_outdated_changes).
 
     Args:
         outdated (LiveDefaultsOutdated): Why the saved file is refused; its
@@ -1478,14 +1555,14 @@ def _outdated_reading(outdated: LiveDefaultsOutdated) -> str:
 
     Returns:
         str: e.g. "Rebalance yes and Min. price movement 10c" ("any" with no
-            minimum), "Rebalance no", "no category excluded" or "Rebalance no
-            and no category excluded".
+            minimum), "Rebalance no", "no category excluded", "no tag
+            excluded" or several joined by "and".
     """
     proposal = outdated.proposal
-    rebalance, categories = _outdated_changes(outdated)
+    rebalance, categories, tags = _outdated_changes(outdated)
     parts = []
-    # A refusal naming neither change reads as the Rebalance choice, as before
-    if rebalance or not categories:
+    # A refusal naming no change reads as the Rebalance choice, as before
+    if rebalance or not (categories or tags):
         if not proposal.rebalance:
             parts.append("Rebalance no")
         else:
@@ -1494,6 +1571,8 @@ def _outdated_reading(outdated: LiveDefaultsOutdated) -> str:
             parts.append(f"Rebalance yes and Min. price movement {move}")
     if categories:
         parts.append("no category excluded")
+    if tags:
+        parts.append("no tag excluded")
     return " and ".join(parts)
 
 
@@ -4146,16 +4225,11 @@ def main(argv: list[str] | None = None) -> None:
                             "live run refuses them (%s): open %s/ and save new ones; a save "
                             "replaces the file", _outdated_when(exc), exc, base)
         else:
-            old = _old_categories(exc)
             logging.warning("The saved live defaults were saved %s, and every "
                             "live run refuses them until they are saved again: open %s/confirm?%s "
                             "to review their values (read as %s) and save them; do not delete "
                             "the file%s", _outdated_when(exc), base, _settings_query(exc.proposal),
-                            _outdated_reading(exc),
-                            "" if old is None else (
-                                ". They traded only " + ", ".join(old) + ": saved as offered "
-                                "they trade every category, so add an exclude_category= "
-                                "field for each category to leave out"))
+                            _outdated_reading(exc), _widening_log_text(exc))
     except LiveDefaultsError as exc:
         logging.warning("The saved live defaults are refused (%s): fix or delete the file "
                         "before saving new ones here", exc)
