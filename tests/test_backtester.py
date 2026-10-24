@@ -15269,8 +15269,8 @@ class TestLiveRuleLine:
         from kalshi_betting import config
         monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", tier_floors)
         monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", band)
-        monkeypatch.setattr(config, "TRADE_CATEGORIES", categories)
-        monkeypatch.setattr(config, "TRADE_TAGS", tags)
+        monkeypatch.setattr(config, "TRADE_EXCLUDE_CATEGORIES", categories)
+        monkeypatch.setattr(config, "TRADE_EXCLUDE_TAGS", tags)
         monkeypatch.setattr(config, "REBALANCE", rebalance)
         monkeypatch.setattr(config, "MIN_PRICE_MOVE", min_price_move)
         monkeypatch.setattr(config, "SELL_AT", sell_at)
@@ -15317,7 +15317,7 @@ class TestLiveRuleLine:
         assert any(m.startswith("Size-cap sweep:") for m in messages[:-1])
 
     # The twelve fields a saved-defaults read records, all or none
-    _LIVE_FIELDS = ("live_tier_floors", "live_spread_band", "live_categories", "live_tags",
+    _LIVE_FIELDS = ("live_tier_floors", "live_spread_band", "live_exclude_categories", "live_exclude_tags",
                     "live_origin", "live_interval_discount", "live_size_cap",
                     "live_same_title_size_cap", "live_rebalance", "live_min_price_move",
                     "live_sell_at", "live_sell_min_days")
@@ -15401,7 +15401,7 @@ class TestLiveRuleLine:
         assert len(reads) == 1
         assert {name: getattr(res, name) for name in self._LIVE_FIELDS} == {
             "live_tier_floors": False, "live_spread_band": (0.1, 0.8),
-            "live_categories": ("Economics",), "live_tags": ("Fed",),
+            "live_exclude_categories": ("Economics",), "live_exclude_tags": ("Fed",),
             "live_origin": saved.origin, "live_interval_discount": 0.6,
             "live_size_cap": 0.35, "live_same_title_size_cap": 0.25,
             "live_rebalance": True, "live_min_price_move": 0.10,
@@ -15456,15 +15456,15 @@ class TestLiveRuleLine:
             spread_band=None, band_sweep=False)
         assert res.live_tier_floors is False
         assert res.live_spread_band == (0.1, 0.8)
-        assert res.live_categories == ("Economics",)
-        assert res.live_tags == ("Fed", "CPI")
+        assert res.live_exclude_categories == ("Economics",)
+        assert res.live_exclude_tags == ("Fed", "CPI")
         # ... and a read handed in is recorded as it is, None included
         candidates = backtester._prepare_candidates(MagicMock(), MagicMock(), golden._START,
                                                     True, None)
         res = backtester._sweep_from_candidates(
             candidates, 10_000.0, interval_discount=None, sweep=False,
             spread_band=None, band_sweep=False, live=None)
-        assert res.live_tier_floors is None and res.live_categories is None
+        assert res.live_tier_floors is None and res.live_exclude_categories is None
 
     # ── The verdict, on each path ───────────────────────────────────────────
 
@@ -15475,7 +15475,7 @@ class TestLiveRuleLine:
             f"Live time-series rule (saved live defaults): {rule} — this run's primary scenario "
             "applies it")
         assert (res.live_tier_floors, res.live_spread_band) == (True, (0.0, 1.0))
-        assert (res.live_categories, res.live_tags) == (None, None)
+        assert (res.live_exclude_categories, res.live_exclude_tags) == (None, None)
 
     def test_a_primary_other_than_no_band_is_matched_by_its_own_band(self, monkeypatch, caplog):
         # The primary's own band, not the default one, is what "primary" tests
@@ -15823,9 +15823,9 @@ class TestLiveRuleLine:
         (None, ("Fed",)),
         (("Economics", "Sports"), None),
         (("Economics",), ("Fed", "CPI")),
-        # Tags tied to a category, alone and beside a plain one
-        (("Economics", "Sports"), ("Sports · Basketball",)),
-        (("Economics", "Sports"), ("Sports · Basketball", "Fed")),
+        # Tags tied to a category not excluded, alone and beside a plain one
+        (("Economics", "Politics"), ("Sports · Basketball",)),
+        (("Economics", "Politics"), ("Sports · Basketball", "Fed")),
     ])
     def test_a_filter_is_named_and_never_called_the_primary(
         self, monkeypatch, caplog, categories, tags,
@@ -15835,36 +15835,42 @@ class TestLiveRuleLine:
         res = self._infeasible(monkeypatch, caplog)
         words = config.describe_trade_filter(config.live_settings())
         # The line cannot name the menu boxes (only the page knows which it offers),
-        # so it says that ticking the filter's own categories and tags shows it
+        # so it says what to tick in each menu and leaves the names to the page
         slices = ("; the dashboard's filter bar shows the live category/tag filter of it "
-                  "when its Category and Tag menus tick the categories and tags the filter "
-                  "lists (each offered where this run filed a pair under it)")
+                  "when its Exclude categories menu ticks the categories the filter "
+                  "excludes and every other category in which it keeps none of this run's "
+                  "pairs and, in each category the filter keeps only in part, its Exclude "
+                  "tags menu ticks the tags the filter leaves out (the page's Live rule "
+                  "line names them)")
         assert self._line(caplog) == (
             f"Live time-series rule (saved live defaults): {rule}; category/tag filter ({words}) — "
             f"this run's primary scenario applies its time-series rule{slices}")
-        assert (res.live_categories, res.live_tags) == (categories, tags)
+        assert (res.live_exclude_categories, res.live_exclude_tags) == (categories, tags)
         assert "never as their union" not in self._line(caplog)
 
     def test_a_grid_cell_names_its_scenario_in_the_filter_line(self, monkeypatch, caplog):
         # A live band that is not the primary's: the filter clause speaks of that scenario
-        rule = self._live(monkeypatch, True, (0.35, 0.5), ("Economics", "Sports"),
+        rule = self._live(monkeypatch, True, (0.35, 0.5), ("Economics", "Politics"),
                           ("Sports · Basketball",))
         self._feasible(monkeypatch, caplog, band_sweep=True)
         assert self._line(caplog) == (
             f"Live time-series rule (saved live defaults): {rule}; category/tag filter "
-            "(categories Economics, Sports; tags Sports · Basketball) — this run's primary "
-            "scenario does not (tier floors on, band 0-1); its grid simulated the live rule "
-            "as band 0.35-0.5 with the tier floors on, which the dashboard's filter bar "
-            "shows; the dashboard's filter bar shows the live category/tag filter of that "
-            "scenario when its Category and Tag menus tick the categories and tags the "
-            "filter lists (each offered where this run filed a pair under it)")
+            "(exclude categories Economics, Politics; exclude tags Sports · Basketball) — this run's "
+            "primary scenario does not (tier floors on, band 0-1); its grid simulated the "
+            "live rule as band 0.35-0.5 with the tier floors on, which the dashboard's "
+            "filter bar shows; the dashboard's filter bar shows the live category/tag filter "
+            "of that scenario when its Exclude categories menu ticks the categories the "
+            "filter excludes and every other category in which it keeps none of this run's "
+            "pairs and, in each category the filter keeps only in part, its Exclude tags "
+            "menu ticks the tags the filter leaves out (the page's Live rule line names "
+            "them)")
 
     def test_the_filter_words_are_describe_trade_filters(self):
         from kalshi_betting import config
         for categories, tags in [(None, None), (("Economics",), None), (None, ("Fed",)),
                                  (("Oil, Gas", "Sports"), ("a|b",))]:
             settings = config.LiveSettings(True, (0.0, 1.0), 0.75, 0.2,
-                                           categories=categories, tags=tags)
+                                           exclude_categories=categories, exclude_tags=tags)
             assert backtester._live_filter_text(categories, tags) == \
                 config.describe_trade_filter(settings)
 

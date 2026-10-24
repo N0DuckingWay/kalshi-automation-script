@@ -24,15 +24,16 @@
 // window.open records each call — {url, target, features} — in __opened and
 // opens nothing (it returns null, as a "noopener" open does).
 //
-// Check-box menus (page.menus): the filter bar's Category and Tag menus,
-// each a <details> element of check boxes (__menu below). A ["tick", id] step
-// is a reader clicking a box: it flips, and its change event runs the box's
-// listeners and then the menu's, unless the box is disabled. ["open", id]
-// opens a menu, ["outside", id] is a click somewhere on the page (on the
-// element named, or on nothing a script knows when id is ""), and ["key",
-// name] a key pressed, both handed to the listeners the script put on the
-// document. A snapshot's "menus" holds each menu's button text, whether it
-// is open, its class, and each row's text, tick and whether it is hidden.
+// Check-box menus (page.menus): the filter bar's Exclude categories and
+// Exclude tags menus, each a <details> element of check boxes (__menu below). A ["tick",
+// id] step is a reader clicking a box: it flips, and its change event runs
+// the box's listeners and then the menu's, unless the box is disabled.
+// ["open", id] opens a menu, ["outside", id] is a click somewhere on the
+// page (on the element named, or on nothing a script knows when id is ""),
+// and ["key", name] a key pressed, both handed to the listeners the script
+// put on the document. A snapshot's "menus" holds each menu's button text,
+// whether it is open, its class, and each row's text, tick and whether it is
+// hidden.
 //
 // Strict mode (page.strict): getElementById returns null for an id the page
 // does not hold, as a browser's does, so a script that dereferences a missing
@@ -155,18 +156,19 @@ function __select(id, spec) {
   return el;
 }
 
-// A check-box menu (the filter bar's Category and Tag menus: a <details>
-// element) with the boxes, texts and attributes Python rendered: its button
-// (<summary>, "<id>-label"), the box that clears it ("<id>-all") and, per
+// A check-box menu (the filter bar's Exclude categories and Exclude tags menus: a
+// <details> element) with the boxes, texts and attributes Python rendered:
+// its button (<summary>, "<id>-label"), its "All" box ("<id>-all") and, per
 // row i, the box ("<id>-<i>"), its text ("<id>-<i>-text") and the row itself
 // ("<id>-<i>-row", which a script hides). A box has "checked" and "disabled";
 // a change event on a box runs the box's own listeners and then the menu's
 // (it bubbles), each handed {target: the box}. The menu answers
-// querySelectorAll with its boxes (the clearing box first) and contains()
-// for itself and its parts. For the tests' sake it also reads like a
-// <select>: "disabled" is its clearing box's, and "value" is the ticked row
-// indexes joined by commas ("" for none) — setting it ticks exactly those
-// rows, as a browser restoring a reader's old ticks would.
+// querySelectorAll with its boxes (the "All" box first) and contains() for
+// itself and its parts. For the tests' sake it also reads like a <select>:
+// "disabled" is its "All" box's, and "value" is the ticked row indexes
+// joined by commas ("" for none) — setting it ticks exactly those rows, as a
+// browser restoring a reader's old ticks would, and leaves the "All" box
+// unticked.
 var __MENUS = {};
 function __checkbox(id, spec) {
   var el = __element(id, 'input');
@@ -213,7 +215,7 @@ function __menu(id, spec) {
     set: function(v) {
       var wanted = String(v) === '' ? [] : String(v).split(',');
       rows.forEach(function(r, i) { r.box.checked = wanted.indexOf(String(i)) >= 0; });
-      all.checked = !wanted.length;
+      all.checked = !!spec.all.checked && !wanted.length;
     }
   });
   __MENUS[id] = {el: el, label: label, all: all, allText: spec.all.text, rows: rows};
@@ -458,10 +460,10 @@ function __snapshot() {
   __updates = [];
   __opened = [];
   // Each check-box menu: its button's text, whether it is open, greyed
-  // (className) and disabled, whether its clearing box is ticked, the row
+  // (className) and disabled, whether its "All" box is ticked, the row
   // indexes ticked, and every row as [text, ticked, hidden] — and, read as a
   // select, its value (the ticked indexes, comma-joined) and its options
-  // (the clearing box, then the rows not hidden)
+  // (the "All" box, then the rows not hidden)
   Object.keys(__MENUS).forEach(function(id) {
     var m = __MENUS[id], ticked = [], options = [['', m.allText]];
     m.rows.forEach(function(r, i) {

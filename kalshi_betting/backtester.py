@@ -4112,11 +4112,12 @@ class BacktestSweep:
             hand-built sweep.
         live_spread_band (tuple[float, float] | None): The saved live
             defaults' spread_band.
-        live_categories (tuple[str, ...] | None): The saved live defaults'
-            categories; None means any category when live_tier_floors is
-            recorded.
-        live_tags (tuple[str, ...] | None): The saved live defaults' tags,
-            likewise.
+        live_exclude_categories (tuple[str, ...] | None): The saved live
+            defaults' exclude_categories; None means no category is excluded
+            when live_tier_floors is recorded.
+        live_exclude_tags (tuple[str, ...] | None): The saved live defaults'
+            exclude_tags; None means no tag is excluded when live_tier_floors
+            is recorded.
         live_origin (str | None): Where the saved live defaults were read
             (LiveSettings.origin: the file, when and from what it was saved),
             from the same read; reporting only.
@@ -4203,8 +4204,8 @@ class BacktestSweep:
     same_title_size_cap: float | None = None
     live_tier_floors: bool | None = None
     live_spread_band: tuple[float, float] | None = None
-    live_categories: tuple[str, ...] | None = None
-    live_tags: tuple[str, ...] | None = None
+    live_exclude_categories: tuple[str, ...] | None = None
+    live_exclude_tags: tuple[str, ...] | None = None
     entry_checkpoint: str | None = None
     live_origin: str | None = None
     live_interval_discount: float | None = None
@@ -10853,7 +10854,7 @@ def _live_rule_fields(live: LiveSettings | None) -> dict:
     if live is None:
         return {}
     return {"live_tier_floors": live.tier_floors, "live_spread_band": live.spread_band,
-            "live_categories": live.categories, "live_tags": live.tags,
+            "live_exclude_categories": live.exclude_categories, "live_exclude_tags": live.exclude_tags,
             "live_origin": live.origin, "live_interval_discount": live.interval_discount,
             "live_size_cap": live.size_cap,
             "live_same_title_size_cap": live.same_title_size_cap,
@@ -10972,8 +10973,8 @@ def _live_sell_note(sweep: BacktestSweep) -> str:
             "which this run's primary does not")
 
 
-def _live_filter_text(categories: tuple[str, ...] | None,
-                      tags: tuple[str, ...] | None) -> str:
+def _live_filter_text(exclude_categories: tuple[str, ...] | None,
+                      exclude_tags: tuple[str, ...] | None) -> str:
     """
     Name a recorded category/tag filter as config.describe_trade_filter does.
 
@@ -10981,13 +10982,15 @@ def _live_filter_text(categories: tuple[str, ...] | None,
     equal by tests/test_backtester.py::TestLiveRuleLine).
 
     Args:
-        categories (tuple[str, ...] | None): BacktestSweep.live_categories.
-        tags (tuple[str, ...] | None): BacktestSweep.live_tags.
+        exclude_categories (tuple[str, ...] | None):
+            BacktestSweep.live_exclude_categories.
+        exclude_tags (tuple[str, ...] | None): BacktestSweep.live_exclude_tags.
 
     Returns:
-        str: e.g. "categories Economics, Sports; tags any".
+        str: e.g. "exclude categories Politics, Sports; exclude tags none".
     """
-    return f"categories {_names_text(categories)}; tags {_names_text(tags)}"
+    return (f"exclude categories {_names_text(exclude_categories)}; "
+            f"exclude tags {_names_text(exclude_tags)}")
 
 
 # _LiveRuleView.where: this run's primary scenario holds the saved live
@@ -11072,10 +11075,18 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
     Word the "Live time-series rule (saved live defaults): ..." log line from a built sweep.
 
     Always a line, so a report never silently omits the live rule: with none
-    recorded it says so (_LIVE_RULE_NONE). A recorded rule's line ends with
-    _live_sizing_note when the saved defaults size differently from this
-    run's primary, then _live_rebalance_note and _live_sell_note when they
-    rebalance held pairs or sell.
+    recorded it says so (_LIVE_RULE_NONE). A recorded rule's line reads
+    "<rule>[; category/tag filter (...)] — <where>", then, in this order,
+    [; <filter-bar clause>] for a saved category/tag filter (what the
+    filter bar's Exclude categories and Exclude tags menus tick to show it:
+    the categories it excludes and any other in which it keeps no pair, and
+    the tags it leaves out of each category it keeps only in part; the page's
+    own Live rule line names the boxes), [; <ladder note>] when the run's
+    ladder switch departs from config.py's, _live_sizing_note when the saved
+    defaults size differently from this run's primary, then
+    _live_rebalance_note and _live_sell_note when they rebalance held pairs
+    or sell. A rule this run did not simulate has no filter-bar clause or
+    ladder note.
 
     Args:
         sweep (BacktestSweep): The run's sweep.
@@ -11088,10 +11099,10 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
         return f"Live time-series rule: {_LIVE_RULE_NONE}"
     prefix = f"Live time-series rule ({_LIVE_RULE_LABEL}): "
     rule = describe_time_series_rule(sweep.live_tier_floors, sweep.live_spread_band)
-    categories, tags = sweep.live_categories, sweep.live_tags
-    filtered = categories is not None or tags is not None
+    excluded, tags = sweep.live_exclude_categories, sweep.live_exclude_tags
+    filtered = excluded is not None or tags is not None
     if filtered:
-        rule += f"; category/tag filter ({_live_filter_text(categories, tags)})"
+        rule += f"; category/tag filter ({_live_filter_text(excluded, tags)})"
     if view.where == _LIVE_RULE_NOT_SIMULATED:
         return (f"{prefix}{rule} — not simulated by this run{_live_sizing_note(sweep)}"
                 f"{_live_rebalance_note(sweep)}{_live_sell_note(sweep)}")
@@ -11111,10 +11122,14 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
                 "which the dashboard's filter bar shows")
         subject = "that scenario"
     if filtered:
-        # Only the page knows which boxes its menus offer, so it names them
+        # This line names no box: only the page knows which its menus offer, so
+        # its own Live rule line names the categories to tick and the tags
         tail += ("; the dashboard's filter bar shows the live category/tag filter of "
-                 f"{subject} when its Category and Tag menus tick the categories and tags "
-                 "the filter lists (each offered where this run filed a pair under it)")
+                 f"{subject} when its Exclude categories menu ticks the categories the "
+                 "filter excludes and every other category in which it keeps none of "
+                 "this run's pairs and, in each category the filter keeps only in part, "
+                 "its Exclude tags menu ticks the tags the filter leaves out (the page's "
+                 "Live rule line names them)")
     return (f"{prefix}{rule} — {tail}{_live_rule_ladder_note(sweep)}"
             f"{_live_sizing_note(sweep)}{_live_rebalance_note(sweep)}{_live_sell_note(sweep)}")
 
@@ -12137,7 +12152,7 @@ def _simulate_at_discount(
     settings = LiveSettings(
         tier_floors=tier_floors is not False, spread_band=(band_lo, band_hi),
         interval_discount=effective_k, size_cap=cap, same_title_size_cap=st_cap,
-        categories=None, tags=None, rebalance=bool(add_to_held or trim_to_kelly))
+        exclude_categories=None, exclude_tags=None, rebalance=bool(add_to_held or trim_to_kelly))
 
     # ── Pass 1b: score the prepared entries and keep the tradeable ones ──
     candidates = []
