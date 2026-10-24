@@ -11169,7 +11169,8 @@ class TestAddToALoneLeg:
     remaining leg is a lone leg, as live's scanner.held_pairs finds it: a new
     pair buying the side held on that market, beside a market no open trade
     holds, may add to it, sized by config.held_pair_fraction with that leg
-    alone as the stake (its value plus its fee). Another open trade on a
+    alone as the stake (the larger of what it paid and its value, each with
+    its fee). Another open trade on a
     ladder of either market refuses it, and so does buying the held market
     on its other side. Figures are at pre_toggle_defaults."""
 
@@ -11207,6 +11208,28 @@ class TestAddToALoneLeg:
         assert stake < first.total_cost + first.fees
         assert self._lines(caplog, _ADD_ON_LINE) == [
             _ADD_ON_LINE + "k=0.850, band 0-1, all, adding to held pairs): 1"]
+
+    def test_a_leg_that_lost_value_counts_at_what_it_paid(self):
+        # The same P and Q, quoted: PB's NO ask falls from 0.55 (what P paid)
+        # to 0.30 by Monday 2. The lone leg counts at the larger of what it
+        # paid and its worth, each with its fee: here what it paid, as live's
+        # HeldPair.stake_dollars counts it
+        p, q = self._held_and_new()
+        candles = {"PA": [_candle(_ck(_LADDER_M1), 0.20, 0.80)],
+                   "PB": [_candle(_ck(_LADDER_M1), 0.45, 0.55),
+                          _candle(_ck(_LADDER_M2), 0.70, 0.30)],
+                   "QA": [_candle(_ck(_LADDER_M2), 0.20, 0.80)]}
+        on = self._sim(_quoted([p, q], candles), k=0.85, add_to_held=True)
+        assert _traded(on) == [("PA", _LADDER_M1), ("QA", _LADDER_M2)]
+        first, add = on.trades
+        assert add.add_on and first.entry_nB == 0.55
+        fee = fee_leg_exact(first.n, first.entry_nB)
+        paid, worth = first.n * 0.55 + fee, first.n * 0.30 + fee
+        f_q = _uncapped_kelly({"pair_type": "time_series", "entry": q["entry"]}, 0.85)
+        assert add.kelly_fraction == pytest.approx(
+            held_pair_fraction(f_q, paid, add.balance_at_entry), abs=1e-12)
+        # Not vacuous: counted at its worth it would have added more
+        assert held_pair_fraction(f_q, worth, add.balance_at_entry) > add.kelly_fraction + 1e-4
 
     def test_the_leg_is_not_lone_while_its_partner_is_open(self):
         # PA pays out with PB: on Monday 2 the pair is still whole, so Q,
@@ -21890,8 +21913,9 @@ class TestTrimMinMove:
 
     def test_an_add_on_moves_the_price_the_next_move_is_measured_from(self):
         # TestTrimToKelly's add-on fixture: bought on Monday 1 (total ask
-        # 0.62), added to on Monday 2 when its price falls (0.52), then up on
-        # Monday 3 (0.96) and Monday 4 (1.00)
+        # 0.62), added to on Monday 2, when its price is down (0.52) and its
+        # wider quotes ask Kelly for more, then up on Monday 3 (0.96) and
+        # Monday 4 (1.00)
         candles = {"SA": [_candle(_ck(_LADDER_M1), 0.20, 0.82), *_held(_LADDER_M2, 0.15, 0.87),
                           *_held(_LADDER_M3, 0.34, 0.68), *_held(_M4, 0.36, 0.66)],
                    "SB": [_candle(_ck(_LADDER_M1), 0.60, 0.42), *_held(_LADDER_M2, 0.65, 0.37),
@@ -21900,7 +21924,8 @@ class TestTrimMinMove:
 
         # At a 25% cap, where Monday 1 buys Kelly's whole share (about 0.19)
         # and Monday 2's wider quotes ask for more, so the pair is added to
-        # though its price fell (counted at its cost, the fall alone adds nothing)
+        # though its price fell (it counts at its cost: its loss makes no room
+        # by itself)
         def run(**kw):
             return self._sim(self._records(mondays, candles), cap=0.25, add_to_held=True, **kw)
         bought, added = self._plain(self._records(mondays, candles), cap=0.25,
@@ -22287,8 +22312,10 @@ class TestMoveGrid:
 
     @staticmethod
     def _add_on_entries() -> list[dict]:
-        # Bought on Monday 1 (total ask 0.62), added to on Monday 2 when its
-        # price falls (0.52), then up on Monday 3 (0.96) and Monday 4 (1.00)
+        # Bought on Monday 1 (total ask 0.62), added to on Monday 2 (at a cap
+        # above Kelly's Monday 1 share), when its price is down (0.52) and its
+        # wider quotes ask Kelly for more, then up on Monday 3 (0.96) and
+        # Monday 4 (1.00)
         candles = {"SA": [_candle(_ck(_LADDER_M1), 0.20, 0.82), *_held(_LADDER_M2, 0.15, 0.87),
                           *_held(_LADDER_M3, 0.34, 0.68), *_held(_M4, 0.36, 0.66)],
                    "SB": [_candle(_ck(_LADDER_M1), 0.60, 0.42), *_held(_LADDER_M2, 0.65, 0.37),
@@ -22409,7 +22436,7 @@ class TestMoveGrid:
         # At a 25% cap, Monday 1 buys Kelly's whole share (about 0.19) and
         # Monday 2's wider spread asks for more (about 0.21), so with no
         # minimum the pair is added to on Monday 2, after a 10c fall (the
-        # pair counts at its cost, so the fall alone would add nothing), then
+        # pair counts at its cost, so its loss makes no room by itself), then
         # trimmed 44c above that add-on and again 4c above that trim: the
         # record holds the add-on's move first. At 5c the second trim is held
         # back; 10c lets through all that the 5c run made (the add-on's 10c

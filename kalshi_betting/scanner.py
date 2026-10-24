@@ -859,7 +859,8 @@ class HeldPair:
             leg.
         count (float): Contracts held on each market.
         cost_dollars (float): The held markets' exposure plus fees paid: what
-            the account paid for them, named in the logs.
+            the account paid for them, named in the logs. The stake is at
+            least this.
         value_dollars (float): The held markets' worth at today's prices, fees
             left out: each market's contracts times the ask of the side held
             there (its exposure when the market has no usable ask this run).

@@ -11744,8 +11744,10 @@ def _held_pair(c: dict, worth: float, trades: list[BacktestTrade],
     compute_trade and the cash walk's at-cap check read only its stake
     (HeldPair.stake_dollars, the live rule): the larger of what the held
     trades cost with their fees (cost_dollars) and their worth at market plus
-    those fees (carried here as value_dollars, with fees_dollars 0). For a
-    lone leg both figures are that one leg's alone.
+    those fees (carried here as value_dollars, with fees_dollars 0, so the
+    DEBUG "not adding" line compute_trade may log names fees of $0.00 beside a
+    worth that holds them). For a lone leg both figures are that one leg's
+    alone.
 
     Args:
         c (dict): The add-on's candidate.

@@ -4396,8 +4396,8 @@ class TestRunProdAddsToHeldPairs:
     listing or lookup it cannot trust means no add-on and one WARNING naming
     why; a held pair with no room even at the per-trade cap is left out, so
     its group's other pair can still trade. The whole position is the held
-    pair's stake (its worth at today's prices plus the fees paid for it) plus
-    the new stake, weighed against the portfolio value (the cash plus
+    pair's stake (the larger of its cost and its worth at today's prices,
+    each with the fees paid for it) plus the new stake, weighed against the portfolio value (the cash plus
     Kalshi's value of the open positions), so a run that could not count that
     value adds to nothing either."""
 
