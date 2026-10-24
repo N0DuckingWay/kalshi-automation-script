@@ -1570,7 +1570,10 @@ tag but Hockey — what the flags `--exclude-category Politics --exclude-tag
 "Sports · Hockey"` above trade — and "Save as live defaults…" sends exactly
 those ticks as the live exclusions (`exclude_category=Politics&exclude_tag=Sports
 · Hockey`). It stays disabled while the ticks keep no trade of the scenario
-shown, would send a name the server refuses (a name reading any or none, or a
+shown, would tick every tag of a category while a category whose name
+differs from it only in letter case still keeps a tag (a live filter reads the
+two as one category, so it could not leave out the first whole), would send a
+name the server refuses (a name reading any or none, or a
 tag of a category whose name holds " · ", which a live filter would read as
 another category and tag), or would make a link the server does not take
 (more than 400 excluded categories or 400 excluded tags, letter-case twins

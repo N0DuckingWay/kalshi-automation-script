@@ -6535,7 +6535,7 @@ class TestFilterSummary:
                          # The menus' and a mix's words, and the save button's
                          # reasons while the ticks stop a save
                          "D.text.save_all_excluded", "D.text.save_too_long",
-                         "D.text.save_refused", "T.none_kept",
+                         "D.text.save_refused", "D.text.save_twin_split", "T.none_kept",
                          "T.mix_note", "D.text.mix_unavailable", "D.text.mix_still_all",
                          "D.text.mix_still", "D.text.mix_still_at", "T.names_join",
                          "T.names_more", "T.sel_none", "T.sel_only", "T.sel_excluded",
@@ -8226,6 +8226,7 @@ class TestSaveLiveDefaultsButton:
         for words in (dashboard._SAVE_LABEL, dashboard._SAVE_TITLE, dashboard._SAVE_NOTE,
                       dashboard._SAVE_BLOCKED_TEXT["save_all_excluded"],
                       dashboard._SAVE_BLOCKED_TEXT["save_refused"],
+                      dashboard._SAVE_BLOCKED_TEXT["save_twin_split"],
                       data["text"]["save_too_long"]):
             assert words not in dashboard._FILTER_JS
         # The too-long text states the very limits the page ships, which the
@@ -18366,6 +18367,7 @@ def _save_lists(kept_cats: list[int], tags: list[int], series: dict = _MIX_SERIE
     ticked with it) — but only with its letter-case twins, each not kept or
     with every tag ticked too — as excluded categories; every other tag
     ticked, as "Category · Tag", as an excluded tag. Both in the menus' order.
+    The button sends nothing while _save_split holds (saveLists' split).
 
     Returns:
         tuple: (the categories' names, the tags as "Category · Tag").
@@ -18386,6 +18388,26 @@ def _save_lists(kept_cats: list[int], tags: list[int], series: dict = _MIX_SERIE
     names = [categories[c] for c in sorted(sent)]
     return names, [config.TAG_SCOPE_SEPARATOR.join(subcats[t]) for t in sorted(closed)
                    if subcats[t][0] not in names]
+
+
+def _save_split(kept_cats: list[int], tags: list[int], series: dict = _MIX_SERIES) -> bool:
+    """Whether the save button stays shut for a set of ticks because a kept
+    category has every tag ticked (a tag's letter-case twins ticked with it)
+    while a letter-case twin of it still keeps a tag (the page's saveLists'
+    split): the page shows the first left out, but the live filter reads the
+    two as one category and could not leave it out whole. Worked out here on
+    its own."""
+    categories, subcats = _mix_axes(series)
+    closed = set(_with_case_twins(tags, series))
+
+    def whole(c: int) -> bool:
+        own = [si for si, (name, _) in enumerate(subcats) if name == categories[c]]
+        return c not in kept_cats or (bool(own) and all(si in closed for si in own))
+
+    return any(c in kept_cats and whole(c)
+               and not all(whole(g) for g, name in enumerate(categories)
+                           if name.casefold() == categories[c].casefold())
+               for c in range(len(categories)))
 
 
 def _mix_kept(kept_cats: list[int], tags: list[int], series: dict = _MIX_SERIES):
@@ -19613,9 +19635,9 @@ class TestMixedSelection:
         # so the button sends it as an excluded category, not its tags one by
         # one: a tag of it the backtest never saw must not trade live either.
         # With a namesake in other letter case it goes only when the namesake
-        # is out too (here, ticking Flu ticks health's Flu with it, but
-        # health's Cold stays), as the live filter reads the two as one.
-        # Part of a category's tags goes as tags
+        # is out too, as the live filter reads the two as one (the button
+        # stays shut while the namesake keeps a tag: the next test). Part of
+        # a category's tags goes as tags
         series = {"KXH0": ("Health", ("Flu",)), "KXH1": ("health", ("Flu",)),
                   "KXH2": ("health", ("Cold",)), "KXS0": ("Sports", ("Golf",)),
                   "KXS1": ("Sports", ("Tennis",)), "KXE0": ("Economy", ("Jobs",))}
@@ -19626,7 +19648,6 @@ class TestMixedSelection:
             "sports": ([index[("Sports", "Golf")], index[("Sports", "Tennis")]],
                        ["Sports"], []),
             "golf": ([index[("Sports", "Golf")]], [], ["Sports · Golf"]),
-            "flu": ([index[("Health", "Flu")]], [], ["Health · Flu", "health · Flu"]),
             "flu_cold": ([index[("Health", "Flu")], index[("health", "Cold")]],
                          ["Health", "health"], []),
         }
@@ -19646,11 +19667,59 @@ class TestMixedSelection:
             # The tests' own reading of the rule agrees
             assert _save_lists(list(range(len(categories))), tags, series) \
                 == (want_cats, want_tags), name
+            assert not _save_split(list(range(len(categories))), tags, series), name
             settings, _ = defaults_server._proposal(defaults_server._params(query), None)
             keeps = config.trade_filter(settings)
             for category in categories:
                 shown_out = category in want_cats
                 assert keeps(category, "A tag never seen") is not shown_out, (name, category)
+
+    def test_every_tag_ticked_while_a_case_twin_keeps_one_shuts_the_button(
+            self, monkeypatch, tmp_path):
+        # Ticking Flu ticks health's Flu with it, so Health has every tag
+        # ticked and is shown left out, while health keeps its Cold. The live
+        # filter reads Health and health as one category, so it cannot leave
+        # out Health without health: saving Health's tags one by one would
+        # let a Health tag the backtest never saw trade live. The button
+        # stays shut, saying why in Python's words, until the reader ticks
+        # Cold too (both go whole) or ticks the category itself
+        series = {"KXH0": ("Health", ("Flu",)), "KXH1": ("health", ("Flu",)),
+                  "KXH2": ("health", ("Cold",)), "KXS0": ("Sports", ("Golf",)),
+                  "KXS1": ("Sports", ("Tennis",)), "KXE0": ("Economy", ("Jobs",))}
+        categories, pairs = _mix_axes(series)
+        index = {pair: i for i, pair in enumerate(pairs)}
+        flu, cold = index[("Health", "Flu")], index[("health", "Cold")]
+        health = categories.index("Health")
+        page = _mix_page(monkeypatch, tmp_path, _counted_trades(series), series=series)
+        data = TestFilterPage._data(page)
+        why = data["text"]["save_twin_split"]
+        assert why == dashboard._SAVE_BLOCKED_TEXT["save_twin_split"]
+        assert why not in dashboard._FILTER_JS
+        everything = list(range(len(categories)))
+        cases = {"flu": ([], [flu], False), "flu_cold": ([], [flu, cold], True),
+                 "category": ([health], [], True),
+                 "flu_golf": ([], [flu, index[("Sports", "Golf")]], False)}
+        steps = [["wait"]]
+        for name, (cats, tags, _) in cases.items():
+            steps += [*_clear_menus(), *(_tick_category(c) for c in cats),
+                      *(_tick_tag(t) for t in tags), ["settle"], ["click", "flt-save"],
+                      ["snap", name]]
+        snaps = _run_script(tmp_path, page, steps, strict=True)
+        for name, (cats, tags, opens) in cases.items():
+            snap = snaps[name]
+            kept = [c for c in everything if c not in cats]
+            # The tests' own reading of the rule agrees
+            assert _save_split(kept, tags, series) is not opens, name
+            assert snap["buttons"]["flt-save"] is not opens, name
+            assert snap["titles"]["flt-save"] == (dashboard._SAVE_TITLE if opens else why), name
+            if not opens:
+                assert snap["opened"] == [], name
+                continue
+            [opened] = snap["opened"]
+            sent = parse_qs(opened["url"].partition("?")[2], strict_parsing=True)
+            assert sent.get("exclude_category", []) == ["Health", "health"], name
+        # The page shows Health left out while it is shut
+        assert "Health" in snaps["flu"]["text"]["flt-summary"]
 
     def test_a_save_is_a_fixed_point_of_the_header(self, monkeypatch, tmp_path):
         # Whatever a reader ticks, saving it and then doing what the page's

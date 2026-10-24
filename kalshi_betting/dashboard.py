@@ -7429,9 +7429,12 @@ def _filter_save_note(exclusions: tuple[str, ...] | list[str] | None,
 # script shows it in place of _SAVE_TITLE and puts _SAVE_TITLE back once the
 # reason is gone): ticks that keep none of the scenario's trades (every
 # category, say), which shows no trade; or a name the defaults server would
-# refuse as a live exclusion (_save_refused). The third reason, more names or
-# a longer address than the server takes in one link, is worded from the
-# page's own limits (_save_too_long_text)
+# refuse as a live exclusion (_save_refused); or every tag of a category
+# ticked while a category whose name differs from it only in letter case
+# still keeps a tag, which the page shows left out but a live filter, reading
+# the two as one category, cannot leave out whole (saveLists' split). The
+# fourth reason, more names or a longer address than the server takes in one
+# link, is worded from the page's own limits (_save_too_long_text)
 _SAVE_BLOCKED_TEXT = {
     "save_all_excluded": ("Cannot save while the categories and tags kept hold no trade "
                           "of this scenario: this view shows no trade, and live runs would "
@@ -7442,6 +7445,13 @@ _SAVE_BLOCKED_TEXT = {
                      f"category whose name holds “{TAG_SCOPE_SEPARATOR.strip()}”, which a "
                      "live filter reads as a category and a tag, or a name it cannot show as "
                      "typed). Untick it to save."),
+    "save_twin_split": ("Cannot save these ticks: every tag of a category is ticked while a "
+                        "category whose name differs from it only in letter case still "
+                        "keeps a tag. Live runs read the two names as one category, so they "
+                        "cannot leave out the first without the second, and a tag of it "
+                        "this backtest never saw would trade. Tick it in the "
+                        f"{_MENU_CAT_LABEL} menu, which leaves out both, or untick one of its "
+                        "tags, to save."),
 }
 
 
@@ -13062,12 +13072,15 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     page for that scenario in a new tab, naming each category excluded
     (one with every tag ticked included) and each other tag ticked. Its
     hover text is _SAVE_TITLE on every page; while the categories and tags
-    kept hold no trade of the scenario shown, while a name it would send is
-    one the defaults server refuses (_save_refused), or while the ticks
-    would name more, or make a longer address, than the server takes in one
-    link, the button stays disabled and the script shows
-    _SAVE_BLOCKED_TEXT["save_all_excluded"] or ["save_refused"], or the
-    save_too_long text (_save_too_long_text), in its place. On a page with
+    kept hold no trade of the scenario shown, while every tag of a category
+    is ticked but a letter-case twin of it still keeps a tag (the live
+    filter reads the two as one category, so it could not leave out the
+    first whole), while a name it would send is one the defaults server
+    refuses (_save_refused), or while the ticks would name more, or make a
+    longer address, than the server takes in one link, the button stays
+    disabled and the script shows _SAVE_BLOCKED_TEXT["save_all_excluded"],
+    ["save_twin_split"] or ["save_refused"], or the save_too_long text
+    (_save_too_long_text), in its place. On a page with
     the Rebalance view whose saved live defaults rebalance
     (save["live_rebalances"]), a grey note (_REBALANCE_SAVE_NOTE) follows
     the button: saving with Rebalance no turns that off.
@@ -13513,12 +13526,14 @@ def _pack_text(raw: str) -> str:
 # each category excluded — a category with every tag ticked included — as
 # exclude_category and each other tag ticked as exclude_tag: saveLists). The
 # button stays disabled while the categories and tags kept hold no trade of
-# the scenario shown, while it would send a name the defaults server refuses
-# (D.save_refused), or while the ticks would name more, or make a longer
-# address or posted form, than the server takes in one link
-# (saveBlockedByTicks); its words are Python's, its hover text too, which
-# reads as Python rendered it except while a tick is what stops a save
-# (D.text.save_all_excluded, D.text.save_refused, D.text.save_too_long). On
+# the scenario shown, while every tag of a category is ticked but a
+# letter-case twin of it still keeps a tag (saveLists' split), while it would
+# send a name the defaults server refuses (D.save_refused), or while the
+# ticks would name more, or make a longer address or posted form, than the
+# server takes in one link (saveBlockedByTicks); its words are Python's, its
+# hover text too, which reads as Python rendered it except while a tick is
+# what stops a save (D.text.save_all_excluded, D.text.save_twin_split,
+# D.text.save_refused, D.text.save_too_long). On
 # load it inflates the base
 # block and the primary
 # scenario's chunk, sets the bar back to the view Python rendered and enables
@@ -13806,7 +13821,11 @@ _FILTER_JS = r"""
   // backtest never saw must not trade either — but only with its letter-case
   // twins (CAT_TWINS, one category to the live filter), each of which must be
   // ticked or have every tag ticked too. Every other tag ticked goes as a tag.
-  // The page's twin of the tests' _save_lists.
+  // split is true when a kept category has every tag ticked but a twin of it
+  // still keeps a tag: the page shows it left out, yet the live filter, for
+  // which the twins are one category, could not leave it out whole, so a tag
+  // of it this backtest never saw would trade (saveBlockedByTicks then stops
+  // the save). The page's twin of the tests' _save_lists and _save_split.
   function saveLists(excluded, tags) {
     function whole(c) {
       if (excluded.indexOf(c) >= 0) { return true; }
@@ -13816,16 +13835,18 @@ _FILTER_JS = r"""
       });
       return own > 0 && ticked === own;
     }
-    var cats = excluded.slice();
+    var cats = excluded.slice(), split = false;
     D.categories.forEach(function(_, c) {
       if (cats.indexOf(c) >= 0) { return; }
       var group = [c].concat(CAT_TWINS[c] || []);
       if (group.every(whole)) {
         group.forEach(function(g) { if (cats.indexOf(g) < 0) { cats.push(g); } });
+      } else if (whole(c)) {
+        split = true;
       }
     });
     cats.sort(ascending);
-    return {cats: cats, tags: tags.filter(function(i) {
+    return {cats: cats, split: split, tags: tags.filter(function(i) {
       return cats.indexOf(D.subcats[i][0]) < 0;
     }).sort(ascending)};
   }
@@ -13850,7 +13871,10 @@ _FILTER_JS = r"""
   // scenario's trades (D.text.save_all_excluded) — every category left out,
   // every tag of those kept ticked, or every category and tag with a trade
   // here — a view with no trade at all, whose save would trade only
-  // categories and tags this backtest gave no trade to; a name the defaults
+  // categories and tags this backtest gave no trade to; every tag of a
+  // category ticked while a letter-case twin of it keeps a tag (saveLists'
+  // split, D.text.save_twin_split), which the page shows left out but the
+  // live filter could not leave out whole; a name the defaults
   // server would refuse among those sent (D.save_refused,
   // D.text.save_refused); or ticks it would not take in one link
   // (D.text.save_too_long): too many categories, or too many tags, for it
@@ -13863,6 +13887,7 @@ _FILTER_JS = r"""
       return D.text.save_all_excluded;
     }
     var sent = saveLists(SHOWN[3], SHOWN[4]), refused = D.save_refused;
+    if (sent.split) { return D.text.save_twin_split; }
     if (refused && (sent.cats.some(function(c) { return refused.categories.indexOf(c) >= 0; })
                     || sent.tags.some(function(t) { return refused.tags.indexOf(t) >= 0; }))) {
       return D.text.save_refused;

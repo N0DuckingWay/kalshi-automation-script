@@ -5021,8 +5021,8 @@ class TestCategoriesRetirement:
         record["settings"]["categories"] = None
         err = _outdated(_text(record))
         assert err.proposal is None
-        assert "and its other settings are refused too (it also holds exclude_categories)" \
-            in str(err)
+        assert ("and its other settings are refused too (it also holds exclude_categories, "
+                "which no version saved beside categories)") in str(err)
 
     def test_the_rebalance_conflict_applies_only_to_the_rebalance_settings(self):
         # A file of the version before this one holds rebalance beside categories:
@@ -5150,8 +5150,43 @@ class TestTagsRetirement:
         record["settings"]["tags"] = None
         err = _outdated(_text(record))
         assert err.proposal is None
-        assert "and its other settings are refused too (it also holds exclude_tags)" \
-            in str(err)
+        assert ("and its other settings are refused too (it also holds exclude_tags, "
+                "which no version saved beside tags)") in str(err)
+
+    @pytest.mark.parametrize("null", [True, False])
+    def test_categories_beside_exclude_tags_is_refused_with_no_proposal(self, null):
+        # No version saved categories (the oldest filter) beside exclude_tags,
+        # as none saved tags beside exclude_tags: such a file says two things
+        # at once and is offered nothing, whatever its categories says
+        record = _with_toggles(exclude_tags=["Sports · Basketball"])
+        record["settings"]["categories"] = None if null else ["Sports"]
+        del record["settings"]["exclude_categories"]
+        err = _outdated(_text(record))
+        assert err.retired == ("categories",)
+        assert err.proposal is None and err.old_categories is None
+        assert ("and its other settings are refused too (it also holds exclude_tags, "
+                "which no version saved beside categories)") in str(err)
+
+    def test_every_filter_era_a_version_saved_still_has_its_proposal(self):
+        # categories beside tags (the oldest filter): both retirements
+        record = json.loads(_OLD_VERSION_BYTES)
+        record["settings"]["categories"] = ["Sports"]
+        record["settings"]["tags"] = ["Basketball"]
+        err = _outdated(_text(record))
+        assert err.retired == ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise",
+                               "categories", "tags")
+        assert err.proposal is not None
+        assert err.old_categories == ("Sports",) and err.old_tags == ("Basketball",)
+        # exclude_categories beside tags (the version before this one)
+        err = _outdated(self._with_tags(b'["Basketball"]', exclude_categories=["Politics"]))
+        assert err.retired == ("tags",)
+        assert err.proposal.exclude_categories == ("Politics",)
+        assert err.old_tags == ("Basketball",)
+        # The Rebalance settings are not part of the filter: beside this
+        # version's filter keys they still read as saved
+        err = _outdated(_text(_with_toggles(add_to_held_pairs=True, trim_to_kelly=True,
+                                            exclude_tags=["Sports · Basketball"])))
+        assert err.proposal.exclude_tags == ("Sports · Basketball",)
 
     def test_one_save_of_the_proposal_replaces_the_file(self):
         proposal = _outdated(self._with_tags(b'["Basketball"]')).proposal

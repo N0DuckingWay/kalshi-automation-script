@@ -3435,6 +3435,19 @@ _RETIREMENTS = (
     (("categories",), "exclude_categories"),
     (("tags",), "exclude_tags"),
 )
+# The category/tag filter's keys that each retired filter key was saved beside
+# by some version: categories (the oldest filter) only beside tags, never
+# beside exclude_categories or exclude_tags; tags beside categories, and beside
+# exclude_categories (the version that excluded categories but still listed
+# tags to trade), never beside exclude_tags. A file holding a retired filter
+# key beside a key of the new filter that no version saved with it says two
+# things at once and gets no proposal (_retired_proposal). The Rebalance
+# settings are not part of the filter: whatever filter keys sit beside them
+# are read as saved.
+_RETIRED_FILTER_COMPANIONS = {
+    "categories": (),
+    "tags": ("exclude_categories",),
+}
 
 # The values `python3 -m kalshi_betting.defaults_server --seed` offers for a
 # first save of the live defaults: tier floors off, spread band 0-0.5, k 0.80,
@@ -3893,21 +3906,27 @@ def _retired_proposal(raw: dict, origin: str
     Raises:
         ValueError: The old values, or the rest of the settings, are refused;
             or the object also holds the settings that replaced a retired one
-            (rebalance or min_price_move beside the Rebalance ones,
-            exclude_categories beside categories, exclude_tags beside tags), so
+            (rebalance or min_price_move beside the Rebalance ones), or a key
+            of the new category/tag filter that no version saved beside a
+            retired filter key (_RETIRED_FILTER_COMPANIONS: exclude_categories
+            or exclude_tags beside categories, exclude_tags beside tags), so
             it says two things at once.
     """
     toggles = {name: value for name, value in raw.items() if name not in _RETIRED_TOGGLES}
+    # Two filters at once cannot be read as one: a retired filter key beside
+    # a new filter key no version ever saved with it has no reading
+    for old, companions in _RETIRED_FILTER_COMPANIONS.items():
+        if old not in raw:
+            continue
+        for new in ("exclude_categories", "exclude_tags"):
+            if new in raw and new not in companions:
+                raise ValueError(f"it also holds {new}, which no version saved "
+                                 f"beside {old}")
     old_categories = old_tags = None
     if "categories" in raw:
-        # Two filters at once cannot be read as one
-        if "exclude_categories" in raw:
-            raise ValueError("it also holds exclude_categories")
         old_categories = _old_categories(raw)
         toggles["exclude_categories"] = None
     if "tags" in raw:
-        if "exclude_tags" in raw:
-            raise ValueError("it also holds exclude_tags")
         old_tags = _old_tags(raw)
         toggles["exclude_tags"] = None
     rebalance_keys = _RETIREMENTS[0][0]
