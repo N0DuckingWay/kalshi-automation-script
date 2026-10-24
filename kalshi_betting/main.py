@@ -156,6 +156,7 @@ from . import run_lock
 from ._http import api_error_summary
 from .auth import build_client, read_account_balance
 from .config import (
+    CATEGORY_FILTER_MAX_NAMED_SERIES,
     CONTRACT_PAYOUT_DOLLARS,
     EXIT_NO_TRADEABLE_SHARDS,
     EXIT_OK,
@@ -930,7 +931,7 @@ def _no_pairs_msg(sandbox: bool = False, settings: LiveSettings | None = None, *
         # helper only renders it, in the words the refusal lines use.
         f"closing within {close_gap_bound_text(SAME_TITLE_MAX_CLOSE_GAP_SECONDS)}"
     )
-    if settings.categories is not None or settings.tags is not None:
+    if settings.exclude_categories is not None or settings.exclude_tags is not None:
         # The run's category/tag filter, in the "Live settings:" line's words
         thresholds += (f" — among pairs filed under the run's category/tag filter "
                        f"({describe_trade_filter(settings)})")
@@ -1075,23 +1076,28 @@ def _attach_series_labels(markets: list, series_categories: dict, *,
 def _filter_by_category(pairs: list, settings: LiveSettings, listing_client, *,
                         series_categories: dict | None = None) -> list:
     """
-    Keep only the pairs filed under the run's categories and tags.
+    Drop the pairs filed under an excluded category or an excluded tag.
 
     Files each pair by MARKET A's series through historical.series_labels,
     the dashboard's filing rule, and keeps it by config.trade_filter, the one
-    definition of the filter: the pair's category is listed (or no category
-    is listed) and, of the tags that apply to that category, either none
-    applies or the pair's tag is one of them. A plain tag ("Basketball")
-    applies to every listed category; a tag tied to a category
-    ("Sports · Basketball") applies to that category alone. So a listed
-    category trades in full unless a tag narrows it. Names are compared
-    without regard to case.
+    definition of the filter: the pair's category is not excluded, and its
+    first tag is not excluded, either plainly ("Basketball", under every
+    category) or tied to its category ("Sports · Basketball", in that
+    category alone). So every category and tag not excluded trades, one the
+    backtest never saw included. Names are compared without regard to case.
 
     Fails CLOSED: with no listing nothing is kept, rather than filing nearly
     every KX ticker as "Other", and its WARNING is the one line saying why,
-    since the run exits EXIT_OK. A category or plain tag that no listed series
-    and no pair of this run carries draws a typo WARNING, and so does a tied
-    tag whose category and tag are not one series' labels together.
+    since the run exits EXIT_OK. With any category or tag excluded, a pair
+    whose market-A series the listing lacks (a series newer than the cached
+    listing, say), or whose event ticker is blank, is not kept either: its
+    category would come from infer_category's ticker-prefix guess and its tag
+    would read "General", so it could trade through the exclusion of its real
+    category or tag. One WARNING counts them (silent at zero). An excluded
+    category or plain tag that no listed series and no pair of this run
+    carries draws a typo WARNING (an excluded name of that kind excludes
+    nothing), and so does an excluded tied tag whose category and tag are
+    not one series' labels together.
 
     Args:
         pairs (list): CandidatePairs after dedup, before enrichment.
@@ -1105,7 +1111,7 @@ def _filter_by_category(pairs: list, settings: LiveSettings, listing_client, *,
         list: The kept pairs, in their original order — the input list itself,
             with no request, when no filter is set; [] when there is no listing.
     """
-    if settings.categories is None and settings.tags is None:
+    if settings.exclude_categories is None and settings.exclude_tags is None:
         return pairs
     # Kalshi's category and tags per series, the map the dashboard files by,
     # unless the caller has read it already
@@ -1125,17 +1131,37 @@ def _filter_by_category(pairs: list, settings: LiveSettings, listing_client, *,
     keeps = trade_filter(settings)
     kept: list = []
     dropped: Counter = Counter()
+    # The series of the pairs left out because the listing does not file them
+    unlisted: Counter = Counter()
     # Every (category, tag) a pair of this run was filed under, case-folded
     filed: set = set()
     for pair in pairs:
         # Filed exactly as the dashboard files a trade of this event
         category, tag = _pair_labels(pair, series_categories)
         filed.add((category.casefold(), tag.casefold()))
+        # With nothing excluded every pair is kept, wherever it was filed
+        if settings.exclude_categories is not None or settings.exclude_tags is not None:
+            event = pair.market_a.event_ticker
+            # Cross-module: market A's literal series, the key the listing files by
+            series = series_ticker(event) if isinstance(event, str) else ""
+            if not series or series not in series_categories:
+                # Filed by a ticker-prefix guess: its real category and tag
+                # are not known, and may be ones this run excludes
+                unlisted[series or "(no event ticker)"] += 1
+                continue
         if keeps(category, tag):
             kept.append(pair)
         else:
             # The pair's category and tag, written as a filter ties a tag
             dropped[f"{category}{TAG_SCOPE_SEPARATOR}{tag}"] += 1
+    if unlisted:
+        named = [name for name, _ in unlisted.most_common(CATEGORY_FILTER_MAX_NAMED_SERIES)]
+        more = len(unlisted) - len(named)
+        logging.warning(
+            "Category/tag filter: %d candidate pairs left out because their series is not "
+            "in Kalshi's /series listing, so their category and tag are not known and may "
+            "be ones this run excludes (series: %s%s)", sum(unlisted.values()), ", ".join(named),
+            f", and {more} more" if more else "")
     logging.info(
         "Category/tag filter (%s): kept %d of %d candidate pairs%s", wanted,
         len(kept), len(pairs),
@@ -1148,28 +1174,28 @@ def _filter_by_category(pairs: list, settings: LiveSettings, listing_client, *,
                      for c, t in series_categories.values()}
     known_cats = {c for c, _ in known}
     known_tags = {t for _, t in known}
-    for name in settings.categories or ():
+    for name in settings.exclude_categories or ():
         if name.casefold() not in known_cats:
             logging.warning(
-                "Category %r names no category in Kalshi's listing of %d series, nor "
-                "any this run's pairs were filed under — check the spelling; it "
-                "matches nothing", name, len(series_categories))
-    for name in settings.tags or ():
+                "Excluded category %r names no category in Kalshi's listing of %d series, "
+                "nor any this run's pairs were filed under — check the spelling; it "
+                "excludes nothing", name, len(series_categories))
+    for name in settings.exclude_tags or ():
         # Cross-module: the category a tag is tied to (None for a plain tag),
         # split as the filter itself splits it
         category, tag = split_tag(name)
         if category is None:
             if tag.casefold() not in known_tags:
                 logging.warning(
-                    "Tag %r is no series' first tag in Kalshi's listing of %d series, nor "
-                    "any this run's pairs were filed under — check the spelling; it "
-                    "matches nothing", name, len(series_categories))
+                    "Excluded tag %r is no series' first tag in Kalshi's listing of %d "
+                    "series, nor any this run's pairs were filed under — check the "
+                    "spelling; it excludes nothing", name, len(series_categories))
         elif (category.casefold(), tag.casefold()) not in known:
             # A tied tag has to be one series' category and first tag together
             logging.warning(
-                "Tag %r is no series' category and first tag in Kalshi's listing of %d "
-                "series, nor any this run's pairs were filed under — check the "
-                "spelling; it matches nothing", name, len(series_categories))
+                "Excluded tag %r is no series' category and first tag in Kalshi's listing "
+                "of %d series, nor any this run's pairs were filed under — check the "
+                "spelling; it excludes nothing", name, len(series_categories))
     return kept
 
 
@@ -1393,39 +1419,14 @@ _LIVE_FLAGS = (
     ("no_sell", "--no-sell"),
     ("sell_min_days", "--sell-min-days"),
     ("no_sell_min_days", "--no-sell-min-days"),
-    ("category", "--category"),
-    ("any_category", "--any-category"),
-    ("tag", "--tag"),
-    ("any_tag", "--any-tag"),
+    ("exclude_category", "--exclude-category"),
+    ("no_exclude_category", "--no-exclude-category"),
+    ("exclude_tag", "--exclude-tag"),
+    ("no_exclude_tag", "--no-exclude-tag"),
 )
 
 # The cap flags, which take a whole percent where LiveSettings holds a fraction
 _LIVE_PERCENT_FLAGS = frozenset({"size_cap", "same_title_size_cap"})
-
-
-def _saved_tag_loses_its_category(reference: LiveSettings, categories) -> bool:
-    """
-    Say whether a saved tied tag names a category this run's categories leave out.
-
-    The saved defaults may tie a tag to a category ("Sports · Basketball").
-    A run whose --category flags do not list that category (or whose
-    --any-category lists none), and which keeps the saved tags, is refused by
-    LiveSettings; this tells _resolve_live_settings when to name the remedy.
-
-    Args:
-        reference (LiveSettings): The saved live defaults.
-        categories (tuple[str, ...] | None): This run's categories, as its
-            flags gave them (None for --any-category).
-
-    Returns:
-        bool: True when some saved tag is tied to a category not among them,
-            compared without regard to case.
-    """
-    listed = {name.strip().casefold() for name in categories or ()}
-    # Cross-module: split each saved tag as the filter itself splits it
-    # (config.split_tag); a plain tag has no category and never counts
-    return any(category is not None and category.casefold() not in listed
-               for category, _ in map(split_tag, reference.tags or ()))
 
 
 def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
@@ -1434,17 +1435,19 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
 
     The run's one read of the saved defaults (config.live_defaults; the AST
     pin test_ast_live_path_reads_toggles_only_through_live_settings allows no
-    other caller); there is no fallback to config.py's toggle constants. LiveSettings re-validates the
-    result, so a flag meets the same rules as a saved value, and the result
-    keeps the defaults' origin. --category and --tag each replace the whole
-    saved list; a run that drops the category of a saved tag tied to one is
-    refused, naming the remedy. --no-sell also clears the minimum of days, and
-    --no-rebalance the minimum price move, since neither minimum is allowed
-    without its switch. A saved file an older version wrote (holding
-    add_to_held_pairs, trim_to_kelly or trim_min_rise) is refused too, with
-    the remedy: save it again through the defaults server, whose pages offer
-    its settings in their new form. Runs before logging is set up, so a
-    refusal logs nothing and sends no request.
+    other caller); there is no fallback to config.py's toggle constants.
+    LiveSettings re-validates the result, so a flag meets the same rules as a
+    saved value, and the result keeps the defaults' origin.
+    --exclude-category and --exclude-tag each replace the whole saved list.
+    --category, --any-category, --tag and --any-tag, which the exclude flags
+    replaced, are refused with the replacement named, in that order.
+    --no-sell also clears the minimum of days, and --no-rebalance the minimum
+    price move, since neither minimum is allowed without its switch. A saved
+    file an older version wrote (holding add_to_held_pairs, trim_to_kelly,
+    trim_min_rise, categories or tags) is refused too, with the remedy: save it
+    again through the defaults server, whose pages offer its settings in their
+    new form when they have one. Runs before logging is set up, so a refusal
+    logs nothing and sends no request.
 
     Args:
         args (argparse.Namespace): The parsed flags; a missing attribute reads
@@ -1457,8 +1460,25 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
 
     Raises:
         SystemExit: Status 2 (parser.error) when no live defaults are saved,
-            the saved file is refused or outdated, or a flag's value is invalid.
+            the saved file is refused or outdated, a retired flag is given, or a
+            flag's value is invalid.
     """
+    # The include lists became exclude lists: an old flag names its replacement
+    # rather than being read the old way
+    if getattr(args, "retired_category", None):
+        parser.error("--category no longer exists: the category filter is now a list of "
+                     "categories NOT to trade, and every other category trades. Use "
+                     "--exclude-category NAME (repeatable), or --no-exclude-category to "
+                     "exclude none")
+    if getattr(args, "retired_any_category", None):
+        parser.error("--any-category no longer exists: use --no-exclude-category (exclude "
+                     "no category)")
+    if getattr(args, "retired_tag", None):
+        parser.error("--tag no longer exists: the tag filter is now a list of tags NOT "
+                     "to trade, and every other tag trades. Use --exclude-tag NAME "
+                     "(repeatable), or --no-exclude-tag to exclude none")
+    if getattr(args, "retired_any_tag", None):
+        parser.error("--any-tag no longer exists: use --no-exclude-tag (exclude no tag)")
     try:
         # The saved live defaults: the reference, and the base the flags lay over.
         # There is no fallback: with none saved, the run does not start
@@ -1515,16 +1535,17 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
         overrides["sell_min_days"] = None
     if getattr(args, "sell_min_days", None) is not None:
         overrides["sell_min_days"] = args.sell_min_days
-    # --category / --tag (repeatable) set the filter; --any-category / --any-tag
-    # clear the saved one (argparse keeps each pair mutually exclusive)
-    if getattr(args, "category", None) is not None:
-        overrides["categories"] = tuple(args.category)
-    elif getattr(args, "any_category", None):
-        overrides["categories"] = None
-    if getattr(args, "tag", None) is not None:
-        overrides["tags"] = tuple(args.tag)
-    elif getattr(args, "any_tag", None):
-        overrides["tags"] = None
+    # --exclude-category / --exclude-tag (repeatable) set the filter;
+    # --no-exclude-category / --no-exclude-tag clear the saved one (argparse
+    # keeps each pair mutually exclusive)
+    if getattr(args, "exclude_category", None) is not None:
+        overrides["exclude_categories"] = tuple(args.exclude_category)
+    elif getattr(args, "no_exclude_category", None):
+        overrides["exclude_categories"] = None
+    if getattr(args, "exclude_tag", None) is not None:
+        overrides["exclude_tags"] = tuple(args.exclude_tag)
+    elif getattr(args, "no_exclude_tag", None):
+        overrides["exclude_tags"] = None
     try:
         # replace re-validates every field (LiveSettings.__post_init__)
         return dc_replace(reference, **overrides), reference
@@ -1552,11 +1573,6 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
             message += (" (--min-price-move takes whole cents, a multiple of "
                         f"{PRICE_MOVE_STEP_CENTS} from {PRICE_MOVE_STEP_CENTS} to "
                         "100, read as that many cents / 100 dollars)")
-        if ("categories" in overrides and "tags" not in overrides
-                and _saved_tag_loses_its_category(reference, overrides["categories"])):
-            # The tag LiveSettings names is a saved one, which no flag of this run shows
-            message += (" — the saved defaults tie a tag to a category this run does "
-                        "not list: add --any-tag, or give this run's tags with --tag")
         parser.error(message)
 
 
@@ -2514,35 +2530,48 @@ def _build_parser() -> argparse.ArgumentParser:
     # Filed as the backtest dashboard files a trade (_filter_by_category)
     categories = live.add_mutually_exclusive_group()
     categories.add_argument(
-        "--category", action="append", default=None, metavar="NAME",
-        help="Trade only pairs filed under this Kalshi category, as the backtest "
-             "dashboard's Category menu names it (repeatable; case-insensitive; "
-             "default: the saved live defaults). Replaces every saved category for "
-             "this run: if the saved defaults tie a tag to a category this run does "
-             "not list, the run exits 2 until --any-tag or this run's own --tag is given",
+        "--exclude-category", action="append", default=None, metavar="NAME",
+        help="Do not trade pairs filed under this Kalshi category, as the backtest "
+             "dashboard's \"Exclude categories\" menu names it; every other category "
+             "trades, one the backtest never saw included, but a pair whose series "
+             "Kalshi's /series listing lacks is not traded while any category or tag is "
+             "excluded (repeatable; case-insensitive; default: the saved live "
+             "defaults). REPLACES the saved excluded categories for this run, so a "
+             "category the saved defaults exclude trades this run unless it is listed "
+             "again",
     )
     categories.add_argument(
-        "--any-category", action="store_true", default=None,
-        help="Trade any category this run, whatever the saved live defaults say (if "
-             "they tie a tag to a category, the run exits 2 until --any-tag or this "
-             "run's own --tag is given)",
+        "--no-exclude-category", action="store_true", default=None,
+        help="Exclude no category this run, whatever the saved live defaults say",
     )
+    # The include-list flags the two above replaced: hidden, and refused with
+    # the replacement named (_resolve_live_settings) rather than read the old way
+    parser.add_argument("--category", action="append", default=None,
+                        dest="retired_category", help=argparse.SUPPRESS)
+    parser.add_argument("--any-category", action="store_true", default=None,
+                        dest="retired_any_category", help=argparse.SUPPRESS)
     tags = live.add_mutually_exclusive_group()
     tags.add_argument(
-        "--tag", action="append", default=None, metavar="NAME",
-        help="Trade only pairs whose series' FIRST Kalshi tag is NAME, under every "
-             "category this run lists (its --category flags, else the saved "
-             "categories; any category when none is listed); or give "
-             "\"Category · Tag\" to narrow that one listed category and leave the "
-             "others as they are. Replaces every saved tag for this run, so a "
-             "category the saved tags narrowed trades in full unless this run's "
-             "tags narrow it (repeatable; case-insensitive; default: the saved "
-             "live defaults)",
+        "--exclude-tag", action="append", default=None, metavar="NAME",
+        help="Do not trade pairs whose series' FIRST Kalshi tag is NAME, in any "
+             "category; or give \"Category · Tag\", as the backtest dashboard's "
+             "\"Exclude tags\" menu names it, to exclude that tag in that one category "
+             "alone. Every other tag trades, but a pair whose series Kalshi's /series "
+             "listing lacks is not traded while any category or tag is excluded "
+             "(repeatable; case-insensitive; default: the saved live defaults). "
+             "REPLACES the saved excluded tags for this run, so a tag the saved "
+             "defaults exclude trades this run unless it is listed again",
     )
     tags.add_argument(
-        "--any-tag", action="store_true", default=None,
-        help="Trade any tag this run, whatever the saved live defaults say",
+        "--no-exclude-tag", action="store_true", default=None,
+        help="Exclude no tag this run, whatever the saved live defaults say",
     )
+    # The include-list flags the two above replaced: hidden, and refused with
+    # the replacement named (_resolve_live_settings)
+    parser.add_argument("--tag", action="append", default=None,
+                        dest="retired_tag", help=argparse.SUPPRESS)
+    parser.add_argument("--any-tag", action="store_true", default=None,
+                        dest="retired_any_tag", help=argparse.SUPPRESS)
     return parser
 
 

@@ -581,8 +581,8 @@ KELLY_TRIM_MAX_BID_DROP = 0.20
 
 # ── Live trading toggles ──────────────────────────────────────────────────────
 #
-# Eleven live toggles (TIME_SERIES_TIER_FLOORS, TIME_SERIES_SPREAD_BAND, TRADE_CATEGORIES,
-# TRADE_TAGS, REBALANCE, MIN_PRICE_MOVE, SELL_AT and SELL_MIN_DAYS below; k,
+# Eleven live toggles (TIME_SERIES_TIER_FLOORS, TIME_SERIES_SPREAD_BAND,
+# TRADE_EXCLUDE_CATEGORIES, TRADE_EXCLUDE_TAGS, REBALANCE, MIN_PRICE_MOVE, SELL_AT and SELL_MIN_DAYS below; k,
 # BUDGET_FRACTION and SAME_TITLE_SIZE_CAP above). They are NOT the live
 # defaults: a live run starts only from the saved ones (LIVE_DEFAULTS_FILE, below) and
 # never falls back to these. They are the backtest's k and caps (backtester and
@@ -613,28 +613,38 @@ TIME_SERIES_TIER_FLOORS = False
 # --spread-min / --spread-max overrides either bound of it for one run.
 TIME_SERIES_SPREAD_BAND = (0.0, 0.5)
 
-# Kalshi categories a pair may trade in ("Economics", ...), or None for
-# any: a non-empty tuple of names, matched case-insensitively against market A's
-# series category as the dashboard files it (historical.series_labels). Each is
-# a category's name alone: one written as a tag tied to a category
-# ("Sports · Basketball") is refused, since it belongs among the tags. Applied
-# by main._filter_by_category, which fails CLOSED (no listing to file by: no
-# trades). A live run reads the saved live defaults' categories instead, which
-# main.py --category NAME (repeatable) / --any-category overrides for one run.
-TRADE_CATEGORIES: tuple[str, ...] | None = None
+# Kalshi categories a pair may NOT trade in ("Politics", ...), or None to
+# exclude none: a non-empty tuple of names, matched case-insensitively against
+# market A's series category as the dashboard files it (historical.series_labels).
+# Every category not listed trades, one the backtest never saw included, which
+# is what lets the backtest dashboard's Exclude categories menu be saved as
+# live defaults. Each is a category's name alone: one written as a tag tied to a
+# category ("Sports · Basketball") is refused, since it belongs among the
+# excluded tags.
+# Applied by main._filter_by_category, which fails CLOSED: no listing to file
+# by means no trades, and with any category excluded a pair whose series the
+# listing lacks (so whose category is not known, and may be excluded) is not
+# traded either. A live run reads the saved live defaults' exclude_categories
+# instead, which main.py --exclude-category NAME (repeatable) /
+# --no-exclude-category overrides for one run.
+TRADE_EXCLUDE_CATEGORIES: tuple[str, ...] | None = None
 
-# Kalshi tags a pair may trade in, or None for any: matched like
-# TRADE_CATEGORIES against the series' FIRST tag. A plain name ("Basketball")
-# applies under every listed category; a name tied to a category
-# ("Sports · Basketball") narrows that category alone, and a listed category no
-# tag applies to trades in full (trade_filter is the rule). A live run reads the
-# saved live defaults' tags instead, which main.py --tag NAME (repeatable) /
-# --any-tag overrides for one run.
-TRADE_TAGS: tuple[str, ...] | None = None
+# How many series main._filter_by_category names in its one WARNING about the
+# pairs it leaves out because their series is not in Kalshi's /series listing
+# (the rest are only counted).
+CATEGORY_FILTER_MAX_NAMED_SERIES = 5
+
+# Kalshi tags a pair may NOT trade in, or None to exclude none, matched
+# case-insensitively against the series' first tag. A plain name ("Basketball")
+# is excluded under every category; a tied name ("Sports · Basketball") only in
+# its own category. While any tag is excluded, a pair whose series Kalshi's
+# /series listing lacks is not traded. A live run reads the saved live
+# defaults' exclude_tags instead (main.py --exclude-tag / --no-exclude-tag).
+TRADE_EXCLUDE_TAGS: tuple[str, ...] | None = None
 
 # How a filter ties a tag to one category: "Sports · Basketball" (a space, a
-# middle dot, a space). The dashboard's Tag menu, the filter's log line and the
-# run page print a category and its tag the same way.
+# middle dot, a space). The backtest dashboard's Exclude tags menu, the filter's
+# log line and the run page print a category and its tag the same way.
 TAG_SCOPE_SEPARATOR = " · "
 
 # Whether a live run rebalances the pairs the account holds: on, a production
@@ -741,7 +751,7 @@ LIVE_DEFAULTS_FILE = PROJECT_ROOT / "live_defaults.json"
 LIVE_DEFAULTS_FORMAT = "live-defaults-v1"
 
 # The largest saved file read; its record is well under 1 KB with a short
-# category/tag filter, and a few KB with a long one.
+# category/tag filter, and tens of KB with hundreds of excluded tags.
 LIVE_DEFAULTS_MAX_BYTES = 65_536
 
 # LiveSettings.origin for toggles built from this module's constants.
@@ -784,13 +794,28 @@ LIVE_DEFAULTS_SOURCE_PATTERN = (
 DEFAULTS_SERVER_HOST = "127.0.0.1"
 DEFAULTS_SERVER_PORT = 8765
 
-# The longest request (path plus body) the server reads. Its form is under 2 KB
-# with one category and tag, and about 4 KB with the most names a link may
-# carry (DEFAULTS_SERVER_MAX_FILTER_NAMES of each, at ordinary lengths).
-DEFAULTS_SERVER_MAX_REQUEST_BYTES = 16_384
+# The longest request (path plus body) the server reads. The dashboard's Save
+# button can name hundreds of excluded tags (16 to 32 KB for 400) and keeps
+# itself disabled for an address that would not fit.
+DEFAULTS_SERVER_MAX_REQUEST_BYTES = 65_536
 
-# The most categories, and the most tags, one confirmation link may name.
-DEFAULTS_SERVER_MAX_FILTER_NAMES = 40
+# The most excluded categories, and the most excluded tags, one confirmation
+# link may name.
+DEFAULTS_SERVER_MAX_FILTER_NAMES = 400
+
+# The longest request line http.server reads ("GET <path> HTTP/1.1" and its
+# line break), whatever DEFAULTS_SERVER_MAX_REQUEST_BYTES says.
+DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES = 65_536
+
+# Bytes the confirmation form adds when posted back: the fingerprint, nonce,
+# token, longest action and attention box fields. The Save button budgets with
+# it; a test checks the sum against a real form.
+DEFAULTS_SERVER_CONFIRM_FORM_EXTRA_BYTES = 218
+
+# Bytes the dashboard's Save button leaves unused under both of the defaults
+# server's limits (the request line and the request), in case its form grows
+# by a field
+DASHBOARD_SAVE_HEADROOM_BYTES = 64
 
 # Seconds the server waits on a silent connection before dropping it: it
 # answers one request at a time, and a browser can hold a connection open
@@ -917,8 +942,10 @@ BACKTEST_SWEEP_FILENAME = "backtest_sweep.pkl.gz"
 # A rebuild refuses a file with any other tag; change it whenever the line's
 # keys, the pickled inputs' keys or the fields of the classes pickled in them
 # (BacktestSweep and the lazy families it holds) change, so an older file is
-# refused rather than misread.
-BACKTEST_SWEEP_FORMAT = "backtest-sweep-v2"
+# refused rather than misread. v4: BacktestSweep.live_tags became
+# live_exclude_tags (the saved live defaults list the tags NOT to trade); v3
+# files, from before, are refused.
+BACKTEST_SWEEP_FORMAT = "backtest-sweep-v4"
 
 # The most bytes a rebuild reads for the saved sweep file's first line (the
 # JSON one): the real line is a few hundred bytes, so a file that runs past
@@ -2996,45 +3023,124 @@ def _step_move(value, name: str) -> float:
     return round(steps * step / 100, 2)
 
 
+# What None means for each filter, and how to ask for it, for _names' messages:
+# (what None reads as, the same as a phrase that follows "to", its main.py
+# flag). exclude_categories' None excludes no category; exclude_tags' None no tag.
+_FILTER_NONE = {
+    "exclude_categories": ("exclude no category", "exclude no category",
+                           "--no-exclude-category"),
+    "exclude_tags": ("exclude no tag", "exclude no tag", "--no-exclude-tag"),
+}
+
+
 def _names(value, name: str) -> tuple[str, ...] | None:
     """
     Validate a category or tag filter and normalise it to a tuple of names.
 
-    None (any) passes through; anything else must be a non-empty tuple or list
-    of strings, each non-empty once stripped. A bare str is refused (iterating
-    it would filter on single characters), and so is "any" in any case (it
-    would render exactly like None on the "Live settings:" line and the
-    trade-log note).
+    None passes through (no category or tag excluded); anything else must
+    be a non-empty tuple or list of strings, each non-empty once stripped. A
+    bare str is refused (iterating it would filter on single characters), and
+    so is a name reading "any" or "none" in any case (each would render exactly
+    like None on the "Live settings:" line and the trade-log note: "exclude
+    tags none", "exclude categories none").
 
     Args:
-        value: The filter (TRADE_CATEGORIES / TRADE_TAGS, main.py --category / --tag,
-            or the saved live defaults file's "categories" / "tags").
-        name (str): The field's name, for the error message.
+        value: The filter (TRADE_EXCLUDE_CATEGORIES / TRADE_EXCLUDE_TAGS,
+            main.py --exclude-category / --exclude-tag, or the saved live
+            defaults file's "exclude_categories" / "exclude_tags").
+        name (str): The field's name ("exclude_categories" or "exclude_tags"),
+            for the error message.
 
     Returns:
-        tuple[str, ...] | None: The stripped names in order, or None for any.
+        tuple[str, ...] | None: The stripped names in order, or None.
 
     Raises:
         ValueError: If the value is a str, not a tuple or list, empty, or holds
-            a non-string or blank name, or a name reading "any".
+            a non-string or blank name, or a name reading "any" or "none".
     """
+    none_reads, none_phrase, none_flag = _FILTER_NONE.get(name, _FILTER_NONE["exclude_tags"])
     if value is None:
         return None
     if isinstance(value, str) or not isinstance(value, (tuple, list)):
-        raise ValueError(f"{name} must be None (any) or a tuple of names, got {value!r}")
+        raise ValueError(f"{name} must be None ({none_reads}) or a tuple of names, "
+                         f"got {value!r}")
     if not value:
-        raise ValueError(f"{name} must name at least one, or be None for any, got {value!r}")
+        raise ValueError(f"{name} must name at least one, or be None to {none_phrase}, "
+                         f"got {value!r}")
     names = []
     for item in value:
         if not isinstance(item, str) or not item.strip():
             raise ValueError(f"{name} must hold non-empty names, got {item!r} in {value!r}")
-        if item.strip().casefold() == "any":
+        if item.strip().casefold() in ("any", "none"):
             raise ValueError(
-                f"{name} cannot hold the name {item!r} (in {value!r}): any category or "
-                f"tag is null in {LIVE_DEFAULTS_FILE.name}, --any-category / --any-tag on "
-                "main.py, or None in config.py")
+                f"{name} cannot hold the name {item.strip()!r}: to {none_phrase} use null "
+                f"in {LIVE_DEFAULTS_FILE.name}, {none_flag} on main.py, or None in config.py")
         names.append(item.strip())
     return tuple(names)
+
+
+def check_filter_name(text: str, field: str) -> str:
+    """
+    Check one excluded category or tag as the defaults server reads it from a link.
+
+    A name with two spaces in a row is refused, for categories and tags
+    alike: a browser shows a run of spaces as one, so on the confirmation
+    page such a name would look exactly like the name spelled with single
+    spaces while being a different name to the filter. That also refuses a
+    tied tag written with a doubled space ("Sports ·  Basketball").
+    defaults_server._name reads every exclude_category and exclude_tag field
+    through it, and filter_name_refusal asks it for the dashboard's Save
+    button, so the two never disagree.
+
+    Args:
+        text (str): The name.
+        field (str): The field's name, for the message.
+
+    Returns:
+        str: The name as given.
+
+    Raises:
+        ValueError: If the name is not one printable line (a zero-width or
+            text-direction character, say), has spaces around it, or holds
+            two spaces in a row.
+    """
+    if not text.isprintable() or text != text.strip():
+        raise ValueError(f"{field} must be one printable name with no spaces around it, "
+                         f"got {text!r}")
+    if any(text[i].isspace() and text[i + 1].isspace() for i in range(len(text) - 1)):
+        raise ValueError(f"{field} must not hold two spaces in a row, got {text!r}")
+    return text
+
+
+def filter_name_refusal(field: str, name: str) -> str | None:
+    """
+    Say why one excluded category or tag would be refused, or None.
+
+    The defaults server reads each name of a link through check_filter_name
+    and then LiveSettings, which holds it to _names (no "any" or "none") and
+    to _check_category_names or _check_tied_tags. Each of those judges a name
+    on its own, so one name's verdict is the verdict of any list holding it.
+    The dashboard asks this of every category and tag its menus offer, so its
+    Save button never opens a link the server refuses.
+
+    Args:
+        field (str): "exclude_categories" or "exclude_tags".
+        name (str): The name as the link would send it (a tag as
+            "Category · Tag").
+
+    Returns:
+        str | None: The refusal's message, or None when the name is taken.
+    """
+    try:
+        check_filter_name(name, field)
+        names = _names((name,), field)
+        if field == "exclude_categories":
+            _check_category_names(names)
+        else:
+            _check_tied_tags(names)
+    except ValueError as exc:
+        return str(exc)
+    return None
 
 
 def split_tag(name: str) -> tuple[str | None, str]:
@@ -3043,14 +3149,13 @@ def split_tag(name: str) -> tuple[str | None, str]:
 
     A tag is tied to a category when its name holds TAG_SCOPE_SEPARATOR
     ("Sports · Basketball"); it is split at the first one, and each half is
-    stripped. Any other name is a plain tag, which applies under every listed
-    category. LiveSettings' check of tied tags, trade_filter,
-    main._filter_by_category's typo check and main.py's remedy for a saved
-    tied tag (_saved_tag_loses_its_category) read a tag through this, so all
-    of them agree on which tags are tied.
+    stripped. Any other name is a plain tag, which applies under every
+    category. LiveSettings' check of tied tags, trade_filter and
+    main._filter_by_category's typo check read a tag through this, so all of
+    them agree on which tags are tied.
 
     Args:
-        name (str): One name of a tags filter, as LiveSettings holds it.
+        name (str): One name of an exclude_tags filter, as LiveSettings holds it.
 
     Returns:
         tuple[str | None, str]: ("Sports", "Basketball") for
@@ -3072,7 +3177,8 @@ def _tie_with_a_blank_half(name: str) -> bool:
     "·Basketball", "Sports·" and "A·B" are not ties.
 
     Args:
-        name (str): One name of a categories or tags filter, already stripped.
+        name (str): One name of an exclude_categories or exclude_tags filter,
+            already stripped.
 
     Returns:
         bool: True for the three shapes above.
@@ -3082,64 +3188,64 @@ def _tie_with_a_blank_half(name: str) -> bool:
             or name.endswith(TAG_SCOPE_SEPARATOR.rstrip()))
 
 
-def _check_category_names(categories: tuple[str, ...] | None) -> None:
+def _check_category_names(exclude_categories: tuple[str, ...] | None) -> None:
     """
-    Refuse a category written as a tag tied to a category.
+    Refuse an excluded category written as a tag tied to a category.
 
     A category is a name alone. One that holds TAG_SCOPE_SEPARATOR
     ("Sports · Basketball"), or is a tie with a blank half ("·",
-    "· Basketball", "Sports ·"), would match no pair, while the filter's own
-    text would read as if the category beside it were narrowed to that tag.
-    Checked whether or not any tag is set.
+    "· Basketball", "Sports ·"), would match no pair, so it would exclude
+    nothing while reading as if it excluded part of a category: only a whole
+    category can be excluded. Checked on every construction.
 
     Args:
-        categories (tuple[str, ...] | None): The categories filter, validated by _names.
+        exclude_categories (tuple[str, ...] | None): The excluded categories,
+            validated by _names.
 
     Raises:
         ValueError: Naming the first category written that way.
     """
-    for name in categories or ():
+    for name in exclude_categories or ():
         if TAG_SCOPE_SEPARATOR in name or _tie_with_a_blank_half(name):
-            raise ValueError(f"categories: {name!r} is a tag tied to a category; "
-                             "give it as a tag")
+            raise ValueError(f"exclude_categories: {name!r} is a tag tied to a category; "
+                             "only a whole category can be excluded, so give just the "
+                             "category name")
 
 
-def _check_tied_tags(categories: tuple[str, ...] | None,
-                     tags: tuple[str, ...] | None) -> None:
+def _check_tied_tags(exclude_tags: tuple[str, ...] | None) -> None:
     """
-    Refuse a tag tied to a category that the filter cannot apply.
+    Refuse an excluded tag whose tie to a category has a blank half or names no tag.
 
-    A tied tag ("Sports · Basketball") narrows one listed category, so it is
-    refused when either half is blank, when its tag half reads "any", or when
-    its category is not among the categories (compared without regard to case;
-    with no categories listed, every tied tag is refused). It is never read as
-    a plain tag instead. A tie whose blank half _names has already stripped
-    (_tie_with_a_blank_half: the dot alone, a name starting with "· " or ending
-    with " ·") is refused the same way; a dot with no space beside it
-    ("·Basketball", "Sports·") is part of a plain tag's name.
+    A tied tag ("Sports · Basketball") excludes one tag of one category, so it
+    is refused when either half is blank, or when its tag half reads "any"
+    (to exclude every tag of a category, exclude the category). It is never
+    read as a plain tag instead. A tie whose blank half _names has already
+    stripped (_tie_with_a_blank_half: the dot alone, a name starting with "· "
+    or ending with " ·") is refused the same way; a dot with no space beside it
+    ("·Basketball", "Sports·") is part of a plain tag's name. A tied tag whose
+    category is excluded too is allowed: it excludes nothing more, so it can
+    never widen what trades.
 
     Args:
-        categories (tuple[str, ...] | None): The categories filter, validated by _names.
-        tags (tuple[str, ...] | None): The tags filter, validated by _names.
+        exclude_tags (tuple[str, ...] | None): The excluded tags, validated by
+            _names.
 
     Raises:
         ValueError: Naming the first tied tag that breaks a rule above.
     """
-    listed = {c.casefold() for c in categories or ()}
-    for name in tags or ():
+    for name in exclude_tags or ():
         category, tag = split_tag(name)
         if category is None:
             if _tie_with_a_blank_half(name):
-                raise ValueError(f"tags: {name!r} must read 'Category{TAG_SCOPE_SEPARATOR}Tag'")
+                raise ValueError(f"exclude_tags: {name!r} must read "
+                                 f"'Category{TAG_SCOPE_SEPARATOR}Tag'")
             continue
         if not category or not tag:
-            raise ValueError(f"tags: {name!r} must read 'Category{TAG_SCOPE_SEPARATOR}Tag'")
+            raise ValueError(f"exclude_tags: {name!r} must read "
+                             f"'Category{TAG_SCOPE_SEPARATOR}Tag'")
         if tag.casefold() == "any":
-            raise ValueError(f"tags: {name!r} names no tag; for any tag of {category!r}, "
-                             "list the category alone")
-        if category.casefold() not in listed:
-            raise ValueError(f"tags: {name!r} names the category {category!r}, which "
-                             "categories does not list")
+            raise ValueError(f"exclude_tags: {name!r} names no tag; to exclude every tag of "
+                             f"{category!r}, exclude the category")
 
 
 @dataclass(frozen=True)
@@ -3169,14 +3275,16 @@ class LiveSettings:
             SIZE_CAP_STEP grid; 1.0 is no cap.
         same_title_size_cap (float): The extra same-title cap, on the same
             grid; default 1.0 (no extra cap).
-        categories (tuple[str, ...] | None): Categories to trade; None (default)
-            for any. Each is a category's name alone: one written as a tag tied
-            to a category ("Sports · Basketball") is refused.
-        tags (tuple[str, ...] | None): Series first tags to trade; None (default)
-            for any. A plain name applies under every listed category; a name
-            tied to a listed category ("Sports · Basketball") narrows that
-            category alone (trade_filter is the rule). A tied tag whose
-            category is not listed is refused.
+        exclude_categories (tuple[str, ...] | None): Categories not to trade;
+            None (default) excludes none. Every other category trades, one the
+            backtest never saw included. Each is a category's name alone: one
+            written as a tag tied to a category ("Sports · Basketball") is
+            refused.
+        exclude_tags (tuple[str, ...] | None): Series first tags not to trade;
+            None (default) excludes none. A plain name is excluded under every
+            category; a name tied to a category ("Sports · Basketball") is
+            excluded in that category alone (trade_filter is the rule). A tied tag whose
+            category is excluded too is allowed (it excludes nothing more).
         rebalance (bool): Whether a production run rebalances the pairs the
             account holds: before it buys, it sells part of each exact held
             pair grown past its Kelly size (a Kelly trim), and it may add to
@@ -3205,17 +3313,16 @@ class LiveSettings:
     Raises:
         ValueError: If any field is out of range or of the wrong type; if a
             category is written as a tag tied to a category
-            (_check_category_names); or if a tied tag has a blank half, names
-            "any" as its tag, or names a category that categories does not
-            list (_check_tied_tags).
+            (_check_category_names); or if a tied tag has a blank half or
+            names "any" as its tag (_check_tied_tags).
     """
     tier_floors: bool
     spread_band: tuple[float, float]
     interval_discount: float
     size_cap: float
     same_title_size_cap: float = 1.0
-    categories: tuple[str, ...] | None = None
-    tags: tuple[str, ...] | None = None
+    exclude_categories: tuple[str, ...] | None = None
+    exclude_tags: tuple[str, ...] | None = None
     rebalance: bool = False
     min_price_move: float | None = None
     sell_at: float | None = None
@@ -3253,11 +3360,12 @@ class LiveSettings:
         object.__setattr__(self, "size_cap", _step_cap(self.size_cap, "size_cap"))
         object.__setattr__(self, "same_title_size_cap",
                            _step_cap(self.same_title_size_cap, "same_title_size_cap"))
-        object.__setattr__(self, "categories", _names(self.categories, "categories"))
-        object.__setattr__(self, "tags", _names(self.tags, "tags"))
-        # With or without tags: a category written as a tied tag narrows nothing
-        _check_category_names(self.categories)
-        _check_tied_tags(self.categories, self.tags)
+        object.__setattr__(self, "exclude_categories",
+                           _names(self.exclude_categories, "exclude_categories"))
+        object.__setattr__(self, "exclude_tags", _names(self.exclude_tags, "exclude_tags"))
+        # Whatever tags are excluded: a category written as a tied tag excludes nothing
+        _check_category_names(self.exclude_categories)
+        _check_tied_tags(self.exclude_tags)
         # A real bool, as tier_floors: a saved file's JSON 1 must be refused
         if type(self.rebalance) is not bool:
             raise ValueError(f"rebalance must be True or False, got {self.rebalance!r}")
@@ -3297,14 +3405,37 @@ _OPTIONAL_TOGGLES = ("rebalance", "min_price_move", "sell_at", "sell_min_days")
 # Each of those toggles' LiveSettings default
 _TOGGLE_DEFAULTS = {f.name: f.default for f in fields(LiveSettings)
                     if f.name in _OPTIONAL_TOGGLES}
-# Settings an older version saved, which rebalance and min_price_move replaced.
-# A saved file holding any of them is refused (LiveDefaultsOutdated) until it
-# is saved again, and the writer never writes them.
-_RETIRED_TOGGLES = ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise")
+# Settings an older version saved: add_to_held_pairs, trim_to_kelly and
+# trim_min_rise, which rebalance and min_price_move replaced; categories (a
+# list of categories to trade), which exclude_categories (categories not to
+# trade) replaced; and tags (a list of tags to trade), which exclude_tags (tags
+# not to trade) replaced. A saved file holding any of them is refused
+# (LiveDefaultsOutdated) until it is saved again, and the writer never writes them.
+_RETIRED_TOGGLES = ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise", "categories",
+                    "tags")
+# Each retirement: the old settings, and what replaced them (as the messages name it)
+_RETIREMENTS = (
+    (("add_to_held_pairs", "trim_to_kelly", "trim_min_rise"), "rebalance and min_price_move"),
+    (("categories",), "exclude_categories"),
+    (("tags",), "exclude_tags"),
+)
+# The category/tag filter's keys that each retired filter key was saved beside
+# by some version: categories (the oldest filter) only beside tags, never
+# beside exclude_categories or exclude_tags; tags beside categories, and beside
+# exclude_categories (the version that excluded categories but still listed
+# tags to trade), never beside exclude_tags. A file holding a retired filter
+# key beside a key of the new filter that no version saved with it says two
+# things at once and gets no proposal (_retired_proposal). The Rebalance
+# settings are not part of the filter: whatever filter keys sit beside them
+# are read as saved.
+_RETIRED_FILTER_COMPANIONS = {
+    "categories": (),
+    "tags": ("exclude_categories",),
+}
 
 # The values `python3 -m kalshi_betting.defaults_server --seed` offers for a
 # first save of the live defaults: tier floors off, spread band 0-0.5, k 0.80,
-# a 10% per-trade cap, a 20% same-title cap, any category or tag, rebalancing
+# a 10% per-trade cap, a 20% same-title cap, no category or tag excluded, rebalancing
 # on with no minimum price movement, and no selling. One pair stakes at most
 # 10% of the portfolio value; an add-on to a held pair stakes no more than a
 # new pair would, and keeps the held pair (at today's prices, plus the fees
@@ -3314,7 +3445,7 @@ _RETIRED_TOGGLES = ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise")
 # until they are confirmed and saved to LIVE_DEFAULTS_FILE.
 LIVE_DEFAULTS_SEED = LiveSettings(
     tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.80,
-    size_cap=0.10, same_title_size_cap=0.20, categories=None, tags=None,
+    size_cap=0.10, same_title_size_cap=0.20, exclude_categories=None, exclude_tags=None,
     rebalance=True)
 
 
@@ -3342,30 +3473,60 @@ class LiveDefaultsOutdated(LiveDefaultsError):
     The saved file holds settings this version replaced (_RETIRED_TOGGLES).
 
     An older version saved add_to_held_pairs, trim_to_kelly and
-    trim_min_rise, where this one has rebalance and min_price_move. A live
-    run refuses such a file, as it refuses any other, so it never trades
-    settings nobody confirmed in their new form. The defaults server offers
-    the proposal on its confirmation page, where one Confirm and save
-    replaces the file.
+    trim_min_rise, where this one has rebalance and min_price_move;
+    categories (categories to trade), where this one has exclude_categories
+    (categories not to trade); and tags (tags to trade), where this one has
+    exclude_tags (tags not to trade). A live run refuses such a file, as it
+    refuses any other, so it never trades settings nobody confirmed in their
+    new form. The defaults server offers the proposal on its confirmation
+    page, where one Confirm and save replaces the file.
 
     Attributes:
         proposal (LiveSettings | None): What the file reads as now: rebalance
             on only when both old switches were on, min_price_move the old
-            minimum then (otherwise none), every other setting as saved. None
+            minimum then (otherwise none), no category excluded in place of
+            old categories, no tag excluded in place of old tags, every other
+            setting as saved. None when the old values break the older
+            version's own rules (_old_categories and _old_tags among them), or
             when the rest of the file is refused too.
+        retired (tuple[str, ...]): The retired settings the file holds, in
+            _RETIRED_TOGGLES' order, so a page can say which change it
+            predates.
+        old_categories (tuple[str, ...] | None): The categories the file
+            traded only, when its old categories listed some. The proposal
+            then WIDENS live trading to every category (a list of categories
+            to trade has no exact reading as categories to exclude), so every
+            page that offers it must say so. None when the old categories was
+            null or absent, or there is no proposal.
+        old_tags (tuple[str, ...] | None): The tags the file limited trading
+            to (as saved; a tied "Category · Tag" limited that category
+            alone), when its old tags listed some. The proposal then WIDENS live trading to every tag, for the
+            same reason, so every page that offers it must say so too. None
+            when the old tags was null or absent, or there is no proposal.
     """
 
-    def __init__(self, message: str, proposal: "LiveSettings | None") -> None:
+    def __init__(self, message: str, proposal: "LiveSettings | None",
+                 retired: tuple[str, ...] = (),
+                 old_categories: tuple[str, ...] | None = None,
+                 old_tags: tuple[str, ...] | None = None) -> None:
         """
-        Keep the message and the proposal.
+        Keep the message, the proposal, the retired settings and the old lists.
 
         Args:
             message (str): Names the file, the old settings it holds and the remedy.
             proposal (LiveSettings | None): The file's settings in their new
                 form, or None when they cannot be read.
+            retired (tuple[str, ...]): The retired settings the file holds.
+            old_categories (tuple[str, ...] | None): The categories the file
+                traded only, or None.
+            old_tags (tuple[str, ...] | None): The tags the file limited
+                trading to, or None.
         """
         super().__init__(message)
         self.proposal = proposal
+        self.retired = tuple(retired)
+        self.old_categories = None if old_categories is None else tuple(old_categories)
+        self.old_tags = None if old_tags is None else tuple(old_tags)
 
 
 class _RetiredSettings(ValueError):
@@ -3379,18 +3540,32 @@ class _RetiredSettings(ValueError):
 
     Attributes:
         proposal (LiveSettings | None): As LiveDefaultsOutdated.proposal.
+        retired (tuple[str, ...]): As LiveDefaultsOutdated.retired.
+        old_categories (tuple[str, ...] | None): As LiveDefaultsOutdated.old_categories.
+        old_tags (tuple[str, ...] | None): As LiveDefaultsOutdated.old_tags.
     """
 
-    def __init__(self, message: str, proposal: "LiveSettings | None") -> None:
+    def __init__(self, message: str, proposal: "LiveSettings | None",
+                 retired: tuple[str, ...] = (),
+                 old_categories: tuple[str, ...] | None = None,
+                 old_tags: tuple[str, ...] | None = None) -> None:
         """
-        Keep the message and the proposal.
+        Keep the message, the proposal, the retired settings and the old lists.
 
         Args:
             message (str): What the settings hold and the remedy, without the file.
             proposal (LiveSettings | None): The settings in their new form, or None.
+            retired (tuple[str, ...]): The retired settings the file holds.
+            old_categories (tuple[str, ...] | None): The categories the old
+                file traded only, or None.
+            old_tags (tuple[str, ...] | None): The tags the old file limited
+                trading to, or None.
         """
         super().__init__(message)
         self.proposal = proposal
+        self.retired = tuple(retired)
+        self.old_categories = None if old_categories is None else tuple(old_categories)
+        self.old_tags = None if old_tags is None else tuple(old_tags)
 
 
 def live_settings() -> LiveSettings:
@@ -3417,8 +3592,8 @@ def live_settings() -> LiveSettings:
         interval_discount=TIME_SERIES_INTERVAL_PROB_DISCOUNT,
         size_cap=BUDGET_FRACTION,
         same_title_size_cap=SAME_TITLE_SIZE_CAP,
-        categories=TRADE_CATEGORIES,
-        tags=TRADE_TAGS,
+        exclude_categories=TRADE_EXCLUDE_CATEGORIES,
+        exclude_tags=TRADE_EXCLUDE_TAGS,
         rebalance=REBALANCE,
         min_price_move=MIN_PRICE_MOVE,
         sell_at=SELL_AT,
@@ -3509,7 +3684,8 @@ def _filter_names(value, name: str) -> None:
 
     Args:
         value: The filter as the file holds it (null or a list of names).
-        name (str): The field's name ("categories" or "tags"), for the message.
+        name (str): The field's name ("exclude_categories" or "exclude_tags"),
+            for the message.
 
     Raises:
         ValueError: If a name in the list is a str that is not printable.
@@ -3557,23 +3733,147 @@ def _settings_from_toggles(raw, origin: str) -> LiveSettings:
     for name in ("sell_at", "sell_min_days", "min_price_move"):
         if isinstance(raw.get(name), bool):
             raise ValueError(f'"{name}" must be a number or null, got {raw[name]!r}')
-    for name in ("categories", "tags"):
+    for name in ("exclude_categories", "exclude_tags"):
         _filter_names(raw[name], name)
     return LiveSettings(**{**raw, "spread_band": tuple(band)}, origin=origin)
 
 
-def _retired_proposal(raw: dict, origin: str) -> LiveSettings:
+def _old_categories(raw: dict) -> tuple[str, ...] | None:
+    """
+    Read the "categories" an older version saved, by that version's own rules.
+
+    The older version's categories was a list of categories to TRADE (null:
+    any category), and a tag tied to a category ("Sports · Basketball") was
+    accepted only with that category listed, so with null categories no tied
+    tag was accepted at all. A value that version refused has no reading now
+    either.
+
+    Args:
+        raw (dict): The file's "settings" object, holding "categories".
+
+    Returns:
+        tuple[str, ...] | None: The listed categories, stripped, in order;
+            None when the file's categories was null.
+
+    Raises:
+        ValueError: The old value is not null or a non-empty list of names
+            (a string, a number, [], a blank name, a name reading "any", or a
+            category written as a tied tag), or a tied tag's category is not
+            among them.
+    """
+    old = raw["categories"]
+    listed: tuple[str, ...] | None = None
+    if old is not None:
+        if not isinstance(old, list) or not old:
+            raise ValueError(f'"categories" must be null or a list of names, got {old!r}')
+        names = []
+        for item in old:
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError(f'"categories" must hold non-empty names, got {old!r}')
+            name = item.strip()
+            if (name.casefold() == "any" or TAG_SCOPE_SEPARATOR in name
+                    or _tie_with_a_blank_half(name)):
+                raise ValueError(f'"categories" cannot hold the name {name!r}')
+            names.append(name)
+        listed = tuple(names)
+    tags = raw.get("tags")
+    allowed = {name.casefold() for name in listed or ()}
+    for item in tags if isinstance(tags, list) else ():
+        if not isinstance(item, str):
+            # LiveSettings refuses it, with its own message
+            continue
+        # The older version's rule: a tied tag's category had to be listed
+        category, _ = split_tag(item.strip())
+        if category is not None and category.casefold() not in allowed:
+            raise ValueError(f"the tag {item.strip()!r} is tied to {category!r}, which its "
+                             "categories did not list")
+    return listed
+
+
+def _old_tags(raw: dict) -> tuple[str, ...] | None:
+    """
+    Read the "tags" an older version saved, by that version's own rules.
+
+    The older version's tags was a list of tags to TRADE (null: any tag). It
+    took null or a non-empty list of printable names, none blank or reading
+    "any" (nor "none", in the version that had exclude_categories), and a tag
+    tied to a category ("Sports · Basketball") only with both halves present
+    and a tag half other than "any", and only when exclude_categories did not
+    exclude its category. A file that also holds categories is older still:
+    that version took "none" as a name, and its rule for a tied tag (its
+    category had to be listed) is _old_categories'. A value the older version
+    refused has no reading now either.
+
+    Args:
+        raw (dict): The file's "settings" object, holding "tags".
+
+    Returns:
+        tuple[str, ...] | None: The listed tags, stripped, in order (a tied one
+            as saved, "Category · Tag"); None when the file's tags was null.
+
+    Raises:
+        ValueError: The old value is not null or a non-empty list of names
+            (a string, a number, [], a blank or unprintable name, a name
+            reading "any" or, with exclude_categories, "none"), a tied tag has
+            a blank half or a tag half reading "any", or a tied tag's category
+            is one the file's exclude_categories excluded.
+    """
+    old = raw["tags"]
+    if old is None:
+        return None
+    if not isinstance(old, list) or not old:
+        raise ValueError(f'"tags" must be null or a list of names, got {old!r}')
+    # The version with exclude_categories also refused the name "none"
+    refused = ("any",) if "categories" in raw else ("any", "none")
+    excluded = raw.get("exclude_categories")
+    excluded = ({c.strip().casefold() for c in excluded if isinstance(c, str)}
+                if isinstance(excluded, list) else set())
+    names = []
+    for item in old:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f'"tags" must hold non-empty names, got {old!r}')
+        if not item.isprintable():
+            raise ValueError(f'"tags" must hold printable names, got {item!r}')
+        name = item.strip()
+        if name.casefold() in refused:
+            raise ValueError(f'"tags" cannot hold the name {name!r}')
+        category, tag = split_tag(name)
+        if category is None:
+            if _tie_with_a_blank_half(name):
+                raise ValueError(f'"tags" cannot hold the name {name!r}')
+        elif not category or not tag or tag.casefold() == "any":
+            raise ValueError(f'"tags" cannot hold the name {name!r}')
+        elif category.casefold() in excluded:
+            # The version with exclude_categories refused a tied tag in an
+            # excluded category
+            raise ValueError(f"the tag {name!r} is tied to {category!r}, which its "
+                             "exclude_categories excluded")
+        names.append(name)
+    return tuple(names)
+
+
+def _retired_proposal(raw: dict, origin: str
+                      ) -> tuple[LiveSettings, tuple[str, ...] | None, tuple[str, ...] | None]:
     """
     Read a "settings" object an older version saved as the settings it means now.
 
-    The older version had two switches and a minimum: add_to_held_pairs,
-    trim_to_kelly and trim_min_rise. Rebalance does both together, so it is
-    on only when both old switches were on, and its minimum (min_price_move)
-    is the old trim minimum then; with either switch off, rebalance is off
-    and there is no minimum. Every other setting is as saved. The old values
-    must be what the older version accepted (real true/false switches, a
-    minimum on the 5c grid only with trim_to_kelly on), and the result must
-    pass every check a saved file does (_settings_from_toggles).
+    Each retirement the object holds is applied in turn. The Rebalance one: the
+    older version had two switches and a minimum (add_to_held_pairs,
+    trim_to_kelly and trim_min_rise). Rebalance does both together, so it is on
+    only when both old switches were on, and its minimum (min_price_move) is
+    the old trim minimum then; with either switch off, rebalance is off and
+    there is no minimum. The old values must be what the older version
+    accepted (real true/false switches, a minimum on the 5c grid only with
+    trim_to_kelly on). The categories one: the old value must be what the
+    older version accepted (_old_categories). The proposal excludes no
+    category either way: a null "categories" (any category) is exactly that,
+    while a list of categories to trade has no exact reading (which categories
+    it leaves out depends on every category Kalshi lists), so the proposal
+    then WIDENS live trading to every category, and the old list is handed
+    back so every page that offers the proposal says so. The tags one is the
+    same, for tags (_old_tags): the proposal excludes no tag, and an old list
+    of tags to trade is handed back. Every other setting is as saved, and the
+    result must pass every check a saved file does (_settings_from_toggles).
 
     Args:
         raw (dict): The file's "settings" object, holding one or more of
@@ -3581,63 +3881,142 @@ def _retired_proposal(raw: dict, origin: str) -> LiveSettings:
         origin (str): The origin the result carries (the file and when it was saved).
 
     Returns:
-        LiveSettings: The settings in their new form.
+        tuple[LiveSettings, tuple[str, ...] | None, tuple[str, ...] | None]:
+            The settings in their new form, the categories the old file traded
+            only (None when it held no categories, or a null one), and the tags
+            the old file limited trading to (None when it held no tags, or a
+            null one).
 
     Raises:
         ValueError: The old values, or the rest of the settings, are refused;
-            or the object also holds rebalance or min_price_move, so it says
-            two things at once.
+            or the object also holds the settings that replaced a retired one
+            (rebalance or min_price_move beside the Rebalance ones), or a key
+            of the new category/tag filter that no version saved beside a
+            retired filter key (_RETIRED_FILTER_COMPANIONS: exclude_categories
+            or exclude_tags beside categories, exclude_tags beside tags), so
+            it says two things at once.
     """
-    if "rebalance" in raw or "min_price_move" in raw:
-        raise ValueError("it also holds rebalance or min_price_move")
-    for name in ("add_to_held_pairs", "trim_to_kelly"):
-        if name in raw and type(raw[name]) is not bool:
-            raise ValueError(f'"{name}" must be true or false, got {raw[name]!r}')
-    rise = raw.get("trim_min_rise")
-    if isinstance(rise, bool):
-        raise ValueError(f'"trim_min_rise" must be a number or null, got {rise!r}')
-    if rise is not None:
-        # The older version's own rules: on the 5c grid, and only with trimming on
-        _step_move(rise, "trim_min_rise")
-        if raw.get("trim_to_kelly") is not True:
-            raise ValueError(f'"trim_min_rise" needs trim_to_kelly on, got {rise!r} '
-                             "with trim_to_kelly off")
-    rebalance = raw.get("add_to_held_pairs") is True and raw.get("trim_to_kelly") is True
     toggles = {name: value for name, value in raw.items() if name not in _RETIRED_TOGGLES}
-    toggles["rebalance"] = rebalance
-    if rebalance and rise is not None:
-        toggles["min_price_move"] = rise
-    return _settings_from_toggles(toggles, origin)
+    # Two filters at once cannot be read as one: a retired filter key beside
+    # a new filter key no version ever saved with it has no reading
+    for old, companions in _RETIRED_FILTER_COMPANIONS.items():
+        if old not in raw:
+            continue
+        for new in ("exclude_categories", "exclude_tags"):
+            if new in raw and new not in companions:
+                raise ValueError(f"it also holds {new}, which no version saved "
+                                 f"beside {old}")
+    old_categories = old_tags = None
+    if "categories" in raw:
+        old_categories = _old_categories(raw)
+        toggles["exclude_categories"] = None
+    if "tags" in raw:
+        old_tags = _old_tags(raw)
+        toggles["exclude_tags"] = None
+    rebalance_keys = _RETIREMENTS[0][0]
+    if any(name in raw for name in rebalance_keys):
+        if "rebalance" in raw or "min_price_move" in raw:
+            raise ValueError("it also holds rebalance or min_price_move")
+        for name in ("add_to_held_pairs", "trim_to_kelly"):
+            if name in raw and type(raw[name]) is not bool:
+                raise ValueError(f'"{name}" must be true or false, got {raw[name]!r}')
+        rise = raw.get("trim_min_rise")
+        if isinstance(rise, bool):
+            raise ValueError(f'"trim_min_rise" must be a number or null, got {rise!r}')
+        if rise is not None:
+            # The older version's own rules: on the 5c grid, and only with trimming on
+            _step_move(rise, "trim_min_rise")
+            if raw.get("trim_to_kelly") is not True:
+                raise ValueError(f'"trim_min_rise" needs trim_to_kelly on, got {rise!r} '
+                                 "with trim_to_kelly off")
+        rebalance = raw.get("add_to_held_pairs") is True and raw.get("trim_to_kelly") is True
+        toggles["rebalance"] = rebalance
+        if rebalance and rise is not None:
+            toggles["min_price_move"] = rise
+    return _settings_from_toggles(toggles, origin), old_categories, old_tags
 
 
 def _retired_message(retired: list[str], proposal: LiveSettings | None,
-                     refused: str | None) -> str:
+                     refused: str | None,
+                     old_categories: tuple[str, ...] | None = None,
+                     old_tags: tuple[str, ...] | None = None) -> str:
     """
     Say what an outdated saved file holds and how to save it again.
+
+    Each retirement the file holds is named with what replaced it.
 
     Args:
         retired (list[str]): The retired settings the file holds, in
             _RETIRED_TOGGLES' order.
         proposal (LiveSettings | None): What the file reads as now, or None.
-        refused (str | None): Why the rest of the file is refused, when
-            proposal is None.
+        refused (str | None): Why there is no proposal (the old values, or
+            the rest of the file, are refused); None when there is a proposal.
+        old_categories (tuple[str, ...] | None): The categories the old file
+            traded only, when it listed some; the proposal then trades every
+            category.
+        old_tags (tuple[str, ...] | None): The tags the old file limited
+            trading to (a tied "Category · Tag" limited that category alone),
+            when it listed some; the proposal then trades every tag.
 
     Returns:
         str: One line, e.g. '"settings" holds add_to_held_pairs, trim_to_kelly
             and trim_min_rise, which rebalance and min_price_move replaced:
             save the live defaults again (start ./start_dashboard.sh; its
-            pages offer them as rebalance yes, min price movement 10c)'.
+            pages offer them as rebalance yes, min price movement 10c)', or,
+            for a file that listed categories to trade, '"settings" holds
+            categories, which exclude_categories replaced: these defaults
+            traded only 'Economics', and this version saves what NOT to trade
+            instead. Saved again as offered (no category excluded), they trade
+            everything: exclude each category not to trade before saving
+            (start ./start_dashboard.sh, or the backtest dashboard's "Save as
+            live defaults…" button)'. A file that listed tags to trade says
+            "limited trading to the tags 'Basketball' (a 'Category · Tag'
+            limited that category alone)" and "exclude each tag not to
+            trade", and one that listed both names both.
     """
-    held = retired[0] if len(retired) == 1 else ", ".join(retired[:-1]) + " and " + retired[-1]
-    head = f'"settings" holds {held}, which rebalance and min_price_move replaced'
+    parts = []
+    for old_names, replaced_by in _RETIREMENTS:
+        held = [name for name in retired if name in old_names]
+        if held:
+            listed = held[0] if len(held) == 1 else ", ".join(held[:-1]) + " and " + held[-1]
+            parts.append(f"{listed}, which {replaced_by} replaced")
+    head = '"settings" holds ' + ", and ".join(parts)
     if proposal is None:
         return (f"{head}, and its other settings are refused too ({refused}): save the "
                 "live defaults again (start ./start_dashboard.sh and save new ones from "
                 "its pages, from the seed values or the backtest dashboard)")
-    offered = ("rebalance yes, min price movement " + _move_text(proposal.min_price_move)
-               if proposal.rebalance else "rebalance no")
+    offered = []
+    if any(name in _RETIREMENTS[0][0] for name in retired):
+        offered.append("rebalance yes, min price movement " + _move_text(proposal.min_price_move)
+                       if proposal.rebalance else "rebalance no")
+    if "categories" in retired:
+        offered.append("no category excluded")
+    if "tags" in retired:
+        offered.append("no tag excluded")
+    # What an old list to trade kept, and what to exclude in its place
+    widened, kinds = [], []
+    if old_categories is not None:
+        names = ", ".join(repr(name) for name in old_categories)
+        # A file that listed only categories keeps the wording it always had
+        widened.append(f"traded only {names}" if old_tags is None
+                       else f"traded only the categories {names}")
+        kinds.append("category")
+    if old_tags is not None:
+        # The old rule narrowed every category to a plain tag, but only its own
+        # category to a tied one
+        widened.append("limited trading to the tags "
+                       + ", ".join(repr(name) for name in old_tags)
+                       + f" (a 'Category{TAG_SCOPE_SEPARATOR}Tag' limited that category alone)")
+        kinds.append("tag")
+    if widened:
+        return (f"{head}: these defaults {' and '.join(widened)}, and this "
+                f"version saves what NOT to trade instead. Saved again as offered "
+                f"({', '.join(offered)}), they trade everything: exclude each "
+                f"{' and '.join(kinds)} not to trade before saving (start "
+                "./start_dashboard.sh, or the backtest dashboard's \"Save as live "
+                "defaults…\" button)")
     return (f"{head}: save the live defaults again (start ./start_dashboard.sh; its pages "
-            f"offer them as {offered})")
+            f"offer them as {', '.join(offered)})")
 
 
 def _saved_settings(record) -> LiveSettings:
@@ -3684,10 +4063,13 @@ def _saved_settings(record) -> LiveSettings:
         # Never read as the new settings: refused, with what they would read as
         # attached for the defaults server to offer
         try:
-            proposal, refused = _retired_proposal(raw, origin), None
+            (proposal, old_categories, old_tags), refused = (
+                _retired_proposal(raw, origin), None)
         except (TypeError, ValueError) as exc:
-            proposal, refused = None, str(exc)
-        raise _RetiredSettings(_retired_message(retired, proposal, refused), proposal)
+            proposal, old_categories, old_tags, refused = None, None, None, str(exc)
+        raise _RetiredSettings(
+            _retired_message(retired, proposal, refused, old_categories, old_tags), proposal,
+            tuple(retired), old_categories, old_tags)
     return _settings_from_toggles(raw, origin)
 
 
@@ -3738,7 +4120,8 @@ def read_saved_live_defaults() -> LiveSettings | None:
     - "settings": the eleven toggles by LiveSettings field name. tier_floors is
       true/false, spread_band is [floor, ceiling], interval_discount, size_cap
       and same_title_size_cap are numbers (the caps as fractions),
-      categories and tags are null (any) or a list of names, rebalance is
+      exclude_categories is null (none excluded) or a list of names,
+      exclude_tags is null (none excluded) or a list of names, rebalance is
       true/false or left out, which reads as off, and min_price_move is
       dollars (0.1 for 10c), or null or left out for no minimum. sell_at (a
       share, e.g. 0.85) and sell_min_days (whole days) are numbers, or null
@@ -3750,8 +4133,10 @@ def read_saved_live_defaults() -> LiveSettings | None:
     refused without waiting on it, or a link to a file that does not exist).
     A link to a regular file is read through. Settings that hold any of
     _RETIRED_TOGGLES (add_to_held_pairs, trim_to_kelly, trim_min_rise: what an
-    older version saved in place of rebalance and min_price_move) are refused
-    as LiveDefaultsOutdated, which carries what they read as now.
+    older version saved in place of rebalance and min_price_move; categories,
+    which exclude_categories replaced; tags, which exclude_tags replaced) are
+    refused as LiveDefaultsOutdated,
+    which carries what they read as now.
 
     Returns:
         LiveSettings | None: The toggles, their origin naming the file and when
@@ -3796,7 +4181,8 @@ def read_saved_live_defaults() -> LiveSettings | None:
     except _RetiredSettings as exc:
         # Saved by an older version: refused like any other bad file, with the
         # settings it means now attached for the defaults server to offer
-        raise LiveDefaultsOutdated(f"{path}: {exc}", exc.proposal) from exc
+        raise LiveDefaultsOutdated(f"{path}: {exc}", exc.proposal, exc.retired,
+                                   exc.old_categories, exc.old_tags) from exc
     except (TypeError, ValueError, RecursionError) as exc:
         raise LiveDefaultsError(f"{path}: {exc}") from exc
 
@@ -4756,16 +5142,17 @@ def _names_text(names: tuple[str, ...] | None) -> str:
 
     Exact where a plain join would print two filters alike: a name holding ",",
     ";" or "|" (each a separator where the filter is printed) switches every
-    name to its repr. None renders "any", a name _names refuses.
+    name to its repr. None renders as "none" (nothing excluded), a name
+    _names refuses.
 
     Args:
         names (tuple[str, ...] | None): A filter as LiveSettings holds it.
 
     Returns:
-        str: "any" for None, else the names joined by ", " (e.g. "Economics, Sports").
+        str: "none" for None, else the names joined by ", " (e.g. "Economics, Sports").
     """
     if names is None:
-        return "any"
+        return "none"
     if any(sep in name for name in names for sep in (",", ";", "|")):
         return ", ".join(repr(name) for name in names)
     return ", ".join(names)
@@ -4811,8 +5198,8 @@ _LIVE_SETTING_FIELDS = (
     ("k", "interval_discount", repr),
     ("per-trade cap", "size_cap", lambda v: _cap_text(v, "no cap")),
     ("same-title cap", "same_title_size_cap", lambda v: _cap_text(v, "no extra cap")),
-    ("categories", "categories", _names_text),
-    ("tags", "tags", _names_text),
+    ("exclude categories", "exclude_categories", _names_text),
+    ("exclude tags", "exclude_tags", _names_text),
     ("rebalance", "rebalance", lambda v: "yes" if v else "no"),
     ("min price movement", "min_price_move", _move_text),
     ("sell at", "sell_at", _sell_at_text),
@@ -4824,17 +5211,17 @@ def trade_filter(settings: LiveSettings) -> Callable[[str, str], bool]:
     """
     Build a run's category/tag filter as one test of a pair's category and tag.
 
-    The rule: keep a pair when its category is listed (or no category is
-    listed) and, looking only at the tags that apply to that category (plain
-    tags, plus tags tied to it), either none applies or the pair's tag is one
-    of them. So a listed category trades in full unless a tag narrows it, and
-    a filter of plain tags alone keeps a pair when its category is listed (or
-    none is) and its tag is listed. Names are compared without regard to case.
-    This is the one definition of the filter: main._filter_by_category decides
-    every pair through it, via trade_filter_for.
+    The rule: keep a pair unless its category is excluded or its first tag is
+    excluded, a plain excluded tag ("Basketball") under every category and a
+    tied one ("Sports · Basketball") in its own category alone. So every
+    category and tag not excluded trades, one the backtest never saw
+    included. Names are compared without regard to case. This is the one
+    definition of the filter: main._filter_by_category decides every pair
+    through it, via trade_filter_for.
 
     Args:
-        settings (LiveSettings): The run's toggles (categories and tags).
+        settings (LiveSettings): The run's toggles (exclude_categories and
+            exclude_tags).
 
     Returns:
         Callable[[str, str], bool]: keeps(category, tag), True when a pair
@@ -4842,30 +5229,32 @@ def trade_filter(settings: LiveSettings) -> Callable[[str, str], bool]:
     """
     # The same test from the two fields alone, so a caller holding only the recorded
     # filter (the backtest page) asks the very same rule
-    return trade_filter_for(settings.categories, settings.tags)
+    return trade_filter_for(settings.exclude_categories, settings.exclude_tags)
 
 
-def trade_filter_for(categories: tuple[str, ...] | None,
-                     tags: tuple[str, ...] | None) -> Callable[[str, str], bool]:
+def trade_filter_for(exclude_categories: tuple[str, ...] | None,
+                     exclude_tags: tuple[str, ...] | None) -> Callable[[str, str], bool]:
     """
     Build the category/tag filter from the two lists alone.
 
     The body of trade_filter, for a caller that holds the two recorded fields
-    (BacktestSweep.live_categories / live_tags) rather than a LiveSettings.
-    The names are taken as validated: tied tags name a listed category.
+    (BacktestSweep.live_exclude_categories / live_exclude_tags) rather than a
+    LiveSettings. The names are taken as validated.
 
     Args:
-        categories (tuple[str, ...] | None): Listed categories; None = any.
-        tags (tuple[str, ...] | None): Listed tags, plain ("Basketball") or tied
-            ("Sports · Basketball"); None = any.
+        exclude_categories (tuple[str, ...] | None): Excluded categories;
+            None = none excluded.
+        exclude_tags (tuple[str, ...] | None): Excluded tags, plain
+            ("Basketball", under every category) or tied ("Sports · Basketball",
+            in that category alone); None = none excluded.
 
     Returns:
         Callable[[str, str], bool]: keeps(category, tag), as trade_filter returns.
     """
-    cats = None if categories is None else {c.casefold() for c in categories}
+    excluded = {c.casefold() for c in exclude_categories or ()}
     plain: set[str] = set()
     tied: dict[str, set[str]] = {}
-    for name in tags or ():
+    for name in exclude_tags or ():
         category, tag = split_tag(name)
         if category is None:
             plain.add(tag.casefold())
@@ -4883,11 +5272,12 @@ def trade_filter_for(categories: tuple[str, ...] | None,
         Returns:
             bool: True when the filter keeps the pair.
         """
-        c = category.casefold()
-        if cats is not None and c not in cats:
+        c, t = category.casefold(), tag.casefold()
+        # An excluded category never trades, nor an excluded tag: a plain one
+        # under every category, a tied one in its own category
+        if c in excluded or t in plain:
             return False
-        applies = plain | tied.get(c, set())
-        return not applies or tag.casefold() in applies
+        return t not in tied.get(c, ())
 
     return keeps
 
@@ -4903,9 +5293,11 @@ def describe_trade_filter(settings: LiveSettings) -> str:
         settings (LiveSettings): The run's toggles.
 
     Returns:
-        str: e.g. "categories Economics, Sports; tags any".
+        str: e.g. "exclude categories Politics, Sports; exclude tags none", or
+            "exclude categories none; exclude tags none" with nothing excluded.
     """
-    return f"categories {_names_text(settings.categories)}; tags {_names_text(settings.tags)}"
+    return (f"exclude categories {_names_text(settings.exclude_categories)}; "
+            f"exclude tags {_names_text(settings.exclude_tags)}")
 
 
 def describe_live_settings(settings: LiveSettings, reference: LiveSettings | None = None) -> str:
@@ -4925,7 +5317,7 @@ def describe_live_settings(settings: LiveSettings, reference: LiveSettings | Non
 
     Returns:
         str: e.g. "tier floors off | spread band 0-0.5 | k 0.8 | per-trade cap
-            100% (no cap) | same-title cap 20% | categories any | tags any |
+            100% (no cap) | same-title cap 20% | exclude categories none | exclude tags none |
             rebalance yes | min price movement any | sell at off | min days to
             maturity any",
             with " (default: X)" after each field that differs from reference's
@@ -4985,9 +5377,10 @@ def live_settings_argv(settings: LiveSettings) -> list[str]:
     gets back settings equal to these (tests/test_main.py checks the round
     trip). Caps are written as whole percents, which LiveSettings' 5% grid
     makes exact. The other numbers are written as their repr, which float()
-    reads back exactly. Each category or tag is written as --category=NAME or
-    --tag=NAME, so a name that begins with "-" still reads as a name; no
-    filter is written as --any-category or --any-tag. Rebalancing is written
+    reads back exactly. Each excluded category or tag is written as
+    --exclude-category=NAME or --exclude-tag=NAME, so a name that begins with
+    "-" still reads as a name; no excluded category is written as
+    --no-exclude-category and no excluded tag as --no-exclude-tag. Rebalancing is written
     either way (--rebalance / --no-rebalance), so a saved value never decides
     it, and so is its minimum price move in whole cents (--min-price-move=10
     / --no-min-price-move), the sell level and its minimum (--sell-at=85 /
@@ -5000,8 +5393,8 @@ def live_settings_argv(settings: LiveSettings) -> list[str]:
         list[str]: The flags, in the order main.py lists them: the tier-floor
             switch, --spread-min, --spread-max, --interval-discount,
             --size-cap, --same-title-size-cap, the rebalance switch and its
-            minimum, the two sell flags, then the category flags and the tag
-            flags.
+            minimum, the two sell flags, then the excluded-category flags and
+            the excluded-tag flags.
     """
     argv = ["--tier-floors" if settings.tier_floors else "--no-tier-floors",
             f"--spread-min={settings.spread_band[0]!r}",
@@ -5018,10 +5411,10 @@ def live_settings_argv(settings: LiveSettings) -> list[str]:
              else ["--no-sell"])
     argv += ([f"--sell-min-days={settings.sell_min_days}"]
              if settings.sell_min_days is not None else ["--no-sell-min-days"])
-    argv += ([f"--category={name}" for name in settings.categories]
-             if settings.categories is not None else ["--any-category"])
-    argv += ([f"--tag={name}" for name in settings.tags]
-             if settings.tags is not None else ["--any-tag"])
+    argv += ([f"--exclude-category={name}" for name in settings.exclude_categories]
+             if settings.exclude_categories is not None else ["--no-exclude-category"])
+    argv += ([f"--exclude-tag={name}" for name in settings.exclude_tags]
+             if settings.exclude_tags is not None else ["--no-exclude-tag"])
     return argv
 
 
