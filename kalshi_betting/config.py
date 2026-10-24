@@ -634,17 +634,12 @@ TRADE_EXCLUDE_CATEGORIES: tuple[str, ...] | None = None
 # (the rest are only counted).
 CATEGORY_FILTER_MAX_NAMED_SERIES = 5
 
-# Kalshi tags a pair may NOT trade in, or None to exclude none: matched
-# case-insensitively against the series' FIRST tag. A plain name ("Basketball")
-# is excluded under every category; a name tied to a category
-# ("Sports · Basketball") is excluded in that category alone (trade_filter is
-# the rule), which is what lets the backtest dashboard's Exclude tags menu be
-# saved as live defaults. A tied tag whose category is excluded too is allowed:
-# it excludes nothing more. While any tag is excluded, main._filter_by_category
-# does not trade a pair whose series Kalshi's /series listing lacks (its first
-# tag is not known, and may be excluded). A live run reads the saved live
-# defaults' exclude_tags instead, which main.py --exclude-tag NAME (repeatable)
-# / --no-exclude-tag overrides for one run.
+# Kalshi tags a pair may NOT trade in, or None to exclude none, matched
+# case-insensitively against the series' first tag. A plain name ("Basketball")
+# is excluded under every category; a tied name ("Sports · Basketball") only in
+# its own category. While any tag is excluded, a pair whose series Kalshi's
+# /series listing lacks is not traded. A live run reads the saved live
+# defaults' exclude_tags instead (main.py --exclude-tag / --no-exclude-tag).
 TRADE_EXCLUDE_TAGS: tuple[str, ...] | None = None
 
 # How a filter ties a tag to one category: "Sports · Basketball" (a space, a
@@ -799,33 +794,22 @@ LIVE_DEFAULTS_SOURCE_PATTERN = (
 DEFAULTS_SERVER_HOST = "127.0.0.1"
 DEFAULTS_SERVER_PORT = 8765
 
-# The longest request (path plus body) the server reads. Its form is under 2 KB
-# with one category and tag; the dashboard's Save button can name hundreds of
-# excluded tags (every "Category · Tag" ticked in its Exclude tags menu, each
-# letter-case spelling included), at 40 to 80 bytes each once percent-encoded,
-# so 400 of them come to about 16 to 32 KB, with room left for the categories
-# and the signed fields. The dashboard keeps its Save button disabled for an
-# address that would not fit.
+# The longest request (path plus body) the server reads. The dashboard's Save
+# button can name hundreds of excluded tags (16 to 32 KB for 400) and keeps
+# itself disabled for an address that would not fit.
 DEFAULTS_SERVER_MAX_REQUEST_BYTES = 65_536
 
 # The most excluded categories, and the most excluded tags, one confirmation
-# link may name. Kalshi lists about 20 categories and a few hundred distinct
-# category and first-tag pairs, so a dashboard page that excludes most tags
-# of most categories still fits.
+# link may name.
 DEFAULTS_SERVER_MAX_FILTER_NAMES = 400
 
-# The longest request line the server's HTTP layer reads, "GET <path>
-# HTTP/1.1" and its line break included: http.server's own limit, whatever
-# DEFAULTS_SERVER_MAX_REQUEST_BYTES says. A confirmation address opened with a
-# GET is held to the smaller of the two (the dashboard's Save button)
+# The longest request line http.server reads ("GET <path> HTTP/1.1" and its
+# line break), whatever DEFAULTS_SERVER_MAX_REQUEST_BYTES says.
 DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES = 65_536
 
-# What the confirmation page's form adds, when it is posted back, to the
-# fields of the address it was opened with: "&fingerprint=" and 64 hex
-# digits (77 bytes), "&nonce=" and 32 (39), "&token=" and 64 (71),
-# "&action=dry_run", the longest action (15), and "&ack_attention=1", the box
-# under the attention banner (16). The dashboard's Save button budgets the
-# posted form with it; a test renders a real form and checks the sum
+# Bytes the confirmation form adds when posted back: the fingerprint, nonce,
+# token, longest action and attention box fields. The Save button budgets with
+# it; a test checks the sum against a real form.
 DEFAULTS_SERVER_CONFIRM_FORM_EXTRA_BYTES = 218
 
 # Bytes the dashboard's Save button leaves unused under both of the defaults
