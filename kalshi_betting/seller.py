@@ -8,10 +8,12 @@ Purpose:
     each sale; main.py hands the plans to trader.sell_positions. A position is an
     exact held pair (one YES and one NO market of equal count), or a lone held
     market with its paid-out partner (a settled market the account held on the other
-    side at the same count, asking the same question). Its held markets are alone on
-    their ladder (one question asked at several deadlines). It is sold when its realized
-    profit (what selling its held markets returns after fees, plus any partner's
-    payout, less its cost) has reached LiveSettings.sell_at of its potential
+    side, asking the same question, at the same count or, when no market of that
+    count fits, at least as many (a lone market partly sold after its partner paid
+    out holds fewer)). Its held markets are alone on their ladder (one question
+    asked at several deadlines). It is sold when its realized profit (what
+    selling its held markets returns after fees, plus any partner's payout, less
+    its cost) has reached LiveSettings.sell_at of its potential
     profit (what it pays if it wins, less its cost) at each of
     config.TAKE_PROFIT_HOLD_DAYS daily checks, the last one now. The rule in
     full, and where it differs from the backtest: CLAUDE.md (live selling).
@@ -64,6 +66,7 @@ from .config import (
     SALE_KIND_TAKE_PROFIT,
     SALE_PARTNER_MAX_AGE_DAYS,
     SALE_PARTNER_MAX_LOOKUPS,
+    SALE_PARTNER_MAX_WIDER_LOOKUPS,
     SCHEDULED_RUN,
     TAKE_PROFIT_HOLD_DAYS,
     TAKE_PROFIT_HOLD_DAYS_MAX,
@@ -133,7 +136,8 @@ class SaleLeg:
             trim, the contracts sold there.
         cost_dollars (float): What they cost, fees included.
         market (Any): The ApiMarket from this run's market list while held; None for a partner.
-        payout_dollars (float | None): What a partner paid when it settled; None while held.
+        payout_dollars (float | None): What a partner paid when it settled, for
+            `count` of the contracts it settled with (_partner_leg); None while held.
         paid_at (datetime | None): When a partner settled (UTC); None while held.
         partner_fee_multiplier (float): For a paid-out partner (no market), the
             fee multiplier it is listed at (scanner.listed_fee_multiplier of its
@@ -373,6 +377,9 @@ class _Reads:
         hold_days (int): How many daily checks there are (0 for a Kelly trim or an
             add-on, which make none).
         lookups (int): Label lookups from the exchange so far (SALE_PARTNER_MAX_LOOKUPS at most).
+        wider_lookups (int): Label lookups from the exchange so far in _find_partner's
+            search for a partner settled with more contracts than are held
+            (SALE_PARTNER_MAX_WIDER_LOOKUPS at most), counted apart from `lookups`.
         fee_multipliers (dict): Series ticker -> fee multiplier
             (historical.load_series_fee_multipliers), for a paid-out partner's fee.
     """
@@ -389,6 +396,7 @@ class _Reads:
         self.now_ts = now_ts
         self.hold_days = hold_days
         self.lookups = 0
+        self.wider_lookups = 0
         self._candles: dict = {}
         self._then_candles: dict = {}
         self._settlements: list | None = None
@@ -480,12 +488,19 @@ class _Reads:
                                 "run: %s", self._settlements_problem)
         return self._settlements, self._settlements_problem
 
-    def labels(self, ticker: str) -> tuple[frozenset | None, str]:
+    def labels(self, ticker: str, *, wider: bool = False) -> tuple[frozenset | None, str]:
         """
         A settled market's ladder labels, found once: in this run's market list, or looked up.
 
+        A lookup counts against SALE_PARTNER_MAX_LOOKUPS, or, for _find_partner's search
+        for a partner settled with more contracts (`wider`), against
+        SALE_PARTNER_MAX_WIDER_LOOKUPS, so that search never uses up the lookups a
+        same-count partner needs. Labels found by either are kept for both.
+
         Args:
             ticker (str): The settled market's ticker.
+            wider (bool): True when the search for a partner settled with more
+                contracts asks.
 
         Returns:
             tuple[frozenset | None, str]: (its labels, "") or (None, why not found).
@@ -493,7 +508,12 @@ class _Reads:
         if ticker in self._labels:
             return self._labels[ticker]
         listed = ticker in self.markets_by_ticker
-        if not listed:
+        if not listed and wider:
+            if self.wider_lookups >= SALE_PARTNER_MAX_WIDER_LOOKUPS:
+                return None, (f"the limit of {SALE_PARTNER_MAX_WIDER_LOOKUPS} lookups for a "
+                              "partner settled with more contracts this run was reached")
+            self.wider_lookups += 1
+        elif not listed:
             if self.lookups >= SALE_PARTNER_MAX_LOOKUPS:
                 return None, (f"the limit of {SALE_PARTNER_MAX_LOOKUPS} partner lookups "
                               "this run was reached")
@@ -541,14 +561,19 @@ def _find_partner(reads: _Reads, ticker: str, side: str, count: int,
     """
     Find a lone held market's one paid-out partner among the account's settlements.
 
-    It is the one settled market no longer held, held on the other side with the
-    same count (none on the held side), asking the held market's question (every
-    pair the bot buys asks one question, so a market of its event that asks
-    another was never its pair-mate), and settled no earlier than
-    SALE_PARTNER_MAX_AGE_DAYS before now (one dated after now is returned, and
-    _plan_one refuses it). Fails closed: a held market with no question label, no
-    partner, two or more, an unreadable label, or a partner settled other than yes
-    or no means no sale.
+    It is the one settled market no longer held, held on the other side (none on
+    the held side), asking the held market's question (every pair the bot buys
+    asks one question, so a market of its event that asks another was never its
+    pair-mate), and settled no earlier than SALE_PARTNER_MAX_AGE_DAYS before now
+    (one dated after now is returned, and _plan_one refuses it). Its count on the
+    other side is the held count when such a market exists; only when none does,
+    it is at least the held count, since a lone market partly sold after its
+    partner paid out (by a sale that filled in part, or one by hand) holds fewer
+    contracts than its partner settled with. Either way exactly one market must
+    fit. The second search's lookups count against SALE_PARTNER_MAX_WIDER_LOOKUPS,
+    apart from the first's (_Reads.labels). Fails closed: a held market with no
+    question label, no partner, two or more, an unreadable label, or a partner
+    settled other than yes or no means no sale.
 
     Args:
         reads (_Reads): This run's reads.
@@ -569,25 +594,39 @@ def _find_partner(reads: _Reads, ticker: str, side: str, count: int,
         return None, problem
     other = _OTHER_SIDE[side]
     oldest = reads.now_ts - SALE_PARTNER_MAX_AGE_DAYS * _DAY_SECONDS
-    candidates = [s for s in settlements
-                  if s.ticker not in reads.held_positions and s.ticker != ticker
-                  and _settled_count(s, other) == count and _settled_count(s, side) == 0
-                  and s.settled_at.timestamp() >= oldest]
-    partners: list[Settlement] = []
-    for settlement in candidates:
-        found, problem = reads.labels(settlement.ticker)
-        if found is None:
-            return None, problem
-        if question not in found:
-            continue
-        partners.append(settlement)
-        if len(partners) > 1:
-            break
+
+    def partners_whose_count(fits, wider: bool) -> tuple[list[Settlement] | None, str]:
+        """Up to two settled markets that pass every test above and whose count on the
+        other side fits; (None, why) when a candidate's labels cannot be found. `wider`
+        names the search for a partner settled with more (its own lookup allowance)."""
+        candidates = [s for s in settlements
+                      if s.ticker not in reads.held_positions and s.ticker != ticker
+                      and fits(_settled_count(s, other)) and _settled_count(s, side) == 0
+                      and s.settled_at.timestamp() >= oldest]
+        partners: list[Settlement] = []
+        for settlement in candidates:
+            found, problem = reads.labels(settlement.ticker, wider=wider)
+            if found is None:
+                return None, problem
+            if question not in found:
+                continue
+            partners.append(settlement)
+            if len(partners) > 1:
+                break
+        return partners, ""
+
+    # The same count first; only when no market fits it, one settled with at least
+    # as many (a label already found is not looked up again)
+    partners, problem = partners_whose_count(lambda settled: settled == count, False)
+    if partners == []:
+        partners, problem = partners_whose_count(lambda settled: settled >= count, True)
+    if partners is None:
+        return None, problem
     if not partners:
         # config.count_text: a contract count written exactly
         return None, (f"no paid-out partner: no market it no longer holds was held "
-                      f"{other.upper()} with {count_text(count)} contracts on its question "
-                      f"and paid out in the last {SALE_PARTNER_MAX_AGE_DAYS} days")
+                      f"{other.upper()} with at least {count_text(count)} contracts on its "
+                      f"question and paid out in the last {SALE_PARTNER_MAX_AGE_DAYS} days")
     if len(partners) > 1:
         return None, ("more than one settled market could be its paid-out partner ("
                       + ", ".join(s.ticker for s in partners) + ")")
@@ -596,6 +635,39 @@ def _find_partner(reads: _Reads, ticker: str, side: str, count: int,
         return None, (f"its partner {partner.ticker} settled {partner.result} rather than "
                       "yes or no, which the rule does not judge")
     return partner, ""
+
+
+def _partner_leg(reads: _Reads, partner: Settlement, other: str, count: int) -> SaleLeg:
+    """
+    A lone held market's paid-out partner as one leg of a position of `count` contract pairs.
+
+    The partner's cost (what was paid for the side held there, plus its fees) and
+    its payout are scaled to `count` of the contracts it settled with on that side:
+    a lone market partly sold after its partner paid out holds fewer contracts than
+    the partner settled with, so the position is that share of the pair. For a
+    partner settled with exactly `count` contracts the share is 1 and the figures
+    are the settlement's own. _plan_one (the take-profit sale) carries this leg
+    beside the held market; its payout values the partner at every check it had
+    paid out by.
+
+    Args:
+        reads (_Reads): This run's reads (for the partner's fee multiplier).
+        partner (Settlement): The partner _find_partner found: settled with at
+            least `count` contracts on `other`.
+        other (str): The side held on the partner, "yes" or "no".
+        count (int): The contracts held on the lone market (at least one).
+
+    Returns:
+        SaleLeg: The partner's leg, with no market.
+    """
+    share = count / _settled_count(partner, other)
+    cost_basis = partner.yes_cost_dollars if other == "yes" else partner.no_cost_dollars
+    return SaleLeg(partner.ticker, partner.event_ticker, other, count,
+                   (cost_basis + partner.fees_dollars) * share,
+                   payout_dollars=partner.revenue_dollars * share,
+                   paid_at=partner.settled_at,
+                   partner_fee_multiplier=reads.partner_fee_multiplier(
+                       partner.ticker, partner.event_ticker))
 
 
 def _checks_text(profits: list[tuple[float, float]]) -> str:
@@ -696,16 +768,13 @@ def _plan_one(pair: HeldPair, reads: _Reads, held_labels: dict, *, sell_at: floa
             not_selling(f"its partner {partner.ticker} is recorded as settling after now")
             return None
         other = _OTHER_SIDE[side]
-        # The partner's cost: what was paid for the side held there, plus its fees
-        cost_basis = partner.yes_cost_dollars if other == "yes" else partner.no_cost_dollars
-        legs.append(SaleLeg(partner.ticker, partner.event_ticker, other, count,
-                            cost_basis + partner.fees_dollars,
-                            payout_dollars=partner.revenue_dollars,
-                            paid_at=partner.settled_at,
-                            partner_fee_multiplier=reads.partner_fee_multiplier(
-                                partner.ticker, partner.event_ticker)))
+        # The partner's cost and payout, scaled to the contracts held here
+        legs.append(_partner_leg(reads, partner, other, count))
+        settled = _settled_count(partner, other)
+        # config.count_text: named only when the partner settled with more than is held here
+        more = "" if settled == count else f" with {count_text(settled)} contracts"
         text = (f"{side.upper()} {ticker} with paid-out {other.upper()} {partner.ticker} "
-                f"(settled {partner.result}, paid {_dollars(partner.revenue_dollars)})")
+                f"(settled {partner.result}{more}, paid {_dollars(partner.revenue_dollars)})")
 
     cost = sum(leg.cost_dollars for leg in legs)
     potential = count * CONTRACT_PAYOUT_DOLLARS - cost

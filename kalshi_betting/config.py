@@ -703,9 +703,18 @@ SALE_KIND_KELLY_TRIM = "kelly_trim"
 # The most settled markets live selling (seller.plan_sales) looks up on the
 # exchange in one run (one or two read-only requests each) to find a held
 # market's paid-out partner (a settled market the account held on the other
-# side, with the same count and question, taken as its pair-mate).
+# side, asking the same question, with the same count or, when no such market
+# fits, at least as many (a lone market partly sold after its partner paid out
+# holds fewer), taken as its pair-mate).
 # Past this many, held markets still waiting for a partner are not sold that run.
 SALE_PARTNER_MAX_LOOKUPS = 20
+
+# The most settled markets one run looks up when no market of a lone held
+# market's count fits and seller._find_partner searches those settled with more
+# contracts. Counted apart from SALE_PARTNER_MAX_LOOKUPS, so that search never
+# uses lookups a same-count partner needs. Past this many, that search finds no
+# partner and the held market is not sold that run.
+SALE_PARTNER_MAX_WIDER_LOOKUPS = 20
 
 # How many days ago, at most, a held market's partner may have paid out for live
 # selling to use it. A pair's two markets stop trading at most MAX_DEADLINE_GAP_DAYS

@@ -477,6 +477,35 @@ class TestParityWithTheBacktest:
         (partner,) = [leg for leg in plan.legs if leg.market is None]
         assert partner.partner_fee_multiplier == 1.0
 
+    @pytest.mark.parametrize("name", [name for name in _PARITY_CASES
+                                      if name.startswith("lone")])
+    def test_a_lone_market_partly_sold_values_as_the_backtests_part_left(self, monkeypatch,
+                                                                       name):
+        # 10 of the lone market's 30 contracts sold after its partner paid
+        # out: live, the partner still shows its 30 settled contracts and is
+        # taken at 20/30; the backtest splits its trade, keeping 20
+        case = _PARITY_CASES[name]()
+        backtester._split_trade(case.trade, 10)
+        held = case.world.positions[_B]
+        case.world.positions[_B] = HeldPosition(
+            _B, held.count * 20 / 30, held.exposure_dollars * 20 / 30,
+            held.fees_dollars * 20 / 30)
+        sale, profits = case.readings()
+        _per_trade, value, cost, _potential_return = sale
+        (plan,) = case.world.plan(monkeypatch, 0.01)
+        assert plan.count == 20
+        for (live_realized, live_potential), (realized, potential) in zip(
+                plan.profits, profits, strict=True):
+            assert live_realized == pytest.approx(realized, abs=1e-9)
+            assert live_potential == pytest.approx(potential, abs=1e-9)
+        assert plan.cost_dollars == pytest.approx(cost, abs=1e-9)
+        paid = sum(leg.payout_dollars for leg in plan.legs if leg.market is None)
+        assert plan.proceeds_dollars == pytest.approx(value - paid, abs=1e-9)
+        top = case.boundary(profits)
+        assert case.world.plan(monkeypatch, top)
+        if top < 1.0:
+            assert not case.world.plan(monkeypatch, round(top + 0.01, 2))
+
     def test_the_levels_tell_the_cases_apart(self):
         # Not vacuous: each case's highest selling level lies strictly inside
         # the grid, so the level just above it is one neither side sells at
@@ -635,6 +664,28 @@ def _settled(ticker: str, event: str, *, yes: float = 30.0, no: float = 0.0,
                       fees, revenue, at or datetime.fromtimestamp(_CK - 3 * _DAY, UTC))
 
 
+# A lone held market with no partner, judged before B (it sorts first)
+_ORPHAN = "KXAAA-26-X"
+
+
+def _orphan_beside_b(decoys: int) -> _World:
+    """B held NO alone (30 contracts) with its partner settled at the same count, and
+    the orphan held YES alone (10 contracts) with no partner: `decoys` settled markets
+    held NO 45 on other questions, each one lookup in the orphan's search for a partner
+    settled with more contracts."""
+    world = _lone_world(_settled(_SAME_EVENT, _EV_B))
+    orphan = _rung(_ORPHAN, "KXAAA-26", "Jan 25, 2026", _B_CLOSE,
+                   title="Will the moon landing happen by Jan 25, 2026?")
+    world.hold(orphan, 10.0, 4.0, 0.20)
+    world.books[_ORPHAN] = _book("yes", ("0.40", "50"))
+    for i in range(decoys):
+        ticker, event = f"KXDECOY{i:02d}-26", f"KXDECOY{i:02d}"
+        world.settlements.insert(i, _settled(ticker, event, yes=0.0, no=45.0))
+        world.lookup[ticker] = _rung(ticker, event, "Jan 20, 2026", _A_CLOSE,
+                                     title=f"Will decoy {i} happen by Jan 20, 2026?")
+    return world
+
+
 class TestPartners:
     def test_a_partner_on_the_held_markets_own_event_is_looked_up_for_its_question(
             self, monkeypatch):
@@ -780,6 +831,94 @@ class TestPartners:
         # Refused before any earlier day's candle is read
         assert world.calls["candles"] == []
 
+    def test_the_same_count_is_taken_before_a_larger_one(self, monkeypatch):
+        # A market settled with more contracts is listed first, and never looked up
+        world = _lone_world(_settled(_SAME_EVENT_2, _EV_B, yes=45.0),
+                            _settled(_SAME_EVENT, _EV_B))
+        (plan,) = world.plan(monkeypatch, 0.01)
+        assert world.calls["lookup"] == [_SAME_EVENT]
+        partner = plan.legs[1]
+        assert (partner.ticker, partner.count) == (_SAME_EVENT, 30)
+        assert partner.cost_dollars == 9.0 + 0.45
+
+    def test_a_larger_one_is_taken_when_no_same_count_market_asks_its_question(
+            self, monkeypatch):
+        # The 30-contract market asks another question, so the 45-contract one
+        # asking B's question is its partner, taken at 30/45
+        option = _rung("KXRKTB-26-BOOM", _EV_B, "Jan 18, 2026", _A_CLOSE,
+                       title="Will the rocket explode by Jan 18, 2026?")
+        world = _lone_world(_settled("KXRKTB-26-BOOM", _EV_B),
+                            _settled(_SAME_EVENT, _EV_B, yes=45.0, cost=13.50, fees=0.60),
+                            lookups={"KXRKTB-26-BOOM": option})
+        (plan,) = world.plan(monkeypatch, 0.01)
+        partner = plan.legs[1]
+        assert (partner.ticker, partner.count) == (_SAME_EVENT, 30)
+        assert partner.cost_dollars == pytest.approx((13.50 + 0.60) * 30 / 45)
+        # Each candidate looked up once over both searches
+        assert world.calls["lookup"] == ["KXRKTB-26-BOOM", _SAME_EVENT]
+
+    def test_a_lone_leg_partly_sold_is_judged_with_its_partner_scaled(self, monkeypatch,
+                                                                      caplog):
+        # B was partly sold after its partner paid out: it holds 86 NO, while
+        # its partner settled with 129 YES (and paid $0), so the partner is
+        # taken at 86/129 of its cost
+        world = _lone_world(_settled(_SAME_EVENT, _EV_B, yes=129.0, cost=38.70, fees=2.58))
+        world.positions[_B] = HeldPosition(_B, -86.0, 34.40, 1.45)
+        with caplog.at_level(logging.INFO):
+            (plan,) = world.plan(monkeypatch, 0.35)
+        partner = plan.legs[1]
+        assert (partner.ticker, partner.side, partner.count) == (_SAME_EVENT, "yes", 86)
+        assert partner.cost_dollars == pytest.approx(27.52)          # $41.28 x 86/129
+        assert partner.payout_dollars == 0.0
+        assert plan.count == 86
+        assert plan.cost_dollars == pytest.approx(63.37)             # $34.40 + $1.45 + $27.52
+        # Each check by hand: 86 NO sold at that check's bid, less the fee on
+        # it, less the cost (a potential profit of $86 - $63.37 = $22.63)
+        assert [fee_leg_exact(86, bid) for bid in (0.85, 0.86, 0.84)] == [0.77, 0.73, 0.81]
+        expected = [86 * 0.85 - 0.77 - 63.37,                        # now: $8.96 (40%)
+                    86 * 0.86 - 0.73 - 63.37,                        # a day before: $9.86
+                    86 * 0.84 - 0.81 - 63.37]                        # two days: $8.06 (36%)
+        for (realized, potential), want in zip(plan.profits, expected, strict=True):
+            assert realized == pytest.approx(want, abs=1e-9)
+            assert potential == pytest.approx(22.63, abs=1e-9)
+        assert "(settled no with 129 contracts, paid $0.00), 86 each" in caplog.text
+        # 35.6% two days before: kept at a 36% level
+        assert world.plan(monkeypatch, 0.36) == []
+
+    def test_the_partner_leg_scales_its_cost_and_payout_to_the_contracts_held(self):
+        reads = seller._Reads(MagicMock(), {}, {}, _CK, 0)
+        paid = _settled(_A, _EV_A, yes=129.0, cost=38.70, fees=2.58, revenue=129.0,
+                        result="yes")
+        leg = seller._partner_leg(reads, paid, "yes", 86)
+        assert (leg.ticker, leg.side, leg.count, leg.market) == (_A, "yes", 86, None)
+        assert leg.cost_dollars == pytest.approx(27.52)
+        assert leg.payout_dollars == pytest.approx(86.0)
+        assert leg.paid_at == paid.settled_at and leg.partner_fee_multiplier == 1.0
+        # A NO partner: its NO cost basis is the one read
+        no_side = _settled(_A, _EV_A, yes=0.0, no=129.0, cost=38.70, fees=2.58)
+        assert seller._partner_leg(reads, no_side, "no", 86).cost_dollars == pytest.approx(27.52)
+        # Settled with exactly the held count: the settlement's own figures, to the bit
+        exact = seller._partner_leg(reads, dc_replace(paid, yes_count=86.0), "yes", 86)
+        assert exact.cost_dollars == 38.70 + 2.58 and exact.payout_dollars == 129.0
+
+    def test_holding_more_than_any_partner_settled_with_has_no_partner(self, monkeypatch,
+                                                                       caplog):
+        world = _lone_world(_settled(_SAME_EVENT, _EV_B, yes=29.0))
+        with caplog.at_level(logging.INFO):
+            assert world.plan(monkeypatch, 0.01) == []
+        assert ("no paid-out partner: no market it no longer holds was held YES with at "
+                "least 30 contracts on its question") in caplog.text
+
+    def test_two_larger_markets_that_could_be_its_partner_are_refused(self, monkeypatch,
+                                                                      caplog):
+        world = _lone_world(_settled(_SAME_EVENT, _EV_B, yes=45.0),
+                            _settled(_SAME_EVENT_2, _EV_B, yes=60.0))
+        with caplog.at_level(logging.INFO):
+            assert world.plan(monkeypatch, 0.01) == []
+        assert (f"more than one settled market could be its paid-out partner ({_SAME_EVENT}, "
+                f"{_SAME_EVENT_2})") in caplog.text
+        assert world.calls["candles"] == []
+
     def test_a_partner_on_another_ladder_is_not_its_partner(self, monkeypatch, caplog):
         other = _rung("KXRAIN-26", "KXRAIN", "Jan 20, 2026", _A_CLOSE,
                       title="Will it rain by Jan 20, 2026?")
@@ -829,6 +968,49 @@ class TestPartners:
         assert world.calls["lookup"] == [_A]
         assert ("Not selling NO KXSNOWB-26 (alone on its ladder): the limit of 1 partner "
                 "lookups this run was reached") in caplog.text
+
+    def test_the_search_for_a_larger_partner_leaves_the_same_count_lookups_alone(
+            self, monkeypatch, caplog):
+        # The orphan, judged first, looks up all 20 larger settled markets and
+        # finds no partner; those lookups have an allowance of their own, so
+        # B's partner at its own count is still looked up and B is sold
+        assert seller.SALE_PARTNER_MAX_WIDER_LOOKUPS == seller.SALE_PARTNER_MAX_LOOKUPS == 20
+        world = _orphan_beside_b(20)
+        with caplog.at_level(logging.INFO):
+            plans = world.plan(monkeypatch, 0.01)
+        assert [plan.legs[0].ticker for plan in plans] == [_B]
+        assert len(world.calls["lookup"]) == 21
+        assert world.calls["lookup"][-1] == _SAME_EVENT
+        assert (f"Not selling YES {_ORPHAN} (alone on its ladder): no paid-out partner"
+                in caplog.text)
+
+    def test_past_the_wider_lookup_limit_that_market_is_not_sold(self, monkeypatch, caplog):
+        # Two lookups allowed for a partner settled with more: the orphan's
+        # third candidate is never asked about, and B, judged after it, is
+        # still sold with its partner at the same count
+        monkeypatch.setattr(seller, "SALE_PARTNER_MAX_WIDER_LOOKUPS", 2)
+        world = _orphan_beside_b(3)
+        with caplog.at_level(logging.INFO):
+            plans = world.plan(monkeypatch, 0.01)
+        assert [plan.legs[0].ticker for plan in plans] == [_B]
+        assert world.calls["lookup"] == ["KXDECOY00-26", "KXDECOY01-26", _SAME_EVENT]
+        assert (f"Not selling YES {_ORPHAN} (alone on its ladder): the limit of 2 lookups "
+                "for a partner settled with more contracts this run was reached"
+                in caplog.text)
+
+    def test_each_search_counts_its_lookups_apart_and_shares_what_it_found(self,
+                                                                           monkeypatch):
+        reads = seller._Reads(MagicMock(), {}, {}, _CK, 0)
+        monkeypatch.setattr(seller, "market_for_labels",
+                            lambda client, ticker, markets, titles: _OWN_EVENT_RUNGS[ticker])
+        found, problem = reads.labels(_SAME_EVENT, wider=True)
+        assert (found, problem) == (market_ladder_keys(_OWN_EVENT_RUNGS[_SAME_EVENT]), "")
+        assert (reads.lookups, reads.wider_lookups) == (0, 1)
+        # Found once, kept for both searches: no second lookup
+        assert reads.labels(_SAME_EVENT) == (found, "")
+        assert (reads.lookups, reads.wider_lookups) == (0, 1)
+        reads.labels(_SAME_EVENT_2)
+        assert (reads.lookups, reads.wider_lookups) == (1, 1)
 
     def test_unreadable_settlements_sell_no_lone_market_and_warn_once(self, monkeypatch,
                                                                       caplog):
