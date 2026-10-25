@@ -4692,6 +4692,35 @@ def held_pair_win_prob(pair_type: str, yes_ask_a: float, no_ask_a: float,
     return time_series_profit_prob(spread, k)
 
 
+def settled_bids(result: str) -> tuple[float, float]:
+    """
+    Return the (YES bid, NO bid) a paid-out market reads as: its settlement price.
+
+    A Kelly trim of a lone leg (the later market of a time-series pair, still
+    held after the earlier market paid out) reads the paid-out market this way,
+    so the pair arithmetic runs unchanged: held_pair_win_prob takes each ask as
+    1 minus the other side's bid (a market that settled "no" has a YES ask of 0
+    and a NO ask of 1), and the side held there adds its bid, $0 when that side
+    lost, to what selling the pair fetches. The live trim (seller._trim_one)
+    and the backtest's trim (backtester._fresh_bids) both read it, so the two
+    read a paid-out market alike.
+
+    Args:
+        result (str): How the market settled, "yes" or "no".
+
+    Returns:
+        tuple[float, float]: (1.0, 0.0) for "yes", (0.0, 1.0) for "no".
+
+    Raises:
+        ValueError: For a result other than "yes" or "no".
+    """
+    if result == "yes":
+        return (1.0, 0.0)
+    if result == "no":
+        return (0.0, 1.0)
+    raise ValueError(f"a settled market's result must be 'yes' or 'no', got {result!r}")
+
+
 def kelly_hold_fraction(win_prob: float, sale_value: float) -> float:
     """
     Return the share of the portfolio value Kelly lets a held pair keep.

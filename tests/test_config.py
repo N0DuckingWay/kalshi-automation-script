@@ -2220,6 +2220,41 @@ class TestHeldPairWinProb:
         assert config.held_pair_win_prob("time_series", *quotes, 0.8) is None
 
 
+class TestSettledBids:
+    """config.settled_bids: the bids a paid-out market reads as, its settlement price.
+
+    A Kelly trim of a lone leg reads the paid-out earlier market this way, so the
+    pair arithmetic (held_pair_win_prob, the sale value) runs unchanged, live and
+    in the backtest alike.
+    """
+
+    def test_each_result_reads_as_its_settlement_price(self):
+        assert config.settled_bids("yes") == (1.0, 0.0)
+        assert config.settled_bids("no") == (0.0, 1.0)
+
+    @pytest.mark.parametrize("result", ["void", "", "Yes", None, 1])
+    def test_any_other_result_is_refused(self, result):
+        with pytest.raises(ValueError, match="'yes' or 'no'"):
+            config.settled_bids(result)
+
+    def test_a_lone_later_leg_after_the_earlier_market_paid_nothing(self):
+        # YES was held on the earlier market A and NO is still held on the later
+        # market B. A settled "no", so its asks read 0 (YES) and 1 (NO): the
+        # chance is 1 - k x B's midpoint. B: YES ask 0.14, NO ask 0.88, so its
+        # YES bid is 0.12 and its midpoint 0.13; at k 0.7 that is 0.909
+        yes_bid_a, no_bid_a = config.settled_bids("no")
+        chance = config.held_pair_win_prob("time_series", 1.0 - no_bid_a, 1.0 - yes_bid_a,
+                                           0.14, 0.88, 0.7)
+        assert chance == pytest.approx(1 - 0.7 * 0.13, abs=1e-12)
+
+    def test_the_later_leg_cannot_win_once_the_earlier_market_paid_out_yes(self):
+        # The event happened by A's deadline, so B must settle "yes" too and the
+        # NO held on B cannot win: no chance to read, so nothing is trimmed
+        yes_bid_a, no_bid_a = config.settled_bids("yes")
+        assert config.held_pair_win_prob("time_series", 1.0 - no_bid_a, 1.0 - yes_bid_a,
+                                         0.14, 0.88, 0.7) is None
+
+
 class TestKellyHoldFraction:
     """config.kelly_hold_fraction: the share of the portfolio a held pair may keep.
 
