@@ -4,10 +4,12 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Generates a self-contained interactive HTML performance dashboard from the
-    results of a backtest run. Assembles nine sections — portfolio performance
-    (equity curve, Sharpe, drawdown, and the selection's empirical k-hat and
-    k-hat − k), returns decomposition (by month, category,
+    Generates an interactive HTML performance dashboard from the results of a
+    backtest run: one page, plus the folder of chunk files beside it that the
+    page's filter bar loads other scenarios from. Assembles nine sections —
+    portfolio performance (equity curve, Sharpe, drawdown, and the
+    selection's empirical k-hat and k-hat − k), returns decomposition (by
+    month, category,
     entry price), calibration analysis (the time-series entry mid spread —
     the later market's midpoint minus the earlier one's, a midpoint being
     halfway between a market's YES ask and its YES bid — against the rate
@@ -29,7 +31,8 @@ Purpose:
     (distribution, slippage, best/worst trades), risk metrics (Kelly sizing
     scatter, capital deployment), and benchmark comparison (S&P 500 via
     yfinance) — into a single HTML file with embedded Plotly charts. The file
-    is written to PROJECT_ROOT and can be opened directly in any browser.
+    is written to PROJECT_ROOT and can be opened directly in any browser;
+    DASHBOARD_FILES_DIRNAME beside it must be kept with it.
     A small Terms link under the title jumps to a Terms section after the
     last of them: the backtest page's share of the dictionary of scores in
     glossary.py (the Data page renders its own share of the same text).
@@ -67,8 +70,10 @@ Purpose:
     into gzip + base64 data blocks — one base block (_filter_payload) and
     one chunk per distinct scenario trade list (_ChunkVisitor) — and swapped
     in by an inline script (_FILTER_JS) that inflates a scenario's chunk
-    only when a reader chooses it. A set of ticks that covers exactly one of
-    those views draws that view. Any other set is a mix, and there are far
+    only when a reader chooses it: the page holds the run's own scenario's
+    chunk, and every other chunk is a file beside the page that the script
+    loads when that scenario is chosen. A set of ticks that covers exactly
+    one of those views draws that view. Any other set is a mix, and there are far
     too many mixes to ship a view of each, so the script works a mix out
     itself (its mixView) from the category · tag views it covers, following
     the Python helpers step by step, with Python's constants, markup and
@@ -153,9 +158,10 @@ Purpose:
     no position of the cell's run without selling would sell IS that run,
     and shows the page's own chunk; one that makes exactly the sales of a
     run already read is that run — and writes each new trade list as a
-    sidecar chunk file in this build's folder beside the page
+    chunk file in this build's folder beside the page
     (config.DASHBOARD_FILES_DIRNAME/<build id>/chunk-<id>.js: one call to
-    window.__dashChunk with the packed block), which the script loads
+    window.__dashChunk with the packed block, the same kind of file every
+    scenario chunk but the page's first is), which the script loads
     through a <script src> element when a reader chooses that setting (a
     page opened from disk may load a script beside it, where fetch() is
     refused). Which chunk each setting shows is not in the base block: each
@@ -257,8 +263,8 @@ Dependencies:
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT, DASHBOARD_FILENAME (the
     page's file name, which defaults_server opens when run on its own and
     live_dashboard serves as its Backtest tab), DASHBOARD_FILES_DIRNAME
-    and DASHBOARD_BUILD_STALE_SECONDS (the sidecar folder beside it, and when
-    a build folder still marked as being written is abandoned),
+    and DASHBOARD_BUILD_STALE_SECONDS (the folder of chunk files beside it,
+    and when a build folder still marked as being written is abandoned),
     CONTRACT_PAYOUT_DOLLARS (named in the Sell select's title), DEFAULTS_SERVER_HOST
     and DEFAULTS_SERVER_PORT (the address the filter bar's save button and
     trade link open), LIVE_DEFAULTS_SOURCE_PATTERN (the note shapes that server
@@ -427,8 +433,9 @@ Notes:
     or count it. Only one cell's
     points are ever alive, so a cap grid's points are never held in memory
     together; the chunks are held as separate packed strings until each is
-    written, and the page is streamed to disk piece by piece, never joined
-    into one string or encoded whole. A size-cap cell (or the size-cap sweep
+    written (the page's first into the page, every other as a file in the
+    build's folder), and the page is streamed to disk piece by piece, never
+    joined into one string or encoded whole. A size-cap cell (or the size-cap sweep
     itself) that cannot be read costs the cap axis (the eager points are
     walked instead, with one WARNING, and the header's run-settings line says
     the sweep could not be used); a tier-floors-off size-cap cell that
@@ -450,10 +457,11 @@ Notes:
     choice on reload) and keeps its selects disabled until both are ready,
     and redraws only when a <select> changes — each chart from its layout as
     Python drew it, so a zoom never carries over into another selection. A
-    scenario's chunk is inflated when it is first chosen — read from the
-    page, or, for a sidecar chunk (an id at or past the base block's
-    inline_chunks), loaded from its file — and the last ones used are kept;
-    a choice made while a chunk is still loading supersedes it.
+    scenario's chunk is inflated when it is first chosen — the primary
+    scenario's is read from the page, every other (an id at or past the base
+    block's inline_chunks) loaded from its file in the build's folder beside
+    the page — and the last ones used are kept; a choice made while a chunk
+    is still loading supersedes it.
 
     The k-hat breakdown (_section_khat) is the one chart that follows the
     filter bar without describing trades. It regroups each band's carried
@@ -7090,7 +7098,8 @@ _SELL_NOTES = {
 }
 # Why a sidecar chunk could not be loaded ({file}: the address its <script>
 # element asked for), the {reason} of the summary line's "unavailable" template
-_SIDECAR_MISSING = ("its file {file} could not be loaded; keep the folder "
+_SIDECAR_MISSING = ("its file {file} could not be loaded: reload the page, since a "
+                    "newer backtest may have replaced it, and keep the folder "
                     f"{DASHBOARD_FILES_DIRNAME} beside the page")
 _SIDECAR_EMPTY = "its file {file} held no data"
 
@@ -10046,16 +10055,20 @@ class _ChunkVisitor:
 
     Each scenario's "all" point is the run the filter bar shows at that
     band, k and cap: its per-trade arrays and every category / category ·
-    tag view of it (_list_payload), packed on its own
-    (<script id="dash-chunk-N">), so the page's script inflates one only when
-    a reader chooses it. Scenarios whose trade lists are equal at an equal k
-    share one chunk (_list_key) — every cap at or above a cell's sharing
-    floor (backtester._sharing_floor) trades the same list. The primary scenario's chunk is built from
-    the page's own trades and curve, first, so it is chunk 0 and its views
-    are exactly what the sections render. Trade-table rows are split
-    (_trade_row_head / _trade_row_tail): the heads go in one table shared by
-    every chunk (heads, shipped in the base block), where equal heads are
-    stored once, the tails in the chunk's own strings.
+    tag view of it (_list_payload), packed on its own as a
+    <script id="dash-chunk-N"> element (_packed_json_script). The page's
+    script inflates one only when a reader chooses it. Scenarios whose trade
+    lists are equal at an equal k share one chunk (_list_key) — every cap at
+    or above a cell's sharing floor (backtester._sharing_floor) trades the
+    same list. The primary scenario's chunk is built from the page's own
+    trades and curve, first, so it is chunk 0 and its views are exactly what
+    the sections render. generate_dashboard writes chunk 0 into the page and
+    every other chunk as a file in the build's folder beside it
+    (_write_chunk_file), where the script loads it from when chosen.
+    Trade-table rows are split (_trade_row_head / _trade_row_tail): the
+    heads go in one table shared by every chunk (heads, shipped in the base
+    block), where equal heads are stored once, the tails in the chunk's own
+    strings.
 
     A tier-floors-off cell the walk hands to `off` is packed the same way
     (never substituting the page's own trades: it is its own run) and filed
@@ -10095,7 +10108,7 @@ class _ChunkVisitor:
         categories (list[str]), subcats (list[tuple[str, str]]): The bar's
             labels (_filter_labels), and cat_index / sub_index into them.
         heads (_StringTable): The shared row-head table.
-        chunks (list[str]): The packed chunks, by id.
+        chunks (list[str]): The packed <script> elements, by id.
         grid (list): [band][k][cap] -> chunk id, or None for a scenario
             never simulated.
         grid_off (list | None): The same for the tier-floors-off cells of
@@ -10679,11 +10692,11 @@ def _build_filter_grid(
 # scenario the bar shows with Rebalance no (the bar sets Sell to "no selling"
 # and shuts it while Rebalance is yes). Its cells are simulated after the walk, in worker
 # processes (_build_sell_grid: one task per spread band and Tier floors
-# setting), and each new trade list is written as a sidecar chunk file beside
-# the page, which the page's script loads through a <script src> element when
-# a reader chooses it — far too many to put in the page itself. Each task's
-# chunk ids go in one packed block of the page ("dash-sell-<i>"), inflated
-# only when a level is first chosen at that band.
+# setting), and each new trade list is written as a chunk file in the build's
+# folder beside the page, which the page's script loads through a <script src>
+# element when a reader chooses it. Each task's chunk ids go in one packed
+# block of the page ("dash-sell-<i>"), inflated only when a level is first
+# chosen at that band.
 
 # The Sell select's value for "no selling" (every other option's value is the
 # level's index in the base block's sell_levels)
@@ -10725,9 +10738,10 @@ class _SellTask:
         cat_index (dict): Category -> its index among the bar's categories.
         sub_index (dict): (category, tag) -> its index among the bar's tags.
         risk_free (RiskFreeRates | None): The rates every view subtracts.
-        inline_keys (frozenset): The list keys (_list_key) of the chunks in
-            the page itself: a list with one of them is never written again.
-        out_dir (Path): The build's sidecar folder.
+        inline_keys (frozenset): The list keys (_list_key) of the scenario
+            chunks the page already has, in the page or as files: a list with
+            one of them is never written again.
+        out_dir (Path): The build's folder of chunk files.
         same_title_size_cap (float): backtester.SAME_TITLE_SIZE_CAP as the
             parent reads it.
         scheduled_run: backtester.SCHEDULED_RUN as the parent reads it.
@@ -10841,7 +10855,7 @@ class _SellGrid:
         days (list[dict]): Per minimum of days before maturity, {"label": the
             option's text, "phrase": what the summary phrase gains after the
             level's, "value": the number of days}.
-        sidecars (int): The sidecar chunk files written.
+        sidecars (int): The Sell select's chunk files written.
         mix_gaps (int): How many of them hold a list whose tags the page
             cannot combine into a mix (_list_payload's mix_gaps).
     """
@@ -10906,13 +10920,15 @@ def _sell_days_phrase(days: int) -> str:
     return f" and at least {_sell_days_option(days)} before its last market closes"
 
 
-def _sell_chunk_text(packed: str) -> str:
+def _chunk_file_text(packed: str) -> str:
     """
-    The text of one sidecar chunk file: a call that hands its packed block to the page's script.
+    The text of one chunk file: a call that hands its packed block to the page's script.
 
-    The page loads the file through a <script src> element, which a page
-    opened from disk may load where fetch() may not; the element that loaded
-    it is document.currentScript, which tells the page which chunk arrived.
+    Every scenario chunk but the page's first, and every chunk the Sell select
+    adds, is a file of this form beside the page (_chunk_file). The page loads
+    it through a <script src> element, which a page opened from disk may load
+    where fetch() may not; the element that loaded it is
+    document.currentScript, which tells the page which chunk arrived.
 
     Args:
         packed (str): The block, gzip-compressed and base64-encoded (_pack_text):
@@ -10929,7 +10945,7 @@ def _sell_key_file(out_dir: Path, key: str) -> Path:
     The file a worker writes a new trade list's chunk to, before the parent numbers it.
 
     Args:
-        out_dir (Path): The build's sidecar folder.
+        out_dir (Path): The build's folder of chunk files.
         key (str): The list's key (_list_key).
 
     Returns:
@@ -10938,12 +10954,12 @@ def _sell_key_file(out_dir: Path, key: str) -> Path:
     return out_dir / f"{key}.js"
 
 
-def _sell_chunk_file(out_dir: Path, chunk_id: int) -> Path:
+def _chunk_file(out_dir: Path, chunk_id: int) -> Path:
     """
-    The file a numbered sidecar chunk is loaded from (the page's script builds the same name).
+    The file a numbered chunk is loaded from (the page's script builds the same name).
 
     Args:
-        out_dir (Path): The build's sidecar folder.
+        out_dir (Path): The build's folder of chunk files.
         chunk_id (int): The chunk's id.
 
     Returns:
@@ -10954,9 +10970,9 @@ def _sell_chunk_file(out_dir: Path, chunk_id: int) -> Path:
 
 def _write_sell_chunk(task: _SellTask, key: str, k: float, point: SweepPoint) -> bool:
     """
-    Write one sell run's trade list as a sidecar chunk file, atomically.
+    Write one sell run's trade list as a chunk file, atomically.
 
-    The chunk holds what an inline chunk holds — the list's per-trade arrays
+    The chunk holds what a scenario's chunk holds — the list's per-trade arrays
     and every category / category · tag view of it (_list_payload, the mix
     parts included) and its strings — plus its own trade-row heads (a worker
     cannot add to the page's shared table): {"list", "strings", "heads"}.
@@ -10980,7 +10996,7 @@ def _write_sell_chunk(task: _SellTask, key: str, k: float, point: SweepPoint) ->
                         task.initial_balance, task.series_categories, k, task.cat_index,
                         task.sub_index, strings, heads=heads, risk_free=task.risk_free,
                         mix_gaps=gaps)
-    text = _sell_chunk_text(_pack_text(_strict_json(
+    text = _chunk_file_text(_pack_text(_strict_json(
         {"list": lst, "strings": strings.items, "heads": heads.items})))
     path = _sell_key_file(task.out_dir, key)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -11002,8 +11018,8 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
     where the setting sells nothing — the run without selling, so the page
     shows its own chunk there. Each point's curve is cut to the page's axis
     (_cut_to_axis) and keyed (_list_key, once per trade list read at one
-    (level, minimum)); a key that is neither in the page nor already written
-    by this task is written (_write_sell_chunk). Each cell's answers go into
+    (level, minimum)); a key that is neither among the page's chunks nor
+    already written by this task is written (_write_sell_chunk). Each cell's answers go into
     its row (_SellResult.rows) as the key's place in the task's key list, or
     -1 for the run without selling; a SameSale copies the entry its earlier
     setting left in the same row, so it needs no simulation and no file.
@@ -11121,7 +11137,7 @@ def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: da
         initial_balance (float): Starting balance in dollars.
         series_categories (dict | None): The series-category map.
         risk_free (RiskFreeRates | None): The rates every view subtracts.
-        folder (Path): The build's sidecar folder.
+        folder (Path): The build's folder of chunk files.
 
     Returns:
         list[_SellTask]: The tasks, tier-on bands first, in band order.
@@ -11269,8 +11285,8 @@ def _build_sell_grid(
     (_sell_tasks) run in-process or in worker processes (_run_sell_tasks),
     each writing its new trade lists as files named by their keys in
     `folder`. Their results are then put back in task order, and each key
-    gets an id: an inline chunk's own id when the page already holds the list,
-    else the next sidecar id after the page's chunks — the file renamed to
+    gets an id: a page chunk's own id when the page already has the list,
+    else the next id after the page's chunks — the file renamed to
     chunk-<id>.js — so the numbering does not depend on which worker finished
     first. Each finished task becomes one packed block (see _SellGrid): every
     covered cell's row (_SellResult.rows, places in the task's key list)
@@ -11288,7 +11304,7 @@ def _build_sell_grid(
         initial_balance (float): Starting balance in dollars.
         series_categories (dict | None): The series-category map.
         risk_free (RiskFreeRates | None): The rates every view subtracts.
-        folder (Path): The build's sidecar folder (it exists).
+        folder (Path): The build's folder of chunk files (it exists).
         workers (int): Keyword-only. The most worker processes; 1 (default)
             runs every task in-process.
 
@@ -11313,7 +11329,7 @@ def _build_sell_grid(
     for index in sorted(results):
         for key in results[index].written:
             if key not in ids:
-                os.replace(_sell_key_file(folder, key), _sell_chunk_file(folder, next_id))
+                os.replace(_sell_key_file(folder, key), _chunk_file(folder, next_id))
                 ids[key] = next_id
                 next_id += 1
     # A failed task's files, and any write it left half-done
@@ -11348,7 +11364,7 @@ def _build_sell_grid(
         for bi, binds in enumerate(walked.tier_binds):
             if not binds:
                 index[1][bi] = index[0][bi]
-    sizes = sum(_sell_chunk_file(folder, i).stat().st_size
+    sizes = sum(_chunk_file(folder, i).stat().st_size
                 for i in range(first_sidecar, next_id))
     logging.info("Dashboard: Sell select built in %.0f s: %d cap points simulated, %d shared "
                  "across caps, %d cells repeating an earlier run, %d cells without a sale; "
@@ -11366,7 +11382,7 @@ def _build_sell_grid(
 @contextlib.contextmanager
 def _builds_lock(root: Path):
     """
-    Hold the lock every dashboard build takes on its sidecar folders.
+    Hold the lock every dashboard build takes on its folders of chunk files.
 
     An flock on <root>/.lock: a build makes its folder, and replaces the page
     and deletes the folders of earlier builds, only while holding it, so a
@@ -11374,7 +11390,7 @@ def _builds_lock(root: Path):
     a page another build has just written reads.
 
     Args:
-        root (Path): The folder of every build's sidecar folder
+        root (Path): The folder of every build's folder of chunk files
             (DASHBOARD_FILES_DIRNAME beside the page); it exists.
 
     Yields:
@@ -11393,12 +11409,14 @@ def _builds_lock(root: Path):
 
 def _new_build_folder(page: Path) -> Path:
     """
-    Make this build's sidecar folder, marked as still being written.
+    Make this build's folder of chunk files, marked as still being written.
 
-    Named by the UTC time, the process and a random suffix, so two builds
-    never share one, under DASHBOARD_FILES_DIRNAME beside the page; made, and
-    marked (_BUILD_WRITING), under the builds' lock, so a build cleaning up
-    never meets it unmarked.
+    The folder holds the page's scenario chunks (_write_chunk_file) and the
+    Sell select's (_build_sell_grid). Named by the UTC time, the process and a
+    random suffix, so two builds never share one, under
+    DASHBOARD_FILES_DIRNAME beside the page; made, and marked
+    (_BUILD_WRITING), under the builds' lock, so a build cleaning up never
+    meets it unmarked.
 
     Args:
         page (Path): The dashboard file the build will write.
@@ -11416,6 +11434,55 @@ def _new_build_folder(page: Path) -> Path:
     return folder
 
 
+def _write_chunk_file(folder: Path, chunk_id: int, element: str) -> int:
+    """
+    Write one of the page's scenario chunks as a file beside the page.
+
+    The page's script loads the file only when that scenario is chosen (load,
+    sidecarText), so the browser never holds a scenario nobody opened. The
+    chunk arrives as the <script> element _packed_json_script made; the file
+    holds its packed text in the one call every chunk file holds
+    (_chunk_file_text), under the name the script asks for (_chunk_file). The
+    folder is unpublished until the page is (_publish_page), so no reader can
+    meet a half-written file.
+
+    Args:
+        folder (Path): The build's folder of chunk files (it exists).
+        chunk_id (int): The chunk's id, at or past the page's inline_chunks.
+        element (str): The packed <script> element.
+
+    Returns:
+        int: The bytes written (the text is ASCII).
+    """
+    packed = element[element.index(">") + 1:element.rindex("</script>")]
+    text = _chunk_file_text(packed)
+    _chunk_file(folder, chunk_id).write_text(text, encoding="utf-8")
+    return len(text)
+
+
+def _clear_build_folder(folder: Path) -> None:
+    """
+    Delete every file in a build's folder but its mark (_BUILD_WRITING).
+
+    Used when the Sell select could not be built: the files its tasks left are
+    named by no page, while the folder itself still receives the page's own
+    chunk files.
+
+    Never raises: a file it cannot delete is named by no page, so it costs
+    disk only, and a WARNING says so.
+
+    Args:
+        folder (Path): The build's folder.
+    """
+    try:
+        for leftover in folder.iterdir():
+            if leftover.is_file() and leftover.name != _BUILD_WRITING:
+                leftover.unlink(missing_ok=True)
+    except OSError:
+        logging.warning("Could not delete the files the failed Sell build left in %s; "
+                        "no page names them", folder, exc_info=True)
+
+
 def _remove_old_builds(root: Path, keep: str | None) -> None:
     """
     Delete every build folder but this build's and those still being written.
@@ -11428,7 +11495,7 @@ def _remove_old_builds(root: Path, keep: str | None) -> None:
     again), and one whose mark it cannot read is kept.
 
     Args:
-        root (Path): The folder of every build's sidecar folder.
+        root (Path): The folder of every build's folder of chunk files.
         keep (str | None): This build's folder name, or None when it wrote
             none.
     """
@@ -11467,14 +11534,14 @@ def _publish_page(tmp_path: Path, out_path: Path, folder: Path | None) -> None:
     place always has its folder. The rename is the publication: nothing after
     it raises, so the caller never takes the page in place for an unpublished
     one (and deletes the folder it reads). A lock that cannot be taken still
-    publishes the page — a page was always published before these folders
-    existed — but deletes no folder, with a WARNING.
+    publishes the page, which does not depend on it, but deletes no folder,
+    with a WARNING.
 
     Args:
         tmp_path (Path): The complete page, beside out_path.
         out_path (Path): The dashboard file.
-        folder (Path | None): This build's sidecar folder, or None when it
-            wrote none.
+        folder (Path | None): This build's folder of chunk files, or None
+            when it wrote none.
 
     Raises:
         OSError: Only from the rename itself, when the page could not be
@@ -11515,8 +11582,8 @@ def _unmark_build(folder: Path | None) -> None:
     by then a newer page has replaced this one.
 
     Args:
-        folder (Path | None): This build's sidecar folder, or None when it
-            wrote none.
+        folder (Path | None): This build's folder of chunk files, or None
+            when it wrote none.
     """
     if folder is None:
         return
@@ -12396,6 +12463,7 @@ def _filter_payload(
     sell: _SellGrid | None = None,
     sell_state: str = "not simulated",
     sidecar_dir: str | None = None,
+    inline_chunks: int | None = None,
     move_state: str = "not simulated",
 ) -> dict:
     """
@@ -12417,9 +12485,10 @@ def _filter_payload(
     too its tier-off twin (chunks.rebalance_off_grid()), and, when the walk
     read its minimum price movements, their grids (chunks.move_grid(),
     move_off_grid()). The lists themselves
-    are the chunks, each its own packed block the script inflates only when
-    a reader chooses that scenario, so the page's load cost does not grow
-    with the grid.
+    are the chunks, each packed on its own: the script inflates one only
+    when a reader chooses that scenario, and only the first (the page's own
+    run) is in the page, the others being files beside it (inline_chunks,
+    sidecar_dir), so the page's load cost does not grow with the grid.
 
     Args:
         source (_GridSource): The grid actually walked (_walk_grid's return).
@@ -12469,10 +12538,15 @@ def _filter_payload(
         sell_state (str): Keyword-only. Why the page has no Sell view when it
             has none, worded as rebalance_state is ("not simulated" or
             "unavailable"); ignored when it has one. "not simulated" (default).
-        sidecar_dir (str | None): Keyword-only. The build's sidecar folder,
-            relative to the page ("backtest_dashboard_files/<build id>"), which
-            the script loads every chunk at or past "inline_chunks" from; None
-            (default) for a page with no sidecar chunk.
+        sidecar_dir (str | None): Keyword-only. The build's folder of chunk
+            files, relative to the page ("backtest_dashboard_files/<build
+            id>"), which the script loads every chunk at or past
+            "inline_chunks" from; None (default) for a page with no chunk
+            file.
+        inline_chunks (int | None): Keyword-only. How many chunks, from id 0,
+            the page holds itself; the script loads every other from a file
+            in sidecar_dir. None (default) is every chunk the visitor
+            packed, so a caller with no folder keeps all of them in the page.
         move_state (str): Keyword-only. Why the page has no view of the
             Rebalance family's minimum price movements when it has none:
             "not simulated" (the run's family carried no minimum) or
@@ -12544,8 +12618,8 @@ def _filter_payload(
             "sell_levels" and "sell_days" ([{label, phrase, value}] per level
             and per minimum of days, [] without the view), "sell_state"
             ("shown", else sell_state), "inline_chunks" (how many chunks the
-            page holds itself: every id from there on is a sidecar file) and
-            "sidecar_dir" (above).
+            page holds itself: every id from there on is a file in the
+            sidecar folder) and "sidecar_dir" (above).
     """
     axis = chunks.axis
     pb, pk, pc = source.primary
@@ -12695,8 +12769,8 @@ def _filter_payload(
         "sell_levels": sell.levels if sell_view else [],
         "sell_days": sell.days if sell_view else [],
         "sell_state": "shown" if sell_view else sell_state,
-        # Every chunk id from here on is a sidecar file in sidecar_dir
-        "inline_chunks": len(chunks.chunks),
+        # Every chunk id from here on is a file in sidecar_dir
+        "inline_chunks": len(chunks.chunks) if inline_chunks is None else inline_chunks,
         "sidecar_dir": sidecar_dir,
     }
 
@@ -13282,51 +13356,12 @@ def _packed_json_script(element_id: str, payload: dict) -> str:
     scenarios a reader chooses. A chunk holds a view per category x tag of
     its list, and its largest part is HTML the page shows verbatim (each
     trade row's tail, each view's category table), which compresses many
-    times over. Measured 2026-09-26 on tests/test_dashboard.py's
-    TestFilterPageSize fixture (36 bands, each a different 40-trade list,
-    8 series in 4 categories), after the k-hat cards and the
-    interval-discount section's data joined the base block: 3.88 MB of
-    compact JSON in 37 blocks (36 chunks and the base block) packed to
-    509 KB of base64, an 819 KB page (3.86 MB, 506 KB and 812 KB before
-    them) — against 4.05 MB packed to 448 KB, a 745 KB page, as the single
-    block it was before the chunks: each list compressed alone forgoes what
-    one shared block compressed across lists, and the rows' shared heads win
-    part of it back. A synthetic 36-band x 13-k x 20-cap grid (9,360
-    scenarios) whose cells share 4 trade lists packed 52 chunks and a 56 KB
-    base block (707 KB of JSON inflated: 254 KB the interval-discount
-    section's "kd", 216 KB the k-hat breakdown with its k-hat − k per k)
-    into a 1.23 MB page in 5.0 s — on the same harness a 35 KB base block
-    (320 KB of JSON) and a 1.28 MB page before them, when that section drew
-    a trace per k. Re-measured 2026-09-26 once the scenario explorer's data
-    came from the same walk as packed blocks of its own (C4): the
-    TestFilterPageSize page is 804 KB (819 KB the same day before it), and
-    TestExplorerFullGrid's 36 x 13 x 20 grid of 4 shared lists, whose cells
-    carry the band sweep's populations so the explorer ships its 21 blocks
-    (249 KB of base64) as well, is a 1.21 MB page built in about 6.7 s — the
-    1.23 MB / 5.0 s above were measured before, without the explorer's
-    blocks or its walk. Re-measured 2026-09-26 at the merge of #68 (the
-    tier-floors-off family), same fixture and environment: without a family
-    3.88 MB of JSON in 37 blocks packed to 509 KB of base64 (the base block
-    67 KB of it), an 809 KB page — about 5 KB up on the 804 KB, for the Tier
-    floors select, its title and note and each band's option text; with the
-    family (#68's worst case: the 18 bands a tier binds at each traded yet
-    another list, with its own 300-entry k-hat population) 5.89 MB of JSON
-    in 55 blocks (54 chunks and the base block) packed to 776 KB (the base
-    block 111 KB: its off grid, off band names and off k-hat breakdown), a
-    1.08 MB page (1,077,022 bytes). Main measured the family on the DR-73
-    calibration corpus's own band sweep at 4,071,051 → 5,489,336 bytes of
-    page, 1.19 MB of that the scenario explorer's tier-off view, whose data
-    block main did not pack; that figure describes main's unpacked explorer
-    and does not carry over to this page, which packs the explorer's blocks
-    too and has not been re-measured on that corpus. The explorer's own
-    tier-floors-off view (its Tier floors select, hidden k-hat table and an
-    "scn-off-cap-<i>" block per cap it has off cells at) then took
-    the same fixture's page to 815,777 bytes without the family and
-    1,098,598 with it (its off block 3,712 bytes of base64), and
-    TestScenarioExplorerPageSize's 468-cell page to 1,736,090 and 2,632,657
-    (its off block 56,340), re-measured the same day. The script inflates
-    each block with the browser's own DecompressionStream, so nothing is
-    added to the page but the bytes.
+    times over. The base block and the page's first chunk are written into
+    the page as the element this returns; every other chunk is written as a
+    file (_write_chunk_file), from the base64 text between its element's
+    tags. The script inflates each block, or each file's text, with the
+    browser's own DecompressionStream, so nothing is added to the page but
+    the bytes.
 
     Non-finite floats become null first (_json_safe) and allow_nan=False
     makes a missed one raise instead of shipping unparseable JSON. The block
@@ -13463,13 +13498,15 @@ def _pack_text(raw: str) -> str:
 # address (saveHref: rebalance, from the Rebalance choice, and
 # min_price_move, "off" for any or with Rebalance no),
 # and like Rebalance it reaches neither the k-hat figures, the
-# interval-discount section nor the scenario explorer. A chunk at or past
-# D.inline_chunks is a sidecar file in D.sidecar_dir, loaded through a
-# <script src> element whose one call to window.__dashChunk hands over its
-# packed text (sidecarText), inflated by the same code as a block in the
-# page (inflateText); a file that cannot be loaded, or hands nothing over,
-# is named in Python's words (D.text.sidecar_missing, sidecar_empty), and
-# the selects go back to what is still shown.
+# interval-discount section nor the scenario explorer. Only the page's first
+# chunk (the run's own scenario) is a block in the page; a chunk at or past
+# D.inline_chunks, every other scenario's and the Sell select's, is a file in
+# D.sidecar_dir, loaded through a <script src> element whose one call to
+# window.__dashChunk hands over its packed text (sidecarText), inflated by
+# the same code as a block in the page (inflateText); a file that cannot be
+# loaded, or hands nothing over, is named in Python's words
+# (D.text.sidecar_missing, sidecar_empty), and the selects go back to what is
+# still shown.
 # Exclude categories and Exclude tags are two check-box menus (<details>
 # elements; SHOWN[3] is the categories left out, SHOWN[4] the tags ticked).
 # A reader ticks as many boxes as they like: a category ticked is left out of
@@ -14654,8 +14691,8 @@ _FILTER_JS = r"""
     if (body) { body.style.display = has ? '' : 'none'; }
   }
   // Trade rows: each [head, tail] pair is _trade_row's HTML, both halves
-  // escaped by Python (the heads shared by every chunk in the page, or a
-  // sidecar chunk's own; the tails its own)
+  // escaped by Python (the heads shared by every scenario chunk, in D.rows,
+  // or a Sell chunk's own; the tails each chunk's own)
   function rows(pairs) {
     var heads = C.heads || D.rows;
     return pairs.map(function(p) { return heads[p[0]] + C.strings[p[1]]; }).join('');
@@ -15066,7 +15103,7 @@ _FILTER_JS = r"""
 
   // A block is gzip-compressed JSON in base64 (_pack_text), inflated by the
   // browser's own DecompressionStream: a block in the page (inflate), or the
-  // text a sidecar file handed over (inflateText).
+  // text a chunk file handed over (inflateText).
   function inflateText(text) {
     var bin = atob(text.trim());
     var bytes = new Uint8Array(bin.length);
@@ -15077,10 +15114,11 @@ _FILTER_JS = r"""
   function inflate(el) {
     return inflateText(el.textContent);
   }
-  // A sidecar chunk (an id at or past D.inline_chunks, the Sell select's) is
-  // a file of its own in D.sidecar_dir, holding one call to
-  // window.__dashChunk with its packed text: loaded through a <script src>
-  // element, which a page opened from disk may load where fetch() may not.
+  // Every chunk but the page's first (an id at or past D.inline_chunks: any
+  // other scenario's, and the Sell select's) is a file of its own in
+  // D.sidecar_dir, holding one call to window.__dashChunk with its packed
+  // text: loaded through a <script src> element, which a page opened from
+  // disk may load where fetch() may not.
   // The element that ran the call names the chunk; WAITING holds each load
   // in flight by id, and a file that fails to load, or runs without handing
   // anything over, rejects it in Python's words (D.text).
@@ -15131,7 +15169,7 @@ _FILTER_JS = r"""
     if (!entry) {
       entry = CHUNKS[id] = {data: null};
       entry.promise = Promise.resolve().then(function() {
-        // In the page itself, or a sidecar file beside it
+        // In the page itself (the first chunk), or a file beside it
         return id < D.inline_chunks ? inflate(byId('dash-chunk-' + id))
                                     : sidecarText(id).then(inflateText);
       }).then(function(data) {
@@ -15502,7 +15540,7 @@ def generate_dashboard(
     period_end: date | None = None,
 ) -> Path:
     """
-    Assemble all nine dashboard sections into a single self-contained HTML file.
+    Assemble all nine dashboard sections into an HTML file, with a folder of chunk files beside it.
 
     Calls each _section_*() builder in order and streams the resulting HTML
     fragments into a full page with an embedded Plotly CDN script tag — plus
@@ -15510,12 +15548,16 @@ def generate_dashboard(
     (_filter_bar_html, with its "Save as live defaults…" button, whose
     confirmation-page address, run's same-title cap and source note are
     _save_target's), one packed chunk per distinct scenario trade list
-    (tier-floors-off scenarios included, when the run carries that family) and
-    the packed base block after the sections (_ChunkVisitor, _filter_payload,
-    _packed_json_script), and the script that swaps a selection in
-    (_FILTER_JS). The filter's grid — every spread band x k x per-trade size
-    cap the run offers (_grid_source) — is walked ONCE before anything is
-    written (_build_filter_grid), because the header needs its result: a
+    (tier-floors-off scenarios included, when the run carries that family),
+    the first of them (the run's own scenario) written into the page after
+    the sections and every other as a file in a new folder beside the page
+    (_write_chunk_file), the packed base block after the chunk
+    (_ChunkVisitor, _filter_payload, _packed_json_script), and the script
+    that swaps a selection in (_FILTER_JS), which loads a chosen scenario's
+    file when it is first chosen. The filter's grid — every spread band x
+    k x per-trade size cap the run offers (_grid_source) — is walked ONCE
+    before anything is written (_build_filter_grid), because the header
+    needs its result: a
     size-cap sweep's cells are simulated during that walk (the
     tier-floors-off size-cap sweep's and the Rebalance family's too),
     a size-cap sweep the walk could
@@ -15536,11 +15578,14 @@ def generate_dashboard(
     (_build_sell_grid: every sell level and minimum of days of every cell
     the bar shows with Rebalance no, in up to
     sell_workers spawned worker processes, each new trade list written as a
-    sidecar chunk file in a new build folder beside the page,
+    chunk file in the build's folder beside the page,
     DASHBOARD_FILES_DIRNAME / <build id> in the page's folder, and each
     band's chunk ids under each Tier floors setting as a packed block
-    written after the page's own chunks); a failure costs the Sell select
-    alone, and a folder no chunk was written to is deleted. If the filter's data
+    written after the page's own chunk); a failure costs the Sell select
+    alone, and a folder no chunk was written to is deleted. The folder is
+    made whenever the page has more than one chunk or a Sell view; when it
+    cannot be made, one WARNING says so, every scenario chunk stays in the
+    page and the Sell select stays disabled. If the filter's data
     cannot be built, the page is written without the bar and its script,
     with a notice in the bar's place (and in the k-hat breakdown's, which
     reads the same base block, and in the interval-discount section, which
@@ -15557,10 +15602,11 @@ def generate_dashboard(
     second reader never sees a half-written page and a failed write leaves
     the previous dashboard intact. Two runs finishing together each write a
     complete page and the later rename wins. The rename and the deletion of
-    every earlier build's sidecar folder happen together under a lock
+    every earlier build's folder of chunk files happen together under a lock
     (_publish_page), so the page in place always has its folder, and a build
     still writing its own is never touched; a page that fails to be written
-    deletes its own new folder and leaves the previous page and folder.
+    deletes its own new folder and leaves the previous page and folder. The
+    page and its folder are kept, copied and moved together.
 
     The two sweep-related parameters are keyword-only with defaults, so a
     four-argument positional call works. Omit both and
@@ -15765,9 +15811,12 @@ def generate_dashboard(
     explorer_data: _ExplorerData | None = None
     explorer_failed = explorer_rebuilt = False
     # The Sell select's data, built after the walk in its own folder of
-    # sidecar chunks beside the page (None: no Sell view, and no folder)
+    # chunk files beside the page (None: no chunk file, and no folder)
     sell_grid: _SellGrid | None = None
     build_folder: Path | None = None
+    # How many of the chunks the page holds itself (the rest are files in
+    # build_folder); set once the filter's data is built
+    inline_chunks = 0
     try:
         source = _grid_source(sweep, trades, equity_df, k_used)
         explorer_visitor = (_new_explorer_visitor(source, sweep, risk_free=risk_free)
@@ -15788,6 +15837,9 @@ def generate_dashboard(
             if chunker.grid[pb][pk][pc] is None:
                 # Never expected: the primary scenario is the page's own run
                 raise ValueError("the primary scenario has no trade list to show")
+            if chunker.grid[pb][pk][pc] != 0:
+                # The page holds only its first chunk, which must be its own run's
+                raise ValueError("the primary scenario is not the page's first chunk")
             # Every run with a sweep has a primary band for the section to
             # follow — a hand-built one that records none has one "not
             # recorded" band, which is its primary (_unbanded_source). No
@@ -15801,12 +15853,21 @@ def generate_dashboard(
             # bar's — an explorer rebuilt from the eager points has the run's
             # own cap alone, while the bar may offer every cap
             explorer_grid = explorer_data is not None and explorer_data.checks
-            if source.sell is not None:
+            # The folder of chunk files beside the page: every chunk but the
+            # first, and the Sell select's. Made now, since the base block
+            # names it; without it every chunk stays in the page
+            if len(chunker.chunks) > 1 or source.sell is not None:
+                try:
+                    build_folder = _new_build_folder(out_path)
+                except OSError:
+                    logging.warning("Could not make the dashboard's folder of chunk files: "
+                                    "every scenario stays in the page and the Sell select "
+                                    "stays disabled", exc_info=True)
+            if source.sell is not None and build_folder is not None:
                 # Every sell level and minimum of days of every scenario the
                 # bar shows with Rebalance no, in worker processes;
                 # a failure costs the Sell select alone
                 try:
-                    build_folder = _new_build_folder(out_path)
                     sell_grid = _build_sell_grid(
                         source, chunker, start_date=start_date,
                         initial_balance=initial_balance, series_categories=series_categories,
@@ -15815,10 +15876,17 @@ def generate_dashboard(
                     logging.warning("The Sell select could not be built; it stays disabled",
                                     exc_info=True)
                     sell_grid = None
-                if build_folder is not None and (sell_grid is None or not sell_grid.sidecars):
-                    # Nothing for the page to load from it
-                    shutil.rmtree(build_folder, ignore_errors=True)
-                    build_folder = None
+                if sell_grid is None:
+                    # Whatever a failed build left there, no page will load
+                    _clear_build_folder(build_folder)
+            if build_folder is not None and len(chunker.chunks) <= 1 and (
+                    sell_grid is None or not sell_grid.sidecars):
+                # Nothing for the page to load from it
+                shutil.rmtree(build_folder, ignore_errors=True)
+                build_folder = None
+            # How many chunks the page itself holds: its own run's alone when
+            # the others are files
+            inline_chunks = 1 if build_folder is not None else len(chunker.chunks)
             # Said once for the whole page, never once per trade list
             unmixable = len(chunker.mix_gaps) + (0 if sell_grid is None else sell_grid.mix_gaps)
             if unmixable:
@@ -15860,6 +15928,7 @@ def generate_dashboard(
                             else "not simulated"),
                 sidecar_dir=(None if build_folder is None
                              else f"{DASHBOARD_FILES_DIRNAME}/{build_folder.name}"),
+                inline_chunks=inline_chunks,
                 # ... and for that family's minimum price movements: a run
                 # whose family carried some but whose page shows none could
                 # not read them (the log says why)
@@ -15904,30 +15973,36 @@ def generate_dashboard(
     # view on the size-cap axis but reads its off cells without it (it could
     # not be read, or an off cell could not be simulated — _walk_once's
     # off_fallback) leaves the off view at the run's own cap only
-    run_settings = _run_settings_html(
-        sweep, cap_sweep_unused=(filter_data is not None and walked is not None
-                                 and walked.cap_sweep is None),
-        tier_off_cap_sweep_unused=(filter_data is not None and walked is not None
-                                   and walked.cap_sweep is not None
-                                   and walked.tier_binds is not None
-                                   and walked.off_cap_sweep is None))
-    # Built after the bar, whose option texts it names (filter_data None: no bar)
-    live_rule = _live_rule_html(sweep, bar=filter_data)
+    try:
+        run_settings = _run_settings_html(
+            sweep, cap_sweep_unused=(filter_data is not None and walked is not None
+                                     and walked.cap_sweep is None),
+            tier_off_cap_sweep_unused=(filter_data is not None and walked is not None
+                                       and walked.cap_sweep is not None
+                                       and walked.tier_binds is not None
+                                       and walked.off_cap_sweep is None))
+        # Built after the bar, whose option texts it names (filter_data None: no bar)
+        live_rule = _live_rule_html(sweep, bar=filter_data)
 
-    # Directly under the Period line, which it qualifies: the corpus holds
-    # nothing settled after its assembly even though the period runs to today.
-    # Rendered on every run, healthy or not (DR-13; DR-66's rule).
-    corpus_note = _corpus_provenance_html(sweep)
-    # The rate every ratio below subtracts, or its absence (DR-66)
-    rf_note = _risk_free_html(risk_free, equity_df)
+        # Directly under the Period line, which it qualifies: the corpus holds
+        # nothing settled after its assembly even though the period runs to today.
+        # Rendered on every run, healthy or not (DR-13; DR-66's rule).
+        corpus_note = _corpus_provenance_html(sweep)
+        # The rate every ratio below subtracts, or its absence (DR-66)
+        rf_note = _risk_free_html(risk_free, equity_df)
 
-    # The weekly moment every entry was priced at, under the run-settings line
-    entry_checkpoint = _entry_checkpoint_html(sweep)
-    # How the trades filled: over a modeled order book, or at the top of the book
-    fills_note = _fills_html(sweep)
-    # The extra data the run read (scheduled close, stale quotes, volume cap,
-    # fees by series) and what the integrity checks found
-    extra_data_note = _extra_data_html(sweep)
+        # The weekly moment every entry was priced at, under the run-settings line
+        entry_checkpoint = _entry_checkpoint_html(sweep)
+        # How the trades filled: over a modeled order book, or at the top of the book
+        fills_note = _fills_html(sweep)
+        # The extra data the run read (scheduled close, stale quotes, volume cap,
+        # fees by series) and what the integrity checks found
+        extra_data_note = _extra_data_html(sweep)
+    except BaseException:
+        # No page will name the folder made for this build
+        if build_folder is not None:
+            shutil.rmtree(build_folder, ignore_errors=True)
+        raise
 
     # Each section is built as it is written, so only one is alive at a time
     sections = (
@@ -16003,9 +16078,10 @@ def generate_dashboard(
     # Streamed beside the target, then renamed over it: the rename is atomic,
     # so the previous dashboard is replaced only by a complete page. The
     # temporary name carries the pid so two concurrent runs never share one.
-    # Every chunk, then the Sell view's blocks, precede the base block, and
-    # all of them precede the script that reads them. newline="" writes
-    # every "\n" as-is on any platform.
+    # The page's own chunk (the others are written as files into the build's
+    # folder as they come up), then the Sell view's blocks, precede the base
+    # block, and all of them precede the script that reads them. newline=""
+    # writes every "\n" as-is on any platform.
     tmp_path = out_path.with_name(f".{out_path.name}.{os.getpid()}.tmp")
     published = False
     try:
@@ -16015,9 +16091,18 @@ def generate_dashboard(
                 page.write(build())
             page.write("\n")
             if base_block is not None:
+                started, files, written = time.monotonic(), 0, 0
                 for i, chunk in enumerate(chunks):
-                    page.write(chunk)
+                    if i < inline_chunks:
+                        page.write(chunk)
+                    else:
+                        written += _write_chunk_file(build_folder, i, chunk)
+                        files += 1
                     chunks[i] = None      # written: nothing keeps it alive
+                if files:
+                    logging.info("Dashboard: %d scenario chunk file(s) (%.1f MB) written beside "
+                                 "the page in %.0f s", files, written / 1e6,
+                                 time.monotonic() - started)
                 for i, block in enumerate(sell_blocks):
                     page.write(block)
                     sell_blocks[i] = None  # written: nothing keeps it alive

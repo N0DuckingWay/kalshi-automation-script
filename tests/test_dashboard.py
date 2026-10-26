@@ -612,7 +612,7 @@ class TestGenerateDashboardHeaderNotice:
         out_path = dashboard.generate_dashboard(
             [make_trade()], make_equity([1000.0, 1010.0, 1005.0]),
             date(2026, 1, 5), 1000.0, **kwargs)
-        return out_path.read_text(encoding="utf-8")
+        return _read_page(out_path)
 
     def test_the_notice_renders_below_the_floor(self, monkeypatch, tmp_path):
         points = _sweep_points([0.75])
@@ -1904,9 +1904,9 @@ class TestNoCandleCapNotice:
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
         start = datetime.now(UTC).date() - timedelta(days=1_000)
-        page = dashboard.generate_dashboard(
+        page = _read_page(dashboard.generate_dashboard(
             [make_trade()], make_equity([1000.0, 1010.0, 1005.0]), start, 1000.0,
-            sweep=_Grid.sweep()).read_text(encoding="utf-8")
+            sweep=_Grid.sweep()))
         assert "This window spans" not in page
         assert "candles per request" not in page
         assert "could never enter" not in page
@@ -2042,7 +2042,7 @@ class TestRunSettingsHeader:
         out_path = dashboard.generate_dashboard(
             [make_trade()], make_equity([1000.0, 1010.0, 1005.0]),
             date(2026, 1, 5), 1000.0, **kwargs)
-        return out_path.read_text(encoding="utf-8")
+        return _read_page(out_path)
 
     def test_no_sweep_says_not_recorded(self, monkeypatch, tmp_path):
         page = self._page(monkeypatch, tmp_path)
@@ -3161,9 +3161,9 @@ class TestLiveRuleHeader:
         sweep = dataclasses.replace(
             _mix_sweep(trades), live_tier_floors=True, live_spread_band=(0.0, 1.0),
             live_exclude_categories=filters[0][0], live_exclude_tags=filters[0][1])
-        page = dashboard.generate_dashboard(
+        page = _read_page(dashboard.generate_dashboard(
             trades, sweep.primary.equity_df, _MIX_START, _MIX_BALANCE, sweep=sweep,
-            interval_discount=0.75, series_categories=series).read_text(encoding="utf-8")
+            interval_discount=0.75, series_categories=series))
         data = TestFilterPage._data(page)
         # The page's header is the line its own base block words, under the
         # menus' own labels
@@ -3510,7 +3510,7 @@ class TestCorpusProvenanceHeader:
         out_path = dashboard.generate_dashboard(
             trades, make_equity([1000.0, 1010.0, 1005.0]), date(2026, 1, 5),
             1000.0, **kwargs)
-        return out_path.read_text(encoding="utf-8")
+        return _read_page(out_path)
 
     def _prov(self, **overrides):
         fields = {"from_cache": False, "assembled_at": self.ASSEMBLED,
@@ -3624,7 +3624,8 @@ class TestScenarioExplorerPageSize:
     blocks were packed (C3), when its data was one JSON block with every
     curve dense. The budget is the measurement + 20% (the curve runs to
     today, so the page grows by a few bytes a day) — well inside the 5 MB
-    the explorer first set. Re-measured at the merge of #68 (2026-09-26, same
+    the explorer first set. Every size here is the page plus its chunk files
+    (_dashboard_bytes). Re-measured at the merge of #68 (2026-09-26, same
     environment): 1,729,930 bytes without a tier-floors-off family (the
     bar's Tier floors select, its title and note, and each band's option
     text add about 5 KB). The same page with a family for its 18 binding
@@ -3720,7 +3721,7 @@ class TestScenarioExplorerPageSize:
 
         out_path = dashboard.generate_dashboard(
             trades, shared_equity, date(2020, 1, 1), 10_000.0, sweep=sweep)
-        page = out_path.read_text(encoding="utf-8")
+        page = _read_page(out_path)
         # The family reaches the bar only when it exists: its off grid in the
         # base block, and a chunk per k of its own list (13 more)
         assert len(TestFilterPage._chunks(page)) == (26 if family else 13)
@@ -3742,7 +3743,8 @@ class TestScenarioExplorerPageSize:
             assert sum(data["tier_binds"]) == 18
             for bi, own in enumerate(data["tier_binds"]):
                 assert (data["grid_off"][bi] != data["grid"][bi]) is own, bi
-        size = out_path.stat().st_size
+        # The page and its chunk files together
+        size = _dashboard_bytes(out_path)
         budget = self.BUDGET_FAMILY if family else self.BUDGET
         assert size <= budget, f"page was {size} bytes"
 
@@ -4719,6 +4721,70 @@ def _packed_blocks(page: str) -> dict[str, dict]:
     return {element_id: _decode_block(body) for element_id, body in _PACKED.findall(page)}
 
 
+# The packed base block of a page, found without decoding the other blocks
+_DASH_DATA = re.compile(
+    r'<script type="text/plain" id="dash-data" data-encoding="gzip\+base64">([^<]*)</script>')
+
+
+class _Page(str):
+    """A rendered page: the text of the file generate_dashboard wrote, which
+    remembers the folder it was written to (`root`) and carries the text of
+    every chunk file beside it as they were when it was read (`files`: the src
+    the page's script asks for -> the file's text), so a later build into the
+    same folder, which deletes the earlier build's files, leaves the page
+    readable (_sidecar_files, _chunks)."""
+
+    root: Path
+    files: dict[str, str]
+
+    def __new__(cls, text: str, root: Path):
+        page = super().__new__(cls, text)
+        page.root, page.files = root, {}
+        match = _DASH_DATA.search(text)
+        folder = _decode_block(match.group(1)).get("sidecar_dir") if match else None
+        if folder:
+            for path in sorted((root / folder).glob("chunk-*.js")):
+                page.files[f"{folder}/{path.name}"] = path.read_text(encoding="utf-8")
+        return page
+
+
+def _read_page(out_path: Path) -> _Page:
+    """The page generate_dashboard wrote, as a _Page that knows the folder it
+    was written to."""
+    return _Page(out_path.read_text(encoding="utf-8"), out_path.parent)
+
+
+def _dashboard_bytes(out: Path) -> int:
+    """The size of the whole dashboard the page `out` belongs to: the page
+    plus the chunk files in the folder beside it. The size budgets of the
+    page-size tests are measured on this total."""
+    folder = out.parent / config.DASHBOARD_FILES_DIRNAME
+    files = [path for path in folder.rglob("*") if path.is_file()] if folder.exists() else []
+    return out.stat().st_size + sum(path.stat().st_size for path in files)
+
+
+def _flat_ids(value) -> set[int]:
+    """Every whole number in a nested list of chunk ids (null and booleans
+    are not ids)."""
+    if isinstance(value, list):
+        return set().union(*(_flat_ids(item) for item in value)) if value else set()
+    return {value} if isinstance(value, int) and not isinstance(value, bool) else set()
+
+
+def _grid_chunk_ids(data: dict) -> set[int]:
+    """Every chunk id the base block's scenario grids name — the Sell select's
+    ids are in its own blocks, not here."""
+    return set().union(*(_flat_ids(data.get(key)) for key in (
+        "grid", "grid_off", "grid_rebalance", "grid_rebalance_off",
+        "grid_move", "grid_move_off")))
+
+
+def _chunk_src(page: str, chunk_id: int) -> str:
+    """The src the page's script asks for to load a chunk from its file."""
+    data = _packed_blocks(page)["dash-data"]
+    return f"{data['sidecar_dir']}/chunk-{chunk_id}.js"
+
+
 def _flt_walk(source, trades, curve, k_used=0.75, series=_FLT_SERIES, pooled_k=None):
     """Walk a grid as generate_dashboard does: (the grid walked, the base
     block, {chunk id: chunk}). The base block carries the interval-discount
@@ -5664,10 +5730,10 @@ class TestMixData:
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
         with caplog.at_level(logging.WARNING):
-            page = dashboard.generate_dashboard(
+            page = _read_page(dashboard.generate_dashboard(
                 sweep.primary.trades, sweep.primary.equity_df, _FLT_START + timedelta(days=2),
                 1000.0, sweep=sweep, interval_discount=0.75,
-                series_categories=_FLT_SERIES).read_text(encoding="utf-8")
+                series_categories=_FLT_SERIES))
         said = [r for r in caplog.records if "cannot combine categories and tags" in r.getMessage()]
         assert len(said) == 1
         chunks = TestFilterPage._chunks(page)
@@ -5998,7 +6064,7 @@ class TestFilterPayloadTierOff:
 class TestFilterPage:
     """The bar, the data blocks and the script, on a whole rendered page."""
 
-    def _page(self, monkeypatch, tmp_path, sweep=None, series=_FLT_SERIES) -> str:
+    def _page(self, monkeypatch, tmp_path, sweep=None, series=_FLT_SERIES) -> _Page:
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
@@ -6006,7 +6072,7 @@ class TestFilterPage:
         out = dashboard.generate_dashboard(sweep.primary.trades, sweep.primary.equity_df,
                                            _FLT_START, 1000.0, sweep=sweep,
                                            interval_discount=0.75, series_categories=series)
-        return out.read_text(encoding="utf-8")
+        return _read_page(out)
 
     @staticmethod
     def _data(page: str) -> dict:
@@ -6019,12 +6085,29 @@ class TestFilterPage:
         return _decode_block(page[start:end])
 
     @staticmethod
-    def _chunks(page: str) -> dict[int, dict]:
-        """Every scenario chunk on the page (id="dash-chunk-<i>"), by chunk
-        id, inflated and parsed strictly."""
-        return {int(element_id[len("dash-chunk-"):]): data
-                for element_id, data in _packed_blocks(page).items()
-                if element_id.startswith("dash-chunk-")}
+    def _chunks(page: _Page) -> dict[int, dict]:
+        """Every scenario chunk of the page, by chunk id, inflated and parsed
+        strictly: the page's own (id="dash-chunk-<i>") and the files beside it
+        that the base block's grids name (the Sell select's chunk files are
+        named by its own blocks, and not returned)."""
+        blocks = _packed_blocks(page)
+        chunks = {int(element_id[len("dash-chunk-"):]): data
+                  for element_id, data in blocks.items()
+                  if element_id.startswith("dash-chunk-")}
+        data = blocks.get("dash-data")
+        if data and data.get("sidecar_dir"):
+            prefix = f"{data['sidecar_dir']}/chunk-"
+            texts = {int(src[len(prefix):-len(".js")]): text
+                     for src, text in page.files.items()}
+            grid = _grid_chunk_ids(data)
+            sell_only = {cid for element_id, block in blocks.items()
+                         if element_id.startswith("dash-sell-")
+                         for cid in _flat_ids(block)} - grid
+            # Every id a grid names must have its file (a KeyError otherwise),
+            # and any other file but the Sell select's own counts too
+            for cid in sorted((grid | set(texts)) - sell_only - set(chunks)):
+                chunks[cid] = _decode_block(_SIDECAR_CALL.fullmatch(texts[cid]).group(1))
+        return chunks
 
     def test_the_bar_preselects_the_primary_and_counts_its_trades(self, monkeypatch, tmp_path):
         page = self._page(monkeypatch, tmp_path)
@@ -6186,21 +6269,29 @@ class TestFilterPage:
             _flt_sweep().primary.equity_df, _flt_trades(), 1000.0)}
         dynamic |= {f"{p}-{part}" for p in ("dec", "cal", "diag", "risk", "khat")
                     for part in ("empty", "body")}
-        # 'dash-chunk-' + id: every scenario's chunk the grid names
-        grid = self._data(page)["grid"]
-        chunk_ids = {c for band in grid for ks in band for c in ks if c is not None}
-        dynamic |= {f"dash-chunk-{c}" for c in chunk_ids}
+        # 'dash-chunk-' + id: every scenario's chunk the grid names that the
+        # page holds (the first), the others being files the script loads
+        data = self._data(page)
+        chunk_ids = {c for band in data["grid"] for ks in band for c in ks if c is not None}
+        in_page = {c for c in chunk_ids if c < data["inline_chunks"]}
+        dynamic |= {f"dash-chunk-{c}" for c in in_page}
         missing = sorted(i for i in literal | dynamic if f'id="{i}"' not in page)
-        assert literal and chunk_ids and not missing
+        assert literal and chunk_ids and in_page == {0} and not missing
         assert "'dash-chunk-' + id" in js
+        # ... every other chunk is a file in the folder the base block names
+        assert set(page.files) == {f"{data['sidecar_dir']}/chunk-{c}.js"
+                                   for c in chunk_ids - in_page}
+        assert "D.sidecar_dir + '/chunk-' + key + '.js'" in js
 
     def test_the_script_comes_after_every_section(self, monkeypatch, tmp_path):
         page = self._page(monkeypatch, tmp_path)
         assert page.index('id="flt-bar"') < page.index("Portfolio Performance")
         script = page.index("function inflate(el)")
-        chunk_at = [page.index(f'id="dash-chunk-{c}"') for c in sorted(self._chunks(page))]
-        # Every chunk and the base block sit after the sections and before the
-        # script: an element a script reaches exists when it runs
+        chunk_at = [page.index(f'id="dash-chunk-{c}"') for c in sorted(self._chunks(page))
+                    if c < self._data(page)["inline_chunks"]]
+        # Every chunk in the page and the base block sit after the sections and
+        # before the script: an element a script reaches exists when it runs
+        assert chunk_at
         assert page.index("Benchmark Comparison") < chunk_at[0]
         assert chunk_at == sorted(chunk_at)
         assert chunk_at[-1] < page.index('id="dash-data"') < script
@@ -6226,6 +6317,8 @@ class TestFilterPage:
         assert 'id="flt-unavailable"' in page and "Portfolio Performance" in page
         assert "function inflate(el)" not in page
         assert any("could not be built" in r.getMessage() for r in caplog.records)
+        # The folder made for the chunk files is deleted with the bar
+        assert TestSidecarFolders._folders(tmp_path) == []
 
     def test_one_k_prices_the_whole_page(self, monkeypatch, tmp_path):
         # No override: the sweep's primary k (0.60 here) prices the Risk
@@ -6239,9 +6332,9 @@ class TestFilterPage:
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
-        page = dashboard.generate_dashboard(
+        page = _read_page(dashboard.generate_dashboard(
             sweep.primary.trades, sweep.primary.equity_df, _FLT_START, 1000.0, sweep=sweep,
-            series_categories=_FLT_SERIES).read_text(encoding="utf-8")
+            series_categories=_FLT_SERIES))
         kx, _ = dashboard._kelly_points(sweep.primary.trades, 0.60)
         data = self._data(page)
         assert self._chunks(page)[0]["list"]["kx"] == pytest.approx(kx)
@@ -6260,10 +6353,10 @@ class TestFilterPage:
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
         with caplog.at_level(logging.WARNING):
-            page = dashboard.generate_dashboard(
+            page = _read_page(dashboard.generate_dashboard(
                 sweep.primary.trades, sweep.primary.equity_df, _FLT_START, 1000.0,
                 sweep=sweep, interval_discount=0.6,
-                series_categories=_FLT_SERIES).read_text(encoding="utf-8")
+                series_categories=_FLT_SERIES))
         warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
                   and "differs from the sweep's primary k" in r.getMessage()]
         assert len(warned) == 1 and "0.6" in warned[0] and "0.75" in warned[0]
@@ -6510,8 +6603,7 @@ class TestFilterSummary:
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
-        page = dashboard.generate_dashboard(trades, curve, _FLT_START, 1000.0) \
-            .read_text(encoding="utf-8")
+        page = _read_page(dashboard.generate_dashboard(trades, curve, _FLT_START, 1000.0))
         assert ("Showing every trade of the run at the primary spread band (not recorded), "
                 "k not recorded, cap not recorded: 5 trades.") in page
 
@@ -6672,18 +6764,25 @@ _SIDECAR_CALL = re.compile(r'window\.__dashChunk\(document\.currentScript,"([A-Z
 
 
 def _sidecar_files(page: str, root: Path) -> dict[str, dict]:
-    """Every sidecar chunk file of a page — in the folder its base block names
-    (sidecar_dir), under `root` (the folder the page was written to) — decoded
+    """Every chunk file of a page — in the folder its base block names
+    (sidecar_dir), under `root` (the folder the page was written to; for a
+    _Page read from there, the files as they were when it was read) — decoded
     strictly, by the src the page's script asks for."""
     data = _packed_blocks(page).get("dash-data") or {}
     folder = data.get("sidecar_dir")
     if not folder:
         return {}
+    if isinstance(page, _Page) and root == page.root:
+        # The files as they were when the page was read
+        texts = page.files
+    else:
+        texts = {f"{folder}/{path.name}": path.read_text(encoding="utf-8")
+                 for path in sorted((root / folder).glob("chunk-*.js"))}
     out = {}
-    for path in sorted((root / folder).glob("chunk-*.js")):
-        match = _SIDECAR_CALL.fullmatch(path.read_text(encoding="utf-8"))
-        assert match, path
-        out[f"{folder}/{path.name}"] = _decode_block(match.group(1))
+    for src, text in texts.items():
+        match = _SIDECAR_CALL.fullmatch(text)
+        assert match, src
+        out[src] = _decode_block(match.group(1))
     return out
 
 
@@ -6698,13 +6797,18 @@ def _explorer_body() -> str:
     return body[:start] + "  function unpack(el) { return __inflate(el); }\n" + body[end:]
 
 
+# files_root's default: the folder the page was written to
+_PAGE_FOLDER = object()
+
+
 def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
                 no_decompression: bool = False, *, strict: bool = False,
                 damaged: tuple = (), keep: int | None = None,
                 deferred: tuple = (), explorer: bool = False,
                 strict_ids: bool = False, setup_js: str = "",
-                files_root: Path | None = None, files_missing: tuple = (),
-                files_empty: tuple = (), files_deferred: tuple = ()) -> dict:
+                files_root: Path | None | object = _PAGE_FOLDER,
+                files_missing: tuple = (), files_empty: tuple = (),
+                files_damaged: tuple = (), files_deferred: tuple = ()) -> dict:
     """
     Run the page's scripts — the filter script, and with explorer=True the
     scenario explorer's before it — over a rendered page under
@@ -6719,7 +6823,8 @@ def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
         page (str): The rendered page.
         steps (list): The harness's steps (["wait"], ["settle"], ["set", id,
             value], ["fire", id], ["zoom", id], ["hide", id], ["select", id],
-            ["repair", id], ["resolve", id], ["reject", id], ["call", name,
+            ["repair", id], ["resolve", id], ["reject", id], ["resolve_file",
+            src], ["reject_file", src], ["repair_file", src], ["call", name,
             args] — a page script's window function called with args, as
             another script would call it — ["click", id] — a reader clicking
             that element, its click listeners run unless it is disabled —
@@ -6759,16 +6864,22 @@ def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
             and before the scripts — to take something off the page Python
             drew.
         files_root (Path | None): Keyword-only. The folder the page was
-            written to: its sidecar chunk files (the Sell select's, in the
-            folder the base block names) are handed to the harness, which
-            loads one when the script appends its <script src> element
-            (["resolve_file", src] / ["reject_file", src] for a deferred one;
-            each snapshot's "files" lists every src loaded). None (default)
-            hands none over, so every sidecar load fails as a missing file's.
+            written to: its chunk files (every scenario's but the page's
+            first, and the Sell select's, in the folder the base block names)
+            are handed to the harness, which loads one when the script
+            appends its <script src> element (["resolve_file", src] /
+            ["reject_file", src] for a deferred one; each snapshot's "files"
+            lists every src loaded). The default is the folder the page
+            carries (_Page.root), else tmp_path, where every page of these
+            tests is written; None hands none over, so every file load
+            fails as a missing file's.
         files_missing (tuple): Keyword-only. Srcs to leave out, as files that
             cannot be loaded.
         files_empty (tuple): Keyword-only. Srcs that run without handing
             anything over.
+        files_damaged (tuple): Keyword-only. Srcs that hand over a block that
+            cannot be inflated (until a ["repair_file", src] step), as a
+            damaged gzip block's would.
         files_deferred (tuple): Keyword-only. Srcs whose load waits for a
             ["resolve_file", src] or ["reject_file", src] step.
 
@@ -6786,6 +6897,8 @@ def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
         body = body.replace("var KEEP = 16;", f"var KEEP = {int(keep)};")
     with_explorer = explorer and "function unpack(el)" in page
     has_filter = 'id="dash-data"' in page
+    if files_root is _PAGE_FOLDER:
+        files_root = getattr(page, "root", None) or tmp_path
     sidecars = {} if files_root is None else _sidecar_files(page, files_root)
     for src in files_missing:
         sidecars.pop(src, None)
@@ -6795,6 +6908,7 @@ def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
         f"__BLOCKS = {json.dumps(_packed_blocks(page))};",
         f"__SIDECARS = {json.dumps(sidecars)};",
         *(f"__SIDECAR_EMPTY[{json.dumps(src)}] = true;" for src in files_empty),
+        *(f"__SIDECAR_DAMAGED[{json.dumps(src)}] = true;" for src in files_damaged),
         *(f"__SIDECAR_DEFERRED[{json.dumps(src)}] = true;" for src in files_deferred),
         *(f"__DAMAGED[{json.dumps(i)}] = true;" for i in damaged),
         *(f"__DEFERRED[{json.dumps(i)}] = true;" for i in deferred),
@@ -7147,7 +7261,7 @@ class TestFilterScript:
         # relabelled or loaded
         assert fired["reacts"] == [] and fired["text"] == ready["text"]
         assert fired["selects"]["flt-band"]["options"] == ready["selects"]["flt-band"]["options"]
-        assert fired["inflated"] == ready["inflated"]
+        assert fired["inflated"] == ready["inflated"] and fired["files"] == ready["files"]
 
     def test_the_khat_chart_follows_the_tier_floors_choice(self, monkeypatch, tmp_path):
         page = self._page(monkeypatch, tmp_path, _flt_sweep_tiers(), _FLT_SERIES_TIERS)
@@ -7310,10 +7424,10 @@ class TestFilterScript:
         page = self._page(monkeypatch, tmp_path, sweep, _FLT_SERIES_TIERS)
         data = TestFilterPage._data(page)
         off = sweep.tier_off_scenarios[0]
-        python_page = dashboard.generate_dashboard(
+        python_page = _read_page(dashboard.generate_dashboard(
             off.trades, off.equity_df, _FLT_START, 1000.0, sweep=sweep,
             interval_discount=0.75, series_categories=_FLT_SERIES_TIERS,
-        ).read_text(encoding="utf-8")
+        ))
         snap = _run_script(tmp_path, page, [
             ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"],
             ["snap", "off"]])["off"]
@@ -7361,9 +7475,9 @@ class TestFilterScript:
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
-        page = dashboard.generate_dashboard(
+        page = _read_page(dashboard.generate_dashboard(
             sweep.primary.trades, sweep.primary.equity_df, golden._START, 10_000.0,
-            sweep=sweep).read_text(encoding="utf-8")
+            sweep=sweep))
         data = TestFilterPage._data(page)
         bands = len(config.SPREAD_BAND_SWEEP_FLOORS) * len(config.SPREAD_BAND_SWEEP_CEILINGS)
         assert len(data["bands"]) == len(data["bands_off"]) == bands
@@ -7392,7 +7506,7 @@ class TestFilterScript:
         off_id = data["grid_off"][0][1][0]
         snap = _run_script(tmp_path, page, [
             ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"],
-            ["snap", "failed"]], damaged=(f"dash-chunk-{off_id}",))["failed"]
+            ["snap", "failed"]], files_damaged=(_chunk_src(page, off_id),))["failed"]
         assert snap["selects"]["flt-tier"]["value"] == "on"
         assert [text for _, text in snap["selects"]["flt-band"]["options"]] == [
             "max(tier,0)-1 (primary)", "max(tier,0.3)-0.6", "max(tier,0.3)-1"]
@@ -7416,7 +7530,7 @@ class TestFilterScript:
                              "khat-group"))
         assert snap["text"]["flt-summary"].startswith(
             "The filter could not load its data (this browser cannot decompress it)")
-        assert snap["reacts"] == [] and snap["inflated"] == []
+        assert snap["reacts"] == [] and snap["inflated"] == [] and snap["files"] == []
 
 
 # ─── The k and size-cap axes ──────────────────────────────────────────────────
@@ -7735,9 +7849,9 @@ class TestFilterKAndCap:
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
-        page = dashboard.generate_dashboard(
+        page = _read_page(dashboard.generate_dashboard(
             run.primary.trades, run.primary.equity_df, golden._START, 10_000.0,
-            sweep=run).read_text(encoding="utf-8")
+            sweep=run))
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
         caps = run.cap_sweep.caps
         assert [c["value"] for c in data["caps"]] == list(caps) and len(caps) == 20
@@ -7785,7 +7899,8 @@ class TestFilterKAndCap:
         assert layout["annotations"][0]["text"] == "sized at k = 0.60"
         assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
             data["text"], _phrase(data, 0, 0, 1), False, None, 3, 3)
-        assert snap["inflated"] == ["dash-data", "dash-chunk-0", "dash-chunk-2"]
+        assert snap["inflated"] == ["dash-data", "dash-chunk-0"]
+        assert snap["files"] == [_chunk_src(page, 2)]
 
     def test_a_cap_change_shows_that_cap_s_sizes(self, monkeypatch, tmp_path):
         page = _kc_page(monkeypatch, tmp_path)
@@ -7820,18 +7935,18 @@ class TestFilterKAndCap:
         assert snap["text"]["flt-summary"].startswith(
             "Showing every trade of the run at "
             "the primary spread band max(tier,0)-1, k = 0.60, 5% cap per trade: 3 trades.")
-        assert snap["inflated"] == ["dash-data", "dash-chunk-0", "dash-chunk-2",
-                                    "dash-chunk-3"]
+        assert snap["inflated"] == ["dash-data", "dash-chunk-0"]
+        assert snap["files"] == [_chunk_src(page, 2), _chunk_src(page, 3)]
 
-    @pytest.mark.parametrize("keep, inflated", [
-        (None, ["dash-data", "dash-chunk-0", "dash-chunk-2", "dash-chunk-3"]),
-        (1, ["dash-data", "dash-chunk-0", "dash-chunk-2", "dash-chunk-3", "dash-chunk-2"]),
+    @pytest.mark.parametrize("keep, loaded", [
+        (None, [2, 3]),
+        (1, [2, 3, 2]),
     ])
     def test_loaded_chunks_are_kept_least_recently_used_first(
-            self, monkeypatch, tmp_path, keep, inflated):
+            self, monkeypatch, tmp_path, keep, loaded):
         # k 0.60 (chunk 2), then 5% (chunk 3), then back to 20% (chunk 2), then
         # the primary: with room for one chunk besides the primary's, chunk 2
-        # was dropped for chunk 3 and is inflated again; the primary's never is
+        # was dropped for chunk 3 and is loaded again; the primary's never is
         page = _kc_page(monkeypatch, tmp_path)
         snap = _run_script(tmp_path, page, [
             ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"],
@@ -7839,7 +7954,8 @@ class TestFilterKAndCap:
             ["set", "flt-cap", "1"], ["fire", "flt-cap"], ["settle"],
             ["set", "flt-k", "1"], ["fire", "flt-k"], ["settle"], ["snap", "s"]],
             keep=keep)["s"]
-        assert snap["inflated"] == inflated
+        assert snap["inflated"] == ["dash-data", "dash-chunk-0"]
+        assert snap["files"] == [_chunk_src(page, c) for c in loaded]
         assert snap["text"]["hdr-trades"] == "3"
 
     def test_a_scenario_never_simulated_shows_nothing_and_says_so(self, monkeypatch, tmp_path):
@@ -7855,8 +7971,9 @@ class TestFilterKAndCap:
         assert snap["text"]["hdr-trades"] == "0"
         for prefix in ("dec", "cal", "diag", "risk"):
             assert snap["display"][f"{prefix}-body"] == "none"
-        # Nothing to inflate for it
-        assert snap["inflated"] == ["dash-data", "dash-chunk-0", "dash-chunk-4"]
+        # Nothing to load for it
+        assert snap["inflated"] == ["dash-data", "dash-chunk-0"]
+        assert snap["files"] == [_chunk_src(page, 4)]
 
     def test_a_chunk_that_cannot_be_loaded_is_named_and_can_be_retried(
             self, monkeypatch, tmp_path):
@@ -7864,9 +7981,9 @@ class TestFilterKAndCap:
         data = TestFilterPage._data(page)
         snaps = _run_script(tmp_path, page, [
             ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "failed"],
-            ["repair", "dash-chunk-2"],
+            ["repair_file", _chunk_src(page, 2)],
             ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "retried"]],
-            damaged=("dash-chunk-2",))
+            files_damaged=(_chunk_src(page, 2),))
         failed, retried = snaps["failed"], snaps["retried"]
         # The line names the scenario that failed and the one still shown; the
         # selects go back to the one shown, and stay usable
@@ -7877,7 +7994,7 @@ class TestFilterKAndCap:
         assert not any(failed["selects"][i]["disabled"] for i in _FLT_SELECTS)
         assert failed["reacts"] == []
         # Chosen again, it is loaded again
-        assert retried["inflated"].count("dash-chunk-2") == 2
+        assert retried["files"].count(_chunk_src(page, 2)) == 2
         assert retried["selects"]["flt-k"]["value"] == "0"
         assert "k = 0.60, 20% cap per trade: 3 trades." in retried["text"]["flt-summary"]
 
@@ -7892,8 +8009,9 @@ class TestFilterKAndCap:
             ["wait"], ["snap", "loaded"],
             ["set", "flt-k", "0"], ["fire", "flt-k"],
             _tick_category("0"), ["snap", "pending"],
-            ["reject", "dash-chunk-2"], ["snap", "failed"]],
-            strict=True, deferred=("dash-chunk-2",))
+            ["resolve_file", _chunk_src(page, 2)], ["snap", "failed"]],
+            strict=True, files_deferred=(_chunk_src(page, 2),),
+            files_damaged=(_chunk_src(page, 2),))
         loaded, pending, failed = snaps["loaded"], snaps["pending"], snaps["failed"]
         assert pending["selects"]["flt-cat"]["value"] == "0"
         for sid in _FLT_SELECTS:
@@ -7924,8 +8042,9 @@ class TestFilterKAndCap:
             ["wait"],
             ["set", "flt-band", "1"], ["fire", "flt-band"],
             ["set", "khat-group", "tag"], ["fire", "khat-group"], ["snap", "pending"],
-            ["reject", "dash-chunk-4"], ["snap", "failed"]],
-            strict=True, deferred=("dash-chunk-4",))
+            ["resolve_file", _chunk_src(page, 4)], ["snap", "failed"]],
+            strict=True, files_deferred=(_chunk_src(page, 4),),
+            files_damaged=(_chunk_src(page, 4),))
         pending, failed = snaps["pending"], snaps["failed"]
         assert [r["id"] for r in pending["reacts"]] == ["khat-fig"]
         title = _last_react(pending, "khat-fig")["layout"]["title"]["text"]
@@ -7945,22 +8064,23 @@ class TestFilterKAndCap:
         # change draws at once, with no second inflate and no "Loading" line.
         # Chosen again, the 5% chunk is inflated again
         page = _kc_page(monkeypatch, tmp_path)
+        src2, src3 = _chunk_src(page, 2), _chunk_src(page, 3)
         snaps = _run_script(tmp_path, page, [
             ["wait"],
-            ["set", "flt-k", "0"], ["fire", "flt-k"], ["resolve", "dash-chunk-2"],
+            ["set", "flt-k", "0"], ["fire", "flt-k"], ["resolve_file", src2],
             ["set", "flt-cap", "0"], ["fire", "flt-cap"],
             ["set", "flt-cap", "1"], ["fire", "flt-cap"], ["snap", "back"],
-            ["resolve", "dash-chunk-3"],
+            ["resolve_file", src3],
             _tick_category("0"), ["snap", "cat"],
-            ["set", "flt-cap", "0"], ["fire", "flt-cap"], ["resolve", "dash-chunk-3"],
+            ["set", "flt-cap", "0"], ["fire", "flt-cap"], ["resolve_file", src3],
             ["snap", "again"]],
-            keep=1, deferred=("dash-chunk-2", "dash-chunk-3"))
+            keep=1, files_deferred=(src2, src3))
         back, cat, again = snaps["back"], snaps["cat"], snaps["again"]
         assert back["text"]["flt-summary"].startswith("Showing every trade")
         assert cat["text"]["flt-summary"].startswith("Showing ")
-        assert cat["inflated"].count("dash-chunk-2") == 1
+        assert cat["files"].count(src2) == 1
         assert {r["id"] for r in cat["reacts"]} >= {"perf-cum", "khat-fig"}
-        assert again["inflated"].count("dash-chunk-3") == 2
+        assert again["files"].count(src3) == 2
         assert "5% cap per trade" in again["text"]["flt-summary"]
 
     def test_at_the_shipped_keep_superseded_loads_never_evict_the_chunk_on_screen(
@@ -7988,18 +8108,18 @@ class TestFilterKAndCap:
         shown = 0
         others = [ci for ci in range(len(caps)) if ci not in (shown, caps.index(0.2))][:16]
         steps = [["wait"], ["set", "flt-cap", str(shown)], ["fire", "flt-cap"],
-                 ["resolve", f"dash-chunk-{grid[shown]}"]]
+                 ["resolve_file", _chunk_src(page, grid[shown])]]
         for ci in others:
             steps += [["set", "flt-cap", str(ci)], ["fire", "flt-cap"]]
         steps += [["set", "flt-cap", str(shown)], ["fire", "flt-cap"], ["snap", "back"]]
-        steps += [["resolve", f"dash-chunk-{grid[ci]}"] for ci in others]
+        steps += [["resolve_file", _chunk_src(page, grid[ci])] for ci in others]
         steps += [_tick_category("0"), ["snap", "cat"]]
-        deferred = tuple(f"dash-chunk-{c}" for c in grid if c != grid[caps.index(0.2)])
-        snaps = _run_script(tmp_path, page, steps, deferred=deferred)
+        deferred = tuple(_chunk_src(page, c) for c in grid if c != grid[caps.index(0.2)])
+        snaps = _run_script(tmp_path, page, steps, files_deferred=deferred)
         assert snaps["back"]["text"]["flt-summary"].startswith("Showing every trade")
         assert snaps["cat"]["text"]["flt-summary"].startswith("Showing ")
-        assert snaps["cat"]["inflated"].count(f"dash-chunk-{grid[shown]}") == 1
-        assert snaps["cat"]["pending"] == []
+        assert snaps["cat"]["files"].count(_chunk_src(page, grid[shown])) == 1
+        assert snaps["cat"]["pending"] == [] and snaps["cat"]["pendingFiles"] == []
 
     def test_a_primary_chunk_that_cannot_be_loaded_disables_the_bar(
             self, monkeypatch, tmp_path):
@@ -8020,9 +8140,9 @@ class TestFilterKAndCap:
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
-        page = dashboard.generate_dashboard(
+        page = _read_page(dashboard.generate_dashboard(
             trades, curve, _FLT_START, 1000.0, interval_discount=0.75,
-            series_categories=_FLT_SERIES).read_text(encoding="utf-8")
+            series_categories=_FLT_SERIES))
         data = TestFilterPage._data(page)
         sports = data["categories"].index("Sports")
         basketball = str(data["subcats"].index([sports, "Basketball"]))
@@ -8451,12 +8571,13 @@ class TestSaveLiveDefaultsButton:
         assert _KC_GRID[1][1][1] == 4
         steps = [["wait"], ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"],
                  ["click", "flt-save"], ["snap", "loading"]]
+        src = _chunk_src(page, 4)
         resolved = _run_script(tmp_path, page, steps + [
-            ["resolve", "dash-chunk-4"], ["snap", "drawn"],
+            ["resolve_file", src], ["snap", "drawn"],
             ["click", "flt-save"], ["snap", "clicked"]],
-            strict=True, deferred=("dash-chunk-4",))
+            strict=True, files_deferred=(src,))
         loading = resolved["loading"]
-        assert loading["pending"] == ["dash-chunk-4"]
+        assert loading["pendingFiles"] == [src]
         assert loading["buttons"]["flt-save"] is True and loading["opened"] == []
         # Once drawn: the new scenario
         assert resolved["drawn"]["buttons"]["flt-save"] is False
@@ -8464,9 +8585,9 @@ class TestSaveLiveDefaultsButton:
         self._assert_sends(data, self._query(data, opened), 1, 1, 1)
         # A chunk that fails: the scenario still shown, which the selects go back to
         failed = _run_script(tmp_path, page, steps + [
-            ["reject", "dash-chunk-4"], ["snap", "failed"],
+            ["resolve_file", src], ["snap", "failed"],
             ["click", "flt-save"], ["snap", "clicked"]],
-            strict=True, deferred=("dash-chunk-4",))
+            strict=True, files_deferred=(src,), files_damaged=(src,))
         assert failed["loading"]["buttons"]["flt-save"] is True
         assert failed["failed"]["selects"]["flt-band"]["value"] == "0"
         assert failed["failed"]["buttons"]["flt-save"] is False
@@ -8643,9 +8764,9 @@ class TestSaveLiveDefaultsButton:
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
-        page = dashboard.generate_dashboard(
+        page = _read_page(dashboard.generate_dashboard(
             trades, curve, _FLT_START, 1000.0, interval_discount=0.75,
-            series_categories=_FLT_SERIES).read_text(encoding="utf-8")
+            series_categories=_FLT_SERIES))
         data = TestFilterPage._data(page)
         pb, pk, pc = data["primary"]
         assert data["bands"][pb]["value"] is None and data["caps"][pc]["value"] is None
@@ -9226,9 +9347,9 @@ class TestScenarioExplorerScript:
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
-        return dashboard.generate_dashboard(
+        return _read_page(dashboard.generate_dashboard(
             sweep.primary.trades, sweep.primary.equity_df, date(2026, 1, 5), 1000.0,
-            sweep=sweep).read_text(encoding="utf-8")
+            sweep=sweep))
 
     def _rows(self, ts: str, ladder: str, cross: str, all_: str) -> list[tuple[str, str]]:
         # Same-title's row is the same under both Tier floors settings
@@ -9927,10 +10048,10 @@ class TestKhatCards:
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
         sweep = _flt_sweep()
         with caplog.at_level(logging.WARNING):
-            page = dashboard.generate_dashboard(
+            page = _read_page(dashboard.generate_dashboard(
                 sweep.primary.trades, sweep.primary.equity_df, _FLT_START, 1000.0,
                 sweep=sweep, interval_discount=0.62,
-                series_categories=_FLT_SERIES).read_text(encoding="utf-8")
+                series_categories=_FLT_SERIES))
         assert any("differs from the sweep's primary k" in r.getMessage()
                    for r in caplog.records)
         data = TestFilterPage._data(page)
@@ -9957,8 +10078,7 @@ class TestKhatCards:
         trades = _flt_trades()
         curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
-        bare = dashboard.generate_dashboard(trades, curve, _FLT_START, 1000.0) \
-            .read_text(encoding="utf-8")
+        bare = _read_page(dashboard.generate_dashboard(trades, curve, _FLT_START, 1000.0))
         assert 'id="kpi-khat"' not in bare and dashboard._KHAT_CARDS_CAPTION not in bare
 
     # ─── The script over the cards ───────────────────────────────────────────
@@ -10527,9 +10647,8 @@ class TestIntervalDiscountFollowsTheBar:
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
         trades = _flt_trades()
         curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
-        page = dashboard.generate_dashboard(trades, curve, _FLT_START, 1000.0,
-                                            series_categories=_FLT_SERIES) \
-            .read_text(encoding="utf-8")
+        page = _read_page(dashboard.generate_dashboard(
+            trades, curve, _FLT_START, 1000.0, series_categories=_FLT_SERIES))
         assert "No interval-discount sweep for this run." in page and 'id="flt-bar"' in page
         data = TestFilterPage._data(page)
         assert data["kd"] is None
@@ -11710,7 +11829,7 @@ class TestTierOffAtEveryCap:
             data["text"], _phrase_off(data, pb, pk, 0), False, None, n, n)
         assert not snap["text"]["flt-summary"].startswith("Showing nothing")
         assert snap["text"]["hdr-trades"] == str(n)
-        assert f"dash-chunk-{cid}" in snap["inflated"]
+        assert _chunk_src(page, cid) in snap["files"]
 
     def test_the_explorer_ships_an_off_block_per_cap_and_follows_the_bar_there(
             self, monkeypatch, tmp_path):
@@ -12498,10 +12617,16 @@ class TestRebalanceView:
                | _rb_ids(data["grid_rebalance"]) | _rb_ids(data["grid_rebalance_off"]))
         assert _rb_ids(data["grid_rebalance"]) - _rb_ids(data["grid"])
         assert _rb_ids(data["grid_rebalance_off"]) - _rb_ids(data["grid_rebalance"])
-        missing = sorted(i for i in ids if f'id="dash-chunk-{i}"' not in page)
+        # Each is the page's own chunk or a file beside it
+        missing = sorted(i for i in ids if (
+            f'id="dash-chunk-{i}"' not in page if i < data["inline_chunks"]
+            else f"{data['sidecar_dir']}/chunk-{i}.js" not in page.files))
         assert ids and not missing
-        # Every chunk on the page is named by some grid: none is left over
-        assert set(TestFilterPage._chunks(page)) == ids
+        # Every chunk of the page is named by some grid: none is left over,
+        # in the page or as a file beside it
+        in_page = {int(c) for c in re.findall(r'id="dash-chunk-(\d+)"', page)}
+        as_files = {int(src.rsplit("chunk-", 1)[1][:-len(".js")]) for src in page.files}
+        assert in_page | as_files == ids and not in_page & as_files
 
 
 # The minimum price movements _kc_sweep_move's family carries
@@ -12606,7 +12731,10 @@ class TestMoveView:
         assert base["rebalance_state"] == "shown" and base["grid_rebalance"] is not None
         assert set(base) == set(clean_base)
         for key in clean_base:
-            if key != "move_state":
+            if key == "sidecar_dir" and None not in (base[key], clean_base[key]):
+                # Each build has a folder of its own, under the same parent
+                assert base[key].rsplit("/", 1)[0] == clean_base[key].rsplit("/", 1)[0]
+            elif key != "move_state":
                 assert base[key] == clean_base[key], key
         assert chunks == clean_chunks
 
@@ -12741,7 +12869,7 @@ class TestMoveView:
         assert data["move_state"] == "shown"
         assert [entry["label"] for entry in data["moves"]] == ["5c", "10c", "25c"]
         assert data["grid_move"][0][1] == self._CELL
-        assert sorted(chunks) == list(range(9)) and data["inline_chunks"] == 9
+        assert sorted(chunks) == list(range(9)) and data["inline_chunks"] == 1
         # A family that carries no minimum says so
         page = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance())
         data = TestFilterPage._data(page)
@@ -13464,7 +13592,8 @@ class TestRebalanceScript:
             ["snap", "s"]], strict=True)["s"]
         assert snap["selects"]["flt-rebalance"]["disabled"] is True
         # The change event on the shut select drew nothing more than the k's did
-        assert snap["inflated"] == ["dash-data", "dash-chunk-0", "dash-chunk-2"]
+        assert snap["inflated"] == ["dash-data", "dash-chunk-0"]
+        assert snap["files"] == [_chunk_src(bare, 2)]
         assert "rebalancing" not in snap["text"]["flt-summary"]
 
     def test_yes_loads_the_rebalance_chunk_and_words_the_scenario(self, monkeypatch, tmp_path):
@@ -13482,7 +13611,8 @@ class TestRebalanceScript:
         assert snaps["loading"]["text"]["flt-summary"] == data["text"]["loading"].format(
             scenario=scenario)
         snap = snaps["on"]
-        assert snap["inflated"] == ["dash-data", "dash-chunk-0", f"dash-chunk-{cid}"]
+        assert snap["inflated"] == ["dash-data", "dash-chunk-0"]
+        assert snap["files"] == [_chunk_src(page, cid)]
         assert {r["id"] for r in snap["reacts"]} == _charts_redrawn()
         view = chunks[cid]["list"]["views"]["all"]
         # The primary cell with Rebalance yes is its own simulation, and the
@@ -13501,7 +13631,7 @@ class TestRebalanceScript:
         assert snap["selects"]["flt-rebalance"]["value"] == "yes"
         # No again is the page as rendered: the primary's chunk, kept, loads nothing
         off = snaps["off"]
-        assert off["inflated"] == snap["inflated"]
+        assert off["inflated"] == snap["inflated"] and off["files"] == snap["files"]
         assert off["text"]["flt-summary"] == dashboard._filter_summary_text(
             data["text"], _phrase(data, 0, 1, 1), True, None, 3, 3)
         assert dashboard._REBALANCE_SUMMARY_NOTE not in off["text"]["flt-summary"]
@@ -13545,6 +13675,7 @@ class TestRebalanceScript:
             ["wait"], ["set", "flt-cap", "2"], ["fire", "flt-cap"], ["settle"],
             ["snap", "plain"], *self.ON, ["snap", "on"]], strict=True)
         assert snap["on"]["inflated"] == snap["plain"]["inflated"]
+        assert snap["on"]["files"] == snap["plain"]["files"]
         assert snap["on"]["text"]["hdr-trades"] == snap["plain"]["text"]["hdr-trades"]
         assert data["text"]["rebalance"] in snap["on"]["text"]["flt-summary"]
 
@@ -13560,6 +13691,7 @@ class TestRebalanceScript:
         assert ready["selects"]["flt-rebalance"]["value"] == "no"
         assert ready["selects"]["flt-rebalance"]["disabled"] is False
         assert ready["inflated"] == ["dash-data", "dash-chunk-0"] and ready["reacts"] == []
+        assert ready["files"] == []
 
     def test_tier_floors_off_reads_the_rebalance_off_grid(self, monkeypatch, tmp_path):
         page = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance(_kc_sweep_tiers()))
@@ -13576,7 +13708,7 @@ class TestRebalanceScript:
             strict=True)
         phrase = data["text"]["rebalance"]
         view = chunks[binding]["list"]["views"]["all"]["n"]
-        assert f"dash-chunk-{binding}" in snaps["binding"]["inflated"]
+        assert _chunk_src(page, binding) in snaps["binding"]["files"]
         assert snaps["binding"]["text"]["flt-summary"] == dashboard._filter_summary_text(
             data["text"], _phrase_off(data, 0, 1, 1) + phrase, False, None, view, view,
             note="other_run", rebalance=True)
@@ -13584,7 +13716,7 @@ class TestRebalanceScript:
         assert snaps["plain"]["text"]["flt-summary"] == dashboard._filter_summary_text(
             data["text"], _phrase_off(data, 1, 1, 1) + phrase, False, None, view, view,
             rebalance=True)
-        assert f"dash-chunk-{plain}" in snaps["plain"]["inflated"]
+        assert _chunk_src(page, plain) in snaps["plain"]["files"]
 
     def test_a_scenario_the_family_never_simulated_reads_missing_and_cannot_be_saved(
             self, monkeypatch, tmp_path):
@@ -13610,8 +13742,8 @@ class TestRebalanceScript:
         cid = data["grid_rebalance"][0][1][1]
         snaps = self._run(tmp_path, page, [
             ["wait"], *self.ON, ["snap", "bad"], ["click", "flt-save"], ["snap", "bad click"],
-            ["repair", f"dash-chunk-{cid}"], *self.ON, ["snap", "good"]],
-            strict=True, damaged=(f"dash-chunk-{cid}",))
+            ["repair_file", _chunk_src(page, cid)], *self.ON, ["snap", "good"]],
+            strict=True, files_damaged=(_chunk_src(page, cid),))
         bad = snaps["bad"]
         assert bad["selects"]["flt-rebalance"]["value"] == "no" and bad["reacts"] == []
         # The line names the scenario that failed, in the phrase rebalancing
@@ -13839,6 +13971,7 @@ class TestMoveScript:
         # A change event on the shut select draws nothing and loads nothing
         ignored = snaps["ignored"]
         assert ignored["reacts"] == [] and ignored["inflated"] == ["dash-data", "dash-chunk-0"]
+        assert ignored["files"] == []
         assert ignored["text"].get("flt-summary") == snaps["ready"]["text"].get("flt-summary")
         assert ignored["selects"]["flt-move"]["disabled"] is True
         # It opens with Rebalance yes and shuts with no
@@ -13863,9 +13996,9 @@ class TestMoveScript:
             scenario=scenario)
         snap = snaps["move"]
         # Exactly its chunk was loaded, after the rebalancing one
-        assert snaps["rebalance"]["inflated"] == ["dash-data", "dash-chunk-0",
-                                                  f"dash-chunk-{rebalanced}"]
-        assert snap["inflated"] == [*snaps["rebalance"]["inflated"], f"dash-chunk-{cid}"]
+        assert snaps["rebalance"]["inflated"] == snap["inflated"] == ["dash-data", "dash-chunk-0"]
+        assert snaps["rebalance"]["files"] == [_chunk_src(page, rebalanced)]
+        assert snap["files"] == [*snaps["rebalance"]["files"], _chunk_src(page, cid)]
         assert {r["id"] for r in snap["reacts"]} == _charts_redrawn()
         view = chunks[cid]["list"]["views"]["all"]
         # Its own simulation, with Rebalance's note on what an added purchase
@@ -13911,6 +14044,7 @@ class TestMoveScript:
             # Nothing was loaded for it (no cap changes nothing, and shows the
             # page's own chunk): the rebalancing chunk, under the minimum's name
             assert snap["inflated"] == snaps["rebalance"]["inflated"], name
+            assert snap["files"] == snaps["rebalance"]["files"], name
             n = chunks[rebalanced[ci]]["list"]["views"]["all"]["n"]
             assert snap["text"]["hdr-trades"] == str(n), name
             assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
@@ -13930,6 +14064,7 @@ class TestMoveScript:
             ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "plain"],
             *self.ON, *self._move(2), ["snap", "move"]], strict=True)
         assert snaps["move"]["inflated"] == snaps["plain"]["inflated"]
+        assert snaps["move"]["files"] == snaps["plain"]["files"]
         assert snaps["move"]["text"]["hdr-trades"] == snaps["plain"]["text"]["hdr-trades"]
         assert self._scenario(data, 0, 0, 1, 1) in snaps["move"]["text"]["flt-summary"]
 
@@ -13946,8 +14081,9 @@ class TestMoveScript:
             ["wait"], ["set", "flt-cap", "0"], ["fire", "flt-cap"], ["settle"], ["snap", "plain"],
             *self.ON, ["snap", "rebalance"], *self._move(3), ["snap", "move"]], strict=True)
         move = snaps["move"]
-        assert move["inflated"] == snaps["rebalance"]["inflated"] == [
-            *snaps["plain"]["inflated"], f"dash-chunk-{rebalanced}"]
+        assert move["inflated"] == snaps["rebalance"]["inflated"] == snaps["plain"]["inflated"]
+        assert move["files"] == snaps["rebalance"]["files"] == [
+            *snaps["plain"]["files"], _chunk_src(page, rebalanced)]
         n = chunks[plain]["list"]["views"]["all"]["n"]
         assert n != chunks[rebalanced]["list"]["views"]["all"]["n"]
         assert move["text"]["hdr-trades"] == snaps["plain"]["text"]["hdr-trades"] == str(n)
@@ -13973,7 +14109,7 @@ class TestMoveScript:
         assert again["selects"]["flt-move"] == move["selects"]["flt-move"]
         assert again["text"]["flt-summary"] == move["text"]["flt-summary"]
         assert again["text"]["hdr-trades"] == move["text"]["hdr-trades"] != "3"
-        assert again["inflated"] == move["inflated"]
+        assert again["inflated"] == move["inflated"] and again["files"] == move["files"]
 
     def test_a_later_choice_supersedes_a_minimum_still_loading(self, monkeypatch, tmp_path):
         page = _rb_page(monkeypatch, tmp_path, _kc_sweep_move())
@@ -13981,9 +14117,9 @@ class TestMoveScript:
         cid = data["grid_move"][0][1][1][1]
         snaps = self._run(tmp_path, page, [
             ["wait"], *self.ON, *self._move(2), ["snap", "loading"], *self._move(1),
-            ["snap", "five"], ["resolve", f"dash-chunk-{cid}"], ["snap", "arrived"]],
-            strict=True, deferred=(f"dash-chunk-{cid}",))
-        assert snaps["loading"]["pending"] == [f"dash-chunk-{cid}"]
+            ["snap", "five"], ["resolve_file", _chunk_src(page, cid)], ["snap", "arrived"]],
+            strict=True, files_deferred=(_chunk_src(page, cid),))
+        assert snaps["loading"]["pendingFiles"] == [_chunk_src(page, cid)]
         assert snaps["loading"]["text"]["flt-summary"] == data["text"]["loading"].format(
             scenario=self._scenario(data, 0, 1, 1, 1))
         five, arrived = snaps["five"], snaps["arrived"]
@@ -14009,7 +14145,7 @@ class TestMoveScript:
             ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"], ["snap", "plain"]],
             strict=True)
         n = chunks[binding]["list"]["views"]["all"]["n"]
-        assert f"dash-chunk-{binding}" in snaps["binding"]["inflated"]
+        assert _chunk_src(page, binding) in snaps["binding"]["files"]
         assert snaps["binding"]["text"]["flt-summary"] == dashboard._filter_summary_text(
             data["text"], self._scenario(data, 0, 1, 1, 0, off=True), False, None, n, n,
             note="other_run", rebalance=True)
@@ -14031,8 +14167,8 @@ class TestMoveScript:
             # ... and from another minimum, back to that one
             *self._move(1), ["snap", "five"], *self._move(3), ["snap", "bad again"],
             ["click", "flt-save"], ["snap", "again click"],
-            ["repair", f"dash-chunk-{cid}"], *self._move(2), ["snap", "good"]],
-            strict=True, damaged=(f"dash-chunk-{cid}",))
+            ["repair_file", _chunk_src(page, cid)], *self._move(2), ["snap", "good"]],
+            strict=True, files_damaged=(_chunk_src(page, cid),))
         reason = f"Error: damaged block dash-chunk-{cid}"
         bad = snaps["bad"]
         # The select goes back to the minimum still shown (any), open, and
@@ -14076,7 +14212,7 @@ class TestMoveScript:
         data = TestFilterPage._data(page)
         cid = data["grid_rebalance"][0][1][1]
         snap = self._run(tmp_path, page, [["wait"], *self.ON, ["snap", "back"]],
-                         strict=True, damaged=(f"dash-chunk-{cid}",))["back"]
+                         strict=True, files_damaged=(_chunk_src(page, cid),))["back"]
         assert snap["selects"]["flt-rebalance"]["value"] == "no"
         assert snap["selects"]["flt-move"]["disabled"] is True
         assert snap["selects"]["flt-move"]["value"] == "0"
@@ -14096,6 +14232,7 @@ class TestMoveScript:
         assert ready["selects"]["flt-move"]["disabled"] is True
         assert ready["selects"]["flt-rebalance"]["value"] == "no"
         assert ready["inflated"] == ["dash-data", "dash-chunk-0"] and ready["reacts"] == []
+        assert ready["files"] == []
 
     # ─── A page without the minimums ─────────────────────────────────────────
 
@@ -14115,6 +14252,7 @@ class TestMoveScript:
         # A change event on the shut select draws nothing
         assert snaps["fired"]["reacts"] == []
         assert snaps["fired"]["inflated"] == snaps["on"]["inflated"]
+        assert snaps["fired"]["files"] == snaps["on"]["files"]
         assert "price move" not in snaps["on"]["text"].get("flt-summary", "")
         assert ("rebalancing" in snaps["on"]["text"].get("flt-summary", "")) is (
             view == "rebalance without minimums")
@@ -14205,7 +14343,13 @@ class TestMoveScript:
         assert move["selects"]["flt-days"]["disabled"] is True
         assert move["selects"]["flt-move"]["disabled"] is False
         # The scenario drawn is the minimum's, with no sale in its words
-        assert f"dash-chunk-{cid}" in move["inflated"] and move["files"] == snaps["level"]["files"]
+        # (and no Sell file was loaded for it: the files read since the level
+        # was chosen are scenario chunks the grids name)
+        since = move["files"][len(snaps["level"]["files"]):]
+        assert move["files"][:len(snaps["level"]["files"])] == snaps["level"]["files"]
+        assert _chunk_src(page, cid) in since
+        assert {int(src.rsplit("chunk-", 1)[1][:-len(".js")]) for src in since} \
+            <= _grid_chunk_ids(data)
         n = chunks[cid]["list"]["views"]["all"]["n"]
         assert move["text"]["flt-summary"] == dashboard._filter_summary_text(
             data["text"], self._scenario(data, 0, 1, 1, 1), False, None, n, n,
@@ -14281,7 +14425,7 @@ class TestMoveScript:
             ["snap", "rebalance"], *self._move(3), ["snap", "move"]], strict=True)
         assert snaps["rebalance"]["text"]["hdr-trades"] == str(n_rebalanced)
         assert snaps["move"]["text"]["hdr-trades"] == str(n_own)
-        assert f"dash-chunk-{own}" in snaps["move"]["inflated"]
+        assert _chunk_src(page, own) in snaps["move"]["files"]
 
 
 class TestRebalanceEndToEnd:
@@ -14337,9 +14481,9 @@ class TestRebalanceEndToEnd:
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
-        page = dashboard.generate_dashboard(
+        page = _read_page(dashboard.generate_dashboard(
             primary.trades, primary.equity_df, start, 10_000.0,
-            sweep=run).read_text(encoding="utf-8")
+            sweep=run))
         return page, fresh
 
     @staticmethod
@@ -14738,9 +14882,9 @@ class TestNoHalfRebalancing:
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
         phase[0] = "page"
-        page = dashboard.generate_dashboard(
+        page = _read_page(dashboard.generate_dashboard(
             run.primary.trades, run.primary.equity_df, golden._START, 10_000.0,
-            sweep=run).read_text(encoding="utf-8")
+            sweep=run))
         data = TestFilterPage._data(page)
         # Every view was built: the run's families reached the page
         for state in ("rebalance_state", "move_state", "sell_state"):
@@ -15199,8 +15343,8 @@ class TestSellGrid:
         for li in range(2):
             for di, n in enumerate(config.TAKE_PROFIT_MIN_DAYS):
                 assert _sl_page_view(page, li, di)[0] == _sl_expected(li, n)
-        # The blocks sit after the page's own chunks and before the base block
-        assert (page.index('id="dash-chunk-4"') < page.index('id="dash-sell-0"')
+        # The blocks sit after the page's own chunk and before the base block
+        assert (page.index('id="dash-chunk-0"') < page.index('id="dash-sell-0"')
                 < page.index('id="dash-sell-1"') < page.index('id="dash-data"'))
 
     def test_a_task_returns_one_compact_row_per_cell(self, tmp_path):
@@ -15280,9 +15424,9 @@ class TestSellGrid:
             monkeypatch.setattr(dashboard, "PROJECT_ROOT", root)
             monkeypatch.setattr(dashboard.yf, "download",
                                 lambda *a, **k: (_ for _ in ()).throw(RuntimeError("off")))
-            page = dashboard.generate_dashboard(
+            page = _read_page(dashboard.generate_dashboard(
                 run.primary.trades, run.primary.equity_df, TestSellEndToEnd._START, 10_000.0,
-                sweep=run, sell_workers=workers).read_text(encoding="utf-8")
+                sweep=run, sell_workers=workers))
             pages[workers] = (TestFilterPage._data(page), TestFilterPage._chunks(page),
                               _sidecar_files(page, root), _sl_blocks(page))
         (d1, c1, f1, _b1), (d2, c2, f2, _b2) = pages[1], pages[2]
@@ -15366,10 +15510,11 @@ class TestSellPage:
         assert 'id="flt-sell-note"' not in page
         data = TestFilterPage._data(page)
         assert data["sell_state"] == "shown" and data["sell_blocks"] == [[0, 1], [None, None]]
-        assert data["inline_chunks"] == 5
+        assert data["inline_chunks"] == 1
         assert data["sidecar_dir"].startswith(f"{config.DASHBOARD_FILES_DIRNAME}/")
+        # The page's other four chunks (1-4) and the Sell select's six (5-10)
         assert sorted(_sidecar_files(page, tmp_path)) == sorted(
-            f"{data['sidecar_dir']}/chunk-{i}.js" for i in range(5, 11))
+            f"{data['sidecar_dir']}/chunk-{i}.js" for i in range(1, 11))
         # Each Sell block decodes strictly: [k][cap] -> one id per setting, with
         # no adding-to-held-pairs level above it
         blocks = _sl_blocks(page)
@@ -15408,14 +15553,16 @@ class TestSellPage:
         assert re.search(r'<span id="flt-sell-note"[^>]*>([^<]*)</span>', page).group(1) == \
             "(not simulated in this backtest)"
         data = TestFilterPage._data(page)
-        assert (data["sell_blocks"], data["sell_levels"], data["sell_days"], data["sell_state"],
-                data["sidecar_dir"]) == (None, [], [], "not simulated", None)
+        assert (data["sell_blocks"], data["sell_levels"], data["sell_days"],
+                data["sell_state"]) == (None, [], [], "not simulated")
         assert _sl_blocks(page) == []
         # The Min. days select is there, shut and empty
         days = re.search(r'<select id="flt-days"([^>]*)>(.*?)</select>', page)
         assert " disabled" in days.group(1) and days.group(2) == ""
         assert dashboard._SELL_REACH_NO_EXPLORER not in data["text"]["unfiltered"]
-        assert not (tmp_path / config.DASHBOARD_FILES_DIRNAME).exists()
+        # The folder beside the page holds the page's own scenario chunks and no Sell file
+        assert set(_sidecar_files(page, tmp_path)) == {
+            f"{data['sidecar_dir']}/chunk-{i}.js" for i in _grid_chunk_ids(data) - {0}}
         unfit = dataclasses.replace(_kc_sweep(), sell_sweep=_FakeSellSweep({}, ks=(0.75,)))
         page = _sl_page(monkeypatch, tmp_path, unfit)
         assert re.search(r'<span id="flt-sell-note"[^>]*>([^<]*)</span>', page).group(1) == \
@@ -15616,10 +15763,14 @@ class TestSidecarFolders:
 
     def test_a_page_without_the_view_deletes_the_folders_no_page_reads(
             self, monkeypatch, tmp_path):
-        _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        first = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
         assert len(self._folders(tmp_path)) == 1
-        _sl_page(monkeypatch, tmp_path, _kc_sweep())
-        assert self._folders(tmp_path) == []
+        second = _sl_page(monkeypatch, tmp_path, _kc_sweep())
+        # Only the new page's own folder (its scenario chunk files) is left
+        assert self._folders(tmp_path) == [
+            TestFilterPage._data(second)["sidecar_dir"].split("/")[1]]
+        assert TestFilterPage._data(first)["sidecar_dir"] != \
+            TestFilterPage._data(second)["sidecar_dir"]
 
     def test_a_failed_page_keeps_the_last_page_and_its_folder(self, monkeypatch, tmp_path):
         page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
@@ -15680,7 +15831,7 @@ class TestSidecarFolders:
         assert any("Could not take the dashboard builds' lock" in r.getMessage()
                    for r in caplog.records)
 
-    def test_a_failed_sell_build_leaves_no_folder(self, monkeypatch, tmp_path, caplog):
+    def test_a_failed_sell_build_leaves_no_sell_file(self, monkeypatch, tmp_path, caplog):
         def fail(*_a, **_k):
             raise RuntimeError("the pool could not start")
 
@@ -15689,8 +15840,321 @@ class TestSidecarFolders:
             page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
         assert any("The Sell select could not be built" in r.getMessage()
                    for r in caplog.records)
+        data = TestFilterPage._data(page)
+        assert data["sell_state"] == "unavailable"
+        # The folder is left holding the page's own scenario chunk files alone
+        assert self._folders(tmp_path) == [data["sidecar_dir"].split("/")[1]]
+        assert sorted(p.name for p in (tmp_path / data["sidecar_dir"]).iterdir()) == sorted(
+            f"chunk-{i}.js" for i in _grid_chunk_ids(data) - {0})
+
+
+class TestScenarioChunksAreFiles:
+    """The page holds the run's own scenario's chunk; every other chunk is a
+    file in the build's folder beside it, which the page's script loads when
+    that scenario is chosen."""
+
+    @staticmethod
+    def _files(page: _Page) -> dict[int, Path]:
+        """The chunk files beside the page, by chunk id."""
+        folder = page.root / TestFilterPage._data(page)["sidecar_dir"]
+        return {int(path.name[len("chunk-"):-len(".js")]): path
+                for path in folder.glob("chunk-*.js")}
+
+    @staticmethod
+    def _named(page: _Page) -> set[int]:
+        """Every chunk id the base block's grids and the Sell blocks name."""
+        sell = {cid for element_id, block in _packed_blocks(page).items()
+                if element_id.startswith("dash-sell-") for cid in _flat_ids(block) if cid >= 0}
+        return _grid_chunk_ids(TestFilterPage._data(page)) | sell
+
+    @staticmethod
+    def _refuse_the_folder(monkeypatch) -> None:
+        def refuse(_page):
+            raise OSError(30, "Read-only file system")
+
+        monkeypatch.setattr(dashboard, "_new_build_folder", refuse)
+
+    @pytest.mark.parametrize("make", [_kc_sweep, _kc_sweep_tiers, _kc_sweep_rebalance,
+                                      _kc_sweep_move, _kc_sweep_sell])
+    def test_the_page_holds_only_the_primary_scenario_s_chunk(self, monkeypatch, tmp_path, make):
+        page = _sl_page(monkeypatch, tmp_path, make())
+        data = TestFilterPage._data(page)
+        pb, pk, pc = data["primary"]
+        assert data["grid"][pb][pk][pc] == 0 and data["inline_chunks"] == 1
+        assert re.findall(r'id="(dash-chunk-\d+)"', page) == ["dash-chunk-0"]
+        assert data["sidecar_dir"].startswith(f"{config.DASHBOARD_FILES_DIRNAME}/")
+
+    @pytest.mark.parametrize("make", [_kc_sweep, _kc_sweep_tiers, _kc_sweep_rebalance,
+                                      _kc_sweep_move, _kc_sweep_sell])
+    def test_every_chunk_but_the_first_is_a_file_and_every_file_is_named(
+            self, monkeypatch, tmp_path, make):
+        page = _sl_page(monkeypatch, tmp_path, make())
+        named, files = self._named(page), self._files(page)
+        # Chunk 0 is in the page and every other chunk any grid or Sell block
+        # names is a file; no file is named by nothing
+        assert 0 in named and len(named) > 1
+        assert set(files) == named - {0}
+        # Each file is the one call every chunk file holds, with strict base64
+        for path in files.values():
+            assert _SIDECAR_CALL.fullmatch(path.read_text(encoding="utf-8"))
+
+    def test_each_file_is_the_chunk_the_walk_builds(self, monkeypatch, tmp_path):
+        page = _kc_page(monkeypatch, tmp_path, _kc_sweep_tiers())
+        _, _, base, built = _flt_payload(_kc_sweep_tiers())
+        data = TestFilterPage._data(page)
+        assert data["grid"] == base["grid"] and data["grid_off"] == base["grid_off"]
+        assert len(built) > 1
+        assert TestFilterPage._chunks(page) == built
+
+    def test_a_file_is_the_packed_text_of_its_element(self, tmp_path):
+        element = dashboard._packed_json_script("dash-chunk-7", {"list": {"n": 1}, "strings": []})
+        written = dashboard._write_chunk_file(tmp_path, 7, element)
+        text = (tmp_path / "chunk-7.js").read_text(encoding="utf-8")
+        packed = _PACKED.fullmatch(element).group(2)
+        assert text == dashboard._chunk_file_text(packed) == \
+            f'window.__dashChunk(document.currentScript,"{packed}");\n'
+        assert written == len(text)
+        assert _decode_block(_SIDECAR_CALL.fullmatch(text).group(1)) == \
+            {"list": {"n": 1}, "strings": []}
+        assert dashboard._chunk_file(tmp_path, 7) == tmp_path / "chunk-7.js"
+
+    def test_clearing_a_build_folder_keeps_only_its_mark(self, tmp_path):
+        folder = dashboard._new_build_folder(tmp_path / config.DASHBOARD_FILENAME)
+        for name in ("chunk-5.js", "abc123.js", ".abc123.js.4242.tmp"):
+            (folder / name).write_text("x", encoding="utf-8")
+        dashboard._clear_build_folder(folder)
+        assert [p.name for p in folder.iterdir()] == [".writing"]
+
+    def test_the_build_logs_the_files_it_wrote(self, monkeypatch, tmp_path, caplog):
+        with caplog.at_level(logging.INFO):
+            page = _kc_page(monkeypatch, tmp_path)
+        assert any(re.fullmatch(
+            rf"Dashboard: {len(self._files(page))} scenario chunk file\(s\) "
+            r"\(\d+\.\d MB\) written beside the page in \d+ s", r.getMessage())
+            for r in caplog.records)
+
+    # ─── The folder that cannot be made ───────────────────────────────────────
+
+    def test_a_page_whose_folder_cannot_be_made_keeps_every_chunk(
+            self, monkeypatch, tmp_path, caplog):
+        self._refuse_the_folder(monkeypatch)
+        with caplog.at_level(logging.WARNING):
+            page = _kc_page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        chunk_ids = _grid_chunk_ids(data)
+        assert len(chunk_ids) > 1
+        assert sorted(TestFilterPage._chunks(page)) == sorted(chunk_ids)
+        assert data["inline_chunks"] == len(chunk_ids) == len(
+            re.findall(r'id="dash-chunk-\d+"', page))
+        assert data["sidecar_dir"] is None
+        assert not (tmp_path / config.DASHBOARD_FILES_DIRNAME).exists()
+        assert any("Could not make the dashboard's folder of chunk files" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_a_page_with_a_sell_view_and_no_folder_keeps_the_select_shut(
+            self, monkeypatch, tmp_path):
+        self._refuse_the_folder(monkeypatch)
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        data = TestFilterPage._data(page)
+        assert (data["sell_blocks"], data["sell_state"], data["sidecar_dir"]) == (
+            None, "unavailable", None)
+        assert data["inline_chunks"] == len(_grid_chunk_ids(data))
+        assert _sl_blocks(page) == []
+
+    def test_a_page_of_one_chunk_and_no_sell_view_has_no_folder(self, monkeypatch, tmp_path):
+        # No sweep: the one "not recorded" scenario is the page's own run
+        trades = _flt_trades()
+        curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        page = _read_page(dashboard.generate_dashboard(
+            trades, curve, _FLT_START, 1000.0, series_categories=_FLT_SERIES))
+        data = TestFilterPage._data(page)
+        assert _grid_chunk_ids(data) == {0}
+        assert data["inline_chunks"] == 1 and data["sidecar_dir"] is None
+        assert not (tmp_path / config.DASHBOARD_FILES_DIRNAME).exists()
+
+    def test_a_sell_build_that_fails_leaves_only_the_page_s_chunk_files(
+            self, monkeypatch, tmp_path):
+        def fail(tasks, workers):
+            # A task that wrote a file and then the pool failed
+            (tasks[0].out_dir / "chunk-9.js").write_text("x", encoding="utf-8")
+            (tasks[0].out_dir / "left-over.js").write_text("x", encoding="utf-8")
+            raise RuntimeError("the pool could not start")
+
+        monkeypatch.setattr(dashboard, "_run_sell_tasks", fail)
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        data = TestFilterPage._data(page)
+        assert data["sell_state"] == "unavailable" and data["inline_chunks"] == 1
+        files = self._files(page)
+        assert set(files) == _grid_chunk_ids(data) - {0}
+        assert sorted(p.name for p in (tmp_path / data["sidecar_dir"]).iterdir()) == sorted(
+            f"chunk-{i}.js" for i in files)
+
+    def test_the_primary_scenario_must_be_the_first_chunk(self, monkeypatch, tmp_path, caplog):
+        real = dashboard._build_filter_grid
+
+        def walked_wrongly(*args, **kwargs):
+            source, chunker, kd = real(*args, **kwargs)
+            pb, pk, pc = source.primary
+            chunker.grid[pb][pk][pc] = 1
+            return source, chunker, kd
+
+        monkeypatch.setattr(dashboard, "_build_filter_grid", walked_wrongly)
+        with caplog.at_level(logging.WARNING):
+            page = _kc_page(monkeypatch, tmp_path)
+        assert "the primary scenario is not the page's first chunk" in caplog.text
+        # The bar is lost, as for any filter that cannot be built; the page and
+        # no folder are written
+        assert 'id="dash-data"' not in page and "dash-chunk-" not in page
+        assert dashboard._FILTER_UNAVAILABLE_HTML in page
+        assert not (tmp_path / config.DASHBOARD_FILES_DIRNAME).exists()
+
+    # ─── A page that cannot be written ────────────────────────────────────────
+
+    def test_a_page_that_fails_to_publish_keeps_the_last_page_and_its_folder(
+            self, monkeypatch, tmp_path):
+        page = _kc_page(monkeypatch, tmp_path)
+        kept = TestSidecarFolders._folders(tmp_path)
+        assert len(kept) == 1
+
+        def fail(*_a, **_k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(dashboard, "_publish_page", fail)
+        with pytest.raises(OSError, match="disk full"):
+            _kc_page(monkeypatch, tmp_path)
+        assert (tmp_path / config.DASHBOARD_FILENAME).read_text(encoding="utf-8") == page
+        assert TestSidecarFolders._folders(tmp_path) == kept
+        assert set(self._files(page)) == _grid_chunk_ids(TestFilterPage._data(page)) - {0}
+
+    def test_a_chunk_file_that_cannot_be_written_leaves_no_new_folder(
+            self, monkeypatch, tmp_path):
+        page = _kc_page(monkeypatch, tmp_path)
+        kept = TestSidecarFolders._folders(tmp_path)
+        real = dashboard._write_chunk_file
+        written = []
+
+        def write_two_then_fail(folder, chunk_id, element):
+            if len(written) == 2:
+                raise OSError("disk full")
+            written.append(chunk_id)
+            return real(folder, chunk_id, element)
+
+        monkeypatch.setattr(dashboard, "_write_chunk_file", write_two_then_fail)
+        with pytest.raises(OSError, match="disk full"):
+            _kc_page(monkeypatch, tmp_path)
+        assert len(written) == 2
+        # The last page and its folder stay in place, and nothing is left of the new build
+        assert (tmp_path / config.DASHBOARD_FILENAME).read_text(encoding="utf-8") == page
+        assert TestSidecarFolders._folders(tmp_path) == kept
+        assert not list(tmp_path.glob(f".{config.DASHBOARD_FILENAME}.*.tmp"))
+
+    def test_the_page_and_its_folder_are_published_together(self, monkeypatch, tmp_path):
+        first = _kc_page(monkeypatch, tmp_path)
+        second = _kc_page(monkeypatch, tmp_path)
+        d1, d2 = TestFilterPage._data(first), TestFilterPage._data(second)
+        assert d1["sidecar_dir"] != d2["sidecar_dir"]
+        assert TestSidecarFolders._folders(tmp_path) == [d2["sidecar_dir"].split("/")[1]]
+        assert not (tmp_path / d2["sidecar_dir"] / ".writing").exists()
+
+    # ─── The script over the files ────────────────────────────────────────────
+
+    def test_choosing_a_scenario_loads_its_file_and_draws_what_a_chunk_in_the_page_draws(
+            self, monkeypatch, tmp_path):
+        # The same sweep twice: once with the chunks as files beside the page, once
+        # with the folder refused so every chunk is in the page itself
+        (tmp_path / "files").mkdir()
+        (tmp_path / "inline").mkdir()
+        as_files = _kc_page(monkeypatch, tmp_path / "files")
+        self._refuse_the_folder(monkeypatch)
+        in_page = _kc_page(monkeypatch, tmp_path / "inline")
+        data = TestFilterPage._data(as_files)
+        cells = [(bi, ki, ci) for bi, band in enumerate(data["grid"])
+                 for ki, row in enumerate(band) for ci, cid in enumerate(row)
+                 if cid is not None]
+        steps = [["wait"]]
+        for bi, ki, ci in cells:
+            steps += [["set", "flt-band", str(bi)], ["set", "flt-k", str(ki)],
+                      ["set", "flt-cap", str(ci)], ["fire", "flt-cap"], ["settle"],
+                      ["snap", f"{bi}-{ki}-{ci}"]]
+        got = _run_script(tmp_path / "files", as_files, steps, strict=True)
+        baseline = _run_script(tmp_path / "inline", in_page, steps, strict=True)
+        assert len(cells) > 3
+        loaded = []
+        for bi, ki, ci in cells:
+            name = f"{bi}-{ki}-{ci}"
+            for key in ("reacts", "text", "html"):
+                assert got[name][key] == baseline[name][key], (name, key)
+            cid = data["grid"][bi][ki][ci]
+            src = _chunk_src(as_files, cid)
+            if cid != 0 and src not in loaded:
+                loaded.append(src)
+            # Exactly the files of the scenarios chosen so far, each loaded once
+            assert got[name]["files"] == loaded, name
+            assert baseline[name]["files"] == []
+        # The primary's chunk is read from the page; no other chunk is
+        assert got[name]["inflated"] == ["dash-data", "dash-chunk-0"]
+        assert len(loaded) == len(self._files(as_files)) > 1
+
+    def test_a_file_that_is_gone_is_named_and_the_choice_goes_back(self, monkeypatch, tmp_path):
+        page = _kc_page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        cid = data["grid"][0][0][1]
+        src = _chunk_src(page, cid)
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "s"]],
+            strict=True, files_missing=(src,))["s"]
+        assert snap["files"] == [src]
+        assert snap["text"]["flt-summary"] == data["text"]["unavailable"].format(
+            failed=_phrase(data, 0, 0, 1),
+            reason="Error: " + data["text"]["sidecar_missing"].format(file=src),
+            scenario=_phrase(data, *data["primary"]))
+        assert snap["selects"]["flt-k"]["value"] == str(data["primary"][1])
+
+    def test_a_page_left_open_says_to_reload_once_a_newer_build_replaced_its_files(
+            self, monkeypatch, tmp_path):
+        # A newer build publishes its own folder and deletes this page's: the
+        # page still open names the missing file and says to reload
+        old = _kc_page(monkeypatch, tmp_path)
+        _kc_page(monkeypatch, tmp_path)
+        snap = _run_script(tmp_path, str(old), [
+            ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "s"]],
+            strict=True, files_root=tmp_path)["s"]
+        assert "reload the page" in snap["text"]["flt-summary"]
+
+    def test_a_sell_build_whose_files_cannot_be_cleared_keeps_the_bar(
+            self, monkeypatch, tmp_path):
+        # The files a failed Sell build left cannot be deleted: a WARNING, and
+        # the bar is still built (only the Sell select is lost)
+        def fail(tasks, workers):
+            (tasks[0].out_dir / "left-over.js").write_text("x", encoding="utf-8")
+            raise RuntimeError("the pool could not start")
+
+        real_unlink = Path.unlink
+
+        def unlink(self, *a, **k):
+            if self.name == "left-over.js":
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_unlink(self, *a, **k)
+
+        monkeypatch.setattr(dashboard, "_run_sell_tasks", fail)
+        monkeypatch.setattr(Path, "unlink", unlink)
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        assert 'id="dash-data"' in page
         assert TestFilterPage._data(page)["sell_state"] == "unavailable"
-        assert self._folders(tmp_path) == []
+
+    def test_a_header_line_that_raises_leaves_no_folder(self, monkeypatch, tmp_path):
+        # The folder is made before the header lines; one that raises takes
+        # the build down without leaving a marked folder behind
+        def broken(*_a, **_k):
+            raise ValueError("boom")
+
+        monkeypatch.setattr(dashboard, "_fills_html", broken)
+        with pytest.raises(ValueError, match="boom"):
+            _kc_page(monkeypatch, tmp_path, _kc_sweep())
+        assert TestSidecarFolders._folders(tmp_path) == []
 
 
 class TestSoldTradeRow:
@@ -15812,7 +16276,7 @@ class TestSellScript:
         assert on["selects"]["flt-sell"]["disabled"] is True
         assert on["selects"]["flt-days"]["disabled"] is True
         # ... and the scenario drawn is the rebalancing one, with no sale in its words
-        assert f"dash-chunk-{cid}" in on["inflated"]
+        assert _chunk_src(page, cid) in on["files"]
         view = chunks[cid]["list"]["views"]["all"]["n"]
         assert on["text"]["flt-summary"] == dashboard._filter_summary_text(
             data["text"], _phrase(data, 0, 1, 1) + data["text"]["rebalance"], False, None,
@@ -15849,7 +16313,7 @@ class TestSellScript:
         snaps = self._run(tmp_path, page, [
             ["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
             ["snap", "level"], *TestRebalanceScript.ON, ["snap", "back"]], strict=True,
-            js=TestRebalanceScript.WAIT, damaged=(f"dash-chunk-{cid}",))
+            js=TestRebalanceScript.WAIT, files_damaged=(_chunk_src(page, cid),))
         back = snaps["back"]["selects"]
         assert back["flt-rebalance"]["value"] == "no"
         assert back["flt-sell"]["value"] == "0" and back["flt-sell"]["disabled"] is False
@@ -15995,17 +16459,19 @@ class TestSellScript:
         steps = [["wait"], ["set", "flt-k", "0"], ["set", "flt-cap", "0"],
                  ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"], ["snap", "s"]]
         snap = self._run(tmp_path, page, steps, strict=True)["s"]
-        assert snap["files"] == []
-        assert snap["inflated"] == ["dash-data", "dash-chunk-0", "dash-sell-0", "dash-chunk-3"]
+        # Only the page's own chunk 3, which the script loads from its file
+        assert snap["files"] == [_chunk_src(page, 3)]
+        assert snap["inflated"] == ["dash-data", "dash-chunk-0", "dash-sell-0"]
         assert self._scenario(data, 0, 0, 0, 0, 0) in snap["text"]["flt-summary"]
         # At k 0.75 and 5%, 25% sells at 1 day and nothing from 2 days: the
-        # page's own chunk 1, which the script inflates from the page
+        # page's own chunk 1, which the script loads from its file after the
+        # sale's
         steps = [["wait"], ["set", "flt-cap", "0"], ["set", "flt-sell", "0"],
                  ["fire", "flt-sell"], ["settle"], ["set", "flt-days", self._di(2)],
                  ["fire", "flt-days"], ["settle"], ["snap", "s"]]
         snap = self._run(tmp_path, page, steps, strict=True)["s"]
-        assert snap["files"] == [f"{data['sidecar_dir']}/chunk-6.js"]
-        assert snap["inflated"][-1] == "dash-chunk-1"
+        assert snap["files"] == [f"{data['sidecar_dir']}/chunk-6.js", _chunk_src(page, 1)]
+        assert snap["inflated"][-1] == "dash-sell-0"
 
     def test_a_block_that_cannot_be_inflated_puts_both_choices_back(self, monkeypatch,
                                                                     tmp_path):
@@ -16115,8 +16581,13 @@ class TestSellScript:
         assert "dash-sell-1" in snap["inflated"] and "dash-sell-2" not in snap["inflated"]
         # The tier-on run's sidecar at 25%
         cid = _sl_page_view(page, 0, 0)[1][1][1][1]
-        assert cid == _sl_page_view(page, 0, 0)[0][1][1][1] >= data["inline_chunks"]
-        assert snap["files"] == [f"{folder}/chunk-{cid}.js"]
+        assert cid == _sl_page_view(page, 0, 0)[0][1][1][1] >= len(_grid_chunk_ids(data))
+        # The tier and band changes before it loaded their own scenario chunks
+        # (band 0.0-1 with the tiers off, then band 0.3-0.6, whose off view is
+        # its tier-on run), and the Sell select's file came last
+        assert snap["files"] == [f"{folder}/chunk-{data['grid_off'][0][1][1]}.js",
+                                 f"{folder}/chunk-{data['grid_off'][1][1][1]}.js",
+                                 f"{folder}/chunk-{cid}.js"]
         # At 50% it sells nothing: the tier-off view's own chunk — its tier-on
         # run's, drawn just before and kept, so nothing is loaded
         own = data["grid_off"][1][1][1]
@@ -16176,9 +16647,9 @@ class TestSellEndToEnd:
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
         with caplog.at_level(logging.INFO):
-            page = dashboard.generate_dashboard(
+            page = _read_page(dashboard.generate_dashboard(
                 run.primary.trades, run.primary.equity_df, self._START, 10_000.0,
-                sweep=run).read_text(encoding="utf-8")
+                sweep=run))
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
         files = {int(src.rsplit("-", 1)[1][:-3]): chunk
                  for src, chunk in _sidecar_files(page, tmp_path).items()}
@@ -16201,7 +16672,7 @@ class TestSellEndToEnd:
                             size_cap=cap, quiet=True, end_date=end,
                             tier_floors=tier_floors, sell_at=level,
                             sell_min_days=min_days)
-                        chunk = files[cid] if cid >= data["inline_chunks"] else chunks[cid]
+                        chunk = chunks[cid] if cid in chunks else files[cid]
                         view = chunk["list"]["views"]["all"]
                         kpis = dashboard._performance_kpis(fresh.equity_df, fresh.trades,
                                                            10_000.0)
@@ -16209,7 +16680,8 @@ class TestSellEndToEnd:
                             tier_floors, level, min_days, cap)
                         assert view["n"] == len(fresh.trades)
                         if any(tr.sold for tr in fresh.trades):
-                            assert cid >= data["inline_chunks"]
+                            # A chunk file of the Sell select's own, none of the page's
+                            assert cid not in _grid_chunk_ids(data)
                             sold += 1
                         else:
                             # Sells nothing: the scenario's own chunk
@@ -16239,7 +16711,9 @@ class TestExplorerFullGrid:
     far better than a real grid's distinct cells will), in a 1.21 MB page
     built in 6.7 s, the process peaking at 348 MiB RSS (imports included).
     The budget is the plan's 8 MB for the explorer's blocks. Slow by the
-    suite's standards; never run against a mutant.
+    suite's standards; never run against a mutant. The page sizes here are the
+    whole dashboard's: the page plus the chunk files beside it
+    (_dashboard_bytes).
     """
 
     BUDGET = 8_000_000
@@ -16276,6 +16750,8 @@ class TestExplorerFullGrid:
         """
         Build the full-grid page; return its explorer blocks, filter chunk count and size.
 
+        The size is the dashboard's: the page plus its chunk files.
+
         With `quoted`, every (band, k) cell trades its list with quotes of its
         own (_random_marks), so each cell's curve is distinct and changes on
         most days a trade is open — the explorer's worst case — and the
@@ -16287,7 +16763,7 @@ class TestExplorerFullGrid:
         Returns:
             tuple[list, int, int]: [(block id, base64 body)] of the explorer's
                 blocks in page order, the number of filter chunks, and the
-                page's size in bytes.
+                size in bytes of the page and its chunk files.
         """
         import random
         rng = random.Random(3)
@@ -16353,10 +16829,10 @@ class TestExplorerFullGrid:
         out = dashboard.generate_dashboard(
             primary.trades, primary.equity_df, start, 10_000.0, sweep=sweep,
             interval_discount=0.75, series_categories=None if quoted else categories)
-        page = out.read_text(encoding="utf-8")
+        page = _read_page(out)
         explorer = [(i, body) for i, body in _PACKED.findall(page) if i.startswith("scn-")]
         assert [i for i, _ in explorer] == ["scn-data"] + [f"scn-cap-{ci}" for ci in range(20)]
-        return explorer, len(TestFilterPage._chunks(page)), out.stat().st_size
+        return explorer, len(TestFilterPage._chunks(page)), _dashboard_bytes(out)
 
 
 class TestFilterPageSize:
@@ -16416,7 +16892,10 @@ class TestFilterPageSize:
     Rebalance and Min. price movement selects, in place of Add to held pairs,
     Trim to Kelly and Min. price rise, take 3,303 bytes off every variant:
     each re-measured 2026-10-17 (same environment), in the constants below,
-    beside its size the same day before them."""
+    beside its size the same day before them.
+
+    Every size here is the whole dashboard: the page plus the chunk files
+    beside it (_dashboard_bytes), so a page and its files are measured together."""
 
     # 837,197 before the mix data; 922,701 with it, the menus and the mix
     # script ("m" in place of "eq" alone); 897,445 with a tag view's other
@@ -16548,7 +17027,7 @@ class TestFilterPageSize:
         out = dashboard.generate_dashboard(
             scenarios[0].trades, scenarios[0].equity_df, start, 10_000.0, sweep=sweep,
             interval_discount=0.75, series_categories=categories)
-        page = out.read_text(encoding="utf-8")
+        page = _read_page(out)
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
         # Nothing collapsed: every list is its own
         assert len(chunks) == (54 if family else 36) + (
@@ -16581,7 +17060,9 @@ class TestFilterPageSize:
             budget = self.BUDGET_REBALANCE_FAMILY if family else self.BUDGET_REBALANCE
         else:
             budget = self.BUDGET_FAMILY if family else self.BUDGET
-        assert out.stat().st_size <= budget, f"page was {out.stat().st_size} bytes"
+        # The page and its chunk files together
+        size = _dashboard_bytes(out)
+        assert size <= budget, f"page was {size} bytes"
 
 
 def _cal_trade(pA: float, pB: float, outcome_a: str, outcome_b: str,
@@ -17281,7 +17762,7 @@ def _rf_page(monkeypatch, tmp_path, sweep: BacktestSweep,
     out = dashboard.generate_dashboard(sweep.primary.trades, sweep.primary.equity_df,
                                        _FLT_START, 1000.0, sweep=sweep, interval_discount=0.75,
                                        series_categories=_FLT_SERIES, risk_free=risk_free)
-    return out.read_text(encoding="utf-8")
+    return _read_page(out)
 
 
 @pytest.fixture(scope="class")
@@ -18227,10 +18708,10 @@ def _mix_page(monkeypatch, tmp_path, trades: list[BacktestTrade], *, risk_free=N
     monkeypatch.setattr(dashboard.yf, "download",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
     sweep = _mix_sweep(trades, observations, balance, end)
-    page = dashboard.generate_dashboard(
+    page = _read_page(dashboard.generate_dashboard(
         trades, sweep.primary.equity_df, start, balance, sweep=sweep,
         interval_discount=0.75, series_categories=series,
-        risk_free=risk_free).read_text(encoding="utf-8")
+        risk_free=risk_free))
     data = TestFilterPage._data(page)
     categories, subcats = _mix_axes(series)
     assert data["categories"] == categories
@@ -19248,8 +19729,9 @@ class TestMixedSelection:
             ["wait"], _tick_category(sports), _tick_category(commodities), ["settle"],
             ["snap", "shown"],
             ["set", "flt-band", "1"], ["fire", "flt-band"], _tick_category(science),
-            ["snap", "pending"], ["reject", f"dash-chunk-{other}"], ["snap", "failed"]],
-            strict=True, deferred=(f"dash-chunk-{other}",))
+            ["snap", "pending"], ["resolve_file", _chunk_src(page, other)], ["snap", "failed"]],
+            strict=True, files_deferred=(_chunk_src(page, other),),
+            files_damaged=(_chunk_src(page, other),))
         shown, pending, failed = snaps["shown"], snaps["pending"], snaps["failed"]
         ticks = sorted([sports, commodities])
         assert shown["menus"]["flt-cat"]["ticked"] == ticks
@@ -19377,8 +19859,9 @@ class TestMixedSelection:
         snaps = _run_script(tmp_path, page, [
             ["wait"], _tick_tag(basketball), ["settle"], ["snap", "shown"],
             ["set", "flt-band", "1"], ["fire", "flt-band"], _tick_tag(hockey),
-            ["snap", "pending"], ["reject", f"dash-chunk-{other}"], ["snap", "failed"]],
-            strict=True, deferred=(f"dash-chunk-{other}",))
+            ["snap", "pending"], ["resolve_file", _chunk_src(page, other)], ["snap", "failed"]],
+            strict=True, files_deferred=(_chunk_src(page, other),),
+            files_damaged=(_chunk_src(page, other),))
         shown, pending, failed = snaps["shown"], snaps["pending"], snaps["failed"]
         assert shown["menus"]["flt-tag"]["ticked"] == [basketball]
         assert pending["menus"]["flt-tag"]["ticked"] == sorted([basketball, hockey])
@@ -20380,9 +20863,9 @@ class TestMixedSelection:
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
-        page = dashboard.generate_dashboard(
+        page = _read_page(dashboard.generate_dashboard(
             trades, base.primary.equity_df, _MIX_START, _MIX_BALANCE, sweep=sweep,
-            interval_discount=0.75, series_categories=_MIX_SERIES).read_text(encoding="utf-8")
+            interval_discount=0.75, series_categories=_MIX_SERIES))
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
         assert [k["value"] for k in data["ks"]] == [0.6, 0.75] and data["primary"][1] == 1
         mixable = {ki: all("m" in view for key, view in chunks[data["grid"][0][ki][0]][
