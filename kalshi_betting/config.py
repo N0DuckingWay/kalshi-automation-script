@@ -1136,6 +1136,13 @@ LIVE_DASHBOARD_HEALTH_MAX_BYTES = 65_536
 # A file the live dashboard sends is copied in blocks of this many bytes.
 LIVE_DASHBOARD_FILE_BLOCK_BYTES = 1_048_576
 
+# How long, in seconds, the live dashboard's Backtest or Data tab may stay
+# hidden before its frame is emptied, so the browser frees the page it held
+# (read only by live_dashboard.py, which writes it into the tab page's
+# script). Going back to the tab loads the page again, at the run's own
+# scenario; going back sooner finds it as it was left.
+LIVE_DASHBOARD_FRAME_UNLOAD_SECONDS = 300
+
 # The chart library the Live tab loads: the same Plotly build the backtest
 # page loads, and its integrity hash (the sha384 of that file, so the browser
 # runs it only when it is exactly that file). The Data page (eda.py) loads the

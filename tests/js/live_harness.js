@@ -14,6 +14,11 @@
 // gives; ok is a status in 200-299), {status, bad_json: true} (json()
 // fails) or {network_error: true} (the request itself fails). Plotly's
 // react, relayout and Plots.resize are recorded, in order, and do nothing.
+// setTimeout records each timer ({id, fn, ms}) and runs none of them on its
+// own; clearTimeout removes one; a ["timers"] step runs every pending timer,
+// oldest first, and clears them. A snapshot lists the delays of the timers
+// still pending, so a test can check both the delay and that a timer was
+// cancelled.
 // ES5 plus Promise, which both runtimes have.
 
 var __emit = (typeof print === 'function') ? print : function(s) { console.log(s); };
@@ -25,6 +30,8 @@ var __fetches = [];
 var __plots = [];
 var __snaps = {};
 var __srcSets = 0;
+var __timers = [];
+var __timerId = 0;
 
 function __element(id, tag) {
   var el = {id: id, tagName: tag || 'div', style: {}, hidden: false, disabled: false,
@@ -74,6 +81,17 @@ function fetch(url, options) {
   });
 }
 
+// A timer is only recorded; a ["timers"] step is what runs it
+function setTimeout(fn, ms) {
+  __timerId += 1;
+  __timers.push({id: __timerId, fn: fn, ms: ms});
+  return __timerId;
+}
+
+function clearTimeout(id) {
+  __timers = __timers.filter(function(timer) { return timer.id !== id; });
+}
+
 function __install() {
   if (__NO_PLOTLY) { return; }
   globalThis.Plotly = {
@@ -89,10 +107,12 @@ function __install() {
 
 // Each element the script has touched: its text, class, hidden state,
 // tooltip, attributes, frame address and disabled state, and a table body's
-// or list's rows (each cell's text, tooltip and left border); and every
-// request and chart call since the last snapshot
+// or list's rows (each cell's text, tooltip and left border); every request
+// and chart call since the last snapshot; and the delays of the timers still
+// pending
 function __snapshot() {
-  var snap = {fetches: __fetches, plots: __plots, srcSets: __srcSets, el: {}};
+  var snap = {fetches: __fetches, plots: __plots, srcSets: __srcSets, el: {},
+              timers: __timers.map(function(timer) { return timer.ms; })};
   __fetches = [];
   __plots = [];
   Object.keys(__elements).forEach(function(id) {
@@ -122,7 +142,9 @@ function __spin(ticks, next) {
 
 // Steps: ["settle"] (let every pending promise run), ["click", id] (a reader
 // clicking that element: its click listeners run unless it is disabled),
-// ["snap", name]. Emits every snapshot, as JSON, once the steps are done.
+// ["timers"] (the time passing: every pending timer runs, oldest first, and
+// is cleared), ["snap", name]. Emits every snapshot, as JSON, once the steps
+// are done.
 function __step(steps, i) {
   if (i >= steps.length) {
     __emit(JSON.stringify(__snaps));
@@ -138,6 +160,10 @@ function __step(steps, i) {
     if (!clicked.disabled) {
       (clicked._listeners.click || []).forEach(function(fn) { fn(); });
     }
+  } else if (s[0] === 'timers') {
+    var due = __timers;
+    __timers = [];
+    due.forEach(function(timer) { timer.fn(); });
   } else if (s[0] === 'snap') {
     __snaps[s[1]] = __snapshot();
   }
