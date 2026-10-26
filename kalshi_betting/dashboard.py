@@ -15998,6 +15998,38 @@ def generate_dashboard(
         # The extra data the run read (scheduled close, stale quotes, volume cap,
         # fees by series) and what the integrity checks found
         extra_data_note = _extra_data_html(sweep)
+
+        # Named head (not `html`) so it can't shadow the `html` module used by
+        # the _section_* helpers above (html.escape()).
+        head = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Kalshi Arbitrage Backtest — {start_date} to today</title>
+  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+  <style>
+    body {{ font-family: sans-serif; max-width: 1200px; margin: 0 auto; padding: 24px; }}
+    h1 {{ color: #1A237E; }}
+  </style>
+</head>
+<body>
+<h1>Kalshi Arbitrage Backtest</h1>
+<p style="margin:0 0 8px 0;">{terms_link_html(PAGE_BACKTEST)}</p>
+<p style="color:#616161; font-size:14px;">
+  Period: {start_date} → {today} &nbsp;|&nbsp;
+  Starting balance: {_starting_balance_text(initial_balance, balance_source)} &nbsp;|&nbsp;
+  Trades found: <span id="hdr-trades">{len(trades)}</span>
+</p>
+{corpus_note}
+{run_settings}
+{live_rule}
+{entry_checkpoint}
+{fills_note}
+{extra_data_note}
+{rf_note}
+{header_note}
+{filter_bar}
+"""
     except BaseException:
         # No page will name the folder made for this build
         if build_folder is not None:
@@ -16042,38 +16074,6 @@ def generate_dashboard(
         # Last, so the header's Terms link jumps to the bottom of the page
         lambda: terms_section_html(PAGE_BACKTEST),
     )
-
-    # Named head (not `html`) so it can't shadow the `html` module used by
-    # the _section_* helpers above (html.escape()).
-    head = f"""<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Kalshi Arbitrage Backtest — {start_date} to today</title>
-  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
-  <style>
-    body {{ font-family: sans-serif; max-width: 1200px; margin: 0 auto; padding: 24px; }}
-    h1 {{ color: #1A237E; }}
-  </style>
-</head>
-<body>
-<h1>Kalshi Arbitrage Backtest</h1>
-<p style="margin:0 0 8px 0;">{terms_link_html(PAGE_BACKTEST)}</p>
-<p style="color:#616161; font-size:14px;">
-  Period: {start_date} → {today} &nbsp;|&nbsp;
-  Starting balance: {_starting_balance_text(initial_balance, balance_source)} &nbsp;|&nbsp;
-  Trades found: <span id="hdr-trades">{len(trades)}</span>
-</p>
-{corpus_note}
-{run_settings}
-{live_rule}
-{entry_checkpoint}
-{fills_note}
-{extra_data_note}
-{rf_note}
-{header_note}
-{filter_bar}
-"""
 
     # Streamed beside the target, then renamed over it: the rename is atomic,
     # so the previous dashboard is replaced only by a complete page. The

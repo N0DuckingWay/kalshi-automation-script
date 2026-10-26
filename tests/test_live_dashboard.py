@@ -1781,34 +1781,43 @@ class TestPageScript:
         hidden = snaps["hidden"]
         assert hidden["el"]["backtest-frame"]["src"] == live_dashboard.BACKTEST_URL
         assert (hidden["srcSets"], hidden["timers"]) == (1, [delay])
-        # Once the delay passes the frame is pointed at an empty page
+        # Once the delay passes the frame is swapped for a copy with no
+        # address: nothing is navigated, so the browser's Back history is
+        # left as it was
         emptied = snaps["emptied"]
-        assert emptied["el"]["backtest-frame"]["src"] == "about:blank"
-        assert (emptied["srcSets"], emptied["timers"]) == (2, [])
-        # Choosing the tab again loads the page again
+        assert emptied["el"]["backtest-frame"]["src"] == ""
+        assert (emptied["srcSets"], emptied["timers"], emptied["replaced"]) == (1, [], 1)
+        # Choosing the tab again loads the page into the copy
         again = snaps["again"]
         assert again["el"]["backtest-frame"]["src"] == live_dashboard.BACKTEST_URL
-        assert (again["srcSets"], again["timers"]) == (3, [])
+        assert (again["srcSets"], again["timers"], again["replaced"]) == (2, [], 1)
         assert again["el"]["panel-backtest"]["hidden"] is False
         # Hiding it a second time starts a new timer, which empties it again
         assert snaps["hidden-again"]["timers"] == [delay]
-        assert snaps["emptied-again"]["el"]["backtest-frame"]["src"] == "about:blank"
-        assert snaps["emptied-again"]["srcSets"] == 4
+        assert snaps["emptied-again"]["el"]["backtest-frame"]["src"] == ""
+        assert (snaps["emptied-again"]["srcSets"], snaps["emptied-again"]["replaced"]) == (2, 2)
 
     def test_going_back_before_the_delay_leaves_the_frame_as_it_was(self, tmp_path):
         data = payload(_view())
         snaps = _run_live_script(tmp_path, [{"status": 200, "body": data}], [
             ["settle"], ["click", "tab-backtest"], ["click", "tab-live"], ["snap", "hidden"],
-            ["click", "tab-backtest"], ["snap", "back"], ["timers"], ["snap", "later"]])
-        assert snaps["hidden"]["timers"] == [config.LIVE_DASHBOARD_FRAME_UNLOAD_SECONDS * 1000]
+            ["click", "tab-backtest"], ["snap", "back"], ["timers"], ["snap", "later"],
+            ["click", "tab-live"], ["snap", "hidden-again"], ["timers"], ["snap", "emptied"]])
+        delay = config.LIVE_DASHBOARD_FRAME_UNLOAD_SECONDS * 1000
+        assert snaps["hidden"]["timers"] == [delay]
         # Choosing the tab again cancels the timer and sets no address
         back = snaps["back"]
         assert (back["srcSets"], back["timers"]) == (1, [])
         assert back["el"]["backtest-frame"]["src"] == live_dashboard.BACKTEST_URL
         # So nothing is emptied when the time passes
         later = snaps["later"]
-        assert (later["srcSets"], later["timers"]) == (1, [])
+        assert (later["srcSets"], later["timers"], later["replaced"]) == (1, [], 0)
         assert later["el"]["backtest-frame"]["src"] == live_dashboard.BACKTEST_URL
+        # The cancelled timer is forgotten: hiding the tab again starts a new
+        # one, which empties the frame
+        assert snaps["hidden-again"]["timers"] == [delay]
+        assert snaps["emptied"]["el"]["backtest-frame"]["src"] == ""
+        assert snaps["emptied"]["replaced"] == 1
 
     def test_the_data_frame_is_emptied_and_loaded_again_the_same_way(self, tmp_path):
         data = payload(_view())
@@ -1824,13 +1833,13 @@ class TestPageScript:
         assert (snaps["back"]["srcSets"], snaps["back"]["timers"]) == (1, [])
         # Hidden again and left past the delay: emptied
         emptied = snaps["emptied"]
-        assert emptied["el"]["data-frame"]["src"] == "about:blank"
-        assert (emptied["srcSets"], emptied["timers"]) == (2, [])
+        assert emptied["el"]["data-frame"]["src"] == ""
+        assert (emptied["srcSets"], emptied["timers"], emptied["replaced"]) == (1, [], 1)
         # The Backtest frame was never opened, so it was never touched
         assert emptied["el"].get("backtest-frame", {"src": ""})["src"] == ""
         again = snaps["again"]
         assert again["el"]["data-frame"]["src"] == live_dashboard.DATA_URL
-        assert again["srcSets"] == 3
+        assert again["srcSets"] == 2
 
     def test_each_hidden_frame_has_a_timer_of_its_own(self, tmp_path):
         data = payload(_view())
@@ -1846,9 +1855,9 @@ class TestPageScript:
         # Choosing the tab already shown starts no timer and does not restart one
         assert snaps["live-again"]["timers"] == [delay, delay]
         emptied = snaps["emptied"]
-        assert emptied["el"]["backtest-frame"]["src"] == "about:blank"
-        assert emptied["el"]["data-frame"]["src"] == "about:blank"
-        assert (emptied["srcSets"], emptied["timers"]) == (4, [])
+        assert emptied["el"]["backtest-frame"]["src"] == ""
+        assert emptied["el"]["data-frame"]["src"] == ""
+        assert (emptied["srcSets"], emptied["timers"], emptied["replaced"]) == (2, [], 2)
 
     def test_a_frame_never_opened_has_no_timer(self, tmp_path):
         data = payload(_view())
@@ -1859,9 +1868,9 @@ class TestPageScript:
         assert snaps["live"]["timers"] == []
         # Only the Backtest frame was opened, so only it is emptied
         emptied = snaps["emptied"]
-        assert emptied["el"]["backtest-frame"]["src"] == "about:blank"
+        assert emptied["el"]["backtest-frame"]["src"] == ""
         assert emptied["el"].get("data-frame", {"src": ""})["src"] == ""
-        assert emptied["srcSets"] == 2
+        assert (emptied["srcSets"], emptied["replaced"]) == (1, 1)
 
     def test_the_delay_in_the_script_is_the_configured_one(self, monkeypatch):
         delay = config.LIVE_DASHBOARD_FRAME_UNLOAD_SECONDS * 1000

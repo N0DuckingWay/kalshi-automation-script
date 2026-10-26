@@ -1592,9 +1592,12 @@ _SCRIPT_TEMPLATE = """
   var CHOSEN = 0;
   var FRAMES = {backtest: ['backtest-frame', BACKTEST_URL], data: ['data-frame', DATA_URL]};
   var OPENED = {};
-  // A frame whose tab stays hidden for UNLOAD_MS is emptied (pointed at
-  // about:blank), so the browser frees the page it held; choosing its tab
-  // loads the page again. HIDING holds the timer of each frame now hidden.
+  // A frame whose tab stays hidden for UNLOAD_MS is emptied: a copy of it
+  // with no address takes its place, so the browser frees the page the old
+  // one held, and choosing its tab loads the page into the copy. Swapping
+  // the frame, rather than pointing it at another address, adds no step to
+  // the Back history of the browser, so Back never blanks a tab or reloads a
+  // hidden page. HIDING holds the timer of each frame now hidden.
   var UNLOAD_MS = __UNLOAD_MS__;
   var HIDING = {};
   var LOADING = false;
@@ -1738,7 +1741,12 @@ _SCRIPT_TEMPLATE = """
       } else if (OPENED[t] && !HIDING[t]) {
         HIDING[t] = setTimeout(function () {
           delete HIDING[t];
-          byId(FRAMES[t][0]).src = 'about:blank';
+          // The copy keeps the id, title and sandbox of the frame; its address is
+          // removed before it is put in place, so it loads nothing
+          var old = byId(FRAMES[t][0]);
+          var fresh = old.cloneNode(false);
+          fresh.removeAttribute('src');
+          old.parentNode.replaceChild(fresh, old);
           OPENED[t] = false;
         }, UNLOAD_MS);
       }

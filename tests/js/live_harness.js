@@ -18,7 +18,9 @@
 // own; clearTimeout removes one; a ["timers"] step runs every pending timer,
 // oldest first, and clears them. A snapshot lists the delays of the timers
 // still pending, so a test can check both the delay and that a timer was
-// cancelled.
+// cancelled. An element can be copied (cloneNode, its id, title,
+// attributes and address) and swapped for its copy (its parentNode's
+// replaceChild); a snapshot counts the swaps ("replaced").
 // ES5 plus Promise, which both runtimes have.
 
 var __emit = (typeof print === 'function') ? print : function(s) { console.log(s); };
@@ -30,6 +32,16 @@ var __fetches = [];
 var __plots = [];
 var __snaps = {};
 var __srcSets = 0;
+// Every element's parent: replacing a child puts the new element where
+// getElementById finds it, and counts the swap (a snapshot's "replaced")
+var __replaced = 0;
+var __parent = {
+  replaceChild: function(fresh, old) {
+    __elements[old.id] = fresh;
+    __replaced += 1;
+    return old;
+  }
+};
 var __timers = [];
 var __timerId = 0;
 
@@ -42,13 +54,28 @@ function __element(id, tag) {
     // As a browser's: setting the text replaces the children
     set: function(v) { el._text = String(v); el.children = []; }
   });
-  var src = '';
+  // A frame's address: setting it is a navigation (counted in __srcSets);
+  // copying it into a clone, or removing it, is not
+  el._src = '';
   Object.defineProperty(el, 'src', {
-    get: function() { return src; },
-    set: function(v) { src = String(v); __srcSets += 1; }
+    get: function() { return el._src; },
+    set: function(v) { el._src = String(v); __srcSets += 1; }
   });
   el.setAttribute = function(name, value) { el._attrs[name] = String(value); };
   el.getAttribute = function(name) { return name in el._attrs ? el._attrs[name] : null; };
+  el.removeAttribute = function(name) {
+    if (name === 'src') { el._src = ''; } else { delete el._attrs[name]; }
+  };
+  // A copy of the element alone (cloneNode(false)): its id, tag, title,
+  // attributes and address, nothing it holds
+  el.cloneNode = function() {
+    var copy = __element(el.id, el.tagName);
+    copy.title = el.title;
+    copy._attrs = JSON.parse(JSON.stringify(el._attrs));
+    copy._src = el._src;
+    return copy;
+  };
+  el.parentNode = __parent;
   el.appendChild = function(child) { el.children.push(child); return child; };
   el.addEventListener = function(type, fn) {
     (el._listeners[type] = el._listeners[type] || []).push(fn);
@@ -112,7 +139,8 @@ function __install() {
 // pending
 function __snapshot() {
   var snap = {fetches: __fetches, plots: __plots, srcSets: __srcSets, el: {},
-              timers: __timers.map(function(timer) { return timer.ms; })};
+              timers: __timers.map(function(timer) { return timer.ms; }),
+              replaced: __replaced};
   __fetches = [];
   __plots = [];
   Object.keys(__elements).forEach(function(id) {

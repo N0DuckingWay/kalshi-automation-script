@@ -575,9 +575,9 @@ backtest.py (CLI)
                                                 then the Sell and Min. days to
                                                 maturity selects: every level and
                                                 minimum of days of every scenario the
-                                                bar shows with no adding to held pairs
-                                                and no trimming (Sell is shut while
-                                                either is on), read through sold_grid in
+                                                bar shows with Rebalance no (Sell is
+                                                shut while Rebalance is yes), read
+                                                through sold_grid in
                                                 --sell-workers worker processes (a
                                                 setting no position of a scenario
                                                 reaches is that scenario's own run;

@@ -16145,13 +16145,14 @@ class TestScenarioChunksAreFiles:
         assert 'id="dash-data"' in page
         assert TestFilterPage._data(page)["sell_state"] == "unavailable"
 
-    def test_a_header_line_that_raises_leaves_no_folder(self, monkeypatch, tmp_path):
-        # The folder is made before the header lines; one that raises takes
-        # the build down without leaving a marked folder behind
+    @pytest.mark.parametrize("part", ["_fills_html", "_starting_balance_text"])
+    def test_a_header_line_that_raises_leaves_no_folder(self, monkeypatch, tmp_path, part):
+        # The folder is made before the header lines and the page's head; one
+        # that raises takes the build down without leaving a marked folder
         def broken(*_a, **_k):
             raise ValueError("boom")
 
-        monkeypatch.setattr(dashboard, "_fills_html", broken)
+        monkeypatch.setattr(dashboard, part, broken)
         with pytest.raises(ValueError, match="boom"):
             _kc_page(monkeypatch, tmp_path, _kc_sweep())
         assert TestSidecarFolders._folders(tmp_path) == []
