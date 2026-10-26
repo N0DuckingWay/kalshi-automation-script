@@ -72,6 +72,7 @@ from .config import (
     SALE_PARTNER_MAX_AGE_DAYS,
     SALE_PARTNER_MAX_LOOKUPS,
     SALE_PARTNER_MAX_WIDER_LOOKUPS,
+    SALE_PARTNER_REVENUE_TOLERANCE_DOLLARS,
     SCHEDULED_RUN,
     TAKE_PROFIT_HOLD_DAYS,
     TAKE_PROFIT_HOLD_DAYS_MAX,
@@ -376,7 +377,28 @@ def _shape_reason(position: HeldPosition) -> tuple[str, str]:
 
 def _settled_count(settlement: Settlement, side: str) -> float:
     """
-    The contracts of one side a settled market's settlement says the account held.
+    The contracts of one side the account held when a settled market paid out.
+
+    Kalshi's settlement lists the contracts bought on each side over the
+    market's life. A sale before the payout is listed as bought on the other
+    side (selling YES is buying NO), and the two net out, so what was held at
+    payout is their difference: 180 YES and 52 NO listed is 128 YES held. For a
+    record that lists one side only, it is that side's count.
+
+    Args:
+        settlement (Settlement): One settled market.
+        side (str): "yes" or "no".
+
+    Returns:
+        float: That side's count less the other side's, never below 0.
+    """
+    bought = _bought_count(settlement, side)
+    return max(0.0, bought - _bought_count(settlement, _OTHER_SIDE[side]))
+
+
+def _bought_count(settlement: Settlement, side: str) -> float:
+    """
+    The contracts of one side a settled market's settlement lists as bought.
 
     Args:
         settlement (Settlement): One settled market.
@@ -610,8 +632,9 @@ def _find_partner(reads: _Reads, ticker: str, side: str, count: int,
     """
     Find a lone held market's one paid-out partner among the account's settlements.
 
-    It is the one settled market no longer held, held on the other side (none on
-    the held side), asking the held market's question (every pair the bot buys
+    It is the one settled market no longer held, held on the other side when it
+    paid out (none on the held side; each count is what was held at payout,
+    _settled_count), asking the held market's question (every pair the bot buys
     asks one question, so a market of its event that asks another was never its
     pair-mate), and settled no earlier than SALE_PARTNER_MAX_AGE_DAYS before now
     (one dated after now is returned, and its callers refuse it). Its count on the
@@ -623,8 +646,10 @@ def _find_partner(reads: _Reads, ticker: str, side: str, count: int,
     SALE_PARTNER_MAX_WIDER_LOOKUPS, apart from the first's (_Reads.labels).
     _plan_one (a take-profit sale) and _trim_one (a Kelly trim of a lone leg)
     both find the partner here. Fails closed: a held market with no question
-    label, no partner, two or more, an unreadable label, or a partner settled
-    other than yes or no means no sale and no trim.
+    label, no partner, two or more, an unreadable label, a partner settled
+    other than yes or no, or a partner whose record lists contracts bought on
+    both sides and whose payout does not match what it held at payout (within
+    SALE_PARTNER_REVENUE_TOLERANCE_DOLLARS) means no sale and no trim.
 
     Args:
         reads (_Reads): This run's reads.
@@ -652,6 +677,8 @@ def _find_partner(reads: _Reads, ticker: str, side: str, count: int,
         names the search for a partner settled with more (its own lookup allowance)."""
         candidates = [s for s in settlements
                       if s.ticker not in reads.held_positions and s.ticker != ticker
+                      # The second test is implied by the net reading (a market
+                      # held on `other` at payout held none on `side`); kept as a guard
                       and fits(_settled_count(s, other)) and _settled_count(s, side) == 0
                       and s.settled_at.timestamp() >= oldest]
         partners: list[Settlement] = []
@@ -685,6 +712,19 @@ def _find_partner(reads: _Reads, ticker: str, side: str, count: int,
     if partner.result not in ("yes", "no"):
         return None, (f"its partner {partner.ticker} settled {partner.result} rather than "
                       "yes or no, which the rule does not judge")
+    if partner.yes_count > 0 and partner.no_count > 0:
+        # Contracts bought on both sides: what was held at payout is their
+        # difference only when the payout says so ($1 for each contract held on
+        # the winning side, $0 when the side held lost)
+        expected = _settled_count(partner, partner.result) * CONTRACT_PAYOUT_DOLLARS
+        if abs(partner.revenue_dollars - expected) > SALE_PARTNER_REVENUE_TOLERANCE_DOLLARS:
+            # config.count_text: a contract count written exactly
+            return None, (f"its partner {partner.ticker} lists contracts bought on both "
+                          f"sides ({count_text(partner.yes_count)} YES, "
+                          f"{count_text(partner.no_count)} NO), and its payout "
+                          f"({_dollars(partner.revenue_dollars)}) does not match the "
+                          f"{count_text(_settled_count(partner, other))} {other.upper()} "
+                          "held when it paid out, so what was held cannot be read")
     return partner, ""
 
 
@@ -693,12 +733,16 @@ def _partner_leg(reads: _Reads, partner: Settlement, other: str, count: int) -> 
     A lone held market's paid-out partner as one leg of a position (or the part of
     one a Kelly trim sells) of `count` contract pairs.
 
-    The partner's cost (what was paid for the side held there, plus its fees) and
-    its payout are scaled to `count` of the contracts it settled with on that side:
-    a lone market partly sold after its partner paid out holds fewer contracts than
-    the partner settled with, so the position is that share of the pair. For a
-    partner settled with exactly `count` contracts the share is 1 and the figures
-    are the settlement's own. _plan_one (the take-profit sale) carries this leg
+    The partner's cost is `count` contracts at the average cost of a contract
+    bought on the side held there, fees included: (that side's cost + the fees) x
+    count / the contracts bought on that side. Contracts sold before the payout
+    were a trade of their own, so the ones held keep their own average cost. Its
+    payout is scaled to `count` of the contracts held when it paid out
+    (_settled_count): a lone market partly sold after its partner paid out holds
+    fewer contracts than the partner settled with, so the position is that share
+    of the pair. For a partner whose record lists one side, bought and held are
+    the same count, so when it settled with exactly `count` contracts the
+    figures are the settlement's own. _plan_one (the take-profit sale) carries this leg
     beside the held market, and its payout values the partner at every check it
     had paid out by; _trim_one (a Kelly trim of a lone leg) carries it for the
     contracts the trim sells, so the part sold's cost includes that share of
@@ -706,8 +750,8 @@ def _partner_leg(reads: _Reads, partner: Settlement, other: str, count: int) -> 
 
     Args:
         reads (_Reads): This run's reads (for the partner's fee multiplier).
-        partner (Settlement): The partner _find_partner found: settled with at
-            least `count` contracts on `other`.
+        partner (Settlement): The partner _find_partner found: holding at least
+            `count` contracts on `other` when it paid out.
         other (str): The side held on the partner, "yes" or "no".
         count (int): The lone market's contracts this leg goes with: all held
             for a take-profit sale (_plan_one), the contracts sold for a Kelly
@@ -716,11 +760,10 @@ def _partner_leg(reads: _Reads, partner: Settlement, other: str, count: int) -> 
     Returns:
         SaleLeg: The partner's leg, with no market.
     """
-    share = count / _settled_count(partner, other)
     cost_basis = partner.yes_cost_dollars if other == "yes" else partner.no_cost_dollars
     return SaleLeg(partner.ticker, partner.event_ticker, other, count,
-                   (cost_basis + partner.fees_dollars) * share,
-                   payout_dollars=partner.revenue_dollars * share,
+                   (cost_basis + partner.fees_dollars) * (count / _bought_count(partner, other)),
+                   payout_dollars=partner.revenue_dollars * (count / _settled_count(partner, other)),
                    paid_at=partner.settled_at,
                    partner_fee_multiplier=reads.partner_fee_multiplier(
                        partner.ticker, partner.event_ticker))

@@ -720,6 +720,14 @@ SALE_PARTNER_MAX_LOOKUPS = 20
 # partner and the held market is not sold that run.
 SALE_PARTNER_MAX_WIDER_LOOKUPS = 20
 
+# How far, in dollars, a paid-out partner's payout may sit from what the position
+# it held at payout should have paid, when its settlement lists contracts bought
+# on both sides (seller._find_partner). The payout is whole cents, so under half
+# a cent means an exact match and a 1c gap is always a mismatch; a record whose
+# payout does not match its net count cannot be read as one position, so the
+# held market is neither sold nor trimmed.
+SALE_PARTNER_REVENUE_TOLERANCE_DOLLARS = 0.005
+
 # How many days ago, at most, a held market's partner may have paid out for live
 # selling to use it. A pair's two markets stop trading at most MAX_DEADLINE_GAP_DAYS
 # apart and the held market still trades, so its partner normally paid out less

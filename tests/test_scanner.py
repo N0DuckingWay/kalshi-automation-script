@@ -8871,7 +8871,7 @@ def _settlements_client(*pages) -> MagicMock:
 
 
 class TestGetSettlements:
-    """get_settlements reads every market the account held when it paid out.
+    """get_settlements reads every market the account traded that has paid out.
     Live selling values a held market's paid-out partner from it, so it reads
     both spellings Kalshi has sent, turns cents into dollars exactly, and gives
     None (never a partial list) when a page cannot be read or the list is cut

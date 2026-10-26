@@ -656,9 +656,25 @@ def _lone_world(*settlements: Settlement, lookups: dict | None = None) -> _World
 def _settled(ticker: str, event: str, *, yes: float = 30.0, no: float = 0.0,
              cost: float = 9.0, fees: float = 0.45, revenue: float = 0.0,
              at: datetime | None = None, result: str = "no") -> Settlement:
-    """One settlement: what the account held when the market paid out."""
+    """One settlement, listing contracts bought on each side (one side, unless `no` is set too)."""
     return Settlement(ticker, event, result, yes, no, cost if yes else 0.0, cost if no else 0.0,
                       fees, revenue, at or datetime.fromtimestamp(_CK - 3 * _DAY, UTC))
+
+
+def _starship(**kwargs) -> Settlement:
+    """
+    A partner whose record lists contracts bought on both sides, with the figures
+    Kalshi listed for KXSPACEXSTARSHIP-15-26OCT16 on a live read: 180 YES bought for
+    $3.47 and 52 NO for $51.48 (52 of the YES sold at 1c before the payout, which
+    Kalshi lists as 52 NO bought at 99c), $0.2738 of fees, settled no and paid $0. It
+    held 180 - 52 = 128 YES when it paid out. Here it is the Jan 18 rung of B's own
+    event, paid out three days before the run; any Settlement field can be given.
+    """
+    fields = {"ticker": _SAME_EVENT, "event_ticker": _EV_B, "result": "no",
+              "yes_count": 180.0, "no_count": 52.0, "yes_cost_dollars": 3.47,
+              "no_cost_dollars": 51.48, "fees_dollars": 0.2738, "revenue_dollars": 0.0,
+              "settled_at": datetime.fromtimestamp(_CK - 3 * _DAY, UTC)}
+    return Settlement(**{**fields, **kwargs})
 
 
 # A lone held market with no partner, judged before B (it sorts first)
@@ -897,6 +913,120 @@ class TestPartners:
         # Settled with exactly the held count: the settlement's own figures, to the bit
         exact = seller._partner_leg(reads, dc_replace(paid, yes_count=86.0), "yes", 86)
         assert exact.cost_dollars == 38.70 + 2.58 and exact.payout_dollars == 129.0
+
+    def test_a_partner_that_sold_some_before_it_paid_out_is_read_by_what_it_held(
+            self, monkeypatch, caplog):
+        # B holds 128 NO. Its partner's record lists 180 YES and 52 NO bought, so it
+        # held 128 YES when it paid out: the same count, found in the first search
+        world = _lone_world(_starship())
+        world.positions[_B] = HeldPosition(_B, -128.0, 51.20, 2.18)
+        with caplog.at_level(logging.INFO):
+            (plan,) = world.plan(monkeypatch, 0.69)
+        assert world.calls["lookup"] == [_SAME_EVENT]
+        partner = plan.legs[1]
+        assert (partner.ticker, partner.side, partner.count) == (_SAME_EVENT, "yes", 128)
+        # 128 YES at the average cost of the 180 bought, fees included:
+        # ($3.47 + $0.2738) x 128 / 180 = $2.662258; it paid $0
+        assert partner.cost_dollars == pytest.approx((3.47 + 0.2738) * 128 / 180)
+        assert partner.cost_dollars == pytest.approx(2.662258, abs=1e-6)
+        assert partner.payout_dollars == 0.0
+        cost = 51.20 + 2.18 + (3.47 + 0.2738) * 128 / 180               # $56.042258
+        assert plan.count == 128 and plan.cost_dollars == pytest.approx(cost)
+        # Each check by hand: 128 NO sold at that check's bid, less the fee on it,
+        # less the cost (a potential profit of $128 - $56.04 = $71.96)
+        assert [fee_leg_exact(128, bid) for bid in (0.85, 0.86, 0.84)] == [1.15, 1.08, 1.21]
+        expected = [128 * 0.85 - 1.15 - cost,                       # now: $51.61 (71.7%)
+                    128 * 0.86 - 1.08 - cost,                       # a day before: $52.96
+                    128 * 0.84 - 1.21 - cost]                       # two days: $50.27 (69.9%)
+        for (realized, potential), want in zip(plan.profits, expected, strict=True):
+            assert realized == pytest.approx(want, abs=1e-9)
+            assert potential == pytest.approx(128 - cost, abs=1e-9)
+        assert "(settled no, paid $0.00), 128 each" in caplog.text
+        # 69.9% two days before: kept at a 70% level
+        assert world.plan(monkeypatch, 0.70) == []
+
+    def test_a_partner_that_sold_all_it_bought_held_nothing(self, monkeypatch, caplog):
+        # 37 YES bought and all 37 sold before the payout (listed as 37 NO bought): it
+        # held nothing when it paid out, so it is no market's partner
+        world = _lone_world(_starship(yes_count=37.0, no_count=37.0, yes_cost_dollars=11.10,
+                                      no_cost_dollars=36.63))
+        world.positions[_B] = HeldPosition(_B, -37.0, 14.80, 0.65)
+        with caplog.at_level(logging.INFO):
+            assert world.plan(monkeypatch, 0.01) == []
+        assert ("no paid-out partner: no market it no longer holds was held YES with at "
+                "least 37 contracts on its question") in caplog.text
+        assert world.calls["lookup"] == [] and world.calls["candles"] == []
+
+    def test_a_two_sided_partner_whose_payout_does_not_match_is_refused(self, monkeypatch,
+                                                                         caplog):
+        # Settled no, yet $52 paid: 52 NO held at the payout, which the 128 YES its
+        # counts say it held cannot explain, so what it held cannot be read
+        world = _lone_world(_starship(revenue_dollars=52.0))
+        world.positions[_B] = HeldPosition(_B, -128.0, 51.20, 2.18)
+        with caplog.at_level(logging.INFO):
+            assert world.plan(monkeypatch, 0.01) == []
+        assert (f"its partner {_SAME_EVENT} lists contracts bought on both sides (180 YES, "
+                "52 NO), and its payout ($52.00) does not match the 128 YES held when it "
+                "paid out, so what was held cannot be read") in caplog.text
+        # Refused before any earlier day's candle is read
+        assert world.calls["candles"] == []
+
+    def test_a_two_sided_partner_whose_held_side_won_is_found(self, monkeypatch):
+        # Settled yes and paid $128: $1 for each of the 128 YES it held at the payout
+        world = _lone_world(_starship(result="yes", revenue_dollars=128.0))
+        world.positions[_B] = HeldPosition(_B, -128.0, 51.20, 2.18)
+        (plan,) = world.plan(monkeypatch, 0.01)
+        partner = plan.legs[1]
+        assert (partner.ticker, partner.side, partner.count) == (_SAME_EVENT, "yes", 128)
+        assert partner.cost_dollars == pytest.approx((3.47 + 0.2738) * 128 / 180)
+        # $128 x 128 / 128: the whole payout goes with the 128 held here
+        assert partner.payout_dollars == 128.0
+
+    def test_a_lone_leg_partly_sold_takes_a_two_sided_partner_in_the_wider_search(
+            self, monkeypatch, caplog):
+        # B was trimmed to 86 NO; its partner held 128 YES at the payout (180 bought,
+        # 52 sold), so no market fits 86 and the search for one settled with more
+        # finds it: 86 contracts at the average cost of the 180 bought, and 86/128 of
+        # what it paid ($0)
+        world = _lone_world(_starship())
+        world.positions[_B] = HeldPosition(_B, -86.0, 34.40, 1.45)
+        with caplog.at_level(logging.INFO):
+            (plan,) = world.plan(monkeypatch, 0.01)
+        assert world.calls["lookup"] == [_SAME_EVENT]
+        partner = plan.legs[1]
+        assert (partner.ticker, partner.side, partner.count) == (_SAME_EVENT, "yes", 86)
+        # ($3.47 + $0.2738) x 86 / 180 = $1.788704
+        assert partner.cost_dollars == pytest.approx((3.47 + 0.2738) * 86 / 180)
+        assert partner.cost_dollars == pytest.approx(1.788704, abs=1e-6)
+        assert partner.payout_dollars == 0.0
+        assert "(settled no with 128 contracts, paid $0.00), 86 each" in caplog.text
+        # It is the wider search that finds it: with no lookups left for that search,
+        # it is not found
+        monkeypatch.setattr(seller, "SALE_PARTNER_MAX_WIDER_LOOKUPS", 0)
+        with caplog.at_level(logging.INFO):
+            assert world.plan(monkeypatch, 0.01) == []
+        assert ("the limit of 0 lookups for a partner settled with more contracts this run "
+                "was reached") in caplog.text
+
+    def test_the_partner_leg_reads_its_cost_on_what_was_bought_and_its_payout_on_what_was_held(
+            self):
+        reads = seller._Reads(MagicMock(), {}, {}, _CK, 0)
+        # The two-sided record settled yes, paying $128 for the 128 YES held: for 86
+        # of them, the cost is 86/180 of the YES cost and fees ($1.788704), and the
+        # payout 86/128 of $128 ($86)
+        won = _starship(result="yes", revenue_dollars=128.0)
+        leg = seller._partner_leg(reads, won, "yes", 86)
+        assert (leg.ticker, leg.side, leg.count, leg.market) == (_SAME_EVENT, "yes", 86, None)
+        assert leg.cost_dollars == pytest.approx((3.47 + 0.2738) * 86 / 180)
+        assert leg.payout_dollars == pytest.approx(128.0 * 86 / 128)
+        assert leg.payout_dollars == pytest.approx(86.0)
+        # What was held at payout: each side's count less the other's, never below 0
+        assert seller._settled_count(won, "yes") == 128.0
+        assert seller._settled_count(won, "no") == 0.0
+        # One side listed: that side's count, as before
+        one_sided = _settled(_A, _EV_A, yes=129.0)
+        assert seller._settled_count(one_sided, "yes") == 129.0
+        assert seller._settled_count(one_sided, "no") == 0.0
 
     def test_holding_more_than_any_partner_settled_with_has_no_partner(self, monkeypatch,
                                                                        caplog):
@@ -2162,6 +2292,64 @@ class TestPlanTrims:
         assert partner.payout_dollars == 0.0
         assert fee_leg_exact(43, 0.86) == 0.37
         assert plan.proceeds_dollars == pytest.approx(43 * 0.86 - 0.37, abs=1e-12)
+
+    def test_a_lone_leg_whose_partner_sold_some_before_paying_out_is_trimmed(
+            self, monkeypatch, caplog):
+        # B holds 128 NO; its partner's record lists 180 YES and 52 NO bought, so it
+        # held 128 YES when it paid out $0. By hand, as for the standard lone leg: B
+        # pays with chance 90.9%, one contract fetches $0.851572 at the best bids, and
+        # under the 10% cap B may keep $74.90: 74.90 / 0.851572 = 87.95, so 87 kept and
+        # 41 to sell (selling 41 returns 41 x 0.86 less a $0.35 fee, $0.851463 a
+        # contract, at which it may still keep only 87)
+        world = _lone_trim(_starship(), count=128, exposure=76.80, fees=2.16)
+        with caplog.at_level(logging.INFO):
+            (plan,) = _lone_trims(world, monkeypatch)
+        assert (f"Kelly trim check: {_LONE_TRIM_TEXT} (time-series), 128 contracts, last "
+                "traded 2026-01-05, 7 day(s) ago, pays 90.9%, $0.85 a contract at the best "
+                "bids, may keep 10.0% of $749.00 -> sell 41") in caplog.text
+        held, partner = plan.legs
+        assert (held.ticker, held.count, held.held) == (_B, 41, 128)
+        assert held.cost_dollars == pytest.approx((76.80 + 2.16) * 41 / 128)
+        # 41 YES at the average cost of the 180 bought: ($3.47 + $0.2738) x 41 / 180
+        # = $0.852754; and 41/128 of the $0 paid
+        assert (partner.ticker, partner.side, partner.count) == (_SAME_EVENT, "yes", 41)
+        assert partner.cost_dollars == pytest.approx((3.47 + 0.2738) * 41 / 180)
+        assert partner.cost_dollars == pytest.approx(0.852754, abs=1e-6)
+        assert partner.payout_dollars == 0.0
+        assert fee_leg_exact(41, 0.86) == 0.35
+        assert plan.proceeds_dollars == pytest.approx(41 * 0.86 - 0.35, abs=1e-12)
+        assert config.kelly_trim_count(
+            128, 749.0, config.held_pair_win_prob("time_series", 0.0, 1.0, 0.14, 0.88, 0.7),
+            0.10, 0.86 - config.fee_per_pair_approx(0.0, 0.86),
+            lambda n: n * 0.86 - fee_leg_exact(n, 0.86)).sell == 41
+
+    def test_a_lone_leg_trimmed_before_takes_a_two_sided_partner_in_the_wider_search(
+            self, monkeypatch, caplog):
+        # An earlier trim left B holding 86 of the 128 YES its partner held at the
+        # payout (180 bought, 52 sold). As for the one-sided partner, under a 5% cap
+        # 43 are kept and 43 sold; the partner's share is 43 of the 180 bought
+        world = _lone_trim(_starship(), count=86, exposure=51.60)
+        with caplog.at_level(logging.INFO):
+            (plan,) = _lone_trims(world, monkeypatch, cap=0.05)
+        assert "may keep 5.0% of $749.00 -> sell 43" in caplog.text
+        held, partner = plan.legs
+        assert (held.count, held.held) == (43, 86)
+        assert (partner.ticker, partner.count) == (_SAME_EVENT, 43)
+        # ($3.47 + $0.2738) x 43 / 180 = $0.894352
+        assert partner.cost_dollars == pytest.approx((3.47 + 0.2738) * 43 / 180)
+        assert partner.payout_dollars == 0.0
+
+    def test_a_lone_leg_whose_two_sided_partner_does_not_add_up_is_not_trimmed(
+            self, monkeypatch, caplog):
+        world = _lone_trim(_starship(revenue_dollars=52.0), count=128, exposure=76.80,
+                           fees=2.16)
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch) == []
+        assert (f"Not trimming {_LONE_HELD_TEXT}: its partner {_SAME_EVENT} lists contracts "
+                "bought on both sides (180 YES, 52 NO), and its payout ($52.00) does not "
+                "match the 128 YES held when it paid out, so what was held cannot be "
+                "read") in caplog.text
+        assert world.calls["book"] == []
 
     def test_a_lone_legs_wait_counts_a_later_fill_on_its_ladder(self, monkeypatch, caplog):
         # A, the rocket question at Jan 20, is in the run's market list (not held) and
