@@ -9,10 +9,11 @@ the level just above it. Everything runs offline: the exchange reads
 (order books, candles, settlements, market lookups) are stubs on the seller
 module, and the client is a MagicMock that is never called.
 
-seller.plan_trims (selling part of a held pair that has outgrown the size the
-Kelly rule allows) is checked the same way: one pair, live and in the
-backtest, must sell the count backtester._kelly_trim sells. Its 7-day wait
-after a trade is tested on each of the 8 days after a purchase.
+seller.plan_trims (selling part of a held pair, or of a lone leg whose
+partner has paid out, that has outgrown the size the Kelly rule allows) is
+checked the same way: one exact pair, live and in the backtest, must sell the
+count backtester._kelly_trim sells. Its 7-day wait after a trade is tested on
+each of the 8 days after a purchase.
 
 seller.plan_add_ons (which held pairs a run may add to) waits as the trim
 does, and its price move must equal the backtest's (backtester._held_pair_move
@@ -143,10 +144,9 @@ class _World:
         """Each held market's ladder labels, as resolve_held_ladders' labels_out gives them."""
         return {t: market_ladder_keys(self.known[t]) for t in self.positions}
 
-    def plan(self, monkeypatch, level: float | None = 0.01, *, min_days: int | None = None,
-             now: datetime = _NOW, labels: dict | None = None,
-             fee_multipliers: dict | None = None) -> list:
-        """Run seller.plan_sales against this world, its reads stubbed and recorded."""
+    def stub_reads(self, monkeypatch) -> None:
+        """Put stubs on the seller module for every exchange read a planner makes,
+        each one served from this world and recorded in `calls` (fills in `fill_reads`)."""
         def book(client, ticker):
             self.calls["book"].append(ticker)
             return self.books.get(ticker)
@@ -171,10 +171,21 @@ class _World:
             self.calls["lookup"].append(ticker)
             return self.lookup.get(ticker)
 
+        def fills(client):
+            self.fill_reads += 1
+            return self.fills
+
         monkeypatch.setattr(seller, "_fetch_orderbook", book)
         monkeypatch.setattr(seller, "recent_candles", candles)
         monkeypatch.setattr(seller, "get_settlements", settlements)
         monkeypatch.setattr(seller, "market_for_labels", lookup)
+        monkeypatch.setattr(seller, "get_fill_times", fills)
+
+    def plan(self, monkeypatch, level: float | None = 0.01, *, min_days: int | None = None,
+             now: datetime = _NOW, labels: dict | None = None,
+             fee_multipliers: dict | None = None) -> list:
+        """Run seller.plan_sales against this world, its reads stubbed and recorded."""
+        self.stub_reads(monkeypatch)
         client = MagicMock()
         plans = seller.plan_sales(client, dict(self.positions),
                                   self.labels() if labels is None else labels,
@@ -192,21 +203,7 @@ class _World:
 
         By default rebalancing is on with no minimum price move, with $50 of cash and
         $50 as Kalshi's value of the open positions."""
-        def book(client, ticker):
-            self.calls["book"].append(ticker)
-            return self.books.get(ticker)
-
-        def candles(client, ticker, event_ticker, start, end):
-            self.calls["candles"].append((ticker, event_ticker, start, end))
-            return self.candles.get(ticker)
-
-        def fills(client):
-            self.fill_reads += 1
-            return self.fills
-
-        monkeypatch.setattr(seller, "_fetch_orderbook", book)
-        monkeypatch.setattr(seller, "recent_candles", candles)
-        monkeypatch.setattr(seller, "get_fill_times", fills)
+        self.stub_reads(monkeypatch)
         client = MagicMock()
         plans = seller.plan_trims(
             client, dict(self.positions), self.labels() if labels is None else labels,
@@ -1575,11 +1572,62 @@ def _trims_at(case: _TrimCase, monkeypatch, now: datetime) -> list:
     return case.live(monkeypatch, 10_000, cap=0.10, now=now)
 
 
+# ─── A lone leg: the later market held after the earlier one paid out ─────────
+
+# How the trim names the standard lone leg before and after its partner is found
+_LONE_HELD_TEXT = f"NO {_B} (alone on its ladder)"
+_LONE_TRIM_TEXT = f"NO {_B} (alone: YES {_SAME_EVENT} paid out $0)"
+
+
+def _lone_partner(**kwargs) -> Settlement:
+    """The standard lone leg's partner: the Jan 18 rung of B's own event, held YES
+    (129 contracts bought at 0.30, $38.70, with $1.90 of fees) and settled no, so it
+    paid $0, three days before the run. Any field of _settled can be given."""
+    return _settled(_SAME_EVENT, _EV_B, **{"yes": 129.0, "cost": 38.70, "fees": 1.90,
+                                           **kwargs})
+
+
+def _lone_trim(*settlements: Settlement, count: int = 129, exposure: float = 77.40,
+               fees: float = 2.17, yes_bid: float = 0.12, no_bid: float = 0.86) -> _World:
+    """
+    B held NO alone, last traded at the previous Monday's run, with `settlements` the
+    account's settlements (_lone_world: a lookup finds the rungs of B's own event).
+
+    Args:
+        settlements (Settlement): The account's settlements.
+        count (int): Keyword-only. B's NO contracts.
+        exposure (float): Keyword-only. What they cost (129 at 0.60 by default).
+        fees (float): Keyword-only. The fees paid on them.
+        yes_bid (float): Keyword-only. B's best YES bid (its NO ask is 1 minus it).
+        no_bid (float): Keyword-only. B's best NO bid (its YES ask is 1 minus it).
+
+    Returns:
+        _World: The account, its fills list reaching 30 days back.
+    """
+    world = _lone_world(*settlements)
+    world.positions[_B] = HeldPosition(_B, -float(count), exposure, fees)
+    world.books[_B] = {"yes": [[yes_bid, 100_000.0]], "no": [[no_bid, 100_000.0]]}
+    world.fills = _fills({_B: _BOUGHT})
+    return world
+
+
+def _lone_trims(world: _World, monkeypatch, *, cap: float = 0.10, k: float = 0.7,
+                min_move: float | None = None, positions_cents: int = 27_500,
+                **kwargs) -> list:
+    """seller.plan_trims on a $749 portfolio ($474 of cash plus Kalshi's $275 for the
+    open positions, unless `positions_cents` says otherwise), at k 0.7 and a 10% cap."""
+    return world.trims(monkeypatch, _trim_settings(k=k, cap=cap, min_move=min_move),
+                       cash_cents=74_900 - positions_cents,
+                       positions_value_cents=positions_cents, **kwargs)
+
+
 class TestTrimWaitAtAnyFrequency:
-    """A pair is trimmed only once 7 calendar days (REBALANCE_MIN_DAYS_SINCE_TRADE),
-    on the bot's own clock, have passed since the last fill on either market.
-    The rule compares two dates and reads only the schedule's time zone, never its
-    run days, so it holds however often the bot runs."""
+    """A pair or lone leg is trimmed only once 7 calendar days
+    (REBALANCE_MIN_DAYS_SINCE_TRADE), on the bot's own clock, have passed since
+    its last fill (on either market of a pair; for a lone leg, on its own market
+    or a market of its ladder in the run's list). The rule compares two dates
+    and reads only the schedule's time zone, never its run days, so it holds
+    however often the bot runs."""
 
     @pytest.mark.parametrize("days_after", range(1, 9))
     def test_a_run_on_each_of_the_eight_days_after_a_purchase(self, monkeypatch, caplog,
@@ -1657,6 +1705,28 @@ class TestTrimWaitAtAnyFrequency:
         # config's own schedule is not what the seller reads
         assert config.SCHEDULED_RUN.timezone == "America/Los_Angeles"
 
+    @pytest.mark.parametrize("days_after", range(1, 9))
+    def test_a_lone_leg_on_each_of_the_eight_days_after_a_purchase(self, monkeypatch, caplog,
+                                                                   days_after):
+        # The lone leg (42 of 129 trimmed once rested) last traded Tuesday January 6
+        # at 10:00; a run at 09:00 on each later day. Its partner paid out on the 9th
+        world = _lone_trim(_lone_partner())
+        bought = _pacific(1, 6, 10)
+        world.fills = _fills({_B: bought}, oldest=bought - timedelta(days=30))
+        with caplog.at_level(logging.INFO):
+            plans = _lone_trims(world, monkeypatch, now=_pacific(1, 6 + days_after, 9))
+        # Days 1 to 6: left alone. Day 7 (the next Tuesday) and day 8: trimmed
+        assert bool(plans) == (days_after >= 7)
+        if plans:
+            assert plans[0].count == 42
+            assert f"129 contracts, last traded 2026-01-06, {days_after} day(s) ago" in (
+                caplog.text)
+        else:
+            assert (f"Not trimming {_LONE_HELD_TEXT}: it last traded 2026-01-06, {days_after} "
+                    "day(s) ago, and a trim waits until 7 day(s) have passed") in caplog.text
+            # Refused before its partner is looked for or any order book is read
+            assert world.calls["settlements"] == 0 and world.calls["book"] == []
+
 
 # ─── plan_trims: each gate and each step ──────────────────────────────────────
 
@@ -1708,8 +1778,8 @@ def _weather_pair(world: _World, name: str, n: int, *, quotes: bool = True,
 
 class TestPlanTrims:
     """seller.plan_trims: nothing is trimmed unless every run-wide check passes,
-    each pair stops at its first failed step with one line saying why, and a
-    plan names the contracts sold apart from those held."""
+    each pair or lone leg stops at its first failed step with one line saying
+    why, and a plan names the contracts sold apart from those held."""
 
     def test_the_standard_pair_is_sold_down_to_its_cap(self, monkeypatch, caplog):
         case = _TrimCase()
@@ -1878,13 +1948,345 @@ class TestPlanTrims:
                 in caplog.text)
         assert case.world.calls == _NO_READS and case.world.fill_reads == 0
 
-    def test_a_lone_held_market_is_never_trimmed(self, monkeypatch, caplog):
-        world = _lone_world(_settled(_SAME_EVENT, _EV_B))
+    # ── A lone leg whose partner has paid out ────────────────────────────────
+
+    def test_a_lone_leg_over_its_cap_is_sold_down_with_its_paid_out_partner(self, monkeypatch,
+                                                                          caplog):
+        # B held NO alone (129 contracts), its partner (YES on the Jan 18 rung) paid
+        # out $0. By hand, at k 0.7 and a 10% cap on $749 ($474 cash + $275 positions):
+        #  - the partner reads as its settlement price: YES bid 0, NO bid $1, so its
+        #    YES ask is 0, its NO ask 1 and its midpoint 0. B's midpoint is halfway
+        #    between its YES ask 0.14 (1 - NO bid 0.86) and its YES bid 0.12: 0.13
+        #  - B pays with chance 1 - 0.7 x (0.13 - 0) = 90.9%
+        #  - one contract sold at the best bids: B's $0.86 plus the partner's $0, less
+        #    the fee 0.07 x 0.86 x 0.14 = $0.008428: $0.851572
+        #  - Kelly's hold share (0.909 - 0.851572) / (1 - 0.851572) = 38.7% is above
+        #    the 10% cap, so B may keep $74.90: 74.90 / 0.851572 = 87.95 contracts, so
+        #    87 kept and 42 to sell
+        #  - selling 42 walks no lower than $0.86: 42 x 0.86 = $36.12 less the fee
+        #    0.07 x 42 x 0.86 x 0.14 = $0.354, rounded up to $0.36: $35.76, or $0.851429
+        #    a contract, at which B may still keep only 87, so 42 it is
+        world = _lone_trim(_lone_partner())
+        with caplog.at_level(logging.INFO):
+            (plan,) = _lone_trims(world, monkeypatch)
+        lines = [r.getMessage() for r in caplog.records]
+        assert (f"Kelly trim check: {_LONE_TRIM_TEXT} (time-series), 129 contracts, last "
+                "traded 2026-01-05, 7 day(s) ago, pays 90.9%, $0.85 a contract at the best "
+                "bids, may keep 10.0% of $749.00 -> sell 42") in lines
+        assert lines[-2:] == ["Pairs to trim this run: 0 of 0",
+                              "Lone legs to trim this run (partner paid out): 1 of 1"]
+        assert _warnings(caplog) == []
+        assert (plan.kind, plan.level, plan.count, plan.days_left) == (
+            config.SALE_KIND_KELLY_TRIM, None, 42, 13)
+        assert plan.title == "Will the rocket launch by Jan 25, 2026?"
+        # The held leg sells 42 of its 129; the paid-out partner goes with them
+        held, partner = plan.legs
+        assert (held.ticker, held.side, held.count, held.held) == (_B, "no", 42, 129)
+        assert held.market is world.markets[_B]
+        assert (partner.ticker, partner.side, partner.count, partner.held) == (
+            _SAME_EVENT, "yes", 42, None)
+        assert partner.market is None and partner.payout_dollars == 0.0
+        assert partner.paid_at == datetime.fromtimestamp(_CK - 3 * _DAY, UTC)
+        # Each leg's cost is the share sold of what it cost, fees included: B's
+        # $77.40 + $2.17, and the partner's $38.70 + $1.90, each times 42/129
+        assert held.cost_dollars == pytest.approx((77.40 + 2.17) * 42 / 129)
+        assert partner.cost_dollars == pytest.approx((38.70 + 1.90) * 42 / 129)
+        cost = (77.40 + 2.17 + 38.70 + 1.90) * 42 / 129
+        assert plan.cost_dollars == pytest.approx(cost)
+        # Sold on B's bids alone: no ladder or walk for the partner
+        assert plan.ladders == {_B: [[0.86, 100_000.0]]}
+        assert plan.walked == {_B: (0.86, 0.86)}
+        assert fee_leg_exact(42, 0.86) == 0.36
+        assert plan.proceeds_dollars == pytest.approx(42 * 0.86 - 0.36, abs=1e-12)
+        assert plan.profits == ((pytest.approx(35.76 - cost, abs=1e-9),
+                                 pytest.approx(42 - cost, abs=1e-9)),)
+        # The count is the shared rule's, handed the settled partner's prices
+        win = config.held_pair_win_prob("time_series", 0.0, 1.0, 0.14, 0.88, 0.7)
+        top = 0.86 - config.fee_per_pair_approx(0.0, 0.86)
+        assert (win, top) == (pytest.approx(0.909), pytest.approx(0.851572))
+        assert config.kelly_trim_count(
+            129, 749.0, win, 0.10, top,
+            lambda n: n * 0.86 - fee_leg_exact(n, 0.86)).sell == 42
+        # Only B's book is read; the partner is found among the settlements
+        assert world.calls["book"] == [_B]
+        assert world.calls["settlements"] == 1 and world.calls["lookup"] == [_SAME_EVENT]
+
+    def test_a_lone_leg_within_its_cap_is_kept(self, monkeypatch, caplog):
+        # Under a 20% cap B may keep $149.80, 175 contracts: all 129 stay
+        world = _lone_trim(_lone_partner())
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch, cap=0.20) == []
+        assert (f"{_LONE_TRIM_TEXT} (time-series), 129 contracts, last traded 2026-01-05, 7 "
+                "day(s) ago, pays 90.9%, $0.85 a contract at the best bids, may keep 20.0% of "
+                "$749.00 -> keep") in caplog.text
+        assert "Lone legs to trim this run (partner paid out): 0 of 1" in caplog.text
+
+    def test_a_lone_leg_whose_partner_won_is_not_trimmed(self, monkeypatch, caplog):
+        # The partner settled yes: its YES paid out, so the event happened by Jan 18,
+        # and B's NO (no event by Jan 25) cannot win
+        world = _lone_trim(_lone_partner(result="yes", revenue=129.0))
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch) == []
+        assert (f"Not trimming {_LONE_HELD_TEXT}: its partner {_SAME_EVENT} paid out on its YES "
+                "side, so this leg cannot win") in caplog.text
+        assert world.calls["book"] == []
+
+    @pytest.mark.parametrize("settlements, reason", [
+        ([], "no paid-out partner"),
+        ([_lone_partner(), _settled(_SAME_EVENT_2, _EV_B, yes=129.0)],
+         "more than one settled market could be its paid-out partner"),
+        ([_lone_partner(at=datetime.fromtimestamp(
+            _CK - seller.SALE_PARTNER_MAX_AGE_DAYS * _DAY - 1, UTC))], "no paid-out partner"),
+        ([_lone_partner(at=datetime.fromtimestamp(_CK + 60, UTC))],
+         "is recorded as settling after now"),
+    ], ids=["none", "two", "too old", "after now"])
+    def test_a_lone_leg_without_one_paid_out_partner_is_not_trimmed(self, monkeypatch, caplog,
+                                                                    settlements, reason):
+        world = _lone_trim(*settlements)
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch) == []
+        assert f"Not trimming {_LONE_HELD_TEXT}: " in caplog.text and reason in caplog.text
+        assert _warnings(caplog) == []
+        # Refused before any order book is read
+        assert world.calls["book"] == []
+        assert "Lone legs to trim this run (partner paid out): 0 of 1" in caplog.text
+
+    @pytest.mark.parametrize("unreadable, problem", [
+        (None, "the account's settlements could not be read"),
+        (1, "1 of the account's settlements could not be read, and any of them may be the "
+            "partner"),
+    ], ids=["the list", "one record"])
+    def test_settlements_that_cannot_be_read_trim_no_lone_leg_and_warn_once(
+            self, monkeypatch, caplog, unreadable, problem):
+        # Two lone legs on two ladders and an exact pair: neither lone leg is trimmed,
+        # with one WARNING, and the pair is still judged
+        world = _lone_trim(_lone_partner())
+        if unreadable is None:
+            world.settlements = None
+        else:
+            world.unreadable = unreadable
+        snow = _rung("KXSNOWB-26", "KXSNOWB", "Jan 25, 2026", _B_CLOSE,
+                     title="Will it snow by Jan 25, 2026?")
+        world.hold(snow, -30.0, 12.0, 0.51)
+        world.books["KXSNOWB-26"] = world.books[_B]
+        rain = _weather_pair(world, "rain", 30)
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch) == []
+        assert _warnings(caplog) == [
+            f"Not trimming any lone leg whose partner has paid out this run: {problem}"]
+        assert world.calls["settlements"] == 1
+        assert f"Not trimming {_LONE_HELD_TEXT}: {problem}" in caplog.text
+        assert f"Not trimming NO KXSNOWB-26 (alone on its ladder): {problem}" in caplog.text
+        assert f"Kelly trim check: YES {rain[0]} / NO {rain[1]} (time-series)" in caplog.text
+        assert world.calls["book"] == list(rain)
+        assert caplog.records[-2].getMessage() == "Pairs to trim this run: 0 of 1"
+        assert caplog.records[-1].getMessage() == (
+            "Lone legs to trim this run (partner paid out): 0 of 2")
+
+    def test_a_lone_leg_on_the_earlier_market_is_not_trimmed(self, monkeypatch, caplog):
+        # A held YES alone (the earlier deadline), its partner B (held NO) settled yes,
+        # so it paid $0: what is left is no later market's chance of paying
+        world = _World()
+        world.hold(_rung(_A, _EV_A, "Jan 20, 2026", _A_CLOSE), 129.0, 38.70, 1.90)
+        market_b = _rung(_B, _EV_B, "Jan 25, 2026", _B_CLOSE)
+        world.known[_B] = world.lookup[_B] = market_b
+        world.settlements = [_settled(_B, _EV_B, yes=0.0, no=129.0, cost=51.60, fees=2.17,
+                                      result="yes")]
+        world.books[_A] = {"yes": [[0.12, 100_000.0]], "no": [[0.86, 100_000.0]]}
+        world.fills = _fills({_A: _BOUGHT})
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch) == []
+        assert (f"Not trimming YES {_A} (alone: NO {_B} paid out $0): a lone leg is trimmed "
+                "only as the later market of a time-series pair") in caplog.text
+        assert world.calls["book"] == []
+
+    def test_a_same_title_lone_leg_is_not_trimmed(self, monkeypatch, caplog):
+        # B held YES alone after its same-title partner A (held NO) settled yes, paying $0
+        case = _TrimCase("same_title", a_now=(0.50, 0.52), b_now=(0.42, 0.60))
+        world = case.world
+        del world.positions[_A]
+        world.settlements = [_settled(_A, _EV_A, yes=0.0, no=30.0, cost=15.0, result="yes")]
+        with caplog.at_level(logging.INFO):
+            assert world.trims(monkeypatch, _trim_settings(cap=0.10)) == []
+        assert (f"Not trimming YES {_B} (alone: NO {_A} paid out $0): a lone leg is trimmed "
+                "only as the later market of a time-series pair") in caplog.text
+        assert world.calls["book"] == []
+        # The two markets read as the same-title pair they were bought as
+        assert seller.held_pair_kind(world.markets[_B], world.markets[_A])[0] == "same_title"
+
+    def test_a_lone_leg_trimmed_before_is_trimmed_again_with_its_partners_share(
+            self, monkeypatch, caplog):
+        # An earlier trim left B holding 86 of the 129 its partner settled with. By hand,
+        # under a 5% cap B may keep $37.45: 37.45 / 0.851572 = 43.98 contracts, so 43
+        # kept and 43 to sell (selling 43 returns 43 x 0.86 less a $0.37 fee, $0.851395 a
+        # contract, at which it may still keep only 43)
+        world = _lone_trim(_lone_partner(), count=86, exposure=51.60)
+        with caplog.at_level(logging.INFO):
+            (plan,) = _lone_trims(world, monkeypatch, cap=0.05)
+        assert (f"Kelly trim check: {_LONE_TRIM_TEXT} (time-series), 86 contracts, " in
+                caplog.text)
+        assert "may keep 5.0% of $749.00 -> sell 43" in caplog.text
+        held, partner = plan.legs
+        assert (held.count, held.held) == (43, 86)
+        assert held.cost_dollars == pytest.approx((51.60 + 2.17) * 43 / 86)
+        # The partner's 129 settled contracts, 43 of them going with the 43 sold
+        assert (partner.ticker, partner.count) == (_SAME_EVENT, 43)
+        assert partner.cost_dollars == pytest.approx((38.70 + 1.90) * 43 / 129)
+        assert partner.payout_dollars == 0.0
+        assert fee_leg_exact(43, 0.86) == 0.37
+        assert plan.proceeds_dollars == pytest.approx(43 * 0.86 - 0.37, abs=1e-12)
+
+    def test_a_lone_legs_wait_counts_a_later_fill_on_its_ladder(self, monkeypatch, caplog):
+        # A, the rocket question at Jan 20, is in the run's market list (not held) and
+        # traded yesterday: a market the finders could pair B with, so B's last trade
+        # is yesterday's, for the trim as for the add-on
+        world = _lone_trim(_lone_partner())
+        world.list(_rung(_A, _EV_A, "Jan 20, 2026", _A_CLOSE))
+        world.fills = _fills({_A: _NOW - timedelta(days=1), _B: _BOUGHT})
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch) == []
+        assert (f"Not trimming {_LONE_HELD_TEXT}: it last traded 2026-01-11, 1 day(s) ago, and "
+                "a trim waits until 7 day(s) have passed since a pair's last trade"
+                in caplog.text)
+        assert world.calls["settlements"] == 0 and world.calls["book"] == []
+        # plan_add_ons names the same day for the same lone leg
+        pattern = re.compile(r"it last traded \S+, -?\d+ day\(s\) ago")
+        trimmed = pattern.findall(caplog.text)
+        caplog.clear()
+        pairs = held_pairs(dict(world.positions), world.labels(), dict(world.markets),
+                           log=False)
+        with caplog.at_level(logging.INFO):
+            assert seller.plan_add_ons(MagicMock(), pairs, dict(world.markets),
+                                       settings=_trim_settings(), now=_NOW) == {}
+        assert pattern.findall(caplog.text) == trimmed == [
+            "it last traded 2026-01-11, 1 day(s) ago"]
+
+    @pytest.mark.parametrize("no_ask_then, prices, trims", [
+        (0.92, "price $0.92 then, $0.88 now (-4c, minimum 10c)", False),
+        (0.76, "price $0.76 then, $0.88 now (+12c, minimum 10c)", True),
+    ])
+    def test_a_lone_legs_price_move_is_its_own_markets(self, monkeypatch, caplog, no_ask_then,
+                                                       prices, trims):
+        # B's NO ask is 0.88 now (1 - its YES bid 0.12). The paid-out partner counts as
+        # 0 then and now, so its payout is never a move
+        world = _lone_trim(_lone_partner())
+        world.candles = {_B: [_candle(_FIRST, 0.10, no_ask_then), _candle(_CK, 0.14, 0.88)]}
+        with caplog.at_level(logging.INFO):
+            plans = _lone_trims(world, monkeypatch, min_move=0.10)
+        if trims:
+            assert [plan.count for plan in plans] == [42]
+            assert (f"129 contracts, last traded 2026-01-05, 7 day(s) ago, {prices}, pays "
+                    "90.9%") in caplog.text
+        else:
+            assert plans == []
+            assert (f"Not trimming {_LONE_TRIM_TEXT}: its price has not moved by the minimum "
+                    f"since it last traded: {prices}") in caplog.text
+        # Only B's own price then was read
+        assert [call[0] for call in world.calls["candles"]] == [_B]
+
+    def test_a_lone_leg_with_no_fill_listed_is_not_trimmed_with_a_minimum(self, monkeypatch,
+                                                                          caplog):
+        world = _lone_trim(_lone_partner())
         world.fills = _fills()
         with caplog.at_level(logging.INFO):
-            assert world.trims(monkeypatch) == []
-        assert "Pairs to trim this run: 0 of 0" in caplog.text
+            assert _lone_trims(world, monkeypatch, min_move=0.10) == []
+        assert (f"Not trimming {_LONE_TRIM_TEXT}: no fill is listed on its market or its "
+                "ladder, so its price when it last traded cannot be read, and a minimum "
+                "price move is set") in caplog.text
+        assert world.calls["candles"] == []
+        # A fill listed, but B's price history cannot be read: no price then
+        world.fills = _fills({_B: _BOUGHT})
+        world.candles = {}
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch, min_move=0.10) == []
+        assert (f"Not trimming {_LONE_TRIM_TEXT}: the NO ask on {_B} when it last traded "
+                "(2026-01-05) cannot be read") in caplog.text
+        assert [call[0] for call in world.calls["candles"]] == [_B]
+
+    def test_a_yes_bid_of_one_cent_on_a_lone_leg_is_not_trimmed(self, monkeypatch, caplog):
+        # The partner's settled YES bid of 0 is no quote a candle must show; B's own
+        # YES bid of 1c is
+        world = _lone_trim(_lone_partner(), yes_bid=0.01)
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch) == []
+        assert (f"Not trimming {_LONE_TRIM_TEXT}: the best YES bid on {_B} ($0.0100) is one "
+                "the hourly price history cannot show") in caplog.text
+
+    def test_a_lone_leg_is_not_sold_into_a_gap_under_its_best_bid(self, monkeypatch):
+        # One contract at the best bid, then nothing until 20c: only that one is sold
+        world = _lone_trim(_lone_partner())
+        world.books[_B]["no"] = [[0.86, 1.0], [0.20, 100_000.0]]
+        (plan,) = _lone_trims(world, monkeypatch)
+        assert plan.count == 1 and [leg.count for leg in plan.legs] == [1, 1]
+        assert plan.ladders == {_B: [[0.86, 1.0]]} and plan.walked == {_B: (0.86, 0.86)}
+        assert plan.proceeds_dollars == pytest.approx(0.86 - fee_leg_exact(1, 0.86))
+
+    def test_a_lone_leg_worth_more_than_every_open_position_stops_every_trim(
+            self, monkeypatch, caplog):
+        world = _lone_trim(_lone_partner())
+        top = 0.86 - config.fee_per_pair_approx(0.0, 0.86)
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch, positions_cents=10_000) == []
+        assert _warnings(caplog) == [
+            "Not trimming any held pair this run, including any marked '-> sell' above: "
+            f"{_LONE_TRIM_TEXT} alone would fetch ${129 * top:.2f} at its best bids (129 "
+            f"contracts at ${top:.2f} each), more than the $100.00 all open positions are "
+            "valued at, so that value cannot be right, and a trim sized on too small a value "
+            "would sell too much"]
+        assert caplog.records[-1].getMessage() == (
+            "Lone legs to trim this run (partner paid out): 0 of 1")
+        # Beside a pair, each alone under the $120 the open positions are valued at but
+        # together over it: no trim either
+        world = _lone_trim(_lone_partner())
+        _weather_pair(world, "rain", 30)
+        pair_top = 0.42 + 0.52 - config.fee_per_pair_approx(0.42, 0.52)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch, positions_cents=12_000) == []
+        (warning,) = _warnings(caplog)
+        assert (f"the 2 positions whose order books were read would fetch "
+                f"${129 * top + 30 * pair_top:.2f} at their best bids together, more than the "
+                "$120.00 all open positions are valued at") in warning
+        # Each alone over the $20 the open positions are valued at (the pair's bids not in
+        # the market list, so its value at this run's bids is $0): the second is counted
+        # as one more position, since one of the two is a lone leg
+        world = _lone_trim(_lone_partner())
+        _weather_pair(world, "rain", 30, quotes=False)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch, positions_cents=2_000) == []
+        (warning,) = _warnings(caplog)
+        assert ("more than the $20.00 all open positions are valued at (and 1 more "
+                "position(s) alike), so that value cannot be right") in warning
+
+    def test_a_lone_leg_picked_for_a_take_profit_sale_is_not_looked_at(self, monkeypatch,
+                                                                       caplog):
+        world = _lone_trim(_lone_partner())
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch, skip=frozenset({_B})) == []
+        assert (f"Not trimming {_LONE_HELD_TEXT}: it is picked for a take-profit sale this run"
+                in caplog.text)
+        assert caplog.records[-1].getMessage() == "Pairs to trim this run: 0 of 0"
         assert world.calls == _NO_READS and world.fill_reads == 0
+
+    def test_the_summary_counts_pairs_and_lone_legs_apart(self, monkeypatch, caplog):
+        # Under a 5% cap both the rain pair (60 each) and the lone leg are sold down
+        world = _lone_trim(_lone_partner())
+        _weather_pair(world, "rain", 60)
+        with caplog.at_level(logging.INFO):
+            plans = _lone_trims(world, monkeypatch, cap=0.05)
+        assert len(plans) == 2
+        assert [r.getMessage() for r in caplog.records][-2:] == [
+            "Pairs to trim this run: 1 of 1",
+            "Lone legs to trim this run (partner paid out): 1 of 1"]
+        # With no lone leg held, the lone legs' line is not logged at all
+        del world.positions[_B]
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert len(_lone_trims(world, monkeypatch, cap=0.05)) == 1
+        assert caplog.records[-1].getMessage() == "Pairs to trim this run: 1 of 1"
+        assert "Lone legs to trim" not in caplog.text
 
     @pytest.mark.parametrize("skip", [frozenset({_A}), frozenset({_B}), frozenset({_A, _B, "X"})])
     def test_a_pair_picked_for_a_take_profit_sale_is_not_looked_at(self, monkeypatch, caplog,

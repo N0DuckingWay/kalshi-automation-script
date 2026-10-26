@@ -4286,7 +4286,12 @@ def held_pair_kind(yes_market: Any, no_market: Any) -> tuple[str, Any, Any] | No
     markets by the finders' own tests. It answers only when the sides held are
     the sides that kind buys (leg_sides): NO on A and YES on B for same-title,
     YES on the earlier deadline (A) and NO on the later (B) for time-series.
-    Anything it cannot show is None, never a guess.
+    Anything it cannot show is None, never a guess. seller.plan_trims also
+    asks it about a lone leg: the held market and its paid-out partner (a
+    settled market, taken from the run's market list or looked up through
+    market_for_labels), each on the side it was held, so for two events the
+    close the time-series test compares is the one Kalshi records for the
+    settled partner.
 
     Both markets need an event ticker: without one, two events cannot be told
     from two rungs of one event, which are ordered by different rules.
@@ -4314,8 +4319,10 @@ def held_pair_kind(yes_market: Any, no_market: Any) -> tuple[str, Any, Any] | No
     not read: those decide what may be bought, not what is held.
 
     Args:
-        yes_market (Any): The market held YES, from the market list.
-        no_market (Any): The market held NO, from the market list.
+        yes_market (Any): The market held YES (for a lone leg, possibly its
+            paid-out partner).
+        no_market (Any): The market held NO (for a lone leg, possibly its
+            paid-out partner).
 
     Returns:
         tuple[str, Any, Any] | None: (pair type, market A, market B), the type
