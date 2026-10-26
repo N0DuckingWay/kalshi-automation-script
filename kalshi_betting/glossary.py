@@ -141,8 +141,9 @@ TERMS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
      "Yes: at each weekly run a held pair is topped up to its Kelly size (its Kelly "
      "fraction of the portfolio value, held to the size cap) when it has room, and "
      "sold down to it when it has grown past it, once 7 days have passed since its "
-     "last trade. No: a pair is bought once and held. Live runs follow the saved "
-     "setting.",
+     "last trade. Once a time-series pair's earlier market has paid out $0, the "
+     "later market still held is sold down the same way. No: a pair is bought "
+     "once and held. Live runs follow the saved setting.",
      "Shows whether keeping every pair at the size Kelly wants beats buying once "
      "and holding.",
      _BACKTEST),

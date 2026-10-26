@@ -11,9 +11,10 @@ module, and the client is a MagicMock that is never called.
 
 seller.plan_trims (selling part of a held pair, or of a lone leg whose
 partner has paid out, that has outgrown the size the Kelly rule allows) is
-checked the same way: one exact pair, live and in the backtest, must sell the
-count backtester._kelly_trim sells. Its 7-day wait after a trade is tested on
-each of the 8 days after a purchase.
+checked the same way: one exact pair, and one lone leg, live and in the
+backtest, must sell the count backtester._kelly_trim sells, and what is left of
+the lone leg must then be valued alike for a take-profit sale. Its 7-day wait
+after a trade is tested on each of the 8 days after a purchase.
 
 seller.plan_add_ons (which held pairs a run may add to) waits as the trim
 does, and its price move must equal the backtest's (backtester._held_pair_move
@@ -1534,10 +1535,124 @@ _TRIM_PARITY_SELLS = {
     "a 1c YES bid on market B": "none",
 }
 
+# The standard lone leg's later market at the run, (YES ask, NO ask): a best NO
+# bid of 0.85 for the NO held, and a best YES bid of 0.14
+_LONE_B_NOW = (0.15, 0.86)
+
+
+class _LoneTrimCase:
+    """
+    One lone leg built twice, as _TrimCase builds a pair: YES on the earlier
+    market A and NO on the later market B of a time-series pair, bought at the
+    previous Monday's run. A paid out $0 ("no") three days before this run; B
+    is still open. The backtest holds it as one trade whose A leg has paid
+    out. The live account holds B alone, with A among its settlements (found
+    by a lookup: it asks B's question) and B's book at the backtest's
+    checkpoint bids. B's candles give both paths the same quotes at the
+    take-profit rule's earlier checks. Live lists no fill on another market of
+    B's ladder: that fill is the one part of the live wait the backtest has no
+    twin for.
+
+    Attributes:
+        n (int): B's NO contracts, and the YES contracts A paid $0 on.
+        trade (BacktestTrade): The position as the backtest holds it.
+        world (_World): The live account and exchange.
+        positions_cents (int): What Kalshi values the open positions at, in cents.
+    """
+
+    def __init__(self, b_now: tuple = _LONE_B_NOW, *, n: int = 30, model=None,
+                 price_a: float = 0.30, price_b: float = 0.40,
+                 positions_cents: int = 5_000) -> None:
+        self.n = n
+        self.positions_cents = positions_cents
+        market_a = _rung(_A, _EV_A, "Jan 20, 2026", _A_CLOSE)
+        market_b = _rung(_B, _EV_B, "Jan 25, 2026", _B_CLOSE)
+        settled = datetime.fromtimestamp(_CK - 3 * _DAY, UTC)
+        candles_a = [_candle(_FIRST, 0.30, 0.71), _candle(_CK - 4 * _DAY, 0.20, 0.81)]
+        candles_b = [_candle(_FIRST, 0.59, 0.41),                  # NO ask 0.41 when bought
+                     _candle(_CK - 2 * _DAY - 3600, 0.16, 0.86),   # NO bid 0.84
+                     _candle(_CK - _DAY - 1800, 0.14, 0.87),       # NO bid 0.86
+                     _candle(_CK, *b_now)]
+        # The backtest: one trade, each market's quotes from its candles
+        quotes_a, _ = backtester._leg_quotes(
+            {"ticker": _A, "settlement_ts": settled.isoformat(), "result": "no"},
+            candles_a, _START, model)
+        quotes_b, _ = backtester._leg_quotes(
+            {"ticker": _B, "settlement_ts": "2026-02-25T12:00:00+00:00", "result": "yes"},
+            candles_b, _START, model)
+        fee_a, fee_b = fee_leg_exact(n, price_a), fee_leg_exact(n, price_b)
+        self.trade = backtester.BacktestTrade(
+            pair_type="time_series", ticker_a=_A, ticker_b=_B, title_a="", title_b="",
+            category="Other", entry_date=date(2026, 1, 5), exit_date=date(2026, 2, 25),
+            entry_pA=price_a, entry_pB=1 - price_b, entry_nA=1 - price_a, entry_nB=price_b,
+            n=n, total_cost=n * price_a + n * price_b, fees=fee_a + fee_b,
+            outcome_a="no", outcome_b="yes", actual_payoff=0.0, profit=0.0,
+            profit_ratio=0.0, monthly_profit_ratio=0.0, kelly_fraction=0.1,
+            expected_payoff=0.0, slippage=0.0, holding_days=10, balance_at_entry=10_000.0,
+            close_date_a=_A_CLOSE.date(), close_date_b=_B_CLOSE.date(),
+            marks=(quotes_a, quotes_b))
+        # Live: B held alone, A one of the account's settlements (n YES bought for
+        # what the trade's A leg cost, paid $0)
+        self.world = _World()
+        self.world.hold(market_b, -float(n), n * price_b, fee_b)
+        self.world.lookup[_A] = market_a
+        self.world.known[_A] = market_a
+        self.world.settlements = [Settlement(_A, _EV_A, "no", float(n), 0.0, n * price_a,
+                                             0.0, fee_a, 0.0, settled)]
+        # Both sides of B's book: a side's best bid is 1 minus the other side's ask
+        best = {"yes": round(1.0 - b_now[1], 6), "no": round(1.0 - b_now[0], 6)}
+        book = {}
+        for side in ("yes", "no"):
+            # Where the backtest has a bid, the book's best bid is that very number
+            assert quotes_b.bid_at_checkpoint(_D, side) == best[side]
+            # The NO held gets the backtest's modeled bid ladder when it has one,
+            # else one deep bid, as the backtest sells
+            ladder = quotes_b.sale_ladder(_D, best[side]) if side == "no" else None
+            book[side] = ladder if ladder is not None else [[best[side], 100_000.0]]
+        self.world.books[_B] = book
+        self.world.candles = {_A: candles_a, _B: candles_b}
+        self.world.fills = _fills({_B: _BOUGHT})
+
+    def value(self, value_cents: int) -> float:
+        """The portfolio value, in dollars, that plan_trims sizes on for `value_cents` in all."""
+        # Kalshi's $50 for the open positions is more than B fetches at its bids,
+        # so live sizes on the cash plus that $50: the whole amount
+        return value_cents / 100
+
+    def backtest(self, value_cents: int, *, k: float = 0.8, cap: float = 1.0,
+                 st_cap: float = 0.2):
+        """backtester._kelly_trim's (decision, sale) for the lone leg at one portfolio value."""
+        return backtester._kelly_trim([self.trade], _D, self.value(value_cents), k, cap, st_cap)
+
+    def live(self, monkeypatch, value_cents: int, *, k: float = 0.8, cap: float = 1.0,
+             st_cap: float = 0.2, min_move: float | None = None) -> list:
+        """seller.plan_trims' plans for the lone leg at the same portfolio value."""
+        return self.world.trims(
+            monkeypatch, _trim_settings(k=k, cap=cap, st_cap=st_cap, min_move=min_move),
+            cash_cents=value_cents - self.positions_cents,
+            positions_value_cents=self.positions_cents)
+
+
+# Each case: (lone leg builder, portfolio value in cents, caps, what is sold:
+# none or part of it). Live and the backtest must sell the same number of contracts
+_LONE_TRIM_PARITY_CASES = {
+    # B's 30 NO, worth $25 of a $100 portfolio, under a 10% cap: sold down to the cap
+    "a lone leg past its size cap": (lambda: _LoneTrimCase(), 10_000, {"cap": 0.10}, "part"),
+    # No cap in the way: Kelly's own share of a $50 portfolio is the limit
+    "a lone leg past its Kelly share, under its cap": (
+        lambda: _LoneTrimCase(b_now=(0.30, 0.72)), 5_000, {}, "part"),
+    "a lone leg within its share": (lambda: _LoneTrimCase(), 100_000, {}, "none"),
+    # B's NO bids on the backtest's modeled ladder, every level within 5c of the best
+    "a lone leg on a modeled ladder": (
+        lambda: _LoneTrimCase(model=_ladder_model(((0.0, 5.0), (0.02, 5.0), (0.05, 100.0)))),
+        10_000, {"cap": 0.10}, "part"),
+}
+
 
 class TestTrimParityWithTheBacktest:
     """seller.plan_trims sells the count backtester._kelly_trim sells of the same
-    pair at the same quotes, portfolio value, k and caps, and values the sale alike."""
+    pair, or the same lone leg, at the same quotes, portfolio value, k and caps,
+    and values the sale alike."""
 
     @pytest.mark.parametrize("name", list(_TRIM_PARITY_CASES))
     def test_the_same_count_and_the_same_sale(self, monkeypatch, name):
@@ -1675,6 +1790,143 @@ class TestTrimParityWithTheBacktest:
         week = config.PRICE_THEN_MAX_AGE_DAYS * _DAY
         assert case.world.calls["candles"][:2] == [
             (_A, _EV_A, _FIRST - week - 3600, _FIRST), (_B, _EV_B, _FIRST - week - 3600, _FIRST)]
+
+    @pytest.mark.parametrize("name", list(_LONE_TRIM_PARITY_CASES))
+    def test_a_lone_leg_sells_the_same_count_and_the_same_sale(self, monkeypatch, name):
+        build, value_cents, caps, sells = _LONE_TRIM_PARITY_CASES[name]
+        case = build()
+        # The backtest reads it as a lone leg: A paid $0 on the YES held, B is open
+        assert backtester._lone_leg(case.trade, _D) is True
+        # B's NO bids all sit within the live reach under the best bid, so the
+        # live cut leaves the book whole and both paths walk the same bids
+        best = case.world.books[_B]["no"][0][0]
+        assert all(best - price <= seller.KELLY_TRIM_MAX_BID_DROP
+                   for price, _contracts in case.world.books[_B]["no"])
+        decision, sale = case.backtest(value_cents, **caps)
+        plans = case.live(monkeypatch, value_cents, **caps)
+        assert [plan.count for plan in plans] == ([decision.sell] if decision.sell else [])
+        if sells == "none":
+            assert decision.sell == 0
+            return
+        assert 0 < decision.sell < case.n, name
+        (plan,) = plans
+        assert plan.kind == config.SALE_KIND_KELLY_TRIM and plan.level is None
+        # B sells the count of the n held; the paid-out partner A goes with them
+        held, partner = plan.legs
+        assert (held.ticker, held.side, held.count, held.held) == (
+            _B, "no", decision.sell, case.n)
+        assert (partner.ticker, partner.side, partner.count, partner.market) == (
+            _A, "yes", decision.sell, None)
+        assert partner.payout_dollars == 0.0
+        # The backtest's own valuation of selling that many: B alone sells, and A
+        # (no sale price) adds its $0 payout
+        sold, per_trade = sale
+        assert sold == [decision.sell]
+        ((sale_value, _fees, (price_a, price_b)),) = per_trade
+        assert price_a is None
+        _, value, cost, potential = backtester._position_sale_value(
+            [case.trade], _D, sold=[decision.sell])
+        assert plan.proceeds_dollars == pytest.approx(sale_value, abs=1e-9)
+        assert plan.proceeds_dollars == pytest.approx(value, abs=1e-9)
+        assert plan.cost_dollars == pytest.approx(cost, abs=1e-9)
+        assert plan.profits == ((pytest.approx(value - cost, abs=1e-9),
+                                 pytest.approx(potential - cost, abs=1e-9)),)
+        assert list(plan.walked) == [_B]
+        assert plan.walked[_B][0] == pytest.approx(price_b, abs=1e-12)
+
+    def test_the_lone_leg_cases_are_what_they_say(self, monkeypatch):
+        # The counts by hand. B's NO bid 0.85 and YES bid 0.14; A reads as its
+        # settlement price (a YES bid of 0, a NO bid of 1), so its midpoint is 0:
+        #  - B pays with chance 1 - 0.8 x (0.145 - 0) = 88.4%
+        #  - one contract sells for 0.85 less the fee 0.07 x 0.85 x 0.15: $0.841075
+        #  - Kelly's hold share (0.884 - 0.841075) / (1 - 0.841075) = 27.0% is above
+        #    the 10% cap, so of a $100 portfolio B may keep $10: 11.89 contracts, so
+        #    11 kept and 19 sold; 19 sell for 19 x 0.85 less a $0.17 fee, $15.98, or
+        #    $0.841053 a contract, at which it may still keep only 11
+        case = _LoneTrimCase()
+        (plan,) = case.live(monkeypatch, 10_000, cap=0.10)
+        assert plan.count == case.backtest(10_000, cap=0.10)[0].sell == 19
+        assert plan.proceeds_dollars == pytest.approx(19 * 0.85 - 0.17, abs=1e-12)
+        # The modeled ladder holds 5 contracts at 0.85, 5 at 0.83 and 100 at 0.80,
+        # and both paths walk down to 0.80
+        build, value_cents, caps, _sells = _LONE_TRIM_PARITY_CASES[
+            "a lone leg on a modeled ladder"]
+        laddered = build()
+        assert laddered.world.books[_B]["no"] == [[0.85, 5.0], [0.83, 5.0], [0.8, 100.0]]
+        (plan,) = laddered.live(monkeypatch, value_cents, **caps)
+        assert plan.walked[_B][1] == pytest.approx(0.80)
+        assert plan.count == laddered.backtest(value_cents, **caps)[0].sell
+
+    def test_a_lone_legs_live_price_move_is_the_backtests(self, monkeypatch):
+        # B's NO ask was 0.41 when bought and is 0.86 now. A has paid out, so it
+        # counts 0 then and now on both paths: the move is B's own, +45c
+        case = _LoneTrimCase()
+        expected = backtester._price_move([case.trade], _D, {})
+        assert expected == pytest.approx(0.45, abs=1e-9)
+        measured = []
+        real = seller.pair_price_move
+
+        def spy(then, now):
+            measured.append((then, now, real(then, now)))
+            return measured[-1][2]
+
+        monkeypatch.setattr(seller, "pair_price_move", spy)
+        # A 45c move meets a 45c minimum, on both paths
+        assert config.price_move_reached(expected, 0.45)
+        (plan,) = case.live(monkeypatch, 10_000, cap=0.10, min_move=0.45)
+        assert measured == [(pytest.approx(0.41), pytest.approx(0.86),
+                             pytest.approx(expected, abs=1e-9))]
+        assert plan.count == case.backtest(10_000, cap=0.10)[0].sell == 19
+        # ... and falls short of a 50c one, on both paths
+        assert not config.price_move_reached(expected, 0.50)
+        assert case.live(monkeypatch, 10_000, cap=0.10, min_move=0.50) == []
+        # Only B's price then is read from candles: A sells nothing
+        assert {ticker for ticker, *_ in case.world.calls["candles"]} == {_B}
+
+    def test_after_a_lone_trim_what_is_left_is_valued_alike(self, monkeypatch):
+        # The trim sells 19 of B's 30 NO. The backtest's walk splits its trade and
+        # keeps 11; live, B then holds 11, its cost and fees in the same share (the
+        # account as the backtest's split keeps it; Kalshi itself keeps the sold
+        # contracts' fees in what it lists as paid), and its partner A, which
+        # settled with 30, is found in the wider search and scaled to 11/30
+        case = _LoneTrimCase()
+        decision, _sale = case.backtest(10_000, cap=0.10)
+        (trim,) = case.live(monkeypatch, 10_000, cap=0.10)
+        sold = trim.count
+        assert sold == decision.sell == 19
+        backtester._split_trade(case.trade, sold)
+        left = case.n - sold
+        held = case.world.positions[_B]
+        case.world.positions[_B] = HeldPosition(
+            _B, -float(left), held.exposure_dollars * left / case.n,
+            held.fees_dollars * left / case.n)
+        # The backtest's take-profit value of what is left, now and at each check
+        _per_trade, value, cost, potential = backtester._position_sale_value([case.trade], _D)
+        sale, profits = backtester._hold_readings([case.trade], _D,
+                                                  backtester._resolve_hold_days())
+        assert tuple(sale[1:]) == (value, cost, potential)
+        (plan,) = case.world.plan(monkeypatch, 0.01)
+        assert plan.count == left
+        held_leg, partner = plan.legs
+        assert (held_leg.ticker, held_leg.count, partner.ticker, partner.count) == (
+            _B, left, _A, left)
+        assert partner.cost_dollars == pytest.approx(
+            (case.n * 0.30 + fee_leg_exact(case.n, 0.30)) * left / case.n, abs=1e-12)
+        assert partner.payout_dollars == 0.0
+        assert plan.cost_dollars == pytest.approx(cost, abs=1e-9)
+        assert plan.proceeds_dollars == pytest.approx(value, abs=1e-9)
+        assert plan.profits[0] == (pytest.approx(value - cost, abs=1e-9),
+                                   pytest.approx(potential - cost, abs=1e-9))
+        for (live_realized, live_potential), (realized, potential_profit) in zip(
+                plan.profits, profits, strict=True):
+            assert live_realized == pytest.approx(realized, abs=1e-9)
+            assert live_potential == pytest.approx(potential_profit, abs=1e-9)
+        # The same verdict at the highest 1% level the backtest sells at, and the next
+        levels = [round(step / 100, 2) for step in range(1, 101)]
+        top = max(level for level in levels
+                  if backtester._reached_every_day(level, profits))
+        assert case.world.plan(monkeypatch, top)
+        assert top < 1.0 and not case.world.plan(monkeypatch, round(top + 0.01, 2))
 
 
 # ─── The wait after a trade, however often the bot runs ───────────────────────

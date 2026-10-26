@@ -23526,6 +23526,45 @@ class TestLoneLegTrim:
         assert decision.sell == 100 and sold == [100]
         assert prices == (None, 0.75) and fees == fee_leg_exact(100, 0.75)
 
+    def test_a_walked_lone_trim_sells_what_is_wanted_at_its_own_price(self):
+        # 3,000 NO held on QB, whose NO bids sit on a modeled ladder: 100 at its
+        # best bid 0.75, then 1,000 at 0.70. QA has paid out $0 on the YES held
+        # there. By hand, on a $10,000 portfolio at k 0.75 and a 20% cap:
+        #  - QB pays with chance 1 - 0.75 x (0.24 - 0) = 82%; one contract at the
+        #    best bid sells for 0.75 less the fee 0.07 x 0.75 x 0.25: $0.736875.
+        #    Kelly's share (0.82 - 0.736875) / 0.263125 = 31.6% is above the cap,
+        #    so $2,000 keeps 2,714 contracts and 286 would be sold
+        #  - selling 286 walks 186 of them down to 0.70: $205.20 less a $4.06 fee,
+        #    $0.703287 a contract, at which only 157 are wanted sold, not 286
+        #  - selling 192 (100 at 0.75, 92 at 0.70): $139.40 less a $2.68 fee,
+        #    $136.72, $0.712083 a contract, which keeps 2,808: all 192 are
+        #    wanted. 193 ($137.41, $0.711969 a contract) keeps 2,809, one short
+        # QA counts $0 in every one of these sales. Counted at $1, each contract
+        # would sell for over $1, the cap would keep fewer than 1,200, and all
+        # 286 would be sold
+        levels = ((0.0, 100.0), (0.05, 1000.0))
+        model = _ladder_model(levels)
+        paid = _sale_quotes("QA", float("nan"), float("nan"), model, paid=True)
+        open_b = _sale_quotes("QB", 0.23, 0.75, model)
+        trade = _held_trade(3000, paid, open_b)
+        day = _LADDER_M2
+        assert backtester._lone_leg(trade, day) is True
+        assert open_b.sale_ladder(day, 0.75) == [[0.75, 100.0], [0.70, 1000.0]]
+        # At the best bid alone the rule would sell 286
+        win = config.held_pair_win_prob("time_series", 0.0, 1.0, 0.25, 0.77, 0.75)
+        top = 0.75 - fee_per_pair_approx(0.0, 0.75)
+        assert config.kelly_trim_count(
+            3000, 10_000.0, win, 0.20, top,
+            lambda count: _sale_value(count, ("paid", 0.0), ("bid", 0.75))).sell == 286
+        decision, (sold, ((value, fees, prices),)) = backtester._kelly_trim(
+            [trade], day, 10_000.0, 0.75, 0.20, 1.0)
+        assert decision.sell == 192 and sold == [192]
+        average = _walk_average(0.75, 192, levels)
+        assert average == pytest.approx(139.40 / 192, abs=1e-12)
+        assert prices == (None, pytest.approx(average, abs=1e-12))
+        assert fees == fee_leg_exact(192, prices[1]) == 2.68
+        assert value == pytest.approx(139.40 - 2.68, abs=1e-9)
+
     def test_a_lone_leg_whose_earlier_side_won_is_left_alone(self):
         # LA settles "yes": the YES held there paid $1, and LB settles "yes"
         # too (its NO lost). Its NO is quoted past the cap, but it is no lone
