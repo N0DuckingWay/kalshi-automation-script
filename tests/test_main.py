@@ -1154,6 +1154,14 @@ class TestLiveSettingsFlags:
         assert out.count("a higher k also sells: each exact held") == 1
         assert out.count("worth more than its new Kelly size is sold down to it before "
                          "anything is bought, once its wait has passed") == 3
+        # A lone leg is the later market of a time-series pair, so the flags that can
+        # reach one (k, and the per-trade cap) name it; the same-title cap does not
+        lone = "pair, or lone leg whose partner has paid out, worth more than its new Kelly"
+        assert out.count(lone) == 2
+        assert ("a higher k also sells: each exact held time-series " + lone) in out
+        assert ("a lower cap also sells: each exact held " + lone) in out
+        assert ("a lower cap also sells: each exact held same-title pair worth more than "
+                "its new Kelly") in out
         assert out.count("With Rebalance yes (saved, or given with --rebalance), a ") == 3
         assert "Production runs only: a dev run holds nothing" in out
         # The constant itself is never named (its wait's constant is, above)
@@ -1169,10 +1177,11 @@ class TestLiveSettingsFlags:
         # The rebalance flags. argparse may wrap a flag's name at a hyphen, so
         # the pinned words stop short of one
         assert ("Rebalance the held pairs this run: before buying, sell part of each exact "
-                "held pair that has outgrown its Kelly size, once "
-                "config.REBALANCE_MIN_DAYS_SINCE_TRADE calendar days have passed since the "
-                "pair's last trade, and let this run add to a pair the account already "
-                "holds") in out
+                "held pair, or lone leg whose partner has paid out, that has outgrown its "
+                "Kelly size, once config.REBALANCE_MIN_DAYS_SINCE_TRADE calendar days have "
+                "passed since its last trade, and let this run add to a pair the account "
+                "already holds (exactly the same two markets, the same side on each, or a "
+                "lone leg beside a market not held) after the same wait") in out
         assert ("neither trims nor adds to a held pair, and clears the saved minimum price "
                 "move too.") in out
         assert "no run acts on it" not in out
@@ -1372,26 +1381,29 @@ class TestLogLiveSettings:
         return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
                 and "can sell more of the held pairs" in r.getMessage()]
 
-    @pytest.mark.parametrize("change, named", [
+    @pytest.mark.parametrize("change, named, lone", [
         ({"size_cap": 0.10}, "the time-series size cap goes from 20% to 10% and the "
-                             "same-title size cap goes from 20% to 10%"),
-        ({"same_title_size_cap": 0.10}, "the same-title size cap goes from 20% to 10%"),
+                             "same-title size cap goes from 20% to 10%", True),
+        # A lone leg is never a same-title position: the sentence leaves it out
+        ({"same_title_size_cap": 0.10}, "the same-title size cap goes from 20% to 10%", False),
         ({"interval_discount": 0.9}, "k goes from 0.8 to 0.9, which lowers a time-series "
-                                     "pair's chance of paying"),
+                                     "pair's chance of paying", True),
     ], ids=["per-trade cap", "same-title cap", "k"])
-    def test_with_rebalancing_on_a_lower_cap_or_a_higher_k_is_said_to_sell(self, caplog,
-                                                                           change, named):
+    def test_with_rebalancing_on_a_lower_cap_or_a_higher_k_is_said_to_sell(
+        self, caplog, change, named, lone,
+    ):
         # A real-money run whose flags lower a cap or raise k warns that it can sell
         saved = LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, rebalance=True,
                              origin=self._ORIGIN)
         with caplog.at_level(logging.INFO):
             main._log_live_settings(dataclasses.replace(saved, **change), saved,
                                     real_money=True)
+        who = ("each exact held pair, or lone leg whose partner has paid out, worth"
+               if lone else "each exact held pair worth")
         assert self._trim_lines(caplog) == [
             "Live settings: with Rebalance yes, these settings can sell more of the held "
-            f"pairs: {named}; each exact held pair worth more than its new Kelly size is sold "
-            "down to it before anything is bought, once the wait since its last trade has "
-            "passed"]
+            f"pairs: {named}; {who} more than its new Kelly size is sold down to it before "
+            "anything is bought, once the wait since its last trade has passed"]
         # ... after the WARNING that the flags override the saved defaults
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert warnings.index(self._trim_lines(caplog)[0]) > [
@@ -5320,6 +5332,10 @@ class TestRunProdAddsToHeldPairsLive:
         client.get_market_orderbook_without_preload_content = MagicMock(
             side_effect=lambda ticker: _raw_json_response(books.get(
                 ticker, {"orderbook_fp": {"yes_dollars": [], "no_dollars": []}})))
+        # A run that trims reads the account's settlements to find a lone leg's paid-out
+        # partner; this account has none, so the lone leg is left as it is
+        client.get_settlements_without_preload_content = MagicMock(
+            return_value=_raw_json_response({"settlements": [], "cursor": None}))
         monkeypatch.setattr(trader_mod, "_V2_NO_MAPPING_CONFIRMED", mapping_confirmed)
         if not same_title:
             monkeypatch.setattr(main, "find_same_title_pairs",
@@ -5367,6 +5383,12 @@ class TestRunProdAddsToHeldPairsLive:
         assert result.status == "executed"
         held = result.spec.pair.held
         assert held is not None and held.lone and held.sides == ((l20, "no"),)
+        # With no paid-out partner among the settlements the lone leg is not trimmed, and
+        # no order on it is a sale; the settlements were read, not failed
+        assert (f"Not trimming NO {l20} (alone on its ladder): no paid-out partner"
+                in caplog.text)
+        assert "settlements could not be read" not in caplog.text
+        assert not [b for b in sent if b["reduce_only"]]
         # The new contracts only: Dec 20 holds its 30 plus them, Dec 13 only them
         assert positions[l20] == -30 - result.spec.x
         assert positions[l13] == result.spec.x
@@ -5604,12 +5626,13 @@ class _SellExchange:
     A stand-in exchange for a run that sells, keeping a ledger of positions.
 
     It serves the balance (`before`, then `after`, until set_balance swaps
-    them), positions from the ledger, order books, hourly candles, an empty
-    settlements list, the account's fills, the orders resting on the account,
-    and order submission. An order fills in full unless `fills` says
-    otherwise, moves its market's position (a bid by +count, an ask by -count)
-    and, if anything filled, adds a fill dated `now` (else the real time). The
-    requests listed under `events` are recorded there, in order.
+    them), positions from the ledger, order books, hourly candles, the
+    account's settlements (none by default), the account's fills, the orders
+    resting on the account, and order submission. An order fills in full
+    unless `fills` says otherwise, moves its market's position (a bid by
+    +count, an ask by -count) and, if anything filled, adds a fill dated `now`
+    (else the real time). The requests listed under `events` are recorded
+    there, in order.
 
     Attributes:
         client (MagicMock): The KalshiClient.
@@ -5628,7 +5651,8 @@ class _SellExchange:
                  include_time_series: bool = False, fill_rows: tuple = (),
                  fills_unreadable: bool = False, candles: dict | None = None,
                  books: dict | None = None, resting_orders: tuple = (),
-                 orders_unreadable: str | None = None):
+                 orders_unreadable: str | None = None, more_events: tuple = (),
+                 settlements: tuple = (), lookups: dict | None = None):
         """
         Build the exchange and its client.
 
@@ -5653,6 +5677,13 @@ class _SellExchange:
             orders_unreadable (str | None): How every resting-orders read fails:
                 "error" (HTTP 500), "not a list", or "repeated cursor" (each page
                 names the same next page); None serves `resting_orders`.
+            more_events (tuple): Events (_ev) the market list carries besides
+                the sellable pair's.
+            settlements (tuple): The account's settlement records
+                (_settlement_row), as the settlements listing serves them.
+            lookups (dict | None): Market ticker -> (raw market dict, its
+                event's title): the markets a single-market lookup finds, such
+                as a paid-out partner the market list no longer holds.
         """
         self.ledger = {r["ticker"]: Decimal(r["position_fp"]) for r in held_rows}
         self.costs = {r["ticker"]: (r.get("market_exposure_dollars"),
@@ -5672,7 +5703,7 @@ class _SellExchange:
         client = _live_shape_client(
             monkeypatch, balance_payload=before, balance_payload_after=after,
             include_held_position=False, include_time_series=include_time_series,
-            extra_events=_sell_events())
+            extra_events=_sell_events() + tuple(more_events))
         self._balance = client.get_balance_without_preload_content.side_effect
 
         def balance_read(*args, **kwargs):
@@ -5686,7 +5717,15 @@ class _SellExchange:
             side_effect=lambda ticker: _raw_json_response(every_book.get(
                 ticker, {"orderbook_fp": {"yes_dollars": [], "no_dollars": []}})))
         client.get_settlements_without_preload_content = MagicMock(
-            return_value=_raw_json_response({"settlements": [], "cursor": None}))
+            return_value=_raw_json_response({"settlements": list(settlements),
+                                             "cursor": None}))
+        if lookups:
+            titles = {raw["event_ticker"]: title for raw, title in lookups.values()}
+            client.get_market_without_preload_content = MagicMock(
+                side_effect=lambda ticker: _raw_json_response({"market": lookups[ticker][0]}))
+            client.get_event_without_preload_content = MagicMock(
+                side_effect=lambda event_ticker: _raw_json_response(
+                    {"event": {"event_ticker": event_ticker, "title": titles[event_ticker]}}))
         client.get_fills_without_preload_content = MagicMock(side_effect=self._fills_page)
         client.get_orders_without_preload_content = MagicMock(side_effect=self._orders_page)
         client.rest_client.request = MagicMock(side_effect=self._request)
@@ -7080,6 +7119,50 @@ _AFTER_TS90_TRIM_BALANCE = {
     "portfolio_value": 4_130,
 }
 
+# A lone leg (the Kelly trim of a held market whose pair-mate paid out). The
+# account holds NO on LONE-LATE alone: 100 contracts bought at 0.60 ($60.00 and
+# $1.70 of fees). Its pair-mate, YES on the earlier rung LONE-PAID of the same
+# event, settled "no" three days ago, so that YES paid $0. LONE-LATE's book is
+# a YES bid of 0.10 and a NO bid of 0.88 (a YES ask of 0.12), so Kalshi values
+# the 100 contracts at $88.00, and a trim is sized on $148.00 = $60.00 of cash
+# + $88.00. By hand, at k 0.75:
+#  - The paid-out market reads as its settlement price, a YES bid of 0 and a NO
+#    bid of $1, so its midpoint is 0. LONE-LATE's is halfway between its YES ask
+#    0.12 and its YES bid 0.10: 0.11. It pays with a chance of
+#    1 - 0.75 x 0.11 = 91.75%.
+#  - One contract sells for 0.88 less the fee 0.07 x 0.88 x 0.12 = $0.007392:
+#    $0.872608. Kelly's hold share is (0.9175 - 0.872608) / (1 - 0.872608) =
+#    35.2%.
+#  - Under a 10% cap it may keep $14.80: 14.80 / 0.872608 = 16.96, so 16 stay
+#    and 84 are sold. Selling 84 returns 84 x 0.88 = $73.92 less the fee
+#    ceil(0.07 x 84 x 0.88 x 0.12) = $0.63, $73.29, or $0.8725 a contract, at
+#    which 16 is still what it may keep (17 x 0.8725 = $14.83).
+#  - With no size cap, Kelly's own share binds: 35.2% of $148.00 = $52.15
+#    keeps 59 (52.15 / 0.872608 = 59.8), so 41 are sold: $36.08 less $0.31 is
+#    $0.8724 a contract, at which 59 is still what it may keep (60 x 0.8724 =
+#    $52.35).
+# LONE-LATE last traded ten days ago, so its wait has passed.
+_TICKER_LONE_PAID, _TICKER_LONE_LATE = "LONE-PAID", "LONE-LATE"
+_LONE_ROWS = (
+    {"ticker": _TICKER_LONE_LATE, "position_fp": "-100.00",
+     "market_exposure_dollars": "60.00", "fees_paid_dollars": "1.70"},
+)
+_LONE_BEFORE = {**_TRIM_BEFORE, "portfolio_value": 8_800}
+_LONE_BOOKS = {_TICKER_LONE_LATE: {"orderbook_fp": {"yes_dollars": [["0.10", "1000"]],
+                                                    "no_dollars": [["0.88", "1000"]]}}}
+_LONE_SIZED = ("Kelly trim sizes on $148.00 = cash $60.00 + open positions $88.00 "
+               "(Kalshi's value $88.00; $88.00 at this run's bids)")
+# What the 84 sold return after the fee, floored to the cent
+_LONE_PROCEEDS_CENTS = 7_329
+# The balance a live run reads back after selling 84: the proceeds on shard 0,
+# and Kalshi's value of the 16 contracts left (16 x 0.88)
+_AFTER_LONE_TRIM_BALANCE = {
+    "balance": 114, "balance_dollars": "133.2900",
+    "balance_breakdown": [{"exchange_index": 0, "balance": "113.2900"},
+                          {"exchange_index": 1, "balance": "20.0000"}],
+    "portfolio_value": 1_408,
+}
+
 
 def _trim_fills(*tickers: str, days_ago: float = 10, oldest_days_ago: float = 30) -> tuple:
     """
@@ -7122,6 +7205,66 @@ def _trim_exchange(monkeypatch, *, held_rows: tuple = _SELL_ROWS, before: dict =
         fill_rows = _trim_fills(*(row["ticker"] for row in held_rows))
     return _SellExchange(monkeypatch, held_rows=held_rows, before=before,
                          fill_rows=fill_rows, **kwargs)
+
+
+def _settlement_row(ticker: str, event_ticker: str, result: str, *, days_ago: float = 3,
+                    count: str = "100.00", cost: str = "30.00", fees: str = "1.40") -> dict:
+    """
+    One settlement of the account, as the settlements listing sends it (cents for revenue).
+
+    The account held `count` YES on the market (so it paid its count in dollars
+    when the market settled "yes", and nothing when it settled "no").
+
+    Args:
+        ticker (str): The settled market.
+        event_ticker (str): Its event.
+        result (str): "yes" or "no".
+        days_ago (float): Keyword-only. How many days ago it paid out.
+        count (str): Keyword-only. The YES contracts held, as a fixed-point string.
+        cost (str): Keyword-only. What they cost, in dollars.
+        fees (str): Keyword-only. The fees paid on them, in dollars.
+
+    Returns:
+        dict: The settlement record.
+    """
+    settled = datetime.now(UTC) - timedelta(days=days_ago)
+    return {"ticker": ticker, "event_ticker": event_ticker, "market_result": result,
+            "yes_count_fp": count, "no_count_fp": "0.00",
+            "yes_total_cost_dollars": cost, "no_total_cost_dollars": "0.000000",
+            "fee_cost": fees, "revenue": int(Decimal(count) * 100) if result == "yes" else 0,
+            "settled_time": settled.isoformat()}
+
+
+def _lone_exchange(monkeypatch, *, partner_result: str = "no", **kwargs) -> _SellExchange:
+    """
+    A _SellExchange for the lone leg above: NO on LONE-LATE, its pair-mate paid out.
+
+    The market list holds LONE-LATE (the Nov 6 rung of event EVL-LONE); the
+    pair-mate LONE-PAID (the Nov 1 rung, a settled market the list no longer
+    holds) is found among the settlements and looked up by ticker.
+
+    Args:
+        monkeypatch (pytest.MonkeyPatch): pytest's per-test patcher.
+        partner_result (str): Keyword-only. How LONE-PAID settled: "no" (its YES
+            paid $0, so LONE-LATE can still win) or "yes".
+        **kwargs: _trim_exchange's other arguments (the balance replies, say).
+
+    Returns:
+        _SellExchange: The exchange.
+    """
+    def close(days: int) -> str:
+        return (datetime.now(UTC) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    late = _mk_market(_TICKER_LONE_LATE, "EVL-LONE", "Will L happen by November 6, 2026?",
+                      "Outcome", "0.12", "0.90", price_level_structure="linear_cent",
+                      close_time=close(35))
+    paid = {**_mk_market(_TICKER_LONE_PAID, "EVL-LONE", "Will L happen by November 1, 2026?",
+                         "Outcome", "0.00", "1.00", price_level_structure="linear_cent",
+                         close_time=close(-3)), "status": "finalized"}
+    settlement = _settlement_row(_TICKER_LONE_PAID, "EVL-LONE", partner_result)
+    return _trim_exchange(
+        monkeypatch, held_rows=_LONE_ROWS, before=kwargs.pop("before", _LONE_BEFORE),
+        books=_LONE_BOOKS, more_events=(_ev("Lone Event", late),), settlements=(settlement,),
+        lookups={_TICKER_LONE_PAID: (paid, "Lone Event")}, **kwargs)
 
 
 def _sale_orders(exchange: _SellExchange) -> list:
@@ -7449,6 +7592,101 @@ class TestRunProdTrimsInADryRun:
         assert ("event", "EVS-SELL-EARLY") not in ladders
         assert ("event", "EVT-TS-EARLY") in ladders
 
+    def test_a_lone_leg_past_its_cap_is_trimmed_before_anything_is_bought(self, monkeypatch,
+                                                                         caplog):
+        # NO on LONE-LATE alone, its pair-mate paid out $0: under a 10% cap 84 of its
+        # 100 contracts are sold (worked out above _LONE_ROWS), the paid-out market
+        # having no order to send
+        exchange = _lone_exchange(monkeypatch)
+        code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=True,
+                                          rebalance=True, size_cap=0.10)
+        assert code == EXIT_OK
+        messages = _messages(caplog)
+        assert _LONE_SIZED in messages
+        [check] = [m for m in messages if m.startswith("Kelly trim check: ")]
+        assert check.startswith("Kelly trim check: NO LONE-LATE (alone: YES LONE-PAID paid out "
+                                "$0) (time-series), 100 contracts, last traded ")
+        assert "pays 91.8%" in check and "$0.87 a contract at the best bids" in check
+        assert check.endswith("may keep 10.0% of $148.00 -> sell 84")
+        assert "Pairs to trim this run: 0 of 0" in messages
+        assert "Lone legs to trim this run (partner paid out): 1 of 1" in messages
+        [would] = [m for m in messages if m.startswith("[DRY RUN] Would sell")]
+        assert "84 NO contracts (of 100 held) on LONE-LATE" in would
+        assert _TICKER_LONE_PAID not in would
+        assert _trim_or_value_warnings(caplog) == []
+        # The partner was found among the settlements and looked up; only the held
+        # market's order book was read, and nothing was sent
+        exchange.client.get_settlements_without_preload_content.assert_called_once()
+        assert [c.kwargs for c in
+                exchange.client.get_market_without_preload_content.call_args_list] == [
+            {"ticker": _TICKER_LONE_PAID}]
+        assert _TICKER_LONE_LATE in _books_read(exchange)
+        assert _TICKER_LONE_PAID not in _books_read(exchange)
+        assert exchange.orders() == ([], [])
+        # Sized on the cash and Kalshi's value, then the buys on the cash the sale frees:
+        # $60.00 + $73.29
+        [trims] = seen["plan_trims"]
+        assert (trims["cash_cents"], trims["positions_value_cents"]) == (_TRIM_CASH_CENTS, 8_800)
+        cash = _TRIM_CASH_CENTS + _LONE_PROCEEDS_CENTS
+        assert seen["enrich"] == [(14_800, cash)] and seen["portfolio"] == [cash]
+        assert "Dry run: sizing as if the sales filled — cash $133.29 (+$73.29)" in messages
+        # The 100 are still held (a dry run takes out only what its sales empty): the
+        # ladder stays held and the market stays out of both finders and add-ons
+        [ladders] = seen["ladders"]
+        assert ("event", "EVL-LONE") in ladders
+        for blocked, markets, add_on_pairs in seen["ts"] + seen["st"]:
+            assert _TICKER_LONE_LATE in blocked and _TICKER_LONE_LATE not in markets
+            assert not add_on_pairs
+        assert "Held pairs already at their size cap, not added to this run: 1" in messages
+        # On record: one simulated trim whose only leg is the held market
+        [record] = report.sales
+        assert (record.status, record.kind, record.level) == (
+            "simulated", config.SALE_KIND_KELLY_TRIM, None)
+        assert [(leg.ticker, leg.held, leg.sold) for leg in record.legs] == [
+            (_TICKER_LONE_LATE, 100, 84)]
+        assert report.cash_after_sales == pytest.approx(133.29)
+        (no_trades, _before, _after, [sale]), (trades, *_rest) = seen["log"]
+        assert no_trades == [] and trades
+        row = reporter._sale_to_row(sale, datetime.now(UTC))
+        assert row[16] == "simulated"
+        assert row[17].startswith("[sale: NO A / YES B, Kelly trim: 84 of 100 contracts, ")
+        assert row[17].endswith("fees=$0.63] ")
+
+    def test_a_lone_leg_trimmed_is_not_added_to(self, monkeypatch, caplog):
+        # With no size cap, Kelly's own share sets the trim (41 of 100), so the leg is
+        # not at its cap: it is left out as picked for a trim, its market blocked
+        exchange = _lone_exchange(monkeypatch)
+        code, seen, _report = _run_selling(exchange, monkeypatch, caplog, dry_run=True,
+                                           rebalance=True, size_cap=1.0,
+                                           same_title_size_cap=0.20)
+        assert code == EXIT_OK
+        messages = _messages(caplog)
+        [check] = [m for m in messages if m.startswith("Kelly trim check: ")]
+        assert check.endswith("may keep 35.2% of $148.00 -> sell 41")
+        [would] = [m for m in messages if m.startswith("[DRY RUN] Would sell")]
+        assert "41 NO contracts (of 100 held) on LONE-LATE" in would
+        assert "Held pairs picked for a Kelly trim this run, not added to: 1" in messages
+        assert not any(m.startswith("Held pairs already at their size cap") for m in messages)
+        for blocked, markets, add_on_pairs in seen["ts"] + seen["st"]:
+            assert not add_on_pairs
+            assert _TICKER_LONE_LATE in blocked and _TICKER_LONE_LATE not in markets
+
+    def test_a_lone_leg_whose_partner_won_is_not_trimmed(self, monkeypatch, caplog):
+        # LONE-PAID settled "yes": its YES paid out, so the event happened by Nov 1
+        # and LONE-LATE's NO cannot win. No book is read and nothing is sold
+        exchange = _lone_exchange(monkeypatch, partner_result="yes")
+        code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=True,
+                                          rebalance=True, size_cap=0.10)
+        assert code == EXIT_OK
+        messages = _messages(caplog)
+        assert ("Not trimming NO LONE-LATE (alone on its ladder): its partner LONE-PAID paid "
+                "out on its YES side, so this leg cannot win") in messages
+        assert "Lone legs to trim this run (partner paid out): 0 of 1" in messages
+        assert len(seen["plan_trims"]) == 1
+        assert _TICKER_LONE_LATE not in _books_read(exchange)
+        assert report.sales == [] and exchange.orders() == ([], [])
+        assert not any(m.startswith("[DRY RUN] Would sell") for m in messages)
+
     def test_an_account_holding_nothing_trims_nothing_and_says_nothing(self, monkeypatch,
                                                                        caplog):
         exchange = _SellExchange(monkeypatch, held_rows=(),
@@ -7466,9 +7704,9 @@ class TestRunProdTrimsInADryRun:
 
 @pytest.mark.usefixtures("pinned_config_toggles")
 class TestRunProdTrimsLive:
-    """A live production run with rebalance on sends each trim's two
-    reduce-only orders (they can only shrink a position), sized to the part
-    sold, before any buy; then it reads its positions and balance again and
+    """A live production run with rebalance on sends each trim's reduce-only
+    orders (two for a pair, one for a lone leg; they can only shrink a
+    position), sized to the part sold, before any buy; then it reads its positions and balance again and
     sizes its buys on what is left. The pair stays held. A trim left uneven,
     or of unknown outcome, makes the run exit 20."""
 
@@ -7543,6 +7781,47 @@ class TestRunProdTrimsLive:
         assert [(leg["ticker"], leg["held"], leg["sold"]) for leg in sale["legs"]] == [
             (_TICKER_SELL_EARLY, 30, 11), (_TICKER_SELL_LATE, 30, 11)]
         assert record["trades"] == []
+
+    def test_a_lone_leg_sends_one_order_on_the_held_market_alone(self, monkeypatch, caplog):
+        # NO on LONE-LATE alone, 84 of 100 sold (worked out above _LONE_ROWS): the NO is
+        # closed by one reduce-only YES bid for the 84, and nothing is sent on the
+        # paid-out pair-mate, which holds nothing to sell
+        exchange = _lone_exchange(monkeypatch, after=_AFTER_LONE_TRIM_BALANCE)
+        code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
+                                          rebalance=True, size_cap=0.10)
+        assert code == EXIT_OK, _messages(caplog)[-5:]
+        [sale], buys = exchange.orders()
+        assert {key: sale[key] for key in ("ticker", "side", "count", "price", "time_in_force",
+                                           "reduce_only")} == {
+            "ticker": _TICKER_LONE_LATE, "side": "bid", "count": "84.00", "price": "0.1200",
+            "time_in_force": "immediate_or_cancel", "reduce_only": True}
+        assert _TICKER_LONE_PAID not in {body["ticker"] for body in (sale, *buys)}
+        assert exchange.ledger[_TICKER_LONE_LATE] == -16
+        # The sale comes before every buy, and the buys are sized on what the account
+        # then holds: the proceeds in cash, and Kalshi's value of the 16 left
+        assert buys, "the same-title pair should still be bought"
+        orders = [i for i, e in enumerate(exchange.events) if e[0] == "order"]
+        assert exchange.events[orders[0]][1]["reduce_only"] is True
+        cash = _TRIM_CASH_CENTS + _LONE_PROCEEDS_CENTS
+        assert seen["enrich"] == [(cash + 1_408, cash)] and seen["portfolio"] == [cash]
+        assert ("After the sales: portfolio value $147.37 = cash $133.29 + open positions "
+                "$14.08") in _messages(caplog)
+        assert _trim_or_value_warnings(caplog) == []
+        # The 16 left are still held: the ladder stays held, the market stays out of
+        # every purchase and is not added to
+        [ladders] = seen["ladders"]
+        assert ("event", "EVL-LONE") in ladders
+        for blocked, markets, add_on_pairs in seen["ts"] + seen["st"]:
+            assert _TICKER_LONE_LATE in blocked and _TICKER_LONE_LATE not in markets
+            assert not add_on_pairs
+        assert not [b for b in buys if b["ticker"] in (_TICKER_LONE_LATE, _TICKER_LONE_PAID)]
+        # On record before any trade: a sold trim of the one held market
+        assert report.submission_started is True
+        [record] = report.sales
+        assert (record.status, record.kind) == ("sold", config.SALE_KIND_KELLY_TRIM)
+        assert [(leg.ticker, leg.held, leg.sold) for leg in record.legs] == [
+            (_TICKER_LONE_LATE, 100, 84)]
+        assert report.cash_after_sales == pytest.approx(133.29)
 
     @pytest.mark.parametrize("status, exchange_kwargs", [
         # SELL-LATE's order sells only 5 of the 11

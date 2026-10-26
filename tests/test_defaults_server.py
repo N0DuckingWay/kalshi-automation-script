@@ -884,25 +884,31 @@ class TestConfirmPage:
     # Saved defaults that rebalance: k 0.8, 20% per-trade and same-title caps
     _REBALANCE_SAVED = LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, rebalance=True)
 
-    @pytest.mark.parametrize("link, named", [
+    @pytest.mark.parametrize("link, named, lone", [
         ({"size_cap": "0.1", "same_title_size_cap": "0.2"},
          "the time-series size cap goes from 20% to 10% and the same-title size cap goes "
-         "from 20% to 10%"),
+         "from 20% to 10%", True),
         ({"k": "0.9", "size_cap": "0.2", "same_title_size_cap": "0.2"},
-         "k goes from 0.8 to 0.9, which lowers a time-series pair&#x27;s chance of paying"),
+         "k goes from 0.8 to 0.9, which lowers a time-series pair&#x27;s chance of paying",
+         True),
+        # A lone leg is never a same-title position: the warning leaves it out
         ({"size_cap": "0.2", "same_title_size_cap": "0.1"},
-         "the same-title size cap goes from 20% to 10%"),
+         "the same-title size cap goes from 20% to 10%", False),
     ], ids=["per-trade cap", "k", "same-title cap"])
-    def test_with_rebalancing_on_a_lower_cap_or_a_higher_k_is_said_to_sell(self, link, named):
+    def test_with_rebalancing_on_a_lower_cap_or_a_higher_k_is_said_to_sell(
+        self, link, named, lone,
+    ):
         # These settings can sell more of the held pairs: the page warns in red
         _save(self._REBALANCE_SAVED)
         response = _get(_app(), "/confirm?" + _query(**link))
         assert response.status == 200
         [warning] = re.findall(r'<p class="warn">(.*?)</p>', response.body)
+        who = ("each exact held pair, or lone leg whose partner has paid out, worth"
+               if lone else "each exact held pair worth")
         assert warning == (
             "Warning: with Rebalance yes, these settings can sell more of the held pairs: "
-            f"{named}; each exact held pair worth more than its new Kelly size is sold down "
-            "to it before anything is bought, once the wait since its last trade has passed.")
+            f"{named}; {who} more than its new Kelly size is sold down to it before "
+            "anything is bought, once the wait since its last trade has passed.")
 
     @pytest.mark.parametrize("saved, link", [
         # Rebalancing saved off, and the link leaves it off
@@ -4508,9 +4514,9 @@ class TestRunPage:
         assert body.count("(Kelly trim)") == 1
         # The note under the table covers both: a trim's profit is on what it sold
         assert defaults_server._SALE_PROFIT_NOTE in body
-        assert ("A Kelly trim sells a held pair down to its Kelly size: part of it, or all "
-                "of it when Kelly keeps none.") in body
-        assert "for a Kelly trim, less what the contract pairs sold cost" in body
+        assert ("A Kelly trim sells a held pair, or a lone leg whose partner has paid out, "
+                "down to its Kelly size: part of it, or all of it when Kelly keeps none.") in body
+        assert "for a Kelly trim, less what the part sold cost" in body
 
     def test_the_profit_note_is_true_of_a_lone_market_sold_with_its_paid_out_partner(self):
         # A lone held market's profit is its proceeds plus its paid-out partner's
@@ -4521,7 +4527,7 @@ class TestRunPage:
         assert "plus the payout of a partner that has already paid out" in note
         assert "less what the whole position cost" in note
         # A trim's profit is still on the part it sold
-        assert "for a Kelly trim, less what the contract pairs sold cost" in note
+        assert "for a Kelly trim, less what the part sold cost" in note
         # A row the note sits under: 30 YES sold return $28.71 after the fee, the
         # partner paid $0, both markets cost $18.80, so the profit is $9.91
         lone = {"title": "Lone", "status": "sold", "level": 0.8, "days_left": 9, "cost": 18.8,
@@ -4542,7 +4548,7 @@ class TestRunPage:
         assert "30 of 30 YES on TRIM-A, 30 of 30 NO on TRIM-B" in body
         assert "Part of each of these held pairs would have been sold" not in body
         assert "keeps the rest" not in body
-        assert ("These held pairs would have been sold down to their Kelly size (a Kelly "
+        assert ("These held positions would have been sold down to their Kelly size (a Kelly "
                 "trim):") in body
 
     def test_a_trim_recorded_by_the_reporter_is_read_as_one(self):
@@ -4571,6 +4577,43 @@ class TestRunPage:
         _disk_run("00000000000000aa", result=_result(exit_code=0, sales=[no_kind]))
         assert "(Kelly trim)" not in _get(_app(), "/runs/00000000000000aa").body
 
+    # One Kelly trim of a lone leg in a run result: 43 of the 129 NO held on LONE-B sold;
+    # its paid-out partner is no leg, since it sold nothing
+    _LONE_TRIMMED = {"title": "Lone trimmed", "status": "sold", "kind": "kelly_trim",
+                     "level": None, "days_left": 9, "cost": 20.1, "proceeds": 36.61,
+                     "profit": 16.51, "realized_percent": None, "error": None,
+                     "legs": [{"ticker": "LONE-B", "side": "no", "held": 129, "sold": 43,
+                               "price": 0.86}]}
+
+    def test_a_lone_leg_trim_shows_what_sold_of_what_was_held(self):
+        _disk_run(result=_result(exit_code=0, sales=[self._LONE_TRIMMED]))
+        body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
+        assert ("<td>Lone trimmed (Kelly trim)</td><td>sold</td>"
+                "<td>43 of 129 NO on LONE-B</td><td>$16.51</td>") in body
+        # The note under the table covers a lone leg too
+        assert "a lone leg whose partner has paid out, down to its Kelly size" in body
+
+    def test_a_run_that_only_trimmed_lone_legs_says_held_positions_were_trimmed(self):
+        _disk_run(result=_result(exit_code=0, sales=[self._LONE_TRIMMED],
+                                 cash_after_sales=130.61))
+        body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
+        assert self._headline(body) == "Held positions trimmed; no trades to complete"
+        # Beside a pair's trim: still only trims
+        _disk_run("00000000000000dd", result=_result(
+            exit_code=0, sales=[self._LONE_TRIMMED, self._TRIMMED]))
+        assert self._headline(_get(_app(), "/runs/00000000000000dd").body) == (
+            "Held positions trimmed; no trades to complete")
+
+    def test_a_dry_run_that_would_only_have_trimmed_a_lone_leg_says_so(self):
+        trim = dict(self._LONE_TRIMMED, status="simulated")
+        _disk_run(dry_run=True, result=_result(dry_run=True, exit_code=0, sales=[trim],
+                                               cash_after_sales=130.61))
+        body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
+        assert self._headline(body) == "Dry run finished — no orders were sent"
+        assert ("These held positions would have been sold down to their Kelly size (a Kelly "
+                "trim):") in body
+        assert "<td>43 of 129 NO on LONE-B</td>" in body
+
     @pytest.mark.parametrize("status", ["sold", "partly_sold"])
     def test_a_run_that_only_trimmed_says_so(self, status):
         # A trim usually sells only part of a pair, so the headline says
@@ -4579,7 +4622,7 @@ class TestRunPage:
         _disk_run(result=_result(exit_code=0, sales=[trim], cash_after_sales=112.15,
                                  balance_before=100.0, portfolio_value_before=150.0))
         body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
-        assert self._headline(body) == "Held pairs trimmed; no trades to complete"
+        assert self._headline(body) == "Held positions trimmed; no trades to complete"
         assert "Portfolio value $150.00 (cash $100.00) — before the sales" in body
 
     def test_a_run_that_sold_a_position_and_trimmed_a_pair_says_positions_sold(self):
@@ -4598,7 +4641,7 @@ class TestRunPage:
                                                cash_after_sales=112.15))
         body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
         assert self._headline(body) == "Dry run finished — no orders were sent"
-        assert ("These held pairs would have been sold down to their Kelly size (a Kelly "
+        assert ("These held positions would have been sold down to their Kelly size (a Kelly "
                 "trim):") in body
         assert "These positions would have been sold:" not in body
         # With a take-profit sale beside it, the positions line stands

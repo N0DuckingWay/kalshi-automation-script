@@ -64,10 +64,12 @@ Purpose:
 
     A production run with rebalance on also sells, before it buys, part
     of each exact held pair (one YES and one NO of equal size on one
-    question) that has grown past its Kelly share of the portfolio value
+    question), or of each lone leg (the later market of a time-series pair,
+    still held after the earlier one paid out $0), that has grown past its
+    Kelly share of the portfolio value
     (seller.plan_trims, planned right after the take-profit plans and before
-    any sale order is sent; never a pair the take-profit rule sells). A pair
-    waits a set number of calendar days after its last trade and, with
+    any sale order is sent; never a position the take-profit rule sells). A
+    position waits a set number of calendar days after its last trade and, with
     min_price_move set, until its price has moved that far, up or down.
     Nothing is trimmed when a shard's cash or Kalshi's value of the open
     positions cannot be counted (or that value is $0), when an order rests on the
@@ -99,7 +101,7 @@ Dependencies:
     reporter.py (Excel output and the run summary), _http.py (a one-line
     description of an error), scanner.py (finding markets and pairs, and
     pricing them from the order book), seller.py (which held positions to
-    sell, which held pairs to trim, and which to add to), strategy.py
+    sell, which held positions to trim, and which to add to), strategy.py
     (sizing and choosing trades), trader.py (sending orders) and run_lock.py
     (the one-real-money-run-at-a-time lock). Run as
     `python3 -m kalshi_betting.main`.
@@ -421,7 +423,7 @@ def _plan_tickers(plans: list) -> frozenset:
     The held markets some sale plans would sell on.
 
     _run_prod passes the take-profit plans' markets to seller.plan_trims as
-    `skip`, so no pair is both sold and trimmed in one run.
+    `skip`, so no position is both sold and trimmed in one run.
 
     Args:
         plans (list): seller.SalePlan objects.
@@ -1782,8 +1784,10 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     is sold when a held market was not identified or the listing was cut short.
 
     With settings.rebalance on and anything held, the same step also
-    trims: seller.plan_trims plans part sales of the exact held pairs grown
-    past their Kelly share (never a pair the take-profit rule sells), sized on
+    trims: seller.plan_trims plans part sales of the exact held pairs, and of
+    the lone legs (the later market of a time-series pair, still held after the
+    earlier one paid out $0), grown past their Kelly share
+    (never a position the take-profit rule sells), sized on
     the cash and positions value read at the start, and trader.sell_positions
     sends them after the take-profit sales. Nothing is trimmed, with one
     WARNING, when a held market was not identified, the listing was cut
@@ -2039,9 +2043,10 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
                         "the account's resting orders could not be read" if resting is None
                         else f"{resting} order(s) rest on the account")
                 else:
-                    # Cross-module: part sales of the exact held pairs grown past their
-                    # Kelly share (read-only requests), sized on the start-of-run cash and
-                    # value, skipping the take-profit plans' pairs, whose sales go first
+                    # Cross-module: part sales of the exact held pairs and lone legs grown
+                    # past their Kelly share (read-only requests), sized on the start-of-run
+                    # cash and value, skipping the take-profit plans' positions, whose sales
+                    # go first
                     plans = plans + plan_trims(
                         client, held_positions, held_labels, markets_by_ticker,
                         settings=settings, now=moment, cash_cents=cash_cents,
@@ -2450,14 +2455,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     # Help ending for --interval-discount and both cap flags: with Rebalance yes,
     # a higher k or a lower cap also sells held pairs
+    # (the third slot is the lone-leg clause; a same-title cap never reaches a lone leg,
+    # which is only ever the later market of a time-series pair)
+    lone_leg = ", or lone leg whose partner has paid out,"
     trim_sells = ("With Rebalance yes (saved, or given with --rebalance), a {} "
-                  "also sells: each exact held {}pair worth more than its new Kelly size is "
+                  "also sells: each exact held {}pair{} worth more than its new Kelly size is "
                   "sold down to it before anything is bought, once its wait has passed")
     live.add_argument(
         "--interval-discount", type=float, default=None, metavar="K",
         help="Time-series interval discount k, in (0, 1] "
              "(default: the saved live defaults). "
-             + trim_sells.format("higher k", "time-series "),
+             + trim_sells.format("higher k", "time-series ", lone_leg),
     )
     # The caps' grid step in percent (SIZE_CAP_STEP); argparse %-formats help, hence "%%"
     cap_step = f"{SIZE_CAP_STEP * 100:g}"
@@ -2465,22 +2473,24 @@ def _build_parser() -> argparse.ArgumentParser:
         "--size-cap", type=int, default=None, metavar="PCT",
         help=f"Per-trade Kelly cap for every pair, in whole percent, in {cap_step}%% "
              "steps; 100 = no cap (default: the saved live defaults). "
-             + trim_sells.format("lower cap", ""),
+             + trim_sells.format("lower cap", "", lone_leg),
     )
     live.add_argument(
         "--same-title-size-cap", type=int, default=None, metavar="PCT",
         help=f"Extra per-trade cap on same-title pairs, in whole percent, in {cap_step}%% "
              "steps; 100 = no extra cap beyond --size-cap "
              "(default: the saved live defaults). "
-             + trim_sells.format("lower cap", "same-title "),
+             + trim_sells.format("lower cap", "same-title ", ""),
     )
     live.add_argument(
         "--rebalance", action=argparse.BooleanOptionalAction, default=None,
         help="Rebalance the held pairs this run: before buying, sell part of each "
-             "exact held pair that has outgrown its Kelly size, once "
+             "exact held pair, or lone leg whose partner has paid out, that has "
+             "outgrown its Kelly size, once "
              "config.REBALANCE_MIN_DAYS_SINCE_TRADE calendar days have passed since "
-             "the pair's last trade, and let this run add to a pair the account "
-             "already holds (exactly the same two markets, the same side on each) "
+             "its last trade, and let this run add to a pair the account "
+             "already holds (exactly the same two markets, the same side on each, or a "
+             "lone leg beside a market not held) "
              "after the same wait, sizing the old and new contracts together as a "
              "share of the portfolio "
              "value (the old ones at today's prices plus the fees paid for them). "

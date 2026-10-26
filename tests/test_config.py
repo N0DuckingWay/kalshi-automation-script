@@ -2220,6 +2220,41 @@ class TestHeldPairWinProb:
         assert config.held_pair_win_prob("time_series", *quotes, 0.8) is None
 
 
+class TestSettledBids:
+    """config.settled_bids: the bids a paid-out market reads as, its settlement price.
+
+    A Kelly trim of a lone leg reads the paid-out earlier market this way, so the
+    pair arithmetic (held_pair_win_prob, the sale value) runs unchanged, live and
+    in the backtest alike.
+    """
+
+    def test_each_result_reads_as_its_settlement_price(self):
+        assert config.settled_bids("yes") == (1.0, 0.0)
+        assert config.settled_bids("no") == (0.0, 1.0)
+
+    @pytest.mark.parametrize("result", ["void", "", "Yes", None, 1])
+    def test_any_other_result_is_refused(self, result):
+        with pytest.raises(ValueError, match="'yes' or 'no'"):
+            config.settled_bids(result)
+
+    def test_a_lone_later_leg_after_the_earlier_market_paid_nothing(self):
+        # YES was held on the earlier market A and NO is still held on the later
+        # market B. A settled "no", so its asks read 0 (YES) and 1 (NO): the
+        # chance is 1 - k x B's midpoint. B: YES ask 0.14, NO ask 0.88, so its
+        # YES bid is 0.12 and its midpoint 0.13; at k 0.7 that is 0.909
+        yes_bid_a, no_bid_a = config.settled_bids("no")
+        chance = config.held_pair_win_prob("time_series", 1.0 - no_bid_a, 1.0 - yes_bid_a,
+                                           0.14, 0.88, 0.7)
+        assert chance == pytest.approx(1 - 0.7 * 0.13, abs=1e-12)
+
+    def test_the_later_leg_cannot_win_once_the_earlier_market_paid_out_yes(self):
+        # The event happened by A's deadline, so B must settle "yes" too and the
+        # NO held on B cannot win: no chance to read, so nothing is trimmed
+        yes_bid_a, no_bid_a = config.settled_bids("yes")
+        assert config.held_pair_win_prob("time_series", 1.0 - no_bid_a, 1.0 - yes_bid_a,
+                                         0.14, 0.88, 0.7) is None
+
+
 class TestKellyHoldFraction:
     """config.kelly_hold_fraction: the share of the portfolio a held pair may keep.
 
@@ -3402,11 +3437,13 @@ class TestRebalanceChangeWarnings:
     _NOW = LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, rebalance=True)
 
     @staticmethod
-    def _sentence(named: str) -> list:
+    def _sentence(named: str, lone: bool = True) -> list:
+        """The sentence for these changes; `lone` False when none can reach a lone leg."""
+        who = ("each exact held pair, or lone leg whose partner has paid out, worth"
+               if lone else "each exact held pair worth")
         return [f"with Rebalance yes, these settings can sell more of the held pairs: "
-                f"{named}; each exact held pair worth more than its new Kelly size is sold "
-                "down to it before anything is bought, once the wait since its last trade "
-                "has passed"]
+                f"{named}; {who} more than its new Kelly size is sold down to it before "
+                "anything is bought, once the wait since its last trade has passed"]
 
     def test_each_change_that_sells_is_named(self):
         new = dataclasses.replace
@@ -3415,7 +3452,7 @@ class TestRebalanceChangeWarnings:
                            "same-title size cap goes from 20% to 10%"))
         assert config.rebalance_change_warnings(
             self._NOW, new(self._NOW, same_title_size_cap=0.1)) == self._sentence(
-                "the same-title size cap goes from 20% to 10%")
+                "the same-title size cap goes from 20% to 10%", lone=False)
         assert config.rebalance_change_warnings(
             self._NOW, new(self._NOW, interval_discount=0.85)) == self._sentence(
                 "k goes from 0.8 to 0.85, which lowers a time-series pair's chance of paying")
@@ -3430,6 +3467,24 @@ class TestRebalanceChangeWarnings:
         assert config.rebalance_change_warnings(uncapped, new(uncapped, size_cap=0.5)) == (
             self._sentence("the time-series size cap goes from 100% (no cap) to 50% and the "
                            "same-title size cap goes from 100% (no cap) to 50%"))
+
+    def test_a_lone_leg_is_named_only_when_a_time_series_setting_can_reach_it(self):
+        # A lone leg is the later market of a time-series pair: a same-title cap
+        # alone never reaches one, a time-series cap or k does, alone or with a
+        # same-title change
+        new = dataclasses.replace
+        [same_title] = config.rebalance_change_warnings(
+            self._NOW, new(self._NOW, same_title_size_cap=0.1))
+        assert "lone leg" not in same_title
+        # Only the time-series cap falls: the same-title cap was already the lower
+        held = new(self._NOW, size_cap=0.3, same_title_size_cap=0.2)
+        assert config.rebalance_change_warnings(held, new(held, size_cap=0.25)) == (
+            self._sentence("the time-series size cap goes from 30% to 25%"))
+        [k_up] = config.rebalance_change_warnings(self._NOW, new(self._NOW, interval_discount=0.9))
+        assert "or lone leg whose partner has paid out, worth more than" in k_up
+        both = config.rebalance_change_warnings(
+            self._NOW, new(self._NOW, same_title_size_cap=0.1, interval_discount=0.9))
+        assert "or lone leg whose partner has paid out" in both[0]
 
     @pytest.mark.parametrize("change", [
         # Rebalancing off in the proposed settings: nothing is trimmed at all

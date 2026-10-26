@@ -47,7 +47,9 @@ Notes:
     call them; trade_day is for live rebalancing only, and kelly_trim_bids
     for live trims only. A live run's switch and minimum
     are LiveSettings.rebalance and min_price_move: with rebalance on, a
-    production run both trims held pairs and may add to them.
+    production run both trims held pairs (and lone legs: the later market of
+    a time-series pair, still held after the earlier one paid out $0) and may
+    add to them.
     A saved file written by an older version, which held add_to_held_pairs,
     trim_to_kelly and trim_min_rise instead, is refused as
     LiveDefaultsOutdated, which carries what it reads as now (its proposal)
@@ -649,7 +651,9 @@ TAG_SCOPE_SEPARATOR = " · "
 
 # Whether a live run rebalances the pairs the account holds: on, a production
 # run, before it buys, sells part of each exact held pair (two held markets
-# alone on one question, one held YES and the other NO, in equal counts) worth
+# alone on one question, one held YES and the other NO, in equal counts), or of
+# each lone leg (the later market of a time-series pair, still held after the
+# earlier one paid out $0), worth
 # more than Kelly allows or more than its size cap (a Kelly trim:
 # main._run_prod, through seller.plan_trims), and may add to a pair it holds:
 # exactly the same two markets, buying the same side on each
@@ -703,9 +707,26 @@ SALE_KIND_KELLY_TRIM = "kelly_trim"
 # The most settled markets live selling (seller.plan_sales) looks up on the
 # exchange in one run (one or two read-only requests each) to find a held
 # market's paid-out partner (a settled market the account held on the other
-# side, with the same count and question, taken as its pair-mate).
+# side, asking the same question, with the same count or, when no such market
+# fits, at least as many (a lone market partly sold after its partner paid out
+# holds fewer), taken as its pair-mate).
 # Past this many, held markets still waiting for a partner are not sold that run.
 SALE_PARTNER_MAX_LOOKUPS = 20
+
+# The most settled markets one run looks up when no market of a lone held
+# market's count fits and seller._find_partner searches those settled with more
+# contracts. Counted apart from SALE_PARTNER_MAX_LOOKUPS, so that search never
+# uses lookups a same-count partner needs. Past this many, that search finds no
+# partner and the held market is not sold that run.
+SALE_PARTNER_MAX_WIDER_LOOKUPS = 20
+
+# How far, in dollars, a paid-out partner's payout may sit from what the position
+# it held at payout should have paid, when its settlement lists contracts bought
+# on both sides (seller._find_partner). The payout is whole cents, so under half
+# a cent means an exact match and a 1c gap is always a mismatch; a record whose
+# payout does not match its net count cannot be read as one position, so the
+# held market is neither sold nor trimmed.
+SALE_PARTNER_REVENUE_TOLERANCE_DOLLARS = 0.005
 
 # How many days ago, at most, a held market's partner may have paid out for live
 # selling to use it. A pair's two markets stop trading at most MAX_DEADLINE_GAP_DAYS
@@ -3287,7 +3308,9 @@ class LiveSettings:
             category is excluded too is allowed (it excludes nothing more).
         rebalance (bool): Whether a production run rebalances the pairs the
             account holds: before it buys, it sells part of each exact held
-            pair grown past its Kelly size (a Kelly trim), and it may add to
+            pair, or lone leg (the later market of a time-series pair, still
+            held after the earlier one paid out $0), grown past its
+            Kelly size (a Kelly trim), and it may add to
             a pair the account already holds (exactly the same two markets,
             the same side on each, or a lone held market whose partner has
             paid out), with Kelly sizing the whole position. A real bool.
@@ -3440,7 +3463,8 @@ _RETIRED_FILTER_COMPANIONS = {
 # 10% of the portfolio value; an add-on to a held pair stakes no more than a
 # new pair would, and keeps the held pair (at today's prices, plus the fees
 # paid for it) and the add-on together within 10% of the portfolio value, and
-# a Kelly trim sells a held pair down to its Kelly size, at most that share.
+# a Kelly trim sells a held pair, or a lone leg whose partner has paid out,
+# down to its Kelly size, at most that share.
 # Nothing trades on them
 # until they are confirmed and saved to LIVE_DEFAULTS_FILE.
 LIVE_DEFAULTS_SEED = LiveSettings(
@@ -4618,6 +4642,9 @@ def days_to_maturity(close_dates, day: date) -> int | None:
 # A held pair (the same two markets, one side of each, in equal counts) can
 # grow past the share of the portfolio Kelly would give it: its price rises,
 # or the rest of the portfolio shrinks. Trimming sells part of it back down.
+# A live trim (seller._trim_one) takes a lone leg whose partner has paid out the
+# same way: the partner is read at its settlement price (settled_bids), so the
+# leg is the position.
 # The pair is priced at what selling it returns now (the bids, less the
 # sale's fee), not at what buying it costs, so the size a run sells down to
 # sits above the size it would buy up to (held_pair_fraction), and a run
@@ -4690,6 +4717,34 @@ def held_pair_win_prob(pair_type: str, yes_ask_a: float, no_ask_a: float,
     if not spread > PRICE_EPSILON:
         return None
     return time_series_profit_prob(spread, k)
+
+
+def settled_bids(result: str) -> tuple[float, float]:
+    """
+    Return the (YES bid, NO bid) a paid-out market reads as: its settlement price.
+
+    A Kelly trim of a lone leg (the later market of a time-series pair, still
+    held after the earlier market paid out) reads the paid-out market this way,
+    so the pair arithmetic runs unchanged: held_pair_win_prob takes each ask as
+    1 minus the other side's bid (a market that settled "no" has a YES ask of 0
+    and a NO ask of 1), and the side held there adds its bid, $0 when that side
+    lost, to what selling the pair fetches. The live Kelly trim of a lone leg
+    (seller._trim_one) reads it.
+
+    Args:
+        result (str): How the market settled, "yes" or "no".
+
+    Returns:
+        tuple[float, float]: (1.0, 0.0) for "yes", (0.0, 1.0) for "no".
+
+    Raises:
+        ValueError: For a result other than "yes" or "no".
+    """
+    if result == "yes":
+        return (1.0, 0.0)
+    if result == "no":
+        return (0.0, 1.0)
+    raise ValueError(f"a settled market's result must be 'yes' or 'no', got {result!r}")
 
 
 def kelly_hold_fraction(win_prob: float, sale_value: float) -> float:
@@ -4845,7 +4900,7 @@ def kelly_trim_bids(ladder, max_drop: float) -> list:
     trim never sells into a gap in the book: under a binding size cap the
     rule (kelly_trim_count) would otherwise sell past one 42c bid into a stub
     bid at 2c. A bid exactly max_drop below the best is kept, within float
-    noise. seller._trim_one calls it on both held sides.
+    noise. seller._trim_one calls it on each held side.
 
     Args:
         ladder: One side's bids, [[price in dollars, quantity], ...], best
@@ -5498,12 +5553,16 @@ def rebalance_change_warnings(current: LiveSettings,
     """
     Say when moving from one set of live settings to another also sells held pairs.
 
-    With rebalancing on, a run sells each exact held pair worth more than its
-    Kelly size (the lower of its size cap and Kelly's own share, which reads
-    k for a time-series pair) down to that size, before anything is bought,
-    once the pair's wait has passed (a Kelly trim). So with the proposed
-    settings rebalancing, a lower size cap (as pair_size_cap applies it) or a
-    higher k can sell pairs the current settings would keep.
+    With rebalancing on, a run sells each exact held pair, or lone leg (the
+    later market of a time-series pair, still held after the earlier one paid
+    out $0), worth more than its Kelly size (the lower of its size cap and
+    Kelly's own share, which reads k for a time-series pair) down to that size,
+    before anything is bought, once its wait has passed (a Kelly trim). So with
+    the proposed settings rebalancing, a lower size cap (as pair_size_cap
+    applies it) or a higher k can sell pairs the current settings would keep,
+    and, through a time-series cap or k, lone legs too: a lone leg is never a
+    same-title position, so a same-title cap alone does not reach one and the
+    sentence then leaves lone legs out.
     main._log_live_settings logs the sentence as a WARNING on a real-money
     run whose flags depart from the saved defaults; the defaults server's
     confirmation page shows it in red.
@@ -5519,6 +5578,9 @@ def rebalance_change_warnings(current: LiveSettings,
     if not proposed.rebalance:
         return []
     changes = []
+    # A lone leg is only ever the later market of a time-series pair, so only a
+    # time-series cap or k can move what one is trimmed to
+    reaches_lone_leg = False
     for pair_type, label in (("time_series", "time-series"), ("same_title", "same-title")):
         # The cap each pair type is trimmed to, as a new trade of it is capped
         before = pair_size_cap(pair_type, current.size_cap, current.same_title_size_cap)
@@ -5526,16 +5588,20 @@ def rebalance_change_warnings(current: LiveSettings,
         if after < before:
             changes.append(f"the {label} size cap goes from {_cap_text(before, 'no cap')} to "
                            f"{_cap_text(after, 'no cap')}")
+            reaches_lone_leg = reaches_lone_leg or pair_type == "time_series"
     if proposed.interval_discount > current.interval_discount:
         changes.append(f"k goes from {_exact_number(current.interval_discount)} to "
                        f"{_exact_number(proposed.interval_discount)}, which lowers a "
                        "time-series pair's chance of paying")
+        reaches_lone_leg = True
     if not changes:
         return []
     named = changes[0] if len(changes) == 1 else ", ".join(changes[:-1]) + " and " + changes[-1]
+    lone_leg = ", or lone leg whose partner has paid out," if reaches_lone_leg else ""
     return [f"with Rebalance yes, these settings can sell more of the held pairs: {named}; "
-            "each exact held pair worth more than its new Kelly size is sold down to it before "
-            "anything is bought, once the wait since its last trade has passed"]
+            f"each exact held pair{lone_leg} worth more than its "
+            "new Kelly size is sold down to it before anything is bought, once the wait since "
+            "its last trade has passed"]
 
 
 def order_api_version_error() -> str | None:
