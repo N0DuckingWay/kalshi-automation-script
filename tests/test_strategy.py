@@ -4085,12 +4085,12 @@ class TestTimeSeriesKellyParity:
         # shortcut tests exactly the rule the walk applies. This checks which
         # function calls which; the behaviour tests (TestSaleNeedsDaysInARow)
         # pin how many days a site checks.
-        # The Kelly trim reads the same two things through two functions of
-        # its own: _fresh_bids (both sides' bids of both markets, for the
-        # chance the pair pays and its sale value at the best bids) and
-        # _kelly_trim, whose net_sale prices a part sale through
-        # _position_sale_value, so a trim and a take-profit sale walk one
-        # ladder with one fee rule
+        # The Kelly trim reads the same two things through functions of its
+        # own: _fresh_bids (both sides' bids of both markets, for the chance
+        # the pair pays and its sale value at the best bids), _lone_leg (which
+        # paid-out markers make a lone leg the trim sells), and _kelly_trim,
+        # whose net_sale prices a part sale through _position_sale_value, so a
+        # trim and a take-profit sale walk one ladder with one fee rule
         sale_readers: dict[str, set] = {"bid_at_checkpoint": set(), "paid_at_checkpoint": set(),
                                         "sale_ladder": set(), "_position_sale_value": set(),
                                         "_sells_at": set()}
@@ -4109,7 +4109,9 @@ class TestTimeSeriesKellyParity:
                                 "paid_at_checkpoint": {"_position_sale_value",
                                                        "_stale_unpaid_leg",
                                                        # ... and the volume cap's (C7)
-                                                       "_volume_capped_leg"},
+                                                       "_volume_capped_leg",
+                                                       # ... and the lone-leg trim's test
+                                                       "_lone_leg"},
                                 "sale_ladder": {"_position_sale_value"},
                                 "_position_sale_value": {"_hold_readings", "_kelly_trim",
                                                          "net_sale"},
@@ -4169,8 +4171,15 @@ class TestTimeSeriesKellyParity:
         assert len(valued) == 1 and len(sells) == 2 and len(trims) == 2
         assert sells[0] < trims[0] < sells[1] < trims[1] < valued[0]
         for shared in ("held_pair_win_prob", "kelly_trim_count", "pair_size_cap", "_fresh_bids",
-                       "_exact_pair", "_last_bought_first", "fee_per_pair_approx"):
+                       "_exact_pair", "_last_bought_first", "fee_per_pair_approx", "_lone_leg"):
             assert _function_calls(backtester, "_kelly_trim", shared), shared
+        # A lone leg (its earlier market paid out $0) is trimmed by the same
+        # rule: _fresh_bids reads the paid-out market at its settlement price
+        # (config.settled_bids, which the live trim reads too) once _lone_leg
+        # says it is one, and only the open market is held to the stale-quote check
+        assert backtester.settled_bids is config.settled_bids
+        for helper in ("_lone_leg", "settled_bids", "_settled_result", "_quote_is_fresh"):
+            assert _function_calls(backtester, "_fresh_bids", helper), helper
         # The four quotes go in as the forecast reads them: each market's YES
         # ask, then its NO ask, an ask being 1 minus the other side's bid.
         # Swapping two of them can keep the mid spread and still misread a
@@ -4311,6 +4320,12 @@ class TestTimeSeriesKellyParity:
         assert ast.unparse(assigned.targets[0]) == "last_day"
         then, now = _calls_to(rise, "_pair_price")
         assert [ast.unparse(call.args[1]) for call in (then, now)] == ["last_day", "day"]
+        # ... and so does a lone leg's, read on its open market alone (the
+        # later one, B) at the same two moments
+        assert _calls_to(rise, "_lone_leg")
+        leg_then, leg_now = _calls_to(rise, "_leg_mark")
+        assert [ast.unparse(call) for call in (leg_then, leg_now)] == [
+            "_leg_mark(latest, 1, last_day)", "_leg_mark(latest, 1, day)"]
         # Only _last_trade_day (an exact pair) and _lone_leg_move (a lone leg,
         # whose trades can be of several pairs) read last_trim
         trim_readers = {func.name for func in ast.walk(tree) if isinstance(func, ast.FunctionDef)

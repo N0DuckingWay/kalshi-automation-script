@@ -183,9 +183,12 @@ Notes:
     of a held pair once it is worth more than its Kelly share of the
     portfolio value, each contract pair counted at what selling it returns
     (config.kelly_trim_count, with the chance it pays from
-    config.held_pair_win_prob). It checks at every entry checkpoint, after
-    the day's pay-outs and take-profit sales and before its purchases. With
-    add_to_held as well, a pair is rebalanced both ways.
+    config.held_pair_win_prob). It sells part of a lone leg the same way: the
+    later market of a time-series pair, still held after the earlier market
+    paid out $0, with that market read at its settlement price (_lone_leg,
+    config.settled_bids), as a live trim reads it. It checks at every entry
+    checkpoint, after the day's pay-outs and take-profit sales and before its
+    purchases. With add_to_held as well, a pair is rebalanced both ways.
 
     Both of these are rebalances, and both follow the same two rules. A held
     pair is added to or trimmed only once REBALANCE_MIN_DAYS_SINCE_TRADE
@@ -452,6 +455,7 @@ from .config import (
     price_move_reached,
     rebalance_min_days,
     rebalance_rested,
+    settled_bids,
     take_profit_reached,
     time_series_mid_spread,
     time_series_profit_prob,
@@ -5329,6 +5333,60 @@ def _sold_copy(trade: BacktestTrade, day: date, sale: tuple) -> BacktestTrade:
 _NO_TRIM = KellyTrim(0, 0.0)
 
 
+def _lone_leg(trade: BacktestTrade, day: date) -> bool | None:
+    """
+    Whether an open trade is a lone leg the Kelly trim may sell at the checkpoint on `day`.
+
+    A lone leg is one market of a pair still held after the other market has
+    paid out. The trim sells part of one only as a live trim does
+    (seller._trim_one): the later market (B) of a time-series pair, still to
+    pay out, once the earlier market (A) has paid out $0 on the side held
+    there. That side lost, so the event the leg bets against has not happened
+    by A's deadline and the leg can still win. A's payout is read from its own
+    record (LegQuotes.paid_yes and paid_no), the one _position_sale_value pays
+    the leg from, so the trim and the money paid cannot disagree.
+
+    Args:
+        trade (BacktestTrade): An open trade.
+        day (date): A checkpoint date on its legs' weekly grid.
+
+    Returns:
+        bool | None: None when neither market has paid out by then (a pair,
+            judged as one) or the trade has no quotes; True for a lone leg the
+            trim may sell; False when a market has paid out and the trade is
+            no such lone leg: a same-title pair, an earlier market still open
+            beside a paid-out later one, both markets paid out, or a side held
+            on A that paid $1 (or an unknown payout).
+
+    Raises:
+        ValueError: From LegQuotes, for a day off the legs' checkpoint grid.
+    """
+    if trade.marks is None:
+        return None
+    paid = [quotes.paid_at_checkpoint(day) for quotes in trade.marks]
+    if not any(paid):
+        return None
+    if paid != [True, False] or trade.pair_type != "time_series":
+        return False
+    # What the side held on A paid (scanner.leg_sides: YES for a time-series pair)
+    quotes_a = trade.marks[0]
+    payout = quotes_a.paid_yes if leg_sides(trade.pair_type)[0] == "yes" else quotes_a.paid_no
+    return payout == 0.0
+
+
+def _settled_result(quotes: LegQuotes) -> str:
+    """
+    How a paid-out market settled, read from its own payout record.
+
+    Args:
+        quotes (LegQuotes): A market that has paid out, with a known payout.
+
+    Returns:
+        str: "yes" when a YES contract paid $1, otherwise "no".
+    """
+    return "yes" if quotes.paid_yes == 1.0 else "no"
+
+
 def _fresh_bids(trade: BacktestTrade, day: date, *,
                 stale_check: bool = True) -> tuple[float, float, float, float] | None:
     """
@@ -5340,6 +5398,13 @@ def _fresh_bids(trade: BacktestTrade, day: date, *,
     profit is read from. Fresh means from a candle within one candle period
     of the checkpoint (LegQuotes.bid_at_checkpoint), as a sale needs.
 
+    For a lone leg (_lone_leg) the paid-out earlier market has no bids: it
+    reads as its settlement price (config.settled_bids: a market that settled
+    "no" is a YES bid of 0 and a NO bid of 1), so the side held there adds $0
+    to a sale and the forecast reads the later market's quotes against a
+    market whose event did not happen. Only the open market is held to the
+    stale-quote check.
+
     Args:
         trade (BacktestTrade): An open trade.
         day (date): A checkpoint date on its legs' weekly grid.
@@ -5349,21 +5414,35 @@ def _fresh_bids(trade: BacktestTrade, day: date, *,
     Returns:
         tuple[float, float, float, float] | None: (market A's YES bid, its NO
             bid, market B's YES bid, its NO bid), in dollars; None for a trade
-            with no quotes, when either market's quote has not moved or traded
-            within the stale-quote limit (_quote_is_fresh), or when a side of
-            either market has no fresh bid.
+            with no quotes, one with a paid-out market that is no lone leg the
+            trim sells, when a market still to pay out has a quote that has
+            not moved or traded within the stale-quote limit
+            (_quote_is_fresh), or when a side of such a market has no fresh
+            bid.
 
     Raises:
         ValueError: From LegQuotes, for a day off the legs' checkpoint grid.
     """
     if trade.marks is None:
         return None
-    if stale_check and not all(_quote_is_fresh(quotes, day) for quotes in trade.marks):
+    lone = _lone_leg(trade, day)
+    if lone is False:
+        # A market has paid out, and what is left is no lone leg the trim sells
+        return None
+    # The markets still to pay out: both of a pair; the later one of a lone leg
+    paid = (True, False) if lone else (False, False)
+    if stale_check and not all(_quote_is_fresh(quotes, day)
+                               for quotes, done in zip(trade.marks, paid, strict=True) if not done):
         # A market whose quote has not moved or traded within the
         # stale-quote limit: no trim this Monday
         return None
-    bids = [quotes.bid_at_checkpoint(day, side) for quotes in trade.marks
-            for side in ("yes", "no")]
+    bids: list[float] = []
+    for quotes, done in zip(trade.marks, paid, strict=True):
+        if done:
+            # Cross-module: a paid-out market reads as its settlement price
+            bids += settled_bids(_settled_result(quotes))
+        else:
+            bids += [quotes.bid_at_checkpoint(day, side) for side in ("yes", "no")]
     # A missing bid is NaN, which is not equal to itself
     if any(bid != bid for bid in bids):
         return None
@@ -5375,8 +5454,9 @@ def _exact_pair(position: list[BacktestTrade]) -> bool:
     Whether every trade of a position is the same two markets bought the same way round.
 
     Such a position is one pair with whatever was added to it, held in equal
-    counts on both markets: what the Kelly trim sells part of. A position
-    that also holds an add-on to a lone leg (a third market) is not one.
+    counts on both markets: what the Kelly trim sells part of (once its
+    earlier market has paid out, as a lone leg: _lone_leg). A position that
+    also holds an add-on to a lone leg (a third market) is not one.
 
     Args:
         position (list[BacktestTrade]): One position's open trades (_positions).
@@ -5431,11 +5511,19 @@ def _kelly_trim(position: list[BacktestTrade], day: date, portfolio_value: float
     the modeled bid ladder. The latest trade's contracts go first
     (_last_bought_first).
 
+    A lone leg (_lone_leg: the later market of a time-series pair, its
+    earlier market paid out $0) is judged the same way, the paid-out market
+    read at its settlement price (_fresh_bids): it adds $0 to one contract
+    pair's sale value and nothing to a sale, so what is sold is contracts of
+    the open market alone.
+
     Left alone, with nothing sold: a position that is not one exact pair
     (_exact_pair), one with no quotes or without a fresh bid on both sides of
-    both markets, a time-series pair whose chance of paying cannot be read (a
-    crossed quote, or a mid spread not above zero), and one with a market
-    that has paid out.
+    each market still to pay out, a time-series pair whose chance of paying
+    cannot be read (a crossed quote, or a mid spread not above zero), and one
+    with a paid-out market that is no such lone leg (a same-title pair, the
+    earlier market still open, both paid out, or the earlier market's side
+    held paid $1).
 
     Args:
         position (list[BacktestTrade]): One position's open trades (_positions).
@@ -5460,6 +5548,8 @@ def _kelly_trim(position: list[BacktestTrade], day: date, portfolio_value: float
     bids = _fresh_bids(first, day, stale_check=stale_check) if _exact_pair(position) else None
     if bids is None:
         return _NO_TRIM, None
+    # A lone leg: market A has paid out, and the trim sells market B alone
+    lone = _lone_leg(first, day)
     yes_bid_a, no_bid_a, yes_bid_b, no_bid_b = bids
     # config.held_pair_win_prob: the chance a new trade of the pair is sized
     # with, at these quotes; each ask is 1 minus the other side's bid
@@ -5485,9 +5575,11 @@ def _kelly_trim(position: list[BacktestTrade], day: date, portfolio_value: float
         sold = _last_bought_first(position, pairs)
         valued = _position_sale_value(position, day, sold=sold, stale_check=stale_check,
                                       volume_cap=volume_cap)
-        # None: the bids hold fewer. A leg with no sale price has paid out,
-        # so there is no pair left to sell
-        if valued is None or any(None in sale[2] for sale in valued[0]):
+        # None: the bids hold fewer. A leg with no sale price has paid out:
+        # on a lone leg that is market A, worth its $0 payout; on a pair
+        # there is no pair left to sell
+        if valued is None or any(None in (sale[2][1:] if lone else sale[2])
+                                 for sale in valued[0]):
             return None
         sales[pairs] = (sold, valued[0])
         return valued[1]
@@ -5573,9 +5665,15 @@ def _price_move(position: list[BacktestTrade], day: date,
     after a trade counts from too). The price (_pair_price) is read the
     same way at that checkpoint and at this one — the ask of the side held on
     each market — so neither what a trade paid nor the gap between a market's
-    bid and ask counts as a move. config.pair_price_move sets the sign: the
-    result is negative when the price fell. The Kelly trim's gate and the
-    add-on gate both read it (an add-on through _held_pair_move).
+    bid and ask counts as a move. For a lone leg (_lone_leg: the earlier
+    market paid out $0, the later one still open) only the open market's ask
+    is read (_leg_mark), at both moments, as a live trim reads it: the
+    paid-out market sells nothing, so its payout is no move.
+    config.pair_price_move sets the sign: the result is negative when the
+    price fell. The Kelly trim's gate and the add-on gate both read it (an
+    add-on through _held_pair_move, which never reaches a lone leg on
+    Kalshi's settlement times, all written in UTC: an add-on to an exact pair
+    needs both settlement dates after the checkpoint date).
 
     Args:
         position (list[BacktestTrade]): One position's open trades
@@ -5602,6 +5700,11 @@ def _price_move(position: list[BacktestTrade], day: date,
         return None
     # The same day the wait after a trade counts from
     last_day = _last_trade_day(position, last_trim)
+    if _lone_leg(latest, day):
+        # A lone leg: its own market's price alone, then and now. The paid-out
+        # market sells nothing, so it counts 0 at both moments and its payout
+        # never reads as a move (as a live trim measures it)
+        return pair_price_move(_leg_mark(latest, 1, last_day), _leg_mark(latest, 1, day))
     # config.pair_price_move: the shared rule's own measure of a move
     return pair_price_move(_pair_price(latest, last_day), _pair_price(latest, day))
 
@@ -12015,10 +12118,16 @@ def _simulate_at_discount(
         pair is sold down to sits above the size add_to_held buys up to, and
         between the two nothing trades;
       * only one exact pair is trimmed: every open trade of the position the
-        same two markets the same way round, neither paid out, with a fresh
-        bid on both sides of both. A lone leg, a position holding a third
-        market, and a time-series pair whose chance of paying cannot be read
-        (a crossed quote, or a mid spread not above zero) are left alone;
+        same two markets the same way round, with a fresh bid on both sides
+        of each market still to pay out. Once the earlier market of a
+        time-series pair has paid out $0 on the side held there, what is
+        left is a lone leg, trimmed the same way with that market read at
+        its settlement price (_lone_leg, _fresh_bids); its price move is the
+        open market's alone. Any other position with a paid-out market (a
+        same-title pair, the later market paid out first, or the earlier
+        market's side won), a position holding a third market, and a
+        time-series pair whose chance of paying cannot be read (a crossed
+        quote, or a mid spread not above zero) are left alone;
       * the part sold is a trade record of its own, exiting at the trim
         (_split_trade, _sold_copy), and the trade it came from keeps the
         rest. A position sold whole is freed as a take-profit sale frees it.
@@ -12032,7 +12141,8 @@ def _simulate_at_discount(
       * min_move (None, the default, sets no minimum) makes a trim
         wait for a price move, up or down. A held pair is looked at only
         once its total price — the ask of the side held on each of its two
-        markets, added (_pair_price) — is at least that many dollars above
+        markets, added (_pair_price); for a lone leg, its open market's ask
+        alone — is at least that many dollars above
         or below where it stood at the checkpoint of the last trade on the
         pair: its latest purchase or add-on, or a later trim (_price_move,
         config.price_move_reached). Short of the minimum the pair is not
