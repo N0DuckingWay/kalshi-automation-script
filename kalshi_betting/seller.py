@@ -632,24 +632,15 @@ def _find_partner(reads: _Reads, ticker: str, side: str, count: int,
     """
     Find a lone held market's one paid-out partner among the account's settlements.
 
-    It is the one settled market no longer held, held on the other side when it
-    paid out (none on the held side; each count is what was held at payout,
-    _settled_count), asking the held market's question (every pair the bot buys
-    asks one question, so a market of its event that asks another was never its
-    pair-mate), and settled no earlier than SALE_PARTNER_MAX_AGE_DAYS before now
-    (one dated after now is returned, and its callers refuse it). Its count on the
-    other side is the held count when such a market exists; only when none does,
-    it is at least the held count, since a lone market partly sold after its
-    partner paid out (by a Kelly trim, a sale that filled in part, or one by
-    hand) holds fewer contracts than its partner settled with. Either way
-    exactly one market must fit. The second search's lookups count against
-    SALE_PARTNER_MAX_WIDER_LOOKUPS, apart from the first's (_Reads.labels).
-    _plan_one (a take-profit sale) and _trim_one (a Kelly trim of a lone leg)
-    both find the partner here. Fails closed: a held market with no question
-    label, no partner, two or more, an unreadable label, a partner settled
-    other than yes or no, or a partner whose record lists contracts bought on
-    both sides and whose payout does not match what it held at payout (within
-    SALE_PARTNER_REVENUE_TOLERANCE_DOLLARS) means no sale and no trim.
+    The partner is the one settled market that is no longer held, was held on
+    the other side at payout (_settled_count), asks the held market's question,
+    and settled within SALE_PARTNER_MAX_AGE_DAYS. Its count is the held count;
+    only if no market has that, at least the held count (a lone market sold in
+    part after payout holds fewer than its partner settled with). Exactly one
+    market must fit; the second search has its own lookup allowance
+    (SALE_PARTNER_MAX_WIDER_LOOKUPS). Used by _plan_one and _trim_one. Fails
+    closed on no or several partners, an unreadable label, a result other than
+    yes or no, or a two-sided record whose payout does not match its net count.
 
     Args:
         reads (_Reads): This run's reads.
@@ -671,7 +662,7 @@ def _find_partner(reads: _Reads, ticker: str, side: str, count: int,
     other = _OTHER_SIDE[side]
     oldest = reads.now_ts - SALE_PARTNER_MAX_AGE_DAYS * _DAY_SECONDS
 
-    def partners_whose_count(fits, wider: bool) -> tuple[list[Settlement] | None, str]:
+    def question_matches_with_count(fits, wider: bool) -> tuple[list[Settlement] | None, str]:
         """Up to two settled markets that pass every test above and whose count on the
         other side fits; (None, why) when a candidate's labels cannot be found. `wider`
         names the search for a partner settled with more (its own lookup allowance)."""
@@ -695,9 +686,9 @@ def _find_partner(reads: _Reads, ticker: str, side: str, count: int,
 
     # The same count first; only when no market fits it, one settled with at least
     # as many (a label already found is not looked up again)
-    partners, problem = partners_whose_count(lambda settled: settled == count, False)
+    partners, problem = question_matches_with_count(lambda settled: settled == count, False)
     if partners == []:
-        partners, problem = partners_whose_count(lambda settled: settled >= count, True)
+        partners, problem = question_matches_with_count(lambda settled: settled >= count, True)
     if partners is None:
         return None, problem
     if not partners:
@@ -1129,42 +1120,15 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
     """
     Judge one exact held pair or lone leg for a Kelly trim, log the verdict, and plan the part sale.
 
-    It is sold down when it is worth more than its Kelly share of the
-    portfolio value, each contract pair (each contract, for a lone leg)
-    counted at what selling it now returns (config.kelly_trim_count, the
-    backtest's rule). A lone leg is one held market whose partner has paid
-    out; it is trimmed only as the later market of a time-series pair whose
-    earlier market paid out $0, read as a pair whose paid-out market shows
-    its settlement price as its bids (config.settled_bids), so the pair
-    arithmetic runs unchanged and the lone leg's value is the whole
-    position's. It stops at the first step that fails, with one "Not
-    trimming" line:
-
-      1. A whole count, and its held markets in this run's market list.
-      2. The wait: enough calendar days since its last trade (_last_fill: the
-         latest fill on its markets; for a lone leg, also on any market of its
-         ladder in this run's list). With no fill listed, it counts from the
-         fills list's oldest fill.
-      3. For a lone leg: its one paid-out partner among the account's
-         settlements (_find_partner), settled by now with the side held there
-         losing (so it paid $0), and that partner's market.
-      4. Its kind (same-title or time-series) and which market is A; a lone
-         leg must be market B (the later market) of a time-series pair.
-      5. The held markets' order books, with a best bid on every side that an
-         hourly candle could show, so it is judged only on quotes the
-         backtest could see (a paid-out partner's bids are its settlement
-         price, and no book is read for it). What it would fetch at its held
-         sides' best bids, after the fee, goes into `fetched`; if that alone
-         is more than all open positions are valued at, it stops here (see
-         Returns).
-      6. With a minimum price move set: its price (the asks of the sides held,
-         added; a lone leg's one market's ask) has moved that far, up or down,
-         since its last trade.
-      7. Its chance of paying can be read (config.held_pair_win_prob).
-
-    The sale is sized and priced only on bids within KELLY_TRIM_MAX_BID_DROP of
-    each held side's best bid (patch seller.KELLY_TRIM_MAX_BID_DROP in a test),
-    so it never sells into a gap in a book.
+    It is sold down when worth more than its Kelly share of the portfolio value
+    (config.kelly_trim_count, the backtest's rule). A lone leg (its partner paid
+    out $0) is trimmed as the later market of a time-series pair, with the
+    partner read at its settlement price (config.settled_bids). It stops at the
+    first failing step with one "Not trimming" line: markets listed, the wait
+    since its last trade (_last_fill), the partner (_find_partner), its kind,
+    readable books (their fetch value goes into `fetched`), the minimum price
+    move, and a readable chance of paying. Only bids within
+    KELLY_TRIM_MAX_BID_DROP of each best bid are sold into.
 
     Args:
         pair (HeldPair): An exact held pair or a lone leg, from scanner.held_pairs.
