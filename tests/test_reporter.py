@@ -902,6 +902,46 @@ def make_trim(status: str = "sold", *, sold: dict | None = None, error: str | No
                                error=error)
 
 
+def make_lone_trim(status: str = "sold", *, sold: dict | None = None,
+                   error: str | None = None, sell: int = 43,
+                   held: int = 129) -> reporter.SaleResult:
+    """
+    Build a Kelly trim of a lone leg, as trader.sell_positions returns it.
+
+    The account holds `held` NO on SELL-B, the later market, whose earlier
+    partner SELL-A (YES) paid out $0. The position cost $100.00 on SELL-B and
+    $38.70 on SELL-A, fees included; the trim sells `sell` NO at a bid of
+    0.86, with that share of both costs. The partner is the plan's second leg,
+    with no market, as seller.plan_trims builds it.
+
+    Args:
+        status (str): The sale's status.
+        sold (dict | None): Keyword-only. Contracts sold per held ticker; None
+            for `sell` on SELL-B.
+        error (str | None): Keyword-only. The sale's error.
+        sell (int): Keyword-only. Contracts the trim sells.
+        held (int): Keyword-only. Contracts the account holds on SELL-B.
+
+    Returns:
+        reporter.SaleResult: The trim.
+    """
+    share = sell / held
+    held_leg = seller.SaleLeg("SELL-B", "EV-SELL-B", "no", sell, 100.0 * share,
+                              market=_sale_market("SELL-B", 6), held=held)
+    partner = seller.SaleLeg("SELL-A", "EV-SELL-A", "yes", sell, 38.70 * share,
+                             payout_dollars=0.0, paid_at=datetime(2026, 10, 1, tzinfo=UTC))
+    walked = {"SELL-B": (0.86, 0.86)}
+    cost = (100.0 + 38.70) * share
+    proceeds = sell * 0.86 - config.fee_leg_exact(sell, 0.86)
+    plan = seller.SalePlan(
+        title="Will S happen by November 6, 2026?", legs=(held_leg, partner), count=sell,
+        cost_dollars=cost, ladders={"SELL-B": [[0.86, 1000.0]]}, walked=walked,
+        proceeds_dollars=proceeds, profits=((proceeds - cost, sell * 1.0 - cost),),
+        days_left=9, level=None, kind=config.SALE_KIND_KELLY_TRIM)
+    return reporter.SaleResult(plan=plan, status=status,
+                               sold={"SELL-B": sell} if sold is None else sold, error=error)
+
+
 class TestSaleRows:
     """A sale's row in the trade log, under the trade columns: the position's
     markets, the bids it was priced at, the contracts sold, its cost and the
@@ -984,9 +1024,43 @@ class TestSaleRows:
         assert row[17] == ("[sale: YES A / NO B, Kelly trim: 13 of 30 contract pairs, "
                            "9 days left, fees=$0.46] sold 10 of 13 on each market")
 
+    def test_a_lone_leg_trim_says_how_many_contracts_it_sells(self):
+        # The one held market sells contracts, not contract pairs; the paid-out
+        # partner is listed with its share of the cost and sells nothing
+        row = reporter._sale_to_row(make_lone_trim(), datetime(2026, 10, 8, 16, 0, tzinfo=UTC))
+        # 0.07 x 43 x 0.86 x 0.14 = 0.3624, rounded up to the cent
+        assert config.fee_leg_exact(43, 0.86) == 0.37
+        cost = (100.0 + 38.70) * 43 / 129
+        realized = 43 * 0.86 - 0.37 - cost
+        assert row == [
+            "2026-10-08", "16:00:00",
+            "Will S happen by November 6, 2026?", "SELL-B", "(paid out)", "SELL-A",
+            "2026-11-06", "", 0.86, "", "", 43, "",
+            round(cost, 2), round(realized, 2), round(realized / cost, 4), "sold",
+            "[sale: NO A / YES B, Kelly trim: 43 of 129 contracts, 9 days left, "
+            "fees=$0.37] ",
+        ]
+        assert (round(cost, 2), round(realized, 2)) == (46.23, -9.62)
+        assert len(row) == len(reporter._TRADE_COLUMNS)
+
+    def test_a_lone_leg_trim_that_sold_less_shows_what_sold_and_no_profit(self):
+        trim = make_lone_trim("partly_sold", sold={"SELL-B": 30},
+                              error="sold 30 of 43 on SELL-B")
+        row = reporter._sale_to_row(trim, datetime(2026, 10, 8, tzinfo=UTC))
+        assert row[11:13] == [30, ""]
+        assert row[14:17] == ["", "", "partly sold"]
+        assert row[17] == ("[sale: NO A / YES B, Kelly trim: 43 of 129 contracts, "
+                           "9 days left, fees=$0.37] sold 30 of 43 on SELL-B")
+
+    def test_a_lone_leg_trim_of_every_contract_held_is_still_a_trim(self):
+        row = reporter._sale_to_row(make_lone_trim(sell=129), datetime(2026, 10, 8, tzinfo=UTC))
+        assert row[17] == ("[sale: NO A / YES B, Kelly trim: 129 of 129 contracts, "
+                           f"9 days left, fees=${config.fee_leg_exact(129, 0.86):.2f}] ")
+
     def test_every_sale_row_starts_as_the_live_trading_tab_reads_it(self):
         # live_portfolio tells a sale row by this start of its Notes, whatever its kind
-        for sale in (make_sale(), make_sale(lone=True), make_trim(), make_trim(sell=30)):
+        for sale in (make_sale(), make_sale(lone=True), make_trim(), make_trim(sell=30),
+                     make_lone_trim()):
             assert reporter._sale_to_row(sale, datetime(2026, 10, 8, tzinfo=UTC))[17].startswith(
                 "[sale: ")
 
@@ -1069,6 +1143,18 @@ class TestReportSales:
                   reporter.SaleLegRecord("SELL-B", "no", 30, 13, 0.42)),
             error=None, kind="kelly_trim")
         assert record.kind == config.SALE_KIND_KELLY_TRIM
+
+    def test_a_lone_leg_trim_records_its_one_held_market(self):
+        [record] = reporter.report_sales([make_lone_trim()])
+        cost = (100.0 + 38.70) * 43 / 129
+        proceeds = 43 * 0.86 - 0.37
+        # One held market, with the contracts held there; the paid-out partner is no leg
+        assert record == reporter.SaleRecord(
+            title="Will S happen by November 6, 2026?", status="sold", level=None,
+            days_left=9, cost=round(cost, 2), proceeds=round(proceeds, 2),
+            profit=round(proceeds - cost, 2), realized_percent=None,
+            legs=(reporter.SaleLegRecord("SELL-B", "no", 129, 43, 0.86),),
+            error=None, kind="kelly_trim")
 
     def test_a_kelly_trim_that_sold_less_records_no_profit(self):
         [record] = reporter.report_sales([make_trim(

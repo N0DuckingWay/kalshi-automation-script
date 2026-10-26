@@ -2011,6 +2011,33 @@ class TestPlanTrims:
         assert world.calls["book"] == [_B]
         assert world.calls["settlements"] == 1 and world.calls["lookup"] == [_SAME_EVENT]
 
+    def test_a_lone_leg_plan_is_one_the_trader_and_the_reporter_read(self, monkeypatch, caplog):
+        # The real plan, handed on as a run would: the trader builds its one
+        # order, on the held market alone (a dry run sends none), and the
+        # reporter words the row and the record in contracts, not contract pairs
+        from kalshi_betting import reporter, trader
+
+        world = _lone_trim(_lone_partner())
+        (plan,) = _lone_trims(world, monkeypatch)
+        legs, problem = trader._sale_legs(plan)
+        assert problem is None and [leg.ticker for leg in legs] == [_B]
+        assert [trader._plan_holding(leg) for leg in legs] == [129]
+        with caplog.at_level(logging.INFO):
+            [result] = trader.sell_positions(MagicMock(), [plan], dry_run=True)
+        assert (result.status, result.sold) == ("simulated", {_B: 42})
+        assert ("42 NO contracts (of 129 held) on " + _B) in caplog.text
+        row = reporter._sale_to_row(result, _NOW)
+        assert row[17] == ("[sale: NO A / YES B, Kelly trim: 42 of 129 contracts, "
+                           f"13 days left, fees=${fee_leg_exact(42, 0.86):.2f}] ")
+        assert row[3:6] == [_B, "(paid out)", _SAME_EVENT]
+        assert row[11:13] == [42, ""] and row[13] == round(plan.cost_dollars, 2)
+        [record] = reporter.report_sales([result])
+        assert (record.kind, record.level, record.realized_percent) == (
+            config.SALE_KIND_KELLY_TRIM, None, None)
+        # The paid-out partner is no leg of the record: it sold nothing
+        assert [(leg.ticker, leg.held, leg.sold) for leg in record.legs] == [(_B, 129, 42)]
+        assert record.profit == round(plan.profits[0][0], 2)
+
     def test_a_lone_leg_within_its_cap_is_kept(self, monkeypatch, caplog):
         # Under a 20% cap B may keep $149.80, 175 contracts: all 129 stay
         world = _lone_trim(_lone_partner())

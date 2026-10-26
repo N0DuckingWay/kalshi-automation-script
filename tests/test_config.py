@@ -3437,11 +3437,13 @@ class TestRebalanceChangeWarnings:
     _NOW = LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, rebalance=True)
 
     @staticmethod
-    def _sentence(named: str) -> list:
+    def _sentence(named: str, lone: bool = True) -> list:
+        """The sentence for these changes; `lone` False when none can reach a lone leg."""
+        who = ("each exact held pair, or lone leg whose partner has paid out, worth"
+               if lone else "each exact held pair worth")
         return [f"with Rebalance yes, these settings can sell more of the held pairs: "
-                f"{named}; each exact held pair worth more than its new Kelly size is sold "
-                "down to it before anything is bought, once the wait since its last trade "
-                "has passed"]
+                f"{named}; {who} more than its new Kelly size is sold down to it before "
+                "anything is bought, once the wait since its last trade has passed"]
 
     def test_each_change_that_sells_is_named(self):
         new = dataclasses.replace
@@ -3450,7 +3452,7 @@ class TestRebalanceChangeWarnings:
                            "same-title size cap goes from 20% to 10%"))
         assert config.rebalance_change_warnings(
             self._NOW, new(self._NOW, same_title_size_cap=0.1)) == self._sentence(
-                "the same-title size cap goes from 20% to 10%")
+                "the same-title size cap goes from 20% to 10%", lone=False)
         assert config.rebalance_change_warnings(
             self._NOW, new(self._NOW, interval_discount=0.85)) == self._sentence(
                 "k goes from 0.8 to 0.85, which lowers a time-series pair's chance of paying")
@@ -3465,6 +3467,24 @@ class TestRebalanceChangeWarnings:
         assert config.rebalance_change_warnings(uncapped, new(uncapped, size_cap=0.5)) == (
             self._sentence("the time-series size cap goes from 100% (no cap) to 50% and the "
                            "same-title size cap goes from 100% (no cap) to 50%"))
+
+    def test_a_lone_leg_is_named_only_when_a_time_series_setting_can_reach_it(self):
+        # A lone leg is the later market of a time-series pair: a same-title cap
+        # alone never reaches one, a time-series cap or k does, alone or with a
+        # same-title change
+        new = dataclasses.replace
+        [same_title] = config.rebalance_change_warnings(
+            self._NOW, new(self._NOW, same_title_size_cap=0.1))
+        assert "lone leg" not in same_title
+        # Only the time-series cap falls: the same-title cap was already the lower
+        held = new(self._NOW, size_cap=0.3, same_title_size_cap=0.2)
+        assert config.rebalance_change_warnings(held, new(held, size_cap=0.25)) == (
+            self._sentence("the time-series size cap goes from 30% to 25%"))
+        [k_up] = config.rebalance_change_warnings(self._NOW, new(self._NOW, interval_discount=0.9))
+        assert "or lone leg whose partner has paid out, worth more than" in k_up
+        both = config.rebalance_change_warnings(
+            self._NOW, new(self._NOW, same_title_size_cap=0.1, interval_discount=0.9))
+        assert "or lone leg whose partner has paid out" in both[0]
 
     @pytest.mark.parametrize("change", [
         # Rebalancing off in the proposed settings: nothing is trimmed at all

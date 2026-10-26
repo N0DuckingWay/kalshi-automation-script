@@ -1154,6 +1154,14 @@ class TestLiveSettingsFlags:
         assert out.count("a higher k also sells: each exact held") == 1
         assert out.count("worth more than its new Kelly size is sold down to it before "
                          "anything is bought, once its wait has passed") == 3
+        # A lone leg is the later market of a time-series pair, so the flags that can
+        # reach one (k, and the per-trade cap) name it; the same-title cap does not
+        lone = "pair, or lone leg whose partner has paid out, worth more than its new Kelly"
+        assert out.count(lone) == 2
+        assert ("a higher k also sells: each exact held time-series " + lone) in out
+        assert ("a lower cap also sells: each exact held " + lone) in out
+        assert ("a lower cap also sells: each exact held same-title pair worth more than "
+                "its new Kelly") in out
         assert out.count("With Rebalance yes (saved, or given with --rebalance), a ") == 3
         assert "Production runs only: a dev run holds nothing" in out
         # The constant itself is never named (its wait's constant is, above)
@@ -1169,10 +1177,11 @@ class TestLiveSettingsFlags:
         # The rebalance flags. argparse may wrap a flag's name at a hyphen, so
         # the pinned words stop short of one
         assert ("Rebalance the held pairs this run: before buying, sell part of each exact "
-                "held pair that has outgrown its Kelly size, once "
-                "config.REBALANCE_MIN_DAYS_SINCE_TRADE calendar days have passed since the "
-                "pair's last trade, and let this run add to a pair the account already "
-                "holds") in out
+                "held pair, or lone leg whose partner has paid out, that has outgrown its "
+                "Kelly size, once config.REBALANCE_MIN_DAYS_SINCE_TRADE calendar days have "
+                "passed since its last trade, and let this run add to a pair the account "
+                "already holds (exactly the same two markets, the same side on each, or a "
+                "lone leg beside a market not held) after the same wait") in out
         assert ("neither trims nor adds to a held pair, and clears the saved minimum price "
                 "move too.") in out
         assert "no run acts on it" not in out
@@ -1372,26 +1381,29 @@ class TestLogLiveSettings:
         return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
                 and "can sell more of the held pairs" in r.getMessage()]
 
-    @pytest.mark.parametrize("change, named", [
+    @pytest.mark.parametrize("change, named, lone", [
         ({"size_cap": 0.10}, "the time-series size cap goes from 20% to 10% and the "
-                             "same-title size cap goes from 20% to 10%"),
-        ({"same_title_size_cap": 0.10}, "the same-title size cap goes from 20% to 10%"),
+                             "same-title size cap goes from 20% to 10%", True),
+        # A lone leg is never a same-title position: the sentence leaves it out
+        ({"same_title_size_cap": 0.10}, "the same-title size cap goes from 20% to 10%", False),
         ({"interval_discount": 0.9}, "k goes from 0.8 to 0.9, which lowers a time-series "
-                                     "pair's chance of paying"),
+                                     "pair's chance of paying", True),
     ], ids=["per-trade cap", "same-title cap", "k"])
-    def test_with_rebalancing_on_a_lower_cap_or_a_higher_k_is_said_to_sell(self, caplog,
-                                                                           change, named):
+    def test_with_rebalancing_on_a_lower_cap_or_a_higher_k_is_said_to_sell(
+        self, caplog, change, named, lone,
+    ):
         # A real-money run whose flags lower a cap or raise k warns that it can sell
         saved = LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, rebalance=True,
                              origin=self._ORIGIN)
         with caplog.at_level(logging.INFO):
             main._log_live_settings(dataclasses.replace(saved, **change), saved,
                                     real_money=True)
+        who = ("each exact held pair, or lone leg whose partner has paid out, worth"
+               if lone else "each exact held pair worth")
         assert self._trim_lines(caplog) == [
             "Live settings: with Rebalance yes, these settings can sell more of the held "
-            f"pairs: {named}; each exact held pair worth more than its new Kelly size is sold "
-            "down to it before anything is bought, once the wait since its last trade has "
-            "passed"]
+            f"pairs: {named}; {who} more than its new Kelly size is sold down to it before "
+            "anything is bought, once the wait since its last trade has passed"]
         # ... after the WARNING that the flags override the saved defaults
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert warnings.index(self._trim_lines(caplog)[0]) > [

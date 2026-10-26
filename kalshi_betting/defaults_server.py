@@ -432,11 +432,11 @@ _SALE_STATUS_WORDS = {"sold": "sold", "partly_sold": "partly sold", "not_sold": 
 # What a run page says under its Sales table
 _SALE_PROFIT_NOTE = ("Profit is what the sale returns at the bids it was priced at, after "
                      "fees, plus the payout of a partner that has already paid out, less "
-                     "what the whole position cost (for a Kelly trim, less what the contract "
-                     "pairs sold cost); it is shown only when everything the sale set out to "
+                     "what the whole position cost (for a Kelly trim, less what the part "
+                     "sold cost); it is shown only when everything the sale set out to "
                      "sell was sold (or, in a dry run, would have been). A Kelly trim sells "
-                     "a held pair down to its Kelly size: part of it, or all of it when "
-                     "Kelly keeps none.")
+                     "a held pair, or a lone leg whose partner has paid out, down to its "
+                     "Kelly size: part of it, or all of it when Kelly keeps none.")
 
 # Added after the title in a Kelly trim's Position cell
 _KELLY_TRIM_MARK = " (Kelly trim)"
@@ -2633,14 +2633,14 @@ def _outcome(run: _Run, exit_code: int | None, result: _Result, lines: list[str]
             done = [s for s in sales if s["status"] in ("sold", "partly_sold")]
             if done:
                 # Kelly trims alone read as "trimmed"
-                return _Outcome("Held pairs trimmed; no trades to complete"
+                return _Outcome("Held positions trimmed; no trades to complete"
                                 if _only_trims(done) else
                                 "Positions sold; no trades to complete", "ok",
                                 message + note)
             if sales and all(s["status"] == "simulated" for s in sales):
                 return _Outcome("Dry run finished — no orders were sent", "",
-                                ("<p>These held pairs would have been sold down to their "
-                                 "Kelly size (a Kelly trim):</p>" if _only_trims(sales) else
+                                ("<p>These held positions would have been sold down to "
+                                 "their Kelly size (a Kelly trim):</p>" if _only_trims(sales) else
                                  "<p>These positions would have been sold:</p>")
                                 + message + note)
             return _Outcome("No trades to complete", "", message + note)
