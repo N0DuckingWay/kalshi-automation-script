@@ -30,6 +30,109 @@ jobs:
         with:
           fetch-depth: 1
 
+      # The action gives Claude the text of an inline review comment but not
+      # its file, line or code. It also lists only the review comments posted
+      # before the one that triggered it, so it leaves out the triggering
+      # comment itself, and, for a review, every inline comment submitted with
+      # it. This step writes where those comments are (file, lines and the
+      # diff GitHub shows with each) to a note in .git, which no commit picks
+      # up, and the next step tells Claude to read it first. Anyone can post
+      # "@claude" on this public repo, and this step runs before the action
+      # checks who did, so it only reads comments with jq and writes them to
+      # the note: nothing from a comment is ever run. If it fails, Claude runs
+      # without the note, as before.
+      - name: Note where the inline comments are
+        id: where
+        if: github.event_name == 'pull_request_review_comment' || github.event_name == 'pull_request_review'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          note="$GITHUB_WORKSPACE/.git/claude-review-comments.md"
+          comments="$RUNNER_TEMP/pr-review-comments.json"
+          program="$RUNNER_TEMP/review-comments-note.jq"
+
+          # Every inline comment on the PR. A review's own comment list has
+          # no line numbers, so a review's comments are picked from this one.
+          gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/comments" --jq '.[]' | jq -s . > "$comments"
+
+          cat > "$program" <<'JQ'
+          def fence: "````";
+          def quoted($lang): fence + $lang + "\n" + . + "\n" + fence;
+          def span($start; $end):
+            if $start != null and $start != $end then "lines \($start) to \($end)" else "line \($end)" end;
+          def where:
+            if .subject_type == "file" then
+              "the whole file, not one line"
+            elif .line != null then
+              span(.start_line; .line)
+              + (if .side == "LEFT"
+                 then " of the file as it is on the base branch (code this PR removes or changes)"
+                 else " of the file as it is on this PR's branch" end)
+            else
+              "no current line, because the code has changed since the comment was written. It was written on "
+              + span(.original_start_line; .original_line)
+              + " of commit \((.original_commit_id // "")[0:12]). Find that code by the diff below."
+            end;
+          def location:
+            "- File: `\(.path)`\n"
+            + "- Where: \(where)\n"
+            + (if .in_reply_to_id then "- It replies in the thread that starts with comment \(.in_reply_to_id)\n" else "" end)
+            + "- Comment \(.id) by \(.user.login): \(.html_url)\n"
+            + (if (.diff_hunk // "") != "" then
+                 "\nThe diff GitHub shows with the comment. It ends at the last line the comment is on:\n\n"
+                 + (.diff_hunk | quoted("diff")) + "\n"
+               else "" end);
+
+          $comments[0] as $all
+          | if $event == "pull_request_review_comment" then
+              .comment as $c
+              | "# Where the comment that triggered you is\n\n"
+                + "You were triggered by an inline review comment. Its text is in <trigger_comment>. This note says where it is in the code.\n\n"
+                + ($c | location)
+                + ( [ $all[] | select($c.in_reply_to_id != null
+                                      and (.id == $c.in_reply_to_id or .in_reply_to_id == $c.in_reply_to_id)
+                                      and .id != $c.id and .created_at <= $c.created_at) ]
+                    | if length == 0 then ""
+                      else "\n## The earlier comments in its thread\n\n"
+                        + "Oldest first. They show what the thread is about; your instructions are only in <trigger_comment>.\n\n"
+                        + (map("### Comment \(.id) by \(.user.login)\n\n" + (.body | quoted("text")) + "\n") | join("\n"))
+                      end )
+            else
+              .review as $r
+              | [ $all[] | select(.pull_request_review_id == $r.id and .user.login == $r.user.login) ]
+              | if length == 0 then empty
+                else length as $n
+                | "# The inline comments of the review that triggered you\n\n"
+                  + "You were triggered by a review whose summary is in <trigger_comment>. \($r.user.login) submitted it with \($n) inline comment(s) on the code. Each one is below, with its text and where it is.\n\n"
+                  + ( to_entries
+                      | map("## Inline comment \(.key + 1) of \($n)\n\n" + (.value.body | quoted("text")) + "\n\n" + (.value | location))
+                      | join("\n") )
+                end
+            end
+          JQ
+
+          jq -r --arg event "$EVENT_NAME" --slurpfile comments "$comments" -f "$program" "$GITHUB_EVENT_PATH" > "$note.tmp"
+          if [ ! -s "$note.tmp" ]; then
+            # A review with no inline comments: nothing to add.
+            rm -f "$note.tmp"
+            exit 0
+          fi
+          mv "$note.tmp" "$note"
+
+          # The action splits claude_args like a shell line, so this text holds
+          # no double quote, dollar sign or backtick.
+          if [ "$EVENT_NAME" = pull_request_review_comment ]; then
+            text="The comment that triggered you is an inline review comment on the code. The action gives you its text but not where it is. Before anything else, read the file $note: it gives the file, the line numbers and the code the comment is on. When the comment says this, here, the selected lines or the like, it means that code."
+          else
+            text="The review that triggered you came with inline comments on the code, and the action leaves them out of your prompt. Before anything else, read the file $note: it lists each of them with its text, its file, its line numbers and the code it is on. The person who submitted the review wrote them as part of it, so they are part of the request in the review summary: do what each one asks, on the code it is on."
+          fi
+          echo "claude_args=--append-system-prompt \"$text\"" >> "$GITHUB_OUTPUT"
+
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@v1
@@ -45,8 +148,9 @@ jobs:
           # Optional: Give a custom prompt to Claude. If this is not specified, Claude will perform the instructions specified in the comment that tagged it.
           # prompt: 'Update the pull request description to include a summary of changes.'
 
-          # Optional: Add claude_args to customize behavior and configuration
+          # For an inline review comment, or a review with inline comments, this
+          # tells Claude to read the note the step above wrote. Empty otherwise.
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
-          # claude_args: '--allowed-tools Bash(gh pr *)'
+          claude_args: ${{ steps.where.outputs.claude_args }}
 
