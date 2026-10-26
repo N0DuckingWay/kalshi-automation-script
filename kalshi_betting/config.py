@@ -4729,7 +4729,7 @@ def settled_bids(result: str) -> tuple[float, float]:
     1 minus the other side's bid (a market that settled "no" has a YES ask of 0
     and a NO ask of 1), and the side held there adds its bid, $0 when that side
     lost, to what selling the pair fetches. The live Kelly trim of a lone leg
-    (seller._trim_one) reads it.
+    (seller._trim_one) and the backtest's (backtester._fresh_bids) read it.
 
     Args:
         result (str): How the market settled, "yes" or "no".
