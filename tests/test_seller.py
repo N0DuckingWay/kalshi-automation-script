@@ -3682,7 +3682,8 @@ class TestIsolation:
         # own functions, the ones the backtest trims with
         for name in ("kelly_trim_count", "kelly_trim_bids", "held_pair_win_prob",
                      "rebalance_rested", "rebalance_min_days", "trade_day", "pair_price_move",
-                     "price_move_reached", "pair_size_cap", "fee_per_pair_approx"):
+                     "price_move_reached", "pair_size_cap", "fee_per_pair_approx",
+                     "settled_bids"):
             assert getattr(seller, name) is getattr(config, name), name
             assert getattr(backtester, name, getattr(config, name)) is getattr(config, name)
         trim_one = _calls("_trim_one")
@@ -3691,6 +3692,13 @@ class TestIsolation:
                 "fee_per_pair_approx", "fee_leg_exact", "walk_bids", "bid_ladder",
                 "candle_reads_bid", "held_pair_kind", "leg_sides", "_fetch_orderbook",
                 "ask_then", "_day", "_other"} <= trim_one
+        # A lone leg is trimmed on the same pair arithmetic: its paid-out partner reads as
+        # its settlement price (config.settled_bids), is found, scaled and dated as a
+        # take-profit sale's is, and the wait and price move count from the one reading of
+        # a position's last fill that an add-on shares
+        assert {"settled_bids", "_find_partner", "_partner_leg", "_last_fill"} <= trim_one
+        assert {"_find_partner", "_partner_leg"} <= _calls("_plan_one")
+        assert "_last_fill" in _calls("_add_on_one")
         # It reads no candle or fills list itself, and turns a time into a day
         # only through _day
         assert not {"recent_candles", "ask_before", "get_fill_times", "trade_day"} & trim_one
@@ -3719,6 +3727,9 @@ class TestIsolation:
         (decided,) = _calls_of("_trim_one", "kelly_trim_count")
         assert (rested.lineno < kind.lineno < book.lineno < measured.lineno < tested.lineno
                 < forecast.lineno < decided.lineno)
+        # A lone leg's partner is found after the wait and before the kind is read
+        (found,) = _calls_of("_trim_one", "_find_partner")
+        assert rested.lineno < found.lineno < kind.lineno
         # What the pair alone fetches, and its check against the value of all open
         # positions, come after the books and before the price move and the forecast
         (valued,) = _calls_of("_trim_one", "fee_per_pair_approx")

@@ -4892,7 +4892,7 @@ def kelly_trim_bids(ladder, max_drop: float) -> list:
     trim never sells into a gap in the book: under a binding size cap the
     rule (kelly_trim_count) would otherwise sell past one 42c bid into a stub
     bid at 2c. A bid exactly max_drop below the best is kept, within float
-    noise. seller._trim_one calls it on both held sides.
+    noise. seller._trim_one calls it on each held side.
 
     Args:
         ladder: One side's bids, [[price in dollars, quantity], ...], best
