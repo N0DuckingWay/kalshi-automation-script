@@ -1082,24 +1082,19 @@ def _log_trim_summary(trimmed: int, considered: int, lone_trimmed: int,
 
 def _last_fill(pair: HeldPair, reads: _Reads, fills: FillTimes | None) -> datetime | None:
     """
-    When a held position last traded: the latest fill on its markets, by the bot or by hand.
+    When a held position last traded: its newest fill, by the bot or by hand.
 
-    For an exact pair, its two markets. For a lone leg, its own market and any
-    market of its ladder in this run's list that the account does not hold: the
-    finders pair a lone leg only with such a market, and a partner sold by hand
-    leaves the positions listing just as a paid-out one does, so buying it back
-    or trimming the leg waits like any other rebalance. A Kelly trim
-    (_trim_one) and an add-on (_add_on_one) both count their wait and their
-    price move from this one moment.
+    Counts fills on the position's own markets and, for a lone leg, on any
+    unheld market of its ladder in this run's list. Trims and add-ons both
+    wait and measure price moves from this moment.
 
     Args:
-        pair (HeldPair): An exact held pair or a lone leg, from scanner.held_pairs.
-        reads (_Reads): This planner call's reads (only this run's market list is used).
-        fills (FillTimes | None): When each market last traded; None when the
-            fills were not read.
+        pair (HeldPair): An exact held pair or a lone leg.
+        reads (_Reads): This planner call's reads (its market list is used).
+        fills (FillTimes | None): Each market's last fill; None if not read.
 
     Returns:
-        datetime | None: The latest such fill; None when fills is None or none is listed.
+        datetime | None: The newest such fill; None if fills is None or none is listed.
     """
     if fills is None:
         return None
