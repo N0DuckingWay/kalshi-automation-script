@@ -232,8 +232,9 @@ from .config import (
 # The fields a confirmation request carries, in the GET query and repeated in
 # the POST body; the signed text is built from exactly these, as raw strings
 _FIELDS = ("tier_floors", "spread_min", "spread_max", "k", "size_cap",
-           "same_title_size_cap", "rebalance", "min_price_move", "sell_at",
-           "sell_min_days", "exclude_category", "exclude_tag", "source")
+           "same_title_size_cap", "rebalance", "min_price_move",
+           "rebalance_min_days_to_maturity", "sell_at", "sell_min_days",
+           "exclude_category", "exclude_tag", "source")
 # The fields a link built by an older version could carry: add_to_held_pairs,
 # trim_to_kelly and trim_min_rise, which rebalance and min_price_move replaced;
 # category (a category to trade), which exclude_category replaced; and tag (a
@@ -244,7 +245,7 @@ _RETIRED_FIELDS = ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise", "categ
 _REQUIRED = ("tier_floors", "spread_min", "spread_max", "k", "size_cap")
 # The fields a request may give more than once: one per excluded category or tag named
 _REPEATABLE = ("exclude_category", "exclude_tag")
-# The largest number of fields a query or form may hold: its thirteen fields, the
+# The largest number of fields a query or form may hold: its fourteen fields, the
 # fingerprint, nonce, token, action and acknowledgement (with room to spare),
 # plus the most categories and tags a link may name; more is refused unread
 _MAX_FIELDS = 20 + 2 * DEFAULTS_SERVER_MAX_FILTER_NAMES
@@ -917,17 +918,21 @@ def _proposal(params: dict[str, list[str]],
     Required: tier_floors ("on"/"off"), spread_min, spread_max, k and
     size_cap (a fraction, e.g. 0.2). Optional: same_title_size_cap,
     rebalance ("on"/"off"), min_price_move ("off" or dollars, e.g. 0.1 for
-    10c), sell_at ("off" or a share in (0, 1]) and sell_min_days ("off" or
-    whole days). One left out keeps the saved value (for a file an older
-    version saved, its value in the new form), or takes the seed's when none
-    is saved or (all but same_title_size_cap) when the link carries the
-    seed's note, so such a link still proposes exactly the seed.
-    LiveSettings refuses a minimum price movement with rebalancing off, as it
-    refuses a minimum of days with no sell level. A link that names one of
-    _RETIRED_FIELDS (built before rebalance and min_price_move replaced the
-    first three, before exclude_category replaced category, or before
-    exclude_tag replaced tag) is refused, with a message saying how to get a
-    new one.
+    10c), rebalance_min_days_to_maturity (0, 1 or 7 days; 0 is "maturity",
+    always rebalance), sell_at ("off" or a share in (0, 1]) and sell_min_days
+    ("off" or whole days). One left out keeps the saved value (for a file an
+    older version saved, its value in the new form), or takes the seed's when
+    none is saved or (all but same_title_size_cap) when the link carries the
+    seed's note, so such a link still proposes exactly the seed. The one
+    exception: a link that names rebalance=off and leaves
+    rebalance_min_days_to_maturity out clears it, so a page built before that
+    field existed can still turn rebalancing off.
+    LiveSettings refuses a minimum price movement or a days-to-maturity limit
+    with rebalancing off, as it refuses a minimum of days with no sell level.
+    A link that names one of _RETIRED_FIELDS (built before rebalance and
+    min_price_move replaced the first three, before exclude_category replaced
+    category, or before exclude_tag replaced tag) is refused, with a message
+    saying how to get a new one.
 
     exclude_category and exclude_tag may each repeat, one name per field, at
     most config.DEFAULTS_SERVER_MAX_FILTER_NAMES of each as sent; a missing
@@ -1012,6 +1017,17 @@ def _proposal(params: dict[str, list[str]],
                           else _number(value["min_price_move"], "min_price_move"))
     else:
         min_price_move = _kept("min_price_move", current, source)
+    # 0 means "maturity" (always rebalance); LiveSettings stores it as None and
+    # refuses anything but 1 or 7
+    if "rebalance_min_days_to_maturity" in value:
+        rebalance_until = _whole_number(value["rebalance_min_days_to_maturity"],
+                                        "rebalance_min_days_to_maturity")
+    elif "rebalance" in value and not rebalance:
+        # A page built before this field existed says rebalance=off and knows
+        # nothing of it; the limit goes with the switch rather than refuse the link
+        rebalance_until = None
+    else:
+        rebalance_until = _kept("rebalance_min_days_to_maturity", current, source)
     # "off" means never selling, or no minimum of days
     if "sell_at" in value:
         sell_at = None if value["sell_at"] == "off" else _number(value["sell_at"], "sell_at")
@@ -1047,6 +1063,7 @@ def _proposal(params: dict[str, list[str]],
         exclude_tags=exclude_tags,
         rebalance=rebalance,
         min_price_move=min_price_move,
+        rebalance_min_days_to_maturity=rebalance_until,
         sell_at=sell_at,
         sell_min_days=sell_min_days,
     )
@@ -1064,7 +1081,8 @@ def _settings_query(values: LiveSettings, *, source: str = "") -> str:
     The fields come in _FIELDS order. Numbers are written as their repr (the
     exact float, which _proposal reads back as the same number), switches as
     on or off, an unset minimum price movement, sell level or minimum of days
-    as off, and each excluded category and each excluded tag as a field of its own, in the
+    as off, an unset days-to-maturity limit ("maturity") as 0, and each
+    excluded category and each excluded tag as a field of its own, in the
     values' order. Every field is named, so the page proposes these
     settings whatever is saved.
 
@@ -1085,6 +1103,7 @@ def _settings_query(values: LiveSettings, *, source: str = "") -> str:
         ("rebalance", "on" if values.rebalance else "off"),
         ("min_price_move",
          "off" if values.min_price_move is None else repr(values.min_price_move)),
+        ("rebalance_min_days_to_maturity", str(values.rebalance_min_days_to_maturity or 0)),
         ("sell_at", "off" if values.sell_at is None else repr(values.sell_at)),
         ("sell_min_days",
          "off" if values.sell_min_days is None else str(values.sell_min_days)),

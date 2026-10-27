@@ -82,6 +82,7 @@ from html.parser import HTMLParser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urlencode
 
 import pytest
@@ -1116,6 +1117,139 @@ class TestConfirmPage:
         assert "min_price_move must be a multiple of 5c from 5c to $1" in html.unescape(
             response.body)
 
+    @pytest.mark.parametrize("saved", [
+        {}, {"rebalance": True}, {"rebalance": True, "rebalance_min_days_to_maturity": 1},
+        {"rebalance": True, "rebalance_min_days_to_maturity": 7,
+         "min_price_move": 0.25}])
+    def test_a_missing_rebalance_until_keeps_the_saved_value(self, saved):
+        # A link that leaves it out (an older dashboard page, a hand-made link)
+        # keeps it as saved, shown as no change, exactly as the minimum price
+        # movement is kept
+        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, **saved))
+        page = _parse(_get(_app(), "/confirm?" + _query()).body)
+        words = {None: "maturity", 1: "1 day before maturity", 7: "7 days before maturity"}
+        expected = words[saved.get("rebalance_min_days_to_maturity")]
+        assert page.rows["rebalance until"] == "same"
+        assert page.cells["rebalance until"][1:3] == [expected, expected]
+        proposed, _ = defaults_server._proposal(defaults_server._params(_query()),
+                                                config.read_saved_live_defaults())
+        assert proposed.rebalance_min_days_to_maturity == saved.get(
+            "rebalance_min_days_to_maturity")
+
+    def test_a_missing_rebalance_until_with_none_saved_is_the_seed_s(self):
+        settings, _ = defaults_server._proposal(defaults_server._params(_query()), None)
+        assert settings.rebalance_min_days_to_maturity is (
+            config.LIVE_DEFAULTS_SEED.rebalance_min_days_to_maturity) is None
+
+    @pytest.mark.parametrize("given, expected, words", [
+        ("0", None, "maturity"),
+        ("1", 1, "1 day before maturity"),
+        ("7", 7, "7 days before maturity"),
+        # Plain ASCII digits as for the minimum of days: leading zeros read as the number
+        ("007", 7, "7 days before maturity"),
+        ("00", None, "maturity"),
+    ])
+    def test_a_named_rebalance_until_is_proposed(self, given, expected, words):
+        # With nothing saved, so the switch a link leaves out is the seed's (on)
+        query = _query(rebalance_min_days_to_maturity=given)
+        settings, _ = defaults_server._proposal(defaults_server._params(query), None)
+        assert settings.rebalance and settings.rebalance_min_days_to_maturity == expected
+        response = _get(_app(), "/confirm?" + query)
+        assert response.status == 200
+        assert _parse(response.body).cells["rebalance until"][1:3] == ["—", words]
+
+    def test_a_named_rebalance_until_over_a_saved_one_is_the_only_change(self):
+        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True,
+                           rebalance_min_days_to_maturity=7))
+        response = _get(_app(), "/confirm?" + _query(rebalance_min_days_to_maturity="1"))
+        page = _parse(response.body)
+        assert [label for label, css in page.rows.items() if css == "changed"] == [
+            "rebalance until"]
+        assert page.cells["rebalance until"][1:3] == ["7 days before maturity",
+                                                      "1 day before maturity"]
+        assert "1 of 12 settings change." in response.body
+        # Naming 0 puts it back to "maturity"
+        page = _parse(_get(_app(), "/confirm?" + _query(
+            rebalance_min_days_to_maturity="0")).body)
+        assert page.cells["rebalance until"][1:3] == ["7 days before maturity", "maturity"]
+
+    def test_rebalance_off_without_the_field_clears_a_saved_limit(self):
+        # A page built before this field existed says rebalance=off and
+        # min_price_move=off and knows nothing of it: the limit goes with the
+        # switch, so the link is not refused for "needs rebalance on"
+        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True,
+                           min_price_move=0.25, rebalance_min_days_to_maturity=7))
+        query = _query(rebalance="off", min_price_move="off")
+        proposed, _ = defaults_server._proposal(defaults_server._params(query),
+                                                config.read_saved_live_defaults())
+        assert proposed.rebalance is False and proposed.rebalance_min_days_to_maturity is None
+        response = _get(_app(), "/confirm?" + query)
+        assert response.status == 200
+        page = _parse(response.body)
+        assert [label for label, css in page.rows.items() if css == "changed"] == [
+            "rebalance", "min price movement", "rebalance until"]
+        assert page.cells["rebalance until"][1:3] == ["7 days before maturity", "maturity"]
+        assert "3 of 12 settings change." in response.body
+
+    def test_rebalance_off_without_the_field_clears_it_with_nothing_saved(self):
+        settings, _ = defaults_server._proposal(
+            defaults_server._params(_query(rebalance="off")), None)
+        assert settings.rebalance_min_days_to_maturity is None
+
+    def test_a_saved_limit_is_kept_when_the_link_leaves_out_both(self):
+        # The switch is left out as well, so nothing says it goes off
+        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True,
+                           rebalance_min_days_to_maturity=7))
+        proposed, _ = defaults_server._proposal(defaults_server._params(_query()),
+                                                config.read_saved_live_defaults())
+        assert proposed.rebalance and proposed.rebalance_min_days_to_maturity == 7
+
+    def test_rebalance_off_naming_a_limit_is_refused_with_the_reason(self):
+        response = _get(_app(), "/confirm?" + _query(
+            rebalance="off", min_price_move="off", rebalance_min_days_to_maturity="7"))
+        assert response.status == 400
+        assert "rebalance_min_days_to_maturity needs rebalance on" in html.unescape(
+            response.body)
+        assert "<form" not in response.body and "<button" not in response.body
+        assert config.read_saved_live_defaults() is None
+        # Naming "maturity" (0) with rebalancing off is nothing to refuse
+        assert _get(_app(), "/confirm?" + _query(
+            rebalance="off", min_price_move="off",
+            rebalance_min_days_to_maturity="0")).status == 200
+
+    def test_a_limit_with_rebalancing_saved_off_is_refused_with_the_reason(self):
+        # The switch is left out, so it stays at the saved off
+        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2))
+        before = config.LIVE_DEFAULTS_FILE.read_bytes()
+        response = _get(_app(), "/confirm?" + _query(rebalance_min_days_to_maturity="1"))
+        assert response.status == 400
+        assert "rebalance_min_days_to_maturity needs rebalance on" in html.unescape(
+            response.body)
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
+
+    @pytest.mark.parametrize("given, reason", [
+        ("2", "rebalance_min_days_to_maturity must be 0, 1 or 7, got 2"),
+        ("14", "rebalance_min_days_to_maturity must be 0, 1 or 7, got 14"),
+        ("seven", "rebalance_min_days_to_maturity must be a whole number of at most six "
+                  "digits, got 'seven'"),
+        ("7.0", "rebalance_min_days_to_maturity must be a whole number of at most six "
+                "digits, got '7.0'"),
+        ("off", "rebalance_min_days_to_maturity must be a whole number of at most six "
+                "digits, got 'off'"),
+        ("", "rebalance_min_days_to_maturity is blank"),
+    ])
+    def test_a_bad_rebalance_until_is_refused_with_the_reason(self, given, reason):
+        response = _get(_app(), "/confirm?" + _query(rebalance_min_days_to_maturity=given))
+        assert response.status == 400
+        assert reason in html.unescape(response.body)
+        assert "<form" not in response.body
+
+    def test_rebalance_until_given_twice_is_refused_with_the_reason(self):
+        response = _get(_app(), "/confirm?" + _query(rebalance_min_days_to_maturity="7")
+                        + "&rebalance_min_days_to_maturity=7")
+        assert response.status == 400
+        assert "rebalance_min_days_to_maturity is given 2 times" in response.body
+
     def test_a_missing_exclusion_proposes_none(self):
         _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, ("Sports",), ("Basketball",)))
         page = _parse(_get(_app(), "/confirm?" + _query(same_title_size_cap="0.2")).body)
@@ -1510,6 +1644,28 @@ class TestConfirmRefusals:
         _query(rebalance="on", min_price_move="1e400"),
         # A minimum with rebalancing named off
         _query(rebalance="off", min_price_move="0.1"),
+        # A days-to-maturity limit: 0, 1 or 7 as plain ASCII digits
+        _query(rebalance_min_days_to_maturity="2"), _query(rebalance_min_days_to_maturity="3"),
+        _query(rebalance_min_days_to_maturity="14"),
+        _query(rebalance_min_days_to_maturity="-1"),
+        _query(rebalance_min_days_to_maturity="+7"),
+        _query(rebalance_min_days_to_maturity=" 7"),
+        _query(rebalance_min_days_to_maturity="7 "),
+        _query(rebalance_min_days_to_maturity="7.0"),
+        _query(rebalance_min_days_to_maturity="1e1"),
+        _query(rebalance_min_days_to_maturity="0x7"),
+        _query(rebalance_min_days_to_maturity="seven"),
+        _query(rebalance_min_days_to_maturity="off"),
+        _query(rebalance_min_days_to_maturity="maturity"),
+        _query(rebalance_min_days_to_maturity=""),
+        _query(rebalance_min_days_to_maturity="７"),
+        _query(rebalance_min_days_to_maturity="٧"),
+        _query(rebalance_min_days_to_maturity="1" * 7),
+        # A limit with rebalancing named off, or given twice
+        _query(rebalance="off", min_price_move="off", rebalance_min_days_to_maturity="1"),
+        _query(rebalance="off", min_price_move="off", rebalance_min_days_to_maturity="7"),
+        _query(rebalance_min_days_to_maturity="7") + "&rebalance_min_days_to_maturity=7",
+        _query(rebalance_min_days_to_maturity="0") + "&rebalance_min_days_to_maturity=7",
         # Either rebalance field given twice
         _query(rebalance="on") + "&rebalance=on",
         _query(rebalance="on", min_price_move="0.1") + "&min_price_move=0.1",
@@ -1636,6 +1792,19 @@ class TestConfirmRefusals:
         assert _get(_app(), "/confirm?" + _query(
             source=config.LIVE_DEFAULTS_SEED_SOURCE, rebalance="on",
             min_price_move="off")).status == 200
+
+    def test_the_seed_note_labels_only_the_seed_s_rebalance_until(self):
+        # The seed rebalances to maturity: its note on a link that stops short
+        # of it is refused, and a seed link naming "maturity" (0) is the seed
+        for days in ("1", "7"):
+            response = _get(_app(), "/confirm?" + _query(
+                source=config.LIVE_DEFAULTS_SEED_SOURCE, rebalance="on",
+                rebalance_min_days_to_maturity=days))
+            assert response.status == 400, days
+            assert "may label only the seed values" in response.body
+        assert _get(_app(), "/confirm?" + _query(
+            source=config.LIVE_DEFAULTS_SEED_SOURCE, rebalance="on",
+            rebalance_min_days_to_maturity="0")).status == 200
 
     @pytest.mark.parametrize("field, value", [
         ("add_to_held_pairs", "on"), ("trim_to_kelly", "off"), ("trim_min_rise", "0.1")])
@@ -2137,6 +2306,7 @@ class TestOutdatedFile:
         assert [name for name in defaults_server._FIELDS
                 if name not in ("exclude_category", "exclude_tag", "source")] == list(params)
         assert params["rebalance"] == ["on"] and params["min_price_move"] == ["0.1"]
+        assert params["rebalance_min_days_to_maturity"] == ["0"]
         # It proposes exactly those values, whatever is saved
         assert defaults_server._proposal(params, None) == (_OLD_VERSION_READS_AS, "")
         assert defaults_server._proposal(params, config.LIVE_DEFAULTS_SEED)[0] == (
@@ -2161,6 +2331,27 @@ class TestOutdatedFile:
         assert page.cells["rebalance"][2] == "yes"
         assert page.cells["min price movement"][2] == "10c"
         assert "12 of 12 settings change." in response.body
+
+    def test_a_link_that_leaves_the_limit_out_keeps_the_old_file_s(self):
+        # The old file's values in their new form carry no limit, so "maturity"
+        config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+        with pytest.raises(config.LiveDefaultsOutdated) as caught:
+            config.read_saved_live_defaults()
+        base = defaults_server._kept_base(None, caught.value)
+        assert base == _OLD_VERSION_READS_AS
+        query = _query(spread_max="0.8", k="0.7", size_cap="0.15")
+        proposed, _ = defaults_server._proposal(defaults_server._params(query), base)
+        assert proposed.rebalance_min_days_to_maturity is None
+        # ... and what the base holds is what a left-out field keeps
+        stand_in = SimpleNamespace(proposal=replace(
+            _OLD_VERSION_READS_AS, rebalance_min_days_to_maturity=7))
+        base = defaults_server._kept_base(None, stand_in)
+        proposed, _ = defaults_server._proposal(defaults_server._params(query), base)
+        assert proposed.rebalance_min_days_to_maturity == 7
+        # With nothing saved and no outdated file, the seed's
+        proposed, _ = defaults_server._proposal(
+            defaults_server._params(query), defaults_server._kept_base(None, None))
+        assert proposed.rebalance_min_days_to_maturity is None
 
     def test_one_confirm_and_save_replaces_the_file(self):
         config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
@@ -2696,6 +2887,24 @@ class TestSave:
         assert saved == _BASE_SETTINGS
         assert saved.origin.endswith(" from " + DASHBOARD_NOTE)
 
+    def test_a_rebalance_until_is_written_after_the_minimum_and_read_back(self):
+        app = _app()
+        form = _page_form(app, _query(rebalance="on", min_price_move="0.1",
+                                      rebalance_min_days_to_maturity="7"))
+        assert ("rebalance_min_days_to_maturity", "7") in form
+        assert _post(app, form).status == 303
+        saved = config.read_saved_live_defaults()
+        assert saved.rebalance_min_days_to_maturity == 7
+        assert saved == replace(_BASE_SETTINGS, min_price_move=0.10,
+                                rebalance_min_days_to_maturity=7)
+        text = config.LIVE_DEFAULTS_FILE.read_text()
+        assert text.index('"min_price_move"') < text.index('"rebalance_min_days_to_maturity": 7')
+        # Saving "maturity" (0) leaves the key out again
+        form = _page_form(app, _query(rebalance_min_days_to_maturity="0"))
+        assert _post(app, form).status == 303
+        assert config.read_saved_live_defaults().rebalance_min_days_to_maturity is None
+        assert "rebalance_min_days_to_maturity" not in config.LIVE_DEFAULTS_FILE.read_text()
+
     def test_it_overwrites_the_defaults_in_force(self):
         _save(LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0))
         app = _app()
@@ -2814,11 +3023,14 @@ class TestSave:
         lambda f: f + [("exclude_category", "Economics")],
         lambda f: [(n, v) for n, v in f if n != "exclude_tag"],
         lambda f: [(n, v) for n, v in f if n != "same_title_size_cap"],
+        lambda f: [(n, "1" if n == "rebalance_min_days_to_maturity" else v) for n, v in f],
+        lambda f: [(n, v) for n, v in f if n != "rebalance_min_days_to_maturity"],
     ])
     def test_a_field_changed_after_signing_is_refused(self, tamper):
         app = _app()
         form = _page_form(app, _query(exclude_category="Sports", exclude_tag="Basketball",
-                                      same_title_size_cap="0.5"))
+                                      same_title_size_cap="0.5",
+                                      rebalance_min_days_to_maturity="7"))
         assert _post(app, tamper(form)).status == 403
         assert config.read_saved_live_defaults() is None
 
@@ -2979,7 +3191,14 @@ class TestSeed:
         # Every field the seed sets, in the server's field order, then its note
         assert list(params) == ["tier_floors", "spread_min", "spread_max", "k", "size_cap",
                                 "same_title_size_cap", "rebalance", "min_price_move",
-                                "sell_at", "sell_min_days", "source"]
+                                "rebalance_min_days_to_maturity", "sell_at", "sell_min_days",
+                                "source"]
+
+    def test_the_seed_query_spells_maturity_as_zero(self):
+        # No limit on how close to maturity a held position is rebalanced
+        params = defaults_server._params(defaults_server._seed_query())
+        assert params["rebalance_min_days_to_maturity"] == ["0"]
+        assert config.LIVE_DEFAULTS_SEED.rebalance_min_days_to_maturity is None
 
     @pytest.mark.parametrize("saved, row, cells", [
         (replace(config.LIVE_DEFAULTS_SEED, min_price_move=0.25),
@@ -2994,6 +3213,24 @@ class TestSeed:
         assert [label for label, css in page.rows.items() if css == "changed"] == [row]
         assert page.cells[row][1:3] == cells
         assert "1 of 12 settings change." in response.body
+
+    def test_the_seed_page_proposes_the_seed_s_rebalance_until(self):
+        # Over saved defaults that stop short of maturity, the seed link changes
+        # that one row, and a seed link that leaves the field out does too
+        _save(replace(config.LIVE_DEFAULTS_SEED, rebalance_min_days_to_maturity=7))
+        stale = "&".join(part for part in defaults_server._seed_query().split("&")
+                         if not part.startswith("rebalance_min_days_to_maturity="))
+        for query in (defaults_server._seed_query(), stale):
+            response = _get(_app(), "/confirm?" + query)
+            assert response.status == 200, query
+            page = _parse(response.body)
+            assert [label for label, css in page.rows.items() if css == "changed"] == [
+                "rebalance until"]
+            assert page.cells["rebalance until"][1:3] == ["7 days before maturity", "maturity"]
+            assert "1 of 12 settings change." in response.body
+            assert defaults_server._proposal(
+                defaults_server._params(query), config.read_saved_live_defaults()) == (
+                config.LIVE_DEFAULTS_SEED, config.LIVE_DEFAULTS_SEED_SOURCE)
 
     def test_a_file_with_rebalancing_off_leaves_its_key_out(self):
         # A saved file that leaves rebalance out reads it as off; the writer
@@ -3012,7 +3249,8 @@ class TestSeed:
         # rebalancing kept on) for a saved minimum the seed does not set
         _save(saved)
         stale = "&".join(part for part in defaults_server._seed_query().split("&")
-                         if not part.startswith(("rebalance=", "min_price_move=")))
+                         if not part.startswith(("rebalance=", "min_price_move=",
+                                                 "rebalance_min_days_to_maturity=")))
         assert "rebalance" not in stale and "source=" in stale
         params = defaults_server._params(stale)
         assert defaults_server._proposal(params, config.read_saved_live_defaults()) == (
@@ -3079,6 +3317,36 @@ class TestSeed:
 
 class TestHelpers:
     """The pieces the routes are built from."""
+
+    @pytest.mark.parametrize("settings, written", [
+        (LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True), "0"),
+        (LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True,
+                      rebalance_min_days_to_maturity=1), "1"),
+        (LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True, min_price_move=0.1,
+                      rebalance_min_days_to_maturity=7), "7"),
+        # With rebalancing off there is no limit to write but "maturity"
+        (LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2), "0"),
+    ])
+    def test_the_settings_query_names_the_limit_and_reads_back(self, settings, written):
+        query = defaults_server._settings_query(settings)
+        params = defaults_server._params(query)
+        assert params["rebalance_min_days_to_maturity"] == [written]
+        # Right after the minimum price movement, as in _FIELDS
+        assert list(params).index("rebalance_min_days_to_maturity") == (
+            list(params).index("min_price_move") + 1)
+        # It proposes exactly these settings, whatever is saved
+        for saved in (None, LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0, rebalance=True,
+                                         rebalance_min_days_to_maturity=7)):
+            assert defaults_server._proposal(params, saved) == (settings, "")
+
+    def test_the_fields_hold_the_limit_once_and_in_the_queries_order(self):
+        assert defaults_server._FIELDS.count("rebalance_min_days_to_maturity") == 1
+        assert "rebalance_min_days_to_maturity" not in defaults_server._REPEATABLE
+        assert len(defaults_server._FIELDS) == 14
+        names = list(defaults_server._params(defaults_server._settings_query(
+            replace(config.LIVE_DEFAULTS_SEED, exclude_categories=("A",), exclude_tags=("B",)),
+            source=config.LIVE_DEFAULTS_SEED_SOURCE)))
+        assert names == list(defaults_server._FIELDS)
 
     def test_the_fingerprint_follows_the_defaults_and_when_they_were_saved(self):
         seed = config.LIVE_DEFAULTS_SEED
@@ -3545,6 +3813,34 @@ class TestActions:
         record = json.loads((_run_folder(run_id) / "run.json").read_text())
         assert ("rebalance yes | min price movement 10c | rebalance until maturity | sell at off"
                 in record["settings"])
+
+    def test_confirming_a_rebalance_until_saves_it_and_a_run_is_started_with_its_flag(self):
+        starter = _Starter()
+        app = _app(start_process=starter)
+        form = _page_form(app, _query(rebalance="on", min_price_move="0.1",
+                                      rebalance_min_days_to_maturity="7"), "confirm-trade")
+        # The page carried the field, as the link named it
+        assert ("rebalance_min_days_to_maturity", "7") in form
+        run_id = _run_id(_post(app, form))
+        saved = config.read_saved_live_defaults()
+        assert saved.rebalance_min_days_to_maturity == 7
+        [(argv, _)] = starter.calls
+        assert argv[5:-2] == config.live_settings_argv(saved)
+        assert "--rebalance-min-days-to-maturity=7" in argv
+        assert "--no-rebalance-min-days-to-maturity" not in argv
+        record = json.loads((_run_folder(run_id) / "run.json").read_text())
+        assert "rebalance until 7 days before maturity" in record["settings"]
+
+    def test_the_trade_page_keeps_a_saved_rebalance_until(self):
+        # /trade runs the saved defaults, flags and all
+        saved = _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True,
+                                   rebalance_min_days_to_maturity=1))
+        starter = _Starter()
+        app = _app(start_process=starter)
+        _run_id(_post(app, _trade_form(app, "confirm-dry-run"), target="/trade"))
+        [(argv, _)] = starter.calls
+        assert argv[5:argv.index("--result-file")] == config.live_settings_argv(saved)
+        assert "--rebalance-min-days-to-maturity=1" in argv
 
     def test_a_run_from_defaults_that_do_not_rebalance_says_so_in_its_flags(self):
         starter = _Starter()
