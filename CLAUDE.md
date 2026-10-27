@@ -3,6 +3,8 @@
 This is a **production prediction-market pair-trading bot** (the "Kalshi Arbitrage Bot" is its product name; the same-title strategy is a near-arbitrage, the time-series strategy is a directional bet) that trades real money via RSA-signed Kalshi REST API calls.
 
 This file is the short part of the project's notes: what the bot is, the rules no change may break, the run commands and an index of the rest. The rest is in `docs/claude/`, moved there word for word from this file on 2026-10-26. **Before changing trading, fee, sizing or order-submission code, read `docs/claude/what-not-to-do.md` in full and the notes the index names for the code you are changing.**
+
+**Keep this file short.** Claude Code sends it with every request, and when it changes on disk during a session it sends the whole new file again beside the old copy (open bug anthropics/claude-code#98553). At 1.28 MB it took about 400,000 of a session's 1,000,000 tokens, and two long sessions were lost when it changed under them. New detail goes into `docs/claude/` (see Documentation Standards), and `tests/test_claude_docs.py` fails if this file grows past 40,000 bytes. Do not `@`-import the notes: an imported file loads with this one and costs the same.
 ---
 
 ## What This Is
@@ -234,9 +236,11 @@ pairs = scanner.enrich_with_orderbook_prices(client, pairs)
 ```
 Single-line calls to stdlib or well-known helpers (e.g. `logging.info(...)`, `sorted(...)`) don't need comments unless the arguments are surprising.
 
-**Update the README and all relevant comments whenever a change affects behavior.** Specifically:
-- If you add, remove, or rename a module: update the Module Dependency Graph in `README.md` and the Module Map in `CLAUDE.md`.
+**Update the README, the notes in `docs/claude/` and all relevant comments whenever a change affects behavior.** Specifically:
+- If you add, remove, or rename a module: update the Module Dependency Graph in `README.md`, the module's row in the `docs/claude/module-map/` file for its area, and `docs/claude/module-map/dependencies.md`.
 - If you change a constant in `config.py`: update the comment explaining the constant's purpose and rationale.
-- If you add a new CLI argument to `main.py` or `backtest.py`: update the Run Commands section in `README.md` and in `CLAUDE.md`.
+- If you add a new CLI argument to `main.py` or `backtest.py`: update the Run Commands section in `README.md` and `docs/claude/run-commands.md` (and this file's short list only when every session needs the command).
 - If you change the data flow of the live or backtest pipeline: update the corresponding ASCII diagram in `README.md`.
 - If you change function signatures or behavior: update the docstring in the same commit, not as a follow-up.
+
+**Record detail in `docs/claude/`, never in this file.** A new gotcha, decision record, measured figure or recorded residual goes into the `docs/claude/` file for its area, one paragraph per line, and a new file there goes into this file's index. Change this file only when a rule every session needs changes, and then change its short form here and its full text in `docs/claude/` in the same commit. Never name a notes file `CLAUDE.md` and never put one under `.claude/rules/` (either is loaded with every request, which is the cost this split removed), and never `@`-import one. `tests/test_claude_docs.py` fails when this file passes 40,000 bytes, when a file under `docs/claude/` is missing from the index, or when the index names a file that does not exist.
