@@ -4897,6 +4897,41 @@ class TestRunProdAddsToHeldPairs:
         assert ("Add-on check: YES TS-EARLY / NO TS-LATE, 30 contracts each, last traded "
                 in caplog.text)
 
+    def test_a_pair_near_maturity_is_not_added_to_under_rebalance_until(self, monkeypatch,
+                                                                        caplog):
+        """
+        Pins that the held pair TS-EARLY / TS-LATE (its later market closes
+        2026-12-11) is not added to 5 days before, under a 7-day minimum:
+        neither finder is handed it, its markets stay blocked from both, and
+        the same-title pair still trades. Under a 1-day minimum, the same pair
+        is added to.
+        """
+        # Noon, 5 days before TS-LATE closes (_CLOSE_LATE)
+        moment = datetime.fromisoformat(_CLOSE_LATE) - timedelta(days=5) + timedelta(hours=12)
+        monkeypatch.setattr(main, "datetime", _Clock(moment))
+        held = (_TICKER_HELD_A, _TICKER_TS_EARLY, _TICKER_TS_LATE)
+        fills = (_fill_row("OLD-MKT", moment - timedelta(days=30)),) + tuple(
+            _fill_row(ticker, moment - timedelta(days=10)) for ticker in held)
+        client = self._client(monkeypatch, fill_rows=fills)
+        results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True,
+                                      rebalance_min_days_to_maturity=7)
+        assert self._traded(results) == {self._SAME_TITLE}
+        assert seen["ts"] == seen["st"] == [{}]
+        ts = {_TICKER_TS_EARLY, _TICKER_TS_LATE}
+        for blocked, markets in seen["blocked"]:
+            assert ts <= blocked and not markets & ts
+        assert ("Not adding to YES TS-EARLY / NO TS-LATE: its later market closes in 5 "
+                "day(s), and rebalancing stops 7 day(s) before maturity") in _messages(caplog)
+        assert "Held pairs that may be added to this run: 0 of 1" in caplog.text
+        assert "adds to" not in caplog.text
+        # Control: a 1-day minimum clears 5 days left, and the pair is added to
+        caplog.clear()
+        client = self._client(monkeypatch, fill_rows=fills)
+        results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True,
+                                      rebalance_min_days_to_maturity=1)
+        assert ("time_series", _TICKER_TS_EARLY, _TICKER_TS_LATE) in self._traded(results)
+        assert "rebalancing stops" not in caplog.text
+
     @staticmethod
     def _candles(quotes: dict):
         """
@@ -5728,19 +5763,29 @@ _AFTER_SALE_BALANCE = {
 }
 
 
-def _sell_events() -> tuple:
-    """The sellable pair's two markets, closing 30 and 35 days from now."""
+def _sell_events(closes: tuple | None = None) -> tuple:
+    """
+    The sellable pair's two markets.
+
+    Args:
+        closes (tuple | None): The earlier and the later market's close times,
+            as ISO strings; None closes them 30 and 35 days from now.
+
+    Returns:
+        tuple: The pair's two events.
+    """
     def close(days: int) -> str:
         return (datetime.now(UTC) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    early, late = closes if closes is not None else (close(30), close(35))
     return (
         _ev("Sell Event", _mk_market(
             _TICKER_SELL_EARLY, "EVS-SELL-EARLY", "Will S happen by November 1, 2026?",
             "Outcome", "0.57", "0.45", price_level_structure="linear_cent",
-            close_time=close(30))),
+            close_time=early)),
         _ev("Sell Event", _mk_market(
             _TICKER_SELL_LATE, "EVS-SELL-LATE", "Will S happen by November 6, 2026?",
             "Outcome", "0.58", "0.44", price_level_structure="linear_cent",
-            close_time=close(35))),
+            close_time=late)),
     )
 
 
@@ -5789,7 +5834,8 @@ class _SellExchange:
                  fills_unreadable: bool = False, candles: dict | None = None,
                  books: dict | None = None, resting_orders: tuple = (),
                  orders_unreadable: str | None = None, more_events: tuple = (),
-                 settlements: tuple = (), lookups: dict | None = None):
+                 settlements: tuple = (), lookups: dict | None = None,
+                 sell_closes: tuple | None = None):
         """
         Build the exchange and its client.
 
@@ -5821,6 +5867,8 @@ class _SellExchange:
             lookups (dict | None): Market ticker -> (raw market dict, its
                 event's title): the markets a single-market lookup finds, such
                 as a paid-out partner the market list no longer holds.
+            sell_closes (tuple | None): The sellable pair's two close times
+                (_sell_events); None closes them 30 and 35 days from now.
         """
         self.ledger = {r["ticker"]: Decimal(r["position_fp"]) for r in held_rows}
         self.costs = {r["ticker"]: (r.get("market_exposure_dollars"),
@@ -5840,7 +5888,7 @@ class _SellExchange:
         client = _live_shape_client(
             monkeypatch, balance_payload=before, balance_payload_after=after,
             include_held_position=False, include_time_series=include_time_series,
-            extra_events=_sell_events() + tuple(more_events))
+            extra_events=_sell_events(sell_closes) + tuple(more_events))
         self._balance = client.get_balance_without_preload_content.side_effect
 
         def balance_read(*args, **kwargs):
@@ -8300,6 +8348,146 @@ class TestRunProdTrimsOnAnyDay:
                 assert line.endswith("it last traded 2026-10-06, 0 day(s) ago, and a trim "
                                      "waits until 7 day(s) have passed since a pair's last "
                                      "trade")
+
+
+@pytest.mark.usefixtures("pinned_config_toggles")
+class TestRunProdRebalanceUntil:
+    """--rebalance-min-days-to-maturity (the "Rebalance until" setting) holds back
+    a trim, and an add-on, for a position whose later market closes in fewer
+    than that many days, counted in whole UTC calendar days from today. It is
+    asked first, before the wait, the price move or any order book, and a
+    position held back logs why. The run's clock is pinned to 2026-11-21 12:00
+    UTC, so the sellable pair (its later market closes 2026-11-26) has 5 days
+    left and the time-series pair (its later market closes 2026-12-11) has 20."""
+
+    # Noon, 20 days before the time-series pair's later market closes (_CLOSE_LATE)
+    _MOMENT = datetime.fromisoformat(_CLOSE_LATE) - timedelta(days=20) + timedelta(hours=12)
+    # The sellable pair's markets close 3 and 5 days after the moment's date
+    _SELL_CLOSES = ((_MOMENT.replace(hour=0) + timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    (_MOMENT.replace(hour=0) + timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    _NEAR = ("Not trimming YES SELL-EARLY / NO SELL-LATE: its later market closes in 5 "
+             "day(s), and rebalancing stops {days} day(s) before maturity")
+
+    def _run(self, monkeypatch, caplog, argv: list, sell_closes: tuple | None = None) -> tuple:
+        """
+        Run main() as a production dry run with --rebalance, a 10% cap and a pinned clock.
+
+        Both pairs are held, rested (last traded ten days before the pinned
+        moment) and past their share, so each is trimmed unless held back.
+
+        Args:
+            monkeypatch (pytest.MonkeyPatch): pytest's per-test patcher.
+            caplog (pytest.LogCaptureFixture): Captures the run's log.
+            argv (list): The rebalance-until flags.
+            sell_closes (tuple | None): The sellable pair's two close times;
+                None closes them 3 and 5 days after the moment's date.
+
+        Returns:
+            tuple: (the exchange, seen, main's exit code); seen holds
+                "plan_trims" (each call's keywords) and "log" (each trade-log
+                write's sales).
+        """
+        monkeypatch.setattr(main, "datetime", _Clock(self._MOMENT))
+        held = (_TICKER_SELL_EARLY, _TICKER_SELL_LATE, _TICKER_TS_EARLY, _TICKER_TS_LATE)
+        fills = (_fill_row("OLD-MKT", self._MOMENT - timedelta(days=30)),) + tuple(
+            _fill_row(ticker, self._MOMENT - timedelta(days=10)) for ticker in held)
+        exchange = _trim_exchange(monkeypatch, held_rows=_SELL_ROWS + _HELD_TS_PAIR,
+                                  before=_TWO_PAIRS_BEFORE, include_time_series=True,
+                                  fill_rows=fills,
+                                  sell_closes=sell_closes or self._SELL_CLOSES)
+        seen: dict = {"plan_trims": [], "log": []}
+        real_trims = main.plan_trims
+
+        def trims_spy(client_, *args, **kwargs):
+            seen["plan_trims"].append(kwargs)
+            return real_trims(client_, *args, **kwargs)
+
+        def fake_log(results, before, after, *, run_note="", sales=()):
+            seen["log"].append(list(sales))
+            return pathlib.Path("/fake/trade_log.xlsx")
+
+        with caplog.at_level(logging.INFO):
+            ran = _main_with(monkeypatch, ["--mode", "prod", "--dry-run", "--rebalance",
+                                           "--size-cap", "10", *argv],
+                             _run_prod=main._run_prod, build_client=lambda mode: exchange.client,
+                             plan_trims=trims_spy, append_to_prod_log=fake_log)
+        return exchange, seen, ran["code"]
+
+    @staticmethod
+    def _trimmed(seen: dict) -> list:
+        """Each pair trimmed: (its first market, contract pairs sold), in order."""
+        [sales] = [written for written in seen["log"] if written]
+        return [(s.plan.legs[0].ticker, s.plan.count) for s in sales]
+
+    @staticmethod
+    def _settings_line(caplog) -> str:
+        """The run's "Live settings:" line."""
+        [line] = [m for m in _messages(caplog) if m.startswith("Live settings:")]
+        return line
+
+    def test_seven_days_holds_back_the_pair_closing_in_five_and_trims_the_one_in_twenty(
+            self, monkeypatch, caplog):
+        exchange, seen, code = self._run(monkeypatch, caplog,
+                                         ["--rebalance-min-days-to-maturity", "7"])
+        assert code == EXIT_OK
+        # The flag reached the trim planner through the run's one settings object
+        [trims] = seen["plan_trims"]
+        assert (trims["settings"].rebalance, trims["settings"].rebalance_min_days_to_maturity,
+                trims["now"]) == (True, 7, self._MOMENT)
+        messages = _messages(caplog)
+        assert self._NEAR.format(days=7) in messages
+        [check] = [m for m in messages if m.startswith("Kelly trim check: ")]
+        assert check.startswith("Kelly trim check: YES TS-EARLY / NO TS-LATE (time-series), ")
+        # Two pairs were considered; the one held back is not among those trimmed
+        assert "Pairs to trim this run: 1 of 2" in messages
+        assert self._trimmed(seen) == [(_TICKER_TS_EARLY, 14)]
+        # The pair held back is asked nothing: its order books are never read
+        assert not _books_read(exchange) & _SELL_TICKERS
+        # The setting is on the run's "Live settings:" line, marked as departing
+        # from the saved defaults (which rebalance until maturity)
+        assert ("rebalance until 7 days before maturity (default: maturity)"
+                in self._settings_line(caplog))
+
+    @pytest.mark.parametrize("argv, until", [
+        ([], "rebalance until maturity"),
+        (["--no-rebalance-min-days-to-maturity"], "rebalance until maturity"),
+        (["--rebalance-min-days-to-maturity", "0"], "rebalance until maturity"),
+        (["--rebalance-min-days-to-maturity", "1"],
+         "rebalance until 1 day before maturity (default: maturity)"),
+    ], ids=["saved maturity", "cleared by flag", "0", "1 day"])
+    def test_at_maturity_or_one_day_both_pairs_are_trimmed(self, monkeypatch, caplog, argv,
+                                                           until):
+        # 5 days left clears a 1-day minimum, and no minimum asks nothing
+        exchange, seen, code = self._run(monkeypatch, caplog, argv)
+        assert code == EXIT_OK
+        messages = _messages(caplog)
+        assert not any("rebalancing stops" in m for m in messages)
+        assert "Pairs to trim this run: 2 of 2" in messages
+        assert self._trimmed(seen) == [(_TICKER_SELL_EARLY, 19), (_TICKER_TS_EARLY, 14)]
+        line = self._settings_line(caplog)
+        assert until in line
+        if "(default:" not in until:
+            assert "rebalance until maturity (default" not in line
+
+
+    @pytest.mark.parametrize("left, held_back", [(7, False), (6, True)],
+                             ids=["7 days left", "6 days left"])
+    def test_seven_days_left_still_rebalances_and_six_does_not(self, monkeypatch, caplog,
+                                                               left, held_back):
+        # The sellable pair's later market closes `left` whole UTC days after today
+        day = self._MOMENT.replace(hour=0)
+        closes = tuple((day + timedelta(days=n)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                       for n in (3, left))
+        _, seen, code = self._run(monkeypatch, caplog,
+                                  ["--rebalance-min-days-to-maturity", "7"], closes)
+        assert code == EXIT_OK
+        near = (f"Not trimming YES SELL-EARLY / NO SELL-LATE: its later market closes in "
+                f"{left} day(s), and rebalancing stops 7 day(s) before maturity")
+        assert (near in _messages(caplog)) is held_back
+        trimmed = [(_TICKER_TS_EARLY, 14)]
+        if not held_back:
+            trimmed.insert(0, (_TICKER_SELL_EARLY, 19))
+        assert self._trimmed(seen) == trimmed
 
 
 class TestLiveRebalanceTextsSayWhatARunDoes:
