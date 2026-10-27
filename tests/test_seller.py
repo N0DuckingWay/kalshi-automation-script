@@ -217,10 +217,12 @@ class _World:
 
 
 def _trim_settings(*, k: float = 0.8, cap: float = 1.0, st_cap: float = 0.2,
-                   min_move: float | None = None, on: bool = True) -> config.LiveSettings:
+                   min_move: float | None = None, on: bool = True,
+                   until: int | None = None) -> config.LiveSettings:
     """The run's settings with rebalancing on (or off), so the Kelly trim with it,
-    and its k, caps and minimum price move."""
+    and its k, caps, minimum price move and "Rebalance until" days (None: maturity)."""
     return dc_replace(config.live_settings(), rebalance=on, min_price_move=min_move,
+                      rebalance_min_days_to_maturity=until,
                       interval_discount=k, size_cap=cap, same_title_size_cap=st_cap)
 
 
@@ -1474,10 +1476,12 @@ class _TrimCase:
         return backtester._kelly_trim([self.trade], _D, self.value(value_cents), k, cap, st_cap)
 
     def live(self, monkeypatch, value_cents: int, *, k: float = 0.8, cap: float = 1.0,
-             st_cap: float = 0.2, min_move: float | None = None, **kwargs) -> list:
+             st_cap: float = 0.2, min_move: float | None = None, until: int | None = None,
+             **kwargs) -> list:
         """seller.plan_trims' plans for the pair at the same portfolio value."""
         return self.world.trims(
-            monkeypatch, _trim_settings(k=k, cap=cap, st_cap=st_cap, min_move=min_move),
+            monkeypatch, _trim_settings(k=k, cap=cap, st_cap=st_cap, min_move=min_move,
+                                        until=until),
             cash_cents=value_cents - self.positions_cents,
             positions_value_cents=self.positions_cents, **kwargs)
 
@@ -1995,10 +1999,11 @@ def _lone_trim(*settlements: Settlement, count: int = 129, exposure: float = 77.
 
 def _lone_trims(world: _World, monkeypatch, *, cap: float = 0.10, k: float = 0.7,
                 min_move: float | None = None, positions_cents: int = 27_500,
-                **kwargs) -> list:
+                until: int | None = None, **kwargs) -> list:
     """seller.plan_trims on a $749 portfolio ($474 of cash plus Kalshi's $275 for the
     open positions, unless `positions_cents` says otherwise), at k 0.7 and a 10% cap."""
-    return world.trims(monkeypatch, _trim_settings(k=k, cap=cap, min_move=min_move),
+    return world.trims(monkeypatch, _trim_settings(k=k, cap=cap, min_move=min_move,
+                                                   until=until),
                        cash_cents=74_900 - positions_cents,
                        positions_value_cents=positions_cents, **kwargs)
 
@@ -2156,6 +2161,23 @@ def _weather_pair(world: _World, name: str, n: int, *, quotes: bool = True,
                                "no": [[no_bid if held == "no" else other, "100000"]]}
         tickers.append(ticker)
     return tickers[0], tickers[1]
+
+
+def _closing_in(case: _TrimCase, days: int) -> _TrimCase:
+    """The case with its later market (B) closing `days` days after the run's UTC
+    date (2026-01-12), at 23:00 UTC, and A an hour before it, as a time-series
+    pair's earlier market closes first."""
+    close = datetime(2026, 1, 12, 23, tzinfo=UTC) + timedelta(days=days)
+    case.world.markets[_B].close_time = close
+    case.world.markets[_A].close_time = close - timedelta(hours=1)
+    return case
+
+
+def _near_maturity(text: str, days: int, until: int) -> str:
+    """The reason a position is not rebalanced when its later market closes too soon."""
+    closes = "closes today" if days == 0 else f"closes in {days} day(s)"
+    return (f"{text}: its later market {closes}, and rebalancing stops "
+            f"{until} day(s) before maturity")
 
 
 class TestPlanTrims:
@@ -3298,6 +3320,145 @@ class TestPlanTrims:
         assert all(type(value) is int for call in case.world.calls["candles"]
                    for value in call[2:])
 
+    # ── "Rebalance until": how near maturity a position may still be trimmed ──
+
+    @pytest.mark.parametrize("until", [None, 1, 7])
+    @pytest.mark.parametrize("days", [0, 1, 6, 7, 8])
+    def test_rebalance_until_holds_back_a_pair_near_maturity(self, monkeypatch, caplog,
+                                                             days, until):
+        # Trimmed only while its later market closes at least `until` days from
+        # today (UTC dates): 7 days left still trims at 7, 6 does not. None
+        # (maturity) trims however near
+        case = _closing_in(_TrimCase(), days)
+        with caplog.at_level(logging.INFO):
+            plans = case.live(monkeypatch, 10_000, cap=0.10, until=until)
+        lines = [r.getMessage() for r in caplog.records]
+        if until is None or days >= until:
+            (plan,) = plans
+            assert (plan.count, plan.days_left) == (19, days)
+            assert not any("rebalancing stops" in line for line in lines)
+            assert lines[-1] == "Pairs to trim this run: 1 of 1"
+        else:
+            assert plans == []
+            assert lines == [f"Not trimming {_near_maturity(_PAIR_TEXT, days, until)}",
+                             "Pairs to trim this run: 0 of 1"]
+            # Left out before anything is read for it: no fills, books or candles
+            assert case.world.fill_reads == 0 and case.world.calls == _NO_READS
+
+    def test_a_later_market_that_closed_yesterday_says_so(self, monkeypatch, caplog):
+        # Still held and listed, but closed before today (UTC): held back at 1
+        case = _closing_in(_TrimCase(), -1)
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10, until=1) == []
+        assert (f"Not trimming {_PAIR_TEXT}: its later market closed 1 day(s) ago, and "
+                "rebalancing stops 1 day(s) before maturity") in caplog.text
+
+    def test_a_pair_is_judged_on_its_later_market(self, monkeypatch, caplog):
+        # A closes in 2 days, within the 7, but B, the later market, in 10: trimmed
+        case = _TrimCase()
+        case.world.markets[_A].close_time = datetime(2026, 1, 14, 23, tzinfo=UTC)
+        case.world.markets[_B].close_time = datetime(2026, 1, 22, 23, tzinfo=UTC)
+        with caplog.at_level(logging.INFO):
+            (plan,) = case.live(monkeypatch, 10_000, cap=0.10, until=7)
+        assert (plan.count, plan.days_left) == (19, 10)
+        assert "rebalancing stops" not in caplog.text
+
+    @pytest.mark.parametrize("until, trims", [(1, True), (7, False)])
+    def test_days_are_counted_on_utc_dates(self, monkeypatch, caplog, until, trims):
+        # A run at 16:00 UTC (8am in Los Angeles) and a close at 03:59 UTC the next
+        # day (7:59pm in Los Angeles, the same day) is 1 day left on UTC dates
+        case = _TrimCase()
+        case.world.markets[_A].close_time = datetime(2026, 1, 13, 2, 59, tzinfo=UTC)
+        case.world.markets[_B].close_time = datetime(2026, 1, 13, 3, 59, tzinfo=UTC)
+        now = datetime(2026, 1, 12, 16, tzinfo=UTC)
+        with caplog.at_level(logging.INFO):
+            plans = case.live(monkeypatch, 10_000, cap=0.10, until=until, now=now)
+        if trims:
+            (plan,) = plans
+            assert (plan.count, plan.days_left) == (19, 1)
+        else:
+            assert plans == []
+            assert f"Not trimming {_near_maturity(_PAIR_TEXT, 1, 7)}" in caplog.text
+
+    @pytest.mark.parametrize("until, trims", [(1, True), (7, False)])
+    def test_today_is_the_utc_date_not_the_bots_own_day(self, monkeypatch, caplog, until,
+                                                        trims):
+        # 02:00 UTC on Jan 13 is 6pm on Jan 12 in Los Angeles: from the UTC date the
+        # later market's Jan 19 close is 6 days away (7 from the bot's own day)
+        case = _TrimCase()
+        case.world.markets[_A].close_time = datetime(2026, 1, 19, 22, tzinfo=UTC)
+        case.world.markets[_B].close_time = datetime(2026, 1, 19, 23, tzinfo=UTC)
+        now = datetime(2026, 1, 13, 2, tzinfo=UTC)
+        with caplog.at_level(logging.INFO):
+            plans = case.live(monkeypatch, 10_000, cap=0.10, until=until, now=now)
+        if trims:
+            (plan,) = plans
+            assert plan.days_left == 6
+        else:
+            assert plans == []
+            assert f"Not trimming {_near_maturity(_PAIR_TEXT, 6, 7)}" in caplog.text
+
+    @pytest.mark.parametrize("until", [1, 7])
+    @pytest.mark.parametrize("how", ["no close time", "a close time with no zone",
+                                     "not in this run's market list"])
+    def test_an_unknown_close_date_holds_it_back(self, monkeypatch, caplog, how, until):
+        case = _TrimCase()
+        if how == "no close time":
+            case.world.markets[_B].close_time = None
+        elif how == "a close time with no zone":
+            case.world.markets[_B].close_time = datetime(2026, 1, 25)
+        else:
+            del case.world.markets[_B]
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10, until=until) == []
+        why = (f"{_B} is not in this run's market list" if how.startswith("not in")
+               else "a held market's close date is unknown")
+        assert [r.getMessage() for r in caplog.records] == [
+            f"Not trimming {_PAIR_TEXT}: {why}, so rebalancing until {until} day(s) before "
+            "maturity cannot be checked",
+            "Pairs to trim this run: 0 of 1"]
+        assert case.world.fill_reads == 0 and case.world.calls == _NO_READS
+
+    @pytest.mark.parametrize("days, until, trims", [(5, 7, False), (5, 1, True),
+                                                    (7, 7, True)])
+    def test_a_lone_leg_is_judged_on_its_own_close(self, monkeypatch, caplog, days, until,
+                                                   trims):
+        # B held alone after its partner (the Jan 18 rung) paid out $0: its own close
+        # is its later market's
+        world = _lone_trim(_lone_partner())
+        world.markets[_B].close_time = (datetime(2026, 1, 12, 23, tzinfo=UTC)
+                                        + timedelta(days=days))
+        with caplog.at_level(logging.INFO):
+            plans = _lone_trims(world, monkeypatch, until=until)
+        lines = [r.getMessage() for r in caplog.records]
+        if trims:
+            (plan,) = plans
+            assert (plan.count, plan.days_left) == (42, days)
+        else:
+            assert plans == []
+            assert lines == [f"Not trimming {_near_maturity(_LONE_HELD_TEXT, days, until)}",
+                             "Pairs to trim this run: 0 of 0",
+                             "Lone legs to trim this run (partner paid out): 0 of 1"]
+            # Not even the settlements are read for its partner
+            assert world.fill_reads == 0 and world.calls == _NO_READS
+
+    def test_a_pair_held_back_near_maturity_costs_no_read(self, monkeypatch, caplog):
+        # HAIL's later market closes in 3 days: it is left out before anything is
+        # read for it (its books are never read). The standard pair, 13 days out,
+        # is trimmed as before, and the summary counts both
+        case = _TrimCase()
+        hail = _weather_pair(case.world, "hail", 10)
+        case.world.markets[hail[0]].close_time = datetime(2026, 1, 15, 22, tzinfo=UTC)
+        case.world.markets[hail[1]].close_time = datetime(2026, 1, 15, 23, tzinfo=UTC)
+        with caplog.at_level(logging.INFO):
+            (plan,) = case.live(monkeypatch, 10_000, cap=0.10, until=7)
+        assert [leg.ticker for leg in plan.legs] == [_A, _B] and plan.count == 19
+        lines = [r.getMessage() for r in caplog.records]
+        hail_text = f"YES {hail[0]} / NO {hail[1]}"
+        assert lines[0] == f"Not trimming {_near_maturity(hail_text, 3, 7)}"
+        assert lines[-1] == "Pairs to trim this run: 1 of 2"
+        assert case.world.calls["book"] == [_A, _B] and case.world.fill_reads == 1
+
 
 # ─── Adding to a held pair: the wait and the price move ───────────────────────
 
@@ -3334,7 +3495,8 @@ def _lone(case: _TrimCase) -> _TrimCase:
 
 
 def _add_ons(case: _TrimCase, monkeypatch, *, min_move: float | None = None, on: bool = True,
-             now: datetime = _NOW, pairs: dict | None = None) -> dict:
+             now: datetime = _NOW, pairs: dict | None = None,
+             until: int | None = None) -> dict:
     """
     seller.plan_add_ons' verdict on what the case's account holds, its reads stubbed and recorded.
 
@@ -3346,6 +3508,8 @@ def _add_ons(case: _TrimCase, monkeypatch, *, min_move: float | None = None, on:
         now (datetime): Keyword-only. The run's moment.
         pairs (dict | None): Keyword-only. What to judge; None is what
             scanner.held_pairs finds the account may add to.
+        until (int | None): Keyword-only. The run's "Rebalance until" days;
+            None is maturity.
 
     Returns:
         dict: The pairs (and lone legs) the run may add to.
@@ -3367,7 +3531,8 @@ def _add_ons(case: _TrimCase, monkeypatch, *, min_move: float | None = None, on:
                            log=False)
     client = MagicMock()
     kept = seller.plan_add_ons(client, pairs, dict(world.markets),
-                               settings=_trim_settings(min_move=min_move, on=on), now=now)
+                               settings=_trim_settings(min_move=min_move, on=on,
+                                                       until=until), now=now)
     # Every read went through a stub: the client itself is never touched
     assert client.mock_calls == []
     return kept
@@ -3804,6 +3969,110 @@ class TestPlanAddOns:
             "ago -> may add",
             "Held pairs that may be added to this run: 1 of 2"]
         assert case.world.fill_reads == 1
+
+    # ── "Rebalance until": how near maturity a position may still be added to ──
+
+    @pytest.mark.parametrize("until", [None, 1, 7])
+    @pytest.mark.parametrize("days", [0, 1, 6, 7, 8])
+    def test_rebalance_until_holds_back_an_add_on_near_maturity(self, monkeypatch, caplog,
+                                                                days, until):
+        # Added to only while its later market closes at least `until` days from
+        # today (UTC dates): 7 days left still adds at 7, 6 does not
+        case = _closing_in(_add_on_case(), days)
+        with caplog.at_level(logging.INFO):
+            kept = _add_ons(case, monkeypatch, until=until)
+        lines = [r.getMessage() for r in caplog.records]
+        if until is None or days >= until:
+            assert set(kept) == {_PAIR_KEY}
+            assert lines == [
+                f"Add-on check: {_PAIR_TEXT}, 30 contracts each, last traded 2026-01-05, "
+                "7 day(s) ago -> may add",
+                "Held pairs that may be added to this run: 1 of 1"]
+        else:
+            assert kept == {}
+            assert lines == [f"Not adding to {_near_maturity(_PAIR_TEXT, days, until)}",
+                             "Held pairs that may be added to this run: 0 of 1"]
+            # Left out before the fills are read
+            assert case.world.fill_reads == 0 and case.world.calls["candles"] == []
+
+    def test_a_pair_is_judged_on_its_later_market(self, monkeypatch):
+        # A closes in 2 days, within the 7, but B, the later market, in 10: kept
+        case = _add_on_case()
+        case.world.markets[_A].close_time = datetime(2026, 1, 14, 23, tzinfo=UTC)
+        case.world.markets[_B].close_time = datetime(2026, 1, 22, 23, tzinfo=UTC)
+        assert set(_add_ons(case, monkeypatch, until=7)) == {_PAIR_KEY}
+
+    @pytest.mark.parametrize("until, adds", [(1, True), (7, False)])
+    def test_days_are_counted_on_utc_dates(self, monkeypatch, caplog, until, adds):
+        # A run at 16:00 UTC and a close at 03:59 UTC the next day: 1 day left
+        case = _add_on_case()
+        case.world.markets[_A].close_time = datetime(2026, 1, 13, 2, 59, tzinfo=UTC)
+        case.world.markets[_B].close_time = datetime(2026, 1, 13, 3, 59, tzinfo=UTC)
+        now = datetime(2026, 1, 12, 16, tzinfo=UTC)
+        with caplog.at_level(logging.INFO):
+            kept = _add_ons(case, monkeypatch, until=until, now=now)
+        assert bool(kept) == adds
+        assert (f"Not adding to {_near_maturity(_PAIR_TEXT, 1, 7)}" in caplog.text) != adds
+
+    @pytest.mark.parametrize("until, adds", [(1, True), (7, False)])
+    def test_today_is_the_utc_date_not_the_bots_own_day(self, monkeypatch, caplog, until,
+                                                        adds):
+        # 02:00 UTC on Jan 13 is 6pm on Jan 12 in Los Angeles: from the UTC date the
+        # later market's Jan 19 close is 6 days away (7 from the bot's own day)
+        case = _add_on_case()
+        case.world.markets[_A].close_time = datetime(2026, 1, 19, 22, tzinfo=UTC)
+        case.world.markets[_B].close_time = datetime(2026, 1, 19, 23, tzinfo=UTC)
+        now = datetime(2026, 1, 13, 2, tzinfo=UTC)
+        with caplog.at_level(logging.INFO):
+            kept = _add_ons(case, monkeypatch, until=until, now=now)
+        assert bool(kept) == adds
+        assert (f"Not adding to {_near_maturity(_PAIR_TEXT, 6, 7)}" in caplog.text) != adds
+
+    @pytest.mark.parametrize("until", [1, 7])
+    def test_an_unknown_close_date_holds_it_back(self, monkeypatch, caplog, until):
+        case = _add_on_case()
+        case.world.markets[_B].close_time = None
+        with caplog.at_level(logging.INFO):
+            assert _add_ons(case, monkeypatch, until=until) == {}
+        assert [r.getMessage() for r in caplog.records] == [
+            f"Not adding to {_PAIR_TEXT}: a held market's close date is unknown, so "
+            f"rebalancing until {until} day(s) before maturity cannot be checked",
+            "Held pairs that may be added to this run: 0 of 1"]
+        assert case.world.fill_reads == 0
+
+    @pytest.mark.parametrize("days, adds", [(5, False), (7, True)])
+    def test_a_lone_leg_is_judged_on_the_market_held(self, monkeypatch, caplog, days, adds):
+        # A has paid out and B is held alone: B's close decides, not A's (here 18
+        # days out), nor the new market's an add-on would pair it with
+        case = _lone(_add_on_case())
+        case.world.markets[_A].close_time = datetime(2026, 1, 30, 23, tzinfo=UTC)
+        case.world.markets[_B].close_time = (datetime(2026, 1, 12, 23, tzinfo=UTC)
+                                             + timedelta(days=days))
+        with caplog.at_level(logging.INFO):
+            kept = _add_ons(case, monkeypatch, until=7)
+        if adds:
+            assert set(kept) == {_LONE_KEY}
+        else:
+            assert kept == {}
+            assert f"Not adding to {_near_maturity(_LONE_TEXT, days, 7)}" in caplog.text
+            assert case.world.fill_reads == 0
+
+    @pytest.mark.parametrize("until, adds", [(1, True), (7, False)])
+    def test_the_days_rule_applies_with_no_wait_and_no_minimum(self, monkeypatch, caplog,
+                                                               until, adds):
+        # With nothing to wait for the fills are never read, but a pair whose later
+        # market closes in 3 days is still held back at 7
+        monkeypatch.setattr(seller, "REBALANCE_MIN_DAYS_SINCE_TRADE", 0)
+        case = _closing_in(_add_on_case(), 3)
+        with caplog.at_level(logging.INFO):
+            kept = _add_ons(case, monkeypatch, until=until)
+        assert bool(kept) == adds and case.world.fill_reads == 0
+        lines = [r.getMessage() for r in caplog.records]
+        if adds:
+            assert lines == ["Held pairs that may be added to this run: 1 of 1"]
+        else:
+            assert lines == [f"Not adding to {_near_maturity(_PAIR_TEXT, 3, 7)}",
+                             "Held pairs that may be added to this run: 0 of 1"]
 
 
 def _raw_candle(yes_ask, yes_bid) -> dict:

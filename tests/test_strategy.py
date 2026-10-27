@@ -4893,6 +4893,35 @@ class TestTimeSeriesKellyParity:
                              for t in n.targets)]
         assert add_ons.lineno < tickers.lineno < blocked.lineno
 
+    def test_ast_rebalancing_stops_near_maturity_through_one_definition(self):
+        # "Rebalance until": both live planners leave out a position whose later
+        # market closes too soon through seller._too_near_maturity, which counts the
+        # days with config.days_to_maturity (as a take-profit sale counts them) and
+        # decides with config.days_left_reached, the one shared test. Each planner
+        # asks it with the run's own setting, before it reads the account's fills,
+        # and plan_add_ons before its early return for "no wait and no minimum"
+        from kalshi_betting import seller
+        assert seller.days_left_reached is config.days_left_reached
+        assert seller.days_to_maturity is config.days_to_maturity
+        assert _function_calls(seller, "_too_near_maturity", "days_left_reached")
+        assert _function_calls(seller, "_too_near_maturity", "days_to_maturity")
+        tree = ast.parse(inspect.getsource(seller))
+        for planner in ("plan_trims", "plan_add_ons"):
+            [near] = _call_nodes(seller, planner, "_too_near_maturity")
+            [fills] = _call_nodes(seller, planner, "get_fill_times")
+            assert near.lineno < fills.lineno
+            assert ast.unparse(near.args[-1]) == "settings.rebalance_min_days_to_maturity"
+        add_ons = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                       and node.name == "plan_add_ons")
+        [near] = _calls_to(add_ons, "_too_near_maturity")
+        [early] = [node for node in add_ons.body if isinstance(node, ast.If)
+                   and ast.unparse(node.test) == "min_days == 0 and min_move is None"]
+        assert near.lineno < early.lineno
+        # Only the two planners ask it
+        callers = {func.name for func in ast.walk(tree) if isinstance(func, ast.FunctionDef)
+                   and _calls_to(func, "_too_near_maturity")}
+        assert callers == {"plan_trims", "plan_add_ons"}
+
     def test_ast_the_backtest_reads_ladders_through_the_one_definition(self):
         # The backtest's one-open-trade-per-ladder rule labels each market
         # through the same scanner.ladder_keys the live rule reads, so the two

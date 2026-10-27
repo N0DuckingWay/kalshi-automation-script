@@ -2239,6 +2239,34 @@ class TestDaysToMaturity:
         closes = (d for d in [date(2026, 1, 20), date(2026, 2, 2)])
         assert config.days_to_maturity(closes, date(2026, 1, 12)) == 21
 
+
+class TestDaysLeftReached:
+    """days_left_reached: the "Rebalance until" test. Always with no minimum,
+    never with an unknown number of days, otherwise at least the minimum."""
+
+    @pytest.mark.parametrize("left", [None, -2, 0, 1, 6, 7, 8, 400])
+    def test_no_minimum_always_allows(self, left):
+        assert config.days_left_reached(left, None) is True
+
+    @pytest.mark.parametrize("min_days", [1, 7])
+    def test_an_unknown_number_of_days_never_allows(self, min_days):
+        assert config.days_left_reached(None, min_days) is False
+
+    @pytest.mark.parametrize("left, at_one, at_seven", [
+        (-2, False, False), (0, False, False), (1, True, False), (6, True, False),
+        # 7 days left still rebalances at 7; 6 does not
+        (7, True, True), (8, True, True)])
+    def test_at_least_the_minimum(self, left, at_one, at_seven):
+        assert config.days_left_reached(left, 1) is at_one
+        assert config.days_left_reached(left, 7) is at_seven
+
+    def test_it_reads_days_to_maturity_on_utc_dates(self):
+        # A run at 16:00 UTC and a close at 03:59 UTC the next day: one UTC date
+        # apart, so 1 day left, though under 12 hours
+        left = config.days_to_maturity([date(2026, 1, 13)], date(2026, 1, 12))
+        assert left == 1
+        assert config.days_left_reached(left, 1) and not config.days_left_reached(left, 7)
+
     def test_a_datetime_is_refused(self):
         # Two datetimes differ by whole 24-hour spans: a close at 08:00 three
         # calendar days after a 16:00 check would read 2 days, not 3. A
@@ -3603,6 +3631,15 @@ class TestRebalanceChangeWarnings:
     def test_nothing_is_said_when_no_more_is_sold(self, change):
         assert config.rebalance_change_warnings(
             self._NOW, dataclasses.replace(self._NOW, **change)) == []
+
+    @pytest.mark.parametrize("before, after", [(7, 1), (7, None), (1, None), (None, 1),
+                                               (None, 7), (1, 7)])
+    def test_rebalance_until_is_never_named(self, before, after):
+        # "Rebalance until" only holds a trim back near maturity and never makes
+        # one bigger, so no sentence names it, lowered or raised
+        current = dataclasses.replace(self._NOW, rebalance_min_days_to_maturity=before)
+        proposed = dataclasses.replace(self._NOW, rebalance_min_days_to_maturity=after)
+        assert config.rebalance_change_warnings(current, proposed) == []
 
     def test_a_same_title_cap_held_below_by_the_per_trade_cap_moves_nothing(self):
         # The same-title cap a pair is trimmed to is the lower of the two

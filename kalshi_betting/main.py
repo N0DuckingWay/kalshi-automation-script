@@ -2537,8 +2537,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     rebalance_until.add_argument(
         "--no-rebalance-min-days-to-maturity", action="store_true", default=None,
-        help="Rebalance a held position however close its later market is to its "
-             "close this run, whatever the saved live defaults say",
+        help="Rebalance held positions this run however soon their later market "
+             "closes, whatever the saved live defaults say",
     )
     sell_level = live.add_mutually_exclusive_group()
     sell_level.add_argument(

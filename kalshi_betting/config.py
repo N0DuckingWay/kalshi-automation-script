@@ -4605,9 +4605,11 @@ def max_kelly_fraction(pair_type: str, settings: LiveSettings) -> float:
 # realized profit (what selling it at the bids would return, after the sale's
 # fees, less its cost) has been at least a set share of its potential profit
 # (what it pays if it wins, less its cost) at every daily check. Live selling
-# (seller.plan_sales) decides with all three functions below, and the backtest with
-# take_profit_reached and days_to_maturity (through backtester._sells_at and
-# _days_left), so the two never apply different arithmetic.
+# (seller.plan_sales) decides with the first three functions below, and the backtest
+# with take_profit_reached and days_to_maturity (through backtester._sells_at and
+# _days_left), so the two never apply different arithmetic. The last,
+# days_left_reached, is "Rebalance until": how near maturity a held position may
+# still be trimmed or added to, read from days_to_maturity's answer.
 
 def take_profit_reached(sell_at: float, realized: float, potential: float) -> bool:
     """
@@ -4680,6 +4682,31 @@ def days_to_maturity(close_dates, day: date) -> int | None:
     if not dates or any(d is None for d in dates):
         return None
     return (max(dates) - day).days
+
+
+def days_left_reached(left: int | None, min_days: int | None) -> bool:
+    """
+    Whether a position with `left` whole days to maturity is far enough from it.
+
+    The test behind "Rebalance until" (LiveSettings.rebalance_min_days_to_maturity):
+    a held position is rebalanced (a Kelly trim, or an add-on) only while its
+    later market closes at least `min_days` days from today. Always True with
+    no minimum; never with an unknown number of days, so a position whose
+    close date cannot be read is not rebalanced under a minimum. Live
+    rebalancing asks it (seller._too_near_maturity); the take-profit sale's
+    minimum of days applies the same test in its own code (seller._plan_one,
+    backtester._far_enough).
+
+    Args:
+        left (int | None): Whole days from today to the position's latest close
+            date (days_to_maturity), or None when a close date is unknown.
+        min_days (int | None): The fewest days left that still allow it, or None
+            for no minimum.
+
+    Returns:
+        bool: True when there is no minimum, or `left` is known and at least `min_days`.
+    """
+    return min_days is None or (left is not None and left >= min_days)
 
 
 # ── Trimming a held pair to its Kelly size ────────────────────────────────────
