@@ -362,7 +362,7 @@ class TestNoPairsMsg:
 @pytest.fixture
 def pinned_config_toggles(monkeypatch, _isolate_live_defaults):
     """
-    Pin the eleven live toggles and save them as this test's live defaults.
+    Pin the twelve live toggles and save them as this test's live defaults.
 
     Through conftest's apply_pre_toggle_defaults, the one definition of their
     values, then save_config_live_defaults into the test's own path (requested
@@ -799,6 +799,129 @@ class TestLiveSettingsFlags:
         assert "not allowed with argument" in err, err
         assert "--min-price-move" in err and "--no-min-price-move" in err
 
+    @pytest.mark.parametrize("mode", ["dev", "prod"])
+    @pytest.mark.parametrize("argv, saved, expected", [
+        # Given alone over saved rebalancing, and with the switch given too
+        (["--rebalance-min-days-to-maturity", "7"], {"rebalance": True}, 7),
+        (["--rebalance-min-days-to-maturity", "1"], {"rebalance": True}, 1),
+        (["--rebalance", "--rebalance-min-days-to-maturity", "7"], {}, 7),
+        # A given number replaces a saved one; 0 is "always", the same as none
+        (["--rebalance-min-days-to-maturity", "1"],
+         {"rebalance": True, "rebalance_min_days_to_maturity": 7}, 1),
+        (["--rebalance-min-days-to-maturity", "0"],
+         {"rebalance": True, "rebalance_min_days_to_maturity": 7}, None),
+        (["--no-rebalance-min-days-to-maturity"],
+         {"rebalance": True, "rebalance_min_days_to_maturity": 7}, None),
+        # No flag, or only the switch, keeps a saved number; --no-rebalance clears it
+        ([], {"rebalance": True, "rebalance_min_days_to_maturity": 1}, 1),
+        (["--rebalance"], {"rebalance": True, "rebalance_min_days_to_maturity": 7}, 7),
+        (["--no-rebalance"], {"rebalance": True, "rebalance_min_days_to_maturity": 7}, None),
+        # ... and with nothing saved they change nothing
+        (["--no-rebalance-min-days-to-maturity"], {}, None),
+        (["--no-rebalance"], {}, None),
+        # The minimum price move is a separate setting that stays as it was
+        (["--rebalance-min-days-to-maturity", "7"],
+         {"rebalance": True, "min_price_move": 0.25}, 7),
+        (["--no-rebalance-min-days-to-maturity"],
+         {"rebalance": True, "min_price_move": 0.25, "rebalance_min_days_to_maturity": 1}, None),
+    ])
+    def test_the_days_to_maturity_flags_lay_over_the_saved_days(
+        self, monkeypatch, mode, argv, saved, expected,
+    ):
+        _save_live_defaults(**saved)
+        seen = _main_with(monkeypatch, ["--mode", mode, *argv])
+        assert seen["code"] == EXIT_OK and seen["mode"] == mode
+        settings, reference = seen["settings"], seen["reference"]
+        assert reference.rebalance_min_days_to_maturity == saved.get(
+            "rebalance_min_days_to_maturity")
+        assert settings.rebalance_min_days_to_maturity == expected
+        assert settings.rebalance_min_days_to_maturity is None or (
+            type(settings.rebalance_min_days_to_maturity) is int)
+        # Nothing but the days moved, bar a rebalance switch given in argv
+        # (--no-rebalance clears the minimum price move with it)
+        for other in config.LIVE_TOGGLE_FIELDS:
+            if other == "rebalance_min_days_to_maturity" or (
+                    ("--rebalance" in argv or "--no-rebalance" in argv)
+                    and other == "rebalance") or (
+                    "--no-rebalance" in argv and other == "min_price_move"):
+                continue
+            assert getattr(settings, other) == getattr(reference, other), other
+
+    def test_no_rebalance_clears_a_saved_days_to_maturity_and_marks_all_three(
+        self, monkeypatch,
+    ):
+        _save_live_defaults(rebalance=True, min_price_move=0.10,
+                            rebalance_min_days_to_maturity=7)
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--no-rebalance"])
+        assert seen["settings"] == dataclasses.replace(
+            seen["reference"], rebalance=False, min_price_move=None,
+            rebalance_min_days_to_maturity=None)
+        line = describe_live_settings(seen["settings"], seen["reference"])
+        assert "rebalance no (default: yes)" in line
+        assert "min price movement any (default: 10c)" in line
+        assert "rebalance until maturity (default: 7 days before maturity)" in line
+        assert line.count("(default:") == 3
+        # No flag keeps all three
+        kept = _main_with(monkeypatch, ["--mode", "prod"])["settings"]
+        assert (kept.rebalance, kept.min_price_move, kept.rebalance_min_days_to_maturity) == (
+            True, 0.10, 7)
+
+    @pytest.mark.parametrize("argv, saved, words", [
+        # Not 0, 1 or 7
+        (["--rebalance-min-days-to-maturity", "2"], {"rebalance": True},
+         ["(--rebalance-min-days-to-maturity):",
+          "rebalance_min_days_to_maturity must be 0, 1 or 7, got 2"]),
+        (["--rebalance-min-days-to-maturity", "30"], {"rebalance": True},
+         ["rebalance_min_days_to_maturity must be 0, 1 or 7, got 30"]),
+        (["--rebalance-min-days-to-maturity", "-1"], {"rebalance": True},
+         ["rebalance_min_days_to_maturity must be 0, 1 or 7, got -1"]),
+        # Days need rebalancing on: none saved, none given, or --no-rebalance
+        (["--rebalance-min-days-to-maturity", "7"], {},
+         ["(--rebalance-min-days-to-maturity):",
+          "rebalance_min_days_to_maturity needs rebalance on"]),
+        (["--no-rebalance", "--rebalance-min-days-to-maturity", "7"], {"rebalance": True},
+         ["(--rebalance/--no-rebalance, --rebalance-min-days-to-maturity):",
+          "rebalance_min_days_to_maturity needs rebalance on"]),
+    ])
+    def test_a_days_to_maturity_flag_the_settings_refuse_is_a_usage_error(
+        self, monkeypatch, capsys, argv, saved, words,
+    ):
+        _save_live_defaults(**saved)
+        seen = _main_with(monkeypatch, ["--mode", "prod", *argv])
+        assert seen["code"] == 2
+        # Refused before logging, the client and either run mode
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "settings" not in seen
+        err = capsys.readouterr().err
+        for word in words:
+            assert word in err, (word, err)
+
+    @pytest.mark.parametrize("argv", [
+        ["--rebalance-min-days-to-maturity", "1.5"], ["--rebalance-min-days-to-maturity", "soon"],
+        ["--rebalance-min-days-to-maturity", "7d"],
+    ])
+    def test_a_fractional_or_non_numeric_days_value_is_a_usage_error(
+        self, monkeypatch, capsys, argv,
+    ):
+        _save_live_defaults(rebalance=True)
+        seen = _main_with(monkeypatch, ["--mode", "prod", *argv])
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "invalid int value" in capsys.readouterr().err
+
+    def test_a_days_to_maturity_and_its_off_twin_are_mutually_exclusive(
+        self, monkeypatch, capsys,
+    ):
+        _save_live_defaults(rebalance=True)
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--rebalance-min-days-to-maturity",
+                                        "7", "--no-rebalance-min-days-to-maturity"])
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        err = capsys.readouterr().err
+        assert "not allowed with argument" in err, err
+        assert "--rebalance-min-days-to-maturity" in err
+        assert "--no-rebalance-min-days-to-maturity" in err
+
     def test_no_flag_hands_the_run_the_saved_defaults_themselves(self, monkeypatch):
         # The scheduler's exact argv (tests/test_scheduler.py pins it)
         seen = _main_with(monkeypatch, ["--mode", "prod"])
@@ -1115,7 +1238,8 @@ class TestLiveSettingsFlags:
         for flag in ("--tier-floors", "--no-tier-floors", "--spread-min", "--spread-max",
                      "--interval-discount", "--size-cap", "--same-title-size-cap",
                      "--rebalance", "--no-rebalance", "--min-price-move",
-                     "--no-min-price-move",
+                     "--no-min-price-move", "--rebalance-min-days-to-maturity",
+                     "--no-rebalance-min-days-to-maturity",
                      "--sell-at", "--no-sell", "--sell-min-days", "--no-sell-min-days",
                      "--exclude-category", "--no-exclude-category", "--exclude-tag", "--no-exclude-tag"):
             assert flag in out, flag
@@ -1123,8 +1247,16 @@ class TestLiveSettingsFlags:
         for gone in ("--add-to-held-pairs", "--trim-to-kelly", "--trim-min-rise"):
             assert gone not in out, gone
         # Every value flag defaults to the saved live defaults, never a config.py constant
-        assert out.count("default: the saved live defaults") == 12
-        assert out.count("whatever the saved live defaults say") == 5
+        assert out.count("default: the saved live defaults") == 13
+        assert out.count("whatever the saved live defaults say") == 6
+        # The days to maturity name their three choices from the one grid, and say
+        # what they need and what --no-rebalance does to them
+        days_help = ("Rebalance (trim or add to) a held position only while its later "
+                     "market closes at least N days from today (UTC dates): 0 = always, "
+                     "or 1 or 7. Needs rebalancing on, saved or given with --rebalance")
+        assert days_help in out
+        assert config.REBALANCE_MATURITY_DAYS == (0, 1, 7)
+        assert "--no-rebalance-min-days-to-maturity" in out
         # --exclude-category and --exclude-tag each replace the whole saved list,
         # and say so
         assert ("REPLACES the saved excluded categories for this run, so a category the "
@@ -1183,7 +1315,7 @@ class TestLiveSettingsFlags:
                 "already holds (exactly the same two markets, the same side on each, or a "
                 "lone leg beside a market not held) after the same wait") in out
         assert ("neither trims nor adds to a held pair, and clears the saved minimum price "
-                "move too.") in out
+                "move and days to maturity too.") in out
         assert "no run acts on it" not in out
         step = config.PRICE_MOVE_STEP_CENTS
         assert (f"a multiple of {step} from {step} to 100. Needs rebalancing on, saved or "
@@ -1264,13 +1396,17 @@ class TestLogLiveSettings:
         "rebalance": (["--rebalance"], "rebalance yes (default: no)"),
         "min_price_move": (["--min-price-move", "10"],
                            "min price movement 10c (default: any)"),
+        "rebalance_min_days_to_maturity": (
+            ["--rebalance-min-days-to-maturity", "7"],
+            "rebalance until 7 days before maturity (default: maturity)"),
         "sell_at": (["--sell-at", "85"], "sell at 85% of potential profit (default: off)"),
         "sell_min_days": (["--sell-min-days", "3"], "min days to maturity 3 (default: any)"),
     }
     # Extra saved defaults a flag needs: a minimum of days needs a sell level,
-    # a minimum price move needs rebalancing on
+    # a minimum price move and days to maturity need rebalancing on
     _SAVED_FOR_FIELD = {"sell_min_days": {"sell_at": 0.85},
-                        "min_price_move": {"rebalance": True}}
+                        "min_price_move": {"rebalance": True},
+                        "rebalance_min_days_to_maturity": {"rebalance": True}}
 
     def test_every_field_has_a_departing_flag(self):
         # A new toggle needs a row, so its departure WARNING is tested
@@ -1524,7 +1660,7 @@ class TestLiveDefaultsRequired:
         # stops before logging or any client, saying how to save it again, and
         # leaves it in place for the defaults server to offer
         record = json.loads(_saved_record())
-        for name in ("rebalance", "min_price_move"):
+        for name in ("rebalance", "min_price_move", "rebalance_min_days_to_maturity"):
             record["settings"].pop(name, None)
         record["settings"].update(add_to_held_pairs=True, trim_to_kelly=True,
                                   trim_min_rise=0.1)
@@ -3823,7 +3959,8 @@ class TestLiveSettingsReachEverySite:
                              exclude_categories=("sports", "WORLD"),
                              exclude_tags=("Hockey", "sports · soccer"),
                              rebalance=True,
-                             min_price_move=0.10, sell_at=0.85, sell_min_days=3)
+                             min_price_move=0.10, rebalance_min_days_to_maturity=7,
+                             sell_at=0.85, sell_min_days=3)
 
     # The cached /series listing. Each same-title pair's two series are filed
     # alike, since the same-title sport check refuses two series filed
@@ -4106,13 +4243,13 @@ class TestLiveSettingsReachEverySite:
         assert ("Time-series entry rule: "
                 + config.describe_time_series_rule(False, (0.05, 0.9))) in caplog.text
         echo = f"Live settings: {describe_live_settings(settings, reference)}"
-        assert echo in caplog.text and echo.count("(config:") == 11
+        assert echo in caplog.text and echo.count("(config:") == 12
         assert "This PRODUCTION run overrides" not in caplog.text
         assert "one time-series pair may stake up to 35%" in caplog.text
         assert "one same-title pair may stake up to 25%" in caplog.text
         # The workbook's separator row carries the same marked line
         assert captured["run_note"] == f"settings: {describe_live_settings(settings, reference)}"
-        assert captured["run_note"].count("(config:") == 11
+        assert captured["run_note"].count("(config:") == 12
 
     def test_a_dev_run_handed_its_settings_reads_them_at_every_site(self, monkeypatch, caplog):
         settings, reference, calls, captured = self._run_under_the_tripwire(
@@ -4132,7 +4269,7 @@ class TestLiveSettingsReachEverySite:
         assert ("Time-series entry rule: "
                 + config.describe_time_series_rule(False, (0.05, 0.9))) in caplog.text
         echo = f"Live settings: {describe_live_settings(settings, reference)}"
-        assert echo in caplog.text and echo.count("(config:") == 11
+        assert echo in caplog.text and echo.count("(config:") == 12
         # Dev never submits an order, so never the production WARNING
         assert "This PRODUCTION run overrides" not in caplog.text
 
@@ -10764,11 +10901,12 @@ class TestResultFile:
 
 def _other_toggles(target: LiveSettings) -> LiveSettings:
     """
-    Build live defaults that differ from target in every one of the eleven toggles.
+    Build live defaults that differ from target in every one of the twelve toggles.
 
-    All but one case: a target that rebalances with no minimum price move
-    meets defaults that do not rebalance, and so hold no minimum either
-    (test_rebalancing_with_no_minimum_clears_a_saved_one covers clearing one).
+    All but two cases: a target that rebalances with no minimum price move, or
+    with no days to maturity, meets defaults that do not rebalance, and so hold
+    neither (test_rebalancing_with_no_minimum_clears_a_saved_one and
+    test_rebalancing_with_no_days_to_maturity_clears_saved_days cover clearing them).
 
     Args:
         target (LiveSettings): The settings a run should trade.
@@ -10789,6 +10927,8 @@ def _other_toggles(target: LiveSettings) -> LiveSettings:
         # The opposite rebalance switch; a 25c minimum when rebalancing here
         rebalance=not target.rebalance,
         min_price_move=None if target.rebalance else 0.25,
+        # Days to maturity likewise: only where the saved defaults rebalance
+        rebalance_min_days_to_maturity=None if target.rebalance else 7,
         # Always selling, so a target that sells nothing needs --no-sell and
         # --no-sell-min-days to win over them
         sell_at=0.5 if target.sell_at != 0.5 else 0.6,
@@ -10796,6 +10936,9 @@ def _other_toggles(target: LiveSettings) -> LiveSettings:
     )
     for name in config.LIVE_TOGGLE_FIELDS:
         if name == "min_price_move" and target.rebalance and target.min_price_move is None:
+            continue
+        if (name == "rebalance_min_days_to_maturity" and target.rebalance
+                and target.rebalance_min_days_to_maturity is None):
             continue
         assert getattr(other, name) != getattr(target, name), name
     assert other.spread_band[0] != target.spread_band[0]
@@ -10853,6 +10996,16 @@ _ARGV_TARGETS = {
         tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
         size_cap=0.1, same_title_size_cap=0.2, rebalance=True, min_price_move=1.0,
         sell_at=0.85, sell_min_days=7),
+    # Rebalancing only while the later market is still 1 or 7 days from its close,
+    # alone and beside a minimum price move and selling
+    "rebalancing-until-1-day-before-maturity": LiveSettings(
+        tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+        size_cap=0.1, same_title_size_cap=0.2, rebalance=True,
+        rebalance_min_days_to_maturity=1),
+    "rebalancing-until-7-days-with-a-move-and-selling": LiveSettings(
+        tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+        size_cap=0.2, same_title_size_cap=1.0, rebalance=True, min_price_move=0.10,
+        rebalance_min_days_to_maturity=7, sell_at=0.85, sell_min_days=3),
 }
 
 
@@ -10890,6 +11043,13 @@ class TestLiveSettingsArgv:
         else:
             assert args.min_price_move == round(target.min_price_move * 100)
             assert args.no_min_price_move is None
+        # ... and so are the days to maturity: a number or the flag that clears it
+        if target.rebalance_min_days_to_maturity is None:
+            assert (args.rebalance_min_days_to_maturity is None
+                    and args.no_rebalance_min_days_to_maturity is True)
+        else:
+            assert args.rebalance_min_days_to_maturity == target.rebalance_min_days_to_maturity
+            assert args.no_rebalance_min_days_to_maturity is None
         # The sell settings are given either way: a percent or --no-sell, a
         # number of days or --no-sell-min-days
         if target.sell_at is None:
@@ -10906,13 +11066,14 @@ class TestLiveSettingsArgv:
         assert config.live_settings_argv(config.LIVE_DEFAULTS_SEED) == [
             "--no-tier-floors", "--spread-min=0.0", "--spread-max=0.5",
             "--interval-discount=0.8", "--size-cap=10", "--same-title-size-cap=20",
-            "--rebalance", "--no-min-price-move", "--no-sell", "--no-sell-min-days",
-            "--no-exclude-category", "--no-exclude-tag"]
+            "--rebalance", "--no-min-price-move", "--no-rebalance-min-days-to-maturity",
+            "--no-sell", "--no-sell-min-days", "--no-exclude-category", "--no-exclude-tag"]
 
     def test_rebalancing_is_spelled_as_a_switch_and_whole_cents(self):
         argv = config.live_settings_argv(_ARGV_TARGETS["rebalancing-after-a-15c-move"])
-        assert argv[argv.index("--same-title-size-cap=100"):][:4] == [
-            "--same-title-size-cap=100", "--rebalance", "--min-price-move=15", "--no-sell"]
+        assert argv[argv.index("--same-title-size-cap=100"):][:5] == [
+            "--same-title-size-cap=100", "--rebalance", "--min-price-move=15",
+            "--no-rebalance-min-days-to-maturity", "--no-sell"]
         # Every 5c step is spelled as exact whole cents and reads back the same
         # (0.55 * 100 is 55.00000000000001, so a plain product would not do)
         assert [c for c in range(5, 101, 5) if c / 100 * 100 != c] == [55]
@@ -10941,10 +11102,43 @@ class TestLiveSettingsArgv:
         assert settings == target and settings.min_price_move is None
         assert reference == saved and reference.min_price_move == 0.25
 
+    @pytest.mark.parametrize("days, text", [(1, "1"), (7, "7")])
+    def test_the_days_to_maturity_are_spelled_as_a_number_after_the_minimum_move(
+        self, days, text,
+    ):
+        target = dataclasses.replace(_ARGV_TARGETS["seed"], min_price_move=0.10,
+                                     rebalance_min_days_to_maturity=days)
+        argv = config.live_settings_argv(target)
+        assert argv[argv.index("--rebalance"):][:4] == [
+            "--rebalance", "--min-price-move=10",
+            f"--rebalance-min-days-to-maturity={text}", "--no-sell"]
+        assert "--no-rebalance-min-days-to-maturity" not in argv
+        args = main._build_parser().parse_args(["--mode", "prod", *argv])
+        assert args.rebalance_min_days_to_maturity == days
+        assert args.no_rebalance_min_days_to_maturity is None
+
+    def test_rebalancing_with_no_days_to_maturity_clears_saved_days(self):
+        # "maturity" (always rebalance) is spelled --no-rebalance-min-days-to-maturity,
+        # which must clear saved days (_other_toggles cannot hold any here:
+        # saved defaults holding days must rebalance too)
+        target = config.LIVE_DEFAULTS_SEED
+        assert target.rebalance and target.rebalance_min_days_to_maturity is None
+        argv = config.live_settings_argv(target)
+        assert argv[argv.index("--no-min-price-move"):][:2] == [
+            "--no-min-price-move", "--no-rebalance-min-days-to-maturity"]
+        saved = config.save_live_defaults(
+            dataclasses.replace(target, rebalance_min_days_to_maturity=7), source="")
+        parser = main._build_parser()
+        args = parser.parse_args(["--mode", "prod", *argv])
+        settings, reference = main._resolve_live_settings(args, parser)
+        assert settings == target and settings.rebalance_min_days_to_maturity is None
+        assert reference == saved and reference.rebalance_min_days_to_maturity == 7
+
     def test_selling_is_spelled_as_whole_percents_and_days(self):
         argv = config.live_settings_argv(_ARGV_TARGETS["selling-at-85-with-a-minimum"])
-        assert argv[argv.index("--no-rebalance"):][:4] == [
-            "--no-rebalance", "--no-min-price-move", "--sell-at=85", "--sell-min-days=7"]
+        assert argv[argv.index("--no-rebalance"):][:5] == [
+            "--no-rebalance", "--no-min-price-move", "--no-rebalance-min-days-to-maturity",
+            "--sell-at=85", "--sell-min-days=7"]
         # Every level of the grid is spelled as its exact whole percent (0.29 * 100
         # is 28.999999999999996) and reads back as the same level
         parser = main._build_parser()

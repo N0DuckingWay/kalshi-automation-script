@@ -54,7 +54,7 @@ Purpose:
         port).
 
     Each run is its own `python -m kalshi_betting.main --mode prod` process,
-    started with all eleven toggles as explicit flags (config.live_settings_argv)
+    started with all twelve toggles as explicit flags (config.live_settings_argv)
     so it trades exactly what its page showed, in a new session (so Ctrl-C on
     this server, or closing its terminal, never reaches it), from
     config.PROJECT_ROOT, writing everything it prints to its own folder under
@@ -62,7 +62,7 @@ Purpose:
 
 Dependencies:
     Imports config and run_lock only (besides the standard library). From
-    config: LiveSettings, LIVE_TOGGLE_FIELDS (the eleven toggle names the
+    config: LiveSettings, LIVE_TOGGLE_FIELDS (the twelve toggle names the
     fingerprint reads), LiveDefaultsError (a refused saved file),
     LiveDefaultsOutdated (a file an older version saved, which carries what
     it reads as now, offered here for one more save) and the
@@ -1151,7 +1151,7 @@ def _fingerprint(current: LiveSettings | None,
 
     Returns:
         str: The SHA-256 hex digest of "none", of the outdated file's
-            refusal, or of the origin and the eleven toggles as JSON.
+            refusal, or of the origin and the twelve toggles as JSON.
     """
     if outdated is not None:
         proposal = outdated.proposal
@@ -3614,7 +3614,7 @@ class _App:
         The one place the server starts a process. It makes the run's folder
         under config.LIVE_RUNS_DIR, writes run.json (what the run is) before
         anything starts, locks output.log and starts
-        `python -m kalshi_betting.main --mode prod` with all eleven toggles as
+        `python -m kalshi_betting.main --mode prod` with all twelve toggles as
         flags (config.live_settings_argv), --result-file in the folder and,
         for a dry run, --dry-run, from config.PROJECT_ROOT, its output going
         to output.log. The process inherits the lock through its output, so
@@ -3644,7 +3644,7 @@ class _App:
         started = datetime.now(UTC)
         folder = config.LIVE_RUNS_DIR / f"{started.strftime(_FOLDER_TIME)}-{run_id}"
         folder.mkdir(parents=True)
-        # All eleven toggles as flags, so the run trades exactly these settings
+        # All twelve toggles as flags, so the run trades exactly these settings
         argv = [sys.executable, "-m", "kalshi_betting.main", "--mode", "prod",
                 *live_settings_argv(settings), "--result-file", str(folder / _RESULT_NAME)]
         if dry_run:

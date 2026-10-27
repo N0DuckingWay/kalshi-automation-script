@@ -100,10 +100,10 @@ KEY = b"k" * 32
 _REAL_POPEN = subprocess.Popen
 # A source note of the dashboard's shape
 DASHBOARD_NOTE = "backtest dashboard for 2025-09-24 to 2026-09-27"
-# The eleven rows of a comparison, in their order on the page
+# The twelve rows of a comparison, in their order on the page
 LABELS = ["tier floors", "spread band", "k", "per-trade cap", "same-title cap",
-          "exclude categories", "exclude tags", "rebalance", "min price movement", "sell at",
-          "min days to maturity"]
+          "exclude categories", "exclude tags", "rebalance", "min price movement",
+          "rebalance until", "sell at", "min days to maturity"]
 # A proposal's fields: the seed's values, spelled as the dashboard spells them
 _BASE = {"tier_floors": "off", "spread_min": "0", "spread_max": "0.5", "k": "0.8",
          "size_cap": "0.1"}
@@ -837,7 +837,7 @@ class TestConfirmPage:
         assert changed == {"tier floors", "spread band"}
         assert all(css == "same" for label, css in page.rows.items() if label not in changed)
         assert response.body.count('<span class="tag">changed</span>') == 2
-        assert "2 of 11 settings change." in response.body
+        assert "2 of 12 settings change." in response.body
         assert "Overwrite the live trading defaults?" in response.body
         assert f"This writes <code>{config.LIVE_DEFAULTS_FILE.absolute()}</code>" \
             in response.body
@@ -863,7 +863,7 @@ class TestConfirmPage:
         assert "none saved — live runs refuse to start until defaults are saved" in response.body
         assert set(page.rows.values()) == {"changed"}
         assert all(cells[1] == "—" for cells in page.cells.values())
-        assert "11 of 11 settings change." in response.body
+        assert "12 of 12 settings change." in response.body
         # The fields the link leaves out take the seed's values
         assert page.cells["same-title cap"][2] == "20%"
         assert page.cells["rebalance"][2] == "yes"
@@ -1155,7 +1155,7 @@ class TestConfirmPage:
         assert page.buttons[1] == {"type": "button", "disabled": None}
         assert html.escape(defaults_server._NOTHING_TO_SAVE) in response.body
         assert "These are already the live defaults — nothing to save." in response.body
-        assert "0 of 11 settings change." in response.body
+        assert "0 of 12 settings change." in response.body
         # With nothing to save, the page does not say it writes
         assert "This writes" not in response.body
         assert str(config.LIVE_DEFAULTS_FILE.absolute()) in response.body
@@ -2160,7 +2160,7 @@ class TestOutdatedFile:
         assert page.cells["per-trade cap"][2] == "15%"
         assert page.cells["rebalance"][2] == "yes"
         assert page.cells["min price movement"][2] == "10c"
-        assert "11 of 11 settings change." in response.body
+        assert "12 of 12 settings change." in response.body
 
     def test_one_confirm_and_save_replaces_the_file(self):
         config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
@@ -2993,7 +2993,7 @@ class TestSeed:
         page = _parse(response.body)
         assert [label for label, css in page.rows.items() if css == "changed"] == [row]
         assert page.cells[row][1:3] == cells
-        assert "1 of 11 settings change." in response.body
+        assert "1 of 12 settings change." in response.body
 
     def test_a_file_with_rebalancing_off_leaves_its_key_out(self):
         # A saved file that leaves rebalance out reads it as off; the writer
@@ -3037,7 +3037,7 @@ class TestSeed:
         page = _parse(response.body)
         assert [label for label, css in page.rows.items() if css == "changed"] == [
             "sell at", "min days to maturity"]
-        assert "2 of 11 settings change." in response.body
+        assert "2 of 12 settings change." in response.body
 
     def test_a_seed_link_that_leaves_selling_out_still_proposes_the_seed(self):
         # A seed link from before selling existed (no sell fields), opened over
@@ -3543,7 +3543,8 @@ class TestActions:
         assert "--rebalance" in argv and "--min-price-move=10" in argv
         assert "--no-rebalance" not in argv and "--no-min-price-move" not in argv
         record = json.loads((_run_folder(run_id) / "run.json").read_text())
-        assert "rebalance yes | min price movement 10c | sell at off" in record["settings"]
+        assert ("rebalance yes | min price movement 10c | rebalance until maturity | sell at off"
+                in record["settings"])
 
     def test_a_run_from_defaults_that_do_not_rebalance_says_so_in_its_flags(self):
         starter = _Starter()

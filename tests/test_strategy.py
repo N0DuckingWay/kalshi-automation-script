@@ -2945,6 +2945,7 @@ class TestTimeSeriesKellyParity:
             "TRADE_EXCLUDE_TAGS",
             "REBALANCE",
             "MIN_PRICE_MOVE",
+            "REBALANCE_MIN_DAYS_TO_MATURITY",
             "SELL_AT",
             "SELL_MIN_DAYS",
         } | self._SAVED_FILE_INTERNALS
