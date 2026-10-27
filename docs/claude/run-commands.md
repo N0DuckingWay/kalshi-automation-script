@@ -108,8 +108,9 @@ python3 -m kalshi_betting.main --mode prod --dry-run --rebalance --min-price-mov
 # day(s), and rebalancing stops 7 day(s) before maturity`; `Not adding to ...` for an add-on). 1 is
 # the other choice; 0 or --no-rebalance-min-days-to-maturity rebalances however near maturity (the
 # default unless saved otherwise). The "Live settings:" line reads `rebalance until 7 days before
-# maturity`. A backtest does not apply this setting yet, and the dashboard's Save button leaves it
-# as saved (a link naming rebalance=off clears it), so a backtest scenario shows none of its effect
+# maturity`. The backtest's walk applies the same rule (_simulate_at_discount's
+# rebalance_min_days_to_maturity), but the dashboard does not offer it yet: its Save button leaves it
+# as saved (a link naming rebalance=off clears it), so a dashboard scenario shows none of its effect
 python3 -m kalshi_betting.main --mode prod --dry-run --rebalance --rebalance-min-days-to-maturity 7
 python3 -m kalshi_betting.main --mode prod --dry-run --no-rebalance
 

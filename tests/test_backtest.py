@@ -2046,7 +2046,7 @@ class TestDashboardOnly:
 
     @pytest.mark.parametrize("damage", ["not gzip", "no header line", "header not json",
                                         "other format", "before tag exclusions",
-                                        "no fingerprint"])
+                                        "before rebalance until", "no fingerprint"])
     def test_a_file_whose_header_cannot_be_read_exits_1(self, rebuild, monkeypatch, damage):
         path = rebuild["path"]
         if damage == "not gzip":
@@ -2063,6 +2063,10 @@ class TestDashboardOnly:
         elif damage == "before tag exclusions":
             # The format a run saved while BacktestSweep held live_tags
             _rewrite_header(path, format="backtest-sweep-v3")
+        elif damage == "before rebalance until":
+            # The format a run saved before SweepPoint and CapSweep gained
+            # rebalance_min_days_to_maturity
+            _rewrite_header(path, format="backtest-sweep-v4")
         else:
             _rewrite_header(path, fingerprint_parts=None)
         with pytest.raises(SystemExit) as exc:
@@ -2071,11 +2075,12 @@ class TestDashboardOnly:
         assert isinstance(exc.value.code, str)
         assert exc.value.code.startswith(f"backtest: {path} cannot be used: ")
         assert exc.value.code.endswith("run the backtest again to save a new one")
-        if damage in ("other format", "before tag exclusions"):
-            old = "v1" if damage == "other format" else "v3"
+        if damage in ("other format", "before tag exclusions", "before rebalance until"):
+            old = {"other format": "v1", "before tag exclusions": "v3",
+                   "before rebalance until": "v4"}[damage]
             assert f"'backtest-sweep-{old}'" in exc.value.code
             assert repr(config.BACKTEST_SWEEP_FORMAT) in exc.value.code
-            assert config.BACKTEST_SWEEP_FORMAT == "backtest-sweep-v4"
+            assert config.BACKTEST_SWEEP_FORMAT == "backtest-sweep-v5"
         assert "dashboard" not in rebuild
 
     @pytest.mark.parametrize("damage", ["cut short", "not the inputs"])
