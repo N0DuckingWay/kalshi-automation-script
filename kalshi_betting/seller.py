@@ -38,7 +38,10 @@ Purpose:
     the same number of calendar days after the last fill on the pair's
     markets and, with a minimum price move, until the pair's price has moved
     that far since, up or down. It sends nothing and sizes nothing: the
-    finders and the sizer do the rest.
+    finders and the sizer do the rest. With
+    LiveSettings.rebalance_min_days_to_maturity set ("Rebalance until"),
+    neither a trim nor an add-on is made once the position's later market
+    closes fewer than that many days from today (UTC dates).
 
 Dependencies:
     Imports the standard library, config, scanner and historical only, never
@@ -79,6 +82,7 @@ from .config import (
     LiveSettings,
     confirmed_fee_multiplier,
     count_text,
+    days_left_reached,
     days_to_maturity,
     fee_leg_exact,
     fee_per_pair_approx,
@@ -1108,6 +1112,56 @@ def _last_fill(pair: HeldPair, reads: _Reads, fills: FillTimes | None) -> dateti
     return max(listed) if listed else None
 
 
+def _too_near_maturity(pair: HeldPair, markets_by_ticker: dict, utc_date: date,
+                       min_days: int | None) -> str | None:
+    """
+    Why a held position may not be rebalanced this run because it is too near maturity.
+
+    "Rebalance until" (LiveSettings.rebalance_min_days_to_maturity): a Kelly
+    trim or an add-on is made only while the position's later market closes
+    at least `min_days` days from today. The later market is the latest close
+    among its held markets: a pair's later market, or a lone leg's own (an
+    add-on to a lone leg is judged on the market held, since the market it
+    would be paired with is not known yet). Days are whole calendar days
+    between UTC dates, as a take-profit sale counts them
+    (config.days_to_maturity). Fails closed: under a minimum, a held market
+    missing from this run's list, or whose close date cannot be read, holds
+    the position back. Reads nothing from the exchange, so both planners ask
+    it before anything is read for a position.
+
+    Args:
+        pair (HeldPair): An exact held pair or a lone leg.
+        markets_by_ticker (dict): This run's market list by ticker.
+        utc_date (date): Today, UTC.
+        min_days (int | None): The fewest days left that still allow a
+            rebalance (1 or 7); None rebalances however near maturity.
+
+    Returns:
+        str | None: The reason, for a "Not trimming" or "Not adding to" line;
+            None when the position may be rebalanced.
+    """
+    if min_days is None:
+        return None
+    unchecked = f"so rebalancing until {min_days} day(s) before maturity cannot be checked"
+    missing = [ticker for ticker, _side in pair.sides if ticker not in markets_by_ticker]
+    if missing:
+        return f"{missing[0]} is not in this run's market list, {unchecked}"
+    # Cross-module: whole days from today (UTC) to the latest held close date
+    left = days_to_maturity([_utc_date(markets_by_ticker[ticker].close_time)
+                             for ticker, _side in pair.sides], utc_date)
+    # Cross-module: config's one test of the days left
+    if days_left_reached(left, min_days):
+        return None
+    if left is None:
+        return f"a held market's close date is unknown, {unchecked}"
+    if left == 0:
+        closes = "closes today"
+    else:
+        closes = f"closes in {left} day(s)" if left > 0 else f"closed {-left} day(s) ago"
+    return (f"its later market {closes}, and rebalancing stops {min_days} day(s) "
+            "before maturity")
+
+
 def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
               settings: LiveSettings, min_days: int, now_date: date, utc_date: date,
               value: float, positions_value: float,
@@ -1437,6 +1491,10 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
 
     And no lone leg is trimmed, with one WARNING, when the account's
     settlements cannot all be read (any record left out may be its partner).
+    With settings.rebalance_min_days_to_maturity set, a position whose later
+    market closes fewer than that many days from today (UTC dates) is left
+    out first, with one "Not trimming" line, before anything is read for it
+    (_too_near_maturity).
     A trim is sized on the cash plus the larger of Kalshi's value of the open
     positions and what the held markets would fetch at this run's bids, which
     can only trim less.
@@ -1447,7 +1505,7 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
         held_labels (dict): Ticker -> ladder labels (scanner.resolve_held_ladders' labels_out).
         markets_by_ticker (dict): This run's whole market list by ticker, held markets included.
         settings (LiveSettings): rebalance (off: trim and read nothing), min_price_move,
-            k and both size caps.
+            rebalance_min_days_to_maturity, k and both size caps.
         now (datetime): The run's moment, timezone-aware.
         cash_cents (float): The account's cash on every shard, in cents.
         positions_value_cents (float | None): Kalshi's value of the open positions, in
@@ -1509,6 +1567,18 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
     if not pairs:
         _log_trim_summary(0, 0, 0, 0)
         return []
+    # "Rebalance until": a position whose later market closes too soon is left out
+    # first, so nothing is read for it
+    utc_date = now.astimezone(UTC).date()
+    for key in sorted(pairs, key=sorted):
+        near = _too_near_maturity(pairs[key], markets_by_ticker, utc_date,
+                                  settings.rebalance_min_days_to_maturity)
+        if near is not None:
+            logging.info("Not trimming %s: %s", _held_text(pairs[key]), near)
+            del pairs[key]
+    if not pairs:
+        _log_trim_summary(0, exact, 0, lone)
+        return []
 
     # Today on the bot's own clock, as every fill's day is read
     now_date = _day(now)
@@ -1563,7 +1633,6 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
     # and, with a minimum price move, each market's price at its last fill
     reads = _Reads(client, held_positions, markets_by_ticker, now.timestamp(), 0,
                    purpose="trimming")
-    utc_date = now.astimezone(UTC).date()
     plans: list[SalePlan] = []
     lone_trimmed = 0
     doubts: list[str] = []
@@ -1752,7 +1821,10 @@ def plan_add_ons(client: Any, add_on_pairs: dict, markets_by_ticker: dict, *,
     added; a lone leg's is its one market's. The price then comes from
     hourly candles at the last fill (_Reads.ask_then, as the trim reads it);
     the price now from this run's market list (scanner.listed_ask). Each pair
-    is judged by _add_on_one.
+    is judged by _add_on_one. Before any of that, with
+    settings.rebalance_min_days_to_maturity set, a pair whose later market
+    closes fewer than that many days from today (UTC dates; a lone leg's own
+    market) is left out, with one "Not adding to" line (_too_near_maturity).
 
     Fails closed: a pair whose wait, price then or price now cannot be read
     is left out, and when the account's fills cannot be read, or (with a
@@ -1765,8 +1837,8 @@ def plan_add_ons(client: Any, add_on_pairs: dict, markets_by_ticker: dict, *,
         add_on_pairs (dict): frozenset of tickers -> HeldPair, what scanner.held_pairs
             found the run may add to (less any pair at its cap or picked for a sale).
         markets_by_ticker (dict): This run's whole market list by ticker, held markets included.
-        settings (LiveSettings): rebalance (off: keep nothing, read nothing) and
-            min_price_move.
+        settings (LiveSettings): rebalance (off: keep nothing, read nothing),
+            min_price_move and rebalance_min_days_to_maturity.
         now (datetime): The run's moment, timezone-aware.
 
     Returns:
@@ -1785,11 +1857,27 @@ def plan_add_ons(client: Any, add_on_pairs: dict, markets_by_ticker: dict, *,
         raise ValueError(f"now must be a timezone-aware datetime, got {now!r}")
     if not add_on_pairs:
         return {}
+    # "Rebalance until": a position whose later market closes too soon is left out
+    # first, so nothing is read for it
+    near_maturity = set()
+    if settings.rebalance_min_days_to_maturity is not None:
+        utc_date = now.astimezone(UTC).date()
+        for key in sorted(add_on_pairs, key=sorted):
+            near = _too_near_maturity(add_on_pairs[key], markets_by_ticker, utc_date,
+                                      settings.rebalance_min_days_to_maturity)
+            if near is not None:
+                logging.info("Not adding to %s: %s", _sides_text(add_on_pairs[key].sides),
+                             near)
+                near_maturity.add(key)
+    pairs = {key: pair for key, pair in add_on_pairs.items() if key not in near_maturity}
+    if not pairs:
+        _log_add_on_summary(0, len(add_on_pairs))
+        return {}
     min_move = settings.min_price_move
     if min_days == 0 and min_move is None:
         # Nothing to wait for, so nothing is read
-        _log_add_on_summary(len(add_on_pairs), len(add_on_pairs))
-        return dict(add_on_pairs)
+        _log_add_on_summary(len(pairs), len(add_on_pairs))
+        return pairs
 
     # Today on the bot's own clock, as every fill's day is read
     now_date = _day(now)
@@ -1822,9 +1910,9 @@ def plan_add_ons(client: Any, add_on_pairs: dict, markets_by_ticker: dict, *,
     # no position is read
     reads = _Reads(client, {}, markets_by_ticker, now.timestamp(), 0)
     kept: dict = {}
-    for key in sorted(add_on_pairs, key=sorted):
-        if _add_on_one(add_on_pairs[key], reads, fills, min_move=min_move,
+    for key in sorted(pairs, key=sorted):
+        if _add_on_one(pairs[key], reads, fills, min_move=min_move,
                        min_days=min_days, now_date=now_date):
-            kept[key] = add_on_pairs[key]
+            kept[key] = pairs[key]
     _log_add_on_summary(len(kept), len(add_on_pairs))
     return kept

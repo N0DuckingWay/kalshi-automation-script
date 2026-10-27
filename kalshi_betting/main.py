@@ -170,6 +170,7 @@ from .config import (
     MIN_BALANCE_CENTS,
     PRICE_MOVE_STEP_CENTS,
     PROJECT_ROOT,
+    REBALANCE_MATURITY_DAYS,
     SALE_KIND_KELLY_TRIM,
     SALE_READ_BACK_RECHECK_SECONDS,
     SAME_TITLE_MAX_CLOSE_GAP_SECONDS,
@@ -1417,6 +1418,8 @@ _LIVE_FLAGS = (
     ("rebalance", "--rebalance/--no-rebalance"),
     ("min_price_move", "--min-price-move"),
     ("no_min_price_move", "--no-min-price-move"),
+    ("rebalance_min_days_to_maturity", "--rebalance-min-days-to-maturity"),
+    ("no_rebalance_min_days_to_maturity", "--no-rebalance-min-days-to-maturity"),
     ("sell_at", "--sell-at"),
     ("no_sell", "--no-sell"),
     ("sell_min_days", "--sell-min-days"),
@@ -1444,11 +1447,11 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
     --category, --any-category, --tag and --any-tag, which the exclude flags
     replaced, are refused with the replacement named, in that order.
     --no-sell also clears the minimum of days, and --no-rebalance the minimum
-    price move, since neither minimum is allowed without its switch. A saved
-    file an older version wrote (holding add_to_held_pairs, trim_to_kelly,
-    trim_min_rise, categories or tags) is refused too, with the remedy: save it
-    again through the defaults server, whose pages offer its settings in their
-    new form when they have one. Runs before logging is set up, so a refusal
+    price move and the days to maturity, since none of them is allowed without
+    its switch. A saved file an older version wrote (holding add_to_held_pairs,
+    trim_to_kelly, trim_min_rise, categories or tags) is refused too, with the
+    remedy: save it again through the defaults server, whose pages offer its
+    settings in their new form when they have one. Runs before logging is set up, so a refusal
     logs nothing and sends no request.
 
     Args:
@@ -1514,18 +1517,24 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
         overrides["size_cap"] = args.size_cap / 100
     if getattr(args, "same_title_size_cap", None) is not None:
         overrides["same_title_size_cap"] = args.same_title_size_cap / 100
-    # --no-rebalance clears the minimum price move too; --min-price-move then
-    # sets one (LiveSettings refuses a minimum with rebalancing off)
+    # --no-rebalance clears the minimum price move and the days to maturity too;
+    # --min-price-move and --rebalance-min-days-to-maturity then set one each
+    # (LiveSettings refuses either with rebalancing off)
     rebalance = getattr(args, "rebalance", None)
     if rebalance is not None:
         overrides["rebalance"] = rebalance
         if not rebalance:
             overrides["min_price_move"] = None
+            overrides["rebalance_min_days_to_maturity"] = None
     if getattr(args, "no_min_price_move", None):
         overrides["min_price_move"] = None
     if getattr(args, "min_price_move", None) is not None:
         # The flag takes whole cents; LiveSettings holds dollars
         overrides["min_price_move"] = args.min_price_move / 100
+    if getattr(args, "no_rebalance_min_days_to_maturity", None):
+        overrides["rebalance_min_days_to_maturity"] = None
+    if getattr(args, "rebalance_min_days_to_maturity", None) is not None:
+        overrides["rebalance_min_days_to_maturity"] = args.rebalance_min_days_to_maturity
     # --no-sell clears the level and the minimum of days; --sell-at and
     # --sell-min-days then set one each (LiveSettings refuses a minimum with no level)
     if getattr(args, "no_sell", None):
@@ -2495,8 +2504,8 @@ def _build_parser() -> argparse.ArgumentParser:
              "share of the portfolio "
              "value (the old ones at today's prices plus the fees paid for them). "
              "--no-rebalance neither trims nor adds to a held pair, and clears the "
-             "saved minimum price move too. Production runs only: a dev run holds "
-             "nothing (default: the saved live defaults)",
+             "saved minimum price move and days to maturity too. Production runs "
+             "only: a dev run holds nothing (default: the saved live defaults)",
     )
     # The minimum's grid step in whole cents (PRICE_MOVE_STEP_CENTS)
     move_step = PRICE_MOVE_STEP_CENTS
@@ -2512,6 +2521,24 @@ def _build_parser() -> argparse.ArgumentParser:
     price_move.add_argument(
         "--no-min-price-move", action="store_true", default=None,
         help="Set no minimum price move this run, whatever the saved live defaults say",
+    )
+    # How close to maturity a held position may still be rebalanced; LiveSettings
+    # holds it to config.REBALANCE_MATURITY_DAYS
+    until_always, *until_days = REBALANCE_MATURITY_DAYS
+    rebalance_until = live.add_mutually_exclusive_group()
+    rebalance_until.add_argument(
+        "--rebalance-min-days-to-maturity", type=int, default=None, metavar="N",
+        help="Rebalance (trim or add to) a held position only while its later market "
+             "closes at least N days from today (UTC dates): "
+             f"{until_always} = always, or {' or '.join(str(d) for d in until_days)}. "
+             "Needs rebalancing on, saved or given with --rebalance "
+             "(default: the saved live defaults; a saved file that leaves it out "
+             f"reads {until_always})",
+    )
+    rebalance_until.add_argument(
+        "--no-rebalance-min-days-to-maturity", action="store_true", default=None,
+        help="Rebalance held positions this run however soon their later market "
+             "closes, whatever the saved live defaults say",
     )
     sell_level = live.add_mutually_exclusive_group()
     sell_level.add_argument(
