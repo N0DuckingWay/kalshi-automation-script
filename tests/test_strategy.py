@@ -4298,12 +4298,16 @@ class TestTimeSeriesKellyParity:
             f"_exact_pair(position) and not {asked}", mode="eval").body)
         assert [ast.unparse(stmt) for stmt in gate.body] == ["pairs_waiting += 1", "continue"]
         assert not gate.orelse
-        # ... before the price move or trim size is worked out, so a waiting pair is
+        # ... after only "Rebalance until" (config.days_left_reached, the first
+        # gate: test_ast_rebalance_until_is_the_first_gate_of_a_trim_and_an_add_on),
+        # and before the price move or trim size is worked out, so a waiting pair is
         # counted on no other line and adds nothing to cap_free_from
+        [near] = _calls_to(plan, "days_left_reached")
         [measured] = _calls_to(plan, "_price_move")
         [tested] = _calls_to(plan, "price_move_reached")
         decided, *_counted = _calls_to(plan, "_kelly_trim")
-        assert gate.lineno < gate.end_lineno < measured.lineno < tested.lineno < decided.lineno
+        assert (near.lineno < gate.lineno < gate.end_lineno < measured.lineno < tested.lineno
+                < decided.lineno)
         # Only the walk asks the rule (for a trim in planned_trims, for an
         # add-on in its own body). It needs no config.trade_day: its
         # checkpoints are already dates
@@ -4386,13 +4390,17 @@ class TestTimeSeriesKellyParity:
                      and n.func.id == callee]
             return sorted(calls, key=lambda c: (c.lineno, c.col_offset))
 
+        [near] = own_calls("days_left_reached")
         [pair_move] = own_calls("_held_pair_move")
         [leg_move] = own_calls("_lone_leg_move")
         [rested] = own_calls("rebalance_rested")
         [moved] = own_calls("price_move_reached")
         [share] = own_calls("held_pair_fraction")
         [sized] = own_calls("_size_trade")
-        assert (max(pair_move.lineno, leg_move.lineno) < rested.lineno < moved.lineno
+        # "Rebalance until" first, before the day and the move are read
+        # (test_ast_rebalance_until_is_the_first_gate_of_a_trim_and_an_add_on)
+        assert (near.lineno < min(pair_move.lineno, leg_move.lineno)
+                <= max(pair_move.lineno, leg_move.lineno) < rested.lineno < moved.lineno
                 < share.lineno < sized.lineno)
         assert ast.unparse(rested) == "rebalance_rested(last_day, d, wait_days)"
         assert ast.unparse(moved) == "price_move_reached(add_move, min_move)"
@@ -4400,7 +4408,8 @@ class TestTimeSeriesKellyParity:
             "[t for t, _paid in held['trades']]", "d", "last_trim"]
         assert [ast.unparse(arg) for arg in leg_move.args] == ["lone_legs", "d", "last_trim"]
         # Each test holds the add-on back with a count and nothing else
-        for call, count in ((rested, "adds_waiting"), (moved, "adds_held_back")):
+        for call, count in ((near, "adds_near_maturity"), (rested, "adds_waiting"),
+                            (moved, "adds_held_back")):
             [gate] = [n for n in own if isinstance(n, ast.If)
                       and any(sub is call for sub in ast.walk(n.test))]
             assert [ast.unparse(stmt) for stmt in gate.body] == [f"{count} += 1", "continue"]
@@ -4424,6 +4433,128 @@ class TestTimeSeriesKellyParity:
         [made] = [n for n in own if isinstance(n, ast.If)
                   and ast.unparse(n.test) == "trade.add_on"]
         assert any(sub is recorded for sub in ast.walk(made))
+
+    def test_ast_rebalance_until_is_the_first_gate_of_a_trim_and_an_add_on(self):
+        # "Rebalance until": the walk holds a trim and an add-on back while what
+        # it would rebalance is too near maturity, with config.days_left_reached
+        # (the test live rebalancing asks in seller._too_near_maturity), on the
+        # days _rebalance_days_left works out once. That gate is the first,
+        # before the wait and the price move, holds back with a count and
+        # nothing else, and every trim and add-on made records the very days it
+        # tested. A take-profit sale's minimum of days asks the same test
+        assert backtester.days_left_reached is config.days_left_reached
+        assert backtester.days_to_maturity is config.days_to_maturity
+        assert backtester.REBALANCE_MATURITY_DAYS is config.REBALANCE_MATURITY_DAYS
+        source = inspect.getsource(backtester)
+        tree = ast.parse(source)
+        askers = {func.name for func in ast.walk(tree) if isinstance(func, ast.FunctionDef)
+                  and _calls_to(func, "days_left_reached")}
+        assert askers == {"_simulate_at_discount", "planned_trims", "_far_enough"}
+        # _far_enough is that one call, on _days_left (its docstring, then the return)
+        far = _def_named(source, "_far_enough")
+        assert isinstance(far.body[0], ast.Expr) and len(far.body) == 2
+        assert ast.unparse(far.body[1]) == (
+            "return days_left_reached(_days_left(position, day), min_days)")
+        # The days: a pair's through _days_left, a lone leg's own market's through
+        # config.days_to_maturity, the count a take-profit sale reads
+        assert _function_calls(backtester, "_rebalance_days_left", "_days_left")
+        assert _function_calls(backtester, "_rebalance_days_left", "days_to_maturity")
+
+        # A trim: the loop over positions first works the days out (a lone
+        # leg's are its own market B's) ...
+        plan = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                    and node.name == "planned_trims")
+        [loop] = [node for node in ast.walk(plan) if isinstance(node, ast.For)
+                  and ast.unparse(node.iter) == "_positions(open_now)"]
+        worked, gate, waited = loop.body[:3]
+        assert ast.unparse(worked) == (
+            "left = _rebalance_days_left(position, d, position[0].ticker_b "
+            "if _lone_leg(position[0], d) else None)")
+        assert [node for node in ast.walk(plan) if isinstance(node, ast.Assign)
+                and ast.unparse(node.targets[0]) == "left"] == [worked]
+        # ... then tests them, for an exact pair, as the wait does, and counts
+        # and skips one too near maturity ...
+        [near] = _calls_to(plan, "days_left_reached")
+        assert isinstance(gate, ast.If) and any(sub is near for sub in ast.walk(gate.test))
+        assert ast.unparse(gate.test) == ast.unparse(ast.parse(
+            "_exact_pair(position) and not days_left_reached(left, until_days)",
+            mode="eval").body)
+        assert [ast.unparse(stmt) for stmt in gate.body] == ["trims_near_maturity += 1",
+                                                             "continue"]
+        assert not gate.orelse
+        # ... before the wait
+        [rested] = _calls_to(plan, "rebalance_rested")
+        assert isinstance(waited, ast.If) and any(sub is rested for sub in ast.walk(waited.test))
+        # Each sale planned records the days tested, beside its move
+        [kept] = [node for node in ast.walk(plan) if isinstance(node, ast.If)
+                  and ast.unparse(node.test) == "sale is not None"]
+        [recorded] = [node for node in ast.walk(plan) if isinstance(node, ast.Call)
+                      and ast.unparse(node.func) == "rebalance_days_left.append"]
+        [moved] = [node for node in ast.walk(plan) if isinstance(node, ast.Call)
+                   and ast.unparse(node.func) == "moves.append"]
+        assert ast.unparse(recorded) == "rebalance_days_left.append(left)"
+        assert all(any(sub is call for sub in ast.walk(kept)) for call in (recorded, moved))
+
+        # An add-on, in the walk's own body: the add-on gate first works the
+        # days out (a pair's, or a lone leg's own market's) ...
+        walk = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "_simulate_at_discount")
+        own = list(_own_nodes(walk))
+        [block] = [node for node in own if isinstance(node, ast.If)
+                   and ast.unparse(node.test) == "held is not None or lone_legs is not None"
+                   and _calls_to(node, "rebalance_rested")]
+        worked, gate = block.body[:2]
+        assert ast.unparse(worked) == (
+            "add_left = _rebalance_days_left([t for t, _paid in held['trades']], d) "
+            "if lone_legs is None else _rebalance_days_left("
+            "[leg['trade'] for leg in lone_legs], d, lone_legs[0]['ticker'])")
+        # ... then tests them, counting and skipping one too near maturity ...
+        assert isinstance(gate, ast.If) and ast.unparse(gate.test) == (
+            "not days_left_reached(add_left, until_days)")
+        assert [ast.unparse(stmt) for stmt in gate.body] == ["adds_near_maturity += 1",
+                                                             "continue"]
+        assert not gate.orelse
+        # ... before the day and move of the wait are read
+        later = [call for name in ("_held_pair_move", "_lone_leg_move", "rebalance_rested")
+                 for call in _calls_to(block, name)]
+        assert len(later) == 3 and all(gate.end_lineno < call.lineno for call in later)
+        # The add-on made records the days tested, beside its move
+        [made] = [node for node in own if isinstance(node, ast.If)
+                  and ast.unparse(node.test) == "trade.add_on"]
+        [recorded] = [node for node in own if isinstance(node, ast.Call)
+                      and ast.unparse(node.func) == "rebalance_days_left.append"]
+        assert ast.unparse(recorded) == "rebalance_days_left.append(add_left)"
+        assert any(sub is recorded for sub in ast.walk(made))
+        # ... and add_left is set nowhere else but where it starts, unread, as None
+        writes = sorted((node for node in own if isinstance(node, ast.Assign)
+                         and any(ast.unparse(target) == "add_left" for target in node.targets)),
+                        key=lambda node: node.lineno)
+        assert [ast.unparse(node.value) for node in writes] == [
+            "None", ast.unparse(worked.value)]
+
+        # The setting is checked once, where the other options are, before any
+        # entry is scored; a CapSweep checks it as it is built
+        [until] = [node for node in walk.body if isinstance(node, ast.Assign)
+                   and ast.unparse(node.targets[0]) == "until_days"]
+        assert ast.unparse(until.value) == (
+            "_resolve_rebalance_until(rebalance_min_days_to_maturity, "
+            "add_to_held or trim_to_kelly)")
+        scored = next(node.lineno for node in walk.body if isinstance(node, ast.Assign)
+                      and ast.unparse(node.targets[0]) == "candidates")
+        assert until.lineno < scored
+        cap_sweep = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                         and node.name == "CapSweep")
+        built = next(node for node in cap_sweep.body if isinstance(node, ast.FunctionDef)
+                     and node.name == "__post_init__")
+        assert _calls_to(built, "_resolve_rebalance_until")
+        # ... against config.REBALANCE_MATURITY_DAYS, never comparing with a day
+        # count of its own
+        resolve = _def_named(source, "_resolve_rebalance_until")
+        assert "REBALANCE_MATURITY_DAYS" in ast.unparse(resolve)
+        assert not [ast.unparse(node) for node in ast.walk(resolve)
+                    if isinstance(node, ast.Compare)
+                    and any(isinstance(side, ast.Constant) and type(side.value) is int
+                            for side in (node.left, *node.comparators))]
 
     def test_ast_a_run_stands_for_a_larger_minimum_through_the_walk_s_own_test(self):
         # RebalanceSweep.move_grid lets a run it already has stand for a larger

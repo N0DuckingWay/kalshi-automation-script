@@ -1383,8 +1383,9 @@ python3 -m kalshi_betting.main --mode prod --dry-run --rebalance --min-price-mov
 # day(s), and rebalancing stops 7 day(s) before maturity`, or `Not adding to ...`). 1 is the other
 # choice; 0 or --no-rebalance-min-days-to-maturity rebalances however near maturity (the default
 # unless saved otherwise). The "Live settings:" line reads `rebalance until 7 days before maturity`.
-# A backtest does not apply this setting yet, and the dashboard's Save button leaves it as saved (a
-# link naming rebalance=off clears it), so a backtest scenario shows none of its effect
+# The backtest's walk applies the same rule (_simulate_at_discount's rebalance_min_days_to_maturity),
+# but the dashboard does not offer it yet: its Save button leaves it as saved (a link naming
+# rebalance=off clears it), so a dashboard scenario shows none of its effect
 python3 -m kalshi_betting.main --mode prod --dry-run --rebalance --rebalance-min-days-to-maturity 7
 
 # Neither add to nor trim a held pair this run, whatever the saved defaults say (also clears the
@@ -1427,8 +1428,9 @@ steps from 5c to $1, `null` for none; only with rebalancing on), how close to
 maturity a held position may still be rebalanced (`rebalance_min_days_to_maturity`,
 "Rebalance until": `null` for always, 1 or 7 days; only with rebalancing on; a trim
 or an add-on is held back, first, for a position whose later market closes in fewer
-than that many days, and the backtest and the dashboard's Save button do not use it
-yet: the button leaves it as saved, and Rebalance no clears it), the share of
+than that many days; the backtest's walk can apply the same rule, but the dashboard
+and its Save button do not use it yet: the button leaves it as saved, and Rebalance
+no clears it), the share of
 potential profit at which it sells a held position (`sell_at`, `null` for
 never; see [Selling a held position](#how-it-profits) above) and the fewest
 days before maturity it may sell at (`sell_min_days`, `null` for no minimum). **A

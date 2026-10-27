@@ -976,10 +976,11 @@ BACKTEST_SWEEP_FILENAME = "backtest_sweep.pkl.gz"
 # A rebuild refuses a file with any other tag; change it whenever the line's
 # keys, the pickled inputs' keys or the fields of the classes pickled in them
 # (BacktestSweep and the lazy families it holds) change, so an older file is
-# refused rather than misread. v4: BacktestSweep.live_tags became
-# live_exclude_tags (the saved live defaults list the tags NOT to trade); v3
-# files, from before, are refused.
-BACKTEST_SWEEP_FORMAT = "backtest-sweep-v4"
+# refused rather than misread. v5: SweepPoint and CapSweep gained
+# rebalance_min_days_to_maturity ("Rebalance until") and SweepPoint the days
+# left at each add-on and trim made (rebalance_days_left); v4 files, from
+# before, are refused.
+BACKTEST_SWEEP_FORMAT = "backtest-sweep-v5"
 
 # The most bytes a rebuild reads for the saved sweep file's first line (the
 # JSON one): the real line is a few hundred bytes, so a file that runs past
@@ -4606,10 +4607,11 @@ def max_kelly_fraction(pair_type: str, settings: LiveSettings) -> float:
 # fees, less its cost) has been at least a set share of its potential profit
 # (what it pays if it wins, less its cost) at every daily check. Live selling
 # (seller.plan_sales) decides with the first three functions below, and the backtest
-# with take_profit_reached and days_to_maturity (through backtester._sells_at and
-# _days_left), so the two never apply different arithmetic. The last,
-# days_left_reached, is "Rebalance until": how near maturity a held position may
-# still be trimmed or added to, read from days_to_maturity's answer.
+# with take_profit_reached, days_to_maturity and days_left_reached (through
+# backtester._sells_at, _days_left and _far_enough), so the two never apply
+# different arithmetic. The last, days_left_reached, is also "Rebalance until":
+# how near maturity a held position may still be trimmed or added to, read from
+# days_to_maturity's answer, live and in the backtest's walk alike.
 
 def take_profit_reached(sell_at: float, realized: float, potential: float) -> bool:
     """
@@ -4693,9 +4695,11 @@ def days_left_reached(left: int | None, min_days: int | None) -> bool:
     later market closes at least `min_days` days from today. Always True with
     no minimum; never with an unknown number of days, so a position whose
     close date cannot be read is not rebalanced under a minimum. Live
-    rebalancing asks it (seller._too_near_maturity); the take-profit sale's
-    minimum of days applies the same test in its own code (seller._plan_one,
-    backtester._far_enough).
+    rebalancing asks it (seller._too_near_maturity), and so does the
+    backtest's walk (backtester._simulate_at_discount, on the days
+    _rebalance_days_left gives) and its take-profit sale's minimum of days
+    (backtester._far_enough); a live sale's minimum applies the same test in
+    its own code (seller._plan_one).
 
     Args:
         left (int | None): Whole days from today to the position's latest close

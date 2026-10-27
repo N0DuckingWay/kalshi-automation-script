@@ -23944,6 +23944,480 @@ class TestAddOnWaitsForAMove:
             backtester._simulate_at_discount([{}], self._START, 10_000.0)
 
 
+_UNTIL_TRIM_LINE = ("Held positions not checked for a trim because their later market "
+                    "matures within")
+_UNTIL_ADD_LINE = "Adds skipped because the held position's later market matures within"
+
+
+class TestRebalanceUntil:
+    """_simulate_at_discount(rebalance_min_days_to_maturity=N), "Rebalance
+    until": with N 1 or 7, the walk neither trims nor adds to a held position
+    whose later market closes fewer than N whole days after the checkpoint's
+    date (UTC dates, as a take-profit sale counts them), as a live run holds
+    one back (seller._too_near_maturity). A pair is judged on the later of
+    its two markets' close dates; a lone leg on its own market's, never its
+    paid-out partner's nor, for an add-on, the new market's. An unknown close
+    date holds back under any minimum. 0 (or None) never holds back. The
+    days behind every trim and add-on made are recorded beside their moves.
+
+    The fixtures are the trim's and the add-on's own (TestTrimToKelly's pair,
+    trimmed on Mondays 2 and 3; TestLoneLegTrim's lone leg, trimmed on Monday
+    3; TestAddOnWaitsForAMove's pair, added to on Mondays 2 and 3, and its
+    lone leg, added to on Monday 2), with each market's maturity moved by a
+    scheduled close (_maturity_close), which changes no price and no payout."""
+
+    _START = date(2026, 1, 1)
+
+    @staticmethod
+    def _matures(records: list[dict], **closes: str) -> list[dict]:
+        """The records with each named market's maturity, its scheduled close, at
+        midnight UTC of the date given."""
+        for rec in records:
+            for monday in backtester._entry_mondays(rec["entry"]):
+                for market in (monday["mA"], monday["mB"]):
+                    if market["ticker"] in closes:
+                        _with_scheduled(market, f"{closes[market['ticker']]}T00:00:00+00:00")
+        return records
+
+    def _pair(self, **closes) -> list[dict]:
+        """TestTrimToKelly's pair (YES SA / NO SB), bought on Monday 1."""
+        return self._matures(TestTrimToKelly()._records(), **closes)
+
+    def _lone(self, **closes) -> list[dict]:
+        """TestLoneLegTrim's pair (YES LA / NO LB): LA pays out $0 on 01-14."""
+        return self._matures(TestLoneLegTrim()._records(), **closes)
+
+    def _add_pair(self, **closes) -> list[dict]:
+        """TestAddOnWaitsForAMove's pair (YES PA / NO PB), wanting more on Mondays 2 and 3."""
+        suite = TestAddOnWaitsForAMove
+        return self._matures(suite._pair(suite._MONDAYS), **closes)
+
+    def _add_lone(self, **closes) -> list[dict]:
+        """TestAddOnWaitsForAMove's lone leg: P (PA paying out 01-10, PB) and Q (QA / PB)."""
+        return self._matures(TestAddOnWaitsForAMove()._lone(), **closes)
+
+    @staticmethod
+    def _trim(records, until=None, cap=0.20, **kw):
+        """k 0.75, a 20% cap unless `cap` names another, trimming unless `kw`
+        says otherwise (TestTrimToKelly's and TestLoneLegTrim's runs)."""
+        kw.setdefault("trim_to_kelly", True)
+        return backtester._simulate_at_discount(
+            records, date(2026, 1, 1), 10_000.0, k=0.75, size_cap=cap,
+            end_date=date(2026, 4, 1), rebalance_min_days_to_maturity=until, **kw)
+
+    @staticmethod
+    def _add(records, until=None, **kw):
+        """k 0.85, a 20% cap, adding to held pairs (TestAddOnWaitsForAMove's runs)."""
+        return TestAddOnWaitsForAMove()._sim(records, rebalance_min_days_to_maturity=until, **kw)
+
+    @staticmethod
+    def _sold_on(point) -> list[date]:
+        return [t.exit_date for t in point.trades if t.sold]
+
+    @staticmethod
+    def _added(point) -> list[date]:
+        return [t.entry_date for t in point.trades if t.add_on]
+
+    @staticmethod
+    def _lines(caplog, prefix: str) -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.getMessage().startswith(prefix)]
+
+    @staticmethod
+    def _same(point, base) -> None:
+        """Every field of two points equal: trades, curve and the rest."""
+        assert [astuple(t) for t in point.trades] == [astuple(t) for t in base.trades]
+        pd.testing.assert_frame_equal(point.equity_df, base.equity_df, check_exact=True)
+        for f in fields(backtester.SweepPoint):
+            if f.name not in ("trades", "equity_df"):
+                assert getattr(point, f.name) == getattr(base, f.name), f.name
+
+    # ── The days ──
+
+    def test_the_days_are_the_later_market_s_close_or_a_lone_leg_s_own(self):
+        (held,) = self._trim(self._pair(), trim_to_kelly=False).trades
+        day = _LADDER_M2
+        pair = [dc_replace(held, close_date_a=date(2026, 1, 15), close_date_b=date(2026, 1, 19))]
+        # A pair: the later of its two markets, whichever it is
+        assert backtester._rebalance_days_left(pair, day) == 7
+        flipped = [dc_replace(held, close_date_a=date(2026, 1, 19),
+                              close_date_b=date(2026, 1, 15))]
+        assert backtester._rebalance_days_left(flipped, day) == 7
+        # A lone leg: its own market's alone, held as B in one trade and A in
+        # another, however late the partner's close
+        lone = [dc_replace(held, close_date_a=date(2026, 3, 31), close_date_b=date(2026, 1, 18)),
+                dc_replace(held, ticker_a="SB", ticker_b="QB", close_date_a=date(2026, 1, 18),
+                           close_date_b=date(2026, 3, 31))]
+        assert backtester._rebalance_days_left(lone, day, "SB") == 6
+        assert backtester._rebalance_days_left(lone, day) == 78
+        # 0 on the close date, below 0 after it
+        assert backtester._rebalance_days_left(pair, date(2026, 1, 19)) == 0
+        assert backtester._rebalance_days_left(pair, date(2026, 1, 26)) == -7
+        # An unknown close date: unknown days, for a pair or for the leg held,
+        # but a lone leg never reads its partner's
+        assert backtester._rebalance_days_left([dc_replace(pair[0], close_date_b=None)],
+                                               day) is None
+        assert backtester._rebalance_days_left([dc_replace(lone[0], close_date_b=None)],
+                                               day, "SB") is None
+        assert backtester._rebalance_days_left([dc_replace(lone[0], close_date_a=None)],
+                                               day, "SB") == 6
+
+    @pytest.mark.parametrize("left", [None, -8, -1, 0, 1, 6, 7, 8, 30])
+    @pytest.mark.parametrize("min_days", [None, 1, 3, 7, 14])
+    def test_a_sale_s_days_rule_is_the_one_it_was(self, left, min_days):
+        # _far_enough now asks config.days_left_reached: the same answer as
+        # before for no minimum, unknown days, a market closing today and one
+        # already closed
+        (held,) = self._trim(self._pair(), trim_to_kelly=False).trades
+        day = _LADDER_M2
+        close = None if left is None else day + timedelta(days=left)
+        position = [dc_replace(held, close_date_a=day - timedelta(days=30), close_date_b=close)]
+        assert backtester._days_left(position, day) == left
+        before = True if min_days is None else (left is not None and left >= min_days)
+        assert backtester._far_enough(position, day, min_days) is before
+
+    # ── A trim ──
+
+    @pytest.mark.parametrize("close_sb, until, trimmed_on, days_left", [
+        # SB, the later market, closes on 01-19: 7 days left on Monday 2 (01-12)
+        # still trims under 7, and 0 on Monday 3 (01-19) does not
+        ("2026-01-19", None, [_LADDER_M2, _LADDER_M3], (7, 0)),
+        ("2026-01-19", 0, [_LADDER_M2, _LADDER_M3], (7, 0)),
+        ("2026-01-19", 7, [_LADDER_M2], (7,)),
+        # 6 days left on Monday 2: held back under 7, trimmed under 1
+        ("2026-01-18", 7, [], ()),
+        ("2026-01-18", 1, [_LADDER_M2], (6,)),
+        # 1 day left on Monday 3 still trims under 1; 0 does not
+        ("2026-01-20", 1, [_LADDER_M2, _LADDER_M3], (8, 1)),
+        ("2026-01-19", 1, [_LADDER_M2], (7,)),
+    ])
+    def test_a_pair_is_trimmed_only_while_its_later_market_is_far_enough(
+            self, close_sb, until, trimmed_on, days_left):
+        # SA matures before SB, so SB is the later market
+        point = self._trim(self._pair(SA="2026-01-15", SB=close_sb), until)
+        assert self._sold_on(point) == trimmed_on
+        assert point.rebalance_days_left == days_left
+        assert type(point.rebalance_days_left) is tuple
+        assert point.rebalance_min_days_to_maturity == (None if until == 0 else until)
+        # One move per trim, beside its days
+        assert len(point.moves) == len(days_left)
+
+    def test_the_later_market_may_be_either_one(self):
+        # SA matures last: its close date is the pair's
+        point = self._trim(self._pair(SA="2026-01-19", SB="2026-01-15"), 7)
+        assert self._sold_on(point) == [_LADDER_M2]
+        assert point.rebalance_days_left == (7,)
+        assert self._sold_on(self._trim(self._pair(SA="2026-01-18", SB="2026-01-15"), 7)) == []
+
+    @pytest.mark.parametrize("close_lb, until, trimmed, days_left", [
+        # The lone leg (NO on LB) is trimmed on Monday 3 (01-19) on LB's own
+        # close date; LA, paid out, matures on 03-31 and is never read
+        ("2026-01-26", 7, True, (7,)),
+        ("2026-01-25", 7, False, ()),
+        ("2026-01-25", 1, True, (6,)),
+        ("2026-01-20", 1, True, (1,)),
+        ("2026-01-19", 1, False, ()),
+        ("2026-01-19", None, True, (0,)),
+    ])
+    def test_a_lone_leg_is_trimmed_only_while_its_own_market_is_far_enough(
+            self, close_lb, until, trimmed, days_left):
+        point = self._trim(self._lone(LA="2026-03-31", LB=close_lb), until)
+        assert self._sold_on(point) == ([_LADDER_M3] if trimmed else [])
+        assert point.rebalance_days_left == days_left
+        if trimmed:
+            # The part sold is NO on LB alone, as without the rule
+            (part,) = [t for t in point.trades if t.sold]
+            assert (part.sale_price_a, part.exit_date) == (None, _LADDER_M3)
+
+    # ── An add-on ──
+
+    @pytest.mark.parametrize("close_pb, until, added_on, days_left", [
+        ("2026-01-19", None, [_LADDER_M2, _LADDER_M3], (7, 0)),
+        ("2026-01-19", 0, [_LADDER_M2, _LADDER_M3], (7, 0)),
+        ("2026-01-19", 7, [_LADDER_M2], (7,)),
+        ("2026-01-18", 7, [], ()),
+        ("2026-01-18", 1, [_LADDER_M2], (6,)),
+        ("2026-01-20", 1, [_LADDER_M2, _LADDER_M3], (8, 1)),
+        ("2026-01-19", 1, [_LADDER_M2], (7,)),
+    ])
+    def test_a_pair_is_added_to_only_while_its_later_market_is_far_enough(
+            self, close_pb, until, added_on, days_left):
+        point = self._add(self._add_pair(PA="2026-01-15", PB=close_pb), until)
+        assert self._added(point) == added_on
+        assert point.rebalance_days_left == days_left
+        assert len(point.moves) == len(days_left)
+        assert point.rebalance_min_days_to_maturity == (None if until == 0 else until)
+
+    @pytest.mark.parametrize("close_pb, until, added, days_left", [
+        # Q adds to PB on Monday 2 (01-12), judged on PB's own close date: PA,
+        # paid out, and QA, the new market, both mature on 03-31
+        ("2026-01-19", 7, True, (7,)),
+        ("2026-01-18", 7, False, ()),
+        ("2026-01-13", 1, True, (1,)),
+        ("2026-01-12", 1, False, ()),
+        ("2026-01-12", None, True, (0,)),
+    ])
+    def test_a_lone_leg_is_added_to_only_while_its_own_market_is_far_enough(
+            self, close_pb, until, added, days_left):
+        point = self._add(self._add_lone(PA="2026-03-31", QA="2026-03-31", PB=close_pb), until)
+        assert self._added(point) == ([_LADDER_M2] if added else [])
+        assert point.rebalance_days_left == days_left
+
+    # ── An unknown close date ──
+
+    @pytest.mark.parametrize("until, rebalanced", [(None, True), (0, True), (1, False),
+                                                   (7, False)])
+    def test_an_unknown_close_date_holds_back_under_a_minimum(self, monkeypatch, until,
+                                                              rebalanced):
+        # The walk always has both close dates (a candidate without one is
+        # skipped), so the days are made unknown where they are worked out
+        seen = []
+
+        def unknown(trades, day, lone_ticker=None):
+            seen.append(day)
+            return None
+
+        monkeypatch.setattr(backtester, "_rebalance_days_left", unknown)
+        trims = self._trim(self._pair(), until)
+        adds = self._add(self._add_pair(), until)
+        assert seen
+        assert self._sold_on(trims) == ([_LADDER_M2, _LADDER_M3] if rebalanced else [])
+        assert self._added(adds) == ([_LADDER_M2, _LADDER_M3] if rebalanced else [])
+        # Recorded as tested: None
+        assert trims.rebalance_days_left == ((None, None) if rebalanced else ())
+        assert adds.rebalance_days_left == ((None, None) if rebalanced else ())
+
+    # ── 0 is no minimum, and what a run records ──
+
+    def test_a_run_at_0_is_the_run_at_none(self, caplog):
+        default = inspect.signature(backtester._simulate_at_discount).parameters[
+            "rebalance_min_days_to_maturity"]
+        assert default.default is None and default.kind is default.KEYWORD_ONLY
+        for build, run in ((self._pair, self._trim), (self._lone, self._trim),
+                           (self._add_pair, self._add), (self._add_lone, self._add)):
+            caplog.clear()
+            with caplog.at_level(logging.DEBUG):
+                base = run(build(), None)
+                lines = [r.getMessage() for r in caplog.records]
+                caplog.clear()
+                zero = run(build(), 0)
+            self._same(zero, base)
+            assert zero.rebalance_min_days_to_maturity is None
+            assert zero.rebalance_days_left == base.rebalance_days_left
+            assert zero.moves == base.moves and zero.cap_free_from == base.cap_free_from
+            assert [r.getMessage() for r in caplog.records] == lines
+            assert not any(line.startswith((_UNTIL_TRIM_LINE, _UNTIL_ADD_LINE))
+                           for line in lines)
+            assert not any("before maturity" in line for line in lines)
+
+    def test_far_closes_change_nothing_at_7(self):
+        # Every trim and add-on of the fixtures has weeks left (SB and PB close
+        # on 03-20): the run at 7 is the run with no minimum, but for its setting
+        for build, run in ((self._pair, self._trim), (self._add_pair, self._add)):
+            base, seven = run(build(), None), run(build(), 7)
+            assert [astuple(t) for t in seven.trades] == [astuple(t) for t in base.trades]
+            pd.testing.assert_frame_equal(seven.equity_df, base.equity_df, check_exact=True)
+            assert seven.rebalance_days_left == base.rebalance_days_left
+            assert all(left >= 7 for left in base.rebalance_days_left)
+            assert (base.rebalance_min_days_to_maturity, seven.rebalance_min_days_to_maturity) == (
+                None, 7)
+
+    def test_a_run_that_neither_adds_nor_trims_records_no_days(self):
+        plain = self._trim(self._pair(), trim_to_kelly=False)
+        assert plain.rebalance_days_left is None and plain.rebalance_min_days_to_maturity is None
+        bare = backtester.SweepPoint(0.75, [], pd.DataFrame())
+        assert bare.rebalance_days_left is None and bare.rebalance_min_days_to_maturity is None
+        # A run that could trim and trimmed nothing
+        assert self._trim(self._pair(), cap=1.0).rebalance_days_left == ()
+        # Like moves: how the trades came about, so not shown and not compared
+        days = next(f for f in fields(backtester.SweepPoint) if f.name == "rebalance_days_left")
+        assert days.repr is False and days.compare is False
+        setting = next(f for f in fields(backtester.SweepPoint)
+                       if f.name == "rebalance_min_days_to_maturity")
+        assert setting.compare is True
+
+    # ── The log lines and the label ──
+
+    def test_the_trim_line_counts_each_position_each_week_it_was_held_back(self, caplog):
+        with caplog.at_level(logging.INFO):
+            point = self._trim(self._pair(SA="2026-01-15", SB="2026-01-19"), 7)
+        label = f"{_label(0.20)}, trimming to Kelly, until 7 days before maturity"
+        # Held back from Monday 3 (0 days left) to the last checkpoint before
+        # SB pays out (03-16): nine checkpoints, the pair and then its lone leg
+        assert self._lines(caplog, _UNTIL_TRIM_LINE) == [
+            f"{_UNTIL_TRIM_LINE} 7 day(s) ({label}): 9"]
+        assert f"Backtest complete at {label}:" in caplog.text
+        assert not self._lines(caplog, _UNTIL_ADD_LINE)
+        assert self._sold_on(point) == [_LADDER_M2]
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            self._trim(self._pair(SA="2026-01-15", SB="2026-01-19"), 1)
+        label = f"{_label(0.20)}, trimming to Kelly, until 1 day before maturity"
+        assert self._lines(caplog, _UNTIL_TRIM_LINE) == [
+            f"{_UNTIL_TRIM_LINE} 1 day(s) ({label}): 9"]
+        # With SB's own close (03-20), the last checkpoint before it pays out
+        # (03-16, 4 days left) is held back under 7, though nothing would be
+        # trimmed there; under 1 nothing is held back, and the line is silent
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            self._trim(self._pair(), 7)
+        assert self._lines(caplog, _UNTIL_TRIM_LINE) == [
+            f"{_UNTIL_TRIM_LINE} 7 day(s) ({_label(0.20)}, trimming to Kelly, until 7 days "
+            "before maturity): 1"]
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            self._trim(self._pair(), 1)
+        assert not self._lines(caplog, _UNTIL_TRIM_LINE)
+        # DEBUG on a quiet run
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            self._trim(self._pair(SA="2026-01-15", SB="2026-01-19"), 7, quiet=True)
+        assert not self._lines(caplog, _UNTIL_TRIM_LINE)
+
+    def test_the_add_on_line_counts_each_add_held_back(self, caplog):
+        with caplog.at_level(logging.INFO):
+            self._add(self._add_pair(PA="2026-01-15", PB="2026-01-18"), 7)
+        label = "k=0.850, band 0-1, all, cap 20%, adding to held pairs, until 7 days before maturity"
+        assert self._lines(caplog, _UNTIL_ADD_LINE) == [
+            f"{_UNTIL_ADD_LINE} 7 day(s) ({label}): 2"]
+        assert f"Backtest complete at {label}:" in caplog.text
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            self._add(self._add_pair(PA="2026-01-15", PB="2026-01-19"), 7)
+        assert self._lines(caplog, _UNTIL_ADD_LINE) == [
+            f"{_UNTIL_ADD_LINE} 7 day(s) ({label}): 1"]
+        # Silent at zero
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            self._add(self._add_pair(), 7)
+        assert not self._lines(caplog, _UNTIL_ADD_LINE)
+
+    def test_the_label_follows_the_minimum_price_move(self, caplog):
+        with caplog.at_level(logging.INFO):
+            self._add(self._add_pair(), 7, trim_to_kelly=True, min_move=0.10)
+        assert ("Backtest complete at k=0.850, band 0-1, all, cap 20%, rebalancing only "
+                "after a 10c price move, until 7 days before maturity:") in caplog.text
+
+    # ── The refusals ──
+
+    def test_a_minimum_needs_a_run_that_adds_or_trims(self):
+        records = self._pair()
+        for until in (1, 7):
+            with pytest.raises(ValueError, match="rebalance_min_days_to_maturity needs "
+                                                 "add_to_held or trim_to_kelly"):
+                backtester._simulate_at_discount(records, self._START, 10_000.0,
+                                                 rebalance_min_days_to_maturity=until)
+        # 0 is no minimum, which any run takes
+        plain = backtester._simulate_at_discount(records, self._START, 10_000.0,
+                                                 end_date=date(2026, 4, 1),
+                                                 rebalance_min_days_to_maturity=0)
+        assert plain.rebalance_min_days_to_maturity is None
+        # Checked before any entry is scored ([{}] fails the moment it is)
+        with pytest.raises(ValueError, match="needs add_to_held or trim_to_kelly"):
+            backtester._simulate_at_discount([{}], self._START, 10_000.0,
+                                             rebalance_min_days_to_maturity=7)
+
+    @pytest.mark.parametrize("bad", [True, False, 2, -1, 14, 7.0, "7", np.int64(7), (7,)])
+    def test_only_a_choice_of_the_live_setting_is_taken(self, bad):
+        with pytest.raises(ValueError, match="rebalance_min_days_to_maturity must be 0, 1 or 7"):
+            backtester._simulate_at_discount([{}], self._START, 10_000.0, trim_to_kelly=True,
+                                             rebalance_min_days_to_maturity=bad)
+
+    def test_the_choices_are_config_s(self, monkeypatch):
+        # The backtester reads its own binding of config.REBALANCE_MATURITY_DAYS
+        assert backtester.REBALANCE_MATURITY_DAYS is config.REBALANCE_MATURITY_DAYS
+        monkeypatch.setattr(backtester, "REBALANCE_MATURITY_DAYS", (0, 3))
+        assert backtester._resolve_rebalance_until(3, True) == 3
+        assert backtester._resolve_rebalance_until(0, False) is None
+        with pytest.raises(ValueError, match="must be 0 or 3, got 7"):
+            backtester._resolve_rebalance_until(7, True)
+
+    # ── Every cap of a CapSweep ──
+
+    @pytest.mark.parametrize("add", [False, True])
+    def test_every_cap_of_a_cap_sweep_equals_a_fresh_simulation(self, add):
+        # TestTrimCapSweep's entries, the trimmed pair's later market SB
+        # maturing on 01-19: Monday 2 (7 days left) rebalances under 7, Monday
+        # 3 (0) does not. The rule reads only dates, so every cap is still the
+        # run a fresh simulation makes
+        suite = TestTrimCapSweep()
+        entries = self._matures(suite._entries(), SA="2026-01-16", SB="2026-01-19")
+        cs = suite._sweep(entries, (0.5, 0.75), add=add, rebalance_min_days_to_maturity=7)
+        assert cs.rebalance_min_days_to_maturity == 7
+        rebalanced = held_back = 0
+        for k in cs.ks:
+            cell = cs.cell(suite._BAND, k)
+            for cap in cs.caps:
+                point = cell[cap]["all"]
+                fresh = backtester._simulate_at_discount(
+                    entries, suite._START, 10_000.0, k=k, spread_band=suite._BAND,
+                    size_cap=cap, quiet=True, end_date=suite._END, add_to_held=add,
+                    trim_to_kelly=True, rebalance_min_days_to_maturity=7)
+                assert (point.size_cap, point.rebalance_min_days_to_maturity,
+                        point.add_to_held) == (cap, 7, add)
+                assert [astuple(t) for t in point.trades] == [
+                    astuple(t) for t in fresh.trades], (k, cap)
+                pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df)
+                # A shared copy carries the days of the run it shares
+                assert point.rebalance_days_left == fresh.rebalance_days_left
+                assert point.moves == fresh.moves
+                assert all(left >= 7 for left in point.rebalance_days_left)
+                rebalanced += bool(point.rebalance_days_left)
+                held_back += [astuple(t) for t in point.trades] != [
+                    astuple(t) for t in suite._fresh(entries, k, cap, add).trades]
+        # The fixture rebalances under the rule, the rule changes some caps'
+        # runs, and some caps share a simulation
+        assert rebalanced > 0 and held_back > 0 and cs.reused > 0
+        assert cs.simulated + cs.reused == len(cs.ks) * len(cs.caps)
+
+    def test_a_cap_sweep_checks_it_as_a_simulation_does(self):
+        suite = TestTrimCapSweep()
+        entries = suite._entries()
+        with pytest.raises(ValueError, match="rebalance_min_days_to_maturity needs "
+                                             "add_to_held or trim_to_kelly"):
+            suite._sweep(entries, (0.75,), trim_to_kelly=False,
+                         rebalance_min_days_to_maturity=7)
+        # Only an actual True adds (_sim_options forwards nothing else)
+        with pytest.raises(ValueError, match="needs add_to_held or trim_to_kelly"):
+            suite._sweep(entries, (0.75,), add=1, trim_to_kelly=False,
+                         rebalance_min_days_to_maturity=7)
+        assert suite._sweep(entries, (0.75,), add=True, trim_to_kelly=False,
+                            rebalance_min_days_to_maturity=1).rebalance_min_days_to_maturity == 1
+        for bad in (True, 2, "7", 7.0):
+            with pytest.raises(ValueError, match="must be 0, 1 or 7"):
+                suite._sweep(entries, (0.75,), rebalance_min_days_to_maturity=bad)
+        # "maturity" is stored as no minimum, so no simulation is handed it
+        assert suite._sweep(entries, (0.75,),
+                            rebalance_min_days_to_maturity=0).rebalance_min_days_to_maturity is None
+        assert suite._sweep(entries, (0.75,)).rebalance_min_days_to_maturity is None
+
+    def test_the_options_forward_it_only_when_set(self):
+        assert backtester._sim_options(None, False, rebalance_min_days_to_maturity=None) == {}
+        assert backtester._sim_options(None, False, rebalance_min_days_to_maturity=7) == {
+            "rebalance_min_days_to_maturity": 7}
+
+    def test_the_checks_re_simulate_at_the_point_s_setting(self, monkeypatch):
+        # _half_split forwards it, and _ex_top_event reads it off the point
+        trade = self._trim(self._pair(), trim_to_kelly=False).trades[0]
+        calls = []
+
+        def spy(*args, **kw):
+            calls.append(kw.get("rebalance_min_days_to_maturity"))
+            return backtester.SweepPoint(0.75, [], pd.DataFrame(
+                {"date": [], "portfolio_value": [], "daily_return": []}))
+
+        monkeypatch.setattr(backtester, "_simulate_at_discount", spy)
+        monkeypatch.setattr(backtester, "_total_return", lambda point, balance: 0.0)
+        backtester._half_split(([], []), self._START, 10_000.0, 0.75, (0.0, 1.0),
+                               trim_to_kelly=True, rebalance_min_days_to_maturity=7)
+        assert calls == [7, 7]
+        calls.clear()
+        point = backtester.SweepPoint(0.75, [dc_replace(trade, event_ticker="EV")],
+                                      pd.DataFrame(), trim_to_kelly=True,
+                                      rebalance_min_days_to_maturity=7)
+        backtester._ex_top_event(point, [], self._START, 10_000.0, (0.0, 1.0))
+        assert calls == [7]
+
+
 @pytest.fixture(scope="class")
 def rebalance_run():
     """The golden band sweep with the Rebalance family, over a narrowed grid —
