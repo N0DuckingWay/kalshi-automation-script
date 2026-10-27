@@ -8,7 +8,6 @@ import inspect
 import json
 import logging
 import math
-import pathlib
 import pickle
 import random
 import re
@@ -77,6 +76,7 @@ from kalshi_betting.config import (
 from kalshi_betting.scanner import CandidatePair, HeldPair, pair_held
 from kalshi_betting.strategy import compute_trade
 
+from . import claude_docs
 from .conftest import apply_pre_toggle_defaults, save_config_live_defaults
 from .test_scheduler import _host_zone
 
@@ -15411,11 +15411,11 @@ class TestLiveRuleLine:
         assert (level_only["live_sell_at"], level_only["live_sell_min_days"]) == (0.85, None)
 
     def test_claude_md_spells_every_backtest_sweep_field(self):
-        # CLAUDE.md lists BacktestSweep's fields in order, so a new field must be added there
-        text = (pathlib.Path(__file__).resolve().parent.parent / "CLAUDE.md").read_text(
-            encoding="utf-8")
+        # The notes (CLAUDE.md and docs/claude/) list BacktestSweep's fields in order,
+        # so a new field must be added there
+        text = claude_docs.notes_text()
         signature = re.search(r"`BacktestSweep\(primary, points, calibration,[^`]*\)`", text)
-        assert signature, "CLAUDE.md no longer writes out BacktestSweep's fields"
+        assert signature, "the notes no longer write out BacktestSweep's fields"
         # Each field name, with any "=default" after it dropped
         named = re.findall(r"(\w+)(?:=[^,)]*)?[,)]", signature.group(0))
         assert named == [f.name for f in fields(backtester.BacktestSweep)]

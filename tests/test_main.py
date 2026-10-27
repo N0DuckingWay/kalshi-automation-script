@@ -148,6 +148,7 @@ from kalshi_betting.config import (
 from kalshi_betting.historical import infer_category
 from kalshi_betting.reporter import TradeResult
 
+from . import claude_docs
 from .conftest import apply_pre_toggle_defaults, save_config_live_defaults
 
 
@@ -8500,16 +8501,23 @@ class TestLiveRebalanceTextsSayWhatARunDoes:
     Whitespace is collapsed first, so wrapped sentences match."""
 
     @staticmethod
-    def _text(doc: str) -> str:
-        """A document of the repo root, its whitespace collapsed."""
-        path = pathlib.Path(__file__).resolve().parent.parent / doc
-        return " ".join(path.read_text(encoding="utf-8").split())
+    def _raw(doc: str) -> str:
+        """A document of the repo root; "CLAUDE.md" is the notes as a whole, the
+        root file and every file under docs/claude/."""
+        if doc == "CLAUDE.md":
+            return claude_docs.notes_text()
+        return (pathlib.Path(__file__).resolve().parent.parent / doc).read_text(
+            encoding="utf-8")
 
-    @staticmethod
-    def _lines(doc: str) -> list[str]:
+    @classmethod
+    def _text(cls, doc: str) -> str:
+        """A document of the repo root, its whitespace collapsed."""
+        return " ".join(cls._raw(doc).split())
+
+    @classmethod
+    def _lines(cls, doc: str) -> list[str]:
         """A document of the repo root, as its lines."""
-        path = pathlib.Path(__file__).resolve().parent.parent / doc
-        return path.read_text(encoding="utf-8").splitlines()
+        return cls._raw(doc).splitlines()
 
     @classmethod
     def _readme_section(cls, heading: str) -> str:
@@ -8576,7 +8584,7 @@ class TestLiveRebalanceTextsSayWhatARunDoes:
     ])
     def test_no_document_or_module_says_live_trading_does_not_trim(self, stale):
         root = pathlib.Path(__file__).resolve().parent.parent
-        paths = [root / "README.md", root / "CLAUDE.md",
+        paths = [root / "README.md", *claude_docs.notes_paths(),
                  *sorted((root / "kalshi_betting").glob("*.py"))]
         for path in paths:
             found = re.search(stale, self._running_text(path), re.IGNORECASE)
@@ -8791,8 +8799,7 @@ class TestLiveRebalanceTextsSayWhatARunDoes:
         # plan_trims reads the rebalance settings, k and both caps off the run's
         # one LiveSettings, and plan_add_ons the rebalance settings, so the rule's
         # list of where the toggles reach names both
-        lines = (pathlib.Path(__file__).resolve().parent.parent / "CLAUDE.md").read_text(
-            encoding="utf-8").splitlines()
+        lines = claude_docs.notes_lines()
         [rule] = [line for line in lines
                   if line.startswith("- **Do not read a live toggle anywhere but through")]
         sites = rule.split("Never read")[0]

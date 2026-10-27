@@ -63,6 +63,8 @@ from kalshi_betting.config import (
 from kalshi_betting.scanner import leg_prices
 from kalshi_betting.strategy import compute_trade
 
+from . import claude_docs
+
 # Modules, never their Test* classes, which pytest would collect twice here
 from . import test_backtester as _tb
 from . import test_scanner as _ts
@@ -1234,8 +1236,10 @@ class TestLiveSettings:
         # Rebalancing and its minimum are live settings, so neither document may
         # say live trading lacks a trim setting
         assert {"rebalance", "min_price_move"} <= set(config.LIVE_TOGGLE_FIELDS)
-        text = (pathlib.Path(__file__).resolve().parent.parent / doc).read_text(
-            encoding="utf-8")
+        # "CLAUDE.md" is the notes as a whole: the root file and docs/claude/
+        text = (claude_docs.notes_text() if doc == "CLAUDE.md" else
+                (pathlib.Path(__file__).resolve().parent.parent / doc).read_text(
+                    encoding="utf-8"))
         # Whitespace is collapsed, so a sentence wrapped over lines still matches
         assert stale not in " ".join(text.split())
 
