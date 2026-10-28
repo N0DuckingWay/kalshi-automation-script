@@ -14,6 +14,13 @@
 // gives; ok is a status in 200-299), {status, bad_json: true} (json()
 // fails) or {network_error: true} (the request itself fails). Plotly's
 // react, relayout and Plots.resize are recorded, in order, and do nothing.
+// setTimeout records each timer ({id, fn, ms}) and runs none of them on its
+// own; clearTimeout removes one; a ["timers"] step runs every pending timer,
+// oldest first, and clears them. A snapshot lists the delays of the timers
+// still pending, so a test can check both the delay and that a timer was
+// cancelled. An element can be copied (cloneNode, its id, title,
+// attributes and address) and swapped for its copy (its parentNode's
+// replaceChild); a snapshot counts the swaps ("replaced").
 // ES5 plus Promise, which both runtimes have.
 
 var __emit = (typeof print === 'function') ? print : function(s) { console.log(s); };
@@ -25,6 +32,18 @@ var __fetches = [];
 var __plots = [];
 var __snaps = {};
 var __srcSets = 0;
+// Every element's parent: replacing a child puts the new element where
+// getElementById finds it, and counts the swap (a snapshot's "replaced")
+var __replaced = 0;
+var __parent = {
+  replaceChild: function(fresh, old) {
+    __elements[old.id] = fresh;
+    __replaced += 1;
+    return old;
+  }
+};
+var __timers = [];
+var __timerId = 0;
 
 function __element(id, tag) {
   var el = {id: id, tagName: tag || 'div', style: {}, hidden: false, disabled: false,
@@ -35,13 +54,28 @@ function __element(id, tag) {
     // As a browser's: setting the text replaces the children
     set: function(v) { el._text = String(v); el.children = []; }
   });
-  var src = '';
+  // A frame's address: setting it is a navigation (counted in __srcSets);
+  // copying it into a clone, or removing it, is not
+  el._src = '';
   Object.defineProperty(el, 'src', {
-    get: function() { return src; },
-    set: function(v) { src = String(v); __srcSets += 1; }
+    get: function() { return el._src; },
+    set: function(v) { el._src = String(v); __srcSets += 1; }
   });
   el.setAttribute = function(name, value) { el._attrs[name] = String(value); };
   el.getAttribute = function(name) { return name in el._attrs ? el._attrs[name] : null; };
+  el.removeAttribute = function(name) {
+    if (name === 'src') { el._src = ''; } else { delete el._attrs[name]; }
+  };
+  // A copy of the element alone (cloneNode(false)): its id, tag, title,
+  // attributes and address, nothing it holds
+  el.cloneNode = function() {
+    var copy = __element(el.id, el.tagName);
+    copy.title = el.title;
+    copy._attrs = JSON.parse(JSON.stringify(el._attrs));
+    copy._src = el._src;
+    return copy;
+  };
+  el.parentNode = __parent;
   el.appendChild = function(child) { el.children.push(child); return child; };
   el.addEventListener = function(type, fn) {
     (el._listeners[type] = el._listeners[type] || []).push(fn);
@@ -74,6 +108,17 @@ function fetch(url, options) {
   });
 }
 
+// A timer is only recorded; a ["timers"] step is what runs it
+function setTimeout(fn, ms) {
+  __timerId += 1;
+  __timers.push({id: __timerId, fn: fn, ms: ms});
+  return __timerId;
+}
+
+function clearTimeout(id) {
+  __timers = __timers.filter(function(timer) { return timer.id !== id; });
+}
+
 function __install() {
   if (__NO_PLOTLY) { return; }
   globalThis.Plotly = {
@@ -89,10 +134,13 @@ function __install() {
 
 // Each element the script has touched: its text, class, hidden state,
 // tooltip, attributes, frame address and disabled state, and a table body's
-// or list's rows (each cell's text, tooltip and left border); and every
-// request and chart call since the last snapshot
+// or list's rows (each cell's text, tooltip and left border); every request
+// and chart call since the last snapshot; and the delays of the timers still
+// pending
 function __snapshot() {
-  var snap = {fetches: __fetches, plots: __plots, srcSets: __srcSets, el: {}};
+  var snap = {fetches: __fetches, plots: __plots, srcSets: __srcSets, el: {},
+              timers: __timers.map(function(timer) { return timer.ms; }),
+              replaced: __replaced};
   __fetches = [];
   __plots = [];
   Object.keys(__elements).forEach(function(id) {
@@ -122,7 +170,9 @@ function __spin(ticks, next) {
 
 // Steps: ["settle"] (let every pending promise run), ["click", id] (a reader
 // clicking that element: its click listeners run unless it is disabled),
-// ["snap", name]. Emits every snapshot, as JSON, once the steps are done.
+// ["timers"] (the time passing: every pending timer runs, oldest first, and
+// is cleared), ["snap", name]. Emits every snapshot, as JSON, once the steps
+// are done.
 function __step(steps, i) {
   if (i >= steps.length) {
     __emit(JSON.stringify(__snaps));
@@ -138,6 +188,10 @@ function __step(steps, i) {
     if (!clicked.disabled) {
       (clicked._listeners.click || []).forEach(function(fn) { fn(); });
     }
+  } else if (s[0] === 'timers') {
+    var due = __timers;
+    __timers = [];
+    due.forEach(function(timer) { timer.fn(); });
   } else if (s[0] === 'snap') {
     __snaps[s[1]] = __snapshot();
   }

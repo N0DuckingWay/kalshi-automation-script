@@ -832,13 +832,15 @@ DEFAULTS_SERVER_CONFIRM_ARM_MS = 1000
 # live_dashboard serves it on LIVE_BACKTEST_PORT as the Backtest tab.
 DASHBOARD_FILENAME = "backtest_dashboard.html"
 
-# The folder beside the dashboard file that holds the data its Sell select
-# loads: one sub-folder per build (<this folder>/<build id>/chunk-<id>.js),
-# far too many blocks to put in the page itself, so the page loads each one
-# through a <script src> element when a reader chooses it. Named as a
-# browser's "Save page as" names a page's folder; the page shows no sell level
-# without it, so the two are kept, copied and moved together. Each build
-# deletes the folders of earlier builds when it replaces the page.
+# The folder beside the dashboard file that holds the data the page loads when
+# a reader chooses it: one sub-folder per build (<this folder>/<build
+# id>/chunk-<id>.js), holding every scenario's chunk but the run's own (which
+# the page itself holds) and the Sell select's. There are far too many blocks
+# to put in the page, so the page loads each one through a <script src>
+# element when a reader chooses it. Named as a browser's "Save page as" names a
+# page's folder; the page shows no scenario but the run's own without it, so
+# the two are kept, copied and moved together. Each build deletes the folders
+# of earlier builds when it replaces the page.
 DASHBOARD_FILES_DIRNAME = "backtest_dashboard_files"
 
 # ─── Exploratory data summaries (eda.py; reporting only) ──────────────────────
@@ -1133,6 +1135,13 @@ LIVE_DASHBOARD_HEALTH_MAX_BYTES = 65_536
 
 # A file the live dashboard sends is copied in blocks of this many bytes.
 LIVE_DASHBOARD_FILE_BLOCK_BYTES = 1_048_576
+
+# How long, in seconds, the live dashboard's Backtest or Data tab may stay
+# hidden before its frame is emptied, so the browser frees the page it held
+# (read only by live_dashboard.py, which writes it into the tab page's
+# script). Going back to the tab loads the page again, at the run's own
+# scenario; going back sooner finds it as it was left.
+LIVE_DASHBOARD_FRAME_UNLOAD_SECONDS = 300
 
 # The chart library the Live tab loads: the same Plotly build the backtest
 # page loads, and its integrity hash (the sha384 of that file, so the browser

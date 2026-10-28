@@ -12,8 +12,10 @@ Purpose:
     backtest page, unchanged, with the chunk files beside it, and the Data
     page (config.EDA_DASHBOARD_FILENAME, written by eda.py after each
     backtest or by `python3 -m kalshi_betting.eda`); the Backtest and Data
-    tabs each load their page in a frame the first time the tab is chosen.
-    Run it with
+    tabs each load their page in a frame the first time the tab is chosen,
+    and a frame whose tab stays hidden for
+    config.LIVE_DASHBOARD_FRAME_UNLOAD_SECONDS is emptied, so the browser
+    frees the page, and loads again when its tab is chosen. Run it with
 
         python3 -m kalshi_betting.live_dashboard [--no-browser]
 
@@ -28,7 +30,8 @@ Purpose:
 Dependencies:
     config (the LIVE_DASHBOARD_* and LIVE_BACKTEST_PORT settings, the Plotly
     build and its hash, PROJECT_ROOT, DASHBOARD_FILENAME,
-    DASHBOARD_FILES_DIRNAME, EDA_DASHBOARD_FILENAME, LIVE_DASHBOARD_PERIODS, LIVE_CANDLE_DAY_ZONE,
+    DASHBOARD_FILES_DIRNAME, EDA_DASHBOARD_FILENAME, LIVE_DASHBOARD_PERIODS,
+    LIVE_DASHBOARD_FRAME_UNLOAD_SECONDS, LIVE_CANDLE_DAY_ZONE,
     RISK_FREE_BILL_TERM, count_text); live_portfolio (build_live_view,
     append_snapshot, trade_log_paths, OTHER_BETS and the view's types);
     historical (build_prod_live_client, the production client, built on the
@@ -1589,6 +1592,14 @@ _SCRIPT_TEMPLATE = """
   var CHOSEN = 0;
   var FRAMES = {backtest: ['backtest-frame', BACKTEST_URL], data: ['data-frame', DATA_URL]};
   var OPENED = {};
+  // A frame whose tab stays hidden for UNLOAD_MS is emptied: a copy of it
+  // with no address takes its place, so the browser frees the page the old
+  // one held, and choosing its tab loads the page into the copy. Swapping
+  // the frame, rather than pointing it at another address, adds no step to
+  // the Back history of the browser, so Back never blanks a tab or reloads a
+  // hidden page. HIDING holds the timer of each frame now hidden.
+  var UNLOAD_MS = __UNLOAD_MS__;
+  var HIDING = {};
   var LOADING = false;
 
   function byId(id) { return document.getElementById(id); }
@@ -1723,6 +1734,23 @@ _SCRIPT_TEMPLATE = """
       byId('tab-' + t).setAttribute('aria-selected', t === name ? 'true' : 'false');
       byId('panel-' + t).hidden = t !== name;
     });
+    Object.keys(FRAMES).forEach(function (t) {
+      if (t === name) {
+        // Back before the delay: the frame stays as it was left
+        if (HIDING[t]) { clearTimeout(HIDING[t]); delete HIDING[t]; }
+      } else if (OPENED[t] && !HIDING[t]) {
+        HIDING[t] = setTimeout(function () {
+          delete HIDING[t];
+          // The copy keeps the id, title and sandbox of the frame; its address is
+          // removed before it is put in place, so it loads nothing
+          var old = byId(FRAMES[t][0]);
+          var fresh = old.cloneNode(false);
+          fresh.removeAttribute('src');
+          old.parentNode.replaceChild(fresh, old);
+          OPENED[t] = false;
+        }, UNLOAD_MS);
+      }
+    });
     if (FRAMES[name] && !OPENED[name]) {
       byId(FRAMES[name][0]).src = FRAMES[name][1];
       OPENED[name] = true;
@@ -1760,6 +1788,7 @@ def _script() -> str:
     values = {
         "__BACKTEST_URL__": json.dumps(BACKTEST_URL),
         "__DATA_URL__": json.dumps(DATA_URL),
+        "__UNLOAD_MS__": str(config.LIVE_DASHBOARD_FRAME_UNLOAD_SECONDS * 1000),
         "__TEXT__": json.dumps(_SCRIPT_TEXT, ensure_ascii=False),
         "__HEADERS__": json.dumps({config.LIVE_DASHBOARD_REQUEST_HEADER: "1"}),
         "__PERIODS__": str(len(config.LIVE_DASHBOARD_PERIODS)),

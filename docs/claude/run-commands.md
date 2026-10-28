@@ -235,8 +235,9 @@ python3 -m kalshi_betting.backtest --no-move-sweep
 # cap sweep: the run simulates nothing — the dashboard step then reads every sell level and
 # minimum of days to maturity of every scenario the filter bar shows that does not rebalance
 # (Sell is shut while Rebalance is yes), in worker processes,
-# simulating only the settings that differ, and writes the new trade lists as sidecar chunk files
-# in backtest_dashboard_files/<build>/ beside the page, which must be kept with it). Skipping it
+# simulating only the settings that differ, and writes the new trade lists as chunk files
+# in backtest_dashboard_files/<build>/ beside the page, with the page's own scenario chunks
+# (every one but the run's own), which must be kept with it). Skipping it
 # makes that step much faster and leaves the filter bar's Sell and Min. days to maturity selects
 # disabled; backtest only — a live run sells only at its own saved sell_at level (--sell-at for one run), not at the dashboard's grid
 python3 -m kalshi_betting.backtest --no-sell-sweep

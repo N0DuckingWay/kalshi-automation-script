@@ -31,8 +31,9 @@ backtest_dashboard*.html
 # The exploratory Data page (config.EDA_DASHBOARD_FILENAME): rebuilt by
 # `python3 -m kalshi_betting.eda` and at the end of each backtest
 eda_dashboard.html
-# The dashboard's sidecar data (config.DASHBOARD_FILES_DIRNAME): the chunks its
-# Sell select loads, one folder per build, kept beside the page
+# The dashboard's chunk files (config.DASHBOARD_FILES_DIRNAME): every scenario's
+# chunk but the run's own, and the Sell select's, one folder per build, kept
+# beside the page
 /backtest_dashboard_files/
 # What a full backtest run saves for the dashboard (config.BACKTEST_SWEEP_FILENAME):
 # `python3 -m kalshi_betting.backtest --dashboard-only` rebuilds the page from it.
