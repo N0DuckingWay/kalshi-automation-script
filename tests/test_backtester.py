@@ -15239,7 +15239,8 @@ class TestLiveRuleLine:
 
     @staticmethod
     def _live(monkeypatch, tier_floors, band, categories=None, tags=None, *,
-              rebalance=False, min_price_move=None, sell_at=None, sell_min_days=None):
+              rebalance=False, min_price_move=None, sell_at=None, sell_min_days=None,
+              rebalance_min_days_to_maturity=None):
         """Save config.py's toggles with this rule and filter as the live
         defaults. Rebalancing and selling stay off unless asked for, so their
         notes appear only in the tests that name them."""
@@ -15250,6 +15251,8 @@ class TestLiveRuleLine:
         monkeypatch.setattr(config, "TRADE_EXCLUDE_TAGS", tags)
         monkeypatch.setattr(config, "REBALANCE", rebalance)
         monkeypatch.setattr(config, "MIN_PRICE_MOVE", min_price_move)
+        monkeypatch.setattr(config, "REBALANCE_MIN_DAYS_TO_MATURITY",
+                            rebalance_min_days_to_maturity)
         monkeypatch.setattr(config, "SELL_AT", sell_at)
         monkeypatch.setattr(config, "SELL_MIN_DAYS", sell_min_days)
         save_config_live_defaults()
@@ -15293,11 +15296,11 @@ class TestLiveRuleLine:
         assert messages[-1].startswith(self._PREFIX)
         assert any(m.startswith("Size-cap sweep:") for m in messages[:-1])
 
-    # The twelve fields a saved-defaults read records, all or none
+    # The thirteen fields a saved-defaults read records, all or none
     _LIVE_FIELDS = ("live_tier_floors", "live_spread_band", "live_exclude_categories", "live_exclude_tags",
                     "live_origin", "live_interval_discount", "live_size_cap",
                     "live_same_title_size_cap", "live_rebalance", "live_min_price_move",
-                    "live_sell_at", "live_sell_min_days")
+                    "live_rebalance_min_days_to_maturity", "live_sell_at", "live_sell_min_days")
 
     @pytest.mark.parametrize("feasible", [False, True])
     def test_a_refused_file_records_none_and_warns_once(self, monkeypatch, caplog, feasible):
@@ -15352,11 +15355,12 @@ class TestLiveRuleLine:
             "when this run started, and live runs refuse to start without them")
         assert bool(res.calibrations_by_band) is feasible
 
-    def test_the_twelve_fields_are_recorded_from_one_read(self, monkeypatch, caplog):
+    def test_the_thirteen_fields_are_recorded_from_one_read(self, monkeypatch, caplog):
         from kalshi_betting import config
         saved = config.save_live_defaults(
             config.LiveSettings(False, (0.1, 0.8), 0.6, 0.35, 0.25, ("Economics",), ("Fed",),
                                 rebalance=True, min_price_move=0.10,
+                                rebalance_min_days_to_maturity=7,
                                 sell_at=0.85, sell_min_days=3),
             source="a note")
         reads: list = []
@@ -15382,13 +15386,14 @@ class TestLiveRuleLine:
             "live_origin": saved.origin, "live_interval_discount": 0.6,
             "live_size_cap": 0.35, "live_same_title_size_cap": 0.25,
             "live_rebalance": True, "live_min_price_move": 0.10,
+            "live_rebalance_min_days_to_maturity": 7,
             "live_sell_at": 0.85, "live_sell_min_days": 3}
 
-    def test_the_live_rule_fields_are_twelve_keys_or_none(self):
+    def test_the_live_rule_fields_are_thirteen_keys_or_none(self):
         from kalshi_betting import config
         assert backtester._live_rule_fields(None) == {}
         fields = backtester._live_rule_fields(config.LIVE_DEFAULTS_SEED)
-        assert tuple(fields) == self._LIVE_FIELDS and len(fields) == 12
+        assert tuple(fields) == self._LIVE_FIELDS and len(fields) == 13
         # Each is a BacktestSweep field, so it can be passed straight to the sweep
         assert set(fields) <= set(backtester.BacktestSweep.__dataclass_fields__)
         assert fields["live_origin"] == config.LIVE_DEFAULTS_SEED.origin
@@ -15401,6 +15406,13 @@ class TestLiveRuleLine:
         moved = backtester._live_rule_fields(dc_replace(config.LIVE_DEFAULTS_SEED,
                                                         min_price_move=0.10))
         assert (moved["live_rebalance"], moved["live_min_price_move"]) == (True, 0.10)
+        # The seed rebalances until maturity (no days limit); defaults with
+        # one record it
+        assert fields["live_rebalance_min_days_to_maturity"] is None
+        until = backtester._live_rule_fields(dc_replace(config.LIVE_DEFAULTS_SEED,
+                                                        rebalance_min_days_to_maturity=7))
+        assert (until["live_rebalance"], until["live_rebalance_min_days_to_maturity"]) == (
+            True, 7)
         # The seed sells nothing; defaults that do record the level and the minimum
         assert fields["live_sell_at"] is None and fields["live_sell_min_days"] is None
         selling = backtester._live_rule_fields(dc_replace(
@@ -15664,6 +15676,22 @@ class TestLiveRuleLine:
             self._infeasible(monkeypatch, caplog)
             assert self._line(caplog).endswith(f"scenario applies it{note}"), move
 
+    def test_the_rebalance_note_names_the_rebalance_until_days(self, monkeypatch, caplog):
+        # The saved "Rebalance until" in the live "Live settings:" line's
+        # words, after any minimum price movement
+        for move, days, words in (
+                (None, 7, " (until 7 days before maturity)"),
+                (None, 1, " (until 1 day before maturity)"),
+                (0.10, 7, " (only after a 10c price move, until 7 days before maturity)")):
+            self._live(monkeypatch, True, (0.0, 1.0), rebalance=True, min_price_move=move,
+                       rebalance_min_days_to_maturity=days)
+            res = self._infeasible(monkeypatch, caplog)
+            assert (res.live_min_price_move, res.live_rebalance_min_days_to_maturity) == (
+                move, days)
+            assert self._line(caplog).endswith(
+                f"scenario applies it; the live defaults rebalance held pairs{words}, which "
+                "this run's primary does not"), (move, days)
+
     def test_no_rebalance_note_when_the_saved_defaults_do_not_rebalance(
             self, monkeypatch, caplog):
         self._live(monkeypatch, True, (0.0, 1.0))
@@ -15691,8 +15719,11 @@ class TestLiveRuleLine:
                                (True, self._REBALANCE_NOTE_NO_MINIMUM)):
             changed = dc_replace(sweep, live_rebalance=recorded)
             assert backtester._live_rebalance_note(changed) == note, recorded
-        # A minimum alone is no rebalance (LiveSettings refuses one with rebalancing off)
+        # A minimum alone is no rebalance (LiveSettings refuses one with rebalancing off),
+        # nor is a days limit alone
         assert backtester._live_rebalance_note(dc_replace(sweep, live_min_price_move=0.10)) == ""
+        assert backtester._live_rebalance_note(dc_replace(
+            sweep, live_rebalance_min_days_to_maturity=7)) == ""
         assert backtester._live_rebalance_note(dc_replace(
             sweep, live_rebalance=True, live_min_price_move=0.10)) == self._REBALANCE_NOTE
 
@@ -24418,6 +24449,517 @@ class TestRebalanceUntil:
         assert calls == [7]
 
 
+class TestMaturityGrid:
+    """RebalanceSweep.maturity_grid reads one (band, k) cell at every
+    "Rebalance until" choice (1 and 7 days) and every minimum price movement
+    (none, then each of min_moves) while simulating only the runs that
+    differ, starting from the runs at "maturity" its caller hands over
+    (starts). Every run it reads rebalances: it adds to and trims held
+    pairs together. A cell that still lets through every add-on and every
+    trim a run no stricter made (each one's move passes the cell's minimum,
+    config.price_move_reached, and its days left pass the cell's choice,
+    config.days_left_reached) is that run, yielded as a SameMaturity naming
+    it; every other one is simulated and yielded as a point. The gate: every
+    (choice, minimum, cap) equals a fresh _simulate_at_discount(...,
+    add_to_held=True, trim_to_kelly=True, min_move=M,
+    rebalance_min_days_to_maturity=D, size_cap=cap) on trades and equity, a
+    SameMaturity through the run it names, which is always a run of
+    `starts` or a point already yielded for that cap.
+
+    Three fixtures, each with a position that rebalances in its last week,
+    so "maturity", 1 day and 7 days are three different runs.
+    TestTrimCapSweep's three pairs, the first (SA / SB) maturing on 01-18:
+    at the low caps it is trimmed on Monday 2 (6 days left, after a 25c
+    rise) and Monday 3 (-1 day left, 8c), at 30% with k 0.5 on Monday 3
+    alone (33c). TestMoveGrid's add-on pair, maturing on 01-25: added to on
+    Monday 2 (13 days left), trimmed on Monday 3 (6) and Monday 4 (-1). And
+    TestAddOnWaitsForAMove's lone leg, NO on PB maturing on 01-18, added to
+    on Monday 2 (6 days left) with QA, a new market maturing on 03-31."""
+
+    _BAND = TestTrimCapSweep._BAND
+    _START = TestTrimCapSweep._START
+    _END = TestTrimCapSweep._END
+    _KS = (0.5, 0.75)
+    _SHORT = TestMoveGrid._SHORT
+    _FEW_CAPS = (0.05, 0.30, 1.0)
+    # What the cover asks of every add-on and trim of a run, in maturity_grid's source
+    _MOVE_TEST = "all(price_move_reached(move, min_move) for move in moves)"
+    _DAYS_TEST = "all(days_left_reached(left, min_days) for left in days_left)"
+    _COVER_MUTANTS = {
+        "the move test dropped": (_MOVE_TEST, "True"),
+        "the days test dropped": (_DAYS_TEST, "True"),
+        "never the same run": (_MOVE_TEST, "False"),
+    }
+    # Where the walk records an add-on's days left, worked out before the
+    # add-on; the mutant records the days of what is held after it instead
+    _ADD_ON_DAYS = "                rebalance_days_left.append(add_left)"
+    _ADD_ON_DAYS_AFTER = ("                rebalance_days_left.append("
+                          "_rebalance_days_left([trade], d))")
+
+    class _Simulated(Exception):
+        """Raised by a stand-in for _simulate_at_discount that must not be called."""
+
+    @staticmethod
+    def _trim_entries() -> list[dict]:
+        return TestRebalanceUntil._matures(TestTrimCapSweep()._entries(),
+                                           SA="2026-01-15", SB="2026-01-18")
+
+    @staticmethod
+    def _add_on_entries() -> list[dict]:
+        return TestRebalanceUntil._matures(TestMoveGrid._add_on_entries(),
+                                           SA="2026-01-15", SB="2026-01-25")
+
+    @staticmethod
+    def _lone_entries() -> list[dict]:
+        return TestRebalanceUntil._matures(TestAddOnWaitsForAMove()._lone(),
+                                           QA="2026-03-31", PB="2026-01-18")
+
+    def _family(self, entries, min_moves, *, caps=backtester.SIZE_CAP_SWEEP, ks=_KS,
+                maturity_days=(1, 7)):
+        return backtester.RebalanceSweep(
+            caps=tuple(caps), primary_cap=0.20, bands=(self._BAND,), off_bands=(),
+            ks=tuple(ks), primary_k=ks[0], start_date=self._START,
+            initial_balance=10_000.0, entries_by_band={self._BAND: entries},
+            off_entries_by_band={},
+            end_dates={(self._BAND, k, "all"): self._END for k in ks},
+            off_end_dates={}, min_moves=tuple(min_moves), maturity_days=tuple(maturity_days))
+
+    def _fresh(self, entries, k, cap, min_move, min_days):
+        """A fresh rebalancing simulation: adding and trimming, as every grid run does."""
+        return backtester._simulate_at_discount(
+            entries, self._START, 10_000.0, k=k, spread_band=self._BAND, size_cap=cap,
+            quiet=True, end_date=self._END, add_to_held=True, trim_to_kelly=True,
+            min_move=min_move, rebalance_min_days_to_maturity=min_days)
+
+    @staticmethod
+    def _record(point) -> tuple:
+        """What maturity_grid keeps of a run: its moves and its days left."""
+        return point.moves, point.rebalance_days_left
+
+    @staticmethod
+    def _trades(point) -> list:
+        return [astuple(t) for t in point.trades]
+
+    @classmethod
+    def _same_run(cls, point, other) -> None:
+        """Assert two simulations are one run: trades and curve alike."""
+        assert cls._trades(point) == cls._trades(other)
+        pd.testing.assert_frame_equal(point.equity_df, other.equity_df, check_exact=True)
+
+    def _starts(self, family, entries, k, caps) -> tuple[dict, dict]:
+        """The runs at maturity, simulated fresh, and their records as `starts`."""
+        runs = {cap: {minimum: self._fresh(entries, k, cap, minimum, None)
+                      for minimum in (None, *family.min_moves)} for cap in caps}
+        return runs, {cap: {minimum: self._record(point) for minimum, point in by_min.items()}
+                      for cap, by_min in runs.items()}
+
+    def _parity(self, family, entries, k, *, caps=None) -> Counter:
+        """Read every (choice, minimum, cap) of maturity_grid and check each
+        cell against a fresh simulation there. A point is that simulation,
+        and differs from every run the grid had for its cap at a choice and
+        a minimum no stricter (so it had to be simulated). A SameMaturity
+        names a run of `starts` or a point already yielded for its cap, no
+        stricter in either direction, and the fresh run equals that run.
+        Returns how many cells of each kind were read."""
+        chosen = family.caps if caps is None else tuple(sorted(caps))
+        minimums = (None, *family.min_moves)
+        choices = (None, *family.maturity_days)
+        runs, starts = self._starts(family, entries, k, chosen)
+        # Per cap, every run a SameMaturity may name, by (minimum, choice):
+        # the runs at maturity, then each point as it is yielded
+        known = {cap: {(minimum, None): runs[cap][minimum] for minimum in minimums}
+                 for cap in chosen}
+        kinds: Counter = Counter()
+        order = []
+        for min_days, min_move, by_cap in family.maturity_grid(self._BAND, k, caps=caps,
+                                                               starts=starts):
+            order.append((min_days, min_move))
+            here = (minimums.index(min_move), choices.index(min_days))
+            assert tuple(by_cap) == chosen
+            for cap, cell in by_cap.items():
+                fresh = self._fresh(entries, k, cap, min_move, min_days)
+                if isinstance(cell, backtester.SameMaturity):
+                    named = (cell.min_move, cell.min_days)
+                    assert named in known[cap], (min_days, min_move, cap, cell)
+                    at = (minimums.index(cell.min_move), choices.index(cell.min_days))
+                    # No stricter than this cell, in either direction
+                    assert at != here and at[0] <= here[0] and at[1] <= here[1]
+                    run = known[cap][named]
+                    self._same_run(fresh, run)
+                    assert self._record(fresh) == self._record(run)
+                    kinds["same as maturity" if cell.min_days is None
+                          else "same as a point"] += 1
+                else:
+                    assert isinstance(cell, backtester.SweepPoint)
+                    assert (cell.min_move, cell.rebalance_min_days_to_maturity, cell.size_cap,
+                            cell.add_to_held, cell.trim_to_kelly) == (
+                        min_move, min_days, cap, True, True)
+                    self._same_run(fresh, cell)
+                    assert self._record(cell) == self._record(fresh)
+                    # Simulated only because it is another run than each the
+                    # grid had for this cap at a choice and minimum no stricter
+                    for (m0, d0), run in known[cap].items():
+                        if minimums.index(m0) <= here[0] and choices.index(d0) <= here[1]:
+                            assert self._trades(cell) != self._trades(run), (
+                                min_days, min_move, cap, m0, d0)
+                    known[cap][min_move, min_days] = cell
+                    kinds["point"] += 1
+                    kinds[f"point at {min_days}"] += 1
+        # Every choice, ascending, and in each every minimum, ascending
+        assert order == [(d, m) for d in family.maturity_days for m in minimums]
+        return kinds
+
+    @staticmethod
+    def _every_kind(kinds: Counter) -> None:
+        """Not vacuous: points at both choices, and runs stood in for by a run
+        at maturity and by a point."""
+        for kind in ("point at 1", "point at 7", "same as maturity", "same as a point"):
+            assert kinds[kind] > 0, (kind, kinds)
+
+    # ── Parity ──
+
+    def test_the_fixtures_rebalance_in_their_last_week(self):
+        # Each fixture's runs at maturity, at 1 day and at 7 days are three runs
+        entries = self._trim_entries()
+        low = [self._fresh(entries, 0.75, 0.05, None, days) for days in (None, 1, 7)]
+        assert [point.rebalance_days_left for point in low] == [(6, -1), (6,), ()]
+        assert low[0].moves == pytest.approx((0.25, 0.08), abs=1e-12)
+        middle = [self._fresh(entries, 0.5, 0.30, None, days) for days in (None, 1, 7)]
+        assert [point.rebalance_days_left for point in middle] == [(-1,), (), ()]
+        assert middle[0].moves == pytest.approx((0.33,), abs=1e-12)
+        added = [self._fresh(self._add_on_entries(), 0.75, 0.10, None, days)
+                 for days in (None, 1, 7)]
+        assert [point.rebalance_days_left for point in added] == [(13, 6, -1), (13, 6), (13,)]
+        assert added[0].moves == pytest.approx((-0.10, 0.44, 0.04), abs=1e-12)
+        for runs in (low, added):
+            assert len({tuple(self._trades(point)) for point in runs}) == 3
+
+    def test_every_choice_minimum_and_cap_equals_a_fresh_simulation(self):
+        entries = self._trim_entries()
+        family = self._family(entries, self._SHORT)
+        kinds: Counter = Counter()
+        for k in self._KS:
+            kinds += self._parity(family, entries, k)
+        assert kinds["point"] + kinds["same as maturity"] + kinds["same as a point"] == (
+            len(self._KS) * 2 * (1 + len(self._SHORT)) * len(family.caps))
+        self._every_kind(kinds)
+
+    def test_add_ons_and_trims_both_decide_which_runs_are_one(self):
+        # The record holds the add-on's days beside the trims': 7 days holds
+        # back both trims (6 and -1 days left) but not the add-on (13)
+        entries = self._add_on_entries()
+        family = self._family(entries, (0.05, 0.10, 0.40, 0.45), caps=(0.10, 0.20))
+        starts = self._starts(family, entries, 0.75, family.caps)[1]
+        grid = {(days, minimum): by_cap for days, minimum, by_cap
+                in family.maturity_grid(self._BAND, 0.75, starts=starts)}
+        one, seven = grid[1, None][0.10], grid[7, None][0.10]
+        assert isinstance(one, backtester.SweepPoint) and one.rebalance_days_left == (13, 6)
+        assert isinstance(seven, backtester.SweepPoint) and seven.rebalance_days_left == (13,)
+        assert [t.entry_date for t in seven.trades if t.add_on] == [_LADDER_M2]
+        assert not any(t.sold for t in seven.trades)
+        kinds = self._parity(family, entries, 0.75)
+        assert kinds["point"] > 0
+        assert kinds["same as maturity"] + kinds["same as a point"] > 0
+
+    def test_a_lone_leg_s_add_on_is_judged_on_the_held_leg_s_days(self):
+        # Q adds to the lone leg (NO on PB, 6 days left on Monday 2) with QA, a
+        # new market maturing much later: the run at maturity records the held
+        # leg's 6 days, worked out before the add-on, so 1 day is that run and
+        # 7 days, which holds the add-on back, is another
+        entries = self._lone_entries()
+        family = self._family(entries, (), caps=(0.20, 1.0), ks=(0.85,))
+        base = self._fresh(entries, 0.85, 0.20, None, None)
+        assert [t.entry_date for t in base.trades if t.add_on] == [_LADDER_M2]
+        assert base.rebalance_days_left[0] == 6
+        starts = self._starts(family, entries, 0.85, family.caps)[1]
+        grid = list(family.maturity_grid(self._BAND, 0.85, starts=starts))
+        assert [(days, minimum) for days, minimum, _cells in grid] == [(1, None), (7, None)]
+        assert grid[0][2][0.20] == backtester.SameMaturity(None, None)
+        seven = grid[1][2][0.20]
+        assert isinstance(seven, backtester.SweepPoint)
+        assert not any(t.add_on for t in seven.trades)
+        self._parity(family, entries, 0.85)
+
+    def test_a_cell_is_the_run_to_its_left_and_a_trim_with_one_day_left_still_counts(self):
+        # At k 0.5 the add-on pair's 7-day cell at 30c is the 25c run of its
+        # own row, a point: neither the run above it (30c at 1 day) nor its
+        # row's first run (no minimum) is the same run. The parity check
+        # fails on a grid that names only those two and simulates the cell
+        entries = self._add_on_entries()
+        family = self._family(entries, self._SHORT, caps=(0.05, 0.10), ks=(0.5,))
+        starts = self._starts(family, entries, 0.5, family.caps)[1]
+        grid = {(days, minimum): by_cap for days, minimum, by_cap
+                in family.maturity_grid(self._BAND, 0.5, starts=starts)}
+        assert isinstance(grid[7, 0.25][0.05], backtester.SweepPoint)
+        assert grid[7, 0.30][0.05] == backtester.SameMaturity(0.25, 7)
+        self._parity(family, entries, 0.5)
+        # TestLoneLegTrim's lone leg, its market LB closing on 01-20, is
+        # trimmed on 01-19 with exactly 1 day left. 1 day still lets that trim
+        # through, so its cell is the run at maturity; the parity check fails
+        # on a grid that does not see that and simulates it
+        lone = TestRebalanceUntil()._lone(LB="2026-01-20")
+        assert self._fresh(lone, 0.75, 0.20, None, None).rebalance_days_left == (1,)
+        family = self._family(lone, (), caps=(0.20,), ks=(0.75,))
+        kinds = self._parity(family, lone, 0.75)
+        assert (kinds["same as maturity"], kinds["point at 7"]) == (1, 1)
+
+    def test_with_no_minimums_only_each_choice_s_cell_is_yielded(self):
+        entries = self._trim_entries()
+        family = self._family(entries, ())
+        kinds: Counter = Counter()
+        for k in self._KS:
+            kinds += self._parity(family, entries, k)
+        assert sum(kinds[kind] for kind in ("point", "same as maturity", "same as a point")) == (
+            len(self._KS) * 2 * len(family.caps))
+        assert kinds["point at 1"] > 0 and kinds["point at 7"] > 0
+        assert kinds["same as maturity"] > 0
+
+    def test_only_the_cells_yielded_as_points_are_simulated(self, monkeypatch):
+        entries = self._trim_entries()
+        family = self._family(entries, self._SHORT)
+        real = backtester._simulate_at_discount
+        calls: list = []
+
+        def spy(raw_entries, start_date, initial_balance, **kw):
+            assert kw["trim_to_kelly"] is True and kw["add_to_held"] is True
+            calls.append((kw.get("rebalance_min_days_to_maturity"), kw.get("min_move"),
+                          kw["size_cap"]))
+            return real(raw_entries, start_date, initial_balance, **kw)
+
+        for k in self._KS:
+            for caps in (None, self._FEW_CAPS):
+                chosen = family.caps if caps is None else caps
+                starts = self._starts(family, entries, k, chosen)[1]
+                calls.clear()
+                stats: dict = {}
+                with monkeypatch.context() as mp:
+                    mp.setattr(backtester, "_simulate_at_discount", spy)
+                    grid = list(family.maturity_grid(self._BAND, k, caps=caps, starts=starts,
+                                                     stats=stats))
+                points = {(days, minimum, cap) for days, minimum, by_cap in grid
+                          for cap, cell in by_cap.items()
+                          if isinstance(cell, backtester.SweepPoint)}
+                same = sum(isinstance(cell, backtester.SameMaturity)
+                           for _days, _minimum, by_cap in grid for cell in by_cap.values())
+                # No run at maturity is simulated again, and only cells
+                # yielded as points are simulated
+                assert calls and all(days is not None for days, _m, _cap in calls)
+                assert set(calls) <= points
+                # Caps that cannot change a run share one simulation, so a
+                # point's choice and minimum were simulated at some cap
+                assert {(days, minimum) for days, minimum, _cap in points} == {
+                    (days, minimum) for days, minimum, _cap in calls}
+                # The counts a report logs
+                assert stats["simulated"] == len(calls)
+                assert stats["simulated"] + stats["reused"] == len(points)
+                assert stats["same"] == same > 0 and points
+                assert len(points) + same == 2 * (1 + len(self._SHORT)) * len(chosen)
+
+    # ── The parity check is not vacuous ──
+
+    @pytest.mark.parametrize("mutant", sorted(_COVER_MUTANTS))
+    def test_the_parity_check_catches_a_wrong_cover(self, monkeypatch, mutant):
+        # maturity_grid's own source with the cover changed, compiled in
+        # backtester's namespace. Without the move test, the 1-day cell at
+        # 30c takes the 25c run at maturity (a trim after a 25c rise, 6 days
+        # left), though 30c holds that trim back; without the days test, the
+        # 1-day cell with no minimum takes the run at maturity, whose trim
+        # with -1 day left 1 day holds back; a cover that never answers "the
+        # same run" simulates runs the grid already has. The parity check
+        # must fail on each
+        source = textwrap.dedent(inspect.getsource(backtester.RebalanceSweep.maturity_grid))
+        old, new = self._COVER_MUTANTS[mutant]
+        assert source.count(old) == 1
+        namespace = dict(vars(backtester))
+        exec(compile(source.replace(old, new), "<maturity_grid mutant>", "exec"), namespace)
+        entries = self._trim_entries()
+        family = self._family(entries, self._SHORT, caps=self._FEW_CAPS)
+        with monkeypatch.context() as mp:
+            mp.setattr(backtester.RebalanceSweep, "maturity_grid", namespace["maturity_grid"])
+            with pytest.raises(AssertionError):
+                self._parity(family, entries, 0.75)
+        # The same narrow check passes with the real cover
+        self._every_kind(self._parity(family, entries, 0.75))
+
+    def test_the_parity_check_catches_a_walk_that_records_the_days_after_an_add_on(
+            self, monkeypatch):
+        # The walk's own source recording, for each add-on, the days of what is
+        # held after it (the new pair QA / PB, whose later market matures on
+        # 03-31) in place of the held leg's, worked out before it. Its run at
+        # maturity then seems to let the 7-day cell through, which holds the
+        # add-on back. The parity check must fail on it
+        source = textwrap.dedent(inspect.getsource(backtester._simulate_at_discount))
+        assert source.count(self._ADD_ON_DAYS) == 1
+        namespace = dict(vars(backtester))
+        exec(compile(source.replace(self._ADD_ON_DAYS, self._ADD_ON_DAYS_AFTER),
+                     "<_simulate_at_discount mutant>", "exec"), namespace)
+        entries = self._lone_entries()
+        family = self._family(entries, (), caps=(0.20,), ks=(0.85,))
+        with monkeypatch.context() as mp:
+            mp.setattr(backtester, "_simulate_at_discount", namespace["_simulate_at_discount"])
+            assert self._fresh(entries, 0.85, 0.20, None, None).rebalance_days_left[0] > 7
+            with pytest.raises(AssertionError):
+                self._parity(family, entries, 0.85)
+        # The same narrow check passes with the real walk
+        assert self._parity(family, entries, 0.85)["point at 7"] == 1
+
+    def test_the_cover_asks_the_walk_s_own_two_tests_about_every_trade_of_a_run(
+            self, monkeypatch):
+        # The walk holds an add-on or a trim back with config.price_move_reached
+        # and config.days_left_reached, and the cover asks those same functions
+        assert backtester.price_move_reached is config.price_move_reached
+        assert backtester.days_left_reached is config.days_left_reached
+        family = self._family(self._trim_entries(), (), caps=(0.05,))
+        starts = {0.05: {None: ((0.25, 0.08), (6, 8))}}
+        seen: list = []
+        real_move, real_days = backtester.price_move_reached, backtester.days_left_reached
+
+        def move_spy(move, min_move):
+            seen.append(("move", move, min_move))
+            return real_move(move, min_move)
+
+        def days_spy(left, min_days):
+            seen.append(("days", left, min_days))
+            return real_days(left, min_days)
+
+        def simulated(*args, **kw):
+            raise self._Simulated
+
+        with monkeypatch.context() as mp:
+            mp.setattr(backtester, "price_move_reached", move_spy)
+            mp.setattr(backtester, "days_left_reached", days_spy)
+            # Both trims pass 1 day, so nothing is simulated and every call
+            # seen is the cover's
+            mp.setattr(backtester, "_simulate_at_discount", simulated)
+            days, minimum, by_cap = next(family.maturity_grid(self._BAND, 0.75,
+                                                              starts=starts))
+        assert (days, minimum) == (1, None)
+        assert seen == [("move", 0.25, None), ("move", 0.08, None), ("days", 6, 1),
+                        ("days", 8, 1)]
+        assert by_cap == {0.05: backtester.SameMaturity(None, None)}
+
+    def test_an_unknown_day_is_never_covered(self, monkeypatch):
+        # A trim whose days could not be counted (None) is held back under any
+        # choice, so the run that made it stands for none of them
+        family = self._family(self._trim_entries(), (), caps=(0.05,))
+
+        def simulated(*args, **kw):
+            raise self._Simulated
+
+        monkeypatch.setattr(backtester, "_simulate_at_discount", simulated)
+        with pytest.raises(self._Simulated):
+            next(family.maturity_grid(self._BAND, 0.75,
+                                      starts={0.05: {None: ((0.25,), (None,))}}))
+        # ... while a run that made no add-on and no trim stands for every one
+        grid = family.maturity_grid(self._BAND, 0.75, starts={0.05: {None: ((), ())}})
+        assert [cells for _days, _minimum, cells in grid] == [
+            {0.05: backtester.SameMaturity(None, None)}] * 2
+
+    # ── Refusals and the family's own checks ──
+
+    def test_a_family_without_choices_yields_nothing_and_simulates_nothing(self, monkeypatch):
+        family = self._family(self._trim_entries(), self._SHORT, maturity_days=())
+        assert family.maturity_days == ()
+        monkeypatch.setattr(backtester, "_simulate_at_discount",
+                            lambda *a, **k: pytest.fail("simulated"))
+        stats: dict = {}
+        assert list(family.maturity_grid(self._BAND, 0.75, starts={}, stats=stats)) == []
+        assert stats == {"simulated": 0, "reused": 0, "same": 0}
+
+    def test_a_grid_it_cannot_read_is_refused_on_the_first_step(self, monkeypatch):
+        family = self._family(self._trim_entries(), (0.05,), caps=self._FEW_CAPS)
+        # Refused before anything is simulated, even with every run given
+        monkeypatch.setattr(backtester, "_simulate_at_discount",
+                            lambda *a, **k: pytest.fail("simulated"))
+        every = {cap: {None: ((), ()), 0.05: ((), ())} for cap in self._FEW_CAPS}
+        with pytest.raises(ValueError, match="size caps .* are not all among"):
+            next(family.maturity_grid(self._BAND, 0.75, caps=(0.05, 0.07), starts=every))
+        with pytest.raises(ValueError, match="no tier-floors-off family to rebalance in"):
+            next(family.maturity_grid(self._BAND, 0.75, tier_floors=False, starts=every))
+        with pytest.raises(KeyError):
+            next(family.maturity_grid((0.2, 0.9), 0.75, starts=every))
+        with pytest.raises(ValueError, match=r"k 0\.6 is not one of"):
+            next(family.maturity_grid(self._BAND, 0.6, starts=every))
+        # `starts` is required
+        with pytest.raises(TypeError, match="starts"):
+            family.maturity_grid(self._BAND, 0.75)
+        # Starts that lack a cap covered or one of its minimums, or hold
+        # something other than one run's (moves, days left)
+        for starts, missing in (
+                ({0.05: every[0.05]}, r"\[\(0\.3, None\), \(0\.3, 0\.05\), \(1\.0, None\), "
+                                      r"\(1\.0, 0\.05\)\]"),
+                (every | {0.30: {None: ((), ())}}, r"\[\(0\.3, 0\.05\)\]"),
+                (every | {1.0: None}, r"\[\(1\.0, None\), \(1\.0, 0\.05\)\]"),
+                (every | {1.0: {None: None, 0.05: ((), ())}}, r"\[\(1\.0, None\)\]"),
+                (every | {1.0: {None: ((), None), 0.05: ((), ())}}, r"\[\(1\.0, None\)\]"),
+                (every | {1.0: {None: (None, ()), 0.05: ((), ())}}, r"\[\(1\.0, None\)\]"),
+                (every | {1.0: {None: ((0.25,), ()), 0.05: ((), ())}}, r"\[\(1\.0, None\)\]"),
+                (every | {1.0: {None: ((), (), ()), 0.05: ((), ())}}, r"\[\(1\.0, None\)\]")):
+            with pytest.raises(ValueError, match=r"starts has no \(moves, days left\) for "
+                                                 rf"\(size cap, minimum\) {missing}"):
+                next(family.maturity_grid(self._BAND, 0.75, starts=starts))
+        # A cap the caller does not cover needs no starts
+        first = next(family.maturity_grid(self._BAND, 0.75, caps=(0.30, 1.0),
+                                          starts={0.30: every[0.30], 1.0: every[1.0]}))
+        assert first == (1, None, {0.30: backtester.SameMaturity(None, None),
+                                   1.0: backtester.SameMaturity(None, None)})
+
+    def test_sweep_takes_one_of_the_family_s_choices(self):
+        entries = self._trim_entries()
+        family = self._family(entries, self._SHORT)
+        assert family.sweep().rebalance_min_days_to_maturity is None
+        swept = family.sweep(rebalance_min_days_to_maturity=7, min_move=0.10,
+                             caps=(1.0, 0.05))
+        assert (swept.rebalance_min_days_to_maturity, swept.min_move, swept.caps,
+                swept.add_to_held, swept.trim_to_kelly) == (7, 0.10, (0.05, 1.0), True, True)
+        point = swept.cell(self._BAND, 0.75)[0.05]["all"]
+        self._same_run(point, self._fresh(entries, 0.75, 0.05, 0.10, 7))
+        for bad in (0, 2, 14, True, 7.0, "7", np.int64(7)):
+            with pytest.raises(ValueError, match="rebalance until .* is not one of"):
+                family.sweep(rebalance_min_days_to_maturity=bad)
+        # A family built without choices takes none
+        with pytest.raises(ValueError, match="is not one of"):
+            self._family(entries, (), maturity_days=()).sweep(rebalance_min_days_to_maturity=7)
+
+    @pytest.mark.parametrize("bad, words", [
+        ((7, 1), "ascending order"), ((1, 1), "ascending order"),
+        ((0,), 'cannot name "maturity"'), ((0, 7), 'cannot name "maturity"'),
+        ((None,), 'cannot name "maturity"'), ((2,), "must be 0, 1 or 7"),
+        ((14,), "must be 0, 1 or 7"), ((True,), "must be 0, 1 or 7"),
+        ((7.0,), "must be 0, 1 or 7"), (("7",), "must be 0, 1 or 7"),
+        ((np.int64(7),), "must be 0, 1 or 7")])
+    def test_a_family_s_choices_are_ascending_choices_that_hold_back(self, bad, words):
+        with pytest.raises(ValueError, match="maturity_days") as exc:
+            self._family(self._trim_entries(), (), maturity_days=bad)
+        assert words in str(exc.value)
+
+    def test_the_family_s_choices_are_config_s_less_maturity(self, monkeypatch):
+        assert backtester._resolve_maturity_days() == (1, 7)
+        assert backtester._resolve_maturity_days() == tuple(
+            days for days in config.REBALANCE_MATURITY_DAYS
+            if days != config.REBALANCE_MATURITY_DAYS[0])
+        # Read when called, from this module's own binding: config's is not it
+        with monkeypatch.context() as mp:
+            mp.setattr(backtester, "REBALANCE_MATURITY_DAYS", (0, 14, 3))
+            mp.setattr(config, "REBALANCE_MATURITY_DAYS", (0, 5))
+            assert backtester._resolve_maturity_days() == (3, 14)
+        for bad, words in (((0, 7.0), "each of REBALANCE_MATURITY_DAYS: .* must be"),
+                           ((0, True), "must be"), ((0, 7, 7), "names a value twice"),
+                           ([0, 7], "must be a tuple"), (7, "must be a tuple")):
+            with monkeypatch.context() as mp:
+                mp.setattr(backtester, "REBALANCE_MATURITY_DAYS", bad)
+                with pytest.raises(ValueError, match=words):
+                    backtester._resolve_maturity_days()
+
+    def test_a_same_maturity_names_the_run_it_repeats(self):
+        assert backtester.SameMaturity(0.05, 1) == backtester.SameMaturity(0.05, 1)
+        assert backtester.SameMaturity(0.05, None) != backtester.SameMaturity(0.05, 1)
+        assert backtester.SameMaturity(None, None) != backtester.SameMove(None)
+        assert backtester.SameMaturity(None, 7).min_days == 7
+        with pytest.raises(AttributeError):
+            backtester.SameMaturity(0.05, 1).min_days = 7
+
+
 @pytest.fixture(scope="class")
 def rebalance_run():
     """The golden band sweep with the Rebalance family, over a narrowed grid —
@@ -24425,8 +24967,9 @@ def rebalance_run():
     0.75, so the two floor-0 bands bind at the tiers: 4 bands x 3 k, two of
     the bands re-run with the tier floors off. Beside it: the same run with
     the flag off and with it left out, one without the size-cap sweep, one
-    without the band sweep and one with the family's minimum price movements
-    as well (move_sweep). Every simulation during the runs goes through a spy
+    without the band sweep, one with the family's minimum price movements
+    as well (move_sweep) and one with its "Rebalance until" choices
+    (maturity_sweep). Every simulation during the runs goes through a spy
     that records its keywords, and each run's INFO log is kept; the spy is
     undone before any cell is read, so the cells run the real function. The
     clock is frozen while the runs go, so every equity frame the tests
@@ -24479,12 +25022,15 @@ def rebalance_run():
         no_cap, _, _ = run(band_sweep=True, tier_off_sweep=True, rebalance_sweep=True)
         single, _, _ = run(band_sweep=False, rebalance_sweep=True)
         move, sims_move, msgs_move = run(rebalance_sweep=True, move_sweep=True, **every)
+        maturity, sims_maturity, msgs_maturity = run(rebalance_sweep=True, maturity_sweep=True,
+                                                     **every)
         mp.undo()
         yield SimpleNamespace(
             on=on, off=off, default=default, no_cap=no_cap, single=single, move=move,
-            sims_on=sims_on, sims_off=sims_off, sims_default=sims_default,
-            sims_move=sims_move, msgs_on=msgs_on, msgs_off=msgs_off, msgs_move=msgs_move,
-            start=golden._START)
+            maturity=maturity, sims_on=sims_on, sims_off=sims_off,
+            sims_default=sims_default, sims_move=sims_move, sims_maturity=sims_maturity,
+            msgs_on=msgs_on, msgs_off=msgs_off, msgs_move=msgs_move,
+            msgs_maturity=msgs_maturity, start=golden._START)
     finally:
         mp.undo()
         toggles.undo()
@@ -25014,6 +25560,123 @@ class TestRebalanceSweep:
                     kinds["point"] += 1
         assert kinds["same"] > 0 and kinds["point"] > 0
         assert sum(kinds.values()) == len(family.min_moves) * len(caps)
+        assert stats["same"] == kinds["same"]
+
+    def test_the_rebalance_until_choices_are_off_by_default(self, rebalance_run):
+        for function in (run_backtest_sweep, backtester._sweep_from_candidates):
+            default = inspect.signature(function).parameters["maturity_sweep"]
+            assert default.default is False and default.kind is default.KEYWORD_ONLY
+        for res in (rebalance_run.on, rebalance_run.no_cap, rebalance_run.single,
+                    rebalance_run.move):
+            assert res.rebalance_sweep.maturity_days == ()
+
+    def test_with_the_rebalance_until_choices_the_run_adds_no_simulation_line_or_figure(
+            self, rebalance_run):
+        assert rebalance_run.sims_maturity == rebalance_run.sims_off
+        maturity, off = rebalance_run.maturity, rebalance_run.off
+        assert self._trades(maturity.primary) == self._trades(off.primary)
+        pd.testing.assert_frame_equal(maturity.primary.equity_df, off.primary.equity_df)
+        # The family's lines are those of a run without the choices
+        assert [m for m in rebalance_run.msgs_maturity if m.startswith(self._REBALANCING)] == [
+            self._SETTING_ON, self._MOVES_OFF, self._SUMMARY]
+        assert self._others(rebalance_run.msgs_maturity) == self._others(rebalance_run.msgs_off)
+
+    def test_with_the_rebalance_until_choices_the_family_carries_config_s_less_maturity(
+            self, rebalance_run):
+        family = rebalance_run.maturity.rebalance_sweep
+        assert family.maturity_days == backtester._resolve_maturity_days() == (1, 7)
+        assert family.min_moves == ()
+        # Every other axis is the family's without them
+        assert dc_replace(family, maturity_days=()) == rebalance_run.on.rebalance_sweep
+        for tier in (True, False):
+            cs = family.sweep(tier_floors=tier, rebalance_min_days_to_maturity=7)
+            assert (cs.add_to_held, cs.trim_to_kelly, cs.rebalance_min_days_to_maturity,
+                    cs.min_move, cs.tier_floors, cs.caps) == (
+                True, True, 7, None, tier, family.caps)
+
+    @pytest.mark.parametrize("entry", ["run_backtest_sweep", "_sweep_from_candidates"])
+    def test_the_rebalance_until_choices_need_the_family(self, monkeypatch, caplog, entry):
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **k: pytest.fail("fetched"))
+        # Choices that would be refused are not even read: the pairing is checked first
+        monkeypatch.setattr(backtester, "REBALANCE_MATURITY_DAYS", (0, 7.0))
+        with caplog.at_level(logging.INFO), pytest.raises(
+                ValueError, match="maturity_sweep needs rebalance_sweep"):
+            if entry == "run_backtest_sweep":
+                run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                   start_date=date(2026, 1, 1), band_sweep=True,
+                                   cap_sweep=True, maturity_sweep=True)
+            else:
+                # Refused before the candidates are touched (None has none to read)
+                backtester._sweep_from_candidates(
+                    None, 10_000.0, interval_discount=None, sweep=False, spread_band=None,
+                    band_sweep=False, maturity_sweep=True)
+        # Refused before the run's first line
+        assert not caplog.records
+
+    @pytest.mark.parametrize("bad", [(0, 7.0), (0, True), (0, "7"), (0, 7, 7), 7])
+    def test_bad_rebalance_until_choices_are_refused_before_any_fetch(self, monkeypatch,
+                                                                       caplog, bad):
+        monkeypatch.setattr(backtester, "REBALANCE_MATURITY_DAYS", bad)
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **k: pytest.fail("fetched"))
+        with caplog.at_level(logging.INFO), pytest.raises(ValueError,
+                                                          match="REBALANCE_MATURITY_DAYS"):
+            run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                               start_date=date(2026, 1, 1), rebalance_sweep=True,
+                               maturity_sweep=True)
+        # Refused before the run's first line
+        assert not caplog.records
+        # Only a run that asks for them reads them
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        for options in ({}, {"rebalance_sweep": True}):
+            assert run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                      start_date=date(2026, 1, 1),
+                                      **options).rebalance_sweep is None
+
+    @pytest.mark.parametrize("tier", [True, False])
+    def test_every_choice_is_a_fresh_simulation_or_the_run_it_names(self, rebalance_run, tier):
+        # Every cell of maturity_grid, at two caps, against a fresh rebalancing
+        # simulation at its choice, from the runs at maturity the family's own
+        # sweep makes: a SameMaturity is the run it names, a point is the
+        # fresh run and differs from every run in hand no stricter
+        family = rebalance_run.maturity.rebalance_sweep
+        band = (family.bands if tier else family.off_bands)[0]
+        entries = (family.entries_by_band if tier else family.off_entries_by_band)[band]
+        end = (family.end_dates if tier else family.off_end_dates)[(band, 0.5, "all")]
+        caps = (family.caps[0], family.caps[-1])
+        base = family.sweep(tier_floors=tier, caps=caps).cell(band, 0.5)
+        starts = {cap: {None: (base[cap]["all"].moves, base[cap]["all"].rebalance_days_left)}
+                  for cap in caps}
+
+        def fresh(cap, days):
+            return backtester._simulate_at_discount(
+                entries, rebalance_run.start, 10_000.0, k=0.5, spread_band=band,
+                size_cap=cap, quiet=True, end_date=end, tier_floors=tier, add_to_held=True,
+                trim_to_kelly=True, rebalance_min_days_to_maturity=days)
+
+        hand = {cap: {None: base[cap]["all"]} for cap in caps}
+        kinds: Counter = Counter()
+        stats: dict = {}
+        for days, minimum, by_cap in family.maturity_grid(band, 0.5, tier_floors=tier,
+                                                          caps=caps, starts=starts,
+                                                          stats=stats):
+            assert minimum is None
+            for cap, cell in by_cap.items():
+                run = fresh(cap, days)
+                if isinstance(cell, backtester.SameMaturity):
+                    assert cell.min_move is None
+                    assert self._trades(run) == self._trades(hand[cap][cell.min_days])
+                    kinds["same"] += 1
+                else:
+                    assert (cell.rebalance_min_days_to_maturity, cell.add_to_held,
+                            cell.trim_to_kelly) == (days, True, True)
+                    assert self._trades(run) == self._trades(cell)
+                    assert all(self._trades(cell) != self._trades(point)
+                               for point in hand[cap].values())
+                    hand[cap][days] = cell
+                    kinds["point"] += 1
+        assert sum(kinds.values()) == len(family.maturity_days) * len(caps)
         assert stats["same"] == kinds["same"]
 
     def test_a_run_that_adds_and_trims_is_labelled_rebalancing(self, caplog):

@@ -4449,7 +4449,10 @@ class TestTimeSeriesKellyParity:
         tree = ast.parse(source)
         askers = {func.name for func in ast.walk(tree) if isinstance(func, ast.FunctionDef)
                   and _calls_to(func, "days_left_reached")}
-        assert askers == {"_simulate_at_discount", "planned_trims", "_far_enough"}
+        # ... and RebalanceSweep.maturity_grid's cover (its nested covers()),
+        # about the days of every add-on and trim of a run it already has
+        assert askers == {"_simulate_at_discount", "planned_trims", "_far_enough",
+                          "maturity_grid", "covers"}
         # _far_enough is that one call, on _days_left (its docstring, then the return)
         far = _def_named(source, "_far_enough")
         assert isinstance(far.body[0], ast.Expr) and len(far.body) == 2
@@ -4580,10 +4583,12 @@ class TestTimeSeriesKellyParity:
         [loop] = tested.generators
         assert (ast.unparse(loop.target), ast.unparse(loop.iter), loop.ifs) == (
             "move", "moves", [])
-        # Only the walk and the grid ask it (each named with the function it sits in)
+        # Only the walk and the two grids ask it (each named with the function it
+        # sits in): move_grid's cells_at, and maturity_grid's covers
         askers = {func.name for func in ast.walk(tree) if isinstance(func, ast.FunctionDef)
                   and _calls_to(func, "price_move_reached")}
-        assert askers == {"_simulate_at_discount", "planned_trims", "move_grid", "cells_at"}
+        assert askers == {"_simulate_at_discount", "planned_trims", "move_grid", "cells_at",
+                          "maturity_grid", "covers"}
 
         def rise_comparisons(source_tree: ast.AST) -> list[str]:
             """Every <, <=, > or >= with a side that names a price movement."""
@@ -4606,6 +4611,43 @@ class TestTimeSeriesKellyParity:
                         "def f(rise, min_rise):\n    return rise >= min_rise - 1e-6\n"):
             assert rise_comparisons(ast.parse(written)), written
         assert rise_comparisons(ast.parse("def f(min_move):\n    return min_move is None\n")) == []
+
+    def test_ast_a_run_stands_for_a_stricter_rebalance_until_through_the_walk_s_own_tests(self):
+        # RebalanceSweep.maturity_grid lets a run it already has stand for a
+        # stricter "Rebalance until" choice and minimum price movement only when
+        # every add-on and trim that run made would still be made there. Its
+        # cover asks config.price_move_reached about each of the run's moves and
+        # config.days_left_reached about each of its days left: the two
+        # functions the walk itself holds a trim and an add-on back with, so the
+        # grid and the walk cannot disagree at a boundary
+        assert backtester.price_move_reached is config.price_move_reached
+        assert backtester.days_left_reached is config.days_left_reached
+        tree = ast.parse(inspect.getsource(backtester))
+        family = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                      and node.name == "RebalanceSweep")
+        grid = next(node for node in family.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "maturity_grid")
+        cover = next(node for node in ast.walk(grid) if isinstance(node, ast.FunctionDef)
+                     and node.name == "covers")
+        # The cover is one return: both tests, over every record of the run
+        [returned] = [node for node in cover.body if isinstance(node, ast.Return)]
+        assert ast.unparse(returned.value) == (
+            "all((price_move_reached(move, min_move) for move in moves)) and "
+            "all((days_left_reached(left, min_days) for left in days_left))")
+        # ... and the only place the grid asks either test
+        for name in ("price_move_reached", "days_left_reached"):
+            assert len(_calls_to(grid, name)) == len(_calls_to(cover, name)) == 1
+        # ... nor does it compare a minimum, a move or a day count itself
+        assert not [ast.unparse(node) for node in ast.walk(grid)
+                    if isinstance(node, ast.Compare)
+                    and any(isinstance(op, (ast.Lt, ast.LtE, ast.Gt, ast.GtE))
+                            for op in node.ops)]
+        # Every cell it names is a run it was handed (starts) or yielded as a
+        # point: a SameMaturity is built only from a minimum and None (the
+        # runs at maturity) or from the cell's own minimum and choice
+        built = [ast.unparse(node) for node in ast.walk(grid) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == "SameMaturity"]
+        assert built == ["SameMaturity(min_move, None)", "SameMaturity(min_move, min_days)"]
 
     def test_ast_the_backtest_reads_the_sell_rule_where_live_code_can(self):
         # The sell rule's arithmetic lives in config, scanner and historical,

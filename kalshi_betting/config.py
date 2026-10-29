@@ -976,11 +976,11 @@ BACKTEST_SWEEP_FILENAME = "backtest_sweep.pkl.gz"
 # A rebuild refuses a file with any other tag; change it whenever the line's
 # keys, the pickled inputs' keys or the fields of the classes pickled in them
 # (BacktestSweep and the lazy families it holds) change, so an older file is
-# refused rather than misread. v5: SweepPoint and CapSweep gained
-# rebalance_min_days_to_maturity ("Rebalance until") and SweepPoint the days
-# left at each add-on and trim made (rebalance_days_left); v4 files, from
-# before, are refused.
-BACKTEST_SWEEP_FORMAT = "backtest-sweep-v5"
+# refused rather than misread. v6: RebalanceSweep gained maturity_days (the
+# "Rebalance until" choices it covers) and BacktestSweep
+# live_rebalance_min_days_to_maturity (the saved live defaults' setting);
+# v5 files, from before, are refused.
+BACKTEST_SWEEP_FORMAT = "backtest-sweep-v6"
 
 # The most bytes a rebuild reads for the saved sweep file's first line (the
 # JSON one): the real line is a few hundred bytes, so a file that runs past
@@ -4697,9 +4697,10 @@ def days_left_reached(left: int | None, min_days: int | None) -> bool:
     close date cannot be read is not rebalanced under a minimum. Live
     rebalancing asks it (seller._too_near_maturity), and so does the
     backtest's walk (backtester._simulate_at_discount, on the days
-    _rebalance_days_left gives) and its take-profit sale's minimum of days
-    (backtester._far_enough); a live sale's minimum applies the same test in
-    its own code (seller._plan_one).
+    _rebalance_days_left gives), its take-profit sale's minimum of days
+    (backtester._far_enough) and RebalanceSweep.maturity_grid, of the days a
+    run recorded, to tell which of its runs are one; a live sale's minimum
+    applies the same test in its own code (seller._plan_one).
 
     Args:
         left (int | None): Whole days from today to the position's latest close
