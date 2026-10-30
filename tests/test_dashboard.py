@@ -33,6 +33,7 @@ import ast
 import base64
 import collections
 import dataclasses
+import gc
 import gzip
 import hashlib
 import html
@@ -46,6 +47,7 @@ import re
 import shutil
 import subprocess
 import warnings
+import weakref
 from array import array
 from collections import Counter
 from datetime import UTC, date, datetime, timedelta
@@ -11919,17 +11921,18 @@ def _rb_page(monkeypatch, tmp_path, sweep, series=_FLT_SERIES_TIERS) -> str:
 
 
 def _rb_payload(sweep: BacktestSweep, state: str = "not simulated",
-                move_state: str = "not simulated") -> tuple:
+                move_state: str = "not simulated",
+                maturity_state: str = "not simulated") -> tuple:
     """(the grid walked, the chunk visitor, the base block) as generate_dashboard
-    builds them for a sweep, with the Rebalance state (and the state of its
-    minimum price movements) the page would pass."""
+    builds them for a sweep, with the Rebalance state (and the states of its
+    minimum price movements and "Rebalance until" choices) the page would pass."""
     trades, curve = sweep.primary.trades, sweep.primary.equity_df
     source = dashboard._grid_source(sweep, trades, curve, 0.75)
     walked, chunker, kd = dashboard._build_filter_grid(
         source, trades, curve, 0.75, _FLT_START, 1000.0, _FLT_SERIES_TIERS)
     base = dashboard._filter_payload(walked, chunker, _FLT_START, 1000.0, _FLT_SERIES_TIERS,
                                      kd=kd.payload(), rebalance_state=state,
-                                     move_state=move_state)
+                                     move_state=move_state, maturity_state=maturity_state)
     return walked, chunker, base
 
 
@@ -11967,11 +11970,25 @@ class _FakeRebalanceSweep:
     simulated, a SameMove as one "same". `move_raise` = (cell, step) makes
     that cell's read raise as that step is read (step 0: the first).
     `asked_moves` records each move_grid() call as (cell, caps, start).
+
+    With `maturity_days` it also carries the family's "Rebalance until"
+    choices and maturity_grid(), a generator as the real one is, yielding
+    every choice ascending and in each no minimum, then every minimum.
+    `maturities` scripts it: (tier floors off, band, k) -> {(choice,
+    minimum): {cap: SweepPoint | SameMaturity}}, or a callable returning
+    that dict, called as the step is read; a cap, a step or a whole cell
+    left out repeats the run at "maturity" with that minimum
+    (SameMaturity(minimum, None)). Like the real one it refuses `starts`
+    that lack a cap asked for or one of its minimums, or hold None for a
+    run's moves or days left, and adds what it yields to `stats`.
+    `maturity_raise` = (cell, step) makes that cell's read raise as that
+    step is read (step 0: the first). `asked_maturities` records each call
+    as (cell, caps, starts).
     """
 
     def __init__(self, sweeps: dict, *, bands=(_KC_B0, _KC_B1), off_bands=(),
                  ks=(0.6, 0.75), caps=(0.05, 0.2, 1.0), min_moves=(), moves=None,
-                 move_raise=None):
+                 move_raise=None, maturity_days=(), maturities=None, maturity_raise=None):
         self.sweeps = sweeps
         self.bands, self.off_bands, self.ks, self.caps = bands, off_bands, ks, caps
         self.asked: list = []
@@ -11979,6 +11996,10 @@ class _FakeRebalanceSweep:
         self.moves = moves or {}
         self.move_raise = move_raise
         self.asked_moves: list = []
+        self.maturity_days = tuple(maturity_days)
+        self.maturities = maturities or {}
+        self.maturity_raise = maturity_raise
+        self.asked_maturities: list = []
 
     def sweep(self, *, tier_floors=True):
         self.asked.append(not tier_floors)
@@ -12002,6 +12023,34 @@ class _FakeRebalanceSweep:
             stats["same"] += same
             stats["simulated"] += len(by_cap) - same
             yield move, by_cap
+
+    def maturity_grid(self, band, k, *, tier_floors=True, caps=None, starts=None, stats=None):
+        cell = (not tier_floors, band, k)
+        self.asked_maturities.append((cell, tuple(caps), starts))
+        minimums = (None, *self.min_moves)
+        missing = [(cap, m) for cap in caps for m in minimums
+                   if (starts.get(cap) or {}).get(m) is None or None in starts[cap][m]]
+        if missing:
+            raise ValueError(f"starts has no (moves, days left) for (size cap, minimum) "
+                             f"{missing!r}")
+        for key in ("simulated", "reused", "same"):
+            stats.setdefault(key, 0)
+        steps = self.maturities.get(cell, {})
+        i = 0
+        for days in self.maturity_days:
+            for minimum in minimums:
+                if self.maturity_raise == (cell, i):
+                    raise RuntimeError("the Rebalance until simulation failed")
+                scripted = steps.get((days, minimum), {})
+                if callable(scripted):
+                    scripted = scripted()
+                by_cap = {cap: scripted.get(cap, backtester.SameMaturity(minimum, None))
+                          for cap in caps}
+                same = sum(isinstance(e, backtester.SameMaturity) for e in by_cap.values())
+                stats["same"] += same
+                stats["simulated"] += len(by_cap) - same
+                yield days, minimum, by_cap
+                i += 1
 
     def entry_events(self):
         return {event for capped in self.sweeps.values() for event in capped.entry_events()}
@@ -13062,16 +13111,726 @@ class TestMoveView:
         assert data["grid_move_off"][1] == data["grid_move"][1]
 
 
+# The "Rebalance until" choices _kc_sweep_until's family carries
+_UT_DAYS = (1, 7)
+_UT_WARNING = ('A "Rebalance until" simulation failed; the filter bar\'s "Rebalance until" '
+               'select stays disabled')
+# The days left _kc_sweep_until records beside each move of a run move_grid
+# simulates: the 20% cap's 10c run trimmed with 3 days left, the tier-off 5c
+# run with 4
+_UT_MOVE_DAYS = {0.30: 3, 0.20: 4}
+
+
+def _ut_point(like: SweepPoint, trades: list, days: int, min_move: float | None = None,
+              moves: tuple = (), days_left: tuple = ()) -> SweepPoint:
+    """`like`'s scenario as a run that rebalances only with at least `days`
+    days left (and, with min_move, after that price move): its own trade list
+    and curve, and the moves and days left behind the add-ons and trims it
+    still made."""
+    curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+    return dataclasses.replace(like, trades=trades, equity_df=curve, min_move=min_move,
+                               rebalance_min_days_to_maturity=days, moves=moves,
+                               rebalance_days_left=days_left)
+
+
+def _ut_trimmed(trades: list) -> list:
+    """A list whose first pair was sold down by another amount than _rb_split
+    and _rb_resplit sell it by: no other scenario trades it."""
+    return [_kc_resized(trades[0], 1), _kc_resized(trades[0], 4), *trades[1:]]
+
+
+def _kc_sweep_until(base: BacktestSweep | None = None, *, min_moves=_MV_MOVES,
+                    maturity_days=_UT_DAYS, scripted: bool = True, raise_on=None,
+                    move_raise=None, maturity_raise=None) -> BacktestSweep:
+    """
+    _kc_sweep_move() whose family also carries "Rebalance until" choices.
+
+    Every rebalancing point records the days left beside each of its moves:
+    (5,) at the 5% cap and (10, 3) at the 20% cap of (0-1, k 0.75), (20,) at
+    every cap of (0.3-0.6, k 0.75) and (4,) at every cap with the tier
+    floors off; and so does every run move_grid simulates (_UT_MOVE_DAYS).
+    Unless `scripted` is False (every step then repeats the run at maturity
+    with its minimum, SameMaturity(minimum, None)), the family's
+    maturity_grid reads, at (0-1, k 0.75):
+      * tier floors on. 20% cap: 7 days holds back the trim made with 3
+        days left, a run of its own (a list no other scenario trades) that
+        5c repeats; at 10c it holds back the 10c run's one trim, which
+        leaves the plain run's list, and 25c repeats that. 5% cap: 7 days
+        holds back its one trim (5 days left), the plain run's list, which
+        5c and 10c repeat; 25c is the run at maturity at 25c. Every 1-day
+        step, and the uncapped run (which made no trade on a held pair),
+        repeats the run at maturity;
+      * tier floors off: 7 days is one run every cap shares (again a list
+        no other scenario trades), which every minimum repeats.
+    Every other cell repeats its runs at maturity at every step (the
+    (0.3-0.6, 0.75) add-on had 20 days left). `min_moves` and `move_raise`
+    are _kc_sweep_move's, `raise_on` _kc_sweep_rebalance's; `maturity_raise`
+    is _FakeRebalanceSweep's.
+    """
+    sweep = _kc_sweep_move(base, min_moves=min_moves, raise_on=raise_on,
+                           move_raise=move_raise)
+    family = sweep.rebalance_sweep
+    same = backtester.SameMaturity
+    for off, capped in family.sweeps.items():
+        for key, point in list(capped.points.items()):
+            days = (4,) if off else {(_KC_B0, 0.75, 0.05): (5,),
+                                     (_KC_B0, 0.75, 0.2): (10, 3)}.get(
+                key, (20,) if key[:2] == (_KC_B1, 0.75) else ())
+            capped.points[key] = dataclasses.replace(point, rebalance_days_left=days)
+    # The runs move_grid simulates, each object once (one point may stand at
+    # several caps)
+    dated: dict = {}
+    for steps in family.moves.values():
+        for by_cap in steps:
+            for cap, entry in by_cap.items():
+                if isinstance(entry, SweepPoint):
+                    if id(entry) not in dated:
+                        dated[id(entry)] = dataclasses.replace(
+                            entry, rebalance_days_left=tuple(_UT_MOVE_DAYS[m]
+                                                             for m in entry.moves))
+                    by_cap[cap] = dated[id(entry)]
+    maturities: dict = {}
+    if scripted:
+        plain = sweep.cap_sweep.points
+        untouched = {cap: (p["all"] if isinstance(p, dict) else p).trades
+                     for cap in (0.05, 0.2) for p in [plain[(_KC_B0, 0.75, cap)]]}
+        on = family.sweeps[False].points
+        seven = _ut_point(on[(_KC_B0, 0.75, 0.2)], _ut_trimmed(untouched[0.2]), 7,
+                          moves=(0.07,), days_left=(10,))
+        maturities[(False, _KC_B0, 0.75)] = {
+            (7, None): {0.2: seven, 0.05: _ut_point(on[(_KC_B0, 0.75, 0.05)],
+                                                    untouched[0.05], 7)},
+            (7, 0.05): {0.2: same(None, 7), 0.05: same(None, 7)},
+            (7, 0.10): {0.2: _ut_point(on[(_KC_B0, 0.75, 0.2)], untouched[0.2], 7, 0.10),
+                        0.05: same(None, 7)},
+            (7, 0.25): {0.2: same(0.10, 7)}}
+        if True in family.sweeps:
+            off_trades = sweep.tier_off_scenarios[0].trades
+            shared = _ut_point(family.sweeps[True].points[(_KC_B0, 0.75, 0.2)],
+                               _ut_trimmed([*off_trades, _rb_added(off_trades[0])]), 7)
+            maturities[(True, _KC_B0, 0.75)] = {
+                (7, None): dict.fromkeys(family.caps, shared),
+                **{(7, move): dict.fromkeys(family.caps, same(None, 7))
+                   for move in min_moves}}
+    family.maturity_days = tuple(maturity_days)
+    family.maturities = maturities
+    family.maturity_raise = maturity_raise
+    return sweep
+
+
+def _ut_warnings(caplog) -> list:
+    """Every WARNING record about the "Rebalance until" choices."""
+    return [r for r in caplog.records
+            if r.levelno == logging.WARNING and "Rebalance until" in r.getMessage()]
+
+
+# The keys of the base block that carry the "Rebalance until" data
+_UT_KEYS = ("maturity", "grid_maturity", "grid_maturity_off", "maturity_state")
+
+
+class TestUntilView:
+    """The page's data for the Rebalance family's "Rebalance until" choices:
+    the walk's last phase reads every rebalancing scenario again at each
+    choice and minimum, starting from the records of the runs it has read;
+    a run of its own gets a chunk, a run that repeats another stores that
+    run's chunk id, and the base block carries them, while the select stays
+    shut."""
+
+    # (0-1, k 0.75) of _kc_sweep_until(), per cap: [choice][minimum place]
+    # (no minimum, 5c, 10c, 25c). At 1 day every step is the movement view's
+    # cell (the 5% cap's 6, 6, 6, 1 and the 20% cap's 5, 5, 8, 8: TestMoveView._CELL
+    # beside the Rebalance grid's 6 and 5). At 7 days the 5% cap trades the
+    # plain run's list (chunk 1) at every minimum, and the 20% cap a run of
+    # its own (the first chunk packed for a choice, 9), which 5c repeats, then
+    # the plain run's list (the page's own, chunk 0) at 10c and 25c. The
+    # uncapped run changes at no step
+    _CELL = [[[6, 6, 6, 1], [1, 1, 1, 1]], [[5, 5, 8, 8], [9, 9, 0, 0]], None]
+
+    def test_the_choices_join_the_grid_with_their_family(self):
+        sweep = _kc_sweep_until()
+        source = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
+                                        0.75)
+        assert source.maturity_days == _UT_DAYS and source.maturity_cell is not None
+        assert source.maturity_stats == {}
+        # Attaching them reads nothing
+        assert sweep.rebalance_sweep.asked_maturities == []
+
+    @pytest.mark.parametrize("how", ["none", "no such attribute"])
+    def test_a_family_without_choices_has_no_such_view(self, how):
+        sweep = _kc_sweep_move(_kc_sweep_tiers())
+        if how == "no such attribute":
+            # A stand-in that knows nothing of them reads as a family with none
+            del sweep.rebalance_sweep.maturity_days
+        walked, _, base = _rb_payload(sweep)
+        assert walked.maturity_days == () and walked.maturity_cell is None
+        assert base["maturity"] == [] and base["maturity_state"] == "not simulated"
+        assert base["grid_maturity"] is None and base["grid_maturity_off"] is None
+        # The movement view is there as before
+        assert base["move_state"] == "shown" and base["grid_move"] is not None
+        assert sweep.rebalance_sweep.asked_maturities == []
+
+    def test_a_choice_is_its_own_chunk_or_the_chunk_of_the_run_it_repeats(self):
+        sweep = _kc_sweep_until()
+        _, _, base, chunks = _flt_payload(sweep)
+        # The page's other grids are what they are without the choices
+        assert base["grid"] == _KC_GRID and base["grid_rebalance"] == _RB_GRID
+        assert base["grid_move"][0][1] == TestMoveView._CELL
+        assert base["maturity_state"] == "shown"
+        # Everywhere but (0-1, 0.75) every step repeats the movement view
+        assert base["grid_maturity"] == [[[None, None, None], self._CELL],
+                                         [[None, None, None], [None, None, None]]]
+        # One list no other scenario trades: one chunk more than the movement view's 9
+        assert len(chunks) == 10
+        seven = sweep.rebalance_sweep.maturities[(False, _KC_B0, 0.75)][(7, None)][0.2]
+        assert chunks[9]["list"]["views"]["all"]["n"] == len(seven.trades) == 4
+        # ... priced at its cell's k, on its own trades
+        assert chunks[9]["list"]["kx"] == pytest.approx(
+            dashboard._kelly_points(seven.trades, 0.75)[0])
+        # This page has no tier-off view, so no such half
+        assert base["grid_maturity_off"] is None
+
+    def test_the_payload_names_every_choice(self):
+        _, _, base = _rb_payload(_kc_sweep_until())
+        assert base["maturity"] == [
+            {"label": "1 day before", "phrase": ", until 1 day before maturity", "value": 1},
+            {"label": "7 days before", "phrase": ", until 7 days before maturity", "value": 7}]
+        # The words a run with that choice is labelled with in the backtest's
+        # log, and the live "Live settings:" line's
+        for entry in base["maturity"]:
+            assert entry["phrase"] == backtester._until_label(entry["value"])
+            assert entry["label"] + " maturity" == config._rebalance_until_text(entry["value"])
+
+    def test_the_records_are_each_run_s_own_and_never_a_point(self):
+        sweep = _kc_sweep_until()
+        _rb_payload(sweep)
+        family = sweep.rebalance_sweep
+        asked = {cell: (caps, starts) for cell, caps, starts in family.asked_maturities}
+        # Each cell with a rebalancing point once, in the Rebalance walk's
+        # order, over the page's caps; (0.3-0.6, 0.60) was never simulated
+        assert [cell for cell, _, _ in family.asked_maturities] == [
+            (False, _KC_B0, 0.6), (False, _KC_B0, 0.75), (False, _KC_B1, 0.75)]
+        assert all(caps == (0.05, 0.2, 1.0) for caps, _ in asked.values())
+        # At every minimum, the records of that minimum's run: a point's own,
+        # and for a repeat the run it names (SameMove(None): the Rebalance
+        # run; SameMove(0.10): the 10c run)
+        nothing = ((), ())
+        assert asked[(False, _KC_B0, 0.75)][1] == {
+            0.05: {None: ((0.12,), (5,)), 0.05: ((0.12,), (5,)), 0.10: ((0.12,), (5,)),
+                   0.25: nothing},
+            0.2: {None: ((0.07, 0.30), (10, 3)), 0.05: ((0.07, 0.30), (10, 3)),
+                  0.10: ((0.30,), (3,)), 0.25: ((0.30,), (3,))},
+            1.0: dict.fromkeys((None, *_MV_MOVES), nothing)}
+        assert asked[(False, _KC_B1, 0.75)][1] == dict.fromkeys(
+            (0.05, 0.2, 1.0), dict.fromkeys((None, *_MV_MOVES), ((0.40,), (20,))))
+        # Tuples the points held, never a point: only one cell's points are alive
+        for _caps, starts in asked.values():
+            for by_min in starts.values():
+                for record in by_min.values():
+                    assert all(type(part) is tuple for part in record), record
+
+    def test_with_no_minimums_each_choice_has_one_id(self):
+        sweep = _kc_sweep_until(min_moves=())
+        _, _, base, chunks = _flt_payload(sweep)
+        assert base["moves"] == [] and base["move_state"] == "not simulated"
+        assert base["grid_move"] is None and base["maturity_state"] == "shown"
+        # The records hold the Rebalance run's alone
+        family = sweep.rebalance_sweep
+        assert family.asked_moves == []
+        for _cell, _caps, starts in family.asked_maturities:
+            assert all(set(by_min) == {None} for by_min in starts.values())
+        # One id per choice: the 7-day runs of the 5% and 20% caps, and
+        # nothing changes with no cap
+        assert base["grid_maturity"][0][1] == [[[6], [1]], [[5], [8]], None]
+        assert len(chunks) == 9
+        assert base["grid_maturity"][1] == [[None] * 3, [None] * 3]
+
+    def test_a_grid_no_choice_changes_is_still_the_view(self):
+        # No choice holds any add-on or trim back: every cell is null, and
+        # that is a result, not a missing view
+        sweep = _kc_sweep_until(scripted=False)
+        _, clean, _ = _rb_payload(_kc_sweep_move())
+        _, chunker, base = _rb_payload(sweep)
+        assert base["maturity_state"] == "shown" and len(base["maturity"]) == 2
+        assert base["grid_maturity"] == [[[None] * 3, [None] * 3], [[None] * 3, [None] * 3]]
+        assert len(chunker.chunks) == len(clean.chunks)
+        assert len(sweep.rebalance_sweep.asked_maturities) == 3
+
+    def test_the_choices_chunks_come_after_every_other_chunk(self):
+        # A page with the choices holds the page without them, chunk for
+        # chunk, then its own; and nothing else in its base block changes
+        _, clean_chunker, clean = _rb_payload(_kc_sweep_move(_kc_sweep_tiers()))
+        _, chunker, base = _rb_payload(_kc_sweep_until(_kc_sweep_tiers()))
+        assert set(base) == set(clean)
+        for key in clean:
+            if key not in (*_UT_KEYS, "rows", "inline_chunks"):
+                assert base[key] == clean[key], key
+        packed = len(clean_chunker.chunks)
+        assert base["rows"][:len(clean["rows"])] == clean["rows"]
+        assert _rb_chunks(chunker)[:packed] == _rb_chunks(clean_chunker)
+        # One run of its own in each of the two settings, packed last
+        known = set().union(*(_rb_ids(clean[key]) for key in (
+            "grid", "grid_off", "grid_rebalance", "grid_rebalance_off")))
+        known |= {cid for key in ("grid_move", "grid_move_off") for band in clean[key]
+                  for cells in band for cell in cells if cell is not None for cid in cell}
+        shown = {cid for key in ("grid_maturity", "grid_maturity_off") for band in base[key]
+                 for cells in band for cell in cells if cell is not None
+                 for row in cell for cid in row}
+        assert sorted(shown - known) == list(range(packed, packed + 2))
+        assert len(chunker.chunks) == packed + 2
+
+    def test_each_half_appears_exactly_with_its_rebalance_twin(self):
+        sweep = _kc_sweep_until(_kc_sweep_tiers())
+        _, _, base = _rb_payload(sweep)
+        assert base["grid_maturity_off"] is not None
+        assert {cell[0] for cell, _, _ in sweep.rebalance_sweep.asked_maturities} == {
+            False, True}
+        # Tier floors off, at the band the tiers bind at: one run every cap
+        # shares at 7 days, at every minimum, and not the movement view's
+        cells = base["grid_maturity_off"][0][1]
+        assert len({str(cell) for cell in cells}) == 1
+        assert cells[0][1] == [cells[0][1][0]] * 4
+        assert cells[0][1][0] not in _rb_ids(base["grid_rebalance_off"])
+        # ... while 1 day there is the movement view: the Rebalance cell at no
+        # minimum, then each minimum's run
+        assert cells[0][0] == [base["grid_rebalance_off"][0][1][0],
+                               *base["grid_move_off"][0][1][0]]
+        # k 0.60 there changes at no step
+        assert base["grid_maturity_off"][0][0] == [None] * 3
+        # A band the tiers never bind at reads its tier-on row
+        assert base["grid_maturity_off"][1] == base["grid_maturity"][1]
+        # Without the tier-floors-off view: no tier-off half, none of it read
+        sweep = _kc_sweep_until()
+        _, _, base = _rb_payload(sweep)
+        assert base["grid_maturity_off"] is None and base["grid_maturity"] is not None
+        assert {cell[0] for cell, _, _ in sweep.rebalance_sweep.asked_maturities} == {False}
+
+    def test_a_band_the_tiers_never_bind_at_reads_its_tier_on_choices(self):
+        # Its tier-floors-off view IS its tier-on run at every choice too. Here
+        # 7 days changes its 5% cap's run (the run without rebalancing), so its
+        # tier-on row is not all null, and its tier-off row is that same row
+        sweep = _kc_sweep_until(_kc_sweep_tiers())
+        family = sweep.rebalance_sweep
+        plain = sweep.cap_sweep.points[(_KC_B1, 0.75, 0.05)]
+        held = family.sweeps[False].points[(_KC_B1, 0.75, 0.05)]
+        family.maturities[(False, _KC_B1, 0.75)] = {(7, None): {0.05: _ut_point(
+            held, (plain["all"] if isinstance(plain, dict) else plain).trades, 7)}}
+        _, _, base = _rb_payload(sweep)
+        assert base["tier_binds"] == [True, False]
+        row = base["grid_maturity"][1]
+        assert row[1][0] is not None
+        assert base["grid_maturity_off"][1] == row
+
+    def test_no_point_outlives_its_step(self, monkeypatch):
+        # Only one step's points are alive at a time: once the walk asks for
+        # the next minimum or choice, no point of the step before is held. The
+        # stand-in hands each point over as a fresh copy, after the caps that
+        # repeat a run, so nothing but the walk could still hold it
+        sweep = _kc_sweep_until()
+        family = sweep.rebalance_sweep
+        held, handed = [], Counter()
+
+        def watched(read, kind):
+            def grid(*args, **kwargs):
+                for *step, by_cap in read(*args, **kwargs):
+                    points = {cap: dataclasses.replace(entry) for cap, entry in by_cap.items()
+                              if isinstance(entry, SweepPoint)}
+                    refs = [weakref.ref(point) for point in points.values()]
+                    by_cap = {**{cap: entry for cap, entry in by_cap.items()
+                                 if cap not in points}, **points}
+                    handed[kind] += len(points)
+                    del points
+                    yield (*step, by_cap)
+                    del by_cap
+                    gc.collect()
+                    held.extend((kind, *step) for ref in refs if ref() is not None)
+            return grid
+
+        monkeypatch.setattr(family, "move_grid", watched(family.move_grid, "move"))
+        monkeypatch.setattr(family, "maturity_grid",
+                            watched(family.maturity_grid, "maturity"))
+        _rb_payload(sweep)
+        assert handed["move"] > 0 and handed["maturity"] > 0
+        assert held == []
+
+    def test_a_whole_page_carries_the_view(self, monkeypatch, tmp_path):
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_until())
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        assert data["maturity_state"] == "shown"
+        assert [entry["label"] for entry in data["maturity"]] == ["1 day before",
+                                                                  "7 days before"]
+        assert data["grid_maturity"][0][1] == self._CELL
+        assert sorted(chunks) == list(range(10)) and data["inline_chunks"] == 10
+        # A family that carries no choice says so
+        data = TestFilterPage._data(_rb_page(monkeypatch, tmp_path, _kc_sweep_move()))
+        assert data["maturity_state"] == "not simulated" and data["maturity"] == []
+        assert data["grid_maturity"] is None and data["grid_maturity_off"] is None
+
+    def test_without_the_rebalance_view_the_payload_passes_the_state_on(self):
+        for state in ("not simulated", "unavailable"):
+            _, _, base = _rb_payload(_kc_sweep(), maturity_state=state)
+            assert base["maturity_state"] == state and base["grid_maturity"] is None
+            assert base["maturity"] == []
+        # With the view, the state handed in is not read
+        _, _, base = _rb_payload(_kc_sweep_until(), maturity_state="unavailable")
+        assert base["maturity_state"] == "shown"
+
+    def test_a_choice_s_curve_is_cut_to_the_page_s_axis(self, monkeypatch):
+        # A run simulated on a later UTC day runs a day past the page's dates
+        sweep = _kc_sweep_until()
+        steps = sweep.rebalance_sweep.maturities[(False, _KC_B0, 0.75)]
+        axis_end = pd.Timestamp(sweep.primary.equity_df["date"].iloc[-1])
+        seven = steps[(7, None)][0.2]
+        late = backtester._build_equity_curve(
+            seven.trades, _FLT_START, 1000.0,
+            end_date=(axis_end + pd.Timedelta(days=1)).date())
+        assert pd.Timestamp(late["date"].iloc[-1]) > axis_end
+        steps[(7, None)][0.2] = dataclasses.replace(seven, equity_df=late)
+        ends: list = []
+        real = dashboard._ChunkVisitor.maturity
+
+        def spy(self, bi, ki, ci, di, mi, entry, **kw):
+            if isinstance(entry, SweepPoint):
+                ends.append(pd.Timestamp(entry.equity_df["date"].iloc[-1]))
+            real(self, bi, ki, ci, di, mi, entry, **kw)
+        monkeypatch.setattr(dashboard._ChunkVisitor, "maturity", spy)
+        _, _, base = _rb_payload(sweep)
+        assert len(ends) == 3 and all(day <= axis_end for day in ends)
+        assert base["grid_maturity"][0][1] == self._CELL
+
+    def test_each_step_hands_over_the_primary_cap_first(self, monkeypatch):
+        # The cap order of every other kind of cell: the run's own 20%, then the rest
+        handed: list = []
+        real = dashboard._ChunkVisitor.maturity
+
+        def spy(self, bi, ki, ci, di, mi, entry, **kw):
+            handed.append((bi, ki, di, mi, ci))
+            real(self, bi, ki, ci, di, mi, entry, **kw)
+        monkeypatch.setattr(dashboard._ChunkVisitor, "maturity", spy)
+        _rb_payload(_kc_sweep_until())
+        # (0-1, 0.60) first, one step at a time: each choice, and in it no
+        # minimum, then each minimum
+        assert handed[:6] == [(0, 0, 0, 0, 1), (0, 0, 0, 0, 0), (0, 0, 0, 0, 2),
+                              (0, 0, 0, 1, 1), (0, 0, 0, 1, 0), (0, 0, 0, 1, 2)]
+        assert [step[2:4] for step in handed[:24:3]] == [
+            (di, mi) for di in range(2) for mi in range(4)]
+        # 3 cells x 2 choices x 4 minimums x 3 caps
+        assert len(handed) == 72
+
+    # The memo test's three cases: (choices, minimums, tier-off view, the two
+    # steps handed the same list object: (tier floors off, choice, minimum))
+    _MEMO = {
+        "the choice": ((1, 7), (), False, ((False, 1, None), (False, 7, None))),
+        "the minimum": ((7,), _MV_MOVES, False, ((False, 7, None), (False, 7, 0.05))),
+        "the tier floors": ((7,), (), True, ((False, 7, None), (True, 7, None))),
+    }
+
+    @pytest.mark.parametrize("case", list(_MEMO))
+    def test_a_list_s_key_is_worked_out_again_at_every_step(self, case):
+        # One step's lists are gone before the next step's are made, so a new
+        # list can sit where an old one did. Here the very same list object,
+        # refilled, is handed at two steps in a row of one (band, k) cell: a
+        # key remembered for it at one step must not be read at the other,
+        # whichever of the choice, the minimum or the Tier floors setting
+        # tells the two steps apart
+        days, moves, tiers, (first, second) = self._MEMO[case]
+        sweep = _kc_sweep_until(_kc_sweep_tiers() if tiers else None, min_moves=moves,
+                                maturity_days=days, scripted=False)
+        family = sweep.rebalance_sweep
+        plain = sweep.cap_sweep.points[(_KC_B0, 0.75, 0.2)]
+        plain = (plain["all"] if isinstance(plain, dict) else plain).trades
+        refills = {first: _ut_trimmed(plain),
+                   second: [*plain, _rb_added(plain[0]), _rb_added(plain[1])]}
+        assert len(refills[first]) != len(refills[second])
+        listed: list = []
+        like = family.sweeps[False].points[(_KC_B0, 0.75, 0.2)]
+
+        def step(at):
+            def handed():
+                # Refilled as the step is read, after the earlier step was packed
+                listed[:] = refills[at]
+                return {0.2: _ut_point(like, listed, at[1], at[2])}
+            return handed
+        for at in (first, second):
+            family.maturities.setdefault((at[0], _KC_B0, 0.75), {})[at[1:]] = step(at)
+        _, _, base, chunks = _flt_payload(sweep, series=_FLT_SERIES_TIERS)
+        ids = []
+        for off, choice, move in (first, second):
+            cell = base["grid_maturity_off" if off else "grid_maturity"][0][1][1]
+            ids.append(cell[days.index(choice)][0 if move is None else moves.index(move) + 1])
+        # Two chunks, each its own step's list
+        assert ids[0] != ids[1]
+        for cid, at in zip(ids, (first, second), strict=True):
+            assert chunks[cid]["list"]["views"]["all"]["n"] == len(refills[at])
+
+    def test_the_log_counts_what_the_choices_cost(self, caplog):
+        with caplog.at_level(logging.INFO):
+            _rb_payload(_kc_sweep_until(_kc_sweep_tiers()))
+        lines = [r.getMessage() for r in caplog.records
+                 if 'read from the "Rebalance until" choices' in r.getMessage()]
+        # A line per cell (few cells), setting by setting. Tier floors on:
+        # four cells, one never simulated; of the 72 entries read, three are
+        # runs of their own
+        assert lines[3] == (
+            'Dashboard: 4/4 band x k cells read from the "Rebalance until" choices (3 cap '
+            "points simulated, 0 shared across caps, 69 the same run as fewer days or a "
+            "lower minimum so far)")
+        # Tier floors off: the binding band's two cells, 48 entries, three of
+        # them the one run every cap shares at 7 days
+        assert lines[5] == (
+            'Dashboard: 2/2 binding band x k cells read from the "Rebalance until" choices '
+            "with the tier floors off (3 cap points simulated, 0 shared across caps, 45 the "
+            "same run as fewer days or a lower minimum so far)")
+        assert len(lines) == 6
+
+    def test_the_walk_reads_the_choices_after_every_move_cell(self):
+        # They are the last cells to pack a chunk, which is what lets their
+        # chunks be dropped without cutting into any other family's
+        sweep = _kc_sweep_until(_kc_sweep_tiers())
+        family = sweep.rebalance_sweep
+        order: list[str] = []
+
+        def note(name: str) -> None:
+            if not order or order[-1] != name:
+                order.append(name)
+        for name, method in (("move", "move_grid"), ("maturity", "maturity_grid")):
+            real = getattr(family, method)
+
+            def grid(band, k, _real=real, _name=name, **kw):
+                note(f"{_name} {not kw['tier_floors']}")
+                return _real(band, k, **kw)
+            setattr(family, method, grid)
+        _rb_payload(sweep)
+        assert order == ["move False", "move True", "maturity False", "maturity True"]
+
+
+class TestUntilFailures:
+    """What each failure costs the "Rebalance until" data: a Rebalance or a
+    Min. price movement cell that raises takes the choices with it (they
+    start from those runs), and a choice that raises costs the choices alone
+    — one WARNING, the grid returned without them and the page, but for
+    saying so, the page of the same family without them. A phase that did
+    not run to the end never ships a grid."""
+
+    @staticmethod
+    def _only_the_choices_are_lost(base, chunks, clean_base, clean_chunks) -> None:
+        """A page whose choices could not be read is, but for saying so, the
+        page of the same family without them: base block and chunks alike."""
+        assert base["grid_maturity"] is None and base["grid_maturity_off"] is None
+        assert base["maturity"] == [] and base["maturity_state"] == "unavailable"
+        assert base["move_state"] == "shown" and base["grid_move"] is not None
+        assert set(base) == set(clean_base)
+        for key in clean_base:
+            if key != "maturity_state":
+                assert base[key] == clean_base[key], key
+        assert chunks == clean_chunks
+
+    @pytest.mark.parametrize("cell, step", [
+        # The first step of the first cell: nothing was packed yet
+        ((False, _KC_B0, 0.6), 0),
+        # Mid-cell, after a run of its own was packed for an earlier step
+        ((False, _KC_B0, 0.75), 6),
+        # The last setting, after the other setting's choices were packed
+        ((True, _KC_B0, 0.75), 5),
+    ])
+    def test_a_choice_that_raises_costs_only_the_choices(
+            self, monkeypatch, tmp_path, caplog, cell, step):
+        clean = _rb_page(monkeypatch, tmp_path, _kc_sweep_move(_kc_sweep_tiers()))
+        sweep = _kc_sweep_until(_kc_sweep_tiers(), maturity_raise=(cell, step))
+        with caplog.at_level(logging.WARNING):
+            page = _rb_page(monkeypatch, tmp_path, sweep)
+        [warned] = _ut_warnings(caplog)
+        assert warned.getMessage() == _UT_WARNING
+        assert isinstance(warned.exc_info[1], RuntimeError)
+        # No other view of the family is said to be lost
+        assert _rb_warnings(caplog) == [_UT_WARNING]
+        self._only_the_choices_are_lost(
+            TestFilterPage._data(page), TestFilterPage._chunks(page),
+            TestFilterPage._data(clean), TestFilterPage._chunks(clean))
+        assert 'id="flt-bar"' in page
+        # The walk stopped at the cell that raised
+        assert sweep.rebalance_sweep.asked_maturities[-1][0] == cell
+
+    def test_a_point_that_records_no_days_costs_only_the_choices(self, caplog):
+        # Its choices have nothing to start from, which the family refuses
+        sweep = _kc_sweep_until()
+        points = sweep.rebalance_sweep.sweeps[False].points
+        points[(_KC_B1, 0.75, 0.2)] = dataclasses.replace(points[(_KC_B1, 0.75, 0.2)],
+                                                          rebalance_days_left=None)
+        _, clean_chunker, clean = _rb_payload(_kc_sweep_move())
+        with caplog.at_level(logging.WARNING):
+            walked, chunker, base = _rb_payload(sweep, maturity_state="unavailable")
+        [warned] = _ut_warnings(caplog)
+        assert "starts has no (moves, days left)" in str(warned.exc_info[1])
+        assert walked.move_cell is not None and walked.maturity_cell is None
+        assert walked.maturity_days == () and walked.maturity_stats == {}
+        self._only_the_choices_are_lost(base, _rb_chunks(chunker), clean,
+                                        _rb_chunks(clean_chunker))
+
+    @pytest.mark.parametrize("named", [
+        # A minimum the grid lacks
+        backtester.SameMaturity(0.5, None),
+        # A choice the grid lacks
+        backtester.SameMaturity(None, 3),
+        # A run the cell has not stored yet: 7 days, named at 1 day
+        backtester.SameMaturity(None, 7),
+    ])
+    def test_a_repeat_of_a_run_the_cell_lacks_costs_only_the_choices(self, caplog, named):
+        # Never from the real family: a cell that cannot be placed is a cell
+        # that cannot be read, not a lost filter bar
+        sweep = _kc_sweep_until()
+        sweep.rebalance_sweep.maturities[(False, _KC_B0, 0.75)][(1, 0.05)] = {0.2: named}
+        _, clean_chunker, clean = _rb_payload(_kc_sweep_move())
+        with caplog.at_level(logging.WARNING):
+            _, chunker, base = _rb_payload(sweep, maturity_state="unavailable")
+        [warned] = _ut_warnings(caplog)
+        assert isinstance(warned.exc_info[1], ValueError) and not chunker.failed
+        self._only_the_choices_are_lost(base, _rb_chunks(chunker), clean,
+                                        _rb_chunks(clean_chunker))
+
+    def test_a_rebalance_cell_that_raises_drops_the_choices_too(self, caplog):
+        sweep = _kc_sweep_until(raise_on=(_KC_B1, 0.75))
+        with caplog.at_level(logging.WARNING):
+            walked, chunker, base = _rb_payload(sweep, "unavailable", "unavailable",
+                                                "unavailable")
+        # The Rebalance failure is the one thing said
+        [warned] = _rb_warnings(caplog)
+        assert warned.startswith(_RB_WARNING) and _ut_warnings(caplog) == []
+        assert walked.maturity_cell is None and walked.maturity_days == ()
+        assert walked.maturity_stats == {}
+        assert base["grid_maturity"] is None and base["grid_maturity_off"] is None
+        assert base["maturity"] == [] and base["maturity_state"] == "unavailable"
+        assert base["grid"] == _KC_GRID and len(chunker.chunks) == 5
+        assert chunker.grids_maturity == {}
+        assert sweep.rebalance_sweep.asked_maturities == []
+
+    @pytest.mark.parametrize("step", [0, 2])
+    def test_a_move_cell_that_raises_drops_the_choices_too(self, monkeypatch, tmp_path, caplog,
+                                                           step):
+        # The choices start from the movement runs: with those lost, the page
+        # is the page of a family with neither
+        clean = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance(_kc_sweep_tiers()))
+        sweep = _kc_sweep_until(_kc_sweep_tiers(), move_raise=((False, _KC_B0, 0.75), step))
+        with caplog.at_level(logging.WARNING):
+            page = _rb_page(monkeypatch, tmp_path, sweep)
+        assert _rb_warnings(caplog) == [_MV_WARNING]
+        data, clean_data = TestFilterPage._data(page), TestFilterPage._data(clean)
+        assert data["move_state"] == data["maturity_state"] == "unavailable"
+        assert data["grid_maturity"] is None and data["grid_maturity_off"] is None
+        assert data["maturity"] == []
+        for key in clean_data:
+            if key not in ("move_state", "maturity_state"):
+                assert data[key] == clean_data[key], key
+        assert TestFilterPage._chunks(page) == TestFilterPage._chunks(clean)
+        assert sweep.rebalance_sweep.asked_maturities == []
+
+    def test_a_move_cell_that_raises_leaves_the_visitor_no_choice_grid(self, caplog):
+        # reset_move drops the choices' grids with the minimums': the chunk
+        # visitor has no "Rebalance until" grid to give, however it is asked
+        sweep = _kc_sweep_until(_kc_sweep_tiers(), move_raise=((False, _KC_B0, 0.75), 2))
+        with caplog.at_level(logging.WARNING):
+            walked, chunker, _ = _rb_payload(sweep, "unavailable", "unavailable",
+                                             "unavailable")
+        assert _rb_warnings(caplog) == [_MV_WARNING]
+        assert walked.move_cell is None and walked.maturity_cell is None
+        assert chunker.grids_move == {} and chunker.grids_maturity == {}
+        assert chunker.maturity_grid() is None and chunker.maturity_off_grid() is None
+
+    def test_a_lost_cap_axis_costs_the_choices_too(self):
+        sweep = _kc_sweep_until(_kc_sweep(raise_on=(_KC_B1, 0.75)))
+        walked, _, base = _rb_payload(sweep, "unavailable", "unavailable", "unavailable")
+        assert walked.cap_sweep is None and walked.rebalance_cell is None
+        assert walked.maturity_cell is None and walked.maturity_days == ()
+        assert base["grid_maturity"] is None and base["maturity_state"] == "unavailable"
+        assert sweep.rebalance_sweep.asked_maturities == []
+
+    def test_a_failing_tier_off_size_cap_cell_keeps_the_choices(self, caplog):
+        # The walk swaps in the grid's eager tier-off lookup, built before the
+        # family was attached: it must still carry the choices and their reader
+        sweep = _kc_sweep_until(_kc_sweep_tiers_capped(raise_on=(_KC_B0, 0.6)))
+        with caplog.at_level(logging.WARNING):
+            walked, _, base = _rb_payload(sweep)
+        assert any(_OFF_WARNING in r.getMessage() for r in caplog.records)
+        assert _rb_warnings(caplog) == []
+        assert walked.off_cap_sweep is None
+        assert walked.maturity_days == _UT_DAYS and walked.maturity_cell is not None
+        assert set(walked.maturity_stats) == {False, True}
+        assert base["maturity_state"] == "shown"
+        assert base["grid_maturity"][0][1][1][1][0] not in _rb_ids(base["grid_rebalance"])
+        assert base["grid_maturity_off"][0][1][0] is not None
+
+    @pytest.mark.parametrize("lost_at", ["__call__", "rebalance", "move"])
+    def test_a_chunk_visitor_that_has_failed_reads_no_choice(self, monkeypatch, lost_at):
+        # The bar is already lost (a chunk could not be built), whether before
+        # the Rebalance cells, among them or among the minimums: no choice is
+        # simulated for it
+        sweep = _kc_sweep_until()
+        real = getattr(dashboard._ChunkVisitor, lost_at)
+
+        def failing(self, *args, **kwargs):
+            real(self, *args, **kwargs)
+            self.failed = True
+        monkeypatch.setattr(dashboard._ChunkVisitor, lost_at, failing)
+        trades, curve = sweep.primary.trades, sweep.primary.equity_df
+        source = dashboard._grid_source(sweep, trades, curve, 0.75)
+        walked, chunker, _ = dashboard._build_filter_grid(
+            source, trades, curve, 0.75, _FLT_START, 1000.0, _FLT_SERIES_TIERS)
+        assert sweep.rebalance_sweep.asked_maturities == []
+        # The choices were not read to the end, so the grid walked has none
+        assert walked.maturity_cell is None and chunker.maturity_grid() is None
+
+    def test_a_chunk_visitor_that_fails_among_the_choices_stops_the_reading(self, monkeypatch):
+        # Lost at the first choice it packs: the cells after that one are not
+        # read for it, where a healthy walk reads every one
+        asked = []
+        for fails in (False, True):
+            sweep = _kc_sweep_until()
+            with monkeypatch.context() as mp:
+                if fails:
+                    real = dashboard._ChunkVisitor.maturity
+
+                    def failing(self, *args, _real=real, **kwargs):
+                        _real(self, *args, **kwargs)
+                        self.failed = True
+                    mp.setattr(dashboard._ChunkVisitor, "maturity", failing)
+                trades, curve = sweep.primary.trades, sweep.primary.equity_df
+                source = dashboard._grid_source(sweep, trades, curve, 0.75)
+                dashboard._build_filter_grid(source, trades, curve, 0.75, _FLT_START, 1000.0,
+                                             _FLT_SERIES_TIERS)
+            asked.append(len(sweep.rebalance_sweep.asked_maturities))
+        healthy, failed = asked
+        assert healthy > 1 and failed == 1
+
+    @pytest.mark.parametrize("how", ["no maturity method", "no move taker"])
+    def test_a_phase_that_did_not_run_ships_no_grid(self, monkeypatch, how):
+        # A grid of nulls is a view only when every choice was read: one never
+        # read (no visitor takes the choices, or the minimums they start from
+        # were never read) is no view at all, never a grid of nulls
+        sweep = _kc_sweep_until()
+        if how == "no maturity method":
+            monkeypatch.delattr(dashboard._ChunkVisitor, "maturity")
+        else:
+            # Without its move method the visitor reads no minimum, so the
+            # records the choices need are never complete
+            monkeypatch.delattr(dashboard._ChunkVisitor, "move")
+        walked, chunker, base = _rb_payload(sweep, maturity_state="unavailable")
+        assert sweep.rebalance_sweep.asked_maturities == []
+        assert walked.maturity_cell is None and walked.maturity_days == ()
+        assert base["grid_rebalance"] is not None
+        assert base["grid_maturity"] is None and base["grid_maturity_off"] is None
+        assert base["maturity"] == [] and base["maturity_state"] == "unavailable"
+        assert chunker.grids_maturity == {}
+
+
 class TestRebalanceSelect:
     """The bar's "Rebalance" select as Python renders it: after Size cap and
-    before Min. price movement and Sell, shut, with its two options, its rule
+    before Min. price movement, Rebalance until and Sell, shut, with its two options, its rule
     in the hover text and, on a page without the view, the reason beside it."""
 
     def test_the_select_follows_the_size_cap_and_is_rendered_shut(self, monkeypatch, tmp_path):
         page = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance())
         ids = re.findall(r'<select id="(flt-[a-z]+)"', page)
         assert ids == ["flt-band", "flt-tier", "flt-k", "flt-cap", "flt-rebalance", "flt-move",
-                       "flt-sell", "flt-days"]
+                       "flt-until", "flt-sell", "flt-days"]
         # ... and before the Exclude categories and Exclude tags menus
         bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
         assert (bar.index('id="flt-cap"') < bar.index('id="flt-rebalance"')
@@ -13231,7 +13990,7 @@ class TestRebalanceSelect:
 
 class TestMoveSelect:
     """The bar's "Min. price movement" select as Python renders it: right after
-    Rebalance and before Sell, on every page, shut, with "any" and one option
+    Rebalance and before Rebalance until, on every page, shut, with "any" and one option
     per minimum the page carries, its rule in the hover text and, on a page
     that shows Rebalance without the minimums, the reason beside it."""
 
@@ -13245,10 +14004,10 @@ class TestMoveSelect:
         moves = tuple(config.MIN_PRICE_MOVES)
         assert len(moves) == 19
         page = _rb_page(monkeypatch, tmp_path, _kc_sweep_move(min_moves=moves))
-        # Right after Rebalance and before Sell
+        # Right after Rebalance and before Rebalance until (then Sell)
         ids = re.findall(r'<(?:select|details) id="(flt-[a-z]+)"', page)
         at = ids.index("flt-rebalance")
-        assert ids[at:at + 3] == ["flt-rebalance", "flt-move", "flt-sell"]
+        assert ids[at:at + 4] == ["flt-rebalance", "flt-move", "flt-until", "flt-sell"]
         # ... with nothing but the gap between Rebalance's label and its own
         assert ('</select></label>&nbsp;&nbsp;<label>Min. price movement: <select '
                 'id="flt-move" disabled autocomplete="off" title="') in page
@@ -13332,7 +14091,7 @@ class TestMoveSelect:
         else:
             # Right after the select, in the Rebalance note's own style
             assert ('</select></label>&nbsp;<span id="flt-move-note" style="color:#9E9E9E; '
-                    f'font-size:13px;">{note}</span>&nbsp;&nbsp;<label>Sell: ') in bar
+                    f'font-size:13px;">{note}</span>&nbsp;&nbsp;<label>Rebalance until: ') in bar
         assert ('id="flt-rebalance-note"' in bar) is (rebalance_state != "shown")
 
     def test_a_payload_without_the_state_reads_as_not_simulated(self):
@@ -13426,6 +14185,165 @@ class TestMoveSelect:
                 "always shows no rebalancing.")
         assert "Scenario Explorer" in dashboard._MOVE_REACH
         assert "Scenario Explorer" not in dashboard._MOVE_REACH_NO_EXPLORER
+
+
+class TestUntilSelect:
+    """The bar's "Rebalance until" select as Python renders it: right after Min.
+    price movement and before Sell, on every page, shut, with "maturity" and
+    one option per choice the page carries, its rule in the hover text and,
+    on a page that shows Rebalance without the choices, the reason beside it.
+    The page script does not read it, so it stays shut whatever is chosen."""
+
+    @staticmethod
+    def _select(page: str):
+        """The select's attributes and its options' markup on a page (or a bar)."""
+        return re.search(r'<select id="flt-until"([^>]*)>(.*?)</select>', page)
+
+    def test_the_select_follows_min_price_movement_with_maturity_and_every_choice(
+            self, monkeypatch, tmp_path):
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_until())
+        # Right after Min. price movement and before Sell
+        ids = re.findall(r'<(?:select|details) id="(flt-[a-z]+)"', page)
+        at = ids.index("flt-move")
+        assert ids[at:at + 3] == ["flt-move", "flt-until", "flt-sell"]
+        # ... with nothing but the gap between Min. price movement's label and its own
+        assert ('</select></label>&nbsp;&nbsp;<label>Rebalance until: <select '
+                'id="flt-until" disabled autocomplete="off" title="') in page
+        select = self._select(page)
+        assert " disabled" in select.group(1) and 'autocomplete="off"' in select.group(1)
+        # "maturity" first and selected, then each choice
+        assert re.findall(r'<option value="([^"]*)"( selected)?>(.*?)</option>',
+                          select.group(2)) == [
+            ("0", " selected", "maturity"), ("1", "", "1 day before"), ("2", "", "7 days before")]
+        # ... every one of which the page-script tests can read
+        assert _page_elements(page)["selects"]["flt-until"] == {"disabled": True, "options": [
+            {"value": "0", "text": "maturity", "selected": True},
+            {"value": "1", "text": "1 day before", "selected": False},
+            {"value": "2", "text": "7 days before", "selected": False}]}
+        # Each option is the base block's own entry, in order
+        data = TestFilterPage._data(page)
+        assert [entry["label"] for entry in data["maturity"]] == ["1 day before",
+                                                                  "7 days before"]
+        title = re.search(r'title="([^"]*)"', select.group(1)).group(1)
+        assert html.unescape(title) == dashboard._UNTIL_TITLE
+        # The hover text says when it counts, what it holds back and how the
+        # days are counted
+        for words in ("Used only while Rebalance is yes",
+                      "Holds back trims and add-ons when the position's later market matures "
+                      "within that many days",
+                      "topped up or sold down only while its later market",
+                      "closes at least that many days after the run",
+                      "counted in whole days on Kalshi's UTC dates",
+                      "maturity: no days limit"):
+            assert words in dashboard._UNTIL_TITLE
+        # ... and promises nothing about Save, which does not send it
+        assert "Save" not in dashboard._UNTIL_TITLE
+        # A page with the view has no note beside it
+        assert 'id="flt-until-note"' not in page
+
+    def test_the_words_are_short_and_plain(self):
+        assert dashboard._UNTIL_OPTION_MATURITY == "maturity"
+        assert dashboard._UNTIL_NOTES == {"not simulated": _RB_NOT_SIMULATED,
+                                          "unavailable": _RB_UNAVAILABLE}
+        assert dashboard._until_option(1) == "1 day before"
+        assert dashboard._until_option(7) == "7 days before"
+        # In the live "Live settings:" line's words (the select's own label
+        # names maturity) and the backtest log's
+        for days in backtester._resolve_maturity_days():
+            assert dashboard._until_option(days) + " maturity" == (
+                config._rebalance_until_text(days))
+            assert dashboard._until_phrase(days) == backtester._until_label(days)
+        assert dashboard._UNTIL_OPTION_MATURITY == config._rebalance_until_text(None)
+
+    def test_a_page_without_the_choices_renders_maturity_alone(self, monkeypatch, tmp_path):
+        # The select is on every page, with one option
+        for sweep in (_kc_sweep_move(), _kc_sweep_rebalance(), _kc_sweep()):
+            page = _rb_page(monkeypatch, tmp_path, sweep)
+            select = self._select(page)
+            assert " disabled" in select.group(1)
+            assert select.group(2) == '<option value="0" selected>maturity</option>'
+            data = TestFilterPage._data(page)
+            assert data["maturity"] == [] and data["maturity_state"] == "not simulated"
+            assert data["grid_maturity"] is None and data["grid_maturity_off"] is None
+
+    @pytest.mark.parametrize("rebalance_state, maturity_state, note", [
+        # Rebalance is shown and the choices are not: this select says why
+        ("shown", "not simulated", _RB_NOT_SIMULATED),
+        ("shown", "unavailable", _RB_UNAVAILABLE),
+        ("shown", "something else", _RB_NOT_SIMULATED),
+        # Both shown: nothing to explain
+        ("shown", "shown", None),
+        # Rebalance is not shown: its own note covers every select after it
+        ("not simulated", "not simulated", None),
+        ("unavailable", "unavailable", None),
+        ("not simulated", "unavailable", None),
+        ("something else", "not simulated", None)])
+    def test_the_note_is_said_only_beside_a_shown_rebalance(self, rebalance_state,
+                                                           maturity_state, note):
+        _, _, base = _rb_payload(_kc_sweep())
+        bar = dashboard._filter_bar_html(
+            {**base, "rebalance_state": rebalance_state, "maturity_state": maturity_state},
+            {"all": {"n": 3}})
+        assert 'id="flt-until" disabled' in bar
+        if note is None:
+            assert 'id="flt-until-note"' not in bar
+        else:
+            # Right after the select, in the Min. price movement note's style
+            assert ('</select></label>&nbsp;<span id="flt-until-note" style="color:#9E9E9E; '
+                    f'font-size:13px;">{note}</span>&nbsp;&nbsp;<label>Sell: ') in bar
+        assert ('id="flt-rebalance-note"' in bar) is (rebalance_state != "shown")
+
+    def test_a_payload_without_the_state_reads_as_not_simulated(self):
+        _, _, base = _rb_payload(_kc_sweep_rebalance())
+        del base["maturity_state"], base["maturity"]
+        bar = dashboard._filter_bar_html(base, {"all": {"n": 3}})
+        assert ('id="flt-until-note" style="color:#9E9E9E; font-size:13px;">'
+                f"{_RB_NOT_SIMULATED}</span>") in bar
+        assert self._select(bar).group(2) == '<option value="0" selected>maturity</option>'
+
+    def test_a_page_says_which_of_the_two_reasons_applies(self, monkeypatch, tmp_path):
+        def note(page: str, select: str = "flt-until") -> str | None:
+            found = re.search(rf'<span id="{select}-note"[^>]*>([^<]*)</span>', page)
+            return found.group(1) if found else None
+
+        # A family without choices: not simulated
+        assert note(_rb_page(monkeypatch, tmp_path, _kc_sweep_move())) == _RB_NOT_SIMULATED
+        # A family whose choices could not be read: see the log, and Rebalance
+        # and Min. price movement are still shown
+        lost = _rb_page(monkeypatch, tmp_path, _kc_sweep_until(
+            maturity_raise=((False, _KC_B0, 0.6), 0)))
+        assert note(lost) == _RB_UNAVAILABLE and note(lost, "flt-move") is None
+        assert 'id="flt-rebalance-note"' not in lost
+        # Lost with the minimums they start from: both say so
+        moved = _rb_page(monkeypatch, tmp_path, _kc_sweep_until(
+            move_raise=((False, _KC_B0, 0.6), 0)))
+        assert note(moved) == note(moved, "flt-move") == _RB_UNAVAILABLE
+        # No family at all: Rebalance's own note says why, and this select has none
+        bare = _rb_page(monkeypatch, tmp_path, _kc_sweep())
+        assert note(bare) is None and 'id="flt-rebalance-note"' in bare
+
+    def test_it_stays_shut_under_the_page_script(self, monkeypatch, tmp_path):
+        # Shut on load, with Rebalance yes and at a minimum alike; a change
+        # event on it loads and draws nothing. flt-until is shut on load, so
+        # the run waits on flt-rebalance. Skipped without a JavaScript runtime
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_until())
+        snaps = TestMoveScript._run(tmp_path, page, [
+            ["snap", "loaded"], ["wait"], ["snap", "ready"], *TestMoveScript.ON, ["snap", "on"],
+            *TestMoveScript._move(2), ["snap", "moved"], ["set", "flt-until", "2"],
+            ["fire", "flt-until"], ["settle"], ["snap", "ignored"]], strict=True)
+        for name in ("loaded", "ready", "on", "moved"):
+            until = snaps[name]["selects"]["flt-until"]
+            assert until["disabled"] is True and until["value"] == "0", name
+        assert snaps["ready"]["selects"]["flt-until"]["options"] == [
+            ["0", "maturity"], ["1", "1 day before"], ["2", "7 days before"]]
+        # Rebalance and Min. price movement beside it open as before
+        assert snaps["on"]["selects"]["flt-rebalance"]["disabled"] is False
+        assert snaps["moved"]["selects"]["flt-move"]["disabled"] is False
+        ignored, moved = snaps["ignored"], snaps["moved"]
+        assert ignored["selects"]["flt-until"]["disabled"] is True
+        assert ignored["reacts"] == [] and ignored["inflated"] == moved["inflated"]
+        assert ignored["text"].get("flt-summary") == moved["text"].get("flt-summary")
+        assert ", until" not in ignored["text"]["flt-summary"]
 
 
 class TestRebalanceScript:
@@ -14486,6 +15404,130 @@ class TestRebalanceEndToEnd:
             self._same(view, point)
         # Not vacuous: the picks do not all draw one trade count
         assert len({snaps[kind]["text"]["hdr-trades"] for kind in picks}) > 1
+
+
+class TestUntilEndToEnd:
+    """A real Rebalance family with "Rebalance until" choices, rendered through
+    generate_dashboard. With the tier floors on it rebalances over
+    TestMaturityGrid's trimming fixture (at the low caps a pair is trimmed
+    with 6 days left, then with -1), with them off over its add-on pair
+    (added to with 13 days left, trimmed with 6, then with -1), so
+    "maturity", 1 day and 7 days are three different runs. The gate: at every
+    choice, minimum and cap, the chunk the page names (the movement view's
+    where the cell is null) is the scenario a fresh simulation that adds and
+    trims at that cap, minimum and choice produces, figure for figure, in
+    both settings; and the select stays shut."""
+
+    _MOVES = TestRebalanceEndToEnd._MOVES
+
+    @classmethod
+    def _page(cls, monkeypatch, tmp_path):
+        """generate_dashboard over a real Rebalance family with both settings,
+        every minimum and every choice.
+
+        Returns:
+            tuple: (page, fresh), where fresh(cap, off, **options) simulates
+                the setting's entries afresh at that cap (off: tier floors off).
+        """
+        fixture = _tb.TestMaturityGrid
+        on_entries, off_entries = fixture._trim_entries(), fixture._add_on_entries()
+        band, k, start, end = fixture._BAND, 0.75, fixture._START, fixture._END
+        caps = backtester.SIZE_CAP_SWEEP
+
+        def fresh(cap, off=False, **options):
+            return backtester._simulate_at_discount(
+                off_entries if off else on_entries, start, 10_000.0, k=k, spread_band=band,
+                size_cap=cap, quiet=True, end_date=end, tier_floors=not off, **options)
+
+        primary, off_primary = fresh(0.20), fresh(0.20, off=True)
+        axes = {"caps": caps, "primary_cap": 0.20, "bands": (band,), "ks": (k,),
+                "primary_k": k, "start_date": start, "initial_balance": 10_000.0}
+        lazy = {**axes, "split_date": None, "checks": False, "st_entries": []}
+        days = {(band, k, "all"): end}
+        run = BacktestSweep(
+            primary=primary, points=[primary], calibration=None, scenarios=[primary],
+            calibrations_by_band={band: None}, same_event_ladders=True,
+            tier_off_scenarios=[off_primary], tier_off_calibrations_by_band={band: None},
+            cap_sweep=backtester.CapSweep(**lazy, entries_by_band={band: on_entries},
+                                          eager={(band, k, "all"): primary}),
+            tier_off_cap_sweep=backtester.CapSweep(
+                **lazy, entries_by_band={band: off_entries}, tier_floors=False,
+                eager={(band, k, "all"): off_primary}),
+            rebalance_sweep=backtester.RebalanceSweep(
+                **axes, off_bands=(band,), entries_by_band={band: on_entries},
+                off_entries_by_band={band: off_entries}, end_dates=days, off_end_dates=days,
+                min_moves=cls._MOVES, maturity_days=backtester._resolve_maturity_days()))
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        page = dashboard.generate_dashboard(
+            primary.trades, primary.equity_df, start, 10_000.0,
+            sweep=run).read_text(encoding="utf-8")
+        return page, fresh
+
+    def test_every_choice_minimum_and_cap_is_its_own_simulation(self, monkeypatch, tmp_path,
+                                                                caplog):
+        with caplog.at_level(logging.INFO):
+            page, fresh = self._page(monkeypatch, tmp_path)
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        caps = backtester.SIZE_CAP_SWEEP
+        choices = backtester._resolve_maturity_days()
+        minimums = (None, *self._MOVES)
+        assert data["maturity_state"] == "shown" and data["move_state"] == "shown"
+        assert [entry["value"] for entry in data["maturity"]] == list(choices) == [1, 7]
+        assert data["tier_binds"] == [True]
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING
+                    and "Rebalance" in r.getMessage()]
+        for off, plain_key, rebalance_key, move_key, until_key in (
+                (False, "grid", "grid_rebalance", "grid_move", "grid_maturity"),
+                (True, "grid_off", "grid_rebalance_off", "grid_move_off",
+                 "grid_maturity_off")):
+            assert data[until_key] is not None
+            kinds: Counter = Counter()
+            for ci, cap in enumerate(caps):
+                own, moved = data[rebalance_key][0][0][ci], data[move_key][0][0][ci]
+                cell = data[until_key][0][0][ci]
+                assert cell is None or [len(row) for row in cell] == [len(minimums)] * 2
+                kinds["nothing differs"] += cell is None
+                for di, choice in enumerate(choices):
+                    for place, move in enumerate(minimums):
+                        # The movement view's chunk at this minimum: what a
+                        # null cell shows
+                        shown = own if (place == 0 or moved is None) else moved[place - 1]
+                        cid = shown if cell is None else cell[di][place]
+                        point = fresh(cap, off, add_to_held=True, trim_to_kelly=True,
+                                      min_move=move, rebalance_min_days_to_maturity=choice)
+                        TestRebalanceEndToEnd._same(chunks[cid]["list"]["views"]["all"], point)
+                        if cell is not None:
+                            kinds["the movement view's chunk" if cid == shown else
+                                  "the plain run's chunk" if cid == data[plain_key][0][0][ci]
+                                  else "another run's chunk"] += 1
+            # Not vacuous, in both settings: caps where no choice changes the
+            # run and caps where one does, and there steps that still show the
+            # movement view's chunk, steps that hold every add-on and trim back
+            # (the run without rebalancing, whose chunk the page already has)
+            # and steps that are another run
+            assert 0 < kinds["nothing differs"] < len(caps), (off, kinds)
+            for kind in ("the movement view's chunk", "the plain run's chunk",
+                         "another run's chunk"):
+                assert kinds[kind] > 0, (off, kind, kinds)
+        # The two settings are two families of runs
+        assert data["grid_maturity"] != data["grid_maturity_off"]
+        # The walk read each setting's one cell once, from the runs it already
+        # had: every (choice, minimum, cap) was simulated, shared across caps,
+        # or the same run as fewer days or a lower minimum, and nothing else
+        counted = [re.search(r"\((\d+) cap points simulated, (\d+) shared across caps, "
+                             r"(\d+) the same run as fewer days or a lower minimum so far\)",
+                             r.getMessage())
+                   for r in caplog.records
+                   if 'read from the "Rebalance until" choices' in r.getMessage()]
+        assert len(counted) == 2
+        for match in counted:
+            simulated, shared, same = map(int, match.groups())
+            assert simulated > 0 and same > 0
+            assert simulated + shared + same == len(choices) * len(minimums) * len(caps)
+        # The select is there, shut, with no note
+        assert 'id="flt-until" disabled' in page and 'id="flt-until-note"' not in page
 
 
 class TestLiveRebalanceRule:
@@ -16416,19 +17458,24 @@ class TestFilterPageSize:
     Rebalance and Min. price movement selects, in place of Add to held pairs,
     Trim to Kelly and Min. price rise, take 3,303 bytes off every variant:
     each re-measured 2026-10-17 (same environment), in the constants below,
-    beside its size the same day before them."""
+    beside its size the same day before them. The "Rebalance until" select
+    (shut, with its hover text and, beside a shown Rebalance without the
+    choices, its note) and the base block's four keys for it add 562 to 676
+    bytes to every variant: each re-measured 2026-10-29 (same environment),
+    in the constants below, beside its size the same day before them."""
 
     # 837,197 before the mix data; 922,701 with it, the menus and the mix
     # script ("m" in place of "eq" alone); 897,445 with a tag view's other
     # curve series left out as well (2026-10-10); 905,055 with the Min. price
     # rise select (2026-10-13; 901,542 the same day before it); 925,829 with
     # the Rebalance and Min. price movement selects (2026-10-17; 929,132 the
-    # same day before them)
-    PAGE_BYTES_MEASURED = 925_829
+    # same day before them); 958,234 with the "Rebalance until" select
+    # (2026-10-29; 957,672 the same day before it)
+    PAGE_BYTES_MEASURED = 958_234
     BUDGET = int(PAGE_BYTES_MEASURED * 1.2)
     # 1,119,167 before; 1,233,927; 1,193,307; 1,200,909 (1,197,396);
-    # 1,235,347 (1,238,650)
-    PAGE_BYTES_MEASURED_FAMILY = 1_235_347
+    # 1,235,347 (1,238,650); 1,267,728 (1,267,162)
+    PAGE_BYTES_MEASURED_FAMILY = 1_267_728
     BUDGET_FAMILY = int(PAGE_BYTES_MEASURED_FAMILY * 1.2)
     # Every trade with quotes that move on most days it is held (a run valued
     # at market), the trade lists unchanged: each curve then changes on most
@@ -16444,21 +17491,25 @@ class TestFilterPageSize:
     # 2026-10-13, with the Min. price rise select, the constants below
     # (1,346,640 and 1,867,390 the same day before it). On 2026-10-17, with
     # the Rebalance and Min. price movement selects, 1,370,924 and 1,905,370
-    # (1,374,227 and 1,908,673 the same day before them).
-    PAGE_BYTES_MEASURED_QUOTED = 1_370_924
+    # (1,374,227 and 1,908,673 the same day before them). On 2026-10-29, with
+    # the "Rebalance until" select, 1,403,293 and 1,937,747 (1,402,727 and
+    # 1,937,177 the same day before it).
+    PAGE_BYTES_MEASURED_QUOTED = 1_403_293
     BUDGET_QUOTED = int(PAGE_BYTES_MEASURED_QUOTED * 1.2)
-    PAGE_BYTES_MEASURED_QUOTED_FAMILY = 1_905_370
+    PAGE_BYTES_MEASURED_QUOTED_FAMILY = 1_937_747
     BUDGET_QUOTED_FAMILY = int(PAGE_BYTES_MEASURED_QUOTED_FAMILY * 1.2)
     # The Rebalance view, where every band's rebalancing run trades yet
     # another list (a worst case: a real rebalancing run mostly trades the
     # list of the run without it and shares its chunk), and beside the
     # tier-floors-off family, whose 18 binding bands each gain a rebalancing
     # twin of their own. Measured 2026-10-17 (plotly 6.9.0, pandas 3.0.3,
-    # numpy 2.4.6): 1,396,467 and 1,943,061 bytes. Each budget is its
-    # measurement + 20%.
-    PAGE_BYTES_MEASURED_REBALANCE = 1_396_467
+    # numpy 2.4.6): 1,396,467 and 1,943,061 bytes. With the "Rebalance until"
+    # select (its note beside it: these families carry no choice), 1,429,014
+    # and 1,975,552 (2026-10-29, same environment; 1,428,338 and 1,974,876
+    # the same day before it). Each budget is its measurement + 20%.
+    PAGE_BYTES_MEASURED_REBALANCE = 1_429_014
     BUDGET_REBALANCE = int(PAGE_BYTES_MEASURED_REBALANCE * 1.2)
-    PAGE_BYTES_MEASURED_REBALANCE_FAMILY = 1_943_061
+    PAGE_BYTES_MEASURED_REBALANCE_FAMILY = 1_975_552
     BUDGET_REBALANCE_FAMILY = int(PAGE_BYTES_MEASURED_REBALANCE_FAMILY * 1.2)
 
     @pytest.mark.parametrize(
