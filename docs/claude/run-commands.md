@@ -109,8 +109,9 @@ python3 -m kalshi_betting.main --mode prod --dry-run --rebalance --min-price-mov
 # the other choice; 0 or --no-rebalance-min-days-to-maturity rebalances however near maturity (the
 # default unless saved otherwise). The "Live settings:" line reads `rebalance until 7 days before
 # maturity`. The backtest's walk applies the same rule (_simulate_at_discount's
-# rebalance_min_days_to_maturity), but the dashboard does not offer it yet: its Save button leaves it
-# as saved (a link naming rebalance=off clears it), so a dashboard scenario shows none of its effect
+# rebalance_min_days_to_maturity), and its Rebalance family carries the runs, but the dashboard
+# does not offer it yet: its Save button leaves it as saved (a link naming rebalance=off clears
+# it), so a dashboard scenario shows none of its effect
 python3 -m kalshi_betting.main --mode prod --dry-run --rebalance --rebalance-min-days-to-maturity 7
 python3 -m kalshi_betting.main --mode prod --dry-run --no-rebalance
 
@@ -247,6 +248,16 @@ python3 -m kalshi_betting.backtest --no-rebalance-sweep
 # --no-rebalance-sweep skips both. Backtest only
 python3 -m kalshi_betting.backtest --no-move-sweep
 
+# Backtest with the "Rebalance" family but without its "Rebalance until" choices (ON by default
+# with that family, and lazy the same way: BacktestSweep.rebalance_sweep.maturity_days holds
+# config.REBALANCE_MATURITY_DAYS less "maturity", 1 and 7 days, where a held position is added
+# to or trimmed only while its later market closes at least that many days away; each is
+# simulated only when a report reads it, at every minimum price movement, and only where it
+# changes a run). The dashboard does not offer the "Rebalance until" select yet, so a page
+# built now reads none of them. Rebalance itself is still built, and --no-rebalance-sweep
+# skips them too. Backtest only
+python3 -m kalshi_betting.backtest --no-maturity-sweep
+
 # Backtest without the dashboard's "Sell" family (ON by default in the CLI, and lazy like the
 # cap sweep: the run simulates nothing — the dashboard step then reads every sell level and
 # minimum of days to maturity of every scenario the filter bar shows that does not rebalance
@@ -275,7 +286,8 @@ python3 -m kalshi_betting.backtest --sell-workers 4
 python3 -m kalshi_betting.backtest --dashboard-only
 
 # The same, quickly, to check a small dashboard change: each of --no-sell-sweep,
-# --no-rebalance-sweep, --no-move-sweep and --no-cap-sweep drops that family from the saved run,
+# --no-rebalance-sweep, --no-move-sweep, --no-maturity-sweep and --no-cap-sweep drops that family
+# (or that part of it) from the saved run,
 # giving the page a run with that flag would have built (the Sell select alone took 1.4 to 4.6 h on
 # the last 365-day runs)
 python3 -m kalshi_betting.backtest --dashboard-only --no-sell-sweep --no-rebalance-sweep
