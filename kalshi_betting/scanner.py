@@ -3247,7 +3247,7 @@ def get_held_tickers(client: Any) -> set:
 @dataclass(frozen=True)
 class Settlement:
     """
-    One market the account held when it paid out, as GET /portfolio/settlements reports it.
+    One market the account traded, as GET /portfolio/settlements reports it once it paid out.
 
     Live selling values a held market's paid-out partner from it.
 
@@ -3255,8 +3255,11 @@ class Settlement:
         ticker (str): The market that paid out.
         event_ticker (str): Its event.
         result (str): market_result as Kalshi sends it: "yes", "no", "scalar" or "void".
-        yes_count (float): YES contracts held when it paid out.
-        no_count (float): NO contracts held when it paid out.
+        yes_count (float): YES contracts bought over the market's life, as Kalshi
+            lists them (a sale before the payout is listed as bought on the other
+            side); seller._settled_count reads what was held at payout as the
+            difference of the two counts.
+        no_count (float): The same for NO.
         yes_cost_dollars (float): The YES contracts' cost basis, fees not included.
         no_cost_dollars (float): The same for the NO contracts.
         fees_dollars (float): Fees paid on this market's trades (fee_cost).
@@ -3378,7 +3381,7 @@ def _settlement_from_dict(record: Any) -> Settlement | None:
 def get_settlements(client: Any, *, unreadable_out: dict | None = None,
                     min_ts: int | None = None) -> list[Settlement] | None:
     """
-    Fetch every market the account held when it paid out (GET /portfolio/settlements).
+    Fetch every market the account traded that has paid out (GET /portfolio/settlements).
 
     Each page is a retried, read-only GET on the SDK's raw-response variant
     (the pinned SDK's model no longer fits the reply). Fails closed: returns
@@ -4286,7 +4289,12 @@ def held_pair_kind(yes_market: Any, no_market: Any) -> tuple[str, Any, Any] | No
     markets by the finders' own tests. It answers only when the sides held are
     the sides that kind buys (leg_sides): NO on A and YES on B for same-title,
     YES on the earlier deadline (A) and NO on the later (B) for time-series.
-    Anything it cannot show is None, never a guess.
+    Anything it cannot show is None, never a guess. seller.plan_trims also
+    asks it about a lone leg: the held market and its paid-out partner (a
+    settled market, taken from the run's market list or looked up through
+    market_for_labels), each on the side it was held, so for two events the
+    close the time-series test compares is the one Kalshi records for the
+    settled partner.
 
     Both markets need an event ticker: without one, two events cannot be told
     from two rungs of one event, which are ordered by different rules.
@@ -4314,8 +4322,10 @@ def held_pair_kind(yes_market: Any, no_market: Any) -> tuple[str, Any, Any] | No
     not read: those decide what may be bought, not what is held.
 
     Args:
-        yes_market (Any): The market held YES, from the market list.
-        no_market (Any): The market held NO, from the market list.
+        yes_market (Any): The market held YES (for a lone leg, possibly its
+            paid-out partner).
+        no_market (Any): The market held NO (for a lone leg, possibly its
+            paid-out partner).
 
     Returns:
         tuple[str, Any, Any] | None: (pair type, market A, market B), the type

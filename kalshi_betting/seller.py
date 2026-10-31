@@ -8,30 +8,40 @@ Purpose:
     each sale; main.py hands the plans to trader.sell_positions. A position is an
     exact held pair (one YES and one NO market of equal count), or a lone held
     market with its paid-out partner (a settled market the account held on the other
-    side at the same count, asking the same question). Its held markets are alone on
-    their ladder (one question asked at several deadlines). It is sold when its realized
-    profit (what selling its held markets returns after fees, plus any partner's
-    payout, less its cost) has reached LiveSettings.sell_at of its potential
+    side, asking the same question, at the same count or, when no market of that
+    count fits, at least as many (a lone market partly sold after its partner paid
+    out holds fewer)). Its held markets are alone on their ladder (one question
+    asked at several deadlines). It is sold when its realized profit (what
+    selling its held markets returns after fees, plus any partner's payout, less
+    its cost) has reached LiveSettings.sell_at of its potential
     profit (what it pays if it wins, less its cost) at each of
     config.TAKE_PROFIT_HOLD_DAYS daily checks, the last one now. The rule in
     full, and where it differs from the backtest: CLAUDE.md (live selling).
 
-    It also plans Kelly trims (plan_trims): selling part of an exact held pair
+    It also plans Kelly trims (plan_trims): selling part of a held position
     that is worth more than its Kelly share of the portfolio value (the most
     Kelly sizing would put in it), by the backtest's rule
-    (config.kelly_trim_count). A pair is trimmed only after enough calendar
-    days without a fill (a trade) on either market and, with
-    LiveSettings.min_price_move set, once its price has moved that far since,
-    up or down.
-    A trim sells only into bids within config.KELLY_TRIM_MAX_BID_DROP of the
-    best bid, never into a gap in a book.
+    (config.kelly_trim_count). A position is an exact held pair, or a lone
+    leg: the later market of a time-series pair, still held after the
+    earlier market paid out $0 (the trim finds that market among the
+    account's settlements as a take-profit sale finds a partner). The
+    paid-out market then reads as its settlement price
+    (config.settled_bids), so the pair arithmetic runs unchanged. A position
+    is trimmed only after enough calendar days without a fill (a trade) on
+    its markets and, with LiveSettings.min_price_move set, once its price
+    has moved that far since, up or down. A trim sells only into bids within
+    config.KELLY_TRIM_MAX_BID_DROP of the best bid, never into a gap in a
+    book.
 
     And it decides which held pairs a run may add to (plan_add_ons): an
     add-on is the other half of a rebalance, so it waits as a trim does,
     the same number of calendar days after the last fill on the pair's
     markets and, with a minimum price move, until the pair's price has moved
     that far since, up or down. It sends nothing and sizes nothing: the
-    finders and the sizer do the rest.
+    finders and the sizer do the rest. With
+    LiveSettings.rebalance_min_days_to_maturity set ("Rebalance until"),
+    neither a trim nor an add-on is made once the position's later market
+    closes fewer than that many days from today (UTC dates).
 
 Dependencies:
     Imports the standard library, config, scanner and historical only, never
@@ -64,12 +74,15 @@ from .config import (
     SALE_KIND_TAKE_PROFIT,
     SALE_PARTNER_MAX_AGE_DAYS,
     SALE_PARTNER_MAX_LOOKUPS,
+    SALE_PARTNER_MAX_WIDER_LOOKUPS,
+    SALE_PARTNER_REVENUE_TOLERANCE_DOLLARS,
     SCHEDULED_RUN,
     TAKE_PROFIT_HOLD_DAYS,
     TAKE_PROFIT_HOLD_DAYS_MAX,
     LiveSettings,
     confirmed_fee_multiplier,
     count_text,
+    days_left_reached,
     days_to_maturity,
     fee_leg_exact,
     fee_per_pair_approx,
@@ -83,6 +96,7 @@ from .config import (
     reached_every_check,
     rebalance_min_days,
     rebalance_rested,
+    settled_bids,
     take_profit_reached,
     trade_day,
 )
@@ -130,10 +144,12 @@ class SaleLeg:
         event_ticker (str): Its event's ticker.
         side (str): "yes" or "no": the side held (for a partner, before it paid out).
         count (int): Contracts held: the position's contract pairs; for a Kelly
-            trim, the contracts sold there.
+            trim, the contracts sold there (for a lone leg's paid-out partner,
+            the share of it that goes with them).
         cost_dollars (float): What they cost, fees included.
         market (Any): The ApiMarket from this run's market list while held; None for a partner.
-        payout_dollars (float | None): What a partner paid when it settled; None while held.
+        payout_dollars (float | None): What a partner paid when it settled, for
+            `count` of the contracts it settled with (_partner_leg); None while held.
         paid_at (datetime | None): When a partner settled (UTC); None while held.
         partner_fee_multiplier (float): For a paid-out partner (no market), the
             fee multiplier it is listed at (scanner.listed_fee_multiplier of its
@@ -141,7 +157,7 @@ class SaleLeg:
             an earlier day's check charges its sale at; 1.0 for a held market,
             whose own market carries its multiplier.
         held (int | None): For a Kelly trim, the contracts held there; None when
-            `count` is all of them.
+            `count` is all of them, and for a paid-out partner.
     """
     ticker: str
     event_ticker: str
@@ -161,13 +177,17 @@ class SalePlan:
     Held contracts a run sells, with what the sale orders need.
 
     A take-profit sale (plan_sales) sells a whole position. A Kelly trim
-    (plan_trims) sells part of an exact held pair; its count and money figures
-    are those of the part sold.
+    (plan_trims) sells part of an exact held pair, or of a lone leg (the later
+    market of a time-series pair, held after its earlier market paid out $0);
+    its count and money figures are those of the part sold, a lone leg's
+    including that share of its paid-out partner.
 
     Attributes:
         title (str): The first held market's display title.
         legs (tuple[SaleLeg, ...]): Its held markets in ticker order, then its partner if any.
-        count (int): Contract pairs sold (for a take-profit sale, all held on each market).
+        count (int): What is sold: contract pairs of an exact pair, contracts of
+            a lone leg's one held market (for a take-profit sale, all held on
+            each market).
         cost_dollars (float): What the whole position cost, fees included; for a trim,
             the part sold.
         ladders (dict): Held ticker -> bids for the side held, best first ([[price, qty], ...]);
@@ -310,6 +330,19 @@ def _sides_text(sides: tuple[tuple[str, str], ...]) -> str:
     return " / ".join(f"{side.upper()} {ticker}" for ticker, side in sides)
 
 
+def _held_text(pair: HeldPair) -> str:
+    """
+    Name a held position by side and ticker, for a log line.
+
+    Args:
+        pair (HeldPair): An exact held pair or a lone leg.
+
+    Returns:
+        str: e.g. "YES KX-A / NO KX-B", or "NO KX-B (alone on its ladder)" for a lone leg.
+    """
+    return _sides_text(pair.sides) + (" (alone on its ladder)" if pair.lone else "")
+
+
 def _held_market_text(ticker: Any, position: HeldPosition) -> str:
     """
     Name one held market by side and ticker, for a "Not selling" line.
@@ -348,7 +381,28 @@ def _shape_reason(position: HeldPosition) -> tuple[str, str]:
 
 def _settled_count(settlement: Settlement, side: str) -> float:
     """
-    The contracts of one side a settled market's settlement says the account held.
+    The contracts of one side the account held when a settled market paid out.
+
+    Kalshi's settlement lists the contracts bought on each side over the
+    market's life. A sale before the payout is listed as bought on the other
+    side (selling YES is buying NO), and the two net out, so what was held at
+    payout is their difference: 180 YES and 52 NO listed is 128 YES held. For a
+    record that lists one side only, it is that side's count.
+
+    Args:
+        settlement (Settlement): One settled market.
+        side (str): "yes" or "no".
+
+    Returns:
+        float: That side's count less the other side's, never below 0.
+    """
+    bought = _bought_count(settlement, side)
+    return max(0.0, bought - _bought_count(settlement, _OTHER_SIDE[side]))
+
+
+def _bought_count(settlement: Settlement, side: str) -> float:
+    """
+    The contracts of one side a settled market's settlement lists as bought.
 
     Args:
         settlement (Settlement): One settled market.
@@ -373,15 +427,26 @@ class _Reads:
         hold_days (int): How many daily checks there are (0 for a Kelly trim or an
             add-on, which make none).
         lookups (int): Label lookups from the exchange so far (SALE_PARTNER_MAX_LOOKUPS at most).
+        wider_lookups (int): Label lookups from the exchange so far in _find_partner's
+            search for a partner settled with more contracts than are held
+            (SALE_PARTNER_MAX_WIDER_LOOKUPS at most), counted apart from `lookups`.
         fee_multipliers (dict): Series ticker -> fee multiplier
             (historical.load_series_fee_multipliers), for a paid-out partner's fee.
+        purpose (str): "selling" (plan_sales) or "trimming" (plan_trims): what a
+            lone held market whose partner has paid out is looked at for, which
+            the WARNING of settlements() names when the settlements cannot be used.
+
+    Besides the reads below, label_market(ticker) gives the market labels()
+    found for a settled market, so a trim can read a paid-out partner's market.
     """
 
     def __init__(self, client: Any, held_positions: dict, markets_by_ticker: dict,
-                 now_ts: float, hold_days: int, *, fee_multipliers: dict | None = None) -> None:
+                 now_ts: float, hold_days: int, *, fee_multipliers: dict | None = None,
+                 purpose: str = "selling") -> None:
         """Start with nothing read; each argument is the attribute of the same name."""
         self.client = client
         self.fee_multipliers = fee_multipliers or {}
+        self.purpose = purpose
         # Each settled market looked up for its labels (None: not found)
         self._label_markets: dict = {}
         self.held_positions = held_positions
@@ -389,6 +454,7 @@ class _Reads:
         self.now_ts = now_ts
         self.hold_days = hold_days
         self.lookups = 0
+        self.wider_lookups = 0
         self._candles: dict = {}
         self._then_candles: dict = {}
         self._settlements: list | None = None
@@ -454,7 +520,8 @@ class _Reads:
         The account's recent settlements, read once, when every record could be read.
 
         An unreadable record may be a lone held market's partner, so then none is
-        used and no lone held market is sold this run (fails closed, one WARNING).
+        used and no lone held market is sold (or, for plan_trims, trimmed) this
+        run (fails closed, one WARNING, worded for `purpose`).
 
         Returns:
             tuple[list | None, str]: (the settlements, "") or (None, why not usable).
@@ -475,17 +542,27 @@ class _Reads:
                     "read, and any of them may be the partner")
             else:
                 self._settlements = found
-            if self._settlements_problem:
+            if self._settlements_problem and self.purpose == "trimming":
+                logging.warning("Not trimming any lone leg whose partner has paid out this "
+                                "run: %s", self._settlements_problem)
+            elif self._settlements_problem:
                 logging.warning("Not selling any held market whose partner has paid out this "
                                 "run: %s", self._settlements_problem)
         return self._settlements, self._settlements_problem
 
-    def labels(self, ticker: str) -> tuple[frozenset | None, str]:
+    def labels(self, ticker: str, *, wider: bool = False) -> tuple[frozenset | None, str]:
         """
         A settled market's ladder labels, found once: in this run's market list, or looked up.
 
+        A lookup counts against SALE_PARTNER_MAX_LOOKUPS, or, for _find_partner's search
+        for a partner settled with more contracts (`wider`), against
+        SALE_PARTNER_MAX_WIDER_LOOKUPS, so that search never uses up the lookups a
+        same-count partner needs. Labels found by either are kept for both.
+
         Args:
             ticker (str): The settled market's ticker.
+            wider (bool): True when the search for a partner settled with more
+                contracts asks.
 
         Returns:
             tuple[frozenset | None, str]: (its labels, "") or (None, why not found).
@@ -493,7 +570,12 @@ class _Reads:
         if ticker in self._labels:
             return self._labels[ticker]
         listed = ticker in self.markets_by_ticker
-        if not listed:
+        if not listed and wider:
+            if self.wider_lookups >= SALE_PARTNER_MAX_WIDER_LOOKUPS:
+                return None, (f"the limit of {SALE_PARTNER_MAX_WIDER_LOOKUPS} lookups for a "
+                              "partner settled with more contracts this run was reached")
+            self.wider_lookups += 1
+        elif not listed:
             if self.lookups >= SALE_PARTNER_MAX_LOOKUPS:
                 return None, (f"the limit of {SALE_PARTNER_MAX_LOOKUPS} partner lookups "
                               "this run was reached")
@@ -511,6 +593,19 @@ class _Reads:
             result = (market_ladder_keys(market), "")
         self._labels[ticker] = result
         return result
+
+    def label_market(self, ticker: str) -> Any:
+        """
+        The market labels() found for a settled market, so a trim can read a paid-out partner.
+
+        Args:
+            ticker (str): The settled market's ticker.
+
+        Returns:
+            Any: Its ApiMarket (from this run's market list, or looked up); None
+                when labels() did not look it up or did not find it.
+        """
+        return self._label_markets.get(ticker)
 
     def partner_fee_multiplier(self, ticker: str, event_ticker: str) -> float:
         """
@@ -541,14 +636,15 @@ def _find_partner(reads: _Reads, ticker: str, side: str, count: int,
     """
     Find a lone held market's one paid-out partner among the account's settlements.
 
-    It is the one settled market no longer held, held on the other side with the
-    same count (none on the held side), asking the held market's question (every
-    pair the bot buys asks one question, so a market of its event that asks
-    another was never its pair-mate), and settled no earlier than
-    SALE_PARTNER_MAX_AGE_DAYS before now (one dated after now is returned, and
-    _plan_one refuses it). Fails closed: a held market with no question label, no
-    partner, two or more, an unreadable label, or a partner settled other than yes
-    or no means no sale.
+    The partner is the one settled market that is no longer held, was held on
+    the other side at payout (_settled_count), asks the held market's question,
+    and settled within SALE_PARTNER_MAX_AGE_DAYS. Its count is the held count;
+    only if no market has that, at least the held count (a lone market sold in
+    part after payout holds fewer than its partner settled with). Exactly one
+    market must fit; the second search has its own lookup allowance
+    (SALE_PARTNER_MAX_WIDER_LOOKUPS). Used by _plan_one and _trim_one. Fails
+    closed on no or several partners, an unreadable label, a result other than
+    yes or no, or a two-sided record whose payout does not match its net count.
 
     Args:
         reads (_Reads): This run's reads.
@@ -569,25 +665,41 @@ def _find_partner(reads: _Reads, ticker: str, side: str, count: int,
         return None, problem
     other = _OTHER_SIDE[side]
     oldest = reads.now_ts - SALE_PARTNER_MAX_AGE_DAYS * _DAY_SECONDS
-    candidates = [s for s in settlements
-                  if s.ticker not in reads.held_positions and s.ticker != ticker
-                  and _settled_count(s, other) == count and _settled_count(s, side) == 0
-                  and s.settled_at.timestamp() >= oldest]
-    partners: list[Settlement] = []
-    for settlement in candidates:
-        found, problem = reads.labels(settlement.ticker)
-        if found is None:
-            return None, problem
-        if question not in found:
-            continue
-        partners.append(settlement)
-        if len(partners) > 1:
-            break
+
+    def question_matches_with_count(fits, wider: bool) -> tuple[list[Settlement] | None, str]:
+        """Up to two settled markets that pass every test above and whose count on the
+        other side fits; (None, why) when a candidate's labels cannot be found. `wider`
+        names the search for a partner settled with more (its own lookup allowance)."""
+        candidates = [s for s in settlements
+                      if s.ticker not in reads.held_positions and s.ticker != ticker
+                      # The second test is implied by the net reading (a market
+                      # held on `other` at payout held none on `side`); kept as a guard
+                      and fits(_settled_count(s, other)) and _settled_count(s, side) == 0
+                      and s.settled_at.timestamp() >= oldest]
+        partners: list[Settlement] = []
+        for settlement in candidates:
+            found, problem = reads.labels(settlement.ticker, wider=wider)
+            if found is None:
+                return None, problem
+            if question not in found:
+                continue
+            partners.append(settlement)
+            if len(partners) > 1:
+                break
+        return partners, ""
+
+    # The same count first; only when no market fits it, one settled with at least
+    # as many (a label already found is not looked up again)
+    partners, problem = question_matches_with_count(lambda settled: settled == count, False)
+    if partners == []:
+        partners, problem = question_matches_with_count(lambda settled: settled >= count, True)
+    if partners is None:
+        return None, problem
     if not partners:
         # config.count_text: a contract count written exactly
         return None, (f"no paid-out partner: no market it no longer holds was held "
-                      f"{other.upper()} with {count_text(count)} contracts on its question "
-                      f"and paid out in the last {SALE_PARTNER_MAX_AGE_DAYS} days")
+                      f"{other.upper()} with at least {count_text(count)} contracts on its "
+                      f"question and paid out in the last {SALE_PARTNER_MAX_AGE_DAYS} days")
     if len(partners) > 1:
         return None, ("more than one settled market could be its paid-out partner ("
                       + ", ".join(s.ticker for s in partners) + ")")
@@ -595,7 +707,61 @@ def _find_partner(reads: _Reads, ticker: str, side: str, count: int,
     if partner.result not in ("yes", "no"):
         return None, (f"its partner {partner.ticker} settled {partner.result} rather than "
                       "yes or no, which the rule does not judge")
+    if partner.yes_count > 0 and partner.no_count > 0:
+        # Contracts bought on both sides: what was held at payout is their
+        # difference only when the payout says so ($1 for each contract held on
+        # the winning side, $0 when the side held lost)
+        expected = _settled_count(partner, partner.result) * CONTRACT_PAYOUT_DOLLARS
+        if abs(partner.revenue_dollars - expected) > SALE_PARTNER_REVENUE_TOLERANCE_DOLLARS:
+            # config.count_text: a contract count written exactly
+            return None, (f"its partner {partner.ticker} lists contracts bought on both "
+                          f"sides ({count_text(partner.yes_count)} YES, "
+                          f"{count_text(partner.no_count)} NO), and its payout "
+                          f"({_dollars(partner.revenue_dollars)}) does not match the "
+                          f"{count_text(_settled_count(partner, other))} {other.upper()} "
+                          "held when it paid out, so what was held cannot be read")
     return partner, ""
+
+
+def _partner_leg(reads: _Reads, partner: Settlement, other: str, count: int) -> SaleLeg:
+    """
+    A lone held market's paid-out partner as one leg of a position (or the part of
+    one a Kelly trim sells) of `count` contract pairs.
+
+    The partner's cost is `count` contracts at the average cost of a contract
+    bought on the side held there, fees included: (that side's cost + the fees) x
+    count / the contracts bought on that side. Contracts sold before the payout
+    were a trade of their own, so the ones held keep their own average cost. Its
+    payout is scaled to `count` of the contracts held when it paid out
+    (_settled_count): a lone market partly sold after its partner paid out holds
+    fewer contracts than the partner settled with, so the position is that share
+    of the pair. For a partner whose record lists one side, bought and held are
+    the same count, so when it settled with exactly `count` contracts the
+    figures are the settlement's own. _plan_one (the take-profit sale) carries this leg
+    beside the held market, and its payout values the partner at every check it
+    had paid out by; _trim_one (a Kelly trim of a lone leg) carries it for the
+    contracts the trim sells, so the part sold's cost includes that share of
+    the partner's.
+
+    Args:
+        reads (_Reads): This run's reads (for the partner's fee multiplier).
+        partner (Settlement): The partner _find_partner found: holding at least
+            `count` contracts on `other` when it paid out.
+        other (str): The side held on the partner, "yes" or "no".
+        count (int): The lone market's contracts this leg goes with: all held
+            for a take-profit sale (_plan_one), the contracts sold for a Kelly
+            trim (_trim_one); at least one.
+
+    Returns:
+        SaleLeg: The partner's leg, with no market.
+    """
+    cost_basis = partner.yes_cost_dollars if other == "yes" else partner.no_cost_dollars
+    return SaleLeg(partner.ticker, partner.event_ticker, other, count,
+                   (cost_basis + partner.fees_dollars) * (count / _bought_count(partner, other)),
+                   payout_dollars=partner.revenue_dollars * (count / _settled_count(partner, other)),
+                   paid_at=partner.settled_at,
+                   partner_fee_multiplier=reads.partner_fee_multiplier(
+                       partner.ticker, partner.event_ticker))
 
 
 def _checks_text(profits: list[tuple[float, float]]) -> str:
@@ -631,7 +797,7 @@ def _plan_one(pair: HeldPair, reads: _Reads, held_labels: dict, *, sell_at: floa
     Returns:
         SalePlan | None: The plan when the rule sells it; None otherwise.
     """
-    text = _sides_text(pair.sides) + (" (alone on its ladder)" if pair.lone else "")
+    text = _held_text(pair)
 
     def not_selling(reason: str) -> None:
         """Log why this position is not sold."""
@@ -696,16 +862,13 @@ def _plan_one(pair: HeldPair, reads: _Reads, held_labels: dict, *, sell_at: floa
             not_selling(f"its partner {partner.ticker} is recorded as settling after now")
             return None
         other = _OTHER_SIDE[side]
-        # The partner's cost: what was paid for the side held there, plus its fees
-        cost_basis = partner.yes_cost_dollars if other == "yes" else partner.no_cost_dollars
-        legs.append(SaleLeg(partner.ticker, partner.event_ticker, other, count,
-                            cost_basis + partner.fees_dollars,
-                            payout_dollars=partner.revenue_dollars,
-                            paid_at=partner.settled_at,
-                            partner_fee_multiplier=reads.partner_fee_multiplier(
-                                partner.ticker, partner.event_ticker)))
+        # The partner's cost and payout, scaled to the contracts held here
+        legs.append(_partner_leg(reads, partner, other, count))
+        settled = _settled_count(partner, other)
+        # config.count_text: named only when the partner settled with more than is held here
+        more = "" if settled == count else f" with {count_text(settled)} contracts"
         text = (f"{side.upper()} {ticker} with paid-out {other.upper()} {partner.ticker} "
-                f"(settled {partner.result}, paid {_dollars(partner.revenue_dollars)})")
+                f"(settled {partner.result}{more}, paid {_dollars(partner.revenue_dollars)})")
 
     cost = sum(leg.cost_dollars for leg in legs)
     potential = count * CONTRACT_PAYOUT_DOLLARS - cost
@@ -900,15 +1063,103 @@ def _price_text(dollars: float) -> str:
     return f"${whole}.{part.rstrip('0').ljust(2, '0')}"
 
 
-def _log_trim_summary(trimmed: int, considered: int) -> None:
+def _log_trim_summary(trimmed: int, considered: int, lone_trimmed: int,
+                      lone_considered: int) -> None:
     """
-    Log how many held pairs the run trims.
+    Log how many exact held pairs, and how many lone legs, the run trims.
+
+    The line for exact pairs is logged on every call; the line for lone legs
+    (one held market whose partner has paid out) only when at least one was
+    looked at.
 
     Args:
-        trimmed (int): Pairs part of which is sold.
+        trimmed (int): Exact pairs part of which is sold.
         considered (int): Exact held pairs not picked for a take-profit sale.
+        lone_trimmed (int): Lone legs part of which is sold.
+        lone_considered (int): Lone legs not picked for a take-profit sale.
     """
     logging.info("Pairs to trim this run: %d of %d", trimmed, considered)
+    if lone_considered:
+        logging.info("Lone legs to trim this run (partner paid out): %d of %d",
+                     lone_trimmed, lone_considered)
+
+
+def _last_fill(pair: HeldPair, reads: _Reads, fills: FillTimes | None) -> datetime | None:
+    """
+    When a held position last traded: its newest fill, by the bot or by hand.
+
+    Counts fills on the position's own markets and, for a lone leg, on any
+    unheld market of its ladder in this run's list. Trims and add-ons both
+    wait and measure price moves from this moment.
+
+    Args:
+        pair (HeldPair): An exact held pair or a lone leg.
+        reads (_Reads): This planner call's reads (its market list is used).
+        fills (FillTimes | None): Each market's last fill; None if not read.
+
+    Returns:
+        datetime | None: The newest such fill; None if fills is None or none is listed.
+    """
+    if fills is None:
+        return None
+    listed = [fills.latest[ticker] for ticker, _side in pair.sides if ticker in fills.latest]
+    if pair.lone:
+        held = {ticker for ticker, _side in pair.sides}
+        # Cross-module: scanner's one reading of a market's ladder labels
+        listed += [when for ticker, when in fills.latest.items()
+                   if ticker not in held and ticker in reads.markets_by_ticker
+                   and market_ladder_keys(reads.markets_by_ticker[ticker]) & pair.labels]
+    return max(listed) if listed else None
+
+
+def _too_near_maturity(pair: HeldPair, markets_by_ticker: dict, utc_date: date,
+                       min_days: int | None) -> str | None:
+    """
+    Why a held position may not be rebalanced this run because it is too near maturity.
+
+    "Rebalance until" (LiveSettings.rebalance_min_days_to_maturity): a Kelly
+    trim or an add-on is made only while the position's later market closes
+    at least `min_days` days from today. The later market is the latest close
+    among its held markets: a pair's later market, or a lone leg's own (an
+    add-on to a lone leg is judged on the market held, since the market it
+    would be paired with is not known yet). Days are whole calendar days
+    between UTC dates, as a take-profit sale counts them
+    (config.days_to_maturity). Fails closed: under a minimum, a held market
+    missing from this run's list, or whose close date cannot be read, holds
+    the position back. Reads nothing from the exchange, so both planners ask
+    it before anything is read for a position.
+
+    Args:
+        pair (HeldPair): An exact held pair or a lone leg.
+        markets_by_ticker (dict): This run's market list by ticker.
+        utc_date (date): Today, UTC.
+        min_days (int | None): The fewest days left that still allow a
+            rebalance (1 or 7); None rebalances however near maturity.
+
+    Returns:
+        str | None: The reason, for a "Not trimming" or "Not adding to" line;
+            None when the position may be rebalanced.
+    """
+    if min_days is None:
+        return None
+    unchecked = f"so rebalancing until {min_days} day(s) before maturity cannot be checked"
+    missing = [ticker for ticker, _side in pair.sides if ticker not in markets_by_ticker]
+    if missing:
+        return f"{missing[0]} is not in this run's market list, {unchecked}"
+    # Cross-module: whole days from today (UTC) to the latest held close date
+    left = days_to_maturity([_utc_date(markets_by_ticker[ticker].close_time)
+                             for ticker, _side in pair.sides], utc_date)
+    # Cross-module: config's one test of the days left
+    if days_left_reached(left, min_days):
+        return None
+    if left is None:
+        return f"a held market's close date is unknown, {unchecked}"
+    if left == 0:
+        closes = "closes today"
+    else:
+        closes = f"closes in {left} day(s)" if left > 0 else f"closed {-left} day(s) ago"
+    return (f"its later market {closes}, and rebalancing stops {min_days} day(s) "
+            "before maturity")
 
 
 def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
@@ -916,59 +1167,46 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
               value: float, positions_value: float,
               fetched: list) -> tuple[SalePlan | None, str | None]:
     """
-    Judge one exact held pair for a Kelly trim, log the verdict, and plan the part sale.
+    Judge one exact held pair or lone leg for a Kelly trim, log the verdict, and plan the part sale.
 
-    The pair is sold down when it is worth more than its Kelly share of the
-    portfolio value, each contract pair counted at what selling it now returns
-    (config.kelly_trim_count, the backtest's rule). It stops at the first step
-    that fails, with one "Not trimming" line:
-
-      1. A whole count, and both markets in this run's market list.
-      2. The wait: enough calendar days since the last fill on either market.
-         A pair with no fill listed counts from the list's oldest fill.
-      3. Its kind (same-title or time-series) and which market is A.
-      4. Both order books, with a best bid on all four sides that an hourly
-         candle could show, so it is judged only on quotes the backtest could
-         see. What the pair would fetch at its held sides' best bids, after the
-         fee, goes into `fetched`; if that alone is more than all open
-         positions are valued at, it stops here (see Returns).
-      5. With a minimum price move set: the pair's total price (the asks of
-         the sides held, added) has moved that far, up or down, since its
-         last fill.
-      6. Its chance of paying can be read (config.held_pair_win_prob).
-
-    The sale is sized and priced only on bids within KELLY_TRIM_MAX_BID_DROP of
-    each held side's best bid (patch seller.KELLY_TRIM_MAX_BID_DROP in a test),
-    so it never sells into a gap in a book.
+    It is sold down when worth more than its Kelly share of the portfolio value
+    (config.kelly_trim_count, the backtest's rule). A lone leg (its partner paid
+    out $0) is trimmed as the later market of a time-series pair, with the
+    partner read at its settlement price (config.settled_bids). It stops at the
+    first failing step with one "Not trimming" line: markets listed, the wait
+    since its last trade (_last_fill), the partner (_find_partner), its kind,
+    readable books (their fetch value goes into `fetched`), the minimum price
+    move, and a readable chance of paying. Only bids within
+    KELLY_TRIM_MAX_BID_DROP of each best bid are sold into.
 
     Args:
-        pair (HeldPair): An exact held pair, never a lone market.
+        pair (HeldPair): An exact held pair or a lone leg, from scanner.held_pairs.
         reads (_Reads): This planner call's reads.
         fills (FillTimes | None): When each market last traded; None only with no
             wait in days and no minimum price move.
         settings (LiveSettings): The run's settings: k, both size caps and the
             minimum price move.
-        min_days (int): Days a pair must go without a trade (_rebalance_min_days).
+        min_days (int): Days a position must go without a trade (_rebalance_min_days).
         now_date (date): Today on the bot's own clock (_day).
         utc_date (date): Today in UTC, for the days left before maturity.
         value (float): What the trim is sized on, in dollars: cash plus open positions.
         positions_value (float): The open positions' part of that value, in dollars.
-        fetched (list): Once the four best bids are read, what the pair would fetch
-            at its held sides' best bids after the fee, in dollars, is appended here.
+        fetched (list): Once its best bids are read, what it would fetch at its
+            held sides' best bids after the fee, in dollars, is appended here.
 
     Returns:
-        tuple[SalePlan | None, str | None]: (plan, None) when part of the pair is
-            sold; (None, None) when it is kept; (None, why) when the pair alone
-            would fetch more than all open positions are valued at, so that value
-            is wrong and plan_trims trims nothing this run.
+        tuple[SalePlan | None, str | None]: (plan, None) when part of it is
+            sold; (None, None) when it is kept; (None, why) when it alone would
+            fetch more than all open positions are valued at, so that value is
+            wrong and plan_trims trims nothing this run.
 
     Raises:
         ValueError: When KELLY_TRIM_MAX_BID_DROP is not a finite number at least 0.
     """
-    text = _sides_text(pair.sides)
+    text = _held_text(pair)
 
     def not_trimming(reason: str) -> None:
-        """Log why this pair is not trimmed."""
+        """Log why this position is not trimmed."""
         logging.info("Not trimming %s: %s", text, reason)
 
     count_value = pair.count
@@ -981,18 +1219,18 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
     if missing:
         not_trimming(f"{missing[0]} is not in this run's market list")
         return None, None
+    # The held markets only: a lone leg's paid-out partner is read apart
     markets = {ticker: reads.markets_by_ticker[ticker] for ticker, _side in pair.sides}
 
-    # The pair's last trade: the latest fill on either market (None when none is
-    # listed). The wait and the price move both count from it
-    listed = ([fills.latest[ticker] for ticker, _side in pair.sides if ticker in fills.latest]
-              if fills is not None else [])
-    last_fill = max(listed) if listed else None
+    # Its last trade (None when no fill is listed). The wait and the price move
+    # both count from it
+    last_fill = _last_fill(pair, reads, fills)
     if min_days == 0:
         waited = "no wait"
     else:
         # No fill listed: its last trade is no later than the list's oldest fill
-        since = last_fill if listed else (fills.oldest if fills is not None else None)
+        since = (last_fill if last_fill is not None
+                 else (fills.oldest if fills is not None else None))
         if since is None:
             not_trimming("when it last traded is not known")
             return None, None
@@ -1005,17 +1243,52 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
             not_trimming(f"it last traded {last}, {ago}, and a trim waits until {min_days} "
                          "day(s) have passed since a pair's last trade")
             return None, None
-        waited = (f"last traded {last}, {days} day(s) ago" if listed
+        waited = (f"last traded {last}, {days} day(s) ago" if last_fill is not None
                   else f"no fill listed (the fills list starts {last})")
 
     by_side = {side: markets[ticker] for ticker, side in pair.sides}
-    # Cross-module: the pair's kind and which market is A
+    partner = None
+    if pair.lone:
+        lone_ticker, lone_side = pair.sides[0]
+        other = _OTHER_SIDE[lone_side]
+        # The one settled market held on the other side that asked this market's
+        # question: its count is the held count, or at least as many once the leg
+        # was trimmed (a trim leaves it holding fewer than its partner settled with)
+        partner, problem = _find_partner(reads, lone_ticker, lone_side, count,
+                                         pair.labels)
+        if partner is None:
+            not_trimming(problem)
+            return None, None
+        if partner.settled_at.timestamp() > reads.now_ts:
+            # A payout dated after now (the exchange's clock runs ahead) has nothing to read it by
+            not_trimming(f"its partner {partner.ticker} is recorded as settling after now")
+            return None, None
+        if partner.result == other:
+            # The partner's side won, so the event this leg bets against has happened
+            not_trimming(f"its partner {partner.ticker} paid out on its {other.upper()} side, "
+                         "so this leg cannot win")
+            return None, None
+        text = (f"{lone_side.upper()} {lone_ticker} (alone: {other.upper()} "
+                f"{partner.ticker} paid out $0)")
+        partner_market = reads.label_market(partner.ticker)
+        if partner_market is None:
+            # Defence only: _find_partner keeps a partner only once its market was found
+            not_trimming(f"the market of its partner {partner.ticker} could not be read")
+            return None, None
+        by_side[other] = partner_market
+    # Cross-module: the pair's kind and which market is A (a lone leg's partner
+    # standing in for the market that paid out)
     kind = held_pair_kind(by_side["yes"], by_side["no"])
     if kind is None:
         not_trimming("its two markets cannot be shown to be a same-title or a time-series "
                      "pair held this way round, so its chance of paying cannot be read")
         return None, None
     pair_type, market_a, market_b = kind
+    if partner is not None and (pair_type != "time_series" or market_b.ticker != lone_ticker):
+        # The forecast for what is left is the later market's chance of paying once
+        # the earlier one has paid $0; no other lone leg has one
+        not_trimming("a lone leg is trimmed only as the later market of a time-series pair")
+        return None, None
     # Cross-module: the side each leg holds
     side_a, side_b = leg_sides(pair_type)
 
@@ -1023,6 +1296,12 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
     # ask is 1 minus the other side's best bid
     bids: dict = {}
     for market in (market_a, market_b):
+        if partner is not None and market.ticker == partner.ticker:
+            # Cross-module: a paid-out market reads as its settlement price, one level
+            # deep without end, and no book or candle is read for it
+            bids[(market.ticker, "yes")], bids[(market.ticker, "no")] = [
+                [(price, math.inf)] for price in settled_bids(partner.result)]
+            continue
         # Cross-module: the market's order book, a retried read-only GET
         book = _fetch_orderbook(reads.client, market.ticker)
         if book is None:
@@ -1045,12 +1324,14 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
     yes_bid_a, no_bid_a = bids[(market_a.ticker, "yes")][0][0], bids[(market_a.ticker, "no")][0][0]
     yes_bid_b, no_bid_b = bids[(market_b.ticker, "yes")][0][0], bids[(market_b.ticker, "no")][0][0]
 
-    # Cross-module: only the held side's bids near its best bid, so a gap in a book
-    # is never sold into
+    # Cross-module: only each held side's bids near its best bid, so a gap in a book
+    # is never sold into (a paid-out partner sells nothing, so it has no ladder)
     ladders = {market.ticker: kelly_trim_bids(bids[(market.ticker, side)],
                                               KELLY_TRIM_MAX_BID_DROP)
-               for market, side in ((market_a, side_a), (market_b, side_b))}
-    bid_a, bid_b = ladders[market_a.ticker][0][0], ladders[market_b.ticker][0][0]
+               for market, side in ((market_a, side_a), (market_b, side_b))
+               if market.ticker in markets}
+    # Each side held's best bid; a paid-out partner's is its settlement price ($0)
+    bid_a, bid_b = bids[(market_a.ticker, side_a)][0][0], bids[(market_b.ticker, side_b)][0][0]
     # One contract pair's sale at the best bids, after the fee. Tested before the
     # price move and the chance, so a pair they hold back still flags a wrong value
     # Each market's fee multiplier, by ticker (market_a's goes with bid_a)
@@ -1060,36 +1341,42 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
     top_value = bid_a + bid_b - fee_per_pair_approx(
         bid_a, bid_b, multiplier_a=fee_mults[market_a.ticker],
         multiplier_b=fee_mults[market_b.ticker])
+    # What a lone leg sells is contracts of its one market; a pair's, contract pairs
+    unit = "contracts" if pair.lone else "contract pairs"
     # plan_trims also tests these pairs together
     fetched.append(count * top_value)
     if count * top_value > positions_value:
         # One pair cannot be worth more than every open position together
         return None, (f"{text} alone would fetch {_dollars(count * top_value)} at its best "
-                      f"bids ({count_text(count)} contract pairs at {_dollars(top_value)} "
+                      f"bids ({count_text(count)} {unit} at {_dollars(top_value)} "
                       f"each), more than the {_dollars(positions_value)} all open positions "
                       "are valued at")
 
     move_text = ""
     if settings.min_price_move is not None:
-        # The pair's total price (the asks of the sides held, added) must have moved
-        # that far, up or down, since its last fill
+        # Its price (the asks of the sides held, added) must have moved that far,
+        # up or down, since its last trade
         if last_fill is None:
-            not_trimming("no fill is listed on either market, so its price when it last "
+            where = "its market or its ladder" if pair.lone else "either market"
+            not_trimming(f"no fill is listed on {where}, so its price when it last "
                          "traded cannot be read, and a minimum price move is set")
             return None, None
         moment = math.floor(last_fill.timestamp())
-        # Its price then: each held side's ask at the last fill, from hourly candles
-        then_a = reads.ask_then(market_a, side_a, moment)
-        then_b = reads.ask_then(market_b, side_b, moment)
+        # Its price then: each held side's ask at the last trade, from hourly candles. A
+        # paid-out partner is not held: its part of the price is 0 then, as now (its
+        # settled ask), so its payout never reads as a move
+        then_a = reads.ask_then(market_a, side_a, moment) if market_a.ticker in markets else 0.0
+        then_b = reads.ask_then(market_b, side_b, moment) if market_b.ticker in markets else 0.0
         # NaN (never equal to itself): no usable quote, or unreadable candles
         if then_a != then_a or then_b != then_b:
             unread, side = (market_a, side_a) if then_a != then_a else (market_b, side_b)
-            not_trimming(f"the {side.upper()} ask on {unread.ticker} when the pair last "
+            who = "it" if pair.lone else "the pair"
+            not_trimming(f"the {side.upper()} ask on {unread.ticker} when {who} last "
                          f"traded ({_day(last_fill)}) cannot be read (no usable quote in the "
                          f"{PRICE_THEN_MAX_AGE_DAYS} days before it, or its price "
                          "history could not be read), and a minimum price move is set")
             return None, None
-        # Its price now, from the books just read
+        # Its price now, from the books just read (a paid-out partner's: 0)
         now_a = 1.0 - bids[(market_a.ticker, _other(side_a))][0][0]
         now_b = 1.0 - bids[(market_b.ticker, _other(side_b))][0][0]
         # Cross-module: the move and its test, both shared with the backtest (a
@@ -1098,13 +1385,15 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
         prices = (f"price {_price_text(then_a + then_b)} then, {_price_text(now_a + now_b)} now "
                   f"({_cents_text(move)}, minimum {settings.min_price_move * 100:.0f}c)")
         if not price_move_reached(move, settings.min_price_move):
-            not_trimming("its total price has not moved by the minimum since it last "
+            total = "price" if pair.lone else "total price"
+            not_trimming(f"its {total} has not moved by the minimum since it last "
                          f"traded: {prices}")
             return None, None
         move_text = prices + ", "
 
     # Cross-module: the chance the pair pays, as a new trade of it would be sized
-    # (each ask is 1 minus the other side's best bid)
+    # (each ask is 1 minus the other side's best bid; a paid-out partner's are its
+    # settlement price)
     win_prob = held_pair_win_prob(pair_type, 1.0 - no_bid_a, 1.0 - yes_bid_a,
                                   1.0 - no_bid_b, 1.0 - yes_bid_b, settings.interval_discount)
     if win_prob is None:
@@ -1114,8 +1403,8 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
         return None, None
 
     def net_sale(pairs: int) -> float | None:
-        """What selling `pairs` contract pairs returns after fees; None when the bids
-        within reach hold fewer."""
+        """What selling `pairs` contract pairs (contracts, for a lone leg) returns
+        after fees; None when the bids within reach hold fewer."""
         total = 0.0
         for ticker, ladder in ladders.items():
             # Cross-module: the one bid walk, then the taker fee on that market's
@@ -1133,9 +1422,12 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
     decision = kelly_trim_count(count, value, win_prob, cap, top_value, net_sale)
     # Cross-module: the share Kelly lets the pair keep at its best bids, for the log line
     keep = min(cap, kelly_hold_fraction(win_prob, top_value))
+    held_words = (f"{count_text(count)} contracts" if pair.lone
+                  else f"{count_text(count)} each")
+    each = "a contract" if pair.lone else "a pair"
     head = (f"Kelly trim check: {text} ({_KIND_WORDS.get(pair_type, pair_type)}), "
-            f"{count_text(count)} each, {waited}, {move_text}pays {win_prob:.1%}, "
-            f"{_dollars(top_value)} a pair at the best bids, may keep {keep:.1%} of "
+            f"{held_words}, {waited}, {move_text}pays {win_prob:.1%}, "
+            f"{_dollars(top_value)} {each} at the best bids, may keep {keep:.1%} of "
             f"{_dollars(value)}")
     sell = decision.sell
     if not sell:
@@ -1145,18 +1437,23 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
     proceeds = net_sale(sell)
     if proceeds is None or None in walked.values():
         # Defence only: the rule returns a count the bids can take
-        not_trimming(f"the bids within reach hold fewer than the {sell} contract pairs a "
+        not_trimming(f"the bids within reach hold fewer than the {sell} {unit} a "
                      "trim would sell")
         return None, None
     logging.info("%s -> sell %d", head, sell)
 
-    # Each leg sells `sell` of the `count` held; its cost is that share of the market's cost
+    # Each held leg sells `sell` of the `count` held; its cost is that share of the
+    # market's cost
     legs = tuple(
         SaleLeg(ticker, markets[ticker].event_ticker, side, sell,
                 (reads.held_positions[ticker].exposure_dollars
                  + reads.held_positions[ticker].fees_dollars) * sell / count,
                 market=markets[ticker], held=count)
         for ticker, side in pair.sides)
+    if partner is not None:
+        # The paid-out partner goes with them: its cost and $0 payout for the
+        # `sell` contracts, as a lone take-profit sale carries it
+        legs += (_partner_leg(reads, partner, other, sell),)
     cost = sum(leg.cost_dollars for leg in legs)
     # Cross-module: days to maturity from each held market's scheduled close date
     days_left = days_to_maturity([_utc_date(m.close_time) for m in markets.values()], utc_date)
@@ -1173,10 +1470,14 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
                positions_value_cents: float | None,
                skip: frozenset = frozenset()) -> list[SalePlan]:
     """
-    Plan this run's Kelly trims: part sales of exact held pairs grown past their Kelly share.
+    Plan this run's Kelly trims: part sales of held positions grown past their Kelly share.
 
-    Each pair is judged by _trim_one. Fails closed: nothing is trimmed, with one
-    log line saying why, unless all of these hold:
+    A position is an exact held pair or a lone leg (one held market whose
+    partner has paid out), and each is judged by _trim_one. A lone leg is
+    trimmed only as the later market of a time-series pair whose earlier
+    market is found among the account's settlements, paid out $0 (the side
+    held there lost). Fails closed: nothing is trimmed, with one log line
+    saying why, unless all of these hold:
 
       - Kalshi's value of the open positions is known and above zero (a trim
         sized on too small a value sells too much).
@@ -1184,13 +1485,19 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
       - With a wait in days or a minimum price move set, the account's fills
         could be read, and with a wait, the list reaches back that many days.
         With neither set, the fills are not read.
-      - The pairs whose best bids were read would not, alone or together, fetch
-        more at those bids than all open positions are valued at. If they
+      - The positions whose best bids were read would not, alone or together,
+        fetch more at those bids than all open positions are valued at. If they
         would, that value is wrong and no trim stands, even one logged "-> sell".
 
+    And no lone leg is trimmed, with one WARNING, when the account's
+    settlements cannot all be read (any record left out may be its partner).
+    With settings.rebalance_min_days_to_maturity set, a position whose later
+    market closes fewer than that many days from today (UTC dates) is left
+    out first, with one "Not trimming" line, before anything is read for it
+    (_too_near_maturity).
     A trim is sized on the cash plus the larger of Kalshi's value of the open
     positions and what the held markets would fetch at this run's bids, which
-    can only trim less. Lone held markets are never trimmed.
+    can only trim less.
 
     Args:
         client (Any): The authenticated production Kalshi client, only read from.
@@ -1198,13 +1505,13 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
         held_labels (dict): Ticker -> ladder labels (scanner.resolve_held_ladders' labels_out).
         markets_by_ticker (dict): This run's whole market list by ticker, held markets included.
         settings (LiveSettings): rebalance (off: trim and read nothing), min_price_move,
-            k and both size caps.
+            rebalance_min_days_to_maturity, k and both size caps.
         now (datetime): The run's moment, timezone-aware.
         cash_cents (float): The account's cash on every shard, in cents.
         positions_value_cents (float | None): Kalshi's value of the open positions, in
             cents; None when it was not read or was refused.
         skip (frozenset): Held tickers picked for a take-profit sale this run; a pair
-            with one is not looked at.
+            or lone leg with one is not looked at.
 
     Returns:
         list[SalePlan]: The part sales in ticker order (kind config.SALE_KIND_KELLY_TRIM);
@@ -1225,7 +1532,7 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
             or not math.isfinite(cash_cents) or cash_cents < 0):
         raise ValueError(f"cash_cents must be a finite number at least 0, got {cash_cents!r}")
     if not held_positions:
-        _log_trim_summary(0, 0)
+        _log_trim_summary(0, 0, 0, 0)
         return []
     # `not ... > 0` is also true for NaN
     if (isinstance(positions_value_cents, bool)
@@ -1235,26 +1542,42 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
             "Not trimming any held pair this run: Kalshi's value of the open positions is "
             "not known or is not above $0, and a trim sized on too small a value would "
             "sell too much")
-        _log_trim_summary(0, 0)
+        _log_trim_summary(0, 0, 0, 0)
         return []
     unknown = sorted((t for t in held_positions if not held_labels.get(t)), key=str)
     if unknown:
         # An unknown ladder could be any pair's, so no pair is provably alone on its ladder
         logging.info("Not trimming this run: the ladder of %d held market(s) is unknown (%s)",
                      len(unknown), ", ".join(str(t) for t in unknown))
-        _log_trim_summary(0, 0)
+        _log_trim_summary(0, 0, 0, 0)
         return []
 
     # Cross-module: the one definition of exact held pairs and lone held markets, quietly
     found = held_pairs(held_positions, held_labels, markets_by_ticker, log=False)
-    # Exact pairs only, and none whose markets a take-profit sale already takes
-    pairs = {key: pair for key, pair in found.items() if not pair.lone and not key & skip}
+    # Exact pairs and lone legs (a lone leg is judged once its paid-out partner is
+    # found), none whose markets a take-profit sale already takes
+    pairs = {key: pair for key, pair in found.items() if not key & skip}
     for key in sorted(found, key=sorted):
-        if not found[key].lone and key & skip:
+        if key & skip:
             logging.info("Not trimming %s: it is picked for a take-profit sale this run",
-                         _sides_text(found[key].sides))
+                         _held_text(found[key]))
+    # The summary counts exact pairs and lone legs apart
+    lone = sum(1 for pair in pairs.values() if pair.lone)
+    exact = len(pairs) - lone
     if not pairs:
-        _log_trim_summary(0, 0)
+        _log_trim_summary(0, 0, 0, 0)
+        return []
+    # "Rebalance until": a position whose later market closes too soon is left out
+    # first, so nothing is read for it
+    utc_date = now.astimezone(UTC).date()
+    for key in sorted(pairs, key=sorted):
+        near = _too_near_maturity(pairs[key], markets_by_ticker, utc_date,
+                                  settings.rebalance_min_days_to_maturity)
+        if near is not None:
+            logging.info("Not trimming %s: %s", _held_text(pairs[key]), near)
+            del pairs[key]
+    if not pairs:
+        _log_trim_summary(0, exact, 0, lone)
         return []
 
     # Today on the bot's own clock, as every fill's day is read
@@ -1267,7 +1590,7 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
             logging.warning(
                 "Not trimming any held pair this run: the account's fills could not be "
                 "read, so when each pair last traded is not known")
-            _log_trim_summary(0, len(pairs))
+            _log_trim_summary(0, exact, 0, lone)
             return []
     if min_days > 0:
         logging.info(
@@ -1287,7 +1610,7 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
             logging.warning(
                 "Not trimming any held pair this run: %s, so a trade in the last %d day(s) "
                 "cannot be ruled out", problem, min_days)
-            _log_trim_summary(0, len(pairs))
+            _log_trim_summary(0, exact, 0, lone)
             return []
 
     # Cross-module: what the held markets would fetch at this run's bids. A trim is
@@ -1306,11 +1629,12 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
             "this run's bids (%s): the Kelly trim is sized on the larger, so it can only "
             "sell less", _dollars(kalshi_value), _dollars(floor))
 
-    # 0 daily checks: a trim reads only the books now and, with a minimum price
-    # move, each market's price at its pair's last fill
-    reads = _Reads(client, held_positions, markets_by_ticker, now.timestamp(), 0)
-    utc_date = now.astimezone(UTC).date()
+    # 0 daily checks: a trim reads only the books now, a lone leg's settled partner
+    # and, with a minimum price move, each market's price at its last fill
+    reads = _Reads(client, held_positions, markets_by_ticker, now.timestamp(), 0,
+                   purpose="trimming")
     plans: list[SalePlan] = []
+    lone_trimmed = 0
     doubts: list[str] = []
     # What each pair whose books were read would fetch at its best bids after the fee
     fetched: list[float] = []
@@ -1323,22 +1647,27 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
             doubts.append(doubt)
         elif plan is not None:
             plans.append(plan)
+            if pairs[key].lone:
+                lone_trimmed += 1
     total = sum(fetched)
+    # A lone leg is one market, not a pair, so a run that looked at one names both "positions"
+    noun = "positions" if lone else "pairs"
     if not doubts and total > positions_value:
         # Together they would fetch more than all open positions: the value is just as wrong
-        doubts.append(f"the {len(fetched)} pairs whose order books were read would fetch "
+        doubts.append(f"the {len(fetched)} {noun} whose order books were read would fetch "
                       f"{_dollars(total)} at their best bids together, more than the "
                       f"{_dollars(positions_value)} all open positions are valued at")
     if doubts:
         # Every trim above was sized on that wrong value, so none stands
-        more = f" (and {len(doubts) - 1} more pair(s) alike)" if len(doubts) > 1 else ""
+        alike = "position(s)" if lone else "pair(s)"
+        more = f" (and {len(doubts) - 1} more {alike} alike)" if len(doubts) > 1 else ""
         logging.warning(
             "Not trimming any held pair this run, including any marked '-> sell' above: "
             "%s%s, so that value cannot be right, and a trim sized on too small a value "
             "would sell too much", doubts[0], more)
-        _log_trim_summary(0, len(pairs))
+        _log_trim_summary(0, exact, 0, lone)
         return []
-    _log_trim_summary(len(plans), len(pairs))
+    _log_trim_summary(len(plans) - lone_trimmed, exact, lone_trimmed, lone)
     return plans
 
 
@@ -1362,12 +1691,13 @@ def _add_on_one(pair: HeldPair, reads: _Reads, fills: FillTimes, *,
 
     It stops at the first step that fails, with one "Not adding to" line:
 
-      1. The wait: enough calendar days since the last fill on its markets
-         (both of an exact pair's; for a lone leg, its own market and any
-         market of its ladder in this run's list, since the finders pair a
-         lone leg only with one of those, so a partner sold by hand restarts
-         the wait). With no fill listed, it last traded no later than the
-         fills list's oldest fill.
+      1. The wait: enough calendar days since its last trade (_last_fill, the
+         Kelly trim's own reading: the last fill on both of an exact pair's
+         markets; for a lone leg, on its own market and any market of its
+         ladder in this run's list, since the finders pair a lone leg only
+         with one of those, so a partner sold by hand restarts the wait).
+         With no fill listed, it last traded no later than the fills list's
+         oldest fill.
       2. With a minimum price move set: a fill is listed, so its price when it
          last traded can be read.
       3. Its price now: the ask of the side held on each market, from this
@@ -1404,26 +1734,15 @@ def _add_on_one(pair: HeldPair, reads: _Reads, fills: FillTimes, *,
     # config.count_text: a contract count written exactly
     count = f"{count_text(pair.count)} contracts" + ("" if pair.lone else " each")
     where = "its market" if pair.lone else "either market"
-    # The last trade: the latest fill on its markets (None when none is listed).
-    # The wait and the price move both count from it
-    listed = [fills.latest[ticker] for ticker, _side in pair.sides if ticker in fills.latest]
-    if pair.lone:
-        # A lone leg is added to beside a market the account does not hold, and the
-        # finders pair it only with a market on its own ladder. A partner sold by hand
-        # leaves the positions listing just as a paid-out one does, so a fill on any
-        # market of that ladder in this run's list counts too: buying such a market
-        # back waits like any other rebalance
-        held = {ticker for ticker, _side in pair.sides}
-        # Cross-module: scanner's one reading of a market's ladder labels
-        listed += [when for ticker, when in fills.latest.items()
-                   if ticker not in held and ticker in reads.markets_by_ticker
-                   and market_ladder_keys(reads.markets_by_ticker[ticker]) & pair.labels]
-    last_fill = max(listed) if listed else None
+    # The last trade: the latest fill on its markets (for a lone leg, also on any
+    # market of its ladder in this run's list; None when none is listed). The wait
+    # and the price move both count from it, as the Kelly trim's do
+    last_fill = _last_fill(pair, reads, fills)
     if min_days == 0:
         waited = "no wait"
     else:
         # No fill listed: its last trade is no later than the list's oldest fill
-        since = last_fill if listed else fills.oldest
+        since = last_fill if last_fill is not None else fills.oldest
         if since is None:
             not_adding("when it last traded is not known")
             return False
@@ -1436,7 +1755,7 @@ def _add_on_one(pair: HeldPair, reads: _Reads, fills: FillTimes, *,
             not_adding(f"it last traded {last}, {ago}, and an add-on waits until {min_days} "
                        "day(s) have passed since a pair's last trade")
             return False
-        waited = (f"last traded {last}, {days} day(s) ago" if listed
+        waited = (f"last traded {last}, {days} day(s) ago" if last_fill is not None
                   else f"no fill listed (the fills list starts {last})")
 
     prices = ""
@@ -1502,7 +1821,10 @@ def plan_add_ons(client: Any, add_on_pairs: dict, markets_by_ticker: dict, *,
     added; a lone leg's is its one market's. The price then comes from
     hourly candles at the last fill (_Reads.ask_then, as the trim reads it);
     the price now from this run's market list (scanner.listed_ask). Each pair
-    is judged by _add_on_one.
+    is judged by _add_on_one. Before any of that, with
+    settings.rebalance_min_days_to_maturity set, a pair whose later market
+    closes fewer than that many days from today (UTC dates; a lone leg's own
+    market) is left out, with one "Not adding to" line (_too_near_maturity).
 
     Fails closed: a pair whose wait, price then or price now cannot be read
     is left out, and when the account's fills cannot be read, or (with a
@@ -1515,8 +1837,8 @@ def plan_add_ons(client: Any, add_on_pairs: dict, markets_by_ticker: dict, *,
         add_on_pairs (dict): frozenset of tickers -> HeldPair, what scanner.held_pairs
             found the run may add to (less any pair at its cap or picked for a sale).
         markets_by_ticker (dict): This run's whole market list by ticker, held markets included.
-        settings (LiveSettings): rebalance (off: keep nothing, read nothing) and
-            min_price_move.
+        settings (LiveSettings): rebalance (off: keep nothing, read nothing),
+            min_price_move and rebalance_min_days_to_maturity.
         now (datetime): The run's moment, timezone-aware.
 
     Returns:
@@ -1535,11 +1857,27 @@ def plan_add_ons(client: Any, add_on_pairs: dict, markets_by_ticker: dict, *,
         raise ValueError(f"now must be a timezone-aware datetime, got {now!r}")
     if not add_on_pairs:
         return {}
+    # "Rebalance until": a position whose later market closes too soon is left out
+    # first, so nothing is read for it
+    near_maturity = set()
+    if settings.rebalance_min_days_to_maturity is not None:
+        utc_date = now.astimezone(UTC).date()
+        for key in sorted(add_on_pairs, key=sorted):
+            near = _too_near_maturity(add_on_pairs[key], markets_by_ticker, utc_date,
+                                      settings.rebalance_min_days_to_maturity)
+            if near is not None:
+                logging.info("Not adding to %s: %s", _sides_text(add_on_pairs[key].sides),
+                             near)
+                near_maturity.add(key)
+    pairs = {key: pair for key, pair in add_on_pairs.items() if key not in near_maturity}
+    if not pairs:
+        _log_add_on_summary(0, len(add_on_pairs))
+        return {}
     min_move = settings.min_price_move
     if min_days == 0 and min_move is None:
         # Nothing to wait for, so nothing is read
-        _log_add_on_summary(len(add_on_pairs), len(add_on_pairs))
-        return dict(add_on_pairs)
+        _log_add_on_summary(len(pairs), len(add_on_pairs))
+        return pairs
 
     # Today on the bot's own clock, as every fill's day is read
     now_date = _day(now)
@@ -1572,9 +1910,9 @@ def plan_add_ons(client: Any, add_on_pairs: dict, markets_by_ticker: dict, *,
     # no position is read
     reads = _Reads(client, {}, markets_by_ticker, now.timestamp(), 0)
     kept: dict = {}
-    for key in sorted(add_on_pairs, key=sorted):
-        if _add_on_one(add_on_pairs[key], reads, fills, min_move=min_move,
+    for key in sorted(pairs, key=sorted):
+        if _add_on_one(pairs[key], reads, fills, min_move=min_move,
                        min_days=min_days, now_date=now_date):
-            kept[key] = add_on_pairs[key]
+            kept[key] = pairs[key]
     _log_add_on_summary(len(kept), len(add_on_pairs))
     return kept

@@ -73,7 +73,8 @@ from .conftest import apply_pre_toggle_defaults
 
 def _settings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20,
               same_title_size_cap=1.0, exclude_categories=None, exclude_tags=None, rebalance=False,
-              min_price_move=None, sell_at=None, sell_min_days=None):
+              min_price_move=None, rebalance_min_days_to_maturity=None, sell_at=None,
+              sell_min_days=None):
     """A LiveSettings with every toggle named, defaulting to the pre-toggle
     values conftest's apply_pre_toggle_defaults pins (no rebalancing, no selling)."""
     return LiveSettings(tier_floors=tier_floors, spread_band=spread_band,
@@ -81,6 +82,7 @@ def _settings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, 
                         same_title_size_cap=same_title_size_cap,
                         exclude_categories=exclude_categories, exclude_tags=exclude_tags,
                         rebalance=rebalance, min_price_move=min_price_move,
+                        rebalance_min_days_to_maturity=rebalance_min_days_to_maturity,
                         sell_at=sell_at, sell_min_days=sell_min_days)
 
 
@@ -1160,6 +1162,70 @@ class TestLiveSettings:
         with pytest.raises(ValueError, match="multiple of 5c"):
             _settings(min_price_move=0.07)
 
+    def test_rebalance_until_defaults_to_maturity(self):
+        # A construction that names no days reads "maturity": always rebalance
+        assert LiveSettings(True, (0.0, 1.0), 0.75, 0.2).rebalance_min_days_to_maturity is None
+        assert _settings().rebalance_min_days_to_maturity is None
+        assert _settings(rebalance=True).rebalance_min_days_to_maturity is None
+
+    def test_rebalance_until_takes_the_dashboards_three_choices(self):
+        assert config.REBALANCE_MATURITY_DAYS == (0, 1, 7)
+        for days in (1, 7):
+            s = _settings(rebalance=True, rebalance_min_days_to_maturity=days)
+            assert s.rebalance_min_days_to_maturity == days
+            assert type(s.rebalance_min_days_to_maturity) is int
+
+    def test_rebalance_until_zero_is_stored_as_maturity(self):
+        # 0 days is "always", the same as None, with rebalancing on or off
+        for rebalance in (True, False):
+            s = _settings(rebalance=rebalance, rebalance_min_days_to_maturity=0)
+            assert s.rebalance_min_days_to_maturity is None
+            assert s == _settings(rebalance=rebalance)
+        # replace re-validates, so it turns a set value back to "maturity" too
+        on = _settings(rebalance=True, rebalance_min_days_to_maturity=7)
+        assert dataclasses.replace(on, rebalance_min_days_to_maturity=0) == _settings(
+            rebalance=True)
+
+    @pytest.mark.parametrize("bad", [
+        2, 3, 6, 8, 14, 30, -1, -7, 100, True, False, 1.0, 7.0, 0.0, 0.5, float("nan"),
+        float("inf"), "7", "1", "maturity", [7], (7,), 10 ** 400])
+    def test_rebalance_until_other_than_zero_one_or_seven_is_refused(self, bad):
+        with pytest.raises(ValueError, match=re.escape(
+                f"rebalance_min_days_to_maturity must be 0, 1 or 7, got {bad!r}")):
+            _settings(rebalance=True, rebalance_min_days_to_maturity=bad)
+        with pytest.raises(ValueError, match="rebalance_min_days_to_maturity"):
+            dataclasses.replace(_settings(rebalance=True), rebalance_min_days_to_maturity=bad)
+
+    def test_rebalance_until_refuses_a_numpy_integer(self):
+        import numpy as np
+
+        # A numpy whole number is not a plain int, as sell_min_days has it
+        for bad in (np.int64(1), np.int64(7), np.int64(0), np.uint8(7), np.bool_(True)):
+            with pytest.raises(ValueError, match="rebalance_min_days_to_maturity must be"):
+                _settings(rebalance=True, rebalance_min_days_to_maturity=bad)
+
+    def test_rebalance_until_with_rebalancing_off_is_refused(self):
+        with pytest.raises(ValueError, match=re.escape(
+                "rebalance_min_days_to_maturity needs rebalance on, got "
+                "rebalance_min_days_to_maturity 7 with rebalance off")):
+            _settings(rebalance_min_days_to_maturity=7)
+        with pytest.raises(ValueError, match="rebalance_min_days_to_maturity needs rebalance on"):
+            _settings(rebalance=False, rebalance_min_days_to_maturity=1)
+        # replace re-validates: turning rebalancing off under days is refused too
+        on = _settings(rebalance=True, rebalance_min_days_to_maturity=1)
+        with pytest.raises(ValueError, match="rebalance_min_days_to_maturity needs rebalance on"):
+            dataclasses.replace(on, rebalance=False)
+        # Rebalancing with no days is fine, and so is turning both off together
+        assert dataclasses.replace(
+            on, rebalance_min_days_to_maturity=None).rebalance is True
+        assert dataclasses.replace(
+            on, rebalance=False, rebalance_min_days_to_maturity=None) == _settings()
+
+    def test_a_bad_rebalance_until_is_named_before_the_switch_it_needs(self):
+        # Not 0, 1 or 7 with rebalancing off: the bad value is named first
+        with pytest.raises(ValueError, match="must be 0, 1 or 7"):
+            _settings(rebalance_min_days_to_maturity=2)
+
     @pytest.mark.parametrize("doc, stale", [
         ("README.md", "since live trading has no such setting"),
         ("CLAUDE.md", "there is no live setting to save it as"),
@@ -1267,11 +1333,13 @@ class TestLiveSettings:
         monkeypatch.setattr(config, "TRADE_EXCLUDE_TAGS", ["Oil & Gas"])
         monkeypatch.setattr(config, "REBALANCE", True)
         monkeypatch.setattr(config, "MIN_PRICE_MOVE", 0.10)
+        monkeypatch.setattr(config, "REBALANCE_MIN_DAYS_TO_MATURITY", 7)
         monkeypatch.setattr(config, "SELL_AT", 0.85)
         monkeypatch.setattr(config, "SELL_MIN_DAYS", 3)
         expected = _settings(True, (0.1, 0.6), 0.6, 0.35, 0.25,
                              ("Economics",), ("Oil & Gas",),
                              rebalance=True, min_price_move=0.10,
+                             rebalance_min_days_to_maturity=7,
                              sell_at=0.85, sell_min_days=3)
         assert live_settings() == expected
         # A minimum needs rebalancing on, so rebalance itself is checked apart
@@ -1279,6 +1347,7 @@ class TestLiveSettings:
                    for name in config.LIVE_TOGGLE_FIELDS if name != "rebalance")
         monkeypatch.setattr(config, "REBALANCE", not shipped.rebalance)
         monkeypatch.setattr(config, "MIN_PRICE_MOVE", None)
+        monkeypatch.setattr(config, "REBALANCE_MIN_DAYS_TO_MATURITY", None)
         assert live_settings().rebalance is (not shipped.rebalance)
 
     def test_live_settings_refuses_an_invalid_constant(self, monkeypatch):
@@ -1303,6 +1372,7 @@ class TestLiveSettings:
             exclude_tags=config.TRADE_EXCLUDE_TAGS,
             rebalance=config.REBALANCE,
             min_price_move=config.MIN_PRICE_MOVE,
+            rebalance_min_days_to_maturity=config.REBALANCE_MIN_DAYS_TO_MATURITY,
             sell_at=config.SELL_AT,
             sell_min_days=config.SELL_MIN_DAYS,
         )
@@ -1329,6 +1399,16 @@ class TestLiveSettings:
         monkeypatch.setattr(config, "REBALANCE", False)
         monkeypatch.setattr(config, "MIN_PRICE_MOVE", 0.10)
         with pytest.raises(ValueError, match="min_price_move needs rebalance on"):
+            live_settings()
+        # The days to maturity: not 0, 1 or 7, then one with rebalancing off
+        monkeypatch.setattr(config, "MIN_PRICE_MOVE", None)
+        monkeypatch.setattr(config, "REBALANCE", True)
+        monkeypatch.setattr(config, "REBALANCE_MIN_DAYS_TO_MATURITY", 2)
+        with pytest.raises(ValueError, match="rebalance_min_days_to_maturity must be 0, 1 or 7"):
+            live_settings()
+        monkeypatch.setattr(config, "REBALANCE", False)
+        monkeypatch.setattr(config, "REBALANCE_MIN_DAYS_TO_MATURITY", 7)
+        with pytest.raises(ValueError, match="rebalance_min_days_to_maturity needs rebalance on"):
             live_settings()
 
     @pytest.mark.parametrize("cap", [0, 0.37, 1.01, float("nan"), True, "0.2", None, 1e-7])
@@ -1377,12 +1457,14 @@ class TestLiveSettings:
         s = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0)
         assert s.exclude_categories is None and s.exclude_tags is None
         assert s.rebalance is False and s.min_price_move is None
+        assert s.rebalance_min_days_to_maturity is None
         assert s.sell_at is None and s.sell_min_days is None
         # Defaulted and last of the toggles: the first five fields keep their
         # positions, so a positional construction of up to seven still builds;
         # origin, not a toggle, comes after them
-        assert list(config.LIVE_TOGGLE_FIELDS)[-6:] == [
-            "exclude_categories", "exclude_tags", "rebalance", "min_price_move", "sell_at", "sell_min_days"]
+        assert list(config.LIVE_TOGGLE_FIELDS)[-7:] == [
+            "exclude_categories", "exclude_tags", "rebalance", "min_price_move",
+            "rebalance_min_days_to_maturity", "sell_at", "sell_min_days"]
         assert [f.name for f in dataclasses.fields(LiveSettings)][-1] == "origin"
         assert LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0, ("Sports",),
                             ("Hockey",)).exclude_tags == ("Hockey",)
@@ -2161,6 +2243,34 @@ class TestDaysToMaturity:
         closes = (d for d in [date(2026, 1, 20), date(2026, 2, 2)])
         assert config.days_to_maturity(closes, date(2026, 1, 12)) == 21
 
+
+class TestDaysLeftReached:
+    """days_left_reached: the "Rebalance until" test. Always with no minimum,
+    never with an unknown number of days, otherwise at least the minimum."""
+
+    @pytest.mark.parametrize("left", [None, -2, 0, 1, 6, 7, 8, 400])
+    def test_no_minimum_always_allows(self, left):
+        assert config.days_left_reached(left, None) is True
+
+    @pytest.mark.parametrize("min_days", [1, 7])
+    def test_an_unknown_number_of_days_never_allows(self, min_days):
+        assert config.days_left_reached(None, min_days) is False
+
+    @pytest.mark.parametrize("left, at_one, at_seven", [
+        (-2, False, False), (0, False, False), (1, True, False), (6, True, False),
+        # 7 days left still rebalances at 7; 6 does not
+        (7, True, True), (8, True, True)])
+    def test_at_least_the_minimum(self, left, at_one, at_seven):
+        assert config.days_left_reached(left, 1) is at_one
+        assert config.days_left_reached(left, 7) is at_seven
+
+    def test_it_reads_days_to_maturity_on_utc_dates(self):
+        # A run at 16:00 UTC and a close at 03:59 UTC the next day: one UTC date
+        # apart, so 1 day left, though under 12 hours
+        left = config.days_to_maturity([date(2026, 1, 13)], date(2026, 1, 12))
+        assert left == 1
+        assert config.days_left_reached(left, 1) and not config.days_left_reached(left, 7)
+
     def test_a_datetime_is_refused(self):
         # Two datetimes differ by whole 24-hour spans: a close at 08:00 three
         # calendar days after a 16:00 check would read 2 days, not 3. A
@@ -2222,6 +2332,41 @@ class TestHeldPairWinProb:
         quotes[place] = bad
         # Without the check a NaN quote reads as a mid spread of zero: a sure win
         assert config.held_pair_win_prob("time_series", *quotes, 0.8) is None
+
+
+class TestSettledBids:
+    """config.settled_bids: the bids a paid-out market reads as, its settlement price.
+
+    A Kelly trim of a lone leg reads the paid-out earlier market this way, so the
+    pair arithmetic (held_pair_win_prob, the sale value) runs unchanged, live and
+    in the backtest alike.
+    """
+
+    def test_each_result_reads_as_its_settlement_price(self):
+        assert config.settled_bids("yes") == (1.0, 0.0)
+        assert config.settled_bids("no") == (0.0, 1.0)
+
+    @pytest.mark.parametrize("result", ["void", "", "Yes", None, 1])
+    def test_any_other_result_is_refused(self, result):
+        with pytest.raises(ValueError, match="'yes' or 'no'"):
+            config.settled_bids(result)
+
+    def test_a_lone_later_leg_after_the_earlier_market_paid_nothing(self):
+        # YES was held on the earlier market A and NO is still held on the later
+        # market B. A settled "no", so its asks read 0 (YES) and 1 (NO): the
+        # chance is 1 - k x B's midpoint. B: YES ask 0.14, NO ask 0.88, so its
+        # YES bid is 0.12 and its midpoint 0.13; at k 0.7 that is 0.909
+        yes_bid_a, no_bid_a = config.settled_bids("no")
+        chance = config.held_pair_win_prob("time_series", 1.0 - no_bid_a, 1.0 - yes_bid_a,
+                                           0.14, 0.88, 0.7)
+        assert chance == pytest.approx(1 - 0.7 * 0.13, abs=1e-12)
+
+    def test_the_later_leg_cannot_win_once_the_earlier_market_paid_out_yes(self):
+        # The event happened by A's deadline, so B must settle "yes" too and the
+        # NO held on B cannot win: no chance to read, so nothing is trimmed
+        yes_bid_a, no_bid_a = config.settled_bids("yes")
+        assert config.held_pair_win_prob("time_series", 1.0 - no_bid_a, 1.0 - yes_bid_a,
+                                         0.14, 0.88, 0.7) is None
 
 
 class TestKellyHoldFraction:
@@ -3111,8 +3256,8 @@ class TestDescribeLiveSettings:
         assert config.describe_live_settings(s, s) == (
             "tier floors on | spread band none | k 0.75 | per-trade cap 20% | "
             "same-title cap 100% (no extra cap) | exclude categories none | exclude tags none | "
-            "rebalance no | min price movement any | sell at off | "
-            "min days to maturity any")
+            "rebalance no | min price movement any | rebalance until maturity | "
+            "sell at off | min days to maturity any")
         assert config.describe_live_settings(s) == config.describe_live_settings(s, s)
 
     def test_the_shipped_values_render_with_no_mark(self):
@@ -3135,6 +3280,8 @@ class TestDescribeLiveSettings:
         "exclude_tags": (("Oil & Gas", "Energy"), "exclude tags Oil & Gas, Energy (config: none)"),
         "rebalance": (False, "rebalance no (config: yes)"),
         "min_price_move": (0.10, "min price movement 10c (config: any)"),
+        "rebalance_min_days_to_maturity": (
+            7, "rebalance until 7 days before maturity (config: maturity)"),
         "sell_at": (None, "sell at off (config: 85% of potential profit)"),
         "sell_min_days": (3, "min days to maturity 3 (config: any)"),
     }
@@ -3149,8 +3296,8 @@ class TestDescribeLiveSettings:
             "tier floors off (config: on) | spread band 0-0.5 (config: none) | "
             "k 0.8 (config: 0.75) | per-trade cap 100% (no cap) (config: 20%) | "
             "same-title cap 20% (config: 100% (no extra cap)) | exclude categories none | exclude tags none | "
-            "rebalance no | min price movement any | sell at off | "
-            "min days to maturity any")
+            "rebalance no | min price movement any | rebalance until maturity | "
+            "sell at off | min days to maturity any")
         for name in config.LIVE_TOGGLE_FIELDS:
             value, mark = self._DEPARTURES[name]
             line = config.describe_live_settings(
@@ -3161,15 +3308,15 @@ class TestDescribeLiveSettings:
     def test_rebalancing_renders_yes_or_no_and_the_move_in_whole_cents(self):
         # Each 5c step prints as its exact cents (0.55 * 100 is 55.00000000000001)
         assert [c for c in range(5, 101, 5) if c / 100 * 100 != c] == [55]
-        assert "| rebalance no | min price movement any | sell at" in (
+        assert "| rebalance no | min price movement any | rebalance until maturity |" in (
             config.describe_live_settings(_settings()))
-        assert "| rebalance yes | min price movement any | sell at" in (
+        assert "| rebalance yes | min price movement any | rebalance until maturity |" in (
             config.describe_live_settings(_settings(rebalance=True)))
         for cents in range(5, 101, 5):
             line = config.describe_live_settings(
                 _settings(rebalance=True, min_price_move=cents / 100))
-            assert f"| rebalance yes | min price movement {cents}c | sell at" in line, (
-                cents, line)
+            assert (f"| rebalance yes | min price movement {cents}c | rebalance until "
+                    "maturity | sell at") in line, (cents, line)
         # Turning a minimum on over rebalancing with none marks that one field
         ref = _settings(rebalance=True)
         line = config.describe_live_settings(
@@ -3182,6 +3329,26 @@ class TestDescribeLiveSettings:
         assert ("| rebalance yes (config: no) | min price movement 10c (config: any) |"
                 in line)
         assert line.count("(config:") == 2
+
+    def test_rebalance_until_renders_maturity_or_its_days(self):
+        # None is "maturity" (always rebalance); 1 and 7 name the days before it
+        for days, text in ((None, "maturity"), (1, "1 day before maturity"),
+                           (7, "7 days before maturity")):
+            line = config.describe_live_settings(
+                _settings(rebalance=True, rebalance_min_days_to_maturity=days))
+            assert f"| min price movement any | rebalance until {text} | sell at off |" in line
+        # The mark names the reference's value, and only this field departs
+        ref = _settings(rebalance=True, rebalance_min_days_to_maturity=7)
+        line = config.describe_live_settings(_settings(rebalance=True), ref)
+        assert "rebalance until maturity (config: 7 days before maturity)" in line
+        assert line.count("(config:") == 1
+        line = config.describe_live_settings(
+            _settings(rebalance=True, rebalance_min_days_to_maturity=1), ref)
+        assert "rebalance until 1 day before maturity (config: 7 days before maturity)" in line
+        # A saved-defaults reference marks it "default"
+        saved = dataclasses.replace(ref, origin=_SAVED_ORIGIN)
+        line = config.describe_live_settings(_settings(rebalance=True), saved)
+        assert "rebalance until maturity (default: 7 days before maturity)" in line
 
     def test_selling_renders_the_exact_whole_percent(self):
         # Off, then each level of the 1% grid as its whole percent: 0.29 * 100
@@ -3212,8 +3379,8 @@ class TestDescribeLiveSettings:
         assert line == ("tier floors off | spread band 0-0.5 | k 0.8 | "
                         "per-trade cap 100% (no cap) | same-title cap 20% | "
                         "exclude categories none | exclude tags none | rebalance no | "
-                        "min price movement any | sell at off | "
-                        "min days to maturity any")
+                        "min price movement any | rebalance until maturity | "
+                        "sell at off | min days to maturity any")
 
     def test_a_filter_renders_its_names_and_none_for_none(self):
         # Each field renders the run's value, then config's in the mark; None is
@@ -3255,8 +3422,8 @@ class TestDescribeLiveSettings:
             "tier floors off (default: on) | spread band 0-0.5 (default: none) | "
             "k 0.8 (default: 0.75) | per-trade cap 100% (no cap) (default: 20%) | "
             "same-title cap 20% (default: 100% (no extra cap)) | exclude categories none | exclude tags none | "
-            "rebalance no | min price movement any | sell at off | "
-            "min days to maturity any")
+            "rebalance no | min price movement any | rebalance until maturity | "
+            "sell at off | min days to maturity any")
         assert "(config:" not in line
         # Every field's mark follows the reference's origin, one mark per departure
         saved = dataclasses.replace(self._REFERENCE, origin=_SAVED_ORIGIN)
@@ -3406,11 +3573,13 @@ class TestRebalanceChangeWarnings:
     _NOW = LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, rebalance=True)
 
     @staticmethod
-    def _sentence(named: str) -> list:
+    def _sentence(named: str, lone: bool = True) -> list:
+        """The sentence for these changes; `lone` False when none can reach a lone leg."""
+        who = ("each exact held pair, or lone leg whose partner has paid out, worth"
+               if lone else "each exact held pair worth")
         return [f"with Rebalance yes, these settings can sell more of the held pairs: "
-                f"{named}; each exact held pair worth more than its new Kelly size is sold "
-                "down to it before anything is bought, once the wait since its last trade "
-                "has passed"]
+                f"{named}; {who} more than its new Kelly size is sold down to it before "
+                "anything is bought, once the wait since its last trade has passed"]
 
     def test_each_change_that_sells_is_named(self):
         new = dataclasses.replace
@@ -3419,7 +3588,7 @@ class TestRebalanceChangeWarnings:
                            "same-title size cap goes from 20% to 10%"))
         assert config.rebalance_change_warnings(
             self._NOW, new(self._NOW, same_title_size_cap=0.1)) == self._sentence(
-                "the same-title size cap goes from 20% to 10%")
+                "the same-title size cap goes from 20% to 10%", lone=False)
         assert config.rebalance_change_warnings(
             self._NOW, new(self._NOW, interval_discount=0.85)) == self._sentence(
                 "k goes from 0.8 to 0.85, which lowers a time-series pair's chance of paying")
@@ -3435,6 +3604,24 @@ class TestRebalanceChangeWarnings:
             self._sentence("the time-series size cap goes from 100% (no cap) to 50% and the "
                            "same-title size cap goes from 100% (no cap) to 50%"))
 
+    def test_a_lone_leg_is_named_only_when_a_time_series_setting_can_reach_it(self):
+        # A lone leg is the later market of a time-series pair: a same-title cap
+        # alone never reaches one, a time-series cap or k does, alone or with a
+        # same-title change
+        new = dataclasses.replace
+        [same_title] = config.rebalance_change_warnings(
+            self._NOW, new(self._NOW, same_title_size_cap=0.1))
+        assert "lone leg" not in same_title
+        # Only the time-series cap falls: the same-title cap was already the lower
+        held = new(self._NOW, size_cap=0.3, same_title_size_cap=0.2)
+        assert config.rebalance_change_warnings(held, new(held, size_cap=0.25)) == (
+            self._sentence("the time-series size cap goes from 30% to 25%"))
+        [k_up] = config.rebalance_change_warnings(self._NOW, new(self._NOW, interval_discount=0.9))
+        assert "or lone leg whose partner has paid out, worth more than" in k_up
+        both = config.rebalance_change_warnings(
+            self._NOW, new(self._NOW, same_title_size_cap=0.1, interval_discount=0.9))
+        assert "or lone leg whose partner has paid out" in both[0]
+
     @pytest.mark.parametrize("change", [
         # Rebalancing off in the proposed settings: nothing is trimmed at all
         {"rebalance": False, "size_cap": 0.1},
@@ -3448,6 +3635,15 @@ class TestRebalanceChangeWarnings:
     def test_nothing_is_said_when_no_more_is_sold(self, change):
         assert config.rebalance_change_warnings(
             self._NOW, dataclasses.replace(self._NOW, **change)) == []
+
+    @pytest.mark.parametrize("before, after", [(7, 1), (7, None), (1, None), (None, 1),
+                                               (None, 7), (1, 7)])
+    def test_rebalance_until_is_never_named(self, before, after):
+        # "Rebalance until" only holds a trim back near maturity and never makes
+        # one bigger, so no sentence names it, lowered or raised
+        current = dataclasses.replace(self._NOW, rebalance_min_days_to_maturity=before)
+        proposed = dataclasses.replace(self._NOW, rebalance_min_days_to_maturity=after)
+        assert config.rebalance_change_warnings(current, proposed) == []
 
     def test_a_same_title_cap_held_below_by_the_per_trade_cap_moves_nothing(self):
         # The same-title cap a pair is trimmed to is the lower of the two
@@ -3483,12 +3679,13 @@ class TestShippedLiveToggles:
         assert (config.TIME_SERIES_TIER_FLOORS, config.TIME_SERIES_SPREAD_BAND,
                 config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, config.BUDGET_FRACTION,
                 config.SAME_TITLE_SIZE_CAP, config.TRADE_EXCLUDE_CATEGORIES, config.TRADE_EXCLUDE_TAGS,
-                config.REBALANCE, config.MIN_PRICE_MOVE, config.SELL_AT,
-                config.SELL_MIN_DAYS) == (
-            False, (0.0, 0.5), 0.80, 1.0, 0.20, None, None, True, None, None, None)
-        # ... and the seed proposes rebalancing too, with no minimum price move
-        assert (config.LIVE_DEFAULTS_SEED.rebalance,
-                config.LIVE_DEFAULTS_SEED.min_price_move) == (True, None)
+                config.REBALANCE, config.MIN_PRICE_MOVE, config.REBALANCE_MIN_DAYS_TO_MATURITY,
+                config.SELL_AT, config.SELL_MIN_DAYS) == (
+            False, (0.0, 0.5), 0.80, 1.0, 0.20, None, None, True, None, None, None, None)
+        # ... and the seed proposes rebalancing too, with no minimum price move and
+        # no limit on how close to maturity a position is rebalanced
+        assert (config.LIVE_DEFAULTS_SEED.rebalance, config.LIVE_DEFAULTS_SEED.min_price_move,
+                config.LIVE_DEFAULTS_SEED.rebalance_min_days_to_maturity) == (True, None, None)
 
     def test_the_finder_admits_any_positive_spread_up_to_the_ceiling(self, caplog):
         # 0.10 at 10 days and 0.20 at 20 days sit under their tiers and are
@@ -3635,8 +3832,8 @@ class TestPreToggleDefaults:
     _TOGGLES = frozenset({
         "TIME_SERIES_TIER_FLOORS", "TIME_SERIES_SPREAD_BAND",
         "TIME_SERIES_INTERVAL_PROB_DISCOUNT", "BUDGET_FRACTION", "SAME_TITLE_SIZE_CAP",
-        "TRADE_EXCLUDE_CATEGORIES", "TRADE_EXCLUDE_TAGS", "REBALANCE", "MIN_PRICE_MOVE", "SELL_AT",
-        "SELL_MIN_DAYS"})
+        "TRADE_EXCLUDE_CATEGORIES", "TRADE_EXCLUDE_TAGS", "REBALANCE", "MIN_PRICE_MOVE",
+        "REBALANCE_MIN_DAYS_TO_MATURITY", "SELL_AT", "SELL_MIN_DAYS"})
 
     @classmethod
     def _by_value_binders(cls, directory: pathlib.Path) -> list[tuple[str, str, str]]:
@@ -3661,7 +3858,8 @@ class TestPreToggleDefaults:
         assert live_settings() == LiveSettings(
             tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20,
             same_title_size_cap=1.0, exclude_categories=None, exclude_tags=None, rebalance=False,
-            min_price_move=None, sell_at=None, sell_min_days=None)
+            min_price_move=None, rebalance_min_days_to_maturity=None, sell_at=None,
+            sell_min_days=None)
         for module, bound, toggle in binders:
             assert getattr(importlib.import_module(f"kalshi_betting.{module}"), bound) == (
                 getattr(config, toggle)), (module, toggle)
@@ -3847,18 +4045,19 @@ class TestLiveSettingsOrigin:
         assert dataclasses.replace(s, size_cap=0.35).origin == _SAVED_ORIGIN
         assert dataclasses.replace(s, exclude_categories=("Sports",)).origin == _SAVED_ORIGIN
 
-    def test_the_toggle_fields_are_the_eleven(self):
+    def test_the_toggle_fields_are_the_twelve(self):
         assert config.LIVE_TOGGLE_FIELDS == (
             "tier_floors", "spread_band", "interval_discount", "size_cap",
             "same_title_size_cap", "exclude_categories", "exclude_tags", "rebalance", "min_price_move",
-            "sell_at", "sell_min_days")
-        assert len(config.LIVE_TOGGLE_FIELDS) == 11
-        # The four a saved file may leave out, in field order, at the end
-        assert config._OPTIONAL_TOGGLES == ("rebalance", "min_price_move", "sell_at",
+            "rebalance_min_days_to_maturity", "sell_at", "sell_min_days")
+        assert len(config.LIVE_TOGGLE_FIELDS) == 12
+        # The five a saved file may leave out, in field order, at the end
+        assert config._OPTIONAL_TOGGLES == ("rebalance", "min_price_move",
+                                            "rebalance_min_days_to_maturity", "sell_at",
                                             "sell_min_days")
         assert config._TOGGLE_DEFAULTS == {
-            "rebalance": False, "min_price_move": None, "sell_at": None,
-            "sell_min_days": None}
+            "rebalance": False, "min_price_move": None,
+            "rebalance_min_days_to_maturity": None, "sell_at": None, "sell_min_days": None}
         # The settings an older version saved in their place, refused when read
         assert config._RETIRED_TOGGLES == ("add_to_held_pairs", "trim_to_kelly",
                                            "trim_min_rise", "categories", "tags")
@@ -3867,7 +4066,7 @@ class TestLiveSettingsOrigin:
 
     def test_every_toggle_count_the_package_states_is_the_number_of_toggles(self):
         # Wherever a module's comments, docstrings or messages count the toggles
-        # ("the eleven toggles", "eleven live toggles", "eleven toggle names"),
+        # ("the twelve toggles", "twelve live toggles", "twelve toggle names"),
         # the count is the number of toggle fields or the number a saved file
         # must hold. Comment lines are joined first, so a split count is found
         names = ("one two three four five six seven eight nine ten eleven twelve "
@@ -4146,6 +4345,53 @@ class TestSavedLiveDefaults:
             assert config.save_live_defaults(wanted, source="") == wanted
             assert config.read_saved_live_defaults().min_price_move == cents / 100
 
+    def test_maturity_writes_exactly_the_bytes_written_before_it_existed(self, monkeypatch):
+        # The days to maturity at "maturity" (None) are left out of the file, so a
+        # file saved with it so is byte for byte the file saved without the setting
+        monkeypatch.setattr(config, "datetime", _FrozenDatetime)
+        for settings in (_SEED_REBALANCE_OFF, config.LIVE_DEFAULTS_SEED):
+            assert settings.rebalance_min_days_to_maturity is None
+            config.save_live_defaults(settings, source=config.LIVE_DEFAULTS_SEED_SOURCE)
+            assert b"rebalance_min_days_to_maturity" not in config.LIVE_DEFAULTS_FILE.read_bytes()
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES.replace(
+            b'    "exclude_tags": null\n',
+            b'    "exclude_tags": null,\n    "rebalance": true\n')
+        # A 0 given in is stored as None, so it is left out too
+        zero = dataclasses.replace(config.LIVE_DEFAULTS_SEED, rebalance_min_days_to_maturity=0)
+        config.save_live_defaults(zero, source=config.LIVE_DEFAULTS_SEED_SOURCE)
+        assert b"rebalance_min_days_to_maturity" not in config.LIVE_DEFAULTS_FILE.read_bytes()
+
+    def test_a_save_writes_the_days_to_maturity_after_the_minimum_move(self, monkeypatch):
+        monkeypatch.setattr(config, "datetime", _FrozenDatetime)
+        # Rebalancing, its minimum move, its days to maturity, then the sell keys
+        everything = dataclasses.replace(
+            config.LIVE_DEFAULTS_SEED, min_price_move=0.10, rebalance_min_days_to_maturity=7,
+            sell_at=0.85, sell_min_days=3)
+        config.save_live_defaults(everything, source=config.LIVE_DEFAULTS_SEED_SOURCE)
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES.replace(
+            b'    "exclude_tags": null\n',
+            b'    "exclude_tags": null,\n    "rebalance": true,\n    "min_price_move": 0.1,\n'
+            b'    "rebalance_min_days_to_maturity": 7,\n'
+            b'    "sell_at": 0.85,\n    "sell_min_days": 3\n')
+        assert config.read_saved_live_defaults() == everything
+        # Alone, it follows rebalance directly
+        one = dataclasses.replace(config.LIVE_DEFAULTS_SEED, rebalance_min_days_to_maturity=1)
+        config.save_live_defaults(one, source=config.LIVE_DEFAULTS_SEED_SOURCE)
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES.replace(
+            b'    "exclude_tags": null\n',
+            b'    "exclude_tags": null,\n    "rebalance": true,\n'
+            b'    "rebalance_min_days_to_maturity": 1\n')
+        assert config.read_saved_live_defaults() == one
+
+    @pytest.mark.parametrize("days", [1, 7])
+    def test_a_save_round_trips_the_days_to_maturity(self, days):
+        settings = dataclasses.replace(self._SETTINGS, rebalance=True,
+                                       rebalance_min_days_to_maturity=days)
+        saved = config.save_live_defaults(settings, source="a note")
+        assert saved == settings and saved.rebalance_min_days_to_maturity == days
+        again = config.read_saved_live_defaults()
+        assert again == settings and type(again.rebalance_min_days_to_maturity) is int
+
     def test_a_save_round_trips_the_rebalance_settings(self):
         settings = dataclasses.replace(self._SETTINGS, rebalance=True, min_price_move=0.25)
         saved = config.save_live_defaults(settings, source="a note")
@@ -4159,7 +4405,7 @@ class TestSavedLiveDefaults:
                             sell_min_days=3),
     ])
     def test_the_writer_never_writes_a_retired_key(self, settings):
-        # Only the eleven toggles' names reach the file, so a save always
+        # Only the twelve toggles' names reach the file, so a save always
         # writes a file every live run reads
         config.save_live_defaults(settings, source="")
         record = json.loads(config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8"))
@@ -4238,6 +4484,36 @@ class TestSavedLiveDefaults:
         assert saved == dataclasses.replace(_SEED_REBALANCE_OFF, **expected)
         assert type(saved.rebalance) is bool
         assert saved.min_price_move is None or type(saved.min_price_move) is float
+
+    @pytest.mark.parametrize("changes, expected", [
+        ({"rebalance": True, "rebalance_min_days_to_maturity": 1},
+         {"rebalance": True, "rebalance_min_days_to_maturity": 1}),
+        ({"rebalance": True, "rebalance_min_days_to_maturity": 7},
+         {"rebalance": True, "rebalance_min_days_to_maturity": 7}),
+        ({"rebalance": True, "min_price_move": 0.1, "rebalance_min_days_to_maturity": 7},
+         {"rebalance": True, "min_price_move": 0.1, "rebalance_min_days_to_maturity": 7}),
+        # Written as 0 or null by hand, it reads "maturity" (none), on or off
+        ({"rebalance": True, "rebalance_min_days_to_maturity": 0}, {"rebalance": True}),
+        ({"rebalance": True, "rebalance_min_days_to_maturity": None}, {"rebalance": True}),
+        ({"rebalance": False, "rebalance_min_days_to_maturity": None}, {}),
+        ({"rebalance": False, "rebalance_min_days_to_maturity": 0}, {}),
+        ({"rebalance_min_days_to_maturity": None}, {}),
+    ])
+    def test_a_file_naming_the_days_to_maturity_reads_them(self, changes, expected):
+        config.LIVE_DEFAULTS_FILE.write_bytes(_text(_with_toggles(**changes)))
+        saved = config.read_saved_live_defaults()
+        assert saved == dataclasses.replace(_SEED_REBALANCE_OFF, **expected)
+        assert (saved.rebalance_min_days_to_maturity is None
+                or type(saved.rebalance_min_days_to_maturity) is int)
+
+    def test_a_file_that_leaves_the_days_out_reads_maturity(self):
+        # Nobody chose a limit, so a run rebalances however near maturity a
+        # position is, with rebalancing on or off
+        for rebalance in (False, True):
+            config.LIVE_DEFAULTS_FILE.write_bytes(_text(_with_toggles(rebalance=rebalance)))
+            assert config.read_saved_live_defaults().rebalance_min_days_to_maturity is None
+        assert config.REBALANCE_MIN_DAYS_TO_MATURITY is None
+        assert config.LIVE_DEFAULTS_SEED.rebalance_min_days_to_maturity is None
 
     @pytest.mark.parametrize("changes, expected", [
         ({"sell_at": 0.85}, {"sell_at": 0.85}),
@@ -4562,6 +4838,23 @@ class TestSavedLiveDefaults:
         ("a minimum move with rebalancing left out", _text(_with_toggles(min_price_move=0.10))),
         ("a minimum move with rebalancing off",
          _text(_with_toggles(rebalance=False, min_price_move=0.10))),
+        # The days to maturity are 0 (read as none), 1 or 7, and need rebalancing on
+        ("rebalance days of true",
+         _text(_with_toggles(rebalance=True, rebalance_min_days_to_maturity=True))),
+        ("rebalance days of false",
+         _text(_with_toggles(rebalance=True, rebalance_min_days_to_maturity=False))),
+        ("rebalance days of two",
+         _text(_with_toggles(rebalance=True, rebalance_min_days_to_maturity=2))),
+        ("rebalance days below zero",
+         _text(_with_toggles(rebalance=True, rebalance_min_days_to_maturity=-1))),
+        ("rebalance days as a float",
+         _text(_with_toggles(rebalance=True, rebalance_min_days_to_maturity=1.0))),
+        ("rebalance days as a string",
+         _text(_with_toggles(rebalance=True, rebalance_min_days_to_maturity="7"))),
+        ("rebalance days with rebalancing left out",
+         _text(_with_toggles(rebalance_min_days_to_maturity=7))),
+        ("rebalance days with rebalancing off",
+         _text(_with_toggles(rebalance=False, rebalance_min_days_to_maturity=1))),
         # Category and tag names
         ("the name any", _text(_with_toggles(exclude_categories=["any"]))),
         ("an empty name", _text(_with_toggles(exclude_tags=[""]))),
@@ -4596,8 +4889,8 @@ class TestSavedLiveDefaults:
              '"spread_band" must be [floor, ceiling]'),
             (_text(_with_toggles(rebalance=1)), "rebalance must be True or False"),
             (_text(_with_toggles(exclude_tags=_DROP)),
-             "(rebalance, min_price_move, sell_at, sell_min_days may be left out, and then "
-             "each reads as off)"),
+             "(rebalance, min_price_move, rebalance_min_days_to_maturity, sell_at, "
+             "sell_min_days may be left out, and then each reads as off)"),
             (_text(_with_toggles(sell_at=True)), '"sell_at" must be a number or null'),
             (_text(_with_toggles(sell_at=0.85, sell_min_days=False)),
              '"sell_min_days" must be a number or null'),
@@ -4616,6 +4909,16 @@ class TestSavedLiveDefaults:
             (_text(_with_toggles(min_price_move=0.10)), "min_price_move needs rebalance on"),
             (_text(_with_toggles(rebalance=False, min_price_move=0.10)),
              "min_price_move needs rebalance on"),
+            (_text(_with_toggles(rebalance=True, rebalance_min_days_to_maturity=True)),
+             '"rebalance_min_days_to_maturity" must be a number or null'),
+            (_text(_with_toggles(rebalance=True, rebalance_min_days_to_maturity=False)),
+             '"rebalance_min_days_to_maturity" must be a number or null'),
+            (_text(_with_toggles(rebalance=True, rebalance_min_days_to_maturity=2)),
+             "rebalance_min_days_to_maturity must be 0, 1 or 7, got 2"),
+            (_text(_with_toggles(rebalance=True, rebalance_min_days_to_maturity=1.0)),
+             "rebalance_min_days_to_maturity must be 0, 1 or 7, got 1.0"),
+            (_text(_with_toggles(rebalance_min_days_to_maturity=7)),
+             "rebalance_min_days_to_maturity needs rebalance on"),
             (_text(_with_toggles(add_to_held_pairs=True)),
              "which rebalance and min_price_move replaced"),
         ]:
@@ -4871,7 +5174,13 @@ class TestOutdatedSavedFile:
          {"add_to_held_pairs": True, "trim_to_kelly": False, "trim_min_rise": 0.1},
          '"trim_min_rise" needs trim_to_kelly on'),
         ("old and new names together", {"add_to_held_pairs": True, "rebalance": True},
-         "it also holds rebalance or min_price_move"),
+         "it also holds rebalance, min_price_move or rebalance_min_days_to_maturity"),
+        ("an old switch beside a minimum move", {"trim_to_kelly": True, "min_price_move": 0.1},
+         "it also holds rebalance, min_price_move or rebalance_min_days_to_maturity"),
+        ("an old switch beside the days to maturity",
+         {"add_to_held_pairs": True, "trim_to_kelly": True,
+          "rebalance_min_days_to_maturity": 7},
+         "it also holds rebalance, min_price_move or rebalance_min_days_to_maturity"),
     ])
     def test_a_broken_setting_beside_an_old_one_leaves_no_proposal(self, label, old, reason):
         # Still refused as outdated, but with nothing to offer: the message says
@@ -5289,6 +5598,7 @@ class TestLiveSettingsChanges:
             ("exclude tags", "Basketball", "none", True),
             ("rebalance", "no", "no", False),
             ("min price movement", "any", "any", False),
+            ("rebalance until", "maturity", "maturity", False),
             ("sell at", "off", "off", False),
             ("min days to maturity", "any", "any", False),
         ]
@@ -5310,10 +5620,11 @@ class TestLiveSettingsChanges:
 
     def test_no_current_defaults_changes_every_row(self):
         rows = config.live_settings_changes(None, config.LIVE_DEFAULTS_SEED)
-        assert len(rows) == len(config.LIVE_TOGGLE_FIELDS) == 11
+        assert len(rows) == len(config.LIVE_TOGGLE_FIELDS) == 12
         assert all(old == "—" and changed for _, old, _, changed in rows)
         assert [new for _, _, new, _ in rows] == [
-            "off", "0-0.5", "0.8", "10%", "20%", "none", "none", "yes", "any", "off", "any"]
+            "off", "0-0.5", "0.8", "10%", "20%", "none", "none", "yes", "any", "maturity",
+            "off", "any"]
 
     def test_turning_selling_on_shows_as_the_two_sell_rows(self):
         on = dataclasses.replace(config.LIVE_DEFAULTS_SEED, sell_at=0.85, sell_min_days=3)
@@ -5341,6 +5652,24 @@ class TestLiveSettingsChanges:
         # A minimum over rebalancing with none changes the one row
         rows = config.live_settings_changes(config.LIVE_DEFAULTS_SEED, on)
         assert [row for row in rows if row[3]] == [("min price movement", "any", "10c", True)]
+
+    def test_choosing_a_rebalance_until_shows_as_its_one_row(self):
+        seed = config.LIVE_DEFAULTS_SEED
+        for days, text in ((1, "1 day before maturity"), (7, "7 days before maturity")):
+            on = dataclasses.replace(seed, rebalance_min_days_to_maturity=days)
+            rows = config.live_settings_changes(seed, on)
+            assert [row for row in rows if row[3]] == [
+                ("rebalance until", "maturity", text, True)]
+            # ... and back to maturity again
+            rows = config.live_settings_changes(on, seed)
+            assert [row for row in rows if row[3]] == [
+                ("rebalance until", text, "maturity", True)]
+        # Turning rebalancing off clears it: both rows change
+        on = dataclasses.replace(seed, rebalance_min_days_to_maturity=7)
+        rows = config.live_settings_changes(on, _SEED_REBALANCE_OFF)
+        assert [row for row in rows if row[3]] == [
+            ("rebalance", "yes", "no", True),
+            ("rebalance until", "7 days before maturity", "maturity", True)]
 
     def test_a_seven_toggle_file_shows_turning_rebalancing_on_as_a_change(self):
         # A file that leaves the toggle out reads it as off; the seed proposes on

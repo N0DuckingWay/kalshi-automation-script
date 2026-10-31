@@ -9,9 +9,11 @@ the level just above it. Everything runs offline: the exchange reads
 (order books, candles, settlements, market lookups) are stubs on the seller
 module, and the client is a MagicMock that is never called.
 
-seller.plan_trims (selling part of a held pair that has outgrown the size the
-Kelly rule allows) is checked the same way: one pair, live and in the
-backtest, must sell the count backtester._kelly_trim sells. Its 7-day wait
+seller.plan_trims (selling part of a held pair, or of a lone leg whose
+partner has paid out, that has outgrown the size the Kelly rule allows) is
+checked the same way: one exact pair, and one lone leg, live and in the
+backtest, must sell the count backtester._kelly_trim sells, and what is left of
+the lone leg must then be valued alike for a take-profit sale. Its 7-day wait
 after a trade is tested on each of the 8 days after a purchase.
 
 seller.plan_add_ons (which held pairs a run may add to) waits as the trim
@@ -143,10 +145,9 @@ class _World:
         """Each held market's ladder labels, as resolve_held_ladders' labels_out gives them."""
         return {t: market_ladder_keys(self.known[t]) for t in self.positions}
 
-    def plan(self, monkeypatch, level: float | None = 0.01, *, min_days: int | None = None,
-             now: datetime = _NOW, labels: dict | None = None,
-             fee_multipliers: dict | None = None) -> list:
-        """Run seller.plan_sales against this world, its reads stubbed and recorded."""
+    def stub_reads(self, monkeypatch) -> None:
+        """Put stubs on the seller module for every exchange read a planner makes,
+        each one served from this world and recorded in `calls` (fills in `fill_reads`)."""
         def book(client, ticker):
             self.calls["book"].append(ticker)
             return self.books.get(ticker)
@@ -171,10 +172,21 @@ class _World:
             self.calls["lookup"].append(ticker)
             return self.lookup.get(ticker)
 
+        def fills(client):
+            self.fill_reads += 1
+            return self.fills
+
         monkeypatch.setattr(seller, "_fetch_orderbook", book)
         monkeypatch.setattr(seller, "recent_candles", candles)
         monkeypatch.setattr(seller, "get_settlements", settlements)
         monkeypatch.setattr(seller, "market_for_labels", lookup)
+        monkeypatch.setattr(seller, "get_fill_times", fills)
+
+    def plan(self, monkeypatch, level: float | None = 0.01, *, min_days: int | None = None,
+             now: datetime = _NOW, labels: dict | None = None,
+             fee_multipliers: dict | None = None) -> list:
+        """Run seller.plan_sales against this world, its reads stubbed and recorded."""
+        self.stub_reads(monkeypatch)
         client = MagicMock()
         plans = seller.plan_sales(client, dict(self.positions),
                                   self.labels() if labels is None else labels,
@@ -192,21 +204,7 @@ class _World:
 
         By default rebalancing is on with no minimum price move, with $50 of cash and
         $50 as Kalshi's value of the open positions."""
-        def book(client, ticker):
-            self.calls["book"].append(ticker)
-            return self.books.get(ticker)
-
-        def candles(client, ticker, event_ticker, start, end):
-            self.calls["candles"].append((ticker, event_ticker, start, end))
-            return self.candles.get(ticker)
-
-        def fills(client):
-            self.fill_reads += 1
-            return self.fills
-
-        monkeypatch.setattr(seller, "_fetch_orderbook", book)
-        monkeypatch.setattr(seller, "recent_candles", candles)
-        monkeypatch.setattr(seller, "get_fill_times", fills)
+        self.stub_reads(monkeypatch)
         client = MagicMock()
         plans = seller.plan_trims(
             client, dict(self.positions), self.labels() if labels is None else labels,
@@ -219,10 +217,12 @@ class _World:
 
 
 def _trim_settings(*, k: float = 0.8, cap: float = 1.0, st_cap: float = 0.2,
-                   min_move: float | None = None, on: bool = True) -> config.LiveSettings:
+                   min_move: float | None = None, on: bool = True,
+                   until: int | None = None) -> config.LiveSettings:
     """The run's settings with rebalancing on (or off), so the Kelly trim with it,
-    and its k, caps and minimum price move."""
+    and its k, caps, minimum price move and "Rebalance until" days (None: maturity)."""
     return dc_replace(config.live_settings(), rebalance=on, min_price_move=min_move,
+                      rebalance_min_days_to_maturity=until,
                       interval_discount=k, size_cap=cap, same_title_size_cap=st_cap)
 
 
@@ -477,6 +477,35 @@ class TestParityWithTheBacktest:
         (partner,) = [leg for leg in plan.legs if leg.market is None]
         assert partner.partner_fee_multiplier == 1.0
 
+    @pytest.mark.parametrize("name", [name for name in _PARITY_CASES
+                                      if name.startswith("lone")])
+    def test_a_lone_market_partly_sold_values_as_the_backtests_part_left(self, monkeypatch,
+                                                                       name):
+        # 10 of the lone market's 30 contracts sold after its partner paid
+        # out: live, the partner still shows its 30 settled contracts and is
+        # taken at 20/30; the backtest splits its trade, keeping 20
+        case = _PARITY_CASES[name]()
+        backtester._split_trade(case.trade, 10)
+        held = case.world.positions[_B]
+        case.world.positions[_B] = HeldPosition(
+            _B, held.count * 20 / 30, held.exposure_dollars * 20 / 30,
+            held.fees_dollars * 20 / 30)
+        sale, profits = case.readings()
+        _per_trade, value, cost, _potential_return = sale
+        (plan,) = case.world.plan(monkeypatch, 0.01)
+        assert plan.count == 20
+        for (live_realized, live_potential), (realized, potential) in zip(
+                plan.profits, profits, strict=True):
+            assert live_realized == pytest.approx(realized, abs=1e-9)
+            assert live_potential == pytest.approx(potential, abs=1e-9)
+        assert plan.cost_dollars == pytest.approx(cost, abs=1e-9)
+        paid = sum(leg.payout_dollars for leg in plan.legs if leg.market is None)
+        assert plan.proceeds_dollars == pytest.approx(value - paid, abs=1e-9)
+        top = case.boundary(profits)
+        assert case.world.plan(monkeypatch, top)
+        if top < 1.0:
+            assert not case.world.plan(monkeypatch, round(top + 0.01, 2))
+
     def test_the_levels_tell_the_cases_apart(self):
         # Not vacuous: each case's highest selling level lies strictly inside
         # the grid, so the level just above it is one neither side sells at
@@ -630,9 +659,47 @@ def _lone_world(*settlements: Settlement, lookups: dict | None = None) -> _World
 def _settled(ticker: str, event: str, *, yes: float = 30.0, no: float = 0.0,
              cost: float = 9.0, fees: float = 0.45, revenue: float = 0.0,
              at: datetime | None = None, result: str = "no") -> Settlement:
-    """One settlement: what the account held when the market paid out."""
+    """One settlement, listing contracts bought on each side (one side, unless `no` is set too)."""
     return Settlement(ticker, event, result, yes, no, cost if yes else 0.0, cost if no else 0.0,
                       fees, revenue, at or datetime.fromtimestamp(_CK - 3 * _DAY, UTC))
+
+
+def _starship(**kwargs) -> Settlement:
+    """
+    A partner whose record lists contracts bought on both sides, with the figures
+    Kalshi listed for KXSPACEXSTARSHIP-15-26OCT16 on a live read: 180 YES bought for
+    $3.47 and 52 NO for $51.48 (52 of the YES sold at 1c before the payout, which
+    Kalshi lists as 52 NO bought at 99c), $0.2738 of fees, settled no and paid $0. It
+    held 180 - 52 = 128 YES when it paid out. Here it is the Jan 18 rung of B's own
+    event, paid out three days before the run; any Settlement field can be given.
+    """
+    fields = {"ticker": _SAME_EVENT, "event_ticker": _EV_B, "result": "no",
+              "yes_count": 180.0, "no_count": 52.0, "yes_cost_dollars": 3.47,
+              "no_cost_dollars": 51.48, "fees_dollars": 0.2738, "revenue_dollars": 0.0,
+              "settled_at": datetime.fromtimestamp(_CK - 3 * _DAY, UTC)}
+    return Settlement(**{**fields, **kwargs})
+
+
+# A lone held market with no partner, judged before B (it sorts first)
+_ORPHAN = "KXAAA-26-X"
+
+
+def _orphan_beside_b(decoys: int) -> _World:
+    """B held NO alone (30 contracts) with its partner settled at the same count, and
+    the orphan held YES alone (10 contracts) with no partner: `decoys` settled markets
+    held NO 45 on other questions, each one lookup in the orphan's search for a partner
+    settled with more contracts."""
+    world = _lone_world(_settled(_SAME_EVENT, _EV_B))
+    orphan = _rung(_ORPHAN, "KXAAA-26", "Jan 25, 2026", _B_CLOSE,
+                   title="Will the moon landing happen by Jan 25, 2026?")
+    world.hold(orphan, 10.0, 4.0, 0.20)
+    world.books[_ORPHAN] = _book("yes", ("0.40", "50"))
+    for i in range(decoys):
+        ticker, event = f"KXDECOY{i:02d}-26", f"KXDECOY{i:02d}"
+        world.settlements.insert(i, _settled(ticker, event, yes=0.0, no=45.0))
+        world.lookup[ticker] = _rung(ticker, event, "Jan 20, 2026", _A_CLOSE,
+                                     title=f"Will decoy {i} happen by Jan 20, 2026?")
+    return world
 
 
 class TestPartners:
@@ -780,6 +847,208 @@ class TestPartners:
         # Refused before any earlier day's candle is read
         assert world.calls["candles"] == []
 
+    def test_the_same_count_is_taken_before_a_larger_one(self, monkeypatch):
+        # A market settled with more contracts is listed first, and never looked up
+        world = _lone_world(_settled(_SAME_EVENT_2, _EV_B, yes=45.0),
+                            _settled(_SAME_EVENT, _EV_B))
+        (plan,) = world.plan(monkeypatch, 0.01)
+        assert world.calls["lookup"] == [_SAME_EVENT]
+        partner = plan.legs[1]
+        assert (partner.ticker, partner.count) == (_SAME_EVENT, 30)
+        assert partner.cost_dollars == 9.0 + 0.45
+
+    def test_a_larger_one_is_taken_when_no_same_count_market_asks_its_question(
+            self, monkeypatch):
+        # The 30-contract market asks another question, so the 45-contract one
+        # asking B's question is its partner, taken at 30/45
+        option = _rung("KXRKTB-26-BOOM", _EV_B, "Jan 18, 2026", _A_CLOSE,
+                       title="Will the rocket explode by Jan 18, 2026?")
+        world = _lone_world(_settled("KXRKTB-26-BOOM", _EV_B),
+                            _settled(_SAME_EVENT, _EV_B, yes=45.0, cost=13.50, fees=0.60),
+                            lookups={"KXRKTB-26-BOOM": option})
+        (plan,) = world.plan(monkeypatch, 0.01)
+        partner = plan.legs[1]
+        assert (partner.ticker, partner.count) == (_SAME_EVENT, 30)
+        assert partner.cost_dollars == pytest.approx((13.50 + 0.60) * 30 / 45)
+        # Each candidate looked up once over both searches
+        assert world.calls["lookup"] == ["KXRKTB-26-BOOM", _SAME_EVENT]
+
+    def test_a_lone_leg_partly_sold_is_judged_with_its_partner_scaled(self, monkeypatch,
+                                                                      caplog):
+        # B was partly sold after its partner paid out: it holds 86 NO, while
+        # its partner settled with 129 YES (and paid $0), so the partner is
+        # taken at 86/129 of its cost
+        world = _lone_world(_settled(_SAME_EVENT, _EV_B, yes=129.0, cost=38.70, fees=2.58))
+        world.positions[_B] = HeldPosition(_B, -86.0, 34.40, 1.45)
+        with caplog.at_level(logging.INFO):
+            (plan,) = world.plan(monkeypatch, 0.35)
+        partner = plan.legs[1]
+        assert (partner.ticker, partner.side, partner.count) == (_SAME_EVENT, "yes", 86)
+        assert partner.cost_dollars == pytest.approx(27.52)          # $41.28 x 86/129
+        assert partner.payout_dollars == 0.0
+        assert plan.count == 86
+        assert plan.cost_dollars == pytest.approx(63.37)             # $34.40 + $1.45 + $27.52
+        # Each check by hand: 86 NO sold at that check's bid, less the fee on
+        # it, less the cost (a potential profit of $86 - $63.37 = $22.63)
+        assert [fee_leg_exact(86, bid) for bid in (0.85, 0.86, 0.84)] == [0.77, 0.73, 0.81]
+        expected = [86 * 0.85 - 0.77 - 63.37,                        # now: $8.96 (40%)
+                    86 * 0.86 - 0.73 - 63.37,                        # a day before: $9.86
+                    86 * 0.84 - 0.81 - 63.37]                        # two days: $8.06 (36%)
+        for (realized, potential), want in zip(plan.profits, expected, strict=True):
+            assert realized == pytest.approx(want, abs=1e-9)
+            assert potential == pytest.approx(22.63, abs=1e-9)
+        assert "(settled no with 129 contracts, paid $0.00), 86 each" in caplog.text
+        # 35.6% two days before: kept at a 36% level
+        assert world.plan(monkeypatch, 0.36) == []
+
+    def test_the_partner_leg_scales_its_cost_and_payout_to_the_contracts_held(self):
+        reads = seller._Reads(MagicMock(), {}, {}, _CK, 0)
+        paid = _settled(_A, _EV_A, yes=129.0, cost=38.70, fees=2.58, revenue=129.0,
+                        result="yes")
+        leg = seller._partner_leg(reads, paid, "yes", 86)
+        assert (leg.ticker, leg.side, leg.count, leg.market) == (_A, "yes", 86, None)
+        assert leg.cost_dollars == pytest.approx(27.52)
+        assert leg.payout_dollars == pytest.approx(86.0)
+        assert leg.paid_at == paid.settled_at and leg.partner_fee_multiplier == 1.0
+        # A NO partner: its NO cost basis is the one read
+        no_side = _settled(_A, _EV_A, yes=0.0, no=129.0, cost=38.70, fees=2.58)
+        assert seller._partner_leg(reads, no_side, "no", 86).cost_dollars == pytest.approx(27.52)
+        # Settled with exactly the held count: the settlement's own figures, to the bit
+        exact = seller._partner_leg(reads, dc_replace(paid, yes_count=86.0), "yes", 86)
+        assert exact.cost_dollars == 38.70 + 2.58 and exact.payout_dollars == 129.0
+
+    def test_a_partner_that_sold_some_before_it_paid_out_is_read_by_what_it_held(
+            self, monkeypatch, caplog):
+        # B holds 128 NO. Its partner's record lists 180 YES and 52 NO bought, so it
+        # held 128 YES when it paid out: the same count, found in the first search
+        world = _lone_world(_starship())
+        world.positions[_B] = HeldPosition(_B, -128.0, 51.20, 2.18)
+        with caplog.at_level(logging.INFO):
+            (plan,) = world.plan(monkeypatch, 0.69)
+        assert world.calls["lookup"] == [_SAME_EVENT]
+        partner = plan.legs[1]
+        assert (partner.ticker, partner.side, partner.count) == (_SAME_EVENT, "yes", 128)
+        # 128 YES at the average cost of the 180 bought, fees included:
+        # ($3.47 + $0.2738) x 128 / 180 = $2.662258; it paid $0
+        assert partner.cost_dollars == pytest.approx((3.47 + 0.2738) * 128 / 180)
+        assert partner.cost_dollars == pytest.approx(2.662258, abs=1e-6)
+        assert partner.payout_dollars == 0.0
+        cost = 51.20 + 2.18 + (3.47 + 0.2738) * 128 / 180               # $56.042258
+        assert plan.count == 128 and plan.cost_dollars == pytest.approx(cost)
+        # Each check by hand: 128 NO sold at that check's bid, less the fee on it,
+        # less the cost (a potential profit of $128 - $56.04 = $71.96)
+        assert [fee_leg_exact(128, bid) for bid in (0.85, 0.86, 0.84)] == [1.15, 1.08, 1.21]
+        expected = [128 * 0.85 - 1.15 - cost,                       # now: $51.61 (71.7%)
+                    128 * 0.86 - 1.08 - cost,                       # a day before: $52.96
+                    128 * 0.84 - 1.21 - cost]                       # two days: $50.27 (69.9%)
+        for (realized, potential), want in zip(plan.profits, expected, strict=True):
+            assert realized == pytest.approx(want, abs=1e-9)
+            assert potential == pytest.approx(128 - cost, abs=1e-9)
+        assert "(settled no, paid $0.00), 128 each" in caplog.text
+        # 69.9% two days before: kept at a 70% level
+        assert world.plan(monkeypatch, 0.70) == []
+
+    def test_a_partner_that_sold_all_it_bought_held_nothing(self, monkeypatch, caplog):
+        # 37 YES bought and all 37 sold before the payout (listed as 37 NO bought): it
+        # held nothing when it paid out, so it is no market's partner
+        world = _lone_world(_starship(yes_count=37.0, no_count=37.0, yes_cost_dollars=11.10,
+                                      no_cost_dollars=36.63))
+        world.positions[_B] = HeldPosition(_B, -37.0, 14.80, 0.65)
+        with caplog.at_level(logging.INFO):
+            assert world.plan(monkeypatch, 0.01) == []
+        assert ("no paid-out partner: no market it no longer holds was held YES with at "
+                "least 37 contracts on its question") in caplog.text
+        assert world.calls["lookup"] == [] and world.calls["candles"] == []
+
+    def test_a_two_sided_partner_whose_payout_does_not_match_is_refused(self, monkeypatch,
+                                                                         caplog):
+        # Settled no, yet $52 paid: 52 NO held at the payout, which the 128 YES its
+        # counts say it held cannot explain, so what it held cannot be read
+        world = _lone_world(_starship(revenue_dollars=52.0))
+        world.positions[_B] = HeldPosition(_B, -128.0, 51.20, 2.18)
+        with caplog.at_level(logging.INFO):
+            assert world.plan(monkeypatch, 0.01) == []
+        assert (f"its partner {_SAME_EVENT} lists contracts bought on both sides (180 YES, "
+                "52 NO), and its payout ($52.00) does not match the 128 YES held when it "
+                "paid out, so what was held cannot be read") in caplog.text
+        # Refused before any earlier day's candle is read
+        assert world.calls["candles"] == []
+
+    def test_a_two_sided_partner_whose_held_side_won_is_found(self, monkeypatch):
+        # Settled yes and paid $128: $1 for each of the 128 YES it held at the payout
+        world = _lone_world(_starship(result="yes", revenue_dollars=128.0))
+        world.positions[_B] = HeldPosition(_B, -128.0, 51.20, 2.18)
+        (plan,) = world.plan(monkeypatch, 0.01)
+        partner = plan.legs[1]
+        assert (partner.ticker, partner.side, partner.count) == (_SAME_EVENT, "yes", 128)
+        assert partner.cost_dollars == pytest.approx((3.47 + 0.2738) * 128 / 180)
+        # $128 x 128 / 128: the whole payout goes with the 128 held here
+        assert partner.payout_dollars == 128.0
+
+    def test_a_lone_leg_partly_sold_takes_a_two_sided_partner_in_the_wider_search(
+            self, monkeypatch, caplog):
+        # B was trimmed to 86 NO; its partner held 128 YES at the payout (180 bought,
+        # 52 sold), so no market fits 86 and the search for one settled with more
+        # finds it: 86 contracts at the average cost of the 180 bought, and 86/128 of
+        # what it paid ($0)
+        world = _lone_world(_starship())
+        world.positions[_B] = HeldPosition(_B, -86.0, 34.40, 1.45)
+        with caplog.at_level(logging.INFO):
+            (plan,) = world.plan(monkeypatch, 0.01)
+        assert world.calls["lookup"] == [_SAME_EVENT]
+        partner = plan.legs[1]
+        assert (partner.ticker, partner.side, partner.count) == (_SAME_EVENT, "yes", 86)
+        # ($3.47 + $0.2738) x 86 / 180 = $1.788704
+        assert partner.cost_dollars == pytest.approx((3.47 + 0.2738) * 86 / 180)
+        assert partner.cost_dollars == pytest.approx(1.788704, abs=1e-6)
+        assert partner.payout_dollars == 0.0
+        assert "(settled no with 128 contracts, paid $0.00), 86 each" in caplog.text
+        # It is the wider search that finds it: with no lookups left for that search,
+        # it is not found
+        monkeypatch.setattr(seller, "SALE_PARTNER_MAX_WIDER_LOOKUPS", 0)
+        with caplog.at_level(logging.INFO):
+            assert world.plan(monkeypatch, 0.01) == []
+        assert ("the limit of 0 lookups for a partner settled with more contracts this run "
+                "was reached") in caplog.text
+
+    def test_the_partner_leg_reads_its_cost_on_what_was_bought_and_its_payout_on_what_was_held(
+            self):
+        reads = seller._Reads(MagicMock(), {}, {}, _CK, 0)
+        # The two-sided record settled yes, paying $128 for the 128 YES held: for 86
+        # of them, the cost is 86/180 of the YES cost and fees ($1.788704), and the
+        # payout 86/128 of $128 ($86)
+        won = _starship(result="yes", revenue_dollars=128.0)
+        leg = seller._partner_leg(reads, won, "yes", 86)
+        assert (leg.ticker, leg.side, leg.count, leg.market) == (_SAME_EVENT, "yes", 86, None)
+        assert leg.cost_dollars == pytest.approx((3.47 + 0.2738) * 86 / 180)
+        assert leg.payout_dollars == pytest.approx(128.0 * 86 / 128)
+        assert leg.payout_dollars == pytest.approx(86.0)
+        # What was held at payout: each side's count less the other's, never below 0
+        assert seller._settled_count(won, "yes") == 128.0
+        assert seller._settled_count(won, "no") == 0.0
+        # One side listed: that side's count, as before
+        one_sided = _settled(_A, _EV_A, yes=129.0)
+        assert seller._settled_count(one_sided, "yes") == 129.0
+        assert seller._settled_count(one_sided, "no") == 0.0
+
+    def test_holding_more_than_any_partner_settled_with_has_no_partner(self, monkeypatch,
+                                                                       caplog):
+        world = _lone_world(_settled(_SAME_EVENT, _EV_B, yes=29.0))
+        with caplog.at_level(logging.INFO):
+            assert world.plan(monkeypatch, 0.01) == []
+        assert ("no paid-out partner: no market it no longer holds was held YES with at "
+                "least 30 contracts on its question") in caplog.text
+
+    def test_two_larger_markets_that_could_be_its_partner_are_refused(self, monkeypatch,
+                                                                      caplog):
+        world = _lone_world(_settled(_SAME_EVENT, _EV_B, yes=45.0),
+                            _settled(_SAME_EVENT_2, _EV_B, yes=60.0))
+        with caplog.at_level(logging.INFO):
+            assert world.plan(monkeypatch, 0.01) == []
+        assert (f"more than one settled market could be its paid-out partner ({_SAME_EVENT}, "
+                f"{_SAME_EVENT_2})") in caplog.text
+        assert world.calls["candles"] == []
+
     def test_a_partner_on_another_ladder_is_not_its_partner(self, monkeypatch, caplog):
         other = _rung("KXRAIN-26", "KXRAIN", "Jan 20, 2026", _A_CLOSE,
                       title="Will it rain by Jan 20, 2026?")
@@ -829,6 +1098,49 @@ class TestPartners:
         assert world.calls["lookup"] == [_A]
         assert ("Not selling NO KXSNOWB-26 (alone on its ladder): the limit of 1 partner "
                 "lookups this run was reached") in caplog.text
+
+    def test_the_search_for_a_larger_partner_leaves_the_same_count_lookups_alone(
+            self, monkeypatch, caplog):
+        # The orphan, judged first, looks up all 20 larger settled markets and
+        # finds no partner; those lookups have an allowance of their own, so
+        # B's partner at its own count is still looked up and B is sold
+        assert seller.SALE_PARTNER_MAX_WIDER_LOOKUPS == seller.SALE_PARTNER_MAX_LOOKUPS == 20
+        world = _orphan_beside_b(20)
+        with caplog.at_level(logging.INFO):
+            plans = world.plan(monkeypatch, 0.01)
+        assert [plan.legs[0].ticker for plan in plans] == [_B]
+        assert len(world.calls["lookup"]) == 21
+        assert world.calls["lookup"][-1] == _SAME_EVENT
+        assert (f"Not selling YES {_ORPHAN} (alone on its ladder): no paid-out partner"
+                in caplog.text)
+
+    def test_past_the_wider_lookup_limit_that_market_is_not_sold(self, monkeypatch, caplog):
+        # Two lookups allowed for a partner settled with more: the orphan's
+        # third candidate is never asked about, and B, judged after it, is
+        # still sold with its partner at the same count
+        monkeypatch.setattr(seller, "SALE_PARTNER_MAX_WIDER_LOOKUPS", 2)
+        world = _orphan_beside_b(3)
+        with caplog.at_level(logging.INFO):
+            plans = world.plan(monkeypatch, 0.01)
+        assert [plan.legs[0].ticker for plan in plans] == [_B]
+        assert world.calls["lookup"] == ["KXDECOY00-26", "KXDECOY01-26", _SAME_EVENT]
+        assert (f"Not selling YES {_ORPHAN} (alone on its ladder): the limit of 2 lookups "
+                "for a partner settled with more contracts this run was reached"
+                in caplog.text)
+
+    def test_each_search_counts_its_lookups_apart_and_shares_what_it_found(self,
+                                                                           monkeypatch):
+        reads = seller._Reads(MagicMock(), {}, {}, _CK, 0)
+        monkeypatch.setattr(seller, "market_for_labels",
+                            lambda client, ticker, markets, titles: _OWN_EVENT_RUNGS[ticker])
+        found, problem = reads.labels(_SAME_EVENT, wider=True)
+        assert (found, problem) == (market_ladder_keys(_OWN_EVENT_RUNGS[_SAME_EVENT]), "")
+        assert (reads.lookups, reads.wider_lookups) == (0, 1)
+        # Found once, kept for both searches: no second lookup
+        assert reads.labels(_SAME_EVENT) == (found, "")
+        assert (reads.lookups, reads.wider_lookups) == (0, 1)
+        reads.labels(_SAME_EVENT_2)
+        assert (reads.lookups, reads.wider_lookups) == (1, 1)
 
     def test_unreadable_settlements_sell_no_lone_market_and_warn_once(self, monkeypatch,
                                                                       caplog):
@@ -1164,10 +1476,12 @@ class _TrimCase:
         return backtester._kelly_trim([self.trade], _D, self.value(value_cents), k, cap, st_cap)
 
     def live(self, monkeypatch, value_cents: int, *, k: float = 0.8, cap: float = 1.0,
-             st_cap: float = 0.2, min_move: float | None = None, **kwargs) -> list:
+             st_cap: float = 0.2, min_move: float | None = None, until: int | None = None,
+             **kwargs) -> list:
         """seller.plan_trims' plans for the pair at the same portfolio value."""
         return self.world.trims(
-            monkeypatch, _trim_settings(k=k, cap=cap, st_cap=st_cap, min_move=min_move),
+            monkeypatch, _trim_settings(k=k, cap=cap, st_cap=st_cap, min_move=min_move,
+                                        until=until),
             cash_cents=value_cents - self.positions_cents,
             positions_value_cents=self.positions_cents, **kwargs)
 
@@ -1225,10 +1539,124 @@ _TRIM_PARITY_SELLS = {
     "a 1c YES bid on market B": "none",
 }
 
+# The standard lone leg's later market at the run, (YES ask, NO ask): a best NO
+# bid of 0.85 for the NO held, and a best YES bid of 0.14
+_LONE_B_NOW = (0.15, 0.86)
+
+
+class _LoneTrimCase:
+    """
+    One lone leg built twice, as _TrimCase builds a pair: YES on the earlier
+    market A and NO on the later market B of a time-series pair, bought at the
+    previous Monday's run. A paid out $0 ("no") three days before this run; B
+    is still open. The backtest holds it as one trade whose A leg has paid
+    out. The live account holds B alone, with A among its settlements (found
+    by a lookup: it asks B's question) and B's book at the backtest's
+    checkpoint bids. B's candles give both paths the same quotes at the
+    take-profit rule's earlier checks. Live lists no fill on another market of
+    B's ladder: that fill is the one part of the live wait the backtest has no
+    twin for.
+
+    Attributes:
+        n (int): B's NO contracts, and the YES contracts A paid $0 on.
+        trade (BacktestTrade): The position as the backtest holds it.
+        world (_World): The live account and exchange.
+        positions_cents (int): What Kalshi values the open positions at, in cents.
+    """
+
+    def __init__(self, b_now: tuple = _LONE_B_NOW, *, n: int = 30, model=None,
+                 price_a: float = 0.30, price_b: float = 0.40,
+                 positions_cents: int = 5_000) -> None:
+        self.n = n
+        self.positions_cents = positions_cents
+        market_a = _rung(_A, _EV_A, "Jan 20, 2026", _A_CLOSE)
+        market_b = _rung(_B, _EV_B, "Jan 25, 2026", _B_CLOSE)
+        settled = datetime.fromtimestamp(_CK - 3 * _DAY, UTC)
+        candles_a = [_candle(_FIRST, 0.30, 0.71), _candle(_CK - 4 * _DAY, 0.20, 0.81)]
+        candles_b = [_candle(_FIRST, 0.59, 0.41),                  # NO ask 0.41 when bought
+                     _candle(_CK - 2 * _DAY - 3600, 0.16, 0.86),   # NO bid 0.84
+                     _candle(_CK - _DAY - 1800, 0.14, 0.87),       # NO bid 0.86
+                     _candle(_CK, *b_now)]
+        # The backtest: one trade, each market's quotes from its candles
+        quotes_a, _ = backtester._leg_quotes(
+            {"ticker": _A, "settlement_ts": settled.isoformat(), "result": "no"},
+            candles_a, _START, model)
+        quotes_b, _ = backtester._leg_quotes(
+            {"ticker": _B, "settlement_ts": "2026-02-25T12:00:00+00:00", "result": "yes"},
+            candles_b, _START, model)
+        fee_a, fee_b = fee_leg_exact(n, price_a), fee_leg_exact(n, price_b)
+        self.trade = backtester.BacktestTrade(
+            pair_type="time_series", ticker_a=_A, ticker_b=_B, title_a="", title_b="",
+            category="Other", entry_date=date(2026, 1, 5), exit_date=date(2026, 2, 25),
+            entry_pA=price_a, entry_pB=1 - price_b, entry_nA=1 - price_a, entry_nB=price_b,
+            n=n, total_cost=n * price_a + n * price_b, fees=fee_a + fee_b,
+            outcome_a="no", outcome_b="yes", actual_payoff=0.0, profit=0.0,
+            profit_ratio=0.0, monthly_profit_ratio=0.0, kelly_fraction=0.1,
+            expected_payoff=0.0, slippage=0.0, holding_days=10, balance_at_entry=10_000.0,
+            close_date_a=_A_CLOSE.date(), close_date_b=_B_CLOSE.date(),
+            marks=(quotes_a, quotes_b))
+        # Live: B held alone, A one of the account's settlements (n YES bought for
+        # what the trade's A leg cost, paid $0)
+        self.world = _World()
+        self.world.hold(market_b, -float(n), n * price_b, fee_b)
+        self.world.lookup[_A] = market_a
+        self.world.known[_A] = market_a
+        self.world.settlements = [Settlement(_A, _EV_A, "no", float(n), 0.0, n * price_a,
+                                             0.0, fee_a, 0.0, settled)]
+        # Both sides of B's book: a side's best bid is 1 minus the other side's ask
+        best = {"yes": round(1.0 - b_now[1], 6), "no": round(1.0 - b_now[0], 6)}
+        book = {}
+        for side in ("yes", "no"):
+            # Where the backtest has a bid, the book's best bid is that very number
+            assert quotes_b.bid_at_checkpoint(_D, side) == best[side]
+            # The NO held gets the backtest's modeled bid ladder when it has one,
+            # else one deep bid, as the backtest sells
+            ladder = quotes_b.sale_ladder(_D, best[side]) if side == "no" else None
+            book[side] = ladder if ladder is not None else [[best[side], 100_000.0]]
+        self.world.books[_B] = book
+        self.world.candles = {_A: candles_a, _B: candles_b}
+        self.world.fills = _fills({_B: _BOUGHT})
+
+    def value(self, value_cents: int) -> float:
+        """The portfolio value, in dollars, that plan_trims sizes on for `value_cents` in all."""
+        # Kalshi's $50 for the open positions is more than B fetches at its bids,
+        # so live sizes on the cash plus that $50: the whole amount
+        return value_cents / 100
+
+    def backtest(self, value_cents: int, *, k: float = 0.8, cap: float = 1.0,
+                 st_cap: float = 0.2):
+        """backtester._kelly_trim's (decision, sale) for the lone leg at one portfolio value."""
+        return backtester._kelly_trim([self.trade], _D, self.value(value_cents), k, cap, st_cap)
+
+    def live(self, monkeypatch, value_cents: int, *, k: float = 0.8, cap: float = 1.0,
+             st_cap: float = 0.2, min_move: float | None = None) -> list:
+        """seller.plan_trims' plans for the lone leg at the same portfolio value."""
+        return self.world.trims(
+            monkeypatch, _trim_settings(k=k, cap=cap, st_cap=st_cap, min_move=min_move),
+            cash_cents=value_cents - self.positions_cents,
+            positions_value_cents=self.positions_cents)
+
+
+# Each case: (lone leg builder, portfolio value in cents, caps, what is sold:
+# none or part of it). Live and the backtest must sell the same number of contracts
+_LONE_TRIM_PARITY_CASES = {
+    # B's 30 NO, worth $25 of a $100 portfolio, under a 10% cap: sold down to the cap
+    "a lone leg past its size cap": (lambda: _LoneTrimCase(), 10_000, {"cap": 0.10}, "part"),
+    # No cap in the way: Kelly's own share of a $50 portfolio is the limit
+    "a lone leg past its Kelly share, under its cap": (
+        lambda: _LoneTrimCase(b_now=(0.30, 0.72)), 5_000, {}, "part"),
+    "a lone leg within its share": (lambda: _LoneTrimCase(), 100_000, {}, "none"),
+    # B's NO bids on the backtest's modeled ladder, every level within 5c of the best
+    "a lone leg on a modeled ladder": (
+        lambda: _LoneTrimCase(model=_ladder_model(((0.0, 5.0), (0.02, 5.0), (0.05, 100.0)))),
+        10_000, {"cap": 0.10}, "part"),
+}
+
 
 class TestTrimParityWithTheBacktest:
     """seller.plan_trims sells the count backtester._kelly_trim sells of the same
-    pair at the same quotes, portfolio value, k and caps, and values the sale alike."""
+    pair, or the same lone leg, at the same quotes, portfolio value, k and caps,
+    and values the sale alike."""
 
     @pytest.mark.parametrize("name", list(_TRIM_PARITY_CASES))
     def test_the_same_count_and_the_same_sale(self, monkeypatch, name):
@@ -1367,6 +1795,143 @@ class TestTrimParityWithTheBacktest:
         assert case.world.calls["candles"][:2] == [
             (_A, _EV_A, _FIRST - week - 3600, _FIRST), (_B, _EV_B, _FIRST - week - 3600, _FIRST)]
 
+    @pytest.mark.parametrize("name", list(_LONE_TRIM_PARITY_CASES))
+    def test_a_lone_leg_sells_the_same_count_and_the_same_sale(self, monkeypatch, name):
+        build, value_cents, caps, sells = _LONE_TRIM_PARITY_CASES[name]
+        case = build()
+        # The backtest reads it as a lone leg: A paid $0 on the YES held, B is open
+        assert backtester._lone_leg(case.trade, _D) is True
+        # B's NO bids all sit within the live reach under the best bid, so the
+        # live cut leaves the book whole and both paths walk the same bids
+        best = case.world.books[_B]["no"][0][0]
+        assert all(best - price <= seller.KELLY_TRIM_MAX_BID_DROP
+                   for price, _contracts in case.world.books[_B]["no"])
+        decision, sale = case.backtest(value_cents, **caps)
+        plans = case.live(monkeypatch, value_cents, **caps)
+        assert [plan.count for plan in plans] == ([decision.sell] if decision.sell else [])
+        if sells == "none":
+            assert decision.sell == 0
+            return
+        assert 0 < decision.sell < case.n, name
+        (plan,) = plans
+        assert plan.kind == config.SALE_KIND_KELLY_TRIM and plan.level is None
+        # B sells the count of the n held; the paid-out partner A goes with them
+        held, partner = plan.legs
+        assert (held.ticker, held.side, held.count, held.held) == (
+            _B, "no", decision.sell, case.n)
+        assert (partner.ticker, partner.side, partner.count, partner.market) == (
+            _A, "yes", decision.sell, None)
+        assert partner.payout_dollars == 0.0
+        # The backtest's own valuation of selling that many: B alone sells, and A
+        # (no sale price) adds its $0 payout
+        sold, per_trade = sale
+        assert sold == [decision.sell]
+        ((sale_value, _fees, (price_a, price_b)),) = per_trade
+        assert price_a is None
+        _, value, cost, potential = backtester._position_sale_value(
+            [case.trade], _D, sold=[decision.sell])
+        assert plan.proceeds_dollars == pytest.approx(sale_value, abs=1e-9)
+        assert plan.proceeds_dollars == pytest.approx(value, abs=1e-9)
+        assert plan.cost_dollars == pytest.approx(cost, abs=1e-9)
+        assert plan.profits == ((pytest.approx(value - cost, abs=1e-9),
+                                 pytest.approx(potential - cost, abs=1e-9)),)
+        assert list(plan.walked) == [_B]
+        assert plan.walked[_B][0] == pytest.approx(price_b, abs=1e-12)
+
+    def test_the_lone_leg_cases_are_what_they_say(self, monkeypatch):
+        # The counts by hand. B's NO bid 0.85 and YES bid 0.14; A reads as its
+        # settlement price (a YES bid of 0, a NO bid of 1), so its midpoint is 0:
+        #  - B pays with chance 1 - 0.8 x (0.145 - 0) = 88.4%
+        #  - one contract sells for 0.85 less the fee 0.07 x 0.85 x 0.15: $0.841075
+        #  - Kelly's hold share (0.884 - 0.841075) / (1 - 0.841075) = 27.0% is above
+        #    the 10% cap, so of a $100 portfolio B may keep $10: 11.89 contracts, so
+        #    11 kept and 19 sold; 19 sell for 19 x 0.85 less a $0.17 fee, $15.98, or
+        #    $0.841053 a contract, at which it may still keep only 11
+        case = _LoneTrimCase()
+        (plan,) = case.live(monkeypatch, 10_000, cap=0.10)
+        assert plan.count == case.backtest(10_000, cap=0.10)[0].sell == 19
+        assert plan.proceeds_dollars == pytest.approx(19 * 0.85 - 0.17, abs=1e-12)
+        # The modeled ladder holds 5 contracts at 0.85, 5 at 0.83 and 100 at 0.80,
+        # and both paths walk down to 0.80
+        build, value_cents, caps, _sells = _LONE_TRIM_PARITY_CASES[
+            "a lone leg on a modeled ladder"]
+        laddered = build()
+        assert laddered.world.books[_B]["no"] == [[0.85, 5.0], [0.83, 5.0], [0.8, 100.0]]
+        (plan,) = laddered.live(monkeypatch, value_cents, **caps)
+        assert plan.walked[_B][1] == pytest.approx(0.80)
+        assert plan.count == laddered.backtest(value_cents, **caps)[0].sell
+
+    def test_a_lone_legs_live_price_move_is_the_backtests(self, monkeypatch):
+        # B's NO ask was 0.41 when bought and is 0.86 now. A has paid out, so it
+        # counts 0 then and now on both paths: the move is B's own, +45c
+        case = _LoneTrimCase()
+        expected = backtester._price_move([case.trade], _D, {})
+        assert expected == pytest.approx(0.45, abs=1e-9)
+        measured = []
+        real = seller.pair_price_move
+
+        def spy(then, now):
+            measured.append((then, now, real(then, now)))
+            return measured[-1][2]
+
+        monkeypatch.setattr(seller, "pair_price_move", spy)
+        # A 45c move meets a 45c minimum, on both paths
+        assert config.price_move_reached(expected, 0.45)
+        (plan,) = case.live(monkeypatch, 10_000, cap=0.10, min_move=0.45)
+        assert measured == [(pytest.approx(0.41), pytest.approx(0.86),
+                             pytest.approx(expected, abs=1e-9))]
+        assert plan.count == case.backtest(10_000, cap=0.10)[0].sell == 19
+        # ... and falls short of a 50c one, on both paths
+        assert not config.price_move_reached(expected, 0.50)
+        assert case.live(monkeypatch, 10_000, cap=0.10, min_move=0.50) == []
+        # Only B's price then is read from candles: A sells nothing
+        assert {ticker for ticker, *_ in case.world.calls["candles"]} == {_B}
+
+    def test_after_a_lone_trim_what_is_left_is_valued_alike(self, monkeypatch):
+        # The trim sells 19 of B's 30 NO. The backtest's walk splits its trade and
+        # keeps 11; live, B then holds 11, its cost and fees in the same share (the
+        # account as the backtest's split keeps it; Kalshi itself keeps the sold
+        # contracts' fees in what it lists as paid), and its partner A, which
+        # settled with 30, is found in the wider search and scaled to 11/30
+        case = _LoneTrimCase()
+        decision, _sale = case.backtest(10_000, cap=0.10)
+        (trim,) = case.live(monkeypatch, 10_000, cap=0.10)
+        sold = trim.count
+        assert sold == decision.sell == 19
+        backtester._split_trade(case.trade, sold)
+        left = case.n - sold
+        held = case.world.positions[_B]
+        case.world.positions[_B] = HeldPosition(
+            _B, -float(left), held.exposure_dollars * left / case.n,
+            held.fees_dollars * left / case.n)
+        # The backtest's take-profit value of what is left, now and at each check
+        _per_trade, value, cost, potential = backtester._position_sale_value([case.trade], _D)
+        sale, profits = backtester._hold_readings([case.trade], _D,
+                                                  backtester._resolve_hold_days())
+        assert tuple(sale[1:]) == (value, cost, potential)
+        (plan,) = case.world.plan(monkeypatch, 0.01)
+        assert plan.count == left
+        held_leg, partner = plan.legs
+        assert (held_leg.ticker, held_leg.count, partner.ticker, partner.count) == (
+            _B, left, _A, left)
+        assert partner.cost_dollars == pytest.approx(
+            (case.n * 0.30 + fee_leg_exact(case.n, 0.30)) * left / case.n, abs=1e-12)
+        assert partner.payout_dollars == 0.0
+        assert plan.cost_dollars == pytest.approx(cost, abs=1e-9)
+        assert plan.proceeds_dollars == pytest.approx(value, abs=1e-9)
+        assert plan.profits[0] == (pytest.approx(value - cost, abs=1e-9),
+                                   pytest.approx(potential - cost, abs=1e-9))
+        for (live_realized, live_potential), (realized, potential_profit) in zip(
+                plan.profits, profits, strict=True):
+            assert live_realized == pytest.approx(realized, abs=1e-9)
+            assert live_potential == pytest.approx(potential_profit, abs=1e-9)
+        # The same verdict at the highest 1% level the backtest sells at, and the next
+        levels = [round(step / 100, 2) for step in range(1, 101)]
+        top = max(level for level in levels
+                  if backtester._reached_every_day(level, profits))
+        assert case.world.plan(monkeypatch, top)
+        assert top < 1.0 and not case.world.plan(monkeypatch, round(top + 0.01, 2))
+
 
 # ─── The wait after a trade, however often the bot runs ───────────────────────
 
@@ -1393,11 +1958,63 @@ def _trims_at(case: _TrimCase, monkeypatch, now: datetime) -> list:
     return case.live(monkeypatch, 10_000, cap=0.10, now=now)
 
 
+# ─── A lone leg: the later market held after the earlier one paid out ─────────
+
+# How the trim names the standard lone leg before and after its partner is found
+_LONE_HELD_TEXT = f"NO {_B} (alone on its ladder)"
+_LONE_TRIM_TEXT = f"NO {_B} (alone: YES {_SAME_EVENT} paid out $0)"
+
+
+def _lone_partner(**kwargs) -> Settlement:
+    """The standard lone leg's partner: the Jan 18 rung of B's own event, held YES
+    (129 contracts bought at 0.30, $38.70, with $1.90 of fees) and settled no, so it
+    paid $0, three days before the run. Any field of _settled can be given."""
+    return _settled(_SAME_EVENT, _EV_B, **{"yes": 129.0, "cost": 38.70, "fees": 1.90,
+                                           **kwargs})
+
+
+def _lone_trim(*settlements: Settlement, count: int = 129, exposure: float = 77.40,
+               fees: float = 2.17, yes_bid: float = 0.12, no_bid: float = 0.86) -> _World:
+    """
+    B held NO alone, last traded at the previous Monday's run, with `settlements` the
+    account's settlements (_lone_world: a lookup finds the rungs of B's own event).
+
+    Args:
+        settlements (Settlement): The account's settlements.
+        count (int): Keyword-only. B's NO contracts.
+        exposure (float): Keyword-only. What they cost (129 at 0.60 by default).
+        fees (float): Keyword-only. The fees paid on them.
+        yes_bid (float): Keyword-only. B's best YES bid (its NO ask is 1 minus it).
+        no_bid (float): Keyword-only. B's best NO bid (its YES ask is 1 minus it).
+
+    Returns:
+        _World: The account, its fills list reaching 30 days back.
+    """
+    world = _lone_world(*settlements)
+    world.positions[_B] = HeldPosition(_B, -float(count), exposure, fees)
+    world.books[_B] = {"yes": [[yes_bid, 100_000.0]], "no": [[no_bid, 100_000.0]]}
+    world.fills = _fills({_B: _BOUGHT})
+    return world
+
+
+def _lone_trims(world: _World, monkeypatch, *, cap: float = 0.10, k: float = 0.7,
+                min_move: float | None = None, positions_cents: int = 27_500,
+                until: int | None = None, **kwargs) -> list:
+    """seller.plan_trims on a $749 portfolio ($474 of cash plus Kalshi's $275 for the
+    open positions, unless `positions_cents` says otherwise), at k 0.7 and a 10% cap."""
+    return world.trims(monkeypatch, _trim_settings(k=k, cap=cap, min_move=min_move,
+                                                   until=until),
+                       cash_cents=74_900 - positions_cents,
+                       positions_value_cents=positions_cents, **kwargs)
+
+
 class TestTrimWaitAtAnyFrequency:
-    """A pair is trimmed only once 7 calendar days (REBALANCE_MIN_DAYS_SINCE_TRADE),
-    on the bot's own clock, have passed since the last fill on either market.
-    The rule compares two dates and reads only the schedule's time zone, never its
-    run days, so it holds however often the bot runs."""
+    """A pair or lone leg is trimmed only once 7 calendar days
+    (REBALANCE_MIN_DAYS_SINCE_TRADE), on the bot's own clock, have passed since
+    its last fill (on either market of a pair; for a lone leg, on its own market
+    or a market of its ladder in the run's list). The rule compares two dates
+    and reads only the schedule's time zone, never its run days, so it holds
+    however often the bot runs."""
 
     @pytest.mark.parametrize("days_after", range(1, 9))
     def test_a_run_on_each_of_the_eight_days_after_a_purchase(self, monkeypatch, caplog,
@@ -1475,6 +2092,28 @@ class TestTrimWaitAtAnyFrequency:
         # config's own schedule is not what the seller reads
         assert config.SCHEDULED_RUN.timezone == "America/Los_Angeles"
 
+    @pytest.mark.parametrize("days_after", range(1, 9))
+    def test_a_lone_leg_on_each_of_the_eight_days_after_a_purchase(self, monkeypatch, caplog,
+                                                                   days_after):
+        # The lone leg (42 of 129 trimmed once rested) last traded Tuesday January 6
+        # at 10:00; a run at 09:00 on each later day. Its partner paid out on the 9th
+        world = _lone_trim(_lone_partner())
+        bought = _pacific(1, 6, 10)
+        world.fills = _fills({_B: bought}, oldest=bought - timedelta(days=30))
+        with caplog.at_level(logging.INFO):
+            plans = _lone_trims(world, monkeypatch, now=_pacific(1, 6 + days_after, 9))
+        # Days 1 to 6: left alone. Day 7 (the next Tuesday) and day 8: trimmed
+        assert bool(plans) == (days_after >= 7)
+        if plans:
+            assert plans[0].count == 42
+            assert f"129 contracts, last traded 2026-01-06, {days_after} day(s) ago" in (
+                caplog.text)
+        else:
+            assert (f"Not trimming {_LONE_HELD_TEXT}: it last traded 2026-01-06, {days_after} "
+                    "day(s) ago, and a trim waits until 7 day(s) have passed") in caplog.text
+            # Refused before its partner is looked for or any order book is read
+            assert world.calls["settlements"] == 0 and world.calls["book"] == []
+
 
 # ─── plan_trims: each gate and each step ──────────────────────────────────────
 
@@ -1524,10 +2163,27 @@ def _weather_pair(world: _World, name: str, n: int, *, quotes: bool = True,
     return tickers[0], tickers[1]
 
 
+def _closing_in(case: _TrimCase, days: int) -> _TrimCase:
+    """The case with its later market (B) closing `days` days after the run's UTC
+    date (2026-01-12), at 23:00 UTC, and A an hour before it, as a time-series
+    pair's earlier market closes first."""
+    close = datetime(2026, 1, 12, 23, tzinfo=UTC) + timedelta(days=days)
+    case.world.markets[_B].close_time = close
+    case.world.markets[_A].close_time = close - timedelta(hours=1)
+    return case
+
+
+def _near_maturity(text: str, days: int, until: int) -> str:
+    """The reason a position is not rebalanced when its later market closes too soon."""
+    closes = "closes today" if days == 0 else f"closes in {days} day(s)"
+    return (f"{text}: its later market {closes}, and rebalancing stops "
+            f"{until} day(s) before maturity")
+
+
 class TestPlanTrims:
     """seller.plan_trims: nothing is trimmed unless every run-wide check passes,
-    each pair stops at its first failed step with one line saying why, and a
-    plan names the contracts sold apart from those held."""
+    each pair or lone leg stops at its first failed step with one line saying
+    why, and a plan names the contracts sold apart from those held."""
 
     def test_the_standard_pair_is_sold_down_to_its_cap(self, monkeypatch, caplog):
         case = _TrimCase()
@@ -1696,13 +2352,430 @@ class TestPlanTrims:
                 in caplog.text)
         assert case.world.calls == _NO_READS and case.world.fill_reads == 0
 
-    def test_a_lone_held_market_is_never_trimmed(self, monkeypatch, caplog):
-        world = _lone_world(_settled(_SAME_EVENT, _EV_B))
+    # ── A lone leg whose partner has paid out ────────────────────────────────
+
+    def test_a_lone_leg_over_its_cap_is_sold_down_with_its_paid_out_partner(self, monkeypatch,
+                                                                          caplog):
+        # B held NO alone (129 contracts), its partner (YES on the Jan 18 rung) paid
+        # out $0. By hand, at k 0.7 and a 10% cap on $749 ($474 cash + $275 positions):
+        #  - the partner reads as its settlement price: YES bid 0, NO bid $1, so its
+        #    YES ask is 0, its NO ask 1 and its midpoint 0. B's midpoint is halfway
+        #    between its YES ask 0.14 (1 - NO bid 0.86) and its YES bid 0.12: 0.13
+        #  - B pays with chance 1 - 0.7 x (0.13 - 0) = 90.9%
+        #  - one contract sold at the best bids: B's $0.86 plus the partner's $0, less
+        #    the fee 0.07 x 0.86 x 0.14 = $0.008428: $0.851572
+        #  - Kelly's hold share (0.909 - 0.851572) / (1 - 0.851572) = 38.7% is above
+        #    the 10% cap, so B may keep $74.90: 74.90 / 0.851572 = 87.95 contracts, so
+        #    87 kept and 42 to sell
+        #  - selling 42 walks no lower than $0.86: 42 x 0.86 = $36.12 less the fee
+        #    0.07 x 42 x 0.86 x 0.14 = $0.354, rounded up to $0.36: $35.76, or $0.851429
+        #    a contract, at which B may still keep only 87, so 42 it is
+        world = _lone_trim(_lone_partner())
+        with caplog.at_level(logging.INFO):
+            (plan,) = _lone_trims(world, monkeypatch)
+        lines = [r.getMessage() for r in caplog.records]
+        assert (f"Kelly trim check: {_LONE_TRIM_TEXT} (time-series), 129 contracts, last "
+                "traded 2026-01-05, 7 day(s) ago, pays 90.9%, $0.85 a contract at the best "
+                "bids, may keep 10.0% of $749.00 -> sell 42") in lines
+        assert lines[-2:] == ["Pairs to trim this run: 0 of 0",
+                              "Lone legs to trim this run (partner paid out): 1 of 1"]
+        assert _warnings(caplog) == []
+        assert (plan.kind, plan.level, plan.count, plan.days_left) == (
+            config.SALE_KIND_KELLY_TRIM, None, 42, 13)
+        assert plan.title == "Will the rocket launch by Jan 25, 2026?"
+        # The held leg sells 42 of its 129; the paid-out partner goes with them
+        held, partner = plan.legs
+        assert (held.ticker, held.side, held.count, held.held) == (_B, "no", 42, 129)
+        assert held.market is world.markets[_B]
+        assert (partner.ticker, partner.side, partner.count, partner.held) == (
+            _SAME_EVENT, "yes", 42, None)
+        assert partner.market is None and partner.payout_dollars == 0.0
+        assert partner.paid_at == datetime.fromtimestamp(_CK - 3 * _DAY, UTC)
+        # Each leg's cost is the share sold of what it cost, fees included: B's
+        # $77.40 + $2.17, and the partner's $38.70 + $1.90, each times 42/129
+        assert held.cost_dollars == pytest.approx((77.40 + 2.17) * 42 / 129)
+        assert partner.cost_dollars == pytest.approx((38.70 + 1.90) * 42 / 129)
+        cost = (77.40 + 2.17 + 38.70 + 1.90) * 42 / 129
+        assert plan.cost_dollars == pytest.approx(cost)
+        # Sold on B's bids alone: no ladder or walk for the partner
+        assert plan.ladders == {_B: [[0.86, 100_000.0]]}
+        assert plan.walked == {_B: (0.86, 0.86)}
+        assert fee_leg_exact(42, 0.86) == 0.36
+        assert plan.proceeds_dollars == pytest.approx(42 * 0.86 - 0.36, abs=1e-12)
+        assert plan.profits == ((pytest.approx(35.76 - cost, abs=1e-9),
+                                 pytest.approx(42 - cost, abs=1e-9)),)
+        # The count is the shared rule's, handed the settled partner's prices
+        win = config.held_pair_win_prob("time_series", 0.0, 1.0, 0.14, 0.88, 0.7)
+        top = 0.86 - config.fee_per_pair_approx(0.0, 0.86)
+        assert (win, top) == (pytest.approx(0.909), pytest.approx(0.851572))
+        assert config.kelly_trim_count(
+            129, 749.0, win, 0.10, top,
+            lambda n: n * 0.86 - fee_leg_exact(n, 0.86)).sell == 42
+        # Only B's book is read; the partner is found among the settlements
+        assert world.calls["book"] == [_B]
+        assert world.calls["settlements"] == 1 and world.calls["lookup"] == [_SAME_EVENT]
+
+    def test_a_lone_leg_plan_is_one_the_trader_and_the_reporter_read(self, monkeypatch, caplog):
+        # The real plan, handed on as a run would: the trader builds its one
+        # order, on the held market alone (a dry run sends none), and the
+        # reporter words the row and the record in contracts, not contract pairs
+        from kalshi_betting import reporter, trader
+
+        world = _lone_trim(_lone_partner())
+        (plan,) = _lone_trims(world, monkeypatch)
+        legs, problem = trader._sale_legs(plan)
+        assert problem is None and [leg.ticker for leg in legs] == [_B]
+        assert [trader._plan_holding(leg) for leg in legs] == [129]
+        with caplog.at_level(logging.INFO):
+            [result] = trader.sell_positions(MagicMock(), [plan], dry_run=True)
+        assert (result.status, result.sold) == ("simulated", {_B: 42})
+        assert ("42 NO contracts (of 129 held) on " + _B) in caplog.text
+        row = reporter._sale_to_row(result, _NOW)
+        assert row[17] == ("[sale: NO A / YES B, Kelly trim: 42 of 129 contracts, "
+                           f"13 days left, fees=${fee_leg_exact(42, 0.86):.2f}] ")
+        assert row[3:6] == [_B, "(paid out)", _SAME_EVENT]
+        assert row[11:13] == [42, ""] and row[13] == round(plan.cost_dollars, 2)
+        [record] = reporter.report_sales([result])
+        assert (record.kind, record.level, record.realized_percent) == (
+            config.SALE_KIND_KELLY_TRIM, None, None)
+        # The paid-out partner is no leg of the record: it sold nothing
+        assert [(leg.ticker, leg.held, leg.sold) for leg in record.legs] == [(_B, 129, 42)]
+        assert record.profit == round(plan.profits[0][0], 2)
+
+    def test_a_lone_leg_within_its_cap_is_kept(self, monkeypatch, caplog):
+        # Under a 20% cap B may keep $149.80, 175 contracts: all 129 stay
+        world = _lone_trim(_lone_partner())
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch, cap=0.20) == []
+        assert (f"{_LONE_TRIM_TEXT} (time-series), 129 contracts, last traded 2026-01-05, 7 "
+                "day(s) ago, pays 90.9%, $0.85 a contract at the best bids, may keep 20.0% of "
+                "$749.00 -> keep") in caplog.text
+        assert "Lone legs to trim this run (partner paid out): 0 of 1" in caplog.text
+
+    def test_a_lone_leg_whose_partner_won_is_not_trimmed(self, monkeypatch, caplog):
+        # The partner settled yes: its YES paid out, so the event happened by Jan 18,
+        # and B's NO (no event by Jan 25) cannot win
+        world = _lone_trim(_lone_partner(result="yes", revenue=129.0))
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch) == []
+        assert (f"Not trimming {_LONE_HELD_TEXT}: its partner {_SAME_EVENT} paid out on its YES "
+                "side, so this leg cannot win") in caplog.text
+        assert world.calls["book"] == []
+
+    @pytest.mark.parametrize("settlements, reason", [
+        ([], "no paid-out partner"),
+        ([_lone_partner(), _settled(_SAME_EVENT_2, _EV_B, yes=129.0)],
+         "more than one settled market could be its paid-out partner"),
+        ([_lone_partner(at=datetime.fromtimestamp(
+            _CK - seller.SALE_PARTNER_MAX_AGE_DAYS * _DAY - 1, UTC))], "no paid-out partner"),
+        ([_lone_partner(at=datetime.fromtimestamp(_CK + 60, UTC))],
+         "is recorded as settling after now"),
+    ], ids=["none", "two", "too old", "after now"])
+    def test_a_lone_leg_without_one_paid_out_partner_is_not_trimmed(self, monkeypatch, caplog,
+                                                                    settlements, reason):
+        world = _lone_trim(*settlements)
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch) == []
+        assert f"Not trimming {_LONE_HELD_TEXT}: " in caplog.text and reason in caplog.text
+        assert _warnings(caplog) == []
+        # Refused before any order book is read
+        assert world.calls["book"] == []
+        assert "Lone legs to trim this run (partner paid out): 0 of 1" in caplog.text
+
+    @pytest.mark.parametrize("unreadable, problem", [
+        (None, "the account's settlements could not be read"),
+        (1, "1 of the account's settlements could not be read, and any of them may be the "
+            "partner"),
+    ], ids=["the list", "one record"])
+    def test_settlements_that_cannot_be_read_trim_no_lone_leg_and_warn_once(
+            self, monkeypatch, caplog, unreadable, problem):
+        # Two lone legs on two ladders and an exact pair: neither lone leg is trimmed,
+        # with one WARNING, and the pair is still judged
+        world = _lone_trim(_lone_partner())
+        if unreadable is None:
+            world.settlements = None
+        else:
+            world.unreadable = unreadable
+        snow = _rung("KXSNOWB-26", "KXSNOWB", "Jan 25, 2026", _B_CLOSE,
+                     title="Will it snow by Jan 25, 2026?")
+        world.hold(snow, -30.0, 12.0, 0.51)
+        world.books["KXSNOWB-26"] = world.books[_B]
+        rain = _weather_pair(world, "rain", 30)
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch) == []
+        assert _warnings(caplog) == [
+            f"Not trimming any lone leg whose partner has paid out this run: {problem}"]
+        assert world.calls["settlements"] == 1
+        assert f"Not trimming {_LONE_HELD_TEXT}: {problem}" in caplog.text
+        assert f"Not trimming NO KXSNOWB-26 (alone on its ladder): {problem}" in caplog.text
+        assert f"Kelly trim check: YES {rain[0]} / NO {rain[1]} (time-series)" in caplog.text
+        assert world.calls["book"] == list(rain)
+        assert caplog.records[-2].getMessage() == "Pairs to trim this run: 0 of 1"
+        assert caplog.records[-1].getMessage() == (
+            "Lone legs to trim this run (partner paid out): 0 of 2")
+
+    def test_a_lone_leg_on_the_earlier_market_is_not_trimmed(self, monkeypatch, caplog):
+        # A held YES alone (the earlier deadline), its partner B (held NO) settled yes,
+        # so it paid $0: what is left is no later market's chance of paying
+        world = _World()
+        world.hold(_rung(_A, _EV_A, "Jan 20, 2026", _A_CLOSE), 129.0, 38.70, 1.90)
+        market_b = _rung(_B, _EV_B, "Jan 25, 2026", _B_CLOSE)
+        world.known[_B] = world.lookup[_B] = market_b
+        world.settlements = [_settled(_B, _EV_B, yes=0.0, no=129.0, cost=51.60, fees=2.17,
+                                      result="yes")]
+        world.books[_A] = {"yes": [[0.12, 100_000.0]], "no": [[0.86, 100_000.0]]}
+        world.fills = _fills({_A: _BOUGHT})
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch) == []
+        assert (f"Not trimming YES {_A} (alone: NO {_B} paid out $0): a lone leg is trimmed "
+                "only as the later market of a time-series pair") in caplog.text
+        assert world.calls["book"] == []
+
+    def test_a_same_title_lone_leg_is_not_trimmed(self, monkeypatch, caplog):
+        # B held YES alone after its same-title partner A (held NO) settled yes, paying $0
+        case = _TrimCase("same_title", a_now=(0.50, 0.52), b_now=(0.42, 0.60))
+        world = case.world
+        del world.positions[_A]
+        world.settlements = [_settled(_A, _EV_A, yes=0.0, no=30.0, cost=15.0, result="yes")]
+        with caplog.at_level(logging.INFO):
+            assert world.trims(monkeypatch, _trim_settings(cap=0.10)) == []
+        assert (f"Not trimming YES {_B} (alone: NO {_A} paid out $0): a lone leg is trimmed "
+                "only as the later market of a time-series pair") in caplog.text
+        assert world.calls["book"] == []
+        # The two markets read as the same-title pair they were bought as
+        assert seller.held_pair_kind(world.markets[_B], world.markets[_A])[0] == "same_title"
+
+    def test_a_lone_leg_trimmed_before_is_trimmed_again_with_its_partners_share(
+            self, monkeypatch, caplog):
+        # An earlier trim left B holding 86 of the 129 its partner settled with. By hand,
+        # under a 5% cap B may keep $37.45: 37.45 / 0.851572 = 43.98 contracts, so 43
+        # kept and 43 to sell (selling 43 returns 43 x 0.86 less a $0.37 fee, $0.851395 a
+        # contract, at which it may still keep only 43)
+        world = _lone_trim(_lone_partner(), count=86, exposure=51.60)
+        with caplog.at_level(logging.INFO):
+            (plan,) = _lone_trims(world, monkeypatch, cap=0.05)
+        assert (f"Kelly trim check: {_LONE_TRIM_TEXT} (time-series), 86 contracts, " in
+                caplog.text)
+        assert "may keep 5.0% of $749.00 -> sell 43" in caplog.text
+        held, partner = plan.legs
+        assert (held.count, held.held) == (43, 86)
+        assert held.cost_dollars == pytest.approx((51.60 + 2.17) * 43 / 86)
+        # The partner's 129 settled contracts, 43 of them going with the 43 sold
+        assert (partner.ticker, partner.count) == (_SAME_EVENT, 43)
+        assert partner.cost_dollars == pytest.approx((38.70 + 1.90) * 43 / 129)
+        assert partner.payout_dollars == 0.0
+        assert fee_leg_exact(43, 0.86) == 0.37
+        assert plan.proceeds_dollars == pytest.approx(43 * 0.86 - 0.37, abs=1e-12)
+
+    def test_a_lone_leg_whose_partner_sold_some_before_paying_out_is_trimmed(
+            self, monkeypatch, caplog):
+        # B holds 128 NO; its partner's record lists 180 YES and 52 NO bought, so it
+        # held 128 YES when it paid out $0. By hand, as for the standard lone leg: B
+        # pays with chance 90.9%, one contract fetches $0.851572 at the best bids, and
+        # under the 10% cap B may keep $74.90: 74.90 / 0.851572 = 87.95, so 87 kept and
+        # 41 to sell (selling 41 returns 41 x 0.86 less a $0.35 fee, $0.851463 a
+        # contract, at which it may still keep only 87)
+        world = _lone_trim(_starship(), count=128, exposure=76.80, fees=2.16)
+        with caplog.at_level(logging.INFO):
+            (plan,) = _lone_trims(world, monkeypatch)
+        assert (f"Kelly trim check: {_LONE_TRIM_TEXT} (time-series), 128 contracts, last "
+                "traded 2026-01-05, 7 day(s) ago, pays 90.9%, $0.85 a contract at the best "
+                "bids, may keep 10.0% of $749.00 -> sell 41") in caplog.text
+        held, partner = plan.legs
+        assert (held.ticker, held.count, held.held) == (_B, 41, 128)
+        assert held.cost_dollars == pytest.approx((76.80 + 2.16) * 41 / 128)
+        # 41 YES at the average cost of the 180 bought: ($3.47 + $0.2738) x 41 / 180
+        # = $0.852754; and 41/128 of the $0 paid
+        assert (partner.ticker, partner.side, partner.count) == (_SAME_EVENT, "yes", 41)
+        assert partner.cost_dollars == pytest.approx((3.47 + 0.2738) * 41 / 180)
+        assert partner.cost_dollars == pytest.approx(0.852754, abs=1e-6)
+        assert partner.payout_dollars == 0.0
+        assert fee_leg_exact(41, 0.86) == 0.35
+        assert plan.proceeds_dollars == pytest.approx(41 * 0.86 - 0.35, abs=1e-12)
+        assert config.kelly_trim_count(
+            128, 749.0, config.held_pair_win_prob("time_series", 0.0, 1.0, 0.14, 0.88, 0.7),
+            0.10, 0.86 - config.fee_per_pair_approx(0.0, 0.86),
+            lambda n: n * 0.86 - fee_leg_exact(n, 0.86)).sell == 41
+
+    def test_a_lone_leg_trimmed_before_takes_a_two_sided_partner_in_the_wider_search(
+            self, monkeypatch, caplog):
+        # An earlier trim left B holding 86 of the 128 YES its partner held at the
+        # payout (180 bought, 52 sold). As for the one-sided partner, under a 5% cap
+        # 43 are kept and 43 sold; the partner's share is 43 of the 180 bought
+        world = _lone_trim(_starship(), count=86, exposure=51.60)
+        with caplog.at_level(logging.INFO):
+            (plan,) = _lone_trims(world, monkeypatch, cap=0.05)
+        assert "may keep 5.0% of $749.00 -> sell 43" in caplog.text
+        held, partner = plan.legs
+        assert (held.count, held.held) == (43, 86)
+        assert (partner.ticker, partner.count) == (_SAME_EVENT, 43)
+        # ($3.47 + $0.2738) x 43 / 180 = $0.894352
+        assert partner.cost_dollars == pytest.approx((3.47 + 0.2738) * 43 / 180)
+        assert partner.payout_dollars == 0.0
+
+    def test_a_lone_leg_whose_two_sided_partner_does_not_add_up_is_not_trimmed(
+            self, monkeypatch, caplog):
+        world = _lone_trim(_starship(revenue_dollars=52.0), count=128, exposure=76.80,
+                           fees=2.16)
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch) == []
+        assert (f"Not trimming {_LONE_HELD_TEXT}: its partner {_SAME_EVENT} lists contracts "
+                "bought on both sides (180 YES, 52 NO), and its payout ($52.00) does not "
+                "match the 128 YES held when it paid out, so what was held cannot be "
+                "read") in caplog.text
+        assert world.calls["book"] == []
+
+    def test_a_lone_legs_wait_counts_a_later_fill_on_its_ladder(self, monkeypatch, caplog):
+        # A, the rocket question at Jan 20, is in the run's market list (not held) and
+        # traded yesterday: a market the finders could pair B with, so B's last trade
+        # is yesterday's, for the trim as for the add-on
+        world = _lone_trim(_lone_partner())
+        world.list(_rung(_A, _EV_A, "Jan 20, 2026", _A_CLOSE))
+        world.fills = _fills({_A: _NOW - timedelta(days=1), _B: _BOUGHT})
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch) == []
+        assert (f"Not trimming {_LONE_HELD_TEXT}: it last traded 2026-01-11, 1 day(s) ago, and "
+                "a trim waits until 7 day(s) have passed since a pair's last trade"
+                in caplog.text)
+        assert world.calls["settlements"] == 0 and world.calls["book"] == []
+        # plan_add_ons names the same day for the same lone leg
+        pattern = re.compile(r"it last traded \S+, -?\d+ day\(s\) ago")
+        trimmed = pattern.findall(caplog.text)
+        caplog.clear()
+        pairs = held_pairs(dict(world.positions), world.labels(), dict(world.markets),
+                           log=False)
+        with caplog.at_level(logging.INFO):
+            assert seller.plan_add_ons(MagicMock(), pairs, dict(world.markets),
+                                       settings=_trim_settings(), now=_NOW) == {}
+        assert pattern.findall(caplog.text) == trimmed == [
+            "it last traded 2026-01-11, 1 day(s) ago"]
+
+    @pytest.mark.parametrize("no_ask_then, prices, trims", [
+        (0.92, "price $0.92 then, $0.88 now (-4c, minimum 10c)", False),
+        (0.76, "price $0.76 then, $0.88 now (+12c, minimum 10c)", True),
+    ])
+    def test_a_lone_legs_price_move_is_its_own_markets(self, monkeypatch, caplog, no_ask_then,
+                                                       prices, trims):
+        # B's NO ask is 0.88 now (1 - its YES bid 0.12). The paid-out partner counts as
+        # 0 then and now, so its payout is never a move
+        world = _lone_trim(_lone_partner())
+        world.candles = {_B: [_candle(_FIRST, 0.10, no_ask_then), _candle(_CK, 0.14, 0.88)]}
+        with caplog.at_level(logging.INFO):
+            plans = _lone_trims(world, monkeypatch, min_move=0.10)
+        if trims:
+            assert [plan.count for plan in plans] == [42]
+            assert (f"129 contracts, last traded 2026-01-05, 7 day(s) ago, {prices}, pays "
+                    "90.9%") in caplog.text
+        else:
+            assert plans == []
+            assert (f"Not trimming {_LONE_TRIM_TEXT}: its price has not moved by the minimum "
+                    f"since it last traded: {prices}") in caplog.text
+        # Only B's own price then was read
+        assert [call[0] for call in world.calls["candles"]] == [_B]
+
+    def test_a_lone_leg_with_no_fill_listed_is_not_trimmed_with_a_minimum(self, monkeypatch,
+                                                                          caplog):
+        world = _lone_trim(_lone_partner())
         world.fills = _fills()
         with caplog.at_level(logging.INFO):
-            assert world.trims(monkeypatch) == []
-        assert "Pairs to trim this run: 0 of 0" in caplog.text
+            assert _lone_trims(world, monkeypatch, min_move=0.10) == []
+        assert (f"Not trimming {_LONE_TRIM_TEXT}: no fill is listed on its market or its "
+                "ladder, so its price when it last traded cannot be read, and a minimum "
+                "price move is set") in caplog.text
+        assert world.calls["candles"] == []
+        # A fill listed, but B's price history cannot be read: no price then
+        world.fills = _fills({_B: _BOUGHT})
+        world.candles = {}
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch, min_move=0.10) == []
+        assert (f"Not trimming {_LONE_TRIM_TEXT}: the NO ask on {_B} when it last traded "
+                "(2026-01-05) cannot be read") in caplog.text
+        assert [call[0] for call in world.calls["candles"]] == [_B]
+
+    def test_a_yes_bid_of_one_cent_on_a_lone_leg_is_not_trimmed(self, monkeypatch, caplog):
+        # The partner's settled YES bid of 0 is no quote a candle must show; B's own
+        # YES bid of 1c is
+        world = _lone_trim(_lone_partner(), yes_bid=0.01)
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch) == []
+        assert (f"Not trimming {_LONE_TRIM_TEXT}: the best YES bid on {_B} ($0.0100) is one "
+                "the hourly price history cannot show") in caplog.text
+
+    def test_a_lone_leg_is_not_sold_into_a_gap_under_its_best_bid(self, monkeypatch):
+        # One contract at the best bid, then nothing until 20c: only that one is sold
+        world = _lone_trim(_lone_partner())
+        world.books[_B]["no"] = [[0.86, 1.0], [0.20, 100_000.0]]
+        (plan,) = _lone_trims(world, monkeypatch)
+        assert plan.count == 1 and [leg.count for leg in plan.legs] == [1, 1]
+        assert plan.ladders == {_B: [[0.86, 1.0]]} and plan.walked == {_B: (0.86, 0.86)}
+        assert plan.proceeds_dollars == pytest.approx(0.86 - fee_leg_exact(1, 0.86))
+
+    def test_a_lone_leg_worth_more_than_every_open_position_stops_every_trim(
+            self, monkeypatch, caplog):
+        world = _lone_trim(_lone_partner())
+        top = 0.86 - config.fee_per_pair_approx(0.0, 0.86)
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch, positions_cents=10_000) == []
+        assert _warnings(caplog) == [
+            "Not trimming any held pair this run, including any marked '-> sell' above: "
+            f"{_LONE_TRIM_TEXT} alone would fetch ${129 * top:.2f} at its best bids (129 "
+            f"contracts at ${top:.2f} each), more than the $100.00 all open positions are "
+            "valued at, so that value cannot be right, and a trim sized on too small a value "
+            "would sell too much"]
+        assert caplog.records[-1].getMessage() == (
+            "Lone legs to trim this run (partner paid out): 0 of 1")
+        # Beside a pair, each alone under the $120 the open positions are valued at but
+        # together over it: no trim either
+        world = _lone_trim(_lone_partner())
+        _weather_pair(world, "rain", 30)
+        pair_top = 0.42 + 0.52 - config.fee_per_pair_approx(0.42, 0.52)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch, positions_cents=12_000) == []
+        (warning,) = _warnings(caplog)
+        assert (f"the 2 positions whose order books were read would fetch "
+                f"${129 * top + 30 * pair_top:.2f} at their best bids together, more than the "
+                "$120.00 all open positions are valued at") in warning
+        # Each alone over the $20 the open positions are valued at (the pair's bids not in
+        # the market list, so its value at this run's bids is $0): the second is counted
+        # as one more position, since one of the two is a lone leg
+        world = _lone_trim(_lone_partner())
+        _weather_pair(world, "rain", 30, quotes=False)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch, positions_cents=2_000) == []
+        (warning,) = _warnings(caplog)
+        assert ("more than the $20.00 all open positions are valued at (and 1 more "
+                "position(s) alike), so that value cannot be right") in warning
+
+    def test_a_lone_leg_picked_for_a_take_profit_sale_is_not_looked_at(self, monkeypatch,
+                                                                       caplog):
+        world = _lone_trim(_lone_partner())
+        with caplog.at_level(logging.INFO):
+            assert _lone_trims(world, monkeypatch, skip=frozenset({_B})) == []
+        assert (f"Not trimming {_LONE_HELD_TEXT}: it is picked for a take-profit sale this run"
+                in caplog.text)
+        assert caplog.records[-1].getMessage() == "Pairs to trim this run: 0 of 0"
         assert world.calls == _NO_READS and world.fill_reads == 0
+
+    def test_the_summary_counts_pairs_and_lone_legs_apart(self, monkeypatch, caplog):
+        # Under a 5% cap both the rain pair (60 each) and the lone leg are sold down
+        world = _lone_trim(_lone_partner())
+        _weather_pair(world, "rain", 60)
+        with caplog.at_level(logging.INFO):
+            plans = _lone_trims(world, monkeypatch, cap=0.05)
+        assert len(plans) == 2
+        assert [r.getMessage() for r in caplog.records][-2:] == [
+            "Pairs to trim this run: 1 of 1",
+            "Lone legs to trim this run (partner paid out): 1 of 1"]
+        # With no lone leg held, the lone legs' line is not logged at all
+        del world.positions[_B]
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert len(_lone_trims(world, monkeypatch, cap=0.05)) == 1
+        assert caplog.records[-1].getMessage() == "Pairs to trim this run: 1 of 1"
+        assert "Lone legs to trim" not in caplog.text
 
     @pytest.mark.parametrize("skip", [frozenset({_A}), frozenset({_B}), frozenset({_A, _B, "X"})])
     def test_a_pair_picked_for_a_take_profit_sale_is_not_looked_at(self, monkeypatch, caplog,
@@ -2247,6 +3320,145 @@ class TestPlanTrims:
         assert all(type(value) is int for call in case.world.calls["candles"]
                    for value in call[2:])
 
+    # ── "Rebalance until": how near maturity a position may still be trimmed ──
+
+    @pytest.mark.parametrize("until", [None, 1, 7])
+    @pytest.mark.parametrize("days", [0, 1, 6, 7, 8])
+    def test_rebalance_until_holds_back_a_pair_near_maturity(self, monkeypatch, caplog,
+                                                             days, until):
+        # Trimmed only while its later market closes at least `until` days from
+        # today (UTC dates): 7 days left still trims at 7, 6 does not. None
+        # (maturity) trims however near
+        case = _closing_in(_TrimCase(), days)
+        with caplog.at_level(logging.INFO):
+            plans = case.live(monkeypatch, 10_000, cap=0.10, until=until)
+        lines = [r.getMessage() for r in caplog.records]
+        if until is None or days >= until:
+            (plan,) = plans
+            assert (plan.count, plan.days_left) == (19, days)
+            assert not any("rebalancing stops" in line for line in lines)
+            assert lines[-1] == "Pairs to trim this run: 1 of 1"
+        else:
+            assert plans == []
+            assert lines == [f"Not trimming {_near_maturity(_PAIR_TEXT, days, until)}",
+                             "Pairs to trim this run: 0 of 1"]
+            # Left out before anything is read for it: no fills, books or candles
+            assert case.world.fill_reads == 0 and case.world.calls == _NO_READS
+
+    def test_a_later_market_that_closed_yesterday_says_so(self, monkeypatch, caplog):
+        # Still held and listed, but closed before today (UTC): held back at 1
+        case = _closing_in(_TrimCase(), -1)
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10, until=1) == []
+        assert (f"Not trimming {_PAIR_TEXT}: its later market closed 1 day(s) ago, and "
+                "rebalancing stops 1 day(s) before maturity") in caplog.text
+
+    def test_a_pair_is_judged_on_its_later_market(self, monkeypatch, caplog):
+        # A closes in 2 days, within the 7, but B, the later market, in 10: trimmed
+        case = _TrimCase()
+        case.world.markets[_A].close_time = datetime(2026, 1, 14, 23, tzinfo=UTC)
+        case.world.markets[_B].close_time = datetime(2026, 1, 22, 23, tzinfo=UTC)
+        with caplog.at_level(logging.INFO):
+            (plan,) = case.live(monkeypatch, 10_000, cap=0.10, until=7)
+        assert (plan.count, plan.days_left) == (19, 10)
+        assert "rebalancing stops" not in caplog.text
+
+    @pytest.mark.parametrize("until, trims", [(1, True), (7, False)])
+    def test_days_are_counted_on_utc_dates(self, monkeypatch, caplog, until, trims):
+        # A run at 16:00 UTC (8am in Los Angeles) and a close at 03:59 UTC the next
+        # day (7:59pm in Los Angeles, the same day) is 1 day left on UTC dates
+        case = _TrimCase()
+        case.world.markets[_A].close_time = datetime(2026, 1, 13, 2, 59, tzinfo=UTC)
+        case.world.markets[_B].close_time = datetime(2026, 1, 13, 3, 59, tzinfo=UTC)
+        now = datetime(2026, 1, 12, 16, tzinfo=UTC)
+        with caplog.at_level(logging.INFO):
+            plans = case.live(monkeypatch, 10_000, cap=0.10, until=until, now=now)
+        if trims:
+            (plan,) = plans
+            assert (plan.count, plan.days_left) == (19, 1)
+        else:
+            assert plans == []
+            assert f"Not trimming {_near_maturity(_PAIR_TEXT, 1, 7)}" in caplog.text
+
+    @pytest.mark.parametrize("until, trims", [(1, True), (7, False)])
+    def test_today_is_the_utc_date_not_the_bots_own_day(self, monkeypatch, caplog, until,
+                                                        trims):
+        # 02:00 UTC on Jan 13 is 6pm on Jan 12 in Los Angeles: from the UTC date the
+        # later market's Jan 19 close is 6 days away (7 from the bot's own day)
+        case = _TrimCase()
+        case.world.markets[_A].close_time = datetime(2026, 1, 19, 22, tzinfo=UTC)
+        case.world.markets[_B].close_time = datetime(2026, 1, 19, 23, tzinfo=UTC)
+        now = datetime(2026, 1, 13, 2, tzinfo=UTC)
+        with caplog.at_level(logging.INFO):
+            plans = case.live(monkeypatch, 10_000, cap=0.10, until=until, now=now)
+        if trims:
+            (plan,) = plans
+            assert plan.days_left == 6
+        else:
+            assert plans == []
+            assert f"Not trimming {_near_maturity(_PAIR_TEXT, 6, 7)}" in caplog.text
+
+    @pytest.mark.parametrize("until", [1, 7])
+    @pytest.mark.parametrize("how", ["no close time", "a close time with no zone",
+                                     "not in this run's market list"])
+    def test_an_unknown_close_date_holds_it_back(self, monkeypatch, caplog, how, until):
+        case = _TrimCase()
+        if how == "no close time":
+            case.world.markets[_B].close_time = None
+        elif how == "a close time with no zone":
+            case.world.markets[_B].close_time = datetime(2026, 1, 25)
+        else:
+            del case.world.markets[_B]
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10, until=until) == []
+        why = (f"{_B} is not in this run's market list" if how.startswith("not in")
+               else "a held market's close date is unknown")
+        assert [r.getMessage() for r in caplog.records] == [
+            f"Not trimming {_PAIR_TEXT}: {why}, so rebalancing until {until} day(s) before "
+            "maturity cannot be checked",
+            "Pairs to trim this run: 0 of 1"]
+        assert case.world.fill_reads == 0 and case.world.calls == _NO_READS
+
+    @pytest.mark.parametrize("days, until, trims", [(5, 7, False), (5, 1, True),
+                                                    (7, 7, True)])
+    def test_a_lone_leg_is_judged_on_its_own_close(self, monkeypatch, caplog, days, until,
+                                                   trims):
+        # B held alone after its partner (the Jan 18 rung) paid out $0: its own close
+        # is its later market's
+        world = _lone_trim(_lone_partner())
+        world.markets[_B].close_time = (datetime(2026, 1, 12, 23, tzinfo=UTC)
+                                        + timedelta(days=days))
+        with caplog.at_level(logging.INFO):
+            plans = _lone_trims(world, monkeypatch, until=until)
+        lines = [r.getMessage() for r in caplog.records]
+        if trims:
+            (plan,) = plans
+            assert (plan.count, plan.days_left) == (42, days)
+        else:
+            assert plans == []
+            assert lines == [f"Not trimming {_near_maturity(_LONE_HELD_TEXT, days, until)}",
+                             "Pairs to trim this run: 0 of 0",
+                             "Lone legs to trim this run (partner paid out): 0 of 1"]
+            # Not even the settlements are read for its partner
+            assert world.fill_reads == 0 and world.calls == _NO_READS
+
+    def test_a_pair_held_back_near_maturity_costs_no_read(self, monkeypatch, caplog):
+        # HAIL's later market closes in 3 days: it is left out before anything is
+        # read for it (its books are never read). The standard pair, 13 days out,
+        # is trimmed as before, and the summary counts both
+        case = _TrimCase()
+        hail = _weather_pair(case.world, "hail", 10)
+        case.world.markets[hail[0]].close_time = datetime(2026, 1, 15, 22, tzinfo=UTC)
+        case.world.markets[hail[1]].close_time = datetime(2026, 1, 15, 23, tzinfo=UTC)
+        with caplog.at_level(logging.INFO):
+            (plan,) = case.live(monkeypatch, 10_000, cap=0.10, until=7)
+        assert [leg.ticker for leg in plan.legs] == [_A, _B] and plan.count == 19
+        lines = [r.getMessage() for r in caplog.records]
+        hail_text = f"YES {hail[0]} / NO {hail[1]}"
+        assert lines[0] == f"Not trimming {_near_maturity(hail_text, 3, 7)}"
+        assert lines[-1] == "Pairs to trim this run: 1 of 2"
+        assert case.world.calls["book"] == [_A, _B] and case.world.fill_reads == 1
+
 
 # ─── Adding to a held pair: the wait and the price move ───────────────────────
 
@@ -2283,7 +3495,8 @@ def _lone(case: _TrimCase) -> _TrimCase:
 
 
 def _add_ons(case: _TrimCase, monkeypatch, *, min_move: float | None = None, on: bool = True,
-             now: datetime = _NOW, pairs: dict | None = None) -> dict:
+             now: datetime = _NOW, pairs: dict | None = None,
+             until: int | None = None) -> dict:
     """
     seller.plan_add_ons' verdict on what the case's account holds, its reads stubbed and recorded.
 
@@ -2295,6 +3508,8 @@ def _add_ons(case: _TrimCase, monkeypatch, *, min_move: float | None = None, on:
         now (datetime): Keyword-only. The run's moment.
         pairs (dict | None): Keyword-only. What to judge; None is what
             scanner.held_pairs finds the account may add to.
+        until (int | None): Keyword-only. The run's "Rebalance until" days;
+            None is maturity.
 
     Returns:
         dict: The pairs (and lone legs) the run may add to.
@@ -2316,7 +3531,8 @@ def _add_ons(case: _TrimCase, monkeypatch, *, min_move: float | None = None, on:
                            log=False)
     client = MagicMock()
     kept = seller.plan_add_ons(client, pairs, dict(world.markets),
-                               settings=_trim_settings(min_move=min_move, on=on), now=now)
+                               settings=_trim_settings(min_move=min_move, on=on,
+                                                       until=until), now=now)
     # Every read went through a stub: the client itself is never touched
     assert client.mock_calls == []
     return kept
@@ -2754,6 +3970,110 @@ class TestPlanAddOns:
             "Held pairs that may be added to this run: 1 of 2"]
         assert case.world.fill_reads == 1
 
+    # ── "Rebalance until": how near maturity a position may still be added to ──
+
+    @pytest.mark.parametrize("until", [None, 1, 7])
+    @pytest.mark.parametrize("days", [0, 1, 6, 7, 8])
+    def test_rebalance_until_holds_back_an_add_on_near_maturity(self, monkeypatch, caplog,
+                                                                days, until):
+        # Added to only while its later market closes at least `until` days from
+        # today (UTC dates): 7 days left still adds at 7, 6 does not
+        case = _closing_in(_add_on_case(), days)
+        with caplog.at_level(logging.INFO):
+            kept = _add_ons(case, monkeypatch, until=until)
+        lines = [r.getMessage() for r in caplog.records]
+        if until is None or days >= until:
+            assert set(kept) == {_PAIR_KEY}
+            assert lines == [
+                f"Add-on check: {_PAIR_TEXT}, 30 contracts each, last traded 2026-01-05, "
+                "7 day(s) ago -> may add",
+                "Held pairs that may be added to this run: 1 of 1"]
+        else:
+            assert kept == {}
+            assert lines == [f"Not adding to {_near_maturity(_PAIR_TEXT, days, until)}",
+                             "Held pairs that may be added to this run: 0 of 1"]
+            # Left out before the fills are read
+            assert case.world.fill_reads == 0 and case.world.calls["candles"] == []
+
+    def test_a_pair_is_judged_on_its_later_market(self, monkeypatch):
+        # A closes in 2 days, within the 7, but B, the later market, in 10: kept
+        case = _add_on_case()
+        case.world.markets[_A].close_time = datetime(2026, 1, 14, 23, tzinfo=UTC)
+        case.world.markets[_B].close_time = datetime(2026, 1, 22, 23, tzinfo=UTC)
+        assert set(_add_ons(case, monkeypatch, until=7)) == {_PAIR_KEY}
+
+    @pytest.mark.parametrize("until, adds", [(1, True), (7, False)])
+    def test_days_are_counted_on_utc_dates(self, monkeypatch, caplog, until, adds):
+        # A run at 16:00 UTC and a close at 03:59 UTC the next day: 1 day left
+        case = _add_on_case()
+        case.world.markets[_A].close_time = datetime(2026, 1, 13, 2, 59, tzinfo=UTC)
+        case.world.markets[_B].close_time = datetime(2026, 1, 13, 3, 59, tzinfo=UTC)
+        now = datetime(2026, 1, 12, 16, tzinfo=UTC)
+        with caplog.at_level(logging.INFO):
+            kept = _add_ons(case, monkeypatch, until=until, now=now)
+        assert bool(kept) == adds
+        assert (f"Not adding to {_near_maturity(_PAIR_TEXT, 1, 7)}" in caplog.text) != adds
+
+    @pytest.mark.parametrize("until, adds", [(1, True), (7, False)])
+    def test_today_is_the_utc_date_not_the_bots_own_day(self, monkeypatch, caplog, until,
+                                                        adds):
+        # 02:00 UTC on Jan 13 is 6pm on Jan 12 in Los Angeles: from the UTC date the
+        # later market's Jan 19 close is 6 days away (7 from the bot's own day)
+        case = _add_on_case()
+        case.world.markets[_A].close_time = datetime(2026, 1, 19, 22, tzinfo=UTC)
+        case.world.markets[_B].close_time = datetime(2026, 1, 19, 23, tzinfo=UTC)
+        now = datetime(2026, 1, 13, 2, tzinfo=UTC)
+        with caplog.at_level(logging.INFO):
+            kept = _add_ons(case, monkeypatch, until=until, now=now)
+        assert bool(kept) == adds
+        assert (f"Not adding to {_near_maturity(_PAIR_TEXT, 6, 7)}" in caplog.text) != adds
+
+    @pytest.mark.parametrize("until", [1, 7])
+    def test_an_unknown_close_date_holds_it_back(self, monkeypatch, caplog, until):
+        case = _add_on_case()
+        case.world.markets[_B].close_time = None
+        with caplog.at_level(logging.INFO):
+            assert _add_ons(case, monkeypatch, until=until) == {}
+        assert [r.getMessage() for r in caplog.records] == [
+            f"Not adding to {_PAIR_TEXT}: a held market's close date is unknown, so "
+            f"rebalancing until {until} day(s) before maturity cannot be checked",
+            "Held pairs that may be added to this run: 0 of 1"]
+        assert case.world.fill_reads == 0
+
+    @pytest.mark.parametrize("days, adds", [(5, False), (7, True)])
+    def test_a_lone_leg_is_judged_on_the_market_held(self, monkeypatch, caplog, days, adds):
+        # A has paid out and B is held alone: B's close decides, not A's (here 18
+        # days out), nor the new market's an add-on would pair it with
+        case = _lone(_add_on_case())
+        case.world.markets[_A].close_time = datetime(2026, 1, 30, 23, tzinfo=UTC)
+        case.world.markets[_B].close_time = (datetime(2026, 1, 12, 23, tzinfo=UTC)
+                                             + timedelta(days=days))
+        with caplog.at_level(logging.INFO):
+            kept = _add_ons(case, monkeypatch, until=7)
+        if adds:
+            assert set(kept) == {_LONE_KEY}
+        else:
+            assert kept == {}
+            assert f"Not adding to {_near_maturity(_LONE_TEXT, days, 7)}" in caplog.text
+            assert case.world.fill_reads == 0
+
+    @pytest.mark.parametrize("until, adds", [(1, True), (7, False)])
+    def test_the_days_rule_applies_with_no_wait_and_no_minimum(self, monkeypatch, caplog,
+                                                               until, adds):
+        # With nothing to wait for the fills are never read, but a pair whose later
+        # market closes in 3 days is still held back at 7
+        monkeypatch.setattr(seller, "REBALANCE_MIN_DAYS_SINCE_TRADE", 0)
+        case = _closing_in(_add_on_case(), 3)
+        with caplog.at_level(logging.INFO):
+            kept = _add_ons(case, monkeypatch, until=until)
+        assert bool(kept) == adds and case.world.fill_reads == 0
+        lines = [r.getMessage() for r in caplog.records]
+        if adds:
+            assert lines == ["Held pairs that may be added to this run: 1 of 1"]
+        else:
+            assert lines == [f"Not adding to {_near_maturity(_PAIR_TEXT, 3, 7)}",
+                             "Held pairs that may be added to this run: 0 of 1"]
+
 
 def _raw_candle(yes_ask, yes_bid) -> dict:
     """One raw hourly candle as Kalshi sends it, ending at the pair's last fill
@@ -3071,7 +4391,8 @@ class TestIsolation:
         # own functions, the ones the backtest trims with
         for name in ("kelly_trim_count", "kelly_trim_bids", "held_pair_win_prob",
                      "rebalance_rested", "rebalance_min_days", "trade_day", "pair_price_move",
-                     "price_move_reached", "pair_size_cap", "fee_per_pair_approx"):
+                     "price_move_reached", "pair_size_cap", "fee_per_pair_approx",
+                     "settled_bids"):
             assert getattr(seller, name) is getattr(config, name), name
             assert getattr(backtester, name, getattr(config, name)) is getattr(config, name)
         trim_one = _calls("_trim_one")
@@ -3080,6 +4401,13 @@ class TestIsolation:
                 "fee_per_pair_approx", "fee_leg_exact", "walk_bids", "bid_ladder",
                 "candle_reads_bid", "held_pair_kind", "leg_sides", "_fetch_orderbook",
                 "ask_then", "_day", "_other"} <= trim_one
+        # A lone leg is trimmed on the same pair arithmetic: its paid-out partner reads as
+        # its settlement price (config.settled_bids), is found, scaled and dated as a
+        # take-profit sale's is, and the wait and price move count from the one reading of
+        # a position's last fill that an add-on shares
+        assert {"settled_bids", "_find_partner", "_partner_leg", "_last_fill"} <= trim_one
+        assert {"_find_partner", "_partner_leg"} <= _calls("_plan_one")
+        assert "_last_fill" in _calls("_add_on_one")
         # It reads no candle or fills list itself, and turns a time into a day
         # only through _day
         assert not {"recent_candles", "ask_before", "get_fill_times", "trade_day"} & trim_one
@@ -3108,6 +4436,9 @@ class TestIsolation:
         (decided,) = _calls_of("_trim_one", "kelly_trim_count")
         assert (rested.lineno < kind.lineno < book.lineno < measured.lineno < tested.lineno
                 < forecast.lineno < decided.lineno)
+        # A lone leg's partner is found after the wait and before the kind is read
+        (found,) = _calls_of("_trim_one", "_find_partner")
+        assert rested.lineno < found.lineno < kind.lineno
         # What the pair alone fetches, and its check against the value of all open
         # positions, come after the books and before the price move and the forecast
         (valued,) = _calls_of("_trim_one", "fee_per_pair_approx")

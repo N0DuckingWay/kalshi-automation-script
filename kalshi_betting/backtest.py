@@ -12,8 +12,8 @@ Purpose:
     --max-volume-share / --no-volume-cap,
     --spread-min, --spread-max, --no-band-sweep,
     --no-cap-sweep, --no-sell-sweep, --sell-workers, --no-rebalance-sweep,
-    --no-move-sweep, --no-eda, --dashboard-only, --accept-changed-simulator),
-    configures logging to kalshi_backtest.log, constructs the necessary API
+    --no-move-sweep, --no-maturity-sweep, --no-eda, --dashboard-only,
+    --accept-changed-simulator), configures logging to kalshi_backtest.log, constructs the necessary API
     clients, works out the starting balance (--balance, or else what the Kalshi
     account is worth when the run starts), fits the depth model from the saved
     order-book snapshots (depth_model.load_depth_model) so each trade is sized
@@ -245,6 +245,17 @@ Notes:
     price movement select). They too are simulated only when the dashboard
     is built. --no-move-sweep skips them and still builds Rebalance itself;
     --no-rebalance-sweep skips both.
+
+    So are the family's "Rebalance until" choices (maturity_sweep=True):
+    the RebalanceSweep also carries every choice of
+    config.REBALANCE_MATURITY_DAYS besides "maturity"
+    (RebalanceSweep.maturity_days), where a held position is added to or
+    trimmed only while its later market closes at least that many days
+    away, at every minimum price movement too. They are simulated only
+    when a report reads them (RebalanceSweep.maturity_grid); the dashboard
+    reads every one as it is built, for its "Rebalance until" select.
+    --no-maturity-sweep skips them (that select then stays shut) and still
+    builds Rebalance itself; --no-rebalance-sweep skips them too.
 
     Every full run saves what it hands generate_dashboard, right after the
     sweep and before the page is built, in config.BACKTEST_SWEEP_FILENAME in
@@ -505,6 +516,28 @@ def _fills_echo(depth_model: DepthModel | None) -> str:
     snapshots, ladders = depth_model.snapshots, depth_model.ladders
     return (f"walked book ({snapshots} snapshot{'' if snapshots == 1 else 's'}, "
             f"{ladders} ladder{'' if ladders == 1 else 's'})")
+
+
+def _rebalance_echo(rebalance_sweep: bool, move_sweep: bool, maturity_sweep: bool) -> str:
+    """
+    Say which parts of the Rebalance family the run builds, for the pre-fetch config line.
+
+    Args:
+        rebalance_sweep (bool): Whether the family is built at all.
+        move_sweep (bool): Whether it carries the minimum price movements.
+        maturity_sweep (bool): Whether it carries the "Rebalance until" choices.
+
+    Returns:
+        str: "off" without the family; "on" with every part; otherwise "on
+            (no ...)" naming each part left out, e.g. "on (no minimum price
+            movements, no Rebalance until)".
+    """
+    if not rebalance_sweep:
+        return "off"
+    missing = [words for words, built in (("no minimum price movements", move_sweep),
+                                          ("no Rebalance until", maturity_sweep))
+               if not built]
+    return f"on ({', '.join(missing)})" if missing else "on"
 
 
 def _log_corpus_provenance(sweep: BacktestSweep) -> None:
@@ -1067,8 +1100,8 @@ def _load_saved_inputs(path: Path) -> dict[str, Any]:
 
 
 def _without_families(sweep: BacktestSweep, *, cap_sweep: bool, sell_sweep: bool,
-                      rebalance_sweep: bool,
-                      move_sweep: bool) -> tuple[BacktestSweep, list[str]]:
+                      rebalance_sweep: bool, move_sweep: bool,
+                      maturity_sweep: bool) -> tuple[BacktestSweep, list[str]]:
     """
     Drop lazy families from a loaded sweep, as a run given the matching --no-*-sweep flags builds it.
 
@@ -1077,12 +1110,12 @@ def _without_families(sweep: BacktestSweep, *, cap_sweep: bool, sell_sweep: bool
     change. Without the size-cap sweep, a run builds the Sell and Rebalance
     families at its own cap alone, so those that stay are narrowed to it
     too. Without the minimum price movements, the Rebalance family stays and
-    carries none.
+    carries none; without the "Rebalance until" choices, likewise.
 
     Args:
         sweep (BacktestSweep): The loaded sweep; left as it is.
-        cap_sweep, sell_sweep, rebalance_sweep, move_sweep (bool): Whether
-            each family stays.
+        cap_sweep, sell_sweep, rebalance_sweep, move_sweep, maturity_sweep
+            (bool): Whether each family stays.
 
     Returns:
         tuple[BacktestSweep, list[str]]: The sweep the page is built from
@@ -1107,11 +1140,16 @@ def _without_families(sweep: BacktestSweep, *, cap_sweep: bool, sell_sweep: bool
     if not rebalance_sweep and sweep.rebalance_sweep is not None:
         changes["rebalance_sweep"] = None
         dropped.append("Rebalance (--no-rebalance-sweep)")
-    elif (not move_sweep and sweep.rebalance_sweep is not None
-          and sweep.rebalance_sweep.min_moves):
+    elif sweep.rebalance_sweep is not None:
+        # The family stays, narrowed above when it had to be, without the
+        # parts its flags drop
         family = changes.get("rebalance_sweep", sweep.rebalance_sweep)
-        changes["rebalance_sweep"] = replace(family, min_moves=())
-        dropped.append("Min. price movement (--no-move-sweep)")
+        if not move_sweep and family.min_moves:
+            family = changes["rebalance_sweep"] = replace(family, min_moves=())
+            dropped.append("Min. price movement (--no-move-sweep)")
+        if not maturity_sweep and family.maturity_days:
+            changes["rebalance_sweep"] = replace(family, maturity_days=())
+            dropped.append("Rebalance until (--no-maturity-sweep)")
     return (replace(sweep, **changes) if changes else sweep), dropped
 
 
@@ -1259,7 +1297,8 @@ def _rebuild_dashboard(parser: argparse.ArgumentParser, args: argparse.Namespace
     logging.info("Loaded the saved run in %.1f s", time.perf_counter() - started)
     sweep, dropped = _without_families(
         inputs["sweep"], cap_sweep=not args.no_cap_sweep, sell_sweep=not args.no_sell_sweep,
-        rebalance_sweep=not args.no_rebalance_sweep, move_sweep=not args.no_move_sweep)
+        rebalance_sweep=not args.no_rebalance_sweep, move_sweep=not args.no_move_sweep,
+        maturity_sweep=not args.no_maturity_sweep)
     if dropped:
         logging.info("Dashboard rebuilt without: %s", "; ".join(dropped))
     # The T-bill yields, read again: never raises (see the full run's read)
@@ -1428,7 +1467,8 @@ def _build_parser() -> argparse.ArgumentParser:
              "(at each weekly checkpoint, top a held pair up to its Kelly share of the "
              "portfolio when it has room and sell it down to it when it has grown past "
              "it): their simulations run only while the dashboard is built, so skipping "
-             "them makes that step faster and leaves both selects disabled. Backtest "
+             "them makes that step faster and leaves both selects disabled. It skips the "
+             "family's \"Rebalance until\" choices too. Backtest "
              "only — a live run adds to and trims held pairs by its own saved settings, "
              "which the dashboard's Save as live defaults… can set to the choice shown "
              "here",
@@ -1442,6 +1482,18 @@ def _build_parser() -> argparse.ArgumentParser:
              "built. Backtest only — a live run's rebalancing (add-ons and trims) "
              "waits for a price move by its own saved min_price_move (main.py "
              "--min-price-move for one run)",
+    )
+    parser.add_argument(
+        "--no-maturity-sweep", action="store_true",
+        help="Skip the Rebalance family's \"Rebalance until\" choices (with Rebalance "
+             "yes, add to or trim a held position only while its later market closes "
+             "at least a chosen number of days away, config.REBALANCE_MATURITY_DAYS); "
+             "Rebalance itself is still built. Their simulations would run only while the "
+             "dashboard is built; skipping them leaves the page's \"Rebalance until\" select "
+             "shut. "
+             "Backtest only — a live run holds its rebalancing back near maturity by "
+             "its own saved rebalance_min_days_to_maturity (main.py "
+             "--rebalance-min-days-to-maturity for one run)",
     )
     parser.add_argument(
         "--sell-workers", type=int, default=None, metavar="N",
@@ -1489,8 +1541,8 @@ def main() -> None:
     --no-scheduled-close, --stale-quote-hours / --no-stale-quote-check,
     --max-volume-share / --no-volume-cap, --spread-min,
     --spread-max, --no-band-sweep, --no-cap-sweep, --no-sell-sweep,
-    --no-rebalance-sweep, --no-move-sweep, --sell-workers, --no-eda,
-    --dashboard-only, --accept-changed-simulator); with --dashboard-only it
+    --no-rebalance-sweep, --no-move-sweep, --no-maturity-sweep, --sell-workers,
+    --no-eda, --dashboard-only, --accept-changed-simulator); with --dashboard-only it
     hands over to _rebuild_dashboard, which rebuilds the page from the saved
     inputs and runs nothing below. Otherwise it configures
     logging, constructs historical and live
@@ -1520,8 +1572,8 @@ def main() -> None:
     by the dashboard, which reads every cell as the page is built (its filter
     bar, Interval Discount section and scenario explorer); the lazily
     simulated sell family (result.sell_sweep) and Rebalance family
-    (result.rebalance_sweep, with its minimum price movements) are read the
-    same way.
+    (result.rebalance_sweep, with its minimum price movements and its
+    "Rebalance until" choices) are read the same way.
     """
     parser = _build_parser()
     args = parser.parse_args()
@@ -1675,6 +1727,8 @@ def main() -> None:
     # add-ons and trims can be made to wait for (the Min. price movement
     # select): on with it unless opted out, and off whenever the family is
     move_sweep = rebalance_sweep and not args.no_move_sweep
+    # ... and its "Rebalance until" choices, the same way
+    maturity_sweep = rebalance_sweep and not args.no_maturity_sweep
     # The dashboard simulates the Sell select in worker processes: one less
     # than the CPUs (the main process waits on them), within the config bound
     sell_workers = _sell_workers(args.sell_workers)
@@ -1738,9 +1792,8 @@ def main() -> None:
         f"on ({sell_workers} worker process{'' if sell_workers == 1 else 'es'})"
         if sell_sweep else "off",
         # A default run reads "on"; the family without its minimum price
-        # movements says so
-        "off" if not rebalance_sweep else "on" if move_sweep
-        else "on (no minimum price movements)",
+        # movements or its "Rebalance until" choices says so
+        _rebalance_echo(rebalance_sweep, move_sweep, maturity_sweep),
         live_rule_echo, _fills_echo(depth_model),
     )
     # Warn on a ceiling that empties a tier. config.time_series_spread_band's
@@ -1829,6 +1882,8 @@ def main() -> None:
         rebalance_sweep=rebalance_sweep,
         # ... with the Min. price movement select's minimums, part of that family
         move_sweep=move_sweep,
+        # ... and its "Rebalance until" choices (simulated only when read)
+        maturity_sweep=maturity_sweep,
         # Every trade's order book is built from this table (None: top of book)
         depth_model=depth_model,
         # The listing the same-title label check files each series by

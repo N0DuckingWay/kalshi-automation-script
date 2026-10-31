@@ -28,7 +28,9 @@ the setting right after the cap sweep's. --no-rebalance-sweep does the same
 for the Rebalance family (rebalance_sweep), named after that, and the old
 --no-add-on-sweep, --no-trim-sweep and --no-trim-rise-sweep are refused.
 --no-move-sweep leaves that family on without its minimum price movements
-(move_sweep=False), and changes only the echo's rebalance clause.
+(move_sweep=False), and changes only the echo's rebalance clause;
+--no-maturity-sweep does the same for its "Rebalance until" choices
+(maturity_sweep=False).
 
 And the echo's "live rule=" clause: the saved live defaults' rule (with their
 origin), "none saved" with no file, "not recorded" with a refused one — a read
@@ -903,11 +905,85 @@ class TestMoveSweepArgument:
                                                                        capsys):
         # The help names main.py --min-price-move, which sets one live run's minimum,
         # and says the minimum holds back a live run's add-ons and trims alike
-        text = _option_help(monkeypatch, capsys, "--no-move-sweep", "--sell-workers")
+        text = _option_help(monkeypatch, capsys, "--no-move-sweep", "--no-maturity-sweep")
         assert text.startswith("Skip the dashboard's Min. price movement select")
         assert text.endswith("a live run's rebalancing (add-ons and trims) waits for a price "
                              "move by its own saved min_price_move (main.py --min-price-move "
                              "for one run)")
+
+
+class TestMaturitySweepArgument:
+    """--no-maturity-sweep: the Rebalance family's "Rebalance until" choices
+    (RebalanceSweep.maturity_days) are ON with the family by default; the
+    flag threads maturity_sweep=False into run_backtest_sweep and leaves the
+    family itself, and its minimum price movements, on; --no-rebalance-sweep
+    turns them off too. The echo's rebalance clause names each part left out."""
+
+    _echo = staticmethod(TestMoveSweepArgument._echo)
+
+    def test_the_choices_are_on_with_the_family_by_default(self, cli, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        kwargs = cli["sweep_kwargs"]
+        assert (kwargs["rebalance_sweep"], kwargs["move_sweep"], kwargs["maturity_sweep"]) == (
+            True, True, True)
+        assert ") | rebalance sweep=on | live rule=" in self._echo(caplog)
+
+    def test_no_maturity_sweep_turns_only_them_off(self, cli, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        default_kwargs, default_echo = cli["sweep_kwargs"], self._echo(caplog)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, "--no-maturity-sweep")
+        kwargs = cli["sweep_kwargs"]
+        assert (kwargs["maturity_sweep"], kwargs["move_sweep"], kwargs["rebalance_sweep"],
+                kwargs["sell_sweep"]) == (False, True, True, True)
+        # No other keyword moves (each run builds a client of its own)
+        skipped = {"maturity_sweep", "hist_client"}
+        assert set(kwargs) == set(default_kwargs)
+        assert ({key: value for key, value in kwargs.items() if key not in skipped}
+                == {key: value for key, value in default_kwargs.items()
+                    if key not in skipped})
+        # ... and only the echo's rebalance clause does
+        assert self._echo(caplog) == default_echo.replace(
+            "| rebalance sweep=on | live rule=",
+            "| rebalance sweep=on (no Rebalance until) | live rule=")
+
+    def test_with_the_minimums_off_too_the_echo_names_both(self, cli, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, "--no-move-sweep", "--no-maturity-sweep")
+        kwargs = cli["sweep_kwargs"]
+        assert (kwargs["rebalance_sweep"], kwargs["move_sweep"], kwargs["maturity_sweep"]) == (
+            True, False, False)
+        assert ("| rebalance sweep=on (no minimum price movements, no Rebalance until) "
+                "| live rule=") in self._echo(caplog)
+
+    @pytest.mark.parametrize("flags", [("--no-rebalance-sweep",),
+                                       ("--no-rebalance-sweep", "--no-maturity-sweep")])
+    def test_no_rebalance_sweep_turns_them_off(self, cli, monkeypatch, caplog, flags):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, *flags)
+        kwargs = cli["sweep_kwargs"]
+        assert (kwargs["rebalance_sweep"], kwargs["maturity_sweep"]) == (False, False)
+        assert ") | rebalance sweep=off | live rule=" in self._echo(caplog)
+
+    def test_the_echo_names_each_part_left_out(self):
+        assert backtest._rebalance_echo(False, True, True) == "off"
+        assert backtest._rebalance_echo(True, True, True) == "on"
+        assert backtest._rebalance_echo(True, False, True) == "on (no minimum price movements)"
+        assert backtest._rebalance_echo(True, True, False) == "on (no Rebalance until)"
+        assert backtest._rebalance_echo(True, False, False) == (
+            "on (no minimum price movements, no Rebalance until)")
+
+    def test_the_help_names_what_it_skips_and_the_live_setting(self, cli, monkeypatch, capsys):
+        text = _option_help(monkeypatch, capsys, "--no-maturity-sweep", "--sell-workers")
+        assert text.startswith("Skip the Rebalance family's \"Rebalance until\" choices")
+        assert "Rebalance itself is still built" in text
+        assert "skipping them leaves the page's \"Rebalance until\" select shut" in text
+        assert text.endswith("its own saved rebalance_min_days_to_maturity (main.py "
+                             "--rebalance-min-days-to-maturity for one run)")
+        assert "sweep_kwargs" not in cli
 
 
 class TestSellWorkersArgument:
@@ -2046,6 +2122,7 @@ class TestDashboardOnly:
 
     @pytest.mark.parametrize("damage", ["not gzip", "no header line", "header not json",
                                         "other format", "before tag exclusions",
+                                        "before rebalance until", "before until choices",
                                         "no fingerprint"])
     def test_a_file_whose_header_cannot_be_read_exits_1(self, rebuild, monkeypatch, damage):
         path = rebuild["path"]
@@ -2063,6 +2140,14 @@ class TestDashboardOnly:
         elif damage == "before tag exclusions":
             # The format a run saved while BacktestSweep held live_tags
             _rewrite_header(path, format="backtest-sweep-v3")
+        elif damage == "before rebalance until":
+            # The format a run saved before SweepPoint and CapSweep gained
+            # rebalance_min_days_to_maturity
+            _rewrite_header(path, format="backtest-sweep-v4")
+        elif damage == "before until choices":
+            # The format a run saved before RebalanceSweep gained
+            # maturity_days and BacktestSweep the saved "Rebalance until"
+            _rewrite_header(path, format="backtest-sweep-v5")
         else:
             _rewrite_header(path, fingerprint_parts=None)
         with pytest.raises(SystemExit) as exc:
@@ -2071,11 +2156,13 @@ class TestDashboardOnly:
         assert isinstance(exc.value.code, str)
         assert exc.value.code.startswith(f"backtest: {path} cannot be used: ")
         assert exc.value.code.endswith("run the backtest again to save a new one")
-        if damage in ("other format", "before tag exclusions"):
-            old = "v1" if damage == "other format" else "v3"
+        if damage in ("other format", "before tag exclusions", "before rebalance until",
+                      "before until choices"):
+            old = {"other format": "v1", "before tag exclusions": "v3",
+                   "before rebalance until": "v4", "before until choices": "v5"}[damage]
             assert f"'backtest-sweep-{old}'" in exc.value.code
             assert repr(config.BACKTEST_SWEEP_FORMAT) in exc.value.code
-            assert config.BACKTEST_SWEEP_FORMAT == "backtest-sweep-v4"
+            assert config.BACKTEST_SWEEP_FORMAT == "backtest-sweep-v6"
         assert "dashboard" not in rebuild
 
     @pytest.mark.parametrize("damage", ["cut short", "not the inputs"])
@@ -2156,7 +2243,7 @@ class TestDashboardOnly:
         run_only = {dest for dest, _ in backtest._RUN_ONLY_FLAGS}
         rebuild = {"dashboard_only", "accept_changed_simulator", "sell_workers",
                    "no_cap_sweep", "no_sell_sweep", "no_rebalance_sweep", "no_move_sweep",
-                   "no_eda"}
+                   "no_maturity_sweep", "no_eda"}
         assert run_only | rebuild == dests
         assert not run_only & rebuild
 
@@ -2194,7 +2281,7 @@ def _families() -> dict:
         "sell_sweep": SellSweep(levels=(0.5,), min_days=(1,), caps=(0.1, 0.2), bands=band,
                                 **lists, **common),
         "rebalance_sweep": RebalanceSweep(caps=(0.1, 0.2), bands=band, min_moves=(0.05, 0.1),
-                                          **lists, **common),
+                                          maturity_days=(1, 7), **lists, **common),
     }
 
 
@@ -2210,7 +2297,7 @@ class TestWithoutFamilies:
     @staticmethod
     def _call(sweep, **off):
         flags = {"cap_sweep": True, "sell_sweep": True, "rebalance_sweep": True,
-                 "move_sweep": True}
+                 "move_sweep": True, "maturity_sweep": True}
         flags.update(dict.fromkeys(off, False))
         return backtest._without_families(sweep, **flags)
 
@@ -2246,6 +2333,34 @@ class TestWithoutFamilies:
         # Dropping the family drops its minimums with it, named once
         out, notes = self._call(sweep, rebalance_sweep=False, move_sweep=False)
         assert out.rebalance_sweep is None and notes == ["Rebalance (--no-rebalance-sweep)"]
+
+    def test_without_the_rebalance_until_choices_rebalancing_stays(self):
+        sweep = self._sweep()
+        out, notes = self._call(sweep, maturity_sweep=False)
+        assert out.rebalance_sweep == dataclasses.replace(sweep.rebalance_sweep,
+                                                          maturity_days=())
+        assert notes == ["Rebalance until (--no-maturity-sweep)"]
+        # With the minimums dropped too, both go, each named
+        out, notes = self._call(sweep, move_sweep=False, maturity_sweep=False)
+        assert out.rebalance_sweep == dataclasses.replace(sweep.rebalance_sweep, min_moves=(),
+                                                          maturity_days=())
+        assert notes == ["Min. price movement (--no-move-sweep)",
+                         "Rebalance until (--no-maturity-sweep)"]
+        # ... and without the size-cap sweep, at the run's own cap as well
+        out, notes = self._call(sweep, cap_sweep=False, maturity_sweep=False)
+        assert out.rebalance_sweep == dataclasses.replace(sweep.rebalance_sweep, caps=(0.2,),
+                                                          maturity_days=())
+        assert notes == ["the size caps (--no-cap-sweep)",
+                         "Rebalance until (--no-maturity-sweep)"]
+        # Dropping the family drops its choices with it, named once
+        out, notes = self._call(sweep, rebalance_sweep=False, maturity_sweep=False)
+        assert out.rebalance_sweep is None and notes == ["Rebalance (--no-rebalance-sweep)"]
+        # The loaded sweep is left as it was
+        assert sweep.rebalance_sweep.maturity_days == (1, 7)
+        # A family that carries no choices is not named
+        plain = dataclasses.replace(sweep, rebalance_sweep=dataclasses.replace(
+            sweep.rebalance_sweep, maturity_days=()))
+        assert self._call(plain, maturity_sweep=False) == (plain, [])
 
     def test_a_family_the_run_did_not_build_is_not_named(self):
         out, notes = self._call(_sweep(), cap_sweep=False, sell_sweep=False,
@@ -2398,10 +2513,13 @@ def saved_golden_run(tmp_path_factory):
 
         def run(**flags):
             options = {"band_sweep": True, "tier_off_sweep": True, "cap_sweep": True,
-                       "sell_sweep": True, "rebalance_sweep": True, "move_sweep": True}
+                       "sell_sweep": True, "rebalance_sweep": True, "move_sweep": True,
+                       "maturity_sweep": True}
             options.update(flags)
-            # As backtest.py sets it: the minimum price movements go with their family
-            options["move_sweep"] = options["move_sweep"] and options["rebalance_sweep"]
+            # As backtest.py sets them: the minimum price movements and the
+            # "Rebalance until" choices go with their family
+            for part in ("move_sweep", "maturity_sweep"):
+                options[part] = options[part] and options["rebalance_sweep"]
             return backtester.run_backtest_sweep(
                 MagicMock(), MagicMock(), golden._START, 10_000.0, same_event_ladders=True,
                 interval_discount=0.5, **options)
@@ -2451,6 +2569,8 @@ class TestRebuildFromTheSavedSweep:
             assert type(getattr(loaded, name)) is type(getattr(swept, name)), name
         assert (loaded.rebalance_sweep.min_moves == swept.rebalance_sweep.min_moves
                 == (0.05, 0.1, 0.3))
+        assert (loaded.rebalance_sweep.maturity_days == swept.rebalance_sweep.maturity_days
+                == (1, 7))
         assert loaded.sell_sweep.levels == swept.sell_sweep.levels
 
     def test_the_rebuilt_page_is_byte_identical(self, saved_golden_run):
@@ -2461,7 +2581,7 @@ class TestRebuildFromTheSavedSweep:
         assert rebuilt == live
 
     @pytest.mark.parametrize("off", [
-        ("cap_sweep", "move_sweep"),
+        ("cap_sweep", "move_sweep", "maturity_sweep"),
         ("sell_sweep", "rebalance_sweep"),
     ])
     def test_the_skip_flags_build_the_page_a_run_with_them_builds(self, saved_golden_run, off):
@@ -2470,7 +2590,7 @@ class TestRebuildFromTheSavedSweep:
         expected = _page_and_sidecars(saved_golden_run.page(saved_golden_run.inputs_of(ran),
                                                             "run-with-flags"))
         kept = {"cap_sweep": True, "sell_sweep": True, "rebalance_sweep": True,
-                "move_sweep": True}
+                "move_sweep": True, "maturity_sweep": True}
         kept.update(flags)
         loaded = saved_golden_run.loaded
         sweep, dropped = backtest._without_families(loaded["sweep"], **kept)
