@@ -253,9 +253,9 @@ python3 -m kalshi_betting.backtest --no-move-sweep
 # config.REBALANCE_MATURITY_DAYS less "maturity", 1 and 7 days, where a held position is added
 # to or trimmed only while its later market closes at least that many days away; each is
 # simulated only when a report reads it, at every minimum price movement, and only where it
-# changes a run). The dashboard reads them as it is built but keeps its "Rebalance until"
-# select shut for now. Rebalance itself is still built, and --no-rebalance-sweep skips them
-# too. Backtest only
+# changes a run). Skipping them skips the dashboard's "Rebalance until" select (and its Save
+# then keeps the saved days limit unless it turns rebalancing off); Rebalance itself is still
+# built, and --no-rebalance-sweep skips them too. Backtest only
 python3 -m kalshi_betting.backtest --no-maturity-sweep
 
 # Backtest without the dashboard's "Sell" family (ON by default in the CLI, and lazy like the

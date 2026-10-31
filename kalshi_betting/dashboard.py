@@ -141,8 +141,13 @@ Purpose:
     id per choice and minimum ("grid_maturity" and its tier-floors-off
     twin), where a null cell means every choice shows the movement view's
     cell. The bar's "Rebalance until" select, right after Min. price
-    movement, names "maturity" and each choice; it is on every page and
-    always shut, since the page script does not read it yet.
+    movement, picks one: "maturity" (no days limit: the movement view's run)
+    or a choice ("1 day before", "7 days before"). It is on every page and
+    open only while Rebalance is yes, on a page that carries the choices; a
+    choice that changes nothing for a scenario shows the movement view's
+    chunk, and a page that shows Rebalance without the choices says why in
+    a short note beside it. Like Rebalance it changes the trade sections and
+    the header's trade count only.
 
     The bar's Sell choice is "no selling" (the page as rendered) or one of the
     sell family's levels (backtester.SellSweep; config.TAKE_PROFIT_LEVELS,
@@ -196,7 +201,10 @@ Purpose:
     its spread band, Tier floors choice, k, size cap, Rebalance choice and
     Min. price movement (only on a page that simulated rebalancing, sent as
     the defaults server's rebalance and min_price_move, always together, so
-    a minimum is never sent with Rebalance no), Sell level and Min. days to
+    a minimum is never sent with Rebalance no), "Rebalance until" choice
+    (only on a page that carries the choices, beside those two as
+    rebalance_min_days_to_maturity: the choice's days, or 0, no days limit,
+    at maturity and with Rebalance no), Sell level and Min. days to
     maturity (only on a page that simulated selling), with this run's
     same-title cap when the run recorded one — never for the Scenario
     Explorer's own selects. The address names each category ticked in the
@@ -5118,32 +5126,43 @@ _NO_REBALANCE_VIEW = "this page has no Rebalance view"
 
 
 def _rebalance_choice_in_bar(bar: dict | None, band_index: int | None, tier_on: bool,
-                             min_move: float | None) -> str:
+                             min_move: float | None, *, min_days: int | None) -> str:
     """
     Say how the filter bar shows the saved defaults' rebalancing at one band, or why it cannot.
 
     Part of the live-rule line, at the band and Tier floors setting where it
     says the bar shows the rule, for saved defaults that rebalance (add to
     held pairs and trim them, together, as the bar shows them). It reads the
-    grids the page script reads (gridAt, moveGridAt). A minimum counts as
-    shown when some k and cap of the band has a chunk for it: its own entry,
-    or the rebalancing chunk where the cell is null (no minimum changes that
-    run), as chunkAt picks.
+    grids the page script reads (gridAt, moveGridAt, untilGridAt). A minimum
+    counts as shown when some k and cap of the band has a chunk for it: its
+    own entry, or the rebalancing chunk where the cell is null (no minimum
+    changes that run), as chunkAt picks. A "Rebalance until" days limit
+    counts as shown likewise, at that minimum: its own entry, or the
+    movement chunk where its cell is null.
 
     Args:
         bar (dict | None): _filter_payload's base block (the
-            "grid_rebalance*" and "grid_move*" grids and "moves"), or None
-            without a filter bar.
+            "grid_rebalance*", "grid_move*" and "grid_maturity*" grids,
+            "moves" and "maturity"), or None without a filter bar.
         band_index (int | None): The band's index in the bar (None with no bar).
         tier_on (bool): True for the Tier floors on grids, False for the off ones.
         min_move (float | None): The saved minimum price movement in dollars,
             or None for no minimum.
+        min_days (int | None): Keyword-only. The saved "Rebalance until" days
+            limit (BacktestSweep.live_rebalance_min_days_to_maturity), or None
+            for none ("maturity").
 
     Returns:
         str: 'choose Rebalance yes and Min. price movement "10c" in the
-            filter bar to see it' ("any" with no minimum); "this page has no
-            Rebalance view" when the grid holds no chunk at the band; or
-            "this page cannot show that minimum price movement".
+            filter bar to see it' ("any" with no minimum) on a page without
+            the "Rebalance until" choices; on a page with them, 'choose
+            Rebalance yes, Min. price movement "10c" and Rebalance until "7
+            days before" in the filter bar to see it' ("maturity" with no
+            days limit); "this page has no Rebalance view" when the grid
+            holds no chunk at the band; "this page cannot show that minimum
+            price movement"; or 'this page cannot show that "Rebalance until"
+            choice' for a days limit the page does not offer or holds no
+            chunk of at the band.
 
     Raises:
         Nothing. It only reads the bar's entries.
@@ -5155,6 +5174,9 @@ def _rebalance_choice_in_bar(bar: dict | None, band_index: int | None, tier_on: 
            and 0 <= band_index < len(grid) else None)
     if row is None or not any(cid is not None for cells in row for cid in cells):
         return _NO_REBALANCE_VIEW
+    # The minimum's place in the bar's moves (None for no minimum) and the
+    # band's row of the minimums' grid
+    place, move_row = None, None
     if min_move is None:
         label = _MOVE_OPTION_ANY
     else:
@@ -5170,7 +5192,67 @@ def _rebalance_choice_in_bar(bar: dict | None, band_index: int | None, tier_on: 
                 for cid, ids in zip(cells, move_cells, strict=False)):
             return "this page cannot show that minimum price movement"
         label = bar["moves"][place]["label"]
-    return f'choose Rebalance yes and Min. price movement "{label}" in the filter bar to see it'
+    choices = f'Min. price movement "{label}"'
+    if min_days is not None:
+        choice = next((i for i, entry in enumerate(bar.get("maturity") or [])
+                       if entry["value"] == min_days), None)
+        until = bar.get("grid_maturity" + suffix)
+        until_row = until[band_index] if until is not None and band_index < len(until) else None
+        # The minimum's place in a cell's [choice] row: 0 for no minimum
+        at = 0 if place is None else place + 1
+
+        def movement(cid, ids):
+            """
+            The movement view's chunk of one scenario at the saved minimum, as chunkAt picks it.
+
+            Args:
+                cid (int | None): The scenario's rebalancing chunk id.
+                ids (list | None): Its cell of the minimums' grid (None:
+                    every minimum shows `cid`).
+
+            Returns:
+                int | None: The chunk id, or None where the page holds none.
+            """
+            if place is None or ids is None:
+                return cid
+            return ids[place] if place < len(ids) else None
+
+        def until_id(cid, ids, cell):
+            """
+            One scenario's chunk at the saved days limit and minimum, as chunkAt picks it.
+
+            Args:
+                cid (int | None): The scenario's rebalancing chunk id.
+                ids (list | None): Its cell of the minimums' grid.
+                cell (list | None): Its cell of the "Rebalance until" grid
+                    (None: every choice shows the movement chunk).
+
+            Returns:
+                int | None: The chunk id, or None where the page holds none.
+            """
+            if cell is None:
+                return movement(cid, ids)
+            entries = cell[choice] if choice < len(cell) else None
+            return entries[at] if entries is not None and at < len(entries) else None
+
+        # Without a minimum the minimums' grid is not read: every cell shows its own
+        move_cells = (move_row if move_row is not None
+                      else [[None] * len(cells) for cells in row])
+        if choice is None or until_row is None or not any(
+                until_id(cid, ids, cell) is not None
+                for cells, mcells, ucells in zip(row, move_cells, until_row, strict=False)
+                for cid, ids, cell in zip(cells, mcells, ucells, strict=False)):
+            return 'this page cannot show that "Rebalance until" choice'
+        until_label = bar["maturity"][choice]["label"]
+    else:
+        # No days limit is "maturity", named only where the page offers the
+        # choices (elsewhere the select stays shut at it)
+        until_label = (_UNTIL_OPTION_MATURITY if bar.get("grid_maturity") is not None
+                       else None)
+    if until_label is None:
+        return f"choose Rebalance yes and {choices} in the filter bar to see it"
+    return (f'choose Rebalance yes, {choices} and Rebalance until "{until_label}" in the '
+            "filter bar to see it")
 
 
 def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
@@ -5193,8 +5275,9 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     the saved defaults rebalance held pairs or sell, which no primary does,
     it says so too, in that order (backtester._live_rebalance_note and
     _live_sell_note) and, where the page shows the rule, how the filter bar
-    shows each: the Rebalance and Min. price movement choices that show the
-    rebalancing, or why they cannot (_rebalance_choice_in_bar), and the Sell
+    shows each: the Rebalance, Min. price movement and (on a page with
+    those choices) "Rebalance until" choices that show the rebalancing, or
+    why they cannot (_rebalance_choice_in_bar), and the Sell
     options that show the selling, if any (_sell_choice_in_bar). The page
     never shows selling together with rebalancing (Sell is shut while
     Rebalance is yes), so when the defaults do both, the rebalancing clause
@@ -5293,7 +5376,9 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     rebalance_note = _live_rebalance_note(sweep)
     sell_note = _live_sell_note(sweep)
     if rebalance_note and shown is not None:
-        clause = _rebalance_choice_in_bar(bar, *shown, sweep.live_min_price_move)
+        clause = _rebalance_choice_in_bar(
+            bar, *shown, sweep.live_min_price_move,
+            min_days=sweep.live_rebalance_min_days_to_maturity)
         # The bar never shows rebalancing together with selling (Sell is shut
         # while Rebalance is yes): with selling saved too, a page that holds
         # rebalancing runs still cannot show them beside it; a page with none
@@ -7029,7 +7114,9 @@ _UNTIL_TITLE = (
     "market matures within that many days: a held pair is topped up or sold down only while "
     "its later market (for a held market whose partner has paid out, its own market) closes "
     "at least that many days after the run, counted in whole days on Kalshi's UTC dates. "
-    "maturity: no days limit.")
+    "maturity: no days limit. From a page with these choices, Save as live defaults saves "
+    "the choice shown (maturity, or Rebalance no, saves no days limit); from any other page "
+    "it keeps the saved one unless the save turns rebalancing off.")
 _UNTIL_NOTES = {
     "not simulated": "(not simulated in this backtest)",
     "unavailable": "(not available on this page; see the log)",
@@ -7072,11 +7159,62 @@ def _until_phrase(days: int) -> str:
     return _backtester._until_label(days)
 
 
+def _until_reach(move_view: bool, explorer: bool) -> str:
+    """
+    The summary line's reach sentence on a page that shows the "Rebalance until" choices.
+
+    It takes the place of _MOVE_REACH (or of _REBALANCE_REACH on a page
+    without the minimum price movements) and names every held-pair select
+    the page shows, since all of them reach the same sections. A page
+    without the choices keeps those sentences as they are.
+
+    Args:
+        move_view (bool): Whether the page also shows the minimum price movements.
+        explorer (bool): Whether the page carries the Scenario Explorer grid
+            (without it the sentence names the Interval Discount section alone).
+
+    Returns:
+        str: e.g. 'Rebalance, Min. price movement and "Rebalance until" change
+            the trade sections only; the k̂ figures do not depend on them, and
+            the Scenario Explorer and Interval Discount sections always show no
+            rebalancing.'
+    """
+    selects = ('Rebalance, Min. price movement and "Rebalance until"' if move_view
+               else 'Rebalance and "Rebalance until"')
+    sections = ("the Scenario Explorer and Interval Discount sections always show" if explorer
+                else "the Interval Discount section always shows")
+    return (f"{selects} change the trade sections only; the k̂ figures do not depend on "
+            f"them, and {sections} no rebalancing.")
+
+
 # Beside the save button on a page with the Rebalance view, when the saved
 # live defaults rebalance (live_rebalance is on): saving from the bar sends the
 # choice shown, and Rebalance no turns it off in the defaults
 _REBALANCE_SAVE_NOTE = ("The live defaults rebalance; saving with Rebalance no here turns "
                         "that off.")
+
+
+def _until_save_note(days: int) -> str:
+    """
+    The grey note beside the save button when the saved live defaults have a "Rebalance until" days limit.
+
+    Shown only on a page with the "Rebalance until" choices
+    (_filter_bar_html), whose save sends the choice shown: "maturity", the
+    select's first option, sends no days limit and so turns the saved one
+    off.
+
+    Args:
+        days (int): The saved limit (BacktestSweep.live_rebalance_min_days_to_maturity,
+            as _save_target's "live_rebalance_until" carries it), 1 or more.
+
+    Returns:
+        str: e.g. 'The live defaults rebalance until 7 days before maturity;
+            saving with Rebalance until "maturity" here turns that limit off.'
+    """
+    # "7 days before maturity": the live "Live settings:" line's words
+    # (_until_option's, and the word it leaves to the select's first option)
+    return (f"The live defaults rebalance until {_until_option(days)} maturity; saving with "
+            f'Rebalance until "{_UNTIL_OPTION_MATURITY}" here turns that limit off.')
 
 # Beside the save button on a page with the Sell view whose saved live defaults sell
 _SELL_SAVE_NOTE = ('The live defaults sell; saving with Sell set to "no selling" turns live '
@@ -7731,6 +7869,12 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date) -> 
             the run recorded them: the note beside the save button on a page
             with the Rebalance view shows only then, since saving with
             Rebalance no turns it off);
+            "live_rebalance_until" (their "Rebalance until" days limit, as the
+            run recorded it, when they rebalance; None for no limit, for
+            saved defaults that do not rebalance and for a run that recorded
+            neither: the note beside the save button on a page with the
+            "Rebalance until" choices shows only with a limit, since saving
+            "maturity" turns it off);
             "live_sells" (whether they sell: the Sell view's save note shows only then);
             "live_exclusions" (the categories they exclude, as a list, or None)
             and "live_tag_exclusions" (the tags they exclude, likewise): the
@@ -7763,11 +7907,15 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date) -> 
                    f"{'on' if configured else 'off'}: its pairs are not the live bot's)")
     if not re.fullmatch(LIVE_DEFAULTS_SOURCE_PATTERN, source, re.ASCII):
         source = None
+    rebalances = getattr(sweep, "live_rebalance", None) is True
     return {
         "url": f"http://{DEFAULTS_SERVER_HOST}:{DEFAULTS_SERVER_PORT}/confirm",
         "same_title_size_cap": None if sweep is None else sweep.same_title_size_cap,
         "source": source,
-        "live_rebalances": getattr(sweep, "live_rebalance", None) is True,
+        "live_rebalances": rebalances,
+        # A days limit counts only with rebalancing on, as the live settings hold it
+        "live_rebalance_until": (getattr(sweep, "live_rebalance_min_days_to_maturity", None)
+                                 if rebalances else None),
         "live_sells": getattr(sweep, "live_sell_at", None) is not None,
         "live_exclusions": _recorded_names(getattr(sweep, "live_exclude_categories", None)),
         "live_tag_exclusions": _recorded_names(getattr(sweep, "live_exclude_tags", None)),
@@ -13027,8 +13175,9 @@ def _filter_payload(
             explorer and explorer_caps (_bar_reach), then closed by one
             sentence per view the page has: _REBALANCE_REACH, or
             _MOVE_REACH in its place when the page also shows the minimum
-            price movements, then _SELL_REACH (each one's _NO_EXPLORER twin
-            without the explorer) — _KHAT_TEXT and
+            price movements, or _until_reach's when it also shows the
+            "Rebalance until" choices, then _SELL_REACH (each one's
+            _NO_EXPLORER twin without the explorer) — _KHAT_TEXT and
             _CALIBRATION_TEXT), "styles" (the trade-type
             lines' and the k-hat bars' drawing, the k-hat chart's height
             formula and reference line, the KPI cards' default colour and a
@@ -13171,8 +13320,10 @@ def _filter_payload(
                                                 explorer_caps=explorer_caps,
                                                 explorer_tiers=explorer_tiers)
                  # Rebalance alone, or with Min. price movement where the
-                 # page shows the minimums too
+                 # page shows the minimums too, and with "Rebalance until"
+                 # where it shows the choices
                  + ("" if not rebalance_view else " " + (
+                     _until_reach(move_view, explorer) if maturity_view else
                      (_MOVE_REACH if explorer else _MOVE_REACH_NO_EXPLORER)
                      if move_view else
                      (_REBALANCE_REACH if explorer else _REBALANCE_REACH_NO_EXPLORER)))
@@ -13598,10 +13749,11 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     days limit, the movement view's run; value "0") and every choice the
     payload names (maturity: "1 day before", "7 days before"; an option's
     value is its place in that list plus one), its title carrying the rule
-    (_UNTIL_TITLE). It is on every page and always rendered shut: the
-    script does not read it yet. A payload that shows Rebalance without the
-    choices ("grid_maturity" null) puts a grey note beside it by its
-    "maturity_state" (_UNTIL_NOTES), as Min. price movement's does.
+    (_UNTIL_TITLE). It is on every page, so the script always finds it; the
+    script opens it only while Rebalance is yes, on a page whose payload
+    carries the choices ("grid_maturity"). A payload that shows Rebalance
+    without them puts a grey note beside it by its "maturity_state"
+    (_UNTIL_NOTES), as Min. price movement's does.
     The Sell select offers "no selling" (selected) and every sell level the
     payload names (sell_levels), its title carrying the rule
     (_sell_select_title, at backtester.TAKE_PROFIT_HOLD_DAYS as the page's
@@ -13641,9 +13793,12 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     (_save_too_long_text), in its place. On a page with
     the Rebalance view whose saved live defaults rebalance
     (save["live_rebalances"]), a grey note (_REBALANCE_SAVE_NOTE) follows
-    the button: saving with Rebalance no turns that off.
-    _SELL_SAVE_NOTE (save["live_sells"]) does the same for selling, after
-    it, in the order of their selects, and _filter_save_note's
+    the button: saving with Rebalance no turns that off. On a page with the
+    "Rebalance until" choices whose saved live defaults have a days limit
+    (save["live_rebalance_until"]), _until_save_note's follows it: saving
+    "maturity" turns that limit off. _SELL_SAVE_NOTE (save["live_sells"])
+    does the same for selling, after them, in the order of their selects,
+    and _filter_save_note's
     (save["live_exclusions"], save["live_tag_exclusions"]) says that saving
     replaces the saved excluded categories and tags, naming them. Then
     the "Trade using defaults…" link
@@ -13773,6 +13928,14 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     save_note = ('&nbsp;<span id="flt-rebalance-save-note" style="color:#9E9E9E; '
                  f'font-size:13px;">{html.escape(_REBALANCE_SAVE_NOTE)}</span>'
                  if save_rebalances else "")
+    # The same for a "Rebalance until" days limit: a page with the choices
+    # sends the one shown, so leaving it at maturity turns the saved limit off
+    until_days = (payload.get("save") or {}).get("live_rebalance_until")
+    save_until = (rebalance_state == "shown" and until_state == "shown"
+                  and type(until_days) is int and until_days > 0)
+    save_note += ('&nbsp;<span id="flt-until-save-note" style="color:#9E9E9E; '
+                  f'font-size:13px;">{html.escape(_until_save_note(until_days))}</span>'
+                  if save_until else "")
     # The same for selling: saving with "no selling" shown turns it off
     save_sells = (sell_state == "shown"
                   and (payload.get("save") or {}).get("live_sells") is True)
@@ -14035,7 +14198,21 @@ def _pack_text(raw: str) -> str:
 # address (saveHref: rebalance, from the Rebalance choice, and
 # min_price_move, "off" for any or with Rebalance no),
 # and like Rebalance it reaches neither the k-hat figures, the
-# interval-discount section nor the scenario explorer. A chunk at or past
+# interval-discount section nor the scenario explorer. The "Rebalance until"
+# select (SHOWN[10]) picks how close to maturity a held position may still
+# be added to or trimmed: "0" is maturity (no days limit: the movement
+# cell's run), and i names D.maturity[i - 1]. It counts, and is open, only
+# while Rebalance is yes, on a page whose base block carries D.grid_maturity
+# (refreshUntil, untilAt); shut, it keeps its value. A scenario's chunk at a
+# choice is that choice's entry, at the minimum shown, in the scenario's
+# cell of D.grid_maturity (or of D.grid_maturity_off with the tier floors
+# off: untilGridAt), and where that cell is null — no choice changes the
+# run — the movement cell's chunk (chunkAt). Its phrase is Python's
+# (D.maturity[i - 1].phrase, after the minimum's); the choice goes into the
+# save button's address as rebalance_min_days_to_maturity (its days, or 0
+# for maturity or with Rebalance no), only from a page with that view, and
+# like Rebalance it reaches neither the k-hat figures, the interval-discount
+# section nor the scenario explorer. A chunk at or past
 # D.inline_chunks is a sidecar file in D.sidecar_dir, loaded through a
 # <script src> element whose one call to window.__dashChunk hands over its
 # packed text (sidecarText), inflated by the same code as a block in the
@@ -14093,8 +14270,9 @@ def _pack_text(raw: str) -> str:
 # selects' choice while a chunk loads) can become the live defaults, and a
 # click opens the defaults server's confirmation page for that scenario in a
 # new tab (saveHref: D.save's address and the axes' values, plus each of the
-# Rebalance choice with its minimum price movement and the Sell level and
-# minimum ("off" for both under no selling), on a page with that view, and
+# Rebalance choice with its minimum price movement (and its "Rebalance
+# until" days, 0 for none, on a page with those choices) and the Sell level
+# and minimum ("off" for both under no selling), on a page with that view, and
 # each category excluded — a category with every tag ticked included — as
 # exclude_category and each other tag ticked as exclude_tag: saveLists). The
 # button stays disabled while the categories and tags kept hold no trade of
@@ -14150,15 +14328,20 @@ _FILTER_JS = r"""
   // price an add-on or a trim waits for ("0": any; i: D.moves[i - 1]); it
   // counts only while Rebalance is yes
   var moveSel = document.getElementById('flt-move');
+  // "Rebalance until": no days limit ("0": maturity), or an add-on or a trim
+  // held back once the position's later market is that near its close (i:
+  // D.maturity[i - 1]); it counts only while Rebalance is yes
+  var untilSel = document.getElementById('flt-until');
   if (!dataEl || !bandSel || !tierSel || !kSel || !capSel || !rebalanceSel || !moveSel
-      || !sellSel || !daysSel || !catMenu || !tagMenu || !catAll || !tagAll) {
+      || !untilSel || !sellSel || !daysSel || !catMenu || !tagMenu || !catAll || !tagAll) {
     return;
   }
   // The bar's save button: a button, not a select, so never in SELECTS
   // (whose reset reads .options); optional, since a page without it has
   // nothing to save from
   var saveBtn = document.getElementById('flt-save');
-  var SELECTS = [bandSel, tierSel, kSel, capSel, rebalanceSel, moveSel, sellSel, daysSel];
+  var SELECTS = [bandSel, tierSel, kSel, capSel, rebalanceSel, moveSel, untilSel, sellSel,
+                 daysSel];
   // The k-hat chart's own "Group by" select follows the bar's rules
   var khatGroup = document.getElementById('khat-group');
   if (khatGroup) { SELECTS.push(khatGroup); }
@@ -14171,8 +14354,9 @@ _FILTER_JS = r"""
   // of indexes into D.categories / D.subcats), the Tier floors choice
   // ("on" / "off"), the Rebalance choice ("no" / "yes"), the Sell choice
   // ("none", or a level's index), the Min. days to maturity choice (an index
-  // into D.sell_days) and the Min. price movement choice ("0" for any, or a
-  // minimum's place in D.moves plus one).
+  // into D.sell_days), the Min. price movement choice ("0" for any, or a
+  // minimum's place in D.moves plus one) and the "Rebalance until" choice
+  // ("0" for maturity, or a choice's place in D.maturity plus one).
   // SELL: every Sell block ("dash-sell-<i>")
   // inflated or inflating, by i — one band's chunk ids under one Tier floors
   // setting at every sell level and minimum of days, inflated the first time
@@ -14265,22 +14449,50 @@ _FILTER_JS = r"""
   // the rebalancing cell) or one id per entry of D.moves; null when the page
   // holds none
   function moveGridAt(t) { return offAt(t) ? D.grid_move_off : D.grid_move; }
+  // The "Rebalance until" choice u counts only while the Rebalance choice r
+  // is yes, on a page whose base block carries the choices: 0 is "maturity"
+  // (no days limit), i the i-th entry of D.maturity
+  function untilAt(r, u) {
+    if (!rebalanceOn(r) || !D.grid_maturity) { return 0; }
+    var i = parseInt(u, 10);
+    return (i > 0 && i <= D.maturity.length) ? i : 0;
+  }
+  // The grid of per-choice chunk ids beside the Min. price movement grid
+  // moveGridAt picks for a Tier floors choice t: [band][k][cap] -> null
+  // (every choice shows the movement cell) or [choice][0 for no minimum, i
+  // for D.moves[i - 1]] -> id; null when the page holds none
+  function untilGridAt(t) { return offAt(t) ? D.grid_maturity_off : D.grid_maturity; }
   // The chunk id of a scenario: band b, k, cap c, Tier floors choice t, Sell
-  // choice s, Min. days choice d, Rebalance choice r and Min. price movement
-  // choice m. Three results: an id; null for a scenario the run never
-  // simulated (a whole grid missing included, and any sell level of a run
-  // that rebalances, which the page never builds); or undefined while a sell
-  // level's band block is not yet inflated (choose() inflates it, then asks
-  // again). In a Sell block, -1 means the setting sells nothing: the
-  // scenario's own chunk. With Rebalance yes and a minimum chosen, the id is
-  // that minimum's in the scenario's cell of moveGridAt's grid (null when
-  // the page holds no such grid), or the rebalancing cell's own where that
-  // cell is null.
-  function chunkAt(b, k, c, t, s, d, r, m) {
+  // choice s, Min. days choice d, Rebalance choice r, Min. price movement
+  // choice m and "Rebalance until" choice u. Three results: an id; null for
+  // a scenario the run never simulated (a whole grid missing included, and
+  // any sell level of a run that rebalances, which the page never builds);
+  // or undefined while a sell level's band block is not yet inflated
+  // (choose() inflates it, then asks again). In a Sell block, -1 means the
+  // setting sells nothing: the scenario's own chunk. With Rebalance yes and
+  // a "Rebalance until" choice other than maturity, the id is that choice's,
+  // at the minimum shown, in the scenario's cell of untilGridAt's grid (null
+  // when the page holds no such grid); where that cell is null, and at
+  // maturity, it is the movement cell's: with a minimum chosen, that
+  // minimum's in the scenario's cell of moveGridAt's grid (null when the
+  // page holds no such grid), or the rebalancing cell's own where that cell
+  // is null.
+  function chunkAt(b, k, c, t, s, d, r, m, u) {
     var g = gridAt(t, r), level = sellAt(s);
     if (level === null) {
       if (!g) { return null; }
-      var mi = moveAt(r, m);
+      var mi = moveAt(r, m), ui = untilAt(r, u);
+      if (ui > 0) {
+        var ug = untilGridAt(t);
+        if (!ug) { return null; }
+        var cell = ug[b][k][c];
+        // A null cell: no choice changes this scenario's runs, so it shows
+        // the movement cell, below
+        if (cell) {
+          var row = cell[ui - 1];
+          return (row && typeof row[mi] === 'number') ? row[mi] : null;
+        }
+      }
       if (mi > 0) {
         var mg = moveGridAt(t);
         if (!mg) { return null; }
@@ -14305,7 +14517,7 @@ _FILTER_JS = r"""
   }
   function cellChunk() {
     return chunkAt(bandIndex(), kIndex(), capIndex(), tierSel.value, sellSel.value,
-                   daysSel.value, rebalanceSel.value, moveSel.value);
+                   daysSel.value, rebalanceSel.value, moveSel.value, untilSel.value);
   }
   // The page as rendered: the primary scenario with the tier floors on and
   // Rebalance no
@@ -14313,8 +14525,9 @@ _FILTER_JS = r"""
   // The filter bar's scenario ON SCREEN (SHOWN) as the defaults server's
   // confirmation-page address, or null when it cannot become live settings:
   // nothing drawn yet, no save target on the page (D.save), a scenario the
-  // run never simulated (a Rebalance choice, a minimum price movement or a
-  // Sell level the page holds no chunk for included), a band the run did
+  // run never simulated (a Rebalance choice, a minimum price movement, a
+  // "Rebalance until" choice or a Sell level the page holds no chunk for
+  // included), a band the run did
   // not record, a k or size cap the run did not record or that is not above
   // zero, or ticks that stop a save (saveBlockedByTicks: none of this
   // scenario's trades kept, or an address the server would not take).
@@ -14343,7 +14556,7 @@ _FILTER_JS = r"""
     // null: never simulated; undefined: a sell level's block not inflated (a
     // scenario on screen has always inflated its own)
     var shownId = chunkAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[7], SHOWN[8],
-                          SHOWN[6], SHOWN[9]);
+                          SHOWN[6], SHOWN[9], SHOWN[10]);
     if (shownId === null || shownId === undefined) { return null; }
     var band = D.bands[SHOWN[0]].value, k = D.ks[SHOWN[1]].value, cap = D.caps[SHOWN[2]].value;
     if (!band || !(k > 0) || !(cap > 0)) { return null; }
@@ -14365,6 +14578,16 @@ _FILTER_JS = r"""
       var mi = moveAt(SHOWN[6], SHOWN[9]);
       q.push(['rebalance', rebalanceOn(SHOWN[6]) ? 'on' : 'off'],
              ['min_price_move', mi > 0 ? D.moves[mi - 1].value : 'off']);
+      // Beside them, only from a page that also carries the "Rebalance
+      // until" choices: the days of the choice shown as
+      // rebalance_min_days_to_maturity, or 0 (no days limit) for maturity
+      // and whenever Rebalance is no (a shut select can still name one), so
+      // the address never asks for a days limit without rebalancing, which
+      // the server refuses
+      if (D.grid_maturity) {
+        var ui = untilAt(SHOWN[6], SHOWN[10]);
+        q.push(['rebalance_min_days_to_maturity', ui > 0 ? D.maturity[ui - 1].value : 0]);
+      }
     }
     // Likewise sent only by a page with the Sell view: the level shown and the
     // minimum of days shown, or off for both when Sell shows no level (the
@@ -15111,19 +15334,21 @@ _FILTER_JS = r"""
   // named as the Tier floors choice t reads it (_band_where, _tier_off_where),
   // closed by Python's rebalancing phrase when the Rebalance choice r is yes
   // — followed by the phrase of the minimum the Min. price movement choice m
-  // names, if any — and, when the Sell choice s names a level, by that
-  // level's phrase and the phrase of the Min. days choice d
-  function scenarioAt(b, k, c, t, s, d, r, m) {
-    var level = sellAt(s), mi = moveAt(r, m);
+  // names, if any, and then by the phrase of the days the "Rebalance until"
+  // choice u names, if any — and, when the Sell choice s names a level, by
+  // that level's phrase and the phrase of the Min. days choice d
+  function scenarioAt(b, k, c, t, s, d, r, m, u) {
+    var level = sellAt(s), mi = moveAt(r, m), ui = untilAt(r, u);
     return fill(D.text.scenario, {where: bandsAt(t)[b].where, k: D.ks[k].text,
                                   cap: D.caps[c].text})
-      + (rebalanceOn(r) ? D.text.rebalance + (mi > 0 ? D.moves[mi - 1].phrase : '') : '')
+      + (rebalanceOn(r) ? D.text.rebalance + (mi > 0 ? D.moves[mi - 1].phrase : '')
+                          + (ui > 0 ? D.maturity[ui - 1].phrase : '') : '')
       + (level !== null ? D.sell_levels[level].phrase
                           + D.sell_days[parseInt(d, 10)].phrase : '');
   }
   function scenario() {
     return scenarioAt(bandIndex(), kIndex(), capIndex(), tierSel.value, sellSel.value,
-                      daysSel.value, rebalanceSel.value, moveSel.value);
+                      daysSel.value, rebalanceSel.value, moveSel.value, untilSel.value);
   }
   // The summary line: the templates _filter_summary_text fills for the view
   // Python rendered, filled here for every other one. With any tick it
@@ -15744,10 +15969,17 @@ _FILTER_JS = r"""
   function refreshMove() {
     moveSel.disabled = !D || !D.grid_move || !rebalanceOn(rebalanceSel.value);
   }
+  // The "Rebalance until" select counts only while Rebalance is yes: it is
+  // shut while Rebalance is no, and on a page whose base block carries no
+  // choices. Shut, it keeps its value.
+  function refreshUntil() {
+    untilSel.disabled = !D || !D.grid_maturity || !rebalanceOn(rebalanceSel.value);
+  }
   // No sell level is built for a run that rebalances: while Rebalance is yes,
   // Sell is set to no level and shut, and it opens again when Rebalance goes
-  // back to no. A page without the Sell view keeps Sell shut. The Min. days
-  // and Min. price movement selects are opened or shut to match.
+  // back to no. A page without the Sell view keeps Sell shut. The Min. days,
+  // Min. price movement and "Rebalance until" selects are opened or shut to
+  // match.
   function refreshSell() {
     if (D && D.sell_blocks) {
       var shut = rebalanceOn(rebalanceSel.value);
@@ -15756,6 +15988,7 @@ _FILTER_JS = r"""
     }
     refreshDays();
     refreshMove();
+    refreshUntil();
   }
   // Draw the scenario the selects and the menus' ticks name, from a chunk
   // (null for a scenario the run never simulated), and record it as SHOWN
@@ -15768,7 +16001,7 @@ _FILTER_JS = r"""
     C = chunk;
     refreshMenus();
     SHOWN = [bandIndex(), kIndex(), capIndex(), excluded, tags, tierSel.value,
-             rebalanceSel.value, sellSel.value, daysSel.value, moveSel.value];
+             rebalanceSel.value, sellSel.value, daysSel.value, moveSel.value, untilSel.value];
     render(v, excluded, tags);
     refreshSell();
     refreshSave();
@@ -15781,16 +16014,18 @@ _FILTER_JS = r"""
   // ticks too, since ticks made while the chunk was loading were never
   // drawn either — the menus rebuilt for the ticks shown — and the line
   // says what could not be shown, in Python's words; the Tier floors,
-  // Rebalance, Min. price movement, Sell and Min. days choices go back too,
-  // with the band options named for the first, Sell shut again while a
-  // rebalancing scenario is shown, the Min. price movement select shut again
-  // when one is not, and the Min. days select shut again when Sell names none
+  // Rebalance, Min. price movement, "Rebalance until", Sell and Min. days
+  // choices go back too, with the band options named for the first, Sell
+  // shut again while a rebalancing scenario is shown, the Min. price
+  // movement and "Rebalance until" selects shut again when one is not, and
+  // the Min. days select shut again when Sell names none
   function putBack(err) {
     var tried = scenario(), ticks = selectionName(excludedCats(), tagTicks());
     bandSel.value = String(SHOWN[0]);
     tierSel.value = SHOWN[5];
     rebalanceSel.value = SHOWN[6];
     moveSel.value = SHOWN[9];
+    untilSel.value = SHOWN[10];
     sellSel.value = SHOWN[7];
     daysSel.value = SHOWN[8];
     relabelBands();
@@ -15801,7 +16036,7 @@ _FILTER_JS = r"""
     PICK = pickKey();
     refreshSell();
     var still = scenarioAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[7], SHOWN[8],
-                           SHOWN[6], SHOWN[9]);
+                           SHOWN[6], SHOWN[9], SHOWN[10]);
     // A mix that could not be shown: the ticks tried and the scenario they
     // were tried at, then what is ticked again now — and at which scenario,
     // when the selects went back to another one too
@@ -15869,7 +16104,7 @@ _FILTER_JS = r"""
     if (saveBtn) { saveBtn.disabled = true; }
     if (D) {
       var p = D.primary;
-      var here = scenarioAt(p[0], p[1], p[2], 'on', 'none', '0', 'no', '0');
+      var here = scenarioAt(p[0], p[1], p[2], 'on', 'none', '0', 'no', '0', '0');
       setText('flt-summary', fill(D.text.unavailable,
                                   {failed: here, reason: reason, scenario: here}));
       return;
@@ -15880,7 +16115,7 @@ _FILTER_JS = r"""
   // A browser can restore a <select>'s last choice, or a box's tick, on a
   // reload, or on going back; the page as rendered is the primary scenario's
   // unfiltered view with the tier floors on, Rebalance no, no minimum price
-  // movement and no sell level, so the bar is
+  // movement, "Rebalance until" at maturity and no sell level, so the bar is
   // set back to it: every select to its rendered
   // option, both menus to nothing ticked. Python renders the selects and the
   // menus' boxes disabled: they are enabled once the
@@ -15918,13 +16153,13 @@ _FILTER_JS = r"""
       C = chunk;
       // Nothing ticked: no category left out (SHOWN[3]) and no tag (SHOWN[4])
       SHOWN = D.primary.concat([[], [], tierSel.value, rebalanceSel.value, sellSel.value,
-                                daysSel.value, moveSel.value]);
+                                daysSel.value, moveSel.value, untilSel.value]);
     }
     // A run with no tier-off (or Rebalance, or Sell) view keeps that select
     // disabled; the Min. days select opens only while Sell names a level,
-    // the Min. price movement select only while Rebalance is yes, and Sell is
-    // shut while a rebalancing scenario is chosen (refreshSell, just below,
-    // shuts what this loop opened)
+    // the Min. price movement and "Rebalance until" selects only while
+    // Rebalance is yes, and Sell is shut while a rebalancing scenario is
+    // chosen (refreshSell, just below, shuts what this loop opened)
     SELECTS.forEach(function(s) {
       s.disabled = (s === tierSel && !D.grid_off) || (s === rebalanceSel && !D.grid_rebalance)
         || (s === sellSel && !D.sell_blocks);
@@ -15950,7 +16185,8 @@ _FILTER_JS = r"""
     // Nothing to switch to without the Rebalance view (the select stays shut)
     if (!D || !D.grid_rebalance) { return; }
     // Sell goes to no level and shuts while Rebalance is yes, and opens again
-    // when it goes back to no; the Min. price movement select opens with yes
+    // when it goes back to no; the Min. price movement and "Rebalance until"
+    // selects open with yes
     refreshSell();
     choose();
   });
@@ -15958,6 +16194,12 @@ _FILTER_JS = r"""
     // The minimum counts only while Rebalance is yes, on a page that carries
     // the minimums (the select is shut otherwise)
     if (!D || !D.grid_move || !rebalanceOn(rebalanceSel.value)) { return; }
+    choose();
+  });
+  untilSel.addEventListener('change', function() {
+    // The days count only while Rebalance is yes, on a page that carries the
+    // choices (the select is shut otherwise)
+    if (!D || !D.grid_maturity || !rebalanceOn(rebalanceSel.value)) { return; }
     choose();
   });
   sellSel.addEventListener('change', function() {
