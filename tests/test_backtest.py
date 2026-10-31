@@ -980,7 +980,7 @@ class TestMaturitySweepArgument:
         text = _option_help(monkeypatch, capsys, "--no-maturity-sweep", "--sell-workers")
         assert text.startswith("Skip the Rebalance family's \"Rebalance until\" choices")
         assert "Rebalance itself is still built" in text
-        assert "the page does not offer that select yet" in text
+        assert "skipping them leaves the page's \"Rebalance until\" select shut" in text
         assert text.endswith("its own saved rebalance_min_days_to_maturity (main.py "
                              "--rebalance-min-days-to-maturity for one run)")
         assert "sweep_kwargs" not in cli

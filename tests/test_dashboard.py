@@ -8167,7 +8167,9 @@ class TestSaveLiveDefaultsButton:
         categories excluded on screen (one exclude_category each, in the
         menu's order), the tags ticked (one exclude_tag each, "Category ·
         Tag", in the menu's order), and no other field. The rebalancing and selling fields may also be present (pages
-        with those views send them); the caller checks their values.
+        with those views send them); the caller checks their values. The
+        "Rebalance until" days go only beside the Rebalance fields, and as 0
+        (no limit) whenever Rebalance is off.
 
         Args:
             data (dict): The page's base block.
@@ -8198,12 +8200,18 @@ class TestSaveLiveDefaultsButton:
         known = {"tier_floors", "spread_min", "spread_max", "k", "size_cap",
                  "same_title_size_cap", "source", "exclude_category", "exclude_tag",
                  "rebalance",
-                 "min_price_move", "sell_at", "sell_min_days"}
+                 "min_price_move", "rebalance_min_days_to_maturity", "sell_at",
+                 "sell_min_days"}
         assert set(query) <= known
         # Rebalance's two fields are always sent together: the server refuses
         # a minimum with rebalancing off, and keeps a saved one a link leaves out
         assert len({name in query for name in ("rebalance", "min_price_move")}) == 1
         assert query.get("rebalance") != "off" or query.get("min_price_move") == "off"
+        # ... and the days limit only beside them, never asking for a limit
+        # with rebalancing off, which the server refuses too
+        if "rebalance_min_days_to_maturity" in query:
+            assert "rebalance" in query
+            assert query["rebalance"] != "off" or query["rebalance_min_days_to_maturity"] == "0"
 
     def test_the_button_is_rendered_disabled_with_its_words(self, monkeypatch, tmp_path):
         page = self._page(monkeypatch, tmp_path)
@@ -8738,7 +8746,8 @@ class TestSaveLiveDefaultsButton:
         target = dashboard._save_target(sweep, _FLT_START, today)
         assert target == {"url": _SAVE_URL, "same_title_size_cap": None,
                           "source": "backtest dashboard for 2026-01-05 to 2026-09-28",
-                          "live_rebalances": False, "live_sells": False,
+                          "live_rebalances": False, "live_rebalance_until": None,
+                          "live_sells": False,
                           "live_exclusions": None, "live_tag_exclusions": None,
                           "max_names": config.DEFAULTS_SERVER_MAX_FILTER_NAMES,
                           "max_query_bytes": dashboard._save_max_query_bytes(),
@@ -8753,6 +8762,14 @@ class TestSaveLiveDefaultsButton:
                                         live_min_price_move=move)
             assert dashboard._save_target(swept, _FLT_START, today)[
                 "live_rebalances"] is said, (rebalance, move)
+        # ... and "live_rebalance_until" names their days limit, only while
+        # they rebalance (a limit means nothing without it)
+        for rebalance, days, said in ((True, 7, 7), (True, 1, 1), (True, None, None),
+                                      (False, 7, None), (None, 7, None)):
+            swept = dataclasses.replace(sweep, live_rebalance=rebalance,
+                                        live_rebalance_min_days_to_maturity=days)
+            assert dashboard._save_target(swept, _FLT_START, today)[
+                "live_rebalance_until"] == said, (rebalance, days)
         # ... and "live_sells" only for a recorded sell level (a minimum alone is no sale)
         for level, days, said in ((0.85, 3, True), (0.85, None, True), (None, None, False),
                                   (None, 3, False)):
@@ -8944,11 +8961,64 @@ class TestSaveLiveDefaultsButton:
         [opened] = snap["opened"]
         query = self._query(data, opened)
         self._assert_sends(data, query, *data["primary"])
-        for name in ("rebalance", "min_price_move"):
+        for name in ("rebalance", "min_price_move", "rebalance_min_days_to_maturity"):
             assert name not in query, name
         settings, _ = defaults_server._proposal(
             defaults_server._params(opened["url"].partition("?")[2]), current)
         assert (settings.rebalance, settings.min_price_move) == (True, 0.1)
+
+    @pytest.mark.parametrize("saved", [None, 7], ids=["saved-maturity", "saved-7-days"])
+    def test_the_rebalance_until_choice_on_screen_is_what_the_defaults_server_reads(
+            self, monkeypatch, tmp_path, saved):
+        # A page with the "Rebalance until" choices names the one shown every
+        # time: 0 at maturity (so a saved days limit is turned off), the
+        # choice's days otherwise, and 0 with Rebalance no. The clicked
+        # address goes to the server's own application and parser, which read
+        # back exactly the scenario's own settings, whatever limit is saved.
+        config.save_live_defaults(
+            dataclasses.replace(config.live_settings(), rebalance=True, min_price_move=None,
+                                rebalance_min_days_to_maturity=saved), source="")
+        current = config.read_saved_live_defaults()
+        assert current.rebalance_min_days_to_maturity == saved
+        page = self._kc(monkeypatch, tmp_path, _kc_sweep_until())
+        data = TestFilterPage._data(page)
+        assert [entry["value"] for entry in data["maturity"]] == [1, 7]
+        until = TestUntilScript._until
+        snaps = TestUntilScript._run(tmp_path, page, [
+            ["wait"], *TestRebalanceScript.ON, ["click", "flt-save"], ["snap", "maturity"],
+            *until(2), ["click", "flt-save"], ["snap", "7 days"],
+            *TestMoveScript._move(2), ["click", "flt-save"], ["snap", "7 days at 10c"],
+            *until(0), ["click", "flt-save"], ["snap", "maturity at 10c"],
+            *until(1), *TestRebalanceScript.OFF, ["click", "flt-save"], ["snap", "no"]],
+            strict=True)
+        app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
+        pb, pk, pc = data["primary"]
+        for name, yes, move, days in (("maturity", True, None, None), ("7 days", True, None, 7),
+                                      ("7 days at 10c", True, 0.10, 7),
+                                      ("maturity at 10c", True, 0.10, None),
+                                      ("no", False, None, None)):
+            [opened] = snaps[name]["opened"]
+            query = self._query(data, opened)
+            self._assert_sends(data, query, pb, pk, pc)
+            assert query["rebalance_min_days_to_maturity"] == str(days or 0), name
+            raw = opened["url"].partition("?")[2]
+            response = app.handle(defaults_server._Request("GET", f"/confirm?{raw}",
+                                                           _SAVE_HOST))
+            assert response.status == 200, response.body
+            settings, source = defaults_server._proposal(defaults_server._params(raw), current)
+            # The page has no Sell view, so the server keeps the saved selling
+            expected = config.LiveSettings(
+                tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
+                interval_discount=data["ks"][pk]["value"],
+                size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5,
+                rebalance=yes, min_price_move=move, rebalance_min_days_to_maturity=days,
+                sell_at=current.sell_at, sell_min_days=current.sell_min_days)
+            assert settings == expected, name
+            for field in config.LIVE_TOGGLE_FIELDS:
+                assert getattr(settings, field) == getattr(expected, field), (name, field)
+            assert source == data["save"]["source"]
+        # Nothing was written by showing the page
+        assert config.read_saved_live_defaults() == current
 
     @pytest.mark.parametrize("saved", ["nothing", "not selling", "selling"])
     def test_the_sell_scenario_on_screen_is_what_the_defaults_server_reads(
@@ -13233,8 +13303,8 @@ class TestUntilView:
     the walk's last phase reads every rebalancing scenario again at each
     choice and minimum, starting from the records of the runs it has read;
     a run of its own gets a chunk, a run that repeats another stores that
-    run's chunk id, and the base block carries them, while the select stays
-    shut."""
+    run's chunk id, and the base block carries them (the select is rendered
+    shut; TestUntilScript drives it under the page script)."""
 
     # (0-1, k 0.75) of _kc_sweep_until(), per cap: [choice][minimum place]
     # (no minimum, 5c, 10c, 25c). At 1 day every step is the movement view's
@@ -13357,13 +13427,17 @@ class TestUntilView:
 
     def test_the_choices_chunks_come_after_every_other_chunk(self):
         # A page with the choices holds the page without them, chunk for
-        # chunk, then its own; and nothing else in its base block changes
+        # chunk, then its own; and nothing else in its base block changes but
+        # the summary's reach sentence, which names the choices too
         _, clean_chunker, clean = _rb_payload(_kc_sweep_move(_kc_sweep_tiers()))
         _, chunker, base = _rb_payload(_kc_sweep_until(_kc_sweep_tiers()))
         assert set(base) == set(clean)
         for key in clean:
-            if key not in (*_UT_KEYS, "rows", "inline_chunks"):
+            if key not in (*_UT_KEYS, "rows", "inline_chunks", "text"):
                 assert base[key] == clean[key], key
+        assert {**base["text"], "unfiltered": None} == {**clean["text"], "unfiltered": None}
+        assert base["text"]["unfiltered"] == clean["text"]["unfiltered"].replace(
+            dashboard._MOVE_REACH_NO_EXPLORER, dashboard._until_reach(True, False))
         packed = len(clean_chunker.chunks)
         assert base["rows"][:len(clean["rows"])] == clean["rows"]
         assert _rb_chunks(chunker)[:packed] == _rb_chunks(clean_chunker)
@@ -14192,7 +14266,7 @@ class TestUntilSelect:
     price movement and before Sell, on every page, shut, with "maturity" and
     one option per choice the page carries, its rule in the hover text and,
     on a page that shows Rebalance without the choices, the reason beside it.
-    The page script does not read it, so it stays shut whatever is chosen."""
+    What the page script does with it is TestUntilScript's."""
 
     @staticmethod
     def _select(page: str):
@@ -14226,18 +14300,20 @@ class TestUntilSelect:
                                                                   "7 days before"]
         title = re.search(r'title="([^"]*)"', select.group(1)).group(1)
         assert html.unescape(title) == dashboard._UNTIL_TITLE
-        # The hover text says when it counts, what it holds back and how the
-        # days are counted
+        # The hover text says when it counts, what it holds back, how the
+        # days are counted and what Save as live defaults saves
         for words in ("Used only while Rebalance is yes",
                       "Holds back trims and add-ons when the position's later market matures "
                       "within that many days",
                       "topped up or sold down only while its later market",
                       "closes at least that many days after the run",
                       "counted in whole days on Kalshi's UTC dates",
-                      "maturity: no days limit"):
+                      "maturity: no days limit",
+                      "From a page with these choices, Save as live defaults saves the choice "
+                      "shown (maturity, or Rebalance no, saves no days limit)",
+                      "from any other page it keeps the saved one unless the save turns "
+                      "rebalancing off"):
             assert words in dashboard._UNTIL_TITLE
-        # ... and promises nothing about Save, which does not send it
-        assert "Save" not in dashboard._UNTIL_TITLE
         # A page with the view has no note beside it
         assert 'id="flt-until-note"' not in page
 
@@ -14322,28 +14398,48 @@ class TestUntilSelect:
         bare = _rb_page(monkeypatch, tmp_path, _kc_sweep())
         assert note(bare) is None and 'id="flt-rebalance-note"' in bare
 
-    def test_it_stays_shut_under_the_page_script(self, monkeypatch, tmp_path):
-        # Shut on load, with Rebalance yes and at a minimum alike; a change
-        # event on it loads and draws nothing. flt-until is shut on load, so
-        # the run waits on flt-rebalance. Skipped without a JavaScript runtime
+    def test_the_reach_sentence_names_the_choices_only_on_a_page_with_them(
+            self, monkeypatch, tmp_path):
+        # With the choices, the summary's closing sentence names all three
+        # held-pair selects (the payload built here has no explorer grid)
+        _, _, base = _rb_payload(_kc_sweep_until())
+        closing = base["text"]["unfiltered"]
+        assert closing.endswith(" " + dashboard._until_reach(True, False))
+        assert dashboard._MOVE_REACH_NO_EXPLORER not in closing
+        # ... and the page shows it, in its Python-drawn summary too
         page = _rb_page(monkeypatch, tmp_path, _kc_sweep_until())
-        snaps = TestMoveScript._run(tmp_path, page, [
-            ["snap", "loaded"], ["wait"], ["snap", "ready"], *TestMoveScript.ON, ["snap", "on"],
-            *TestMoveScript._move(2), ["snap", "moved"], ["set", "flt-until", "2"],
-            ["fire", "flt-until"], ["settle"], ["snap", "ignored"]], strict=True)
-        for name in ("loaded", "ready", "on", "moved"):
-            until = snaps[name]["selects"]["flt-until"]
-            assert until["disabled"] is True and until["value"] == "0", name
-        assert snaps["ready"]["selects"]["flt-until"]["options"] == [
-            ["0", "maturity"], ["1", "1 day before"], ["2", "7 days before"]]
-        # Rebalance and Min. price movement beside it open as before
-        assert snaps["on"]["selects"]["flt-rebalance"]["disabled"] is False
-        assert snaps["moved"]["selects"]["flt-move"]["disabled"] is False
-        ignored, moved = snaps["ignored"], snaps["moved"]
-        assert ignored["selects"]["flt-until"]["disabled"] is True
-        assert ignored["reacts"] == [] and ignored["inflated"] == moved["inflated"]
-        assert ignored["text"].get("flt-summary") == moved["text"].get("flt-summary")
-        assert ", until" not in ignored["text"]["flt-summary"]
+        assert TestFilterPage._data(page)["text"]["unfiltered"] == closing
+        assert html.escape(dashboard._until_reach(True, False)) in page
+        # A family with choices and no minimums names Rebalance and the choices
+        _, _, base = _rb_payload(_kc_sweep_until(min_moves=()))
+        closing = base["text"]["unfiltered"]
+        assert base["move_state"] == "not simulated" and base["grid_maturity"] is not None
+        assert closing.endswith(" " + dashboard._until_reach(False, False))
+        assert "Min. price movement" not in closing
+        # Without the choices the sentence is as before: a family without them,
+        # and one whose choices could not be read
+        _, _, clean = _rb_payload(_kc_sweep_move())
+        _, _, lost = _rb_payload(_kc_sweep_until(maturity_raise=((False, _KC_B0, 0.6), 0)),
+                                 maturity_state="unavailable")
+        for closing in (clean["text"]["unfiltered"], lost["text"]["unfiltered"]):
+            assert closing.endswith(" " + dashboard._MOVE_REACH_NO_EXPLORER)
+            assert "Rebalance until" not in closing
+        # The words: what the selects leave alone, the explorer named only with its grid
+        assert dashboard._until_reach(True, True) == (
+            'Rebalance, Min. price movement and "Rebalance until" change the trade sections '
+            "only; the k̂ figures do not depend on them, and the Scenario Explorer and "
+            "Interval Discount sections always show no rebalancing.")
+        assert dashboard._until_reach(False, False) == (
+            'Rebalance and "Rebalance until" change the trade sections only; the k̂ figures '
+            "do not depend on them, and the Interval Discount section always shows no "
+            "rebalancing.")
+        # Each is _MOVE_REACH's (or _REBALANCE_REACH's) sentence naming the choices too
+        assert dashboard._until_reach(True, True).replace(
+            ', Min. price movement and "Rebalance until"', " and Min. price movement") == (
+            dashboard._MOVE_REACH)
+        assert dashboard._until_reach(True, False).replace(
+            ', Min. price movement and "Rebalance until"', " and Min. price movement") == (
+            dashboard._MOVE_REACH_NO_EXPLORER)
 
 
 class TestRebalanceScript:
@@ -15202,6 +15298,393 @@ class TestMoveScript:
         assert f"dash-chunk-{own}" in snaps["move"]["inflated"]
 
 
+class TestUntilScript:
+    """The bar's "Rebalance until" select under the page script (run outside a
+    browser): open only while Rebalance is yes, on a page with the choices; a
+    choice shows its own run's chunk at the minimum shown, or the movement
+    cell's where no choice changes the scenario, the tier floors on and off;
+    Rebalance no shows the plain run and keeps the choice; a chunk that cannot
+    be loaded puts the choice back; a browser's restored choice is set back to
+    maturity on load; and Save sends the days shown (0 for maturity, or with
+    Rebalance no) only from a page with the choices, which the defaults server
+    reads back. The explorer never follows it. flt-until is shut on load, so
+    these tests wait on flt-rebalance (setup_js adds it). Skipped without a
+    JavaScript runtime.
+
+    The page is _kc_sweep_until()'s: at (0-1, k 0.75), per cap,
+    TestUntilView._CELL names each choice's chunk at each minimum (the 20%
+    cap, the page's own, at 7 days a run of its own with no minimum and at
+    5c, then the plain run's list at 10c and 25c; the 5% cap the plain run's
+    list at every minimum); with no cap, as in every other cell, no choice
+    changes anything. The select's values: "0" maturity, "1" 1 day before,
+    "2" 7 days before."""
+
+    WAIT = TestRebalanceScript.WAIT
+    ON, OFF = TestRebalanceScript.ON, TestRebalanceScript.OFF
+
+    @staticmethod
+    def _until(value) -> list:
+        """The steps of a reader choosing one option of the "Rebalance until" select."""
+        return [["set", "flt-until", str(value)], ["fire", "flt-until"], ["settle"]]
+
+    @staticmethod
+    def _choose(select: str, value) -> list:
+        """The steps of a reader choosing one option of another select of the bar."""
+        return [["set", select, str(value)], ["fire", select], ["settle"]]
+
+    @classmethod
+    def _run(cls, tmp_path, page, steps, **kwargs) -> dict:
+        """_run_script over a page, waiting on the Rebalance select too."""
+        return _run_script(tmp_path, page, steps, setup_js=cls.WAIT + kwargs.pop("js", ""),
+                           **kwargs)
+
+    @staticmethod
+    def _scenario(data: dict, bi: int, ki: int, ci: int, mi: int | None = None,
+                  ui: int | None = None, *, off: bool = False) -> str:
+        """A rebalancing scenario in the summary's words, as the script builds
+        it: TestMoveScript's (mi indexes the base block's moves, None for
+        any), then Python's phrase for the choice at index ui of its maturity
+        (None: maturity, which adds no words)."""
+        return (TestMoveScript._scenario(data, bi, ki, ci, mi, off=off)
+                + ("" if ui is None else data["maturity"][ui]["phrase"]))
+
+    @staticmethod
+    def _loaded(snaps: dict, before: str, after: str) -> list:
+        """The blocks inflated between two snapshots."""
+        return snaps[after]["inflated"][len(snaps[before]["inflated"]):]
+
+    def test_it_is_shut_on_load_and_while_rebalance_is_no(self, monkeypatch, tmp_path):
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_until())
+        snaps = self._run(tmp_path, page, [
+            ["snap", "loaded"], ["wait"], ["snap", "ready"], *self._until(2), ["snap", "ignored"],
+            *self._until(0), *self.ON, ["snap", "on"], *TestMoveScript._move(2), ["snap", "moved"],
+            *self.OFF, ["snap", "off"]], strict=True)
+        assert snaps["loaded"]["selects"]["flt-until"]["disabled"] is True
+        ready = snaps["ready"]["selects"]
+        assert ready["flt-until"]["disabled"] is True and ready["flt-until"]["value"] == "0"
+        assert ready["flt-until"]["options"] == [["0", "maturity"], ["1", "1 day before"],
+                                                 ["2", "7 days before"]]
+        # Rebalance beside it is open
+        assert ready["flt-rebalance"]["disabled"] is False
+        # A change event on the shut select draws nothing and loads nothing
+        ignored = snaps["ignored"]
+        assert ignored["reacts"] == [] and ignored["inflated"] == ["dash-data", "dash-chunk-0"]
+        assert ignored["text"].get("flt-summary") == snaps["ready"]["text"].get("flt-summary")
+        assert ignored["selects"]["flt-until"]["disabled"] is True
+        # It opens with Rebalance yes, stays open at a minimum, and shuts with no
+        for name in ("on", "moved"):
+            assert snaps[name]["selects"]["flt-until"]["disabled"] is False, name
+            assert snaps[name]["selects"]["flt-until"]["value"] == "0", name
+        assert snaps["moved"]["selects"]["flt-move"]["disabled"] is False
+        assert snaps["off"]["selects"]["flt-until"]["disabled"] is True
+
+    def test_each_choice_shows_its_own_chunk_at_each_minimum(self, monkeypatch, tmp_path):
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_until())
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        cells, primary = data["grid_maturity"][0][1], data["grid"][0][1][1]
+        assert cells == TestUntilView._CELL
+        steps, cases = [["wait"], *self.ON], []
+        for ci in (0, 1):
+            steps += self._choose("flt-cap", ci)
+            for ui in (1, 2):
+                for mi in (0, 1, 2, 3):
+                    name = f"cap {ci}, choice {ui}, minimum {mi}"
+                    steps += [*TestMoveScript._move(mi), ["snap", name + ", before"],
+                              *self._until(ui), ["snap", name]]
+                    cases.append((name, ci, ui, mi))
+        # keep=0: no chunk but the page's own outlives its draw, so each step
+        # inflates exactly the chunk it draws (the page's own: nothing)
+        snaps = self._run(tmp_path, page, steps, strict=True, keep=0)
+        drawn = set()
+        for name, ci, ui, mi in cases:
+            snap, cid = snaps[name], cells[ci][ui - 1][mi]
+            drawn.add(cid)
+            assert self._loaded(snaps, name + ", before", name) == (
+                [] if cid == primary else [f"dash-chunk-{cid}"]), name
+            n = chunks[cid]["list"]["views"]["all"]["n"]
+            assert snap["text"]["hdr-trades"] == str(n), name
+            # The summary names the choice after the minimum, in Python's words
+            assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
+                data["text"], self._scenario(data, 0, 1, ci, mi - 1 if mi else None, ui - 1),
+                False, None, n, n, note="other_run" if ci == 1 else None, rebalance=True), name
+            assert snap["selects"]["flt-until"]["value"] == str(ui), name
+            assert snap["selects"]["flt-move"]["value"] == str(mi), name
+        # Not vacuous: the movement view's chunks, the plain run's, the page's
+        # own and a run no other select reaches were all drawn
+        moved = _rb_ids(data["grid_rebalance"]) | {
+            cid for cell in data["grid_move"][0][1] if cell for cid in cell}
+        assert drawn & moved and primary in drawn and data["grid"][0][1][0] in drawn
+        assert drawn - moved - _rb_ids(data["grid"])
+
+    def test_tier_floors_off_read_the_tier_off_grid(self, monkeypatch, tmp_path):
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_until(_kc_sweep_tiers()))
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        on, off = data["grid_maturity"][0][1][1], data["grid_maturity_off"][0][1][1]
+        moved = data["grid_move_off"][0][1][1]
+        # With the tier floors off, 7 days is one run every minimum repeats, a
+        # list the tier-on grid never names; 1 day is the movement cell
+        assert off == [[data["grid_rebalance_off"][0][1][1], *moved], [off[1][0]] * 4]
+        assert off[1][0] not in {cid for band in data["grid_maturity"] for cells in band
+                                 for cell in cells if cell for row in cell for cid in row}
+        # At the band no tier binds at, the off view is its tier-on run, which
+        # no choice changes
+        assert data["grid_maturity_off"][1] == data["grid_maturity"][1] == [[None] * 3] * 2
+        steps = [["wait"], *self._choose("flt-tier", "off"), *self.ON,
+                 *TestMoveScript._move(2), ["snap", "a"], *self._until(2), ["snap", "off 7 at 10c"],
+                 *self._until(1), ["snap", "off 1 at 10c"],
+                 *TestMoveScript._move(0), *self._choose("flt-tier", "on"), ["snap", "b"],
+                 *self._until(2), ["snap", "on 7"],
+                 *self._choose("flt-tier", "off"), *self._choose("flt-band", 1), ["snap", "c"],
+                 *self._until(2), ["snap", "off band 1"]]
+        snaps = self._run(tmp_path, page, steps, strict=True, keep=0)
+        for name, before, cid, (bi, mi, ui), tiers_off in (
+                ("off 7 at 10c", "a", off[1][2], (0, 1, 1), True),
+                ("off 1 at 10c", "off 7 at 10c", moved[1], (0, 1, 0), True),
+                ("on 7", "b", on[1][0], (0, None, 1), False),
+                ("off band 1", "c", data["grid_rebalance_off"][1][1][1], (1, None, 1), True)):
+            assert self._loaded(snaps, before, name) == [f"dash-chunk-{cid}"], name
+            n = chunks[cid]["list"]["views"]["all"]["n"]
+            assert snaps[name]["text"]["hdr-trades"] == str(n), name
+            assert snaps[name]["text"]["flt-summary"] == dashboard._filter_summary_text(
+                data["text"], self._scenario(data, bi, 1, 1, mi, ui, off=tiers_off), False, None,
+                n, n, note="other_run" if bi == 0 else None, rebalance=True), name
+        # The two settings' 7-day runs are two runs
+        assert off[1][0] != on[1][0]
+
+    def test_a_null_cell_shows_the_movement_cell(self, monkeypatch, tmp_path):
+        # No choice changes any run here (every step repeats the run at
+        # maturity), so every cell is null and each choice shows the movement
+        # view's chunk: at a minimum, that minimum's own run
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_until(scripted=False))
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        assert data["maturity_state"] == "shown"
+        assert data["grid_maturity"] == [[[None] * 3] * 2] * 2
+        moved, own = data["grid_move"][0][1][1], data["grid_rebalance"][0][1][1]
+        # At the 20% cap, 10c is a run of its own: neither the rebalancing run
+        # nor the plain one
+        assert moved[1] not in (own, data["grid"][0][1][1])
+        snaps = self._run(tmp_path, page, [
+            ["wait"], *self.ON, *TestMoveScript._move(2), ["snap", "10c"], *self._until(2),
+            ["snap", "7 days at 10c"], *TestMoveScript._move(0), ["snap", "any"],
+            *self._until(1), ["snap", "1 day"]], strict=True, keep=0)
+        for name, before, cid, mi, ui in (("7 days at 10c", "10c", moved[1], 1, 1),
+                                          ("1 day", "any", own, None, 0)):
+            assert self._loaded(snaps, before, name) == [f"dash-chunk-{cid}"], name
+            n = chunks[cid]["list"]["views"]["all"]["n"]
+            assert snaps[name]["text"]["hdr-trades"] == str(n), name
+            # The line still names the choice: the run was simulated, and changed nothing
+            assert snaps[name]["text"]["flt-summary"] == dashboard._filter_summary_text(
+                data["text"], self._scenario(data, 0, 1, 1, mi, ui), False, None, n, n,
+                note="other_run", rebalance=True), name
+
+    def test_rebalance_no_shows_the_plain_run_and_yes_again_the_kept_choice(
+            self, monkeypatch, tmp_path):
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_until())
+        data = TestFilterPage._data(page)
+        snaps = self._run(tmp_path, page, [
+            ["wait"], *self.ON, *self._until(2), ["snap", "until"], *self.OFF, ["snap", "off"],
+            *self.ON, ["snap", "again"]], strict=True)
+        until, off, again = snaps["until"], snaps["off"], snaps["again"]
+        assert until["text"]["hdr-trades"] == "4"
+        # No: the page as rendered, the select shut with its choice kept
+        assert off["selects"]["flt-until"] == {**until["selects"]["flt-until"], "disabled": True}
+        assert off["selects"]["flt-until"]["value"] == "2"
+        assert off["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], _phrase(data, 0, 1, 1), True, None, 3, 3)
+        assert off["text"]["hdr-trades"] == "3"
+        # Yes again: straight back to the choice it still names, nothing loaded anew
+        assert again["selects"]["flt-until"] == until["selects"]["flt-until"]
+        assert again["text"]["flt-summary"] == until["text"]["flt-summary"]
+        assert again["text"]["hdr-trades"] == until["text"]["hdr-trades"]
+        assert again["inflated"] == until["inflated"]
+
+    def test_a_choice_counts_only_with_rebalance_yes_and_the_grid(self, tmp_path):
+        # untilAt on its own, over base blocks that name two choices: with the
+        # grid, Rebalance yes reads each choice and maturity, anything else, 0;
+        # Rebalance no, a page without the Rebalance view and a block without
+        # the grid (Python never builds one: its "maturity" is [] then) read 0
+        found = _run_js(tmp_path, ("rebalanceOn", "untilAt"), (
+            "(function() {"
+            " var out = [], g = [[[1]]];"
+            " [[g, g], [g, null], [null, g]].forEach(function(grids) {"
+            "  D = {grid_rebalance: grids[0], grid_maturity: grids[1],"
+            "       maturity: [{value: 1}, {value: 7}]};"
+            "  ['yes', 'no'].forEach(function(r) {"
+            "   ['0', '1', '2', '3', 'x'].forEach(function(u) { out.push(untilAt(r, u)); });"
+            "  });"
+            " });"
+            " return out; })()"))
+        assert found[:5] == [0, 1, 2, 0, 0]
+        assert found[5:] == [0] * 25
+
+    # ─── A chunk that cannot be loaded, and a restored choice ────────────────
+
+    def test_a_chunk_that_cannot_be_loaded_puts_the_choice_back(self, monkeypatch, tmp_path):
+        page = TestSaveLiveDefaultsButton._kc(monkeypatch, tmp_path, _kc_sweep_until())
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        # 7 days at the 20% cap, no minimum: a run of its own
+        cid = data["grid_maturity"][0][1][1][1][0]
+        assert cid not in _rb_ids(data["grid"]) | _rb_ids(data["grid_rebalance"])
+        snaps = self._run(tmp_path, page, [
+            ["wait"], *self.ON, ["snap", "rebalance"], *self._until(2), ["snap", "bad"],
+            ["click", "flt-save"], ["snap", "bad click"],
+            # ... and from another choice, back to that one
+            *self._until(1), ["snap", "one"], *self._until(2), ["snap", "bad again"],
+            ["click", "flt-save"], ["snap", "again click"],
+            ["repair", f"dash-chunk-{cid}"], *self._until(2), ["snap", "good"]],
+            strict=True, damaged=(f"dash-chunk-{cid}",))
+        reason = f"Error: damaged block dash-chunk-{cid}"
+        save = TestSaveLiveDefaultsButton()
+        for name, click, shown, ui in (("bad", "bad click", "rebalance", None),
+                                       ("bad again", "again click", "one", 0)):
+            bad = snaps[name]
+            # The select goes back to the choice still shown, open, and the
+            # line says what could not be shown, in Python's words
+            assert bad["selects"]["flt-until"]["value"] == str(0 if ui is None else ui + 1), name
+            assert bad["selects"]["flt-until"]["disabled"] is False, name
+            assert bad["selects"]["flt-rebalance"]["value"] == "yes", name
+            assert bad["reacts"] == [], name
+            assert bad["text"]["flt-summary"] == data["text"]["unavailable"].format(
+                failed=self._scenario(data, 0, 1, 1, None, 1), reason=reason,
+                scenario=self._scenario(data, 0, 1, 1, None, ui)), name
+            assert bad["text"]["hdr-trades"] == snaps[shown]["text"]["hdr-trades"], name
+            # Save sends the scenario still shown, not the 7 days that failed to load
+            assert bad["buttons"]["flt-save"] is False, name
+            [opened] = snaps[click]["opened"]
+            query = save._query(data, opened)
+            save._assert_sends(data, query, 0, 1, 1)
+            assert (query["rebalance"], query["min_price_move"]) == ("on", "off"), name
+            assert query["rebalance_min_days_to_maturity"] == (
+                "0" if ui is None else str(data["maturity"][ui]["value"])), name
+        # Repaired, choosing it again works
+        good = snaps["good"]
+        assert good["selects"]["flt-until"]["value"] == "2"
+        assert good["text"]["hdr-trades"] == str(chunks[cid]["list"]["views"]["all"]["n"])
+
+    def test_a_failed_rebalance_chunk_shuts_the_select_again(self, monkeypatch, tmp_path):
+        # Rebalance yes was chosen and its chunk could not be loaded: Rebalance
+        # goes back to no, and the select it had opened shuts with it
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_until())
+        data = TestFilterPage._data(page)
+        cid = data["grid_rebalance"][0][1][1]
+        snap = self._run(tmp_path, page, [["wait"], *self.ON, ["snap", "back"]],
+                         strict=True, damaged=(f"dash-chunk-{cid}",))["back"]
+        assert snap["selects"]["flt-rebalance"]["value"] == "no"
+        assert snap["selects"]["flt-until"]["disabled"] is True
+        assert snap["selects"]["flt-until"]["value"] == "0"
+
+    def test_a_restored_choice_is_set_back_to_maturity(self, monkeypatch, tmp_path):
+        # A browser restoring a reader's last choices on reload: every one goes
+        # back to the page as rendered, and no rebalancing chunk is loaded;
+        # Rebalance yes then shows the rebalancing run at maturity
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_until())
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        snaps = self._run(tmp_path, page, [
+            ["snap", "loaded"], ["wait"], ["snap", "ready"], *self.ON, ["snap", "on"]],
+            pre=(("flt-rebalance", "yes"), ("flt-move", "2"), ("flt-until", "2")), strict=True)
+        assert snaps["loaded"]["selects"]["flt-until"]["value"] == "0"
+        ready = snaps["ready"]
+        assert ready["selects"]["flt-until"]["value"] == "0"
+        assert ready["selects"]["flt-until"]["disabled"] is True
+        assert ready["selects"]["flt-rebalance"]["value"] == "no"
+        assert ready["inflated"] == ["dash-data", "dash-chunk-0"] and ready["reacts"] == []
+        on = snaps["on"]
+        assert on["selects"]["flt-until"]["value"] == "0"
+        n = chunks[data["grid_rebalance"][0][1][1]]["list"]["views"]["all"]["n"]
+        assert on["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], self._scenario(data, 0, 1, 1), False, None, n, n, note="other_run",
+            rebalance=True)
+
+    # ─── Save ────────────────────────────────────────────────────────────────
+
+    def test_a_save_sends_the_days_shown_and_none_with_rebalance_no(self, monkeypatch, tmp_path):
+        # rebalance_min_days_to_maturity is 0 at maturity, else the choice's
+        # days, which the server reads back exactly; with Rebalance no it is
+        # 0, though the shut select still names 7 days
+        save = TestSaveLiveDefaultsButton()
+        page = save._kc(monkeypatch, tmp_path, _kc_sweep_until())
+        data = TestFilterPage._data(page)
+        assert [entry["value"] for entry in data["maturity"]] == [1, 7]
+        steps = [["wait"], *self.ON, ["click", "flt-save"], ["snap", "maturity"]]
+        for value in (1, 2):
+            steps += [*self._until(value), ["click", "flt-save"], ["snap", str(value)]]
+        steps += [*TestMoveScript._move(2), ["click", "flt-save"], ["snap", "2 at 10c"],
+                  *self.OFF, ["click", "flt-save"], ["snap", "off"]]
+        snaps = self._run(tmp_path, page, steps, strict=True)
+        app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
+        for name, yes, move, days in (("maturity", True, None, None), ("1", True, None, 1),
+                                      ("2", True, None, 7), ("2 at 10c", True, 0.10, 7),
+                                      ("off", False, None, None)):
+            snap = snaps[name]
+            assert snap["buttons"]["flt-save"] is False, name
+            [opened] = snap["opened"]
+            query = save._query(data, opened)
+            save._assert_sends(data, query, 0, 1, 1)
+            assert query["rebalance"] == ("on" if yes else "off"), name
+            assert query["rebalance_min_days_to_maturity"] == str(days or 0), name
+            raw = opened["url"].partition("?")[2]
+            response = app.handle(defaults_server._Request("GET", f"/confirm?{raw}",
+                                                           _SAVE_HOST))
+            assert response.status == 200, response.body
+            settings, _ = defaults_server._proposal(defaults_server._params(raw), None)
+            assert (settings.rebalance, settings.min_price_move,
+                    settings.rebalance_min_days_to_maturity) == (yes, move, days), name
+        # Rebalance no: the shut select still names 7 days, and the address none
+        assert snaps["off"]["selects"]["flt-until"] == {
+            **snaps["off"]["selects"]["flt-until"], "value": "2", "disabled": True}
+
+    @pytest.mark.parametrize("view", ["minimums without choices", "rebalance without minimums",
+                                      "no rebalance"])
+    def test_a_page_without_the_choices_keeps_it_shut_and_sends_no_days(
+            self, monkeypatch, tmp_path, view):
+        sweep = {"minimums without choices": _kc_sweep_move,
+                 "rebalance without minimums": _kc_sweep_rebalance,
+                 "no rebalance": _kc_sweep}[view]()
+        save = TestSaveLiveDefaultsButton()
+        page = save._kc(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        assert data["grid_maturity"] is None and data["maturity"] == []
+        # A page with no Rebalance view never opens flt-rebalance: not waited on
+        run = _run_script if view == "no rebalance" else self._run
+        snaps = run(tmp_path, page, [
+            ["snap", "loaded"], ["wait"], *self.ON, ["snap", "on"], *self._until(0),
+            ["snap", "fired"], ["click", "flt-save"], ["snap", "saved"]], strict=True)
+        for name in ("loaded", "on", "fired"):
+            select = snaps[name]["selects"]["flt-until"]
+            assert select["disabled"] is True and select["options"] == [["0", "maturity"]], name
+        # A change event on the shut select draws nothing
+        assert snaps["fired"]["reacts"] == []
+        assert snaps["fired"]["inflated"] == snaps["on"]["inflated"]
+        assert ", until" not in snaps["on"]["text"].get("flt-summary", "")
+        # ... and Save names no days: the server keeps the saved limit
+        [opened] = snaps["saved"]["opened"]
+        query = save._query(data, opened)
+        save._assert_sends(data, query, *data["primary"])
+        assert "rebalance_min_days_to_maturity" not in query
+        assert ("rebalance" in query) is (view != "no rebalance")
+
+    # ─── The explorer ────────────────────────────────────────────────────────
+
+    def test_the_bar_s_call_to_the_explorer_never_carries_the_choice(
+            self, monkeypatch, tmp_path):
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_until())
+        data = TestFilterPage._data(page)
+        spy = ("window.dashScenarioSelect = function() { var el = document.getElementById("
+               "'__spy'); var seen = el.textContent ? JSON.parse(el.textContent) : []; "
+               "seen.push(Array.prototype.slice.call(arguments)); "
+               "el.textContent = JSON.stringify(seen); };")
+        snaps = self._run(tmp_path, page, [["wait"], *self.ON, *self._until(2), *self.OFF,
+                                           ["snap", "s"]], js=spy)
+        calls = json.loads(snaps["s"]["text"]["__spy"])
+        labels = [data["bands"][0]["label"], data["ks"][1]["label"], data["caps"][1]["label"],
+                  "on"]
+        # One call per redraw, none of them naming the choice
+        assert calls == [labels, labels, labels]
+        [call] = re.findall(r"window\.dashScenarioSelect\(([^;]*)\);", dashboard._FILTER_JS)
+        assert len(re.split(r",\s*(?![^\[]*\])", call)) == 4
+        assert "SHOWN[10]" not in call and "untilSel" not in call
+
+
 class TestRebalanceEndToEnd:
     """A real Rebalance family, rendered through generate_dashboard. With the
     tier floors on it rebalances over the backtester's trimming fixture
@@ -15416,7 +15899,8 @@ class TestUntilEndToEnd:
     choice, minimum and cap, the chunk the page names (the movement view's
     where the cell is null) is the scenario a fresh simulation that adds and
     trims at that cap, minimum and choice produces, figure for figure, in
-    both settings; and the select stays shut."""
+    both settings; and the select is rendered shut, with no note (the page
+    script opens it while Rebalance is yes: TestUntilScript)."""
 
     _MOVES = TestRebalanceEndToEnd._MOVES
 
@@ -15533,9 +16017,11 @@ class TestUntilEndToEnd:
 class TestLiveRebalanceRule:
     """The page when the saved live defaults rebalance held pairs: a grey note
     by the save button on a page with the Rebalance view (saving with
-    Rebalance no turns it off), and the header line naming the choices that
-    show the rebalancing, or why the page cannot (no Rebalance view, a minimum
-    it cannot show, or rebalancing with selling)."""
+    Rebalance no turns it off), another on a page with the "Rebalance until"
+    choices when they have a days limit (saving "maturity" turns it off), and
+    the header line naming the choices that show the rebalancing, or why the
+    page cannot (no Rebalance view, a minimum or a "Rebalance until" choice it
+    cannot show, or rebalancing with selling)."""
 
     _NOTE = "; the live defaults rebalance held pairs, which this run's primary does not"
     _NOTE_10C = ("; the live defaults rebalance held pairs (only after a 10c price "
@@ -15545,6 +16031,38 @@ class TestLiveRebalanceRule:
     _NO_VIEW = " — this page has no Rebalance view"
     _NO_MOVE = " — this page cannot show that minimum price movement"
     _MOVES = [{"label": "5c", "value": 0.05}, {"label": "10c", "value": 0.1}]
+    _SHOWN_UNTIL = (' — choose Rebalance yes, Min. price movement "{}" and Rebalance until '
+                    '"{}" in the filter bar to see it')
+    _NO_UNTIL = ' — this page cannot show that "Rebalance until" choice'
+    _UNTIL = [{"label": "1 day before", "value": 1}, {"label": "7 days before", "value": 7}]
+
+    @staticmethod
+    def _note(move: str | None = None, until: str | None = None) -> str:
+        """The rebalancing note backtester._live_rebalance_note words, naming
+        a minimum ("10c") and a days limit ("7 days") when given."""
+        parts = ([] if move is None else [f"only after a {move} price move"]) + (
+            [] if until is None else [f"until {until} before maturity"])
+        after = f" ({', '.join(parts)})" if parts else ""
+        return f"; the live defaults rebalance held pairs{after}, which this run's primary does not"
+
+    @classmethod
+    def _until_view(cls, grid: list | None, *, maturity: list | None = None,
+                    suffix: str = "") -> dict:
+        """
+        The "Rebalance until" keys of a filter bar's base block, as _filter_payload ships them.
+
+        Args:
+            grid (list | None): The choices' grid ([band][k][cap] -> None, or
+                [choice][0 for no minimum, i + 1 for moves[i]] -> chunk id);
+                None for none.
+            maturity (list | None): The choices offered; None for 1 and 7 days.
+            suffix (str): Which grid: "" (tier floors on) or "_off".
+
+        Returns:
+            dict: "grid_maturity<suffix>" and "maturity".
+        """
+        return {"grid_maturity" + suffix: grid,
+                "maturity": cls._UNTIL if maturity is None else maturity}
 
     @classmethod
     def _view(cls, rebalance: list | None, move: list | None, *, moves: list | None = None,
@@ -15602,14 +16120,52 @@ class TestLiveRebalanceRule:
         page = _rb_page(monkeypatch, tmp_path, self._both(_kc_sweep()))
         assert 'id="flt-rebalance-save-note"' not in page and 'id="flt-save"' in page
 
+    def test_the_save_button_notes_that_saving_maturity_turns_a_saved_limit_off(
+            self, monkeypatch, tmp_path):
+        note = ('The live defaults rebalance until 7 days before maturity; saving with '
+                'Rebalance until "maturity" here turns that limit off.')
+        assert dashboard._until_save_note(7) == note
+        # In the live "Live settings:" line's words for each choice
+        for days in config.REBALANCE_MATURITY_DAYS[1:]:
+            assert dashboard._until_save_note(days).startswith(
+                f"The live defaults rebalance until {config._rebalance_until_text(days)};")
+
+        def between(page):
+            bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
+            return bar[bar.index('id="flt-save"'):bar.index('id="flt-trade"')]
+
+        with_view = self._both(_kc_sweep_until())
+        page = _rb_page(monkeypatch, tmp_path, dataclasses.replace(
+            with_view, live_rebalance_min_days_to_maturity=7))
+        # Right after the Rebalance note, in Python's words
+        assert re.search(r'</span>&nbsp;<span id="flt-until-save-note"[^>]*>'
+                         + re.escape(html.escape(note)) + '</span>', between(page))
+        assert between(page).index('id="flt-rebalance-save-note"') < between(page).index(
+            'id="flt-until-save-note"')
+        assert "flt-until-save-note" not in dashboard._FILTER_JS
+        # No note without a saved limit, with saved defaults that do not
+        # rebalance (or the run recorded none) ...
+        for live in ({"live_rebalance_min_days_to_maturity": None},
+                     {"live_rebalance": False, "live_rebalance_min_days_to_maturity": 7},
+                     {"live_rebalance": None, "live_rebalance_min_days_to_maturity": 7}):
+            page = _rb_page(monkeypatch, tmp_path, dataclasses.replace(with_view, **live))
+            assert 'id="flt-until-save-note"' not in page, live
+        # ... nor on a page without the choices, whose Save sends no days
+        page = _rb_page(monkeypatch, tmp_path, self._both(
+            _kc_sweep_move(), live_rebalance_min_days_to_maturity=7))
+        assert 'id="flt-until-save-note"' not in page
+        assert 'id="flt-rebalance-save-note"' in page
+
     def test_the_notes_follow_the_button_in_the_order_of_their_selects(
             self, monkeypatch, tmp_path):
-        sweep = self._both(_kc_sweep_rebalance(_kc_sweep_sell()), live_sell_at=0.85)
+        sweep = self._both(_kc_sweep_until(_kc_sweep_sell()), live_sell_at=0.85,
+                           live_rebalance_min_days_to_maturity=7)
         page = _sl_page(monkeypatch, tmp_path, sweep)
         bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
         between = bar[bar.index('id="flt-save"'):bar.index('id="flt-trade"')]
-        # Rebalance, then Sell: the bar's own order
+        # Rebalance, "Rebalance until", then Sell: the bar's own order
         assert (between.index('id="flt-rebalance-save-note"')
+                < between.index('id="flt-until-save-note"')
                 < between.index('id="flt-sell-save-note"'))
 
     # ─── The page-header line ─────────────────────────────────────────────────
@@ -15662,6 +16218,66 @@ class TestLiveRebalanceRule:
             plain = dataclasses.replace(sweep, live_rebalance=saved, live_min_price_move=move)
             text = run()._text(plain, {**run._bar(), **self._view([[[7]]], [[[None]]])})
             assert "rebalanc" not in text.lower() and "held pairs" not in text
+
+    @pytest.mark.parametrize("days", [None, 1, 7])
+    def test_the_header_names_the_rebalance_until_choice(self, days):
+        run = TestLiveRuleHeader
+        rule = config.describe_time_series_rule(True, (0.0, 1.0))
+        head = f"Live rule (saved live defaults): {rule}; {run._CAP} — this run's primary"
+        sweep = self._both(run._sweep(), live_rebalance_min_days_to_maturity=days)
+        until = None if days is None else self._UNTIL[[1, 7].index(days)]
+        named = "maturity" if until is None else until["label"]
+        note = self._note(until=None if days is None else
+                          config._rebalance_until_text(days).removesuffix(" before maturity"))
+        moved = {**run._bar(), **self._view([[[7]]], [[[None]]])}
+        # A null cell: every choice shows the movement cell, so the page shows it
+        bar = {**moved, **self._until_view([[[None]]])}
+        assert run()._text(sweep, bar) == head + note + self._SHOWN_UNTIL.format("any", named)
+        # ... and so does a cell with a chunk of its own at that choice
+        own = {**moved, **self._until_view([[[[[9, 9, 9], [9, 9, 9]]]]])}
+        assert run()._text(sweep, own).endswith(self._SHOWN_UNTIL.format("any", named))
+        # Without the choices: no limit reads as before, a limit cannot be shown
+        assert run()._text(sweep, moved) == head + note + (
+            self._SHOWN.format("any") if days is None else self._NO_UNTIL)
+        assert run()._text(sweep, {**moved, **self._until_view(None)}) == (
+            run()._text(sweep, moved))
+        if days is None:
+            return
+        # A limit the page does not offer, or holds no chunk of at the band
+        for bar in ({**moved, **self._until_view([[[None]]], maturity=[])},
+                    {**moved, **self._until_view(
+                        [[[None]]], maturity=[{"label": "3 days before", "value": 3}])},
+                    {**moved, **self._until_view([[[[[None] * 3, [None] * 3]]]])}):
+            assert run()._text(sweep, bar).endswith(self._NO_UNTIL), bar
+        # ... a chunk at the saved minimum only: shown at 10c, not with no minimum
+        ten = dataclasses.replace(sweep, live_min_price_move=0.1)
+        cell = {**moved, **self._until_view([[[[[None, None, 3], [None, None, 3]]]]])}
+        assert run()._text(ten, cell) == (
+            head + self._note("10c", config._rebalance_until_text(days).removesuffix(
+                " before maturity")) + self._SHOWN_UNTIL.format("10c", named))
+        assert run()._text(sweep, cell).endswith(self._NO_UNTIL)
+
+    def test_tiers_off_reads_the_tier_off_rebalance_until_grid(self):
+        run = TestLiveRuleHeader
+        band = (0.0, 0.5)
+        sweep = self._both(
+            run._sweep(live_tier_floors=False, live_spread_band=band,
+                       calibrations_by_band={(0.0, 1.0): None, band: None},
+                       tier_off_calibrations_by_band={(0.0, 1.0): None, band: None},
+                       tier_off_scenarios=[object()]),
+            live_rebalance_min_days_to_maturity=7)
+        bar = {**run._bar(bands=[band, (0.0, 1.0)]),
+               **self._view([[[3]], [[4]]], [[[None]], [[None]]]),
+               **self._view([[[7]], [[8]]], [[[None]], [[None]]], suffix="_off"),
+               **self._until_view([[[None]], [[None]]])}
+        for until, said in (
+                ([[[None]], [[None]]], self._SHOWN_UNTIL.format("any", "7 days before")),
+                # no chunk at 7 days with the tiers off, at the live band
+                ([[[[[1], [None]]]], [[None]]], self._NO_UNTIL),
+                # the tier-off grid is missing
+                (None, self._NO_UNTIL)):
+            view = {**bar, **self._until_view(until, suffix="_off")}
+            assert run()._text(sweep, view).endswith(said), until
 
     def test_tiers_off_at_a_binding_band_reads_the_tier_off_grids(self):
         run = TestLiveRuleHeader
@@ -15728,6 +16344,23 @@ class TestLiveRebalanceRule:
         # No Rebalance family
         page = _rb_page(monkeypatch, tmp_path, dataclasses.replace(sweep, rebalance_sweep=None))
         assert note.format(10) + "this page has no Rebalance view</p>" in page
+
+    @pytest.mark.parametrize("days", [None, 1, 7])
+    def test_the_header_of_a_whole_page_names_the_rebalance_until_choice(
+            self, monkeypatch, tmp_path, days):
+        sweep = self._both(_kc_sweep_until(), live_min_price_move=0.1, live_tier_floors=True,
+                           live_spread_band=_KC_B0, live_rebalance_min_days_to_maturity=days)
+        until = None if days is None else config._rebalance_until_text(days)
+        note = self._note("10c", None if until is None else until.removesuffix(" before maturity"))
+        label = "maturity" if until is None else until.removesuffix(" maturity")
+        page = _rb_page(monkeypatch, tmp_path, sweep)
+        assert note[2:] + self._SHOWN_UNTIL.format("10c", label) + "</p>" in page
+        # A page without the choices: a limit cannot be shown there
+        page = _rb_page(monkeypatch, tmp_path, self._both(
+            _kc_sweep_move(), live_min_price_move=0.1, live_tier_floors=True,
+            live_spread_band=_KC_B0, live_rebalance_min_days_to_maturity=days))
+        assert note[2:] + (self._SHOWN.format("10c") if days is None else self._NO_UNTIL) + (
+            "</p>") in page
 
 
 class TestNoHalfRebalancing:

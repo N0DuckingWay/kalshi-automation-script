@@ -155,6 +155,14 @@ TERMS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
      "Every top-up or sale pays fees, so this shows whether acting on small price "
      "moves is worth it.",
      _BACKTEST),
+    ("Rebalance until",
+     "Used only with Rebalance yes. Holds back trims and add-ons when the position's "
+     "later market matures within the days chosen: a held pair is topped up or sold "
+     "down only while its later market closes at least that many days after the run, "
+     "counted in whole days on Kalshi's UTC dates. maturity: no days limit.",
+     "A top-up or sale close to payout has little time left to pay off its fees, so "
+     "this shows whether leaving a position alone in its last days does better.",
+     _BACKTEST),
     ("Fills",
      "Whether a trade was priced by walking a modeled order book, whose depth comes "
      "from saved snapshots, or at the top-of-book price in any size.",

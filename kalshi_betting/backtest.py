@@ -253,9 +253,9 @@ Notes:
     trimmed only while its later market closes at least that many days
     away, at every minimum price movement too. They are simulated only
     when a report reads them (RebalanceSweep.maturity_grid); the dashboard
-    reads every one as it is built, but keeps its "Rebalance until" select
-    shut for now. --no-maturity-sweep skips them and still builds Rebalance
-    itself; --no-rebalance-sweep skips them too.
+    reads every one as it is built, for its "Rebalance until" select.
+    --no-maturity-sweep skips them (that select then stays shut) and still
+    builds Rebalance itself; --no-rebalance-sweep skips them too.
 
     Every full run saves what it hands generate_dashboard, right after the
     sweep and before the page is built, in config.BACKTEST_SWEEP_FILENAME in
@@ -1489,7 +1489,8 @@ def _build_parser() -> argparse.ArgumentParser:
              "yes, add to or trim a held position only while its later market closes "
              "at least a chosen number of days away, config.REBALANCE_MATURITY_DAYS); "
              "Rebalance itself is still built. Their simulations would run only while the "
-             "dashboard is built, and the page does not offer that select yet. "
+             "dashboard is built; skipping them leaves the page's \"Rebalance until\" select "
+             "shut. "
              "Backtest only — a live run holds its rebalancing back near maturity by "
              "its own saved rebalance_min_days_to_maturity (main.py "
              "--rebalance-min-days-to-maturity for one run)",
