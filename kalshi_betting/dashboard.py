@@ -114,8 +114,8 @@ Purpose:
     When that family carries minimum price movements
     (backtester.RebalanceSweep.min_moves: add to or trim a held pair only
     once its total price has moved that far, up or down, since the last
-    trade on it), the walk's last phase reads every Rebalance scenario at
-    each of them (_walk_move_cells, through RebalanceSweep.move_grid, which
+    trade on it), the walk then reads every Rebalance scenario at each of
+    them (_walk_move_cells, through RebalanceSweep.move_grid, which
     simulates only the runs that differ). A run of its own is packed as a
     chunk; a run that repeats another stores that run's chunk id. The base
     block carries the minimums ("moves") and, per scenario, each minimum's
@@ -128,6 +128,21 @@ Purpose:
     them says why in a short note beside it. Like Rebalance it changes the
     trade sections and the header's trade count only, and Sell stays shut at
     any minimum.
+
+    When the family also carries "Rebalance until" choices
+    (backtester.RebalanceSweep.maturity_days: add to or trim a held position
+    only while its later market closes at least that many days after the
+    run), the walk's last phase reads every Rebalance scenario at each
+    choice and each minimum (_walk_maturity_cells, through
+    RebalanceSweep.maturity_grid, which starts from the runs already read
+    and simulates only the runs that differ). A run of its own is packed as
+    a chunk; a run that repeats another stores that run's chunk id. The
+    base block carries the choices ("maturity") and, per scenario, a chunk
+    id per choice and minimum ("grid_maturity" and its tier-floors-off
+    twin), where a null cell means every choice shows the movement view's
+    cell. The bar's "Rebalance until" select, right after Min. price
+    movement, names "maturity" and each choice; it is on every page and
+    always shut, since the page script does not read it yet.
 
     The bar's Sell choice is "no selling" (the page as rendered) or one of the
     sell family's levels (backtester.SellSweep; config.TAKE_PROFIT_LEVELS,
@@ -247,13 +262,15 @@ Dependencies:
     backtester.CapSweep), sell_sweep (a backtester.SellSweep) and
     rebalance_sweep (a backtester.RebalanceSweep, whose move_grid hands back
     a backtester.SameMove for a minimum price movement that repeats another
-    run) by their attributes; imports backtester itself to
+    run, and whose maturity_grid a backtester.SameMaturity for a "Rebalance
+    until" choice that does) by their attributes; imports backtester itself to
     read, and in a worker process install, its SAME_TITLE_SIZE_CAP,
     SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS (_run_sell_task; the last also
     names the Sell select's rule, _sell_select_title), to read its
     REBALANCE_MIN_DAYS_SINCE_TRADE (named in the Rebalance select's hover
-    text, _rebalance_select_title), and to word a minimum price movement as
-    a run's label does (_move_label) — and
+    text, _rebalance_select_title), and to word a minimum price movement and
+    a "Rebalance until" choice as a run's label does (_move_label,
+    _until_label) — and
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT, DASHBOARD_FILENAME (the
     page's file name, which defaults_server opens when run on its own and
     live_dashboard serves as its Backtest tab), DASHBOARD_FILES_DIRNAME
@@ -401,9 +418,10 @@ Notes:
     `off` method; a band the tiers never bind at reuses its tier-on chunks,
     so nothing is simulated twice), then the Rebalance cells
     (_GridSource.rebalance_cell and rebalance_off_cell, handed to the
-    visitors that define a `rebalance` method: the chunk visitor) and their
+    visitors that define a `rebalance` method: the chunk visitor), their
     minimum price movements (move_cell, to the visitors with a `move`
-    method) — by
+    method) and their "Rebalance until" choices (maturity_cell, to the
+    visitors with a `maturity` method) — by
     visitors that keep only what they
     build (the Sell select's cells are not walked: _build_sell_grid simulates
     them afterwards, in worker processes, over the grid the walk walked):
@@ -578,6 +596,7 @@ from .backtester import (
     CorpusProvenance,
     IntervalCalibration,
     OutcomeLabelCoverage,
+    SameMaturity,
     SameMove,
     SameSale,
     SweepPoint,
@@ -6999,6 +7018,60 @@ def _move_phrase(move: float) -> str:
     return _backtester._move_label(move)
 
 
+# The "Rebalance until" select after Min. price movement: its first option (no
+# days limit: the run of the movement cell itself; the others are
+# _until_option's, one per choice the base block names), its hover text, and
+# the note beside it when the page shows Rebalance without the choices, by the
+# payload's "maturity_state"
+_UNTIL_OPTION_MATURITY = "maturity"
+_UNTIL_TITLE = (
+    "Used only while Rebalance is yes. Holds back trims and add-ons when the position's later "
+    "market matures within that many days: a held pair is topped up or sold down only while "
+    "its later market (for a held market whose partner has paid out, its own market) closes "
+    "at least that many days after the run, counted in whole days on Kalshi's UTC dates. "
+    "maturity: no days limit.")
+_UNTIL_NOTES = {
+    "not simulated": "(not simulated in this backtest)",
+    "unavailable": "(not available on this page; see the log)",
+}
+
+
+def _until_option(days: int) -> str:
+    """
+    Name a "Rebalance until" choice as the select's option does.
+
+    The words of the live "Live settings:" line (config._rebalance_until_text)
+    without its last word, "maturity", which the select's first option names
+    on its own. The base block ships it as each choice's "label"
+    (_filter_payload's "maturity").
+
+    Args:
+        days (int): A choice of RebalanceSweep.maturity_days (whole days, 1 or more).
+
+    Returns:
+        str: "1 day before" for 1, else "<days> days before".
+    """
+    return f"{days} day{'' if days == 1 else 's'} before"
+
+
+def _until_phrase(days: int) -> str:
+    """
+    Name a "Rebalance until" choice as it follows the Rebalance phrase in a scenario's summary.
+
+    The words are the backtester's own (backtester._until_label), so the
+    page names a run as that run's log line does. The base block ships it as
+    each choice's "phrase".
+
+    Args:
+        days (int): A choice of RebalanceSweep.maturity_days.
+
+    Returns:
+        str: ", until <days> days before maturity", e.g. ", until 7 days
+            before maturity" (", until 1 day before maturity" for 1).
+    """
+    return _backtester._until_label(days)
+
+
 # Beside the save button on a page with the Rebalance view, when the saved
 # live defaults rebalance (live_rebalance is on): saving from the bar sends the
 # choice shown, and Rebalance no turns it off in the defaults
@@ -7873,6 +7946,31 @@ class _GridSource:
             "reused" and "same" counts move_cell's reads have added up for
             that setting, read only for the walk's log; empty until a cell
             is read.
+        maturity_days (tuple[int, ...]): The "Rebalance until" choices the
+            Rebalance family covers besides "maturity"
+            (backtester.RebalanceSweep.maturity_days), whole days,
+            ascending: with one, a held position is topped up or sold down
+            only while its later market closes at least that many days after
+            the run. Empty when the family carries none, or the page has no
+            Rebalance view.
+        maturity_cell: Callable (band, k, tier floors off, starts) -> an
+            iterator of (choice, minimum price movement or None, {cap:
+            SweepPoint | SameMaturity}): every choice of maturity_days,
+            ascending, and in each no minimum then every minimum of moves,
+            ascending (backtester.RebalanceSweep.maturity_grid over the caps
+            `starts` names). `starts` is {cap: {minimum or None: (moves, days
+            left)}}, the records of that cell's runs at "maturity" (the
+            Rebalance run and each minimum's), so none is simulated again. A
+            SweepPoint is the "all" point of a run simulated at that choice
+            and minimum; a SameMaturity(m, None) says the cap's run is the
+            run at "maturity" with minimum m (the Rebalance run for None),
+            and a SameMaturity(m, d) that it is the point yielded earlier at
+            choice d and minimum m. The runs are simulated as the iterator
+            is read, so it may raise. None without maturity_days.
+        maturity_stats (dict): Tier floors off (bool) -> the "simulated",
+            "reused" and "same" counts maturity_cell's reads have added up
+            for that setting, read only for the walk's log; empty until a
+            cell is read.
     """
     bands: tuple
     ks: tuple
@@ -7899,6 +7997,9 @@ class _GridSource:
     moves: tuple[float, ...] = ()
     move_cell: Callable | None = None
     move_stats: dict = field(default_factory=dict)
+    maturity_days: tuple[int, ...] = ()
+    maturity_cell: Callable | None = None
+    maturity_stats: dict = field(default_factory=dict)
 
 
 def _primary_calibration(sweep: BacktestSweep | None) -> IntervalCalibration | None:
@@ -8151,7 +8252,11 @@ def _with_rebalance(source: "_GridSource", sweep: BacktestSweep | None) -> "_Gri
     (the family's move_grid over the grid's caps), whose counts add up in
     move_stats for the walk's log. A family without them, or a stand-in
     with no such attribute, gets no reader: moves stays empty and move_cell
-    None.
+    None. A family that carries "Rebalance until" choices (its
+    maturity_days) gives the grid those and maturity_cell, the reader of one
+    cell at every choice and minimum (the family's maturity_grid), whose
+    counts add up in maturity_stats; one without them, or a stand-in with no
+    such attribute, gets no such reader either.
 
     The grid's off_fallback (the eager tier-off lookup the walk swaps in when
     a tier-floors-off cell fails) is re-wrapped to keep the family, so the
@@ -8166,8 +8271,8 @@ def _with_rebalance(source: "_GridSource", sweep: BacktestSweep | None) -> "_Gri
         _GridSource: The source itself when there is no family, no band or
             no fit; else a copy carrying rebalance_cell (and
             rebalance_off_cell), their sweeps, the events the family's trades
-            can carry and, when the family covers minimum price movements,
-            those and their reader.
+            can carry and, when the family covers minimum price movements
+            or "Rebalance until" choices, those and their readers.
     """
     family = getattr(sweep, "rebalance_sweep", None) if sweep is not None else None
     if family is None or source.bands == (None,):
@@ -8186,6 +8291,8 @@ def _with_rebalance(source: "_GridSource", sweep: BacktestSweep | None) -> "_Gri
             # The minimum price movements the family covers: none on a family
             # built without them, or on a stand-in with no such attribute
             moves = tuple(getattr(family, "min_moves", ()) or ())
+            # ... and its "Rebalance until" choices, read the same way
+            days = tuple(getattr(family, "maturity_days", ()) or ())
     except Exception:
         logging.warning("The Rebalance simulations could not be read; the filter bar's "
                         "Rebalance select stays disabled", exc_info=True)
@@ -8267,9 +8374,37 @@ def _with_rebalance(source: "_GridSource", sweep: BacktestSweep | None) -> "_Gri
         return family.move_grid(band, k, tier_floors=not off, caps=source.caps,
                                 start=start, stats=move_stats.setdefault(off, {}))
 
+    # The same for its "Rebalance until" choices
+    maturity_stats: dict = {}
+
+    def maturity_cell(band, k, off, starts):
+        """
+        One (band, k)'s rebalancing runs at every "Rebalance until" choice and minimum, at the caps it has records for.
+
+        Args:
+            band: The cell's band.
+            k: The cell's k.
+            off: Whether the tier floors are off (a band the tiers bind at).
+            starts: {cap: {minimum or None: (moves, days left)}}, the records
+                of the cell's runs at "maturity", which the walk has already
+                read. A cap left out (one with no rebalancing point) is not
+                read.
+
+        Returns:
+            Iterator: (choice, minimum, {cap: SweepPoint | SameMaturity}) per
+                choice and minimum, ascending
+                (backtester.RebalanceSweep.maturity_grid). A run is simulated
+                when its step is read, so reading it may raise.
+        """
+        return family.maturity_grid(band, k, tier_floors=not off,
+                                    caps=[cap for cap in source.caps if cap in starts],
+                                    starts=starts, stats=maturity_stats.setdefault(off, {}))
+
     fields = {"rebalance_cell": rebalance_cell, "rebalance_off_cell": rebalance_off_cell,
               "rebalance_sweeps": sweeps, "events": source.events | found, "moves": moves,
-              "move_cell": move_cell if moves else None, "move_stats": move_stats}
+              "move_cell": move_cell if moves else None, "move_stats": move_stats,
+              "maturity_days": days, "maturity_cell": maturity_cell if days else None,
+              "maturity_stats": maturity_stats}
     attached = dataclasses.replace(source, **fields)
     if source.off_fallback is None:
         return attached
@@ -8909,7 +9044,7 @@ def _walk_off_cells(source: _GridSource, off_takers: list, axis_end: pd.Timestam
 
 def _walk_rebalance_cells(source: _GridSource, takers: list,
                           axis_end: pd.Timestamp | None,
-                          starts: dict | None = None) -> Exception | None:
+                          records: dict | None = None) -> Exception | None:
     """
     Hand every Rebalance scenario of a grid to the visitors that take it.
 
@@ -8923,21 +9058,25 @@ def _walk_rebalance_cells(source: _GridSource, takers: list,
     page's own trades are never substituted: a rebalancing run is always
     its own simulation.
 
-    With `starts`, each cell also leaves behind what its minimum price
-    movements start from: per cap, how far the pair's price had moved before
-    each add-on and each trim that cap's run made (SweepPoint.moves).
-    _walk_move_cells reads the cells back in this order, and hands each
-    cell's entry to RebalanceSweep.move_grid so the run with no minimum is
-    not simulated twice.
+    With `records`, each cell also leaves behind what its minimum price
+    movements and "Rebalance until" choices start from: per cap, how far the
+    pair's price had moved before each add-on and each trim that cap's run
+    made (SweepPoint.moves) and how many days its position's later market
+    had left (SweepPoint.rebalance_days_left). _walk_move_cells and
+    _walk_maturity_cells read the cells back in this order, and hand them to
+    the family so the run with no minimum is not simulated twice. They are
+    tuples the points held, never the points: only one cell's points are
+    alive at a time.
 
     Args:
         source (_GridSource): The grid (its rebalance_cell is not None).
         takers (list): The visitors with a `rebalance` method.
         axis_end (pd.Timestamp | None): The page's last date.
-        starts (dict | None): Filled, when given, with (tier floors off, band
-            index, k index) -> {cap: the moves of that cap's "all" point} for
-            every cell read, in the order read (a cap without an "all" point
-            is left out). None (default) records nothing.
+        records (dict | None): Filled, when given, with (tier floors off,
+            band index, k index) -> {cap: {None: (moves, days left) of that
+            cap's "all" point}} for every cell read, in the order read (a cap
+            without an "all" point is left out). None (default) records
+            nothing.
 
     Returns:
         Exception | None: The exception a cell raised, which stops this
@@ -8960,12 +9099,12 @@ def _walk_rebalance_cells(source: _GridSource, takers: list,
             except Exception as exc:
                 return exc
             by_cap = _cut_to_axis(by_cap, axis_end)
-            if starts is not None:
-                # The moves behind each cap's add-ons and trims: where its
-                # minimums start
-                starts[(off, bi, ki)] = {
-                    cap: pops[_ALL_VIEW].moves for cap, pops in by_cap.items()
-                    if pops.get(_ALL_VIEW) is not None}
+            if records is not None:
+                # The moves and days left behind each cap's add-ons and trims:
+                # where its minimums and "Rebalance until" choices start
+                records[(off, bi, ki)] = {
+                    cap: {None: (pops[_ALL_VIEW].moves, pops[_ALL_VIEW].rebalance_days_left)}
+                    for cap, pops in by_cap.items() if pops.get(_ALL_VIEW) is not None}
             for ci in caps:
                 pops = by_cap.get(source.caps[ci])
                 if pops:
@@ -8983,33 +9122,41 @@ def _walk_rebalance_cells(source: _GridSource, takers: list,
 
 
 def _walk_move_cells(source: _GridSource, takers: list,
-                     axis_end: pd.Timestamp | None, starts: dict) -> Exception | None:
+                     axis_end: pd.Timestamp | None, records: dict) -> Exception | None:
     """
     Hand every minimum price movement of every Rebalance scenario to the visitors that take it.
 
-    The cells are the ones the Rebalance walk read (the keys of `starts`),
+    The cells are the ones the Rebalance walk read (the keys of `records`),
     in the same order: each Tier floors setting in turn, one (band, k) at a
-    time. A cell is read one minimum at a time (source.move_cell — the
-    family simulates the runs that differ as each step is read), ascending.
-    At each minimum every simulated point's curve is cut to the page's axis
-    (_cut_to_axis) and every cap's entry — the cut point, or the SameMove
-    naming the run that cap repeats — is handed to each visitor's move(band
-    index, k index, cap index, minimum index, entry, off=...), the primary
-    cap first. Only one minimum's points are alive at a time. A cell in
-    which the Rebalance walk found no point has no minimum to read and is
-    passed over.
+    time. A cell is read one minimum at a time (source.move_cell, started
+    from the moves the Rebalance walk recorded — the family simulates the
+    runs that differ as each step is read), ascending. At each minimum every
+    simulated point's curve is cut to the page's axis (_cut_to_axis) and
+    every cap's entry — the cut point, or the SameMove naming the run that
+    cap repeats — is handed to each visitor's move(band index, k index, cap
+    index, minimum index, entry, off=...), the primary cap first. Only one
+    minimum's points are alive at a time. A cell in which the Rebalance walk
+    found no point has no minimum to read and is passed over.
+
+    On a grid with "Rebalance until" choices (source.maturity_cell), each
+    minimum's records join the cell's in `records`, for _walk_maturity_cells
+    to start from: a simulated point's own (moves, days left), and for a
+    SameMove the records of the run it names (the Rebalance run's for
+    SameMove(None), else the records already kept for the minimum it
+    names). They are the tuples the points held, never the points.
 
     Args:
         source (_GridSource): The grid (its move_cell is not None).
         takers (list): The visitors with a `move` method.
         axis_end (pd.Timestamp | None): The page's last date.
-        starts (dict): (tier floors off, band index, k index) -> {cap: the
-            moves of that cell's rebalancing point}, as
-            _walk_rebalance_cells recorded it.
+        records (dict): (tier floors off, band index, k index) -> {cap:
+            {None: (moves, days left) of that cell's rebalancing point}}, as
+            _walk_rebalance_cells recorded it; with maturity_cell, filled
+            here with each minimum's records under that minimum.
 
     Returns:
         Exception | None: The exception reading a cell raised, which stops
-            this phase — a run that could not be simulated, a `start` the
+            this phase — a run that could not be simulated, a start the
             family refuses (a cap with no point, or a point that records no
             moves), or a minimum the grid does not name; None when every
             cell was visited, or when every visitor had failed and the rest
@@ -9018,22 +9165,35 @@ def _walk_move_cells(source: _GridSource, takers: list,
     pc = source.primary[2]
     caps = [pc] + [ci for ci in range(len(source.caps)) if ci != pc]
     places = {move: mi for mi, move in enumerate(source.moves)}
+    # Each minimum's records are kept only for a grid whose choices read them
+    keep = source.maturity_cell is not None
     # Each setting's cells, in the order the Rebalance walk read them
     settings: dict[bool, list] = {}
-    for (off, bi, ki), start in starts.items():
-        settings.setdefault(off, []).append((bi, ki, start))
+    for (off, bi, ki), by_cap in records.items():
+        settings.setdefault(off, []).append((bi, ki, by_cap))
     for off, cells in settings.items():
         step = max(1, math.ceil(len(cells) / _WALK_PROGRESS_LINES))
-        for done, (bi, ki, start) in enumerate(cells, 1):
+        for done, (bi, ki, kept) in enumerate(cells, 1):
             if all(getattr(visit, "failed", False) for visit in takers):
                 # A visitor that has failed keeps nothing it is handed, so
                 # no further run is simulated for it
                 return None
+            # The Rebalance run's moves, per cap: where the minimums start
+            start = {cap: by_min[None][0] for cap, by_min in kept.items()}
             try:
                 steps = (source.move_cell(source.bands[bi], source.ks[ki], off, start)
                          if start else ())
                 for move, by_cap in steps:
                     mi = places[move]
+                    if keep:
+                        # A repeat's records are those of the run it names. Read
+                        # in one comprehension, so no name here still holds the
+                        # last cap's point while the next minimum is simulated
+                        found = {cap: (kept[cap][entry.min_move] if isinstance(entry, SameMove)
+                                       else (entry.moves, entry.rebalance_days_left))
+                                 for cap, entry in by_cap.items()}
+                        for cap, record in found.items():
+                            kept[cap][move] = record
                     # A SameMove holds no curve: only the simulated points are cut
                     cut = _cut_to_axis({cap: {_ALL_VIEW: entry} for cap, entry in by_cap.items()
                                         if not isinstance(entry, SameMove)}, axis_end)
@@ -9061,10 +9221,95 @@ def _walk_move_cells(source: _GridSource, takers: list,
     return None
 
 
+def _walk_maturity_cells(source: _GridSource, takers: list,
+                         axis_end: pd.Timestamp | None, records: dict) -> Exception | None:
+    """
+    Hand every "Rebalance until" choice of every Rebalance scenario, at every minimum price movement, to the visitors that take it.
+
+    The cells are the ones the Rebalance walk read (the keys of `records`),
+    in the same order: each Tier floors setting in turn, one (band, k) at a
+    time. A cell is read one (choice, minimum) at a time (source.maturity_cell,
+    handed the records of the cell's runs at "maturity", so none of them is
+    simulated again — the family simulates the runs that differ as each step
+    is read): each choice ascending, and in each no minimum, then every
+    minimum ascending. At each step every simulated point's curve is cut to
+    the page's axis (_cut_to_axis) and every cap's entry — the cut point, or
+    the SameMaturity naming the run that cap repeats — is handed to each
+    visitor's maturity(band index, k index, cap index, choice index, minimum
+    place, entry, off=...), the primary cap first; the minimum's place is 0
+    for no minimum and i + 1 for source.moves[i]. Only one step's points are
+    alive at a time. A cell in which the Rebalance walk found no point has
+    nothing to read and is passed over.
+
+    Args:
+        source (_GridSource): The grid (its maturity_cell is not None).
+        takers (list): The visitors with a `maturity` method.
+        axis_end (pd.Timestamp | None): The page's last date.
+        records (dict): (tier floors off, band index, k index) -> {cap:
+            {minimum or None: (moves, days left)}}, as _walk_rebalance_cells
+            and _walk_move_cells recorded them: every minimum of
+            source.moves, for every cap the cell has a point at.
+
+    Returns:
+        Exception | None: The exception reading a cell raised, which stops
+            this phase — a run that could not be simulated, records the
+            family refuses (a minimum missing, or a point that records no
+            days left), or a choice or minimum the grid does not name; None
+            when every cell was visited, or when every visitor had failed
+            and the rest were left unread.
+    """
+    pc = source.primary[2]
+    caps = [pc] + [ci for ci in range(len(source.caps)) if ci != pc]
+    choices = {days: di for di, days in enumerate(source.maturity_days)}
+    places = {None: 0, **{move: mi + 1 for mi, move in enumerate(source.moves)}}
+    # Each setting's cells, in the order the Rebalance walk read them
+    settings: dict[bool, list] = {}
+    for (off, bi, ki), by_cap in records.items():
+        settings.setdefault(off, []).append((bi, ki, by_cap))
+    for off, cells in settings.items():
+        step = max(1, math.ceil(len(cells) / _WALK_PROGRESS_LINES))
+        for done, (bi, ki, starts) in enumerate(cells, 1):
+            if all(getattr(visit, "failed", False) for visit in takers):
+                # A visitor that has failed keeps nothing it is handed, so
+                # no further run is simulated for it
+                return None
+            try:
+                steps = (source.maturity_cell(source.bands[bi], source.ks[ki], off, starts)
+                         if starts else ())
+                for days, move, by_cap in steps:
+                    di, mi = choices[days], places[move]
+                    # A SameMaturity holds no curve: only the simulated points are cut
+                    cut = _cut_to_axis({cap: {_ALL_VIEW: entry} for cap, entry in by_cap.items()
+                                        if not isinstance(entry, SameMaturity)}, axis_end)
+                    entries = {cap: cut[cap][_ALL_VIEW] if cap in cut else entry
+                               for cap, entry in by_cap.items()}
+                    del by_cap, cut
+                    for ci in caps:
+                        if source.caps[ci] in entries:
+                            for visit in takers:
+                                visit.maturity(bi, ki, ci, di, mi, entries[source.caps[ci]],
+                                               off=off)
+                    # One step's points at a time: gone before the next is simulated
+                    del entries
+            except Exception as exc:
+                return exc
+            if done % step == 0 or done == len(cells):
+                counts = source.maturity_stats.get(off, {})
+                logging.info("Dashboard: %d/%d %s read from the \"Rebalance until\" "
+                             "choices%s (%d cap points simulated, %d shared across caps, %d "
+                             "the same run as fewer days or a lower minimum so far)",
+                             done, len(cells),
+                             "binding band x k cells" if off else "band x k cells",
+                             " with the tier floors off" if off else "",
+                             counts.get("simulated", 0), counts.get("reused", 0),
+                             counts.get("same", 0))
+    return None
+
+
 def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | None
                ) -> tuple[Exception | None, _GridSource]:
     """
-    Hand every scenario of a grid to each visitor: tier-on, tier-off, rebalancing, price movements, same-title.
+    Hand every scenario of a grid to each visitor: tier-on, tier-off, rebalancing, price movements, "Rebalance until", same-title.
 
     First the tier-on cells (_walk_cells: the primary cell and cap first, so
     the primary scenario's chunk is always chunk 0, one cell alive at a
@@ -9089,17 +9334,28 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
     `rebalance` method that has not failed), every rebalancing cell is
     walked (_walk_rebalance_cells). One that raises costs that choice alone:
     ONE WARNING (with the traceback), the grid returned without the family
-    (its minimum price movements with it), and every taker's rebalancing
-    state dropped (`reset_rebalance(grid)`, on the visitors that define it),
-    so every other choice keeps the chunks and grids it built. Then, when
-    the family carries minimum price movements (source.move_cell) and its
-    cells were walked, every one of those cells is read again at each
-    minimum for the visitors with a `move` method (_walk_move_cells). These
-    are the last cells to pack a chunk, so dropping what they packed cuts
-    into nothing else: a cell that raises there costs the minimum price
-    movements alone — ONE WARNING (with the traceback), the grid returned
-    without them, and `reset_move(grid)` on each taker — while the Rebalance
-    view keeps its chunks and grids.
+    (its minimum price movements and "Rebalance until" choices with it),
+    and every taker's rebalancing state dropped (`reset_rebalance(grid)`, on
+    the visitors that define it), so every other choice keeps the chunks
+    and grids it built. Then, when the family carries minimum price
+    movements (source.move_cell) and its cells were walked, every one of
+    those cells is read again at each minimum for the visitors with a `move`
+    method (_walk_move_cells). A cell that raises there costs the minimum
+    price movements and the "Rebalance until" choices, which start from
+    them — ONE WARNING (with the traceback), the grid returned without
+    either, and `reset_move(grid)` on each taker — while the Rebalance view
+    keeps its chunks and grids. Then, when the family carries "Rebalance
+    until" choices (source.maturity_cell), its cells were walked and so
+    were their minimums (if it has any), every one of those cells is read
+    again at each choice and minimum for the visitors with a `maturity`
+    method (_walk_maturity_cells). These are the last cells to pack a
+    chunk, so dropping what they packed cuts into nothing else: a cell that
+    raises there costs the choices alone — ONE WARNING (with the traceback),
+    the grid returned without them, and `reset_maturity(grid)` on each taker
+    — while the Rebalance and Min. price movement views keep their chunks
+    and grids. A grid whose choices were not read to the end, for any
+    reason, is returned without them, so no page shows a view of them that
+    was never built.
     Last, when some visitor shows it (one with a
     same_title method), the band- and k-independent same-title population is
     read once
@@ -9122,7 +9378,11 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
             rebalance() built — and, beside it, a move(band index, k index,
             cap index, minimum index, SweepPoint | SameMove, off=bool) method
             taking each minimum price movement of those cells, with a
-            reset_move(grid) method dropping what move() built.
+            reset_move(grid) method dropping what move() built — and a
+            maturity(band index, k index, cap index, choice index, minimum
+            place, SweepPoint | SameMaturity, off=bool) method taking each
+            "Rebalance until" choice of those cells, with a
+            reset_maturity(grid) method dropping what maturity() built.
         axis_end (pd.Timestamp | None): The page's last date.
 
     Returns:
@@ -9131,7 +9391,8 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
             the walk, else None; and the grid walked — the source, its
             off_fallback when the tier-off size-cap sweep could not be read,
             and without the Rebalance family, or that family's minimum price
-            movements, when it could not be simulated.
+            movements or "Rebalance until" choices, when it could not be
+            simulated.
     """
     error = _walk_cells(source, visitors, axis_end)
     if error is not None:
@@ -9157,38 +9418,71 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
     # not simulated for it
     rebalance_takers = [visit for visit in visitors
                         if hasattr(visit, "rebalance") and not getattr(visit, "failed", False)]
-    # What each Rebalance cell's minimum price movements start from, filled as
-    # those cells are walked; None on a grid that carries no minimum
-    starts: dict | None = {} if source.move_cell is not None else None
+    # What each Rebalance cell's minimum price movements and "Rebalance until"
+    # choices start from, filled as those cells (and then their minimums) are
+    # walked; None on a grid that carries neither
+    records: dict | None = ({} if (source.move_cell is not None
+                                   or source.maturity_cell is not None) else None)
+    # The grid without the "Rebalance until" choices: no reader, no counts
+    no_choices = {"maturity_days": (), "maturity_cell": None, "maturity_stats": {}}
     if source.rebalance_cell is not None and rebalance_takers:
-        error = _walk_rebalance_cells(source, rebalance_takers, axis_end, starts)
+        error = _walk_rebalance_cells(source, rebalance_takers, axis_end, records)
         if error is not None:
-            # Costs the Rebalance view alone; the minimum price movements are
-            # part of that view and go with it
+            # Costs the Rebalance view alone; the minimum price movements and
+            # the "Rebalance until" choices are part of that view and go with it
             logging.warning("A Rebalance simulation failed; the filter bar's Rebalance select "
                             "stays disabled", exc_info=error)
             source = dataclasses.replace(source, rebalance_cell=None, rebalance_off_cell=None,
                                          rebalance_sweeps={}, moves=(), move_cell=None,
-                                         move_stats={})
+                                         move_stats={}, **no_choices)
             for visit in rebalance_takers:
                 reset_rebalance = getattr(visit, "reset_rebalance", None)
                 if reset_rebalance is not None:
                     reset_rebalance(source)
-    # The last cells to pack a chunk, so dropping them cuts into nothing else.
     # A visitor that failed while it took the Rebalance cells takes none
     move_takers = [visit for visit in rebalance_takers
                    if hasattr(visit, "move") and not getattr(visit, "failed", False)]
+    # Whether every minimum's records are in hand (a grid with no minimum has
+    # none to read)
+    moved = source.move_cell is None
     if source.rebalance_cell is not None and source.move_cell is not None and move_takers:
-        error = _walk_move_cells(source, move_takers, axis_end, starts)
+        error = _walk_move_cells(source, move_takers, axis_end, records)
         if error is not None:
-            # Costs the Min. price movement view alone: Rebalance keeps what it built
+            # Costs the Min. price movement view, and the "Rebalance until"
+            # choices that start from its runs: Rebalance keeps what it built
             logging.warning("A Rebalance price-movement simulation failed; the filter bar's "
                             "Min. price movement select stays disabled", exc_info=error)
-            source = dataclasses.replace(source, moves=(), move_cell=None, move_stats={})
+            source = dataclasses.replace(source, moves=(), move_cell=None, move_stats={},
+                                         **no_choices)
             for visit in move_takers:
                 reset_move = getattr(visit, "reset_move", None)
                 if reset_move is not None:
                     reset_move(source)
+        else:
+            moved = True
+    # The last cells to pack a chunk, so dropping them cuts into nothing else
+    maturity_takers = [visit for visit in move_takers
+                       if hasattr(visit, "maturity") and not getattr(visit, "failed", False)]
+    chosen = False
+    if (source.rebalance_cell is not None and source.maturity_cell is not None and moved
+            and maturity_takers):
+        error = _walk_maturity_cells(source, maturity_takers, axis_end, records)
+        if error is None:
+            # Read to the end, unless every taker failed and the rest was left unread
+            chosen = not all(getattr(visit, "failed", False) for visit in maturity_takers)
+        else:
+            # Costs the "Rebalance until" data alone: Rebalance and Min. price
+            # movement keep what they built
+            logging.warning('A "Rebalance until" simulation failed; the filter bar\'s '
+                            '"Rebalance until" select stays disabled', exc_info=error)
+    if source.maturity_cell is not None and not chosen:
+        # Choices that were not read to the end (a failure, or no visitor left
+        # to read them) leave the page no view of them
+        source = dataclasses.replace(source, **no_choices)
+        for visit in visitors:
+            reset_maturity = getattr(visit, "reset_maturity", None)
+            if reset_maturity is not None:
+                reset_maturity(source)
     takers = [visit for visit in visitors if hasattr(visit, "same_title")]
     if takers:
         # Never raises: a failure falls back to the run's own point
@@ -9217,9 +9511,10 @@ def _walk_grid(source: _GridSource, visitors: list,
     view's other caps, recovered inside the walk (_walk_once, off_fallback),
     with the tier-on cap axis kept. One walk reads, in order, the tier-on
     cells, the tier-floors-off ones, the Rebalance ones, each Rebalance
-    cell's minimum price movements, and the same-title population
-    (_walk_once); a Rebalance or price-movement cell that raises costs its
-    own view alone, inside the walk.
+    cell's minimum price movements, then its "Rebalance until" choices, and
+    the same-title population (_walk_once); a Rebalance, price-movement or
+    "Rebalance until" cell that raises costs its own view alone (and the
+    views read after it from its runs), inside the walk.
     (The size-cap sweep's same-title
     population costs less still: only the same-title rows at the other caps
     — _same_title_points.) The fallback grid carries the same
@@ -10073,8 +10368,8 @@ class _ChunkVisitor:
     non-binding band's row with its rebalancing tier-on chunk ids, as
     off_grid() does. Should a rebalancing cell fail to simulate,
     reset_rebalance() drops every chunk and row head packed for those cells
-    (and for their minimum price movements, packed after them) and their
-    grids, leaving everything else as it was.
+    (and for their minimum price movements and "Rebalance until" choices,
+    packed after them) and their grids, leaving everything else as it was.
 
     Each minimum price movement of a Rebalance cell the walk hands to `move`
     is filed in grids_move, one chunk id per minimum: a run simulated at
@@ -10082,9 +10377,22 @@ class _ChunkVisitor:
     at an equal k), and a run that repeats another (backtester.SameMove)
     stores that run's id with nothing packed. move_grid() and
     move_off_grid() read those grids for the page, a cell null where every
-    minimum shows the Rebalance cell's own chunk. These cells are the last
-    the walk packs, so reset_move() drops what they packed and leaves
-    everything else, the Rebalance grids included, as it was.
+    minimum shows the Rebalance cell's own chunk. reset_move() drops what
+    they packed (and what the "Rebalance until" choices, packed after them,
+    packed) and leaves everything else, the Rebalance grids included, as it
+    was.
+
+    Each "Rebalance until" choice of a Rebalance cell, at each minimum price
+    movement, that the walk hands to `maturity` is filed in grids_maturity,
+    one chunk id per (choice, minimum): a run simulated there is packed the
+    same way, and a run that repeats another (backtester.SameMaturity)
+    stores that run's id with nothing packed — the movement view's chunk at
+    that minimum for a run at "maturity", or the id this cell stored for an
+    earlier choice. maturity_grid() and maturity_off_grid() read those grids
+    for the page, a cell null where every choice at every minimum shows the
+    movement view's chunk. These cells are the last the walk packs, so
+    reset_maturity() drops what they packed and leaves everything else, the
+    Rebalance and movement grids included, as it was.
 
     A failure while building a chunk is caught here: one WARNING, and the
     visitor marks itself failed and drops what it built — the page is then
@@ -10109,6 +10417,12 @@ class _ChunkVisitor:
             cell's minimum price movements are read, then one chunk id per
             minimum of source.moves (None for one not read); empty when the
             grid carries no minimum.
+        grids_maturity (dict): The same keys -> [band][k][cap] -> None until
+            the cell's "Rebalance until" choices are read, then [choice
+            index][minimum place] -> chunk id (None for one not read), the
+            choices those of source.maturity_days and the places 0 for no
+            minimum and i + 1 for source.moves[i]; empty when the grid
+            carries no choice.
         primary_views (dict | None): The primary chunk's view key -> {"n"},
             for the bar's option counts.
         risk_free (RiskFreeRates | None): The rates every view's Sharpe and
@@ -10188,6 +10502,12 @@ class _ChunkVisitor:
             {} if source.move_cell is None else
             {key: [[[None] * len(source.caps) for _ in source.ks] for _ in source.bands]
              for key in self.grids_rebalance})
+        # ... and at every "Rebalance until" choice and minimum: empty on a grid
+        # that carries no choice
+        self.grids_maturity: dict[bool, list] = (
+            {} if source.maturity_cell is None else
+            {key: [[[None] * len(source.caps) for _ in source.ks] for _ in source.bands]
+             for key in self.grids_rebalance})
         self.primary_views: dict | None = None
         self.failed = False
         # (phase, band, k) of the cell whose list keys are memoised: a cell's
@@ -10197,7 +10517,8 @@ class _ChunkVisitor:
         # objects, whose ids may reuse those of the cell walked last. Each
         # minimum price movement of a Rebalance cell has a phase of its own
         # ("move<i>", or "move<i>_off"), since one minimum's lists are gone
-        # before the next minimum's are made
+        # before the next minimum's are made; so has each "Rebalance until"
+        # choice at each minimum ("maturity<days>_<place>", or with "_off")
         self._cell: tuple[str, int, int] | None = None
         self._keys: dict[tuple[int, float | None], str] = {}
         # (chunks, row heads) held when the first off cell was packed, so
@@ -10207,6 +10528,8 @@ class _ChunkVisitor:
         self._rebalance_mark: tuple[int, int] | None = None
         # ... and for the first minimum price movement packed, for reset_move
         self._move_mark: tuple[int, int] | None = None
+        # ... and for the first "Rebalance until" choice packed, for reset_maturity
+        self._maturity_mark: tuple[int, int] | None = None
         # One item per packed list whose tags the page cannot combine into a
         # mix (_list_payload's mix_gaps): generate_dashboard says so once
         self.mix_gaps: list = []
@@ -10248,10 +10571,12 @@ class _ChunkVisitor:
             listed (list): The trade list.
             phase (str): Keyword-only. Which kind of cell it is: "on" (a
                 tier-on cell), "off" (tier floors off), "rebalance" (held
-                pairs rebalanced), "rebalance_off" (both), or a Rebalance
+                pairs rebalanced), "rebalance_off" (both), a Rebalance
                 cell at one minimum price movement ("move<i>", or
-                "move<i>_off"); each is a separate memo from the others'
-                cell of the same band and k. "on" (default).
+                "move<i>_off") or at one "Rebalance until" choice and minimum
+                ("maturity<days>_<place>", or with "_off"); each is a
+                separate memo from the others' cell of the same band and k.
+                "on" (default).
 
         Returns:
             str: _list_key(k, listed).
@@ -10363,16 +10688,36 @@ class _ChunkVisitor:
         except Exception:
             self._fail()
 
+    def _drop_since(self, *marks: tuple[int, int] | None) -> None:
+        """
+        Drop every chunk and row head packed since the earliest of some marks, and forget the memoised keys.
+
+        Args:
+            *marks (tuple[int, int] | None): (chunks, row heads) as they
+                stood when a kind of cell first packed a chunk, or None for a
+                kind that packed none, in the order the walk packs those
+                kinds: the first one set is the earliest. Nothing is dropped
+                when none is set, or once a chunk has failed (the visitor
+                then keeps nothing anyway).
+        """
+        mark = next((m for m in marks if m is not None), None)
+        if mark is not None and not self.failed:
+            n_chunks, n_heads = mark
+            del self.chunks[n_chunks:]
+            self.seen = {key: cid for key, cid in self.seen.items() if cid < n_chunks}
+            self.heads.truncate(n_heads)
+        self._cell, self._keys = None, {}
+
     def reset_rebalance(self, source: _GridSource) -> None:
         """
         Drop every Rebalance chunk and grid.
 
         Every chunk and row head packed since the first Rebalance cell is
         dropped (with its dedup key); those cells are walked after every
-        other kind but their own minimum price movements, which go with them
-        (their chunks come later still, and their grids are dropped too), so
-        the chunks before that mark and every other grid are kept, as are
-        the labels.
+        other kind but their own minimum price movements and "Rebalance
+        until" choices, which go with them (their chunks come later still,
+        and their grids are dropped too), so the chunks before that mark and
+        every other grid are kept, as are the labels.
 
         Args:
             source (_GridSource): The grid walked from here on (without the
@@ -10380,16 +10725,11 @@ class _ChunkVisitor:
         """
         self.source = source
         # The Rebalance cells are packed before their minimum price movements,
-        # so the earlier of the two marks covers both
-        mark = self._rebalance_mark if self._rebalance_mark is not None else self._move_mark
-        if mark is not None and not self.failed:
-            n_chunks, n_heads = mark
-            del self.chunks[n_chunks:]
-            self.seen = {key: cid for key, cid in self.seen.items() if cid < n_chunks}
-            self.heads.truncate(n_heads)
-        self._rebalance_mark = self._move_mark = None
-        self.grids_rebalance, self.grids_move = {}, {}
-        self._cell, self._keys = None, {}
+        # and those before the "Rebalance until" choices, so the earliest mark
+        # set covers all three
+        self._drop_since(self._rebalance_mark, self._move_mark, self._maturity_mark)
+        self._rebalance_mark = self._move_mark = self._maturity_mark = None
+        self.grids_rebalance, self.grids_move, self.grids_maturity = {}, {}, {}
 
     def rebalance_grid(self) -> list | None:
         """
@@ -10484,23 +10824,20 @@ class _ChunkVisitor:
         Drop every minimum-price-movement chunk and grid.
 
         Every chunk and row head packed since the first minimum price
-        movement is dropped (with its dedup key). Those are the last cells
-        the walk packs, so every chunk before that mark and every other grid
-        — the Rebalance ones included — are kept, as are the labels.
+        movement is dropped (with its dedup key). Only the "Rebalance until"
+        choices, which start from those runs, are packed after them, and
+        their chunks and grids go too; every chunk before that mark and
+        every other grid — the Rebalance ones included — are kept, as are
+        the labels.
 
         Args:
             source (_GridSource): The grid walked from here on (without the
-                minimums).
+                minimums or the choices).
         """
         self.source = source
-        if self._move_mark is not None and not self.failed:
-            n_chunks, n_heads = self._move_mark
-            del self.chunks[n_chunks:]
-            self.seen = {key: cid for key, cid in self.seen.items() if cid < n_chunks}
-            self.heads.truncate(n_heads)
-        self._move_mark = None
-        self.grids_move = {}
-        self._cell, self._keys = None, {}
+        self._drop_since(self._move_mark, self._maturity_mark)
+        self._move_mark = self._maturity_mark = None
+        self.grids_move, self.grids_maturity = {}, {}
 
     @staticmethod
     def _move_ids(cell: list | None, own: int | None) -> list | None:
@@ -10572,6 +10909,180 @@ class _ChunkVisitor:
                               for cell, cid in zip(cells, cids, strict=True)]
                              for cells, cids in zip(own[bi], own_rebalance[bi], strict=True)])
         return rows
+
+    def maturity(self, bi: int, ki: int, ci: int, di: int, mi: int,
+                 entry: SweepPoint | SameMaturity, *, off: bool = False) -> None:
+        """
+        Keep one "Rebalance until" choice of one Rebalance scenario at one minimum: its own chunk, or the chunk of the run it repeats.
+
+        A run simulated there is packed like any scenario (priced at the
+        cell's k, sharing a chunk with any equal list at an equal k). A
+        SameMaturity is a run the page already has, so its chunk id is
+        copied and nothing is packed: for SameMaturity(m, None), a run at
+        "maturity", the movement view's chunk at minimum m — the Rebalance
+        cell's own for m None, and also where that cell's minimums were
+        never read; for SameMaturity(m, d), the id this cell stored for
+        choice d at minimum m.
+
+        Args:
+            bi (int): Band index.
+            ki (int): k index.
+            ci (int): Cap index.
+            di (int): The choice's index in source.maturity_days.
+            mi (int): The minimum's place: 0 for no minimum, i + 1 for
+                source.moves[i].
+            entry (SweepPoint | SameMaturity): The "all" point of the run
+                rebalancing only with at least that many days left (and
+                after that move), or the run it repeats.
+            off (bool): Keyword-only. Whether the cell is a binding band's
+                with the tier floors off. False (default).
+
+        Raises:
+            ValueError: If a SameMaturity names a choice or a minimum the
+                grid does not carry, or a run this cell has not stored yet
+                (never from backtester.RebalanceSweep.maturity_grid). The
+                walk reads it as a cell that cannot be read.
+        """
+        grid = self.grids_maturity.get(off)
+        if self.failed or grid is None:
+            return
+        cell = grid[bi][ki][ci]
+        if cell is None:
+            cell = grid[bi][ki][ci] = [[None] * (1 + len(self.source.moves))
+                                       for _ in self.source.maturity_days]
+        if isinstance(entry, SameMaturity):
+            place = (0 if entry.min_move is None
+                     else self.source.moves.index(entry.min_move) + 1)
+            if entry.min_days is None:
+                # A run at "maturity": the Rebalance cell, or its minimum's run
+                moved = self.grids_move.get(off)
+                at = None if (moved is None or place == 0) else moved[bi][ki][ci]
+                named = (self.grids_rebalance[off][bi][ki][ci] if at is None
+                         else at[place - 1])
+            else:
+                named = cell[self.source.maturity_days.index(entry.min_days)][place]
+            if named is None:
+                raise ValueError(f"a repeat of the run at {entry.min_days!r} day(s) and minimum "
+                                 f"{entry.min_move!r}, which this cell has no chunk for")
+            cell[di][mi] = named
+            return
+        if self._maturity_mark is None:
+            self._maturity_mark = (len(self.chunks), len(self.heads.items))
+        try:
+            # The choice and the minimum are part of the phase, so a key memoised
+            # for another step's list (an object since freed) is never read here
+            phase = (f"maturity{self.source.maturity_days[di]}_{mi}"
+                     + ("_off" if off else ""))
+            cell[di][mi] = self._chunk(bi, ki, self.source.ks[ki], entry.trades,
+                                       entry.equity_df, False, phase=phase)
+        except Exception:
+            self._fail()
+
+    def reset_maturity(self, source: _GridSource) -> None:
+        """
+        Drop every "Rebalance until" chunk and grid.
+
+        Every chunk and row head packed since the first "Rebalance until"
+        choice is dropped (with its dedup key). Those are the last cells the
+        walk packs, so every chunk before that mark and every other grid —
+        the Rebalance and minimum-price-movement ones included — are kept,
+        as are the labels.
+
+        Args:
+            source (_GridSource): The grid walked from here on (without the
+                choices).
+        """
+        self.source = source
+        self._drop_since(self._maturity_mark)
+        self._maturity_mark = None
+        self.grids_maturity = {}
+
+    @staticmethod
+    def _maturity_ids(cell: list | None, own: int | None, moved: list | None) -> list | None:
+        """
+        One scenario's chunk ids at every "Rebalance until" choice and minimum, as the page reads them.
+
+        Args:
+            cell (list | None): The ids maturity() stored, [choice][minimum
+                place]; None for a cell whose choices were never read.
+            own (int | None): The chunk id of the same scenario's Rebalance
+                cell.
+            moved (list | None): The ids move() stored for the same
+                scenario, one per minimum; None where there are none (no
+                minimum, or never read: every minimum then shows `own`).
+
+        Returns:
+            list | None: None when the choices were never read, or every
+                choice at every minimum shows the movement view's chunk at
+                that minimum (the page then reads that one); else a copy of
+                the ids.
+        """
+        if cell is None:
+            return None
+        # What "maturity" shows at each minimum place: the Rebalance cell, then
+        # each minimum's run
+        shown = [own, *(moved if moved is not None else [own] * (len(cell[0]) - 1))]
+        if all(cid == shown[place] for row in cell for place, cid in enumerate(row)):
+            return None
+        return [list(row) for row in cell]
+
+    def _maturity_rows(self, off: bool, bi: int) -> list:
+        """
+        One band's "Rebalance until" cells under one Tier floors setting, as the page reads them.
+
+        Args:
+            off (bool): Whether to read the tier-floors-off grids.
+            bi (int): Band index.
+
+        Returns:
+            list: [k][cap] -> None or [choice][minimum place] -> chunk id
+                (_maturity_ids); every cell None when that setting has no
+                grids.
+        """
+        own, rebalanced = self.grids_maturity.get(off), self.grids_rebalance.get(off)
+        if own is None or rebalanced is None:
+            return [[None] * len(self.source.caps) for _ in self.source.ks]
+        moved = self.grids_move.get(off)
+        return [[self._maturity_ids(cell, cid, None if moved is None else moved[bi][ki][ci])
+                 for ci, (cell, cid) in enumerate(zip(cells, cids, strict=True))]
+                for ki, (cells, cids) in enumerate(zip(own[bi], rebalanced[bi], strict=True))]
+
+    def maturity_grid(self) -> list | None:
+        """
+        The "Rebalance until" grid with the tier floors on.
+
+        Returns:
+            list | None: [band][k][cap] -> None where every choice at every
+                minimum shows the movement view's chunk (or the cell was
+                never read), else [choice index][0 for no minimum, i + 1 for
+                source.moves[i]] -> chunk id. A grid of nothing but None is
+                still a view: no choice changed any run. None when the grid
+                carries no choice, a chunk failed, or there is no Rebalance
+                grid to read it beside.
+        """
+        if self.rebalance_grid() is None or self.grids_maturity.get(False) is None:
+            return None
+        return [self._maturity_rows(False, bi) for bi in range(len(self.source.bands))]
+
+    def maturity_off_grid(self) -> list | None:
+        """
+        The "Rebalance until" grid with the tier floors off.
+
+        A binding band's row is its own tier-floors-off cells (None where
+        the grid has no tier-off half), every other band's its tier-on row —
+        its off view IS its run, as move_off_grid() has it.
+
+        Returns:
+            list | None: [band][k][cap] -> None or [choice][minimum place]
+                -> chunk id, as maturity_grid() gives them; None without the
+                tier-on grid or without a tier-floors-off view to pair it
+                with.
+        """
+        on = self.maturity_grid()
+        if on is None or self.source.tier_binds is None:
+            return None
+        return [self._maturity_rows(True, bi) if binds else on[bi]
+                for bi, binds in enumerate(self.source.tier_binds)]
 
     def _chunk(self, bi: int, ki: int, k: float | None, listed: list,
                curve: pd.DataFrame, primary: bool, *, phase: str = "on") -> int:
@@ -12397,6 +12908,7 @@ def _filter_payload(
     sell_state: str = "not simulated",
     sidecar_dir: str | None = None,
     move_state: str = "not simulated",
+    maturity_state: str = "not simulated",
 ) -> dict:
     """
     Build the base data block the page's filter bar and script read on load.
@@ -12416,7 +12928,8 @@ def _filter_payload(
     Rebalance grid (chunks.rebalance_grid()), with the tier-floors-off view
     too its tier-off twin (chunks.rebalance_off_grid()), and, when the walk
     read its minimum price movements, their grids (chunks.move_grid(),
-    move_off_grid()). The lists themselves
+    move_off_grid()), and its "Rebalance until" choices', when it read
+    those (chunks.maturity_grid(), maturity_off_grid()). The lists themselves
     are the chunks, each its own packed block the script inflates only when
     a reader chooses that scenario, so the page's load cost does not grow
     with the grid.
@@ -12479,6 +12992,11 @@ def _filter_payload(
             "unavailable" (it carried some, and the page could not read
             them or has no Rebalance view to show them beside); ignored when
             it has the view. "not simulated" (default).
+        maturity_state (str): Keyword-only. The same for the family's
+            "Rebalance until" choices: "not simulated" (the run's family
+            carried none) or "unavailable" (it carried some, and the page
+            could not read them or has no Rebalance view to show them
+            beside); ignored when it has the view. "not simulated" (default).
 
     Returns:
         dict: "dates" (the shared axis, ISO dates), "bands" ([{label,
@@ -12536,7 +13054,21 @@ def _filter_payload(
             chunk, else one chunk id per minimum, in "moves" order —
             chunks.move_grid()), "grid_move_off" (the same beside
             "grid_rebalance_off", null wherever that grid is) and
-            "move_state" ("shown", else move_state); and the Sell view's:
+            "move_state" ("shown", else move_state); the data of that
+            family's "Rebalance until" choices: "maturity" ([{label, phrase,
+            value}] per choice besides "maturity" — _until_option's "7 days
+            before", _until_phrase's words after the Rebalance and minimum
+            phrases and the days themselves; [] without the view),
+            "grid_maturity" (null without the view, else [band][k][cap] ->
+            null where every choice at every minimum shows that scenario's
+            movement view — its "grid_move" chunk at that minimum, or its
+            "grid_rebalance" chunk with no minimum or where that cell is
+            null — else [choice, in "maturity" order][0 for no minimum, i +
+            1 for "moves"[i]] -> chunk id, one id per choice when the page
+            has no minimums — chunks.maturity_grid()), "grid_maturity_off"
+            (the same beside "grid_move_off" and "grid_rebalance_off", null
+            wherever "grid_rebalance_off" is) and "maturity_state" ("shown",
+            else maturity_state); and the Sell view's:
             "sell_blocks" (null without the view, else [Tier floors 0 on / 1
             off][band] -> the number i of the packed block "dash-sell-<i>"
             holding that band's chunk ids ([k][cap] -> one id per sell level
@@ -12570,6 +13102,13 @@ def _filter_payload(
     grid_move = (chunks.move_grid()
                  if (rebalance_view and source.move_cell is not None) else None)
     move_view = grid_move is not None
+    # ... and at every "Rebalance until" choice, only from a grid whose walk
+    # read them to the end (it strips the reader otherwise), beside a
+    # minimum-price-movement view whenever the family has minimums
+    grid_maturity = (chunks.maturity_grid()
+                     if (rebalance_view and source.maturity_cell is not None
+                         and (move_view or not source.moves)) else None)
+    maturity_view = grid_maturity is not None
     # Per band, its k-hat population broken down like its trades
     # (_khat_band) — each group with its k-hat − k at every k of the bar,
     # for the performance section's cards
@@ -12688,6 +13227,17 @@ def _filter_payload(
         "grid_move": grid_move,
         "grid_move_off": chunks.move_off_grid() if (move_view and off_view) else None,
         "move_state": "shown" if move_view else move_state,
+        # The same scenarios at each "Rebalance until" choice and minimum: the
+        # choices' names, each scenario's chunk id per (choice, minimum) (a
+        # null cell: every one shows the movement view's chunk) and why a
+        # page has none. The select is rendered shut on every page
+        "maturity": ([{"label": _until_option(days), "phrase": _until_phrase(days),
+                       "value": days} for days in source.maturity_days]
+                     if maturity_view else []),
+        "grid_maturity": grid_maturity,
+        "grid_maturity_off": (chunks.maturity_off_grid()
+                              if (maturity_view and off_view) else None),
+        "maturity_state": "shown" if maturity_view else maturity_state,
         # The Sell view: which packed block holds each band's chunk ids
         # (null without the view), the levels' and minimums' names, and why a
         # page has none
@@ -13044,6 +13594,14 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     without them puts a grey note beside it by its "move_state"
     (_MOVE_NOTES); where Rebalance itself is not shown, that select's own
     note says why and this one has none.
+    The "Rebalance until" select after it offers "maturity" (selected: no
+    days limit, the movement view's run; value "0") and every choice the
+    payload names (maturity: "1 day before", "7 days before"; an option's
+    value is its place in that list plus one), its title carrying the rule
+    (_UNTIL_TITLE). It is on every page and always rendered shut: the
+    script does not read it yet. A payload that shows Rebalance without the
+    choices ("grid_maturity" null) puts a grey note beside it by its
+    "maturity_state" (_UNTIL_NOTES), as Min. price movement's does.
     The Sell select offers "no selling" (selected) and every sell level the
     payload names (sell_levels), its title carrying the rule
     (_sell_select_title, at backtester.TAKE_PROFIT_HOLD_DAYS as the page's
@@ -13170,6 +13728,18 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
                  '&nbsp;<span id="flt-move-note" style="color:#9E9E9E; font-size:13px;">'
                  f"{html.escape(move_why)}</span>")
     move_title = html.escape(_MOVE_TITLE)
+    # The "Rebalance until" choice: maturity (no days limit, value "0") or a
+    # choice, each option's value its place in the payload's maturity plus one
+    until_opts = (f'<option value="0" selected>{html.escape(_UNTIL_OPTION_MATURITY)}</option>'
+                  + "".join(f'<option value="{i + 1}">{html.escape(entry["label"])}</option>'
+                            for i, entry in enumerate(payload.get("maturity") or [])))
+    until_state = payload.get("maturity_state", "not simulated")
+    # Said only where Rebalance itself is shown, as for Min. price movement
+    until_why = _UNTIL_NOTES.get(until_state, _UNTIL_NOTES["not simulated"])
+    until_note = ("" if rebalance_state != "shown" or until_state == "shown" else
+                  '&nbsp;<span id="flt-until-note" style="color:#9E9E9E; font-size:13px;">'
+                  f"{html.escape(until_why)}</span>")
+    until_title = html.escape(_UNTIL_TITLE)
     # The Sell choice: no selling (the page as rendered) or a level, each
     # option's value its index in the payload's sell_levels; a page with no
     # Sell view says why beside the select it keeps shut
@@ -13252,6 +13822,8 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
         f'{rebalance_note}&nbsp;&nbsp;'
         f'<label>Min. price movement: <select id="flt-move" disabled autocomplete="off" '
         f'title="{move_title}">{move_opts}</select></label>{move_note}&nbsp;&nbsp;'
+        f'<label>Rebalance until: <select id="flt-until" disabled autocomplete="off" '
+        f'title="{until_title}">{until_opts}</select></label>{until_note}&nbsp;&nbsp;'
         f'<label>Sell: <select id="flt-sell" disabled autocomplete="off" '
         f'title="{sell_title}">{sell_opts}</select></label>{sell_note}&nbsp;&nbsp;'
         f'<label>Min. days to maturity: <select id="flt-days" disabled autocomplete="off" '
@@ -15865,6 +16437,10 @@ def generate_dashboard(
                 # not read them (the log says why)
                 move_state=("unavailable" if getattr(
                     getattr(sweep, "rebalance_sweep", None), "min_moves", ())
+                    else "not simulated"),
+                # ... and for its "Rebalance until" choices, the same way
+                maturity_state=("unavailable" if getattr(
+                    getattr(sweep, "rebalance_sweep", None), "maturity_days", ())
                     else "not simulated"))
             filter_bar = _filter_bar_html(filter_data, chunker.primary_views or {})
             base_block = _packed_json_script("dash-data", filter_data)

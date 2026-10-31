@@ -253,9 +253,9 @@ Notes:
     trimmed only while its later market closes at least that many days
     away, at every minimum price movement too. They are simulated only
     when a report reads them (RebalanceSweep.maturity_grid); the dashboard
-    does not offer the "Rebalance until" select yet, so a page built now
-    reads none of them. --no-maturity-sweep skips them and still builds
-    Rebalance itself; --no-rebalance-sweep skips them too.
+    reads every one as it is built, but keeps its "Rebalance until" select
+    shut for now. --no-maturity-sweep skips them and still builds Rebalance
+    itself; --no-rebalance-sweep skips them too.
 
     Every full run saves what it hands generate_dashboard, right after the
     sweep and before the page is built, in config.BACKTEST_SWEEP_FILENAME in
