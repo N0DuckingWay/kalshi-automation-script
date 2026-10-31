@@ -8,12 +8,13 @@ Purpose:
     term is complete, listed once and tagged with a known page, a page lists
     only its own terms, every cell is escaped, the Terms link points at the
     section's id, the heading clears the sticky filter bar, the tier-floor
-    figures and the Rebalance wait match config's, the Rebalance and Min. price
-    movement entries sit after Size cap on the backtest page alone, and the
-    module imports only the standard library.
+    figures and the Rebalance wait match config's, the Rebalance, Min. price
+    movement and "Rebalance until" entries sit after Size cap on the backtest
+    page alone, and the module imports only the standard library.
 """
 
 import ast
+import re
 import sys
 from pathlib import Path
 
@@ -59,16 +60,28 @@ class TestTerms:
         assert f"at least {long_}" in text
 
     def test_the_rebalance_terms_follow_size_cap_on_the_backtest_page_alone(self):
-        # They name two choices of the backtest page's filter bar, which sit
-        # right after Size cap there, so the Data page does not list them
+        # They name three choices of the backtest page's filter bar, which sit
+        # right after Size cap there, in the bar's order, so the Data page
+        # does not list them
         names = [entry[0] for entry in glossary.TERMS]
         at = names.index("Size cap")
-        assert names[at + 1:at + 3] == ["Rebalance", "Min. price movement"]
+        rebalancing = ["Rebalance", "Min. price movement", "Rebalance until"]
+        assert names[at + 1:at + 4] == rebalancing
         pages = {entry[0]: entry[3] for entry in glossary.TERMS}
-        assert pages["Rebalance"] == pages["Min. price movement"] == (
-            glossary.PAGE_BACKTEST,)
+        for name in rebalancing:
+            assert pages[name] == (glossary.PAGE_BACKTEST,), name
         data = {t for t, _, _ in glossary.terms_for(glossary.PAGE_DATA)}
-        assert not data & {"Rebalance", "Min. price movement"}
+        assert not data & set(rebalancing)
+
+    def test_rebalance_until_says_what_it_holds_back_and_names_no_day_count(self):
+        # Its words are the select's own rule: it holds back trims and add-ons
+        # near maturity, counts whole UTC days and names "maturity" as no
+        # limit; it types out no choice's days, so config can change them
+        text = {t: m for t, m, _, _ in glossary.TERMS}["Rebalance until"]
+        assert text.startswith("Used only with Rebalance yes. Holds back trims and add-ons")
+        assert "counted in whole days on Kalshi's UTC dates" in text
+        assert text.endswith("maturity: no days limit.")
+        assert not re.search(r"\d", text)
 
     def test_the_rebalance_wait_matches_config(self):
         # The entry types the wait out, since this module imports no project
