@@ -7221,6 +7221,17 @@ def _trim_plan(sell: int = 13, held: int | None = 30, *, held_b: int | None = No
     return dataclasses.replace(plan, level=None, kind=config.SALE_KIND_KELLY_TRIM)
 
 
+def _lone_trim_plan(sell: int = 43, held: int = 129, *,
+                    title: str = "Test position") -> seller.SalePlan:
+    """A Kelly trim of a lone leg, as seller.plan_trims builds it: sells `sell` of the
+    `held` NO on KX-B, whose earlier partner KX-P (YES) paid out. The partner is the
+    plan's second leg, with no market and no holding, and has no ladder or walk."""
+    leg = dataclasses.replace(_held("KX-B", "no", sell), held=held)
+    plan = _sale_plan((leg, [[0.86, 100], [0.85, 100]]),
+                      partner=_paid_out("KX-P", "yes", sell), title=title)
+    return dataclasses.replace(plan, level=None, kind=config.SALE_KIND_KELLY_TRIM)
+
+
 class TestSellPartOfAHolding:
     """Selling part of a holding (a Kelly trim): a leg's `count` is the contracts
     to sell and `held` the contracts held. Orders are sized on `count`, the
@@ -7429,10 +7440,12 @@ class TestSellPartOfAHolding:
     def test_a_lone_market_sold_in_part_counts_what_is_left_from_its_holding(
         self, monkeypatch, caplog,
     ):
-        # The seller never trims a lone market, but the trader still reads a
-        # leg's holding when it carries one
+        # A lone market can be trimmed too (its partner has paid out): its leg
+        # carries the holding, and the trader counts what is left from it
         leg = dataclasses.replace(_held("KX-A", "yes", 4), held=10)
-        plan = _sale_plan((leg, [[0.45, 10]]), partner=_paid_out("KX-P", "no"))
+        plan = dataclasses.replace(
+            _sale_plan((leg, [[0.45, 10]]), partner=_paid_out("KX-P", "no")),
+            level=None, kind=config.SALE_KIND_KELLY_TRIM)
         exchange = _SaleExchange({"KX-A": 10}, fills={"KX-A": 3})
         with caplog.at_level(logging.INFO):
             [result] = self._sell(monkeypatch, exchange, [plan])
@@ -7449,6 +7462,61 @@ class TestSellPartOfAHolding:
         [result] = self._sell(monkeypatch, exchange, [plan])
         assert (result.status, result.sold) == ("sold", {"KX-A": 4})
         assert exchange.positions == {"KX-A": 6}
+
+    def test_a_lone_leg_trim_sends_one_reduce_only_order_for_the_count(self, monkeypatch,
+                                                                       caplog):
+        # 43 of the 129 NO held on KX-B: one order on KX-B, a reduce-only YES bid
+        # (a held NO is sold by buying YES back), sized 43, never the 129 held. The
+        # paid-out partner KX-P is neither read nor sold
+        exchange = _SaleExchange({"KX-B": -129})
+        plan = _lone_trim_plan()
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [plan])
+        assert (result.plan, result.status, result.sold, result.error) == (
+            plan, "sold", {"KX-B": 43}, None)
+        assert result.decided_by_account is False
+        [body] = exchange.bodies
+        assert (body["ticker"], body["side"], body["count"]) == ("KX-B", "bid", "43.00")
+        # A NO bought back at 0.14 or less is a NO sold at 0.86 or more
+        assert body["price"] == "0.1400"
+        assert body["reduce_only"] is True
+        assert body["time_in_force"] == "immediate_or_cancel"
+        assert exchange.positions == {"KX-B": -86}
+        assert exchange.events == [("read", "KX-B"), ("pace",), ("post", "KX-B")]
+        [line] = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Sold ")]
+        assert line == ("Sold 'Test position': 43 of 43 NO (of 129 held) on KX-B sold"
+                        " (YES bid at 0.1400, so 0.8600 or more a NO contract)")
+
+    def test_a_lone_leg_trim_that_fills_part_leaves_the_rest_held(self, monkeypatch, caplog):
+        exchange = _SaleExchange({"KX-B": -129}, fills={"KX-B": 30})
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [_lone_trim_plan()])
+        assert (result.status, result.sold, result.error) == (
+            "partly_sold", {"KX-B": 30}, "sold 30 of 43")
+        assert exchange.positions == {"KX-B": -99}
+        # What is still held is counted from the 129 held, not from the 43 asked
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning == ("Partly sold 'Test position': 30 of 43 NO (of 129 held) on KX-B"
+                           " sold (YES bid at 0.1400, so 0.8600 or more a NO contract);"
+                           " still held: 99 NO contracts on KX-B")
+
+    def test_a_lone_leg_trim_waits_for_the_holding_it_was_made_on(self, monkeypatch):
+        exchange = _SaleExchange({"KX-B": -43})
+        [result] = self._sell(monkeypatch, exchange, [_lone_trim_plan()])
+        assert (result.status, result.sold) == ("not_sold", {"KX-B": 0})
+        assert result.error == ("not sent: KX-B now holds 43 NO contracts; the plan holds 129"
+                                " NO contracts")
+        assert exchange.bodies == [] and exchange.positions == {"KX-B": -43}
+
+    def test_a_dry_run_names_a_lone_legs_part_and_holding(self, monkeypatch, caplog):
+        exchange = _SaleExchange({"KX-B": -129})
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [_lone_trim_plan()], dry_run=True)
+        assert (result.status, result.sold, result.error) == ("simulated", {"KX-B": 43}, None)
+        assert exchange.events == []
+        [line] = [r.getMessage() for r in caplog.records if "[DRY RUN]" in r.getMessage()]
+        assert line == ("[DRY RUN] Would sell 'Test position': 43 NO contracts (of 129 held)"
+                        " on KX-B (YES bid at 0.1400, so 0.8600 or more a NO contract)")
 
     def test_nothing_is_sent_once_the_no_leg_mapping_is_disproven(self, monkeypatch):
         monkeypatch.setattr(trader, "_V2_NO_MAPPING_DISPROVEN", True)

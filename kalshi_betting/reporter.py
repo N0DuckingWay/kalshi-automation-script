@@ -11,7 +11,9 @@ Purpose:
 
     A run that sells writes its sales to the log first, a row each (_sale_to_row):
     a take-profit sale of a whole position, or a Kelly trim, which sells a held
-    pair down to the size the Kelly rule allows (part of it, or all of it).
+    pair, or a lone leg (the later market of a time-series pair, still held after
+    the earlier one paid out $0), down to the size the Kelly rule allows (part
+    of it, or all of it).
 
     It also writes the run result of a production run started with
     `main.py --result-file`: a RunReport that main.py fills in as the run goes
@@ -452,15 +454,17 @@ def _sale_to_row(sale: SaleResult, run_ts: datetime) -> list:
     "(paid out)"); pA/pB the average bids the plan priced the sale at
     (SalePlan.walked), which real fills can differ from; nA blank; x/y the
     contracts sold. Cost, profit and fees are the plan's, fees counted once
-    per held market (for a Kelly trim, all three are those of the contract
-    pairs it sells). "Profit if won" (a
+    per held market (for a Kelly trim, all three are those of the part it
+    sells, a paid-out partner's share of the cost included). "Profit if won" (a
     paid-out partner's payout included) and its ratio to the cost are filled
     only for "sold" and "simulated".
     Notes read "[sale: YES A / NO B, 84% of potential profit (level 80%), 9
     days left, fees=$0.42] " (potential profit: the payout if it wins, less
-    its cost), or for a trim "[sale: YES A / NO B, Kelly trim: 13 of 30
-    contract pairs, 9 days left, fees=$0.42] ", then any error. The "[sale: "
-    start is how live_portfolio tells a sale row.
+    its cost), or for a trim of an exact pair "[sale: YES A / NO B, Kelly trim:
+    13 of 30 contract pairs, 9 days left, fees=$0.42] ", or for a trim of a
+    lone leg (one held market, its paid-out partner listed beside it) "[sale:
+    NO A / YES B, Kelly trim: 43 of 129 contracts, 9 days left, fees=$0.42] ",
+    then any error. The "[sale: " start is how live_portfolio tells a sale row.
 
     Args:
         sale (SaleResult): The sale, from trader.sell_positions.
@@ -482,9 +486,12 @@ def _sale_to_row(sale: SaleResult, run_ts: datetime) -> list:
     realized, potential = plan.profits[0]
     whole = sale.status in _SALE_WHOLE_STATUSES
     if _is_kelly_trim(plan):
-        # A trim has no sell level: say how many of the pairs held it sells
+        # A trim has no sell level: say how much of what is held it sells. A lone
+        # leg has one held market, so it sells contracts; a pair sells contract pairs
+        held_legs = [leg for leg in legs if leg.market is not None]
+        unit = "contracts" if len(held_legs) == 1 else "contract pairs"
         why = (f"Kelly trim: {count_text(plan.count)} of "
-               f"{count_text(_leg_holding(legs[0]))} contract pairs")
+               f"{count_text(_leg_holding(held_legs[0] if held_legs else legs[0]))} {unit}")
     else:
         why = f"{realized / potential:.0%} of potential profit (level {plan.level:.0%})"
     notes = (f"[sale: {sides}, {why}, {_days_left_text(plan.days_left)}, "
@@ -1065,7 +1072,9 @@ class SaleRecord:
     """
     One held position's sale as a run result records it; money figures are the plan's.
 
-    For a Kelly trim, cost, proceeds and profit cover only the contract pairs it sells.
+    For a Kelly trim, cost, proceeds and profit cover only the part it sells: the
+    contract pairs of a pair, the contracts of a lone leg (its paid-out partner's
+    share of the cost included).
 
     Attributes:
         title (str | None): The position's title (SalePlan.title).

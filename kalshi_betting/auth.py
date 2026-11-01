@@ -40,8 +40,8 @@ Notes:
       never an error.
     - A shard entry whose cash cannot be read is left out of the cash and
       named in AccountBalance.cash_left_out. Less cash only makes a purchase
-      smaller, but would make a Kelly trim (selling part of a held pair) sell
-      more, so main.py trims nothing that run.
+      smaller, but would make a Kelly trim (selling part of a held pair or lone
+      leg) sell more, so main.py trims nothing that run.
 """
 import json
 import logging

@@ -141,8 +141,9 @@ TERMS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
      "Yes: at each weekly run a held pair is topped up to its Kelly size (its Kelly "
      "fraction of the portfolio value, held to the size cap) when it has room, and "
      "sold down to it when it has grown past it, once 7 days have passed since its "
-     "last trade. No: a pair is bought once and held. Live runs follow the saved "
-     "setting.",
+     "last trade. Once a time-series pair's earlier market has paid out $0, the "
+     "later market still held is sold down the same way. No: a pair is bought "
+     "once and held. Live runs follow the saved setting.",
      "Shows whether keeping every pair at the size Kelly wants beats buying once "
      "and holding.",
      _BACKTEST),
@@ -153,6 +154,14 @@ TERMS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
      "10% of a $1 payout.",
      "Every top-up or sale pays fees, so this shows whether acting on small price "
      "moves is worth it.",
+     _BACKTEST),
+    ("Rebalance until",
+     "Used only with Rebalance yes. Holds back trims and add-ons when the position's "
+     "later market matures within the days chosen: a held pair is topped up or sold "
+     "down only while its later market closes at least that many days after the run, "
+     "counted in whole days on Kalshi's UTC dates. maturity: no days limit.",
+     "A top-up or sale close to payout has little time left to pay off its fees, so "
+     "this shows whether leaving a position alone in its last days does better.",
      _BACKTEST),
     ("Fills",
      "Whether a trade was priced by walking a modeled order book, whose depth comes "
