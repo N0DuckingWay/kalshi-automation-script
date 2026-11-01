@@ -47,7 +47,9 @@ Notes:
     call them; trade_day is for live rebalancing only, and kelly_trim_bids
     for live trims only. A live run's switch and minimum
     are LiveSettings.rebalance and min_price_move: with rebalance on, a
-    production run both trims held pairs and may add to them.
+    production run both trims held pairs (and lone legs: the later market of
+    a time-series pair, still held after the earlier one paid out $0) and may
+    add to them.
     A saved file written by an older version, which held add_to_held_pairs,
     trim_to_kelly and trim_min_rise instead, is refused as
     LiveDefaultsOutdated, which carries what it reads as now (its proposal)
@@ -581,8 +583,9 @@ KELLY_TRIM_MAX_BID_DROP = 0.20
 
 # ── Live trading toggles ──────────────────────────────────────────────────────
 #
-# Eleven live toggles (TIME_SERIES_TIER_FLOORS, TIME_SERIES_SPREAD_BAND,
-# TRADE_EXCLUDE_CATEGORIES, TRADE_EXCLUDE_TAGS, REBALANCE, MIN_PRICE_MOVE, SELL_AT and SELL_MIN_DAYS below; k,
+# Twelve live toggles (TIME_SERIES_TIER_FLOORS, TIME_SERIES_SPREAD_BAND,
+# TRADE_EXCLUDE_CATEGORIES, TRADE_EXCLUDE_TAGS, REBALANCE, MIN_PRICE_MOVE,
+# REBALANCE_MIN_DAYS_TO_MATURITY, SELL_AT and SELL_MIN_DAYS below; k,
 # BUDGET_FRACTION and SAME_TITLE_SIZE_CAP above). They are NOT the live
 # defaults: a live run starts only from the saved ones (LIVE_DEFAULTS_FILE, below) and
 # never falls back to these. They are the backtest's k and caps (backtester and
@@ -649,7 +652,9 @@ TAG_SCOPE_SEPARATOR = " · "
 
 # Whether a live run rebalances the pairs the account holds: on, a production
 # run, before it buys, sells part of each exact held pair (two held markets
-# alone on one question, one held YES and the other NO, in equal counts) worth
+# alone on one question, one held YES and the other NO, in equal counts), or of
+# each lone leg (the later market of a time-series pair, still held after the
+# earlier one paid out $0), worth
 # more than Kelly allows or more than its size cap (a Kelly trim:
 # main._run_prod, through seller.plan_trims), and may add to a pair it holds:
 # exactly the same two markets, buying the same side on each
@@ -677,6 +682,18 @@ REBALANCE = True
 # --min-price-move CENTS / --no-min-price-move for one run).
 MIN_PRICE_MOVE: float | None = None
 
+# How close to maturity a held position may still be rebalanced: 0 (always), 1
+# or 7 days. A position is rebalanced only while its later market closes at
+# least that many days from today (UTC dates, as a sale counts them).
+REBALANCE_MATURITY_DAYS = (0, 1, 7)
+
+# The fewest days a held position's later market may be from its close for a live
+# run to rebalance it: None (always), 1 or 7. Only with REBALANCE on. config.py's
+# value is the no-settings fallback; a live run reads the saved live defaults'
+# rebalance_min_days_to_maturity instead (main.py --rebalance-min-days-to-maturity
+# N / --no-rebalance-min-days-to-maturity for one run).
+REBALANCE_MIN_DAYS_TO_MATURITY: int | None = None
+
 # The share of its potential profit at which a held position is sold, on the
 # 1% grid (SELL_AT_STEP) in (0, 1], or None to never sell. A live run reads the
 # saved live defaults' sell_at instead (main.py --sell-at / --no-sell for one run).
@@ -703,9 +720,26 @@ SALE_KIND_KELLY_TRIM = "kelly_trim"
 # The most settled markets live selling (seller.plan_sales) looks up on the
 # exchange in one run (one or two read-only requests each) to find a held
 # market's paid-out partner (a settled market the account held on the other
-# side, with the same count and question, taken as its pair-mate).
+# side, asking the same question, with the same count or, when no such market
+# fits, at least as many (a lone market partly sold after its partner paid out
+# holds fewer), taken as its pair-mate).
 # Past this many, held markets still waiting for a partner are not sold that run.
 SALE_PARTNER_MAX_LOOKUPS = 20
+
+# The most settled markets one run looks up when no market of a lone held
+# market's count fits and seller._find_partner searches those settled with more
+# contracts. Counted apart from SALE_PARTNER_MAX_LOOKUPS, so that search never
+# uses lookups a same-count partner needs. Past this many, that search finds no
+# partner and the held market is not sold that run.
+SALE_PARTNER_MAX_WIDER_LOOKUPS = 20
+
+# How far, in dollars, a paid-out partner's payout may sit from what the position
+# it held at payout should have paid, when its settlement lists contracts bought
+# on both sides (seller._find_partner). The payout is whole cents, so under half
+# a cent means an exact match and a 1c gap is always a mismatch; a record whose
+# payout does not match its net count cannot be read as one position, so the
+# held market is neither sold nor trimmed.
+SALE_PARTNER_REVENUE_TOLERANCE_DOLLARS = 0.005
 
 # How many days ago, at most, a held market's partner may have paid out for live
 # selling to use it. A pair's two markets stop trading at most MAX_DEADLINE_GAP_DAYS
@@ -731,7 +765,7 @@ LIVE_EXPOSURE_WARN_FRACTION = 0.20
 
 # ── Saved live defaults ───────────────────────────────────────────────────────
 
-# The live defaults every live run starts from: one JSON record of the eleven
+# The live defaults every live run starts from: one JSON record of the twelve
 # live toggles (any of _OPTIONAL_TOGGLES may be left out, and then reads as off),
 # saved through defaults_server's confirmation page
 # (python3 -m kalshi_betting.defaults_server; its --seed proposes
@@ -942,10 +976,11 @@ BACKTEST_SWEEP_FILENAME = "backtest_sweep.pkl.gz"
 # A rebuild refuses a file with any other tag; change it whenever the line's
 # keys, the pickled inputs' keys or the fields of the classes pickled in them
 # (BacktestSweep and the lazy families it holds) change, so an older file is
-# refused rather than misread. v4: BacktestSweep.live_tags became
-# live_exclude_tags (the saved live defaults list the tags NOT to trade); v3
-# files, from before, are refused.
-BACKTEST_SWEEP_FORMAT = "backtest-sweep-v4"
+# refused rather than misread. v6: RebalanceSweep gained maturity_days (the
+# "Rebalance until" choices it covers) and BacktestSweep
+# live_rebalance_min_days_to_maturity (the saved live defaults' setting);
+# v5 files, from before, are refused.
+BACKTEST_SWEEP_FORMAT = "backtest-sweep-v6"
 
 # The most bytes a rebuild reads for the saved sweep file's first line (the
 # JSON one): the real line is a few hundred bytes, so a file that runs past
@@ -3287,7 +3322,9 @@ class LiveSettings:
             category is excluded too is allowed (it excludes nothing more).
         rebalance (bool): Whether a production run rebalances the pairs the
             account holds: before it buys, it sells part of each exact held
-            pair grown past its Kelly size (a Kelly trim), and it may add to
+            pair, or lone leg (the later market of a time-series pair, still
+            held after the earlier one paid out $0), grown past its
+            Kelly size (a Kelly trim), and it may add to
             a pair the account already holds (exactly the same two markets,
             the same side on each, or a lone held market whose partner has
             paid out), with Kelly sizing the whole position. A real bool.
@@ -3298,6 +3335,11 @@ class LiveSettings:
             its last trade before it is rebalanced (a Kelly trim, or an
             add-on), in dollars on the 5c grid from 5c to $1 (0.1 for 10c);
             None (default) is no minimum. Refused with rebalance off.
+        rebalance_min_days_to_maturity (int | None): How close to maturity a
+            held position may still be rebalanced: it is rebalanced only while
+            its later market closes at least this many days from today. None
+            (default) is "maturity": always rebalance. 1 or 7 days; a 0 given
+            in is stored as None. Refused with rebalance off.
         sell_at (float | None): The share of its potential profit at which a
             held position is sold, in (0, 1] on the 1% grid (0.85 for 85%); None
             (default) never sells.
@@ -3325,6 +3367,7 @@ class LiveSettings:
     exclude_tags: tuple[str, ...] | None = None
     rebalance: bool = False
     min_price_move: float | None = None
+    rebalance_min_days_to_maturity: int | None = None
     sell_at: float | None = None
     sell_min_days: int | None = None
     origin: str = field(default=LIVE_DEFAULTS_FROM_CONFIG, compare=False)
@@ -3376,6 +3419,20 @@ class LiveSettings:
             if not self.rebalance:
                 raise ValueError("min_price_move needs rebalance on, got min_price_move "
                                  f"{self.min_price_move!r} with rebalance off")
+        days = self.rebalance_min_days_to_maturity
+        # type() is int refuses a bool, a float such as 1.0 and a numpy integer
+        if type(days) is int and days == 0:
+            # 0 days is "maturity": always rebalance, which is None
+            object.__setattr__(self, "rebalance_min_days_to_maturity", None)
+        elif days is not None:
+            if type(days) is not int or days not in REBALANCE_MATURITY_DAYS:
+                raise ValueError("rebalance_min_days_to_maturity must be "
+                                 f"{', '.join(str(d) for d in REBALANCE_MATURITY_DAYS[:-1])}"
+                                 f" or {REBALANCE_MATURITY_DAYS[-1]}, got {days!r}")
+            # Like the minimum price movement, it holds a rebalance back
+            if not self.rebalance:
+                raise ValueError("rebalance_min_days_to_maturity needs rebalance on, got "
+                                 f"rebalance_min_days_to_maturity {days!r} with rebalance off")
         if self.sell_at is not None:
             object.__setattr__(self, "sell_at", _step_share(self.sell_at, "sell_at"))
         if self.sell_min_days is not None:
@@ -3394,14 +3451,15 @@ class LiveSettings:
             raise ValueError(f"origin must be a printable description, got {self.origin!r}")
 
 
-# The eleven toggles by field name: every LiveSettings field except origin
+# The twelve toggles by field name: every LiveSettings field except origin
 LIVE_TOGGLE_FIELDS = tuple(f.name for f in fields(LiveSettings) if f.compare)
 
 # Toggles a saved file may leave out. A missing one reads as its LiveSettings
 # default (all off, whatever config.py ships), since nobody confirmed a value
 # for it in that file. save_live_defaults leaves one out while it is at its
 # default, so code that does not know the toggle can still read the file.
-_OPTIONAL_TOGGLES = ("rebalance", "min_price_move", "sell_at", "sell_min_days")
+_OPTIONAL_TOGGLES = ("rebalance", "min_price_move", "rebalance_min_days_to_maturity",
+                     "sell_at", "sell_min_days")
 # Each of those toggles' LiveSettings default
 _TOGGLE_DEFAULTS = {f.name: f.default for f in fields(LiveSettings)
                     if f.name in _OPTIONAL_TOGGLES}
@@ -3419,6 +3477,11 @@ _RETIREMENTS = (
     (("categories",), "exclude_categories"),
     (("tags",), "exclude_tags"),
 )
+# The Rebalance settings: a saved file holding one of them beside an old
+# switch (add_to_held_pairs, trim_to_kelly, trim_min_rise) says two things at
+# once, so _retired_proposal gives it no proposal
+_REBALANCE_SETTINGS = ("rebalance", "min_price_move", "rebalance_min_days_to_maturity")
+
 # The category/tag filter's keys that each retired filter key was saved beside
 # by some version: categories (the oldest filter) only beside tags, never
 # beside exclude_categories or exclude_tags; tags beside categories, and beside
@@ -3436,11 +3499,13 @@ _RETIRED_FILTER_COMPANIONS = {
 # The values `python3 -m kalshi_betting.defaults_server --seed` offers for a
 # first save of the live defaults: tier floors off, spread band 0-0.5, k 0.80,
 # a 10% per-trade cap, a 20% same-title cap, no category or tag excluded, rebalancing
-# on with no minimum price movement, and no selling. One pair stakes at most
+# on with no minimum price movement and no limit on how close to maturity (the
+# days to maturity read "maturity"), and no selling. One pair stakes at most
 # 10% of the portfolio value; an add-on to a held pair stakes no more than a
 # new pair would, and keeps the held pair (at today's prices, plus the fees
 # paid for it) and the add-on together within 10% of the portfolio value, and
-# a Kelly trim sells a held pair down to its Kelly size, at most that share.
+# a Kelly trim sells a held pair, or a lone leg whose partner has paid out,
+# down to its Kelly size, at most that share.
 # Nothing trades on them
 # until they are confirmed and saved to LIVE_DEFAULTS_FILE.
 LIVE_DEFAULTS_SEED = LiveSettings(
@@ -3570,7 +3635,7 @@ class _RetiredSettings(ValueError):
 
 def live_settings() -> LiveSettings:
     """
-    Return config.py's own eleven toggle constants as LiveSettings, validated.
+    Return config.py's own twelve toggle constants as LiveSettings, validated.
 
     Read at call time, so a test that monkeypatches a constant here takes
     effect. It is NOT the live defaults: a live run starts only from the saved
@@ -3596,6 +3661,7 @@ def live_settings() -> LiveSettings:
         exclude_tags=TRADE_EXCLUDE_TAGS,
         rebalance=REBALANCE,
         min_price_move=MIN_PRICE_MOVE,
+        rebalance_min_days_to_maturity=REBALANCE_MIN_DAYS_TO_MATURITY,
         sell_at=SELL_AT,
         sell_min_days=SELL_MIN_DAYS,
     )
@@ -3701,13 +3767,13 @@ def _settings_from_toggles(raw, origin: str) -> LiveSettings:
     """
     Turn a saved file's "settings" object into LiveSettings, or refuse it.
 
-    Checks what LiveSettings cannot see in JSON: exactly the eleven toggle
+    Checks what LiveSettings cannot see in JSON: exactly the twelve toggle
     names (a toggle in _OPTIONAL_TOGGLES may be left out, and then takes its
     LiveSettings default, off), a spread band of two real numbers
     (LiveSettings would read a JSON true as 1), no JSON true or false as a
-    sell level, minimum of days or minimum price move (refused here so the
-    error names the field), and printable filter names. LiveSettings then
-    validates every value.
+    sell level, minimum of days, minimum price move or rebalance-until days
+    (refused here so the error names the field), and printable filter names.
+    LiveSettings then validates every value.
 
     Args:
         raw: The file's "settings" value, as json.loads returned it.
@@ -3730,7 +3796,8 @@ def _settings_from_toggles(raw, origin: str) -> LiveSettings:
             isinstance(x, (int, float)) and not isinstance(x, bool) for x in band)):
         raise ValueError(f'"spread_band" must be [floor, ceiling], got {band!r}')
     # LiveSettings refuses a JSON true or false too; refusing it here names the field
-    for name in ("sell_at", "sell_min_days", "min_price_move"):
+    for name in ("sell_at", "sell_min_days", "min_price_move",
+                 "rebalance_min_days_to_maturity"):
         if isinstance(raw.get(name), bool):
             raise ValueError(f'"{name}" must be a number or null, got {raw[name]!r}')
     for name in ("exclude_categories", "exclude_tags"):
@@ -3890,11 +3957,12 @@ def _retired_proposal(raw: dict, origin: str
     Raises:
         ValueError: The old values, or the rest of the settings, are refused;
             or the object also holds the settings that replaced a retired one
-            (rebalance or min_price_move beside the Rebalance ones), or a key
-            of the new category/tag filter that no version saved beside a
-            retired filter key (_RETIRED_FILTER_COMPANIONS: exclude_categories
-            or exclude_tags beside categories, exclude_tags beside tags), so
-            it says two things at once.
+            (rebalance, min_price_move or rebalance_min_days_to_maturity beside
+            the Rebalance ones), or a key of the new category/tag filter that
+            no version saved beside a retired filter key
+            (_RETIRED_FILTER_COMPANIONS: exclude_categories or exclude_tags
+            beside categories, exclude_tags beside tags), so it says two
+            things at once.
     """
     toggles = {name: value for name, value in raw.items() if name not in _RETIRED_TOGGLES}
     # Two filters at once cannot be read as one: a retired filter key beside
@@ -3915,8 +3983,9 @@ def _retired_proposal(raw: dict, origin: str
         toggles["exclude_tags"] = None
     rebalance_keys = _RETIREMENTS[0][0]
     if any(name in raw for name in rebalance_keys):
-        if "rebalance" in raw or "min_price_move" in raw:
-            raise ValueError("it also holds rebalance or min_price_move")
+        if any(name in raw for name in _REBALANCE_SETTINGS):
+            raise ValueError("it also holds rebalance, min_price_move or "
+                             "rebalance_min_days_to_maturity")
         for name in ("add_to_held_pairs", "trim_to_kelly"):
             if name in raw and type(raw[name]) is not bool:
                 raise ValueError(f'"{name}" must be true or false, got {raw[name]!r}')
@@ -4117,15 +4186,16 @@ def read_saved_live_defaults() -> LiveSettings | None:
     - "format": LIVE_DEFAULTS_FORMAT;
     - "saved_at": UTC, e.g. 2026-09-27T21:05:13Z;
     - "source": a note (live_defaults_source's rules);
-    - "settings": the eleven toggles by LiveSettings field name. tier_floors is
+    - "settings": the twelve toggles by LiveSettings field name. tier_floors is
       true/false, spread_band is [floor, ceiling], interval_discount, size_cap
       and same_title_size_cap are numbers (the caps as fractions),
       exclude_categories is null (none excluded) or a list of names,
       exclude_tags is null (none excluded) or a list of names, rebalance is
       true/false or left out, which reads as off, and min_price_move is
-      dollars (0.1 for 10c), or null or left out for no minimum. sell_at (a
-      share, e.g. 0.85) and sell_min_days (whole days) are numbers, or null
-      or left out for off.
+      dollars (0.1 for 10c), or null or left out for no minimum.
+      rebalance_min_days_to_maturity is 1 or 7 (days), or null or left out for
+      "maturity" (always rebalance). sell_at (a share, e.g. 0.85) and
+      sell_min_days (whole days) are numbers, or null or left out for off.
 
     Refused on top of that: a repeated key, NaN or Infinity, a file over
     LIVE_DEFAULTS_MAX_BYTES, any value LiveSettings rejects, and anything at
@@ -4285,11 +4355,11 @@ def save_live_defaults(settings: LiveSettings, *, source: str) -> LiveSettings:
     this process id, flushed, and renamed over the file, so a reader at the
     same moment sees the old file or the new one, never part of one. The
     directory is flushed too, so the rename survives a power cut. The file is
-    then read back from disk and must equal settings (the eleven toggles;
+    then read back from disk and must equal settings (the twelve toggles;
     origin is not compared). A toggle in _OPTIONAL_TOGGLES is written only
-    when it is not at its default, so a file with all four off holds only the
+    when it is not at its default, so a file with all five off holds only the
     seven other toggles, which code that does not know them can still read.
-    Only the eleven toggles' names are written, never one of
+    Only the twelve toggles' names are written, never one of
     _RETIRED_TOGGLES, so a save replaces a file an older version saved with
     one every live run reads.
 
@@ -4536,9 +4606,12 @@ def max_kelly_fraction(pair_type: str, settings: LiveSettings) -> float:
 # realized profit (what selling it at the bids would return, after the sale's
 # fees, less its cost) has been at least a set share of its potential profit
 # (what it pays if it wins, less its cost) at every daily check. Live selling
-# (seller.plan_sales) decides with all three functions below, and the backtest with
-# take_profit_reached and days_to_maturity (through backtester._sells_at and
-# _days_left), so the two never apply different arithmetic.
+# (seller.plan_sales) decides with the first three functions below, and the backtest
+# with take_profit_reached, days_to_maturity and days_left_reached (through
+# backtester._sells_at, _days_left and _far_enough), so the two never apply
+# different arithmetic. The last, days_left_reached, is also "Rebalance until":
+# how near maturity a held position may still be trimmed or added to, read from
+# days_to_maturity's answer, live and in the backtest's walk alike.
 
 def take_profit_reached(sell_at: float, realized: float, potential: float) -> bool:
     """
@@ -4613,11 +4686,42 @@ def days_to_maturity(close_dates, day: date) -> int | None:
     return (max(dates) - day).days
 
 
+def days_left_reached(left: int | None, min_days: int | None) -> bool:
+    """
+    Whether a position with `left` whole days to maturity is far enough from it.
+
+    The test behind "Rebalance until" (LiveSettings.rebalance_min_days_to_maturity):
+    a held position is rebalanced (a Kelly trim, or an add-on) only while its
+    later market closes at least `min_days` days from today. Always True with
+    no minimum; never with an unknown number of days, so a position whose
+    close date cannot be read is not rebalanced under a minimum. Live
+    rebalancing asks it (seller._too_near_maturity), and so does the
+    backtest's walk (backtester._simulate_at_discount, on the days
+    _rebalance_days_left gives), its take-profit sale's minimum of days
+    (backtester._far_enough) and RebalanceSweep.maturity_grid, of the days a
+    run recorded, to tell which of its runs are one; a live sale's minimum
+    applies the same test in its own code (seller._plan_one).
+
+    Args:
+        left (int | None): Whole days from today to the position's latest close
+            date (days_to_maturity), or None when a close date is unknown.
+        min_days (int | None): The fewest days left that still allow it, or None
+            for no minimum.
+
+    Returns:
+        bool: True when there is no minimum, or `left` is known and at least `min_days`.
+    """
+    return min_days is None or (left is not None and left >= min_days)
+
+
 # ── Trimming a held pair to its Kelly size ────────────────────────────────────
 #
 # A held pair (the same two markets, one side of each, in equal counts) can
 # grow past the share of the portfolio Kelly would give it: its price rises,
 # or the rest of the portfolio shrinks. Trimming sells part of it back down.
+# A live trim (seller._trim_one) takes a lone leg whose partner has paid out the
+# same way: the partner is read at its settlement price (settled_bids), so the
+# leg is the position.
 # The pair is priced at what selling it returns now (the bids, less the
 # sale's fee), not at what buying it costs, so the size a run sells down to
 # sits above the size it would buy up to (held_pair_fraction), and a run
@@ -4690,6 +4794,34 @@ def held_pair_win_prob(pair_type: str, yes_ask_a: float, no_ask_a: float,
     if not spread > PRICE_EPSILON:
         return None
     return time_series_profit_prob(spread, k)
+
+
+def settled_bids(result: str) -> tuple[float, float]:
+    """
+    Return the (YES bid, NO bid) a paid-out market reads as: its settlement price.
+
+    A Kelly trim of a lone leg (the later market of a time-series pair, still
+    held after the earlier market paid out) reads the paid-out market this way,
+    so the pair arithmetic runs unchanged: held_pair_win_prob takes each ask as
+    1 minus the other side's bid (a market that settled "no" has a YES ask of 0
+    and a NO ask of 1), and the side held there adds its bid, $0 when that side
+    lost, to what selling the pair fetches. The live Kelly trim of a lone leg
+    (seller._trim_one) and the backtest's (backtester._fresh_bids) read it.
+
+    Args:
+        result (str): How the market settled, "yes" or "no".
+
+    Returns:
+        tuple[float, float]: (1.0, 0.0) for "yes", (0.0, 1.0) for "no".
+
+    Raises:
+        ValueError: For a result other than "yes" or "no".
+    """
+    if result == "yes":
+        return (1.0, 0.0)
+    if result == "no":
+        return (0.0, 1.0)
+    raise ValueError(f"a settled market's result must be 'yes' or 'no', got {result!r}")
 
 
 def kelly_hold_fraction(win_prob: float, sale_value: float) -> float:
@@ -4845,7 +4977,7 @@ def kelly_trim_bids(ladder, max_drop: float) -> list:
     trim never sells into a gap in the book: under a binding size cap the
     rule (kelly_trim_count) would otherwise sell past one 42c bid into a stub
     bid at 2c. A bid exactly max_drop below the best is kept, within float
-    noise. seller._trim_one calls it on both held sides.
+    noise. seller._trim_one calls it on each held side.
 
     Args:
         ladder: One side's bids, [[price in dollars, quantity], ...], best
@@ -5188,6 +5320,23 @@ def _move_text(move: float | None) -> str:
     return f"{round(move * 100)}c"
 
 
+def _rebalance_until_text(days: int | None) -> str:
+    """
+    Name a validated "rebalance until" setting on the "Live settings:" line.
+
+    Args:
+        days (int | None): LiveSettings.rebalance_min_days_to_maturity (1 or
+            7), or None.
+
+    Returns:
+        str: "maturity" for None (always rebalance), else e.g. "1 day before
+            maturity" or "7 days before maturity".
+    """
+    if days is None:
+        return "maturity"
+    return f"{days} day{'' if days == 1 else 's'} before maturity"
+
+
 # Every live toggle as the "Live settings:" line (describe_live_settings) and
 # the comparison of two sets of defaults (live_settings_changes) name it:
 # (label, field, renderer), each exact where a short form would print two
@@ -5202,6 +5351,7 @@ _LIVE_SETTING_FIELDS = (
     ("exclude tags", "exclude_tags", _names_text),
     ("rebalance", "rebalance", lambda v: "yes" if v else "no"),
     ("min price movement", "min_price_move", _move_text),
+    ("rebalance until", "rebalance_min_days_to_maturity", _rebalance_until_text),
     ("sell at", "sell_at", _sell_at_text),
     ("min days to maturity", "sell_min_days", lambda v: "any" if v is None else str(v)),
 )
@@ -5318,8 +5468,8 @@ def describe_live_settings(settings: LiveSettings, reference: LiveSettings | Non
     Returns:
         str: e.g. "tier floors off | spread band 0-0.5 | k 0.8 | per-trade cap
             100% (no cap) | same-title cap 20% | exclude categories none | exclude tags none |
-            rebalance yes | min price movement any | sell at off | min days to
-            maturity any",
+            rebalance yes | min price movement any | rebalance until maturity |
+            sell at off | min days to maturity any",
             with " (default: X)" after each field that differs from reference's
             when reference is the saved live defaults (its origin is anything
             but LIVE_DEFAULTS_FROM_CONFIG), " (config: X)" when it was built
@@ -5369,7 +5519,7 @@ def live_settings_changes(current: LiveSettings | None,
 
 def live_settings_argv(settings: LiveSettings) -> list[str]:
     """
-    Spell a run's settings as main.py's toggle flags, all eleven toggles.
+    Spell a run's settings as main.py's toggle flags, all twelve toggles.
 
     A program that starts main.py with these flags gets a run that trades
     exactly these settings, whatever the saved live defaults say:
@@ -5383,8 +5533,10 @@ def live_settings_argv(settings: LiveSettings) -> list[str]:
     --no-exclude-category and no excluded tag as --no-exclude-tag. Rebalancing is written
     either way (--rebalance / --no-rebalance), so a saved value never decides
     it, and so is its minimum price move in whole cents (--min-price-move=10
-    / --no-min-price-move), the sell level and its minimum (--sell-at=85 /
-    --no-sell, --sell-min-days=7 / --no-sell-min-days).
+    / --no-min-price-move), how close to maturity it still rebalances
+    (--rebalance-min-days-to-maturity=7 / --no-rebalance-min-days-to-maturity),
+    the sell level and its minimum (--sell-at=85 / --no-sell,
+    --sell-min-days=7 / --no-sell-min-days).
 
     Args:
         settings (LiveSettings): The settings to spell.
@@ -5392,9 +5544,9 @@ def live_settings_argv(settings: LiveSettings) -> list[str]:
     Returns:
         list[str]: The flags, in the order main.py lists them: the tier-floor
             switch, --spread-min, --spread-max, --interval-discount,
-            --size-cap, --same-title-size-cap, the rebalance switch and its
-            minimum, the two sell flags, then the excluded-category flags and
-            the excluded-tag flags.
+            --size-cap, --same-title-size-cap, the rebalance switch, its
+            minimum and its days to maturity, the two sell flags, then the
+            excluded-category flags and the excluded-tag flags.
     """
     argv = ["--tier-floors" if settings.tier_floors else "--no-tier-floors",
             f"--spread-min={settings.spread_band[0]!r}",
@@ -5406,6 +5558,9 @@ def live_settings_argv(settings: LiveSettings) -> list[str]:
     # The minimum price move is a multiple of 5c, so its whole cents are exact
     argv += ([f"--min-price-move={round(settings.min_price_move * 100)}"]
              if settings.min_price_move is not None else ["--no-min-price-move"])
+    argv += ([f"--rebalance-min-days-to-maturity={settings.rebalance_min_days_to_maturity}"]
+             if settings.rebalance_min_days_to_maturity is not None
+             else ["--no-rebalance-min-days-to-maturity"])
     # The sell level is a multiple of 1%, so its whole percent is exact
     argv += ([f"--sell-at={round(settings.sell_at * 100)}"] if settings.sell_at is not None
              else ["--no-sell"])
@@ -5498,12 +5653,16 @@ def rebalance_change_warnings(current: LiveSettings,
     """
     Say when moving from one set of live settings to another also sells held pairs.
 
-    With rebalancing on, a run sells each exact held pair worth more than its
-    Kelly size (the lower of its size cap and Kelly's own share, which reads
-    k for a time-series pair) down to that size, before anything is bought,
-    once the pair's wait has passed (a Kelly trim). So with the proposed
-    settings rebalancing, a lower size cap (as pair_size_cap applies it) or a
-    higher k can sell pairs the current settings would keep.
+    With rebalancing on, a run sells each exact held pair, or lone leg (the
+    later market of a time-series pair, still held after the earlier one paid
+    out $0), worth more than its Kelly size (the lower of its size cap and
+    Kelly's own share, which reads k for a time-series pair) down to that size,
+    before anything is bought, once its wait has passed (a Kelly trim). So with
+    the proposed settings rebalancing, a lower size cap (as pair_size_cap
+    applies it) or a higher k can sell pairs the current settings would keep,
+    and, through a time-series cap or k, lone legs too: a lone leg is never a
+    same-title position, so a same-title cap alone does not reach one and the
+    sentence then leaves lone legs out.
     main._log_live_settings logs the sentence as a WARNING on a real-money
     run whose flags depart from the saved defaults; the defaults server's
     confirmation page shows it in red.
@@ -5519,6 +5678,9 @@ def rebalance_change_warnings(current: LiveSettings,
     if not proposed.rebalance:
         return []
     changes = []
+    # A lone leg is only ever the later market of a time-series pair, so only a
+    # time-series cap or k can move what one is trimmed to
+    reaches_lone_leg = False
     for pair_type, label in (("time_series", "time-series"), ("same_title", "same-title")):
         # The cap each pair type is trimmed to, as a new trade of it is capped
         before = pair_size_cap(pair_type, current.size_cap, current.same_title_size_cap)
@@ -5526,16 +5688,20 @@ def rebalance_change_warnings(current: LiveSettings,
         if after < before:
             changes.append(f"the {label} size cap goes from {_cap_text(before, 'no cap')} to "
                            f"{_cap_text(after, 'no cap')}")
+            reaches_lone_leg = reaches_lone_leg or pair_type == "time_series"
     if proposed.interval_discount > current.interval_discount:
         changes.append(f"k goes from {_exact_number(current.interval_discount)} to "
                        f"{_exact_number(proposed.interval_discount)}, which lowers a "
                        "time-series pair's chance of paying")
+        reaches_lone_leg = True
     if not changes:
         return []
     named = changes[0] if len(changes) == 1 else ", ".join(changes[:-1]) + " and " + changes[-1]
+    lone_leg = ", or lone leg whose partner has paid out," if reaches_lone_leg else ""
     return [f"with Rebalance yes, these settings can sell more of the held pairs: {named}; "
-            "each exact held pair worth more than its new Kelly size is sold down to it before "
-            "anything is bought, once the wait since its last trade has passed"]
+            f"each exact held pair{lone_leg} worth more than its "
+            "new Kelly size is sold down to it before anything is bought, once the wait since "
+            "its last trade has passed"]
 
 
 def order_api_version_error() -> str | None:

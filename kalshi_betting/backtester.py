@@ -183,11 +183,19 @@ Notes:
     of a held pair once it is worth more than its Kelly share of the
     portfolio value, each contract pair counted at what selling it returns
     (config.kelly_trim_count, with the chance it pays from
-    config.held_pair_win_prob). It checks at every entry checkpoint, after
-    the day's pay-outs and take-profit sales and before its purchases. With
-    add_to_held as well, a pair is rebalanced both ways.
+    config.held_pair_win_prob). It sells part of a lone leg the same way: the
+    later market of a time-series pair, still held after the earlier market
+    paid out $0, with that market read at its settlement price (_lone_leg,
+    config.settled_bids), as a live trim reads it. It checks at every entry
+    checkpoint, after the day's pay-outs and take-profit sales and before its
+    purchases. With add_to_held as well, a pair is rebalanced both ways.
 
-    Both of these are rebalances, and both follow the same two rules. A held
+    Both of these are rebalances, and both follow the same rules. With
+    rebalance_min_days_to_maturity set ("Rebalance until": 1 or 7), a held
+    pair is neither added to nor trimmed while its later market (a lone
+    leg's own) closes fewer than that many days after the checkpoint
+    (_rebalance_days_left, config.days_left_reached, as live rebalancing
+    reads it). A held
     pair is added to or trimmed only once REBALANCE_MIN_DAYS_SINCE_TRADE
     calendar days have passed since its last trade: its latest purchase,
     add-on or trim (_last_trade_day, config.rebalance_rested). Checkpoints
@@ -304,8 +312,17 @@ Notes:
     made (SweepPoint.moves), which is how RebalanceSweep.move_grid simulates
     only the minimums that differ: a larger minimum that still lets through
     every add-on and trim a run made (config.price_move_reached) is that
-    run, yielded as a SameMove. No other family adds to or trims held pairs,
-    so a backtest never simulates one without the other.
+    run, yielded as a SameMove. With maturity_sweep, the family also carries
+    each "Rebalance until" choice besides "maturity"
+    (RebalanceSweep.maturity_days), and every run records the days left
+    before each add-on and trim it made (SweepPoint.rebalance_days_left),
+    which is how RebalanceSweep.maturity_grid, starting from the runs at
+    "maturity" its reader already has, simulates only the cells that
+    differ: a cell whose minimum and days limit still let through every
+    add-on and trim of a run no stricter (config.price_move_reached,
+    config.days_left_reached) is that run, yielded as a SameMaturity. No
+    page reads those cells yet. No other family adds to or trims held
+    pairs, so a backtest never simulates one without the other.
 
     An ENTRY CHECKPOINT is a moment at which the backtest may open a
     simulated trade: the live bot's weekly run time (config.SCHEDULED_RUN,
@@ -412,6 +429,7 @@ from .config import (
     MIN_ACTIVE_PRICE_DOLLARS,
     MIN_PRICE_MOVES,
     PRICE_EPSILON,
+    REBALANCE_MATURITY_DAYS,
     REBALANCE_MIN_DAYS_SINCE_TRADE,
     SAME_TITLE_CO_RESOLVE_PROB,
     SAME_TITLE_MIN_PRICE_DIFF,
@@ -435,8 +453,10 @@ from .config import (
     _cap_text,
     _exact_number,
     _names_text,
+    _rebalance_until_text,
     _step_cap,
     confirmed_fee_multiplier,
+    days_left_reached,
     days_to_maturity,
     describe_time_series_rule,
     fee_leg_exact,
@@ -452,6 +472,7 @@ from .config import (
     price_move_reached,
     rebalance_min_days,
     rebalance_rested,
+    settled_bids,
     take_profit_reached,
     time_series_mid_spread,
     time_series_profit_prob,
@@ -711,7 +732,8 @@ def _sim_options(size_cap: float | None, quiet: bool, *,
                  sell_at: float | None = None,
                  sell_min_days: int | None = None,
                  trim_to_kelly: bool = False,
-                 min_move: float | None = None) -> dict:
+                 min_move: float | None = None,
+                 rebalance_min_days_to_maturity: int | None = None) -> dict:
     """
     Build the keyword arguments a sweep helper forwards to _simulate_at_discount.
 
@@ -750,7 +772,9 @@ def _sim_options(size_cap: float | None, quiet: bool, *,
     exactly True (a CapSweep that trims held pairs to their Kelly size, or a
     split-half or excluding-top-event check of a point that does), and
     min_move only when it is set (a run that adds to or trims a pair
-    only after its price has moved), so every other call is unchanged.
+    only after its price has moved), and rebalance_min_days_to_maturity
+    only when it is set (a run that stops adding to and trimming a pair
+    near its maturity), so every other call is unchanged.
 
     Args:
         size_cap (float | None): The cap the caller simulates under; None or
@@ -784,13 +808,18 @@ def _sim_options(size_cap: float | None, quiet: bool, *,
             simulation adds to it or looks at it for a trim (see
             _simulate_at_discount); forwarded only when it is not None.
             Default None, not forwarded.
+        rebalance_min_days_to_maturity (int | None): Keyword-only. The fewest
+            days a held pair's later market must be from its close for the
+            simulation to add to it or trim it ("Rebalance until", see
+            _simulate_at_discount); forwarded only when it is not None.
+            Default None, not forwarded.
 
     Returns:
         dict: {} on a default call; otherwise "size_cap", "quiet",
             "end_date", "tier_floors" (always False when present),
             "add_to_held" (always True when present), "sell_at",
-            "sell_min_days", "trim_to_kelly" (always True when present)
-            and/or "min_move".
+            "sell_min_days", "trim_to_kelly" (always True when present),
+            "min_move" and/or "rebalance_min_days_to_maturity".
     """
     out: dict = {}
     if size_cap is not None and size_cap != BUDGET_FRACTION:
@@ -812,6 +841,8 @@ def _sim_options(size_cap: float | None, quiet: bool, *,
         out["trim_to_kelly"] = True
     if min_move is not None:
         out["min_move"] = min_move
+    if rebalance_min_days_to_maturity is not None:
+        out["rebalance_min_days_to_maturity"] = rebalance_min_days_to_maturity
     return out
 
 # ─── Data structures ──────────────────────────────────────────────────────────
@@ -2147,6 +2178,21 @@ class SweepPoint:
             the same. RebalanceSweep.move_grid reads it to tell which larger
             minimums give this same run. Not in repr and not compared, like
             sales.
+        rebalance_min_days_to_maturity (int | None): "Rebalance until": the
+            fewest days the held position's later market (a lone leg's own)
+            had to be from its close for the simulation to add to it or
+            trim it (_simulate_at_discount's rebalance_min_days_to_maturity,
+            1 or 7), or None when it had no such minimum ("maturity", given
+            as 0 or None). Like min_move, _half_split and _ex_top_event
+            re-simulate the point at this setting. Defaults to None.
+        rebalance_days_left (tuple[int | None, ...] | None): The days left to
+            the held position's later market's close (_rebalance_days_left;
+            None where a close date was unknown) at every trim and every
+            add-on the run made, one figure each, in the order of moves:
+            the very number "Rebalance until" tested before it. () when it
+            could add or trim and did neither, None when it does neither or
+            the point was built by hand. A copy CapSweep shares at another
+            cap keeps it. Not in repr and not compared, like moves.
     """
     k: float
     trades: list[BacktestTrade]
@@ -2166,6 +2212,9 @@ class SweepPoint:
     trim_to_kelly: bool = False
     min_move: float | None = None
     moves: tuple[float, ...] | None = field(default=None, repr=False, compare=False)
+    rebalance_min_days_to_maturity: int | None = None
+    rebalance_days_left: tuple[int | None, ...] | None = field(default=None, repr=False,
+                                                               compare=False)
 
 
 @dataclass(frozen=True)
@@ -2767,10 +2816,13 @@ class CapSweep:
     the last trade on it (_simulate_at_discount's min_move), in every
     simulation it runs; and each of its simulations waits
     REBALANCE_MIN_DAYS_SINCE_TRADE days after a trade before an add-on or a
-    trim. Both tests read prices and the dates of the pair's trades, never
-    the cap: a pair the trim's gate holds back is not asked for a trim
-    decision, and an add-on the add-on gate holds back is never sized, so
-    sharing stays exact with them. Adding (add_to_held) and trimming
+    trim. With rebalance_min_days_to_maturity ("Rebalance until") as well,
+    no simulation adds to or trims a held position whose later market
+    closes within that many days. These tests read prices and dates (of the
+    pair's trades, and of its markets' closes), never the cap: a pair the
+    trim's gate holds back is not asked for a trim decision, and an add-on
+    the add-on gate holds back is never sized, so sharing stays exact with
+    them. Adding (add_to_held) and trimming
     (trim_to_kelly) are two switches here so each step can be tested alone,
     but the one family that rebalances, RebalanceSweep, turns both on in
     every sweep it builds, so no backtest run adds without trimming or trims
@@ -2937,6 +2989,13 @@ class CapSweep:
             (_simulate_at_discount's min_move). Needs add_to_held or
             trim_to_kelly. Forwarded only when set. Default None (no
             minimum).
+        rebalance_min_days_to_maturity (int | None): "Rebalance until": the
+            fewest days a held position's later market must be from its
+            close for any simulation it runs, and its checks, to add to it
+            or trim it (_simulate_at_discount's rebalance_min_days_to_maturity:
+            1 or 7). Needs add_to_held or trim_to_kelly; a 0 given in
+            ("maturity") is stored as None. Forwarded only when set. Default
+            None (no minimum).
         end_dates (dict): (band, k, population) -> the day that population's
             curves end on, for a cell with no eager point (the eager map is
             empty for a sweep whose setting no eager run shares: one that
@@ -2982,6 +3041,9 @@ class CapSweep:
     # The least price move, up or down, an add-on or a trim needs (None: any);
     # only with add_to_held or trim_to_kelly
     min_move: float | None = None
+    # "Rebalance until": the fewest days to maturity an add-on or a trim needs
+    # (None: any); only with add_to_held or trim_to_kelly
+    rebalance_min_days_to_maturity: int | None = None
 
     def _own_setting(self) -> str | None:
         """
@@ -3018,8 +3080,11 @@ class CapSweep:
                 without sell_at or is not a whole number of at least 1, if
                 trim_to_kelly is not True or False, if min_move is set
                 without add_to_held (exactly True) or trim_to_kelly, or is not
-                a number from the finest price step to 1, or if trim_to_kelly
-                is set with checks (see the class docstring).
+                a number from the finest price step to 1, if
+                rebalance_min_days_to_maturity is not one of
+                config.REBALANCE_MATURITY_DAYS or is 1 or 7 without
+                add_to_held (exactly True) or trim_to_kelly, or if
+                trim_to_kelly is set with checks (see the class docstring).
         """
         if not isinstance(self.trim_to_kelly, bool):
             # Only an actual True reaches the simulations (_sim_options), so
@@ -3031,6 +3096,11 @@ class CapSweep:
         # read. Only an actual True add_to_held reaches the simulations
         # (_sim_options), so only that counts as adding here
         _resolve_min_move(self.min_move, self.add_to_held is True or self.trim_to_kelly)
+        # "Rebalance until", checked the same way; "maturity" (0) is stored as
+        # None, so it reaches no simulation as a keyword
+        self.rebalance_min_days_to_maturity = _resolve_rebalance_until(
+            self.rebalance_min_days_to_maturity,
+            self.add_to_held is True or self.trim_to_kelly)
         if self.sell_at is not None:
             # Checked as the simulation checks it, before any cell is read
             _resolve_sell_at(self.sell_at)
@@ -3067,7 +3137,8 @@ class CapSweep:
         else a quiet simulation, pinned to the eager point's end date (with
         no eager point, to end_dates' day for this cell) and run at this
         sweep's Tier floors, add-on, sell and Kelly-trim settings (tier_floors,
-        add_to_held, sell_at, sell_min_days, trim_to_kelly, min_move),
+        add_to_held, sell_at, sell_min_days, trim_to_kelly, min_move,
+        rebalance_min_days_to_maturity),
         with the split-half and top-event checks — at those settings too —
         when the band sweep ran and the population carries them.
 
@@ -3144,7 +3215,9 @@ class CapSweep:
                                    sell_at=self.sell_at,
                                    sell_min_days=self.sell_min_days,
                                    trim_to_kelly=self.trim_to_kelly,
-                                   min_move=self.min_move))
+                                   min_move=self.min_move,
+                                   rebalance_min_days_to_maturity=(
+                                       self.rebalance_min_days_to_maturity)))
                 self.simulated += 1
                 if self.checks and population in _CHECKED_POPULATIONS:
                     point.halves = _half_split(
@@ -3154,7 +3227,8 @@ class CapSweep:
                         end_date=end_date, add_to_held=self.add_to_held,
                         sell_at=self.sell_at, sell_min_days=self.sell_min_days,
                         trim_to_kelly=self.trim_to_kelly,
-                        min_move=self.min_move)
+                        min_move=self.min_move,
+                        rebalance_min_days_to_maturity=self.rebalance_min_days_to_maturity)
                     point.ex_top_event = _ex_top_event(
                         point, subset, self.start_date, self.initial_balance, band,
                         population=population, tier_floors=self.tier_floors, quiet=True,
@@ -3309,6 +3383,31 @@ class SameMove:
             rebalancing run with no minimum (the run move_grid starts from).
     """
     min_move: float | None
+
+
+@dataclass(frozen=True)
+class SameMaturity:
+    """
+    A "Rebalance until" cell that is exactly a run RebalanceSweep.maturity_grid already has, at the same size cap.
+
+    maturity_grid yields one of these, instead of a point, for a (choice,
+    minimum price movement, cap) that walks exactly as a run of the same
+    cell and cap at a choice and a minimum no stricter: every add-on and
+    every trim that run made came after a move this minimum lets through
+    and with at least this choice's days left, so the two runs make the
+    same trades (maturity_grid says why). A reader reuses whatever it made
+    of that run; nothing is simulated or kept for this one.
+
+    Attributes:
+        min_move (float | None): The minimum price movement the run was
+            simulated at; None for no minimum.
+        min_days (int | None): Its "Rebalance until" choice: one that
+            maturity_grid yielded as a point for this cap at min_move, or
+            None for the run at "maturity" (no days limit), one of the runs
+            the caller handed maturity_grid in `starts`.
+    """
+    min_move: float | None
+    min_days: int | None
 
 
 @dataclass(frozen=True)
@@ -3668,6 +3767,20 @@ class RebalanceSweep:
     holds back none of the add-ons and trims a run at a smaller minimum
     made is that run, yielded as a SameMove.
 
+    With maturity_days (the choices of config.REBALANCE_MATURITY_DAYS other
+    than "maturity", on a run that asked for them), the family also covers
+    the dashboard's "Rebalance until" data: the same scenarios with a held
+    position added to or trimmed only while its later market (a lone leg's
+    own market) closes at least that many days after the checkpoint
+    (_simulate_at_discount's rebalance_min_days_to_maturity), at every
+    minimum price movement too. sweep(rebalance_min_days_to_maturity=...)
+    is the CapSweep at one choice, and maturity_grid() reads one (band, k)
+    cell at every choice and minimum while simulating only the runs that
+    differ, starting from the runs at "maturity" its caller has already
+    read: a cell that holds back none of the add-ons and trims a run at a
+    choice and a minimum no stricter made is that run, yielded as a
+    SameMaturity.
+
     Retention: its entry maps are the very objects BacktestSweep's size-cap
     and sell families hold, so beside either of them it keeps nothing more
     alive; on a run with neither it is what keeps those entries.
@@ -3693,6 +3806,13 @@ class RebalanceSweep:
             finest price step (MIN_ACTIVE_PRICE_DOLLARS) to 1 (_checked_min_move).
             Empty (default) on a family built without them: sweep() then
             takes no minimum and move_grid() yields nothing.
+        maturity_days (tuple[int, ...]): The "Rebalance until" choices the
+            family covers besides "maturity" (no days limit): whole days,
+            ascending, distinct, each a choice of
+            config.REBALANCE_MATURITY_DAYS other than its first, "maturity"
+            (_resolve_rebalance_until). Empty (default) on a family built
+            without them: sweep() then takes no days limit and
+            maturity_grid() yields nothing.
     """
     caps: tuple[float, ...]
     primary_cap: float
@@ -3708,19 +3828,25 @@ class RebalanceSweep:
     off_end_dates: dict = field(repr=False)
     # The minimum price movements the dashboard offers (empty: none simulated)
     min_moves: tuple[float, ...] = ()
+    # The "Rebalance until" choices besides "maturity" (empty: none simulated)
+    maturity_days: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         """
-        Refuse minimum price movements that are not ascending amounts from the finest price step to 1.
+        Refuse minimum price movements and "Rebalance until" choices that are not ascending choices of their own.
 
         move_grid reads the minimums in the order they are held and lets a
         run stand for the minimums after it, which is exact only when each
-        is larger than the one before.
+        is larger than the one before; maturity_grid reads the choices the
+        same way, each holding back more than the one before.
 
         Raises:
             ValueError: If a value of min_moves is not a real number from
-                the finest price step to 1 (_checked_min_move), or the
-                values are not strictly ascending.
+                the finest price step to 1 (_checked_min_move), a value of
+                maturity_days is not a choice of
+                config.REBALANCE_MATURITY_DAYS that holds a rebalance back
+                (an int, never "maturity"), or either one's values are not
+                strictly ascending.
         """
         checked = [_checked_min_move(move, "each of RebalanceSweep's min_moves")
                    for move in self.min_moves]
@@ -3728,11 +3854,27 @@ class RebalanceSweep:
         if checked != sorted(set(checked)):
             raise ValueError("RebalanceSweep's min_moves must be in ascending order, each "
                              f"named once, got {self.min_moves!r}")
+        for days in self.maturity_days:
+            # The check a simulation makes (a bool, 7.0 or "7" refused); every
+            # family run rebalances, so only "maturity" reads as None
+            try:
+                resolved = _resolve_rebalance_until(days, True)
+            except ValueError as e:
+                raise ValueError(f"each of RebalanceSweep's maturity_days: {e}") from None
+            if resolved is None:
+                raise ValueError(
+                    "RebalanceSweep's maturity_days cannot name \"maturity\" (no days "
+                    "limit): those runs are the family's plain ones, which "
+                    f"maturity_grid starts from, got {self.maturity_days!r}")
+        if list(self.maturity_days) != sorted(set(self.maturity_days)):
+            raise ValueError("RebalanceSweep's maturity_days must be in ascending order, each "
+                             f"named once, got {self.maturity_days!r}")
 
     def sweep(self, *, tier_floors: bool = True, min_move: float | None = None,
+              rebalance_min_days_to_maturity: int | None = None,
               caps: Iterable[float] | None = None) -> CapSweep:
         """
-        The lazy size-cap sweep that rebalances under one Tier floors and price-movement setting.
+        The lazy size-cap sweep that rebalances under one Tier floors, price-movement and "Rebalance until" setting.
 
         Args:
             tier_floors (bool): Keyword-only. True (default) for the tier-on
@@ -3742,6 +3884,11 @@ class RebalanceSweep:
                 add to or trim a held pair only once its total price has
                 moved that many dollars, up or down, since the last trade on
                 it. None (default) sets no minimum.
+            rebalance_min_days_to_maturity (int | None): Keyword-only. One
+                of self.maturity_days: add to or trim a held position only
+                while its later market (a lone leg's own) closes at least
+                that many days after the checkpoint. None (default) is
+                "maturity": no days limit.
             caps (Iterable[float] | None): Keyword-only. The caps to simulate,
                 each one of self.caps; None (default) means every one. A cap
                 left out is not simulated, and the caps that cannot change a
@@ -3751,19 +3898,26 @@ class RebalanceSweep:
             CapSweep: Over that setting's bands and entries, every k and the
                 caps chosen, the "all" population only, adding to and
                 trimming held pairs (add_to_held and trim_to_kelly both on,
-                after that price movement when one is given); nothing is
-                simulated until one of its cells is read.
+                after that price movement and within that days limit when
+                given); nothing is simulated until one of its cells is read.
 
         Raises:
             ValueError: For tier_floors False on a family with no
-                tier-floors-off bands, a minimum not in self.min_moves, or a
-                cap not in self.caps.
+                tier-floors-off bands, a minimum not in self.min_moves, a
+                days limit not in self.maturity_days, or a cap not in
+                self.caps.
         """
         if not tier_floors and not self.off_bands:
             raise ValueError("this run has no tier-floors-off family to rebalance in")
         if min_move is not None and min_move not in self.min_moves:
             raise ValueError(
                 f"minimum price move {min_move!r} is not one of {self.min_moves}")
+        # type() is int as well, since True and 7.0 compare equal to 1 and 7
+        if rebalance_min_days_to_maturity is not None and (
+                type(rebalance_min_days_to_maturity) is not int
+                or rebalance_min_days_to_maturity not in self.maturity_days):
+            raise ValueError(f"rebalance until {rebalance_min_days_to_maturity!r} day(s) is "
+                             f"not one of {self.maturity_days}")
         chosen = self.caps if caps is None else tuple(sorted(set(caps)))
         if any(cap not in self.caps for cap in chosen):
             raise ValueError(f"size caps {chosen!r} are not all among {self.caps}")
@@ -3777,7 +3931,8 @@ class RebalanceSweep:
             entries_by_band=self.entries_by_band if tier_floors else self.off_entries_by_band,
             st_entries=[], eager={}, tier_floors=tier_floors, add_to_held=True,
             end_dates=self.end_dates if tier_floors else self.off_end_dates,
-            trim_to_kelly=True, min_move=min_move)
+            trim_to_kelly=True, min_move=min_move,
+            rebalance_min_days_to_maturity=rebalance_min_days_to_maturity)
 
     def move_grid(self, band: tuple[float, float], k: float, *, tier_floors: bool = True,
                   caps: Iterable[float] | None = None,
@@ -3943,6 +4098,221 @@ class RebalanceSweep:
         for min_move in self.min_moves:
             # Built inside the call, so between yields this frame holds no point
             yield min_move, cells_at(min_move)
+
+    def maturity_grid(
+            self, band: tuple[float, float], k: float, *, tier_floors: bool = True,
+            caps: Iterable[float] | None = None,
+            starts: Mapping[float, Mapping[float | None,
+                                           tuple[Sequence[float], Sequence[int | None]]]],
+            stats: dict | None = None,
+    ) -> Iterator[tuple[int, float | None, dict[float, SweepPoint | SameMaturity]]]:
+        """
+        Every "Rebalance until" choice and minimum price movement of one (band, k) cell, simulating only the runs that differ.
+
+        The grid has one row per choice (self.maturity_days, ascending) and,
+        in each row, one cell per minimum price movement: no minimum first,
+        then each of self.min_moves, ascending. The row before the first is
+        the runs at "maturity" (no days limit), one per minimum, which the
+        caller has already read and hands over as `starts`, so none of them
+        is simulated again. All the grid keeps of a run is which run it is
+        and, for each add-on and each trim the run made, how far the price
+        had moved before it (SweepPoint.moves) and how many days its
+        position's later market had left (SweepPoint.rebalance_days_left).
+        Every (choice, minimum, cap) is then one of two things:
+          * SameMaturity(m0, d0) — exactly a run the grid already has for
+            that cap. It tries two: first the run of the cell above (the
+            same minimum at the choice before; in the first row, the
+            `starts` run of that minimum), then the run of the cell to the
+            left (the minimum before, at this choice). The cell is that run
+            when every add-on and every trim the run made came after a move
+            this minimum lets through (config.price_move_reached) and with
+            at least this choice's days left (config.days_left_reached):
+            the two tests the walk itself asks before a trim and before an
+            add-on. A run that made neither always qualifies; a day the run
+            could not count (None) never does. Nothing is simulated;
+          * a point — simulated at this choice and minimum, the caps that
+            cannot change the run sharing one simulation (CapSweep). Later
+            cells of that cap can name it.
+        A cell that equals a SameMaturity's run names that run itself, so
+        every name is a `starts` run (d0 None) or a point already yielded
+        for the same cap.
+
+        Why a SameMaturity is exact. It is move_grid's reasoning, in both
+        directions at once. The run named was made at a minimum no larger
+        than this cell's and at a choice no stricter: the cell above and the
+        cell to the left are each no stricter, and so is any run they name.
+        Follow the named run and a run at this cell side by side, one
+        weekly checkpoint at a time. While they have made the same trades
+        they hold the same positions, each last traded on the same day, so
+        the wait after a trade holds back the same positions in both, and
+        each position's price move and days left read the same in both (the
+        days depend only on what is held and the date). A position the
+        named run holds back, this cell holds back too: both tests only get
+        harder as the minimum and the days limit grow. Trims come first at
+        a checkpoint: a trim the named run made passes both of this cell's
+        tests (its move and its days are in the record, which the condition
+        above covers) and, everything else being equal, sells the same
+        amount; a position it looked at and did not trim is not trimmed
+        here either, whether it is looked at here or held back. Then
+        add-ons, the same way: an add-on it made passes both tests here and
+        is sized the same; one it held back is held back here; one it let
+        through and then did not make (no room below its Kelly share, no
+        size that fits) changed nothing, which a hold-back here does not
+        either. So both make the same trades at that checkpoint, and at the
+        next, to the end. An add-on to a lone leg is judged on the held
+        leg's days, worked out before the add-on and recorded so; the new
+        market it pairs with, which may close later, never counts. Trying
+        only the two nearest runs misses none: a run no stricter than this
+        cell that it equals is no stricter than the cell above or the cell
+        to the left either, so that cell is the same run, with the same
+        records, and those records let this cell name it.
+
+        The tests read prices, trade dates and close dates, never the size
+        cap, so the sharing across caps inside each CapSweep is as it is
+        without them. Only one cell's points are alive at a time: between
+        yields the generator keeps, per cap, the name and records of each
+        run of the row above and of this row so far, never a point.
+
+        Args:
+            band (tuple[float, float]): One of the setting's bands.
+            k (float): One of self.ks.
+            tier_floors (bool): Keyword-only. The Tier floors setting.
+            caps (Iterable[float] | None): Keyword-only. The caps to cover,
+                each one of self.caps; None (default) means every one.
+            starts (Mapping): Keyword-only, required. For each cap covered,
+                a mapping from each minimum price movement (None for no
+                minimum, and every one of self.min_moves) to the records of
+                this cell's rebalancing run at "maturity" with that
+                minimum: (moves, days left), its SweepPoint.moves and
+                SweepPoint.rebalance_days_left. They must be those very
+                runs' records — the same band, k, Tier floors setting, cap
+                and minimum (a run move_grid named for a minimum is that
+                minimum's run) — since every SameMaturity is decided from
+                them and nothing here can check where they came from.
+            stats (dict | None): Keyword-only. When given, its "simulated"
+                and "reused" counts are raised by the cap points this call
+                simulated and shared across caps (CapSweep's counters) and
+                its "same" count by the cells yielded as SameMaturity, for a
+                report's log line.
+
+        Yields:
+            tuple[int, float | None, dict[float, SweepPoint | SameMaturity]]:
+                (choice, minimum, cap -> the "all" point rebalancing only
+                with at least that many days left and after that move, or a
+                SameMaturity naming the run it equals), for every choice of
+                self.maturity_days, ascending, and in each, no minimum
+                (None) and then every minimum of self.min_moves, ascending;
+                on a family without minimums, (choice, None) alone. Nothing
+                on a family without choices.
+
+        Raises:
+            ValueError: On the first step: as sweep(); for a k the family
+                does not hold; and for `starts` that lacks a cap covered or
+                one of its minimums, or holds for one something other than
+                a run's (moves, days left): None for either (a run that does
+                not rebalance), or the two of different lengths. From
+                CapSweep, for a cell with no end day, at the first
+                simulation the cell needs.
+            KeyError: On the first step, for a band the setting does not hold.
+        """
+        # Checked as sweep() checks them, here because a cell may need no
+        # simulation at all; its caps are the ones asked for, ascending
+        setting = self.sweep(tier_floors=tier_floors, caps=caps)
+        chosen = setting.caps
+        if band not in setting.entries_by_band:
+            raise KeyError(band)
+        if k not in setting.ks:
+            # Every run may already be in `starts`, so a k the family does
+            # not hold is refused here rather than never
+            raise ValueError(f"k {k!r} is not one of {setting.ks}")
+        if stats is not None:
+            for key in ("simulated", "reused", "same"):
+                stats.setdefault(key, 0)
+        if not self.maturity_days:
+            return
+        minimums = (None, *self.min_moves)
+
+        def start(cap: float, min_move: float | None) -> tuple | None:
+            """starts' (moves, days left) for one cap and minimum, as tuples; None when it has none."""
+            try:
+                moves, days_left = starts[cap][min_move]
+                moves, days_left = tuple(moves), tuple(days_left)
+            except (KeyError, TypeError, ValueError):
+                # No entry, or not a pair of sequences (None included)
+                return None
+            # One move and one day count per add-on and trim made
+            return (moves, days_left) if len(moves) == len(days_left) else None
+
+        records = {(cap, min_move): start(cap, min_move)
+                   for cap in chosen for min_move in minimums}
+        missing = [key for key, record in records.items() if record is None]
+        if missing:
+            raise ValueError(
+                f"starts has no (moves, days left) for (size cap, minimum) {missing!r}: it "
+                "must give, for every cap covered and every minimum (None and each of "
+                f"{self.min_moves}), that rebalancing run's records at maturity (None is a "
+                "run that does not rebalance)")
+        # Per cap and minimum, the run of the row above: (the SameMaturity
+        # naming it, the move and the days left behind each add-on and trim
+        # it made). At first the runs at maturity
+        above: dict[float, dict[float | None, tuple]] = {
+            cap: {min_move: (SameMaturity(min_move, None), *records[cap, min_move])
+                  for min_move in minimums}
+            for cap in chosen}
+        del records
+
+        def covers(run: tuple, min_move: float | None, min_days: int) -> bool:
+            """Whether every add-on and trim `run` made is still made at this minimum and choice."""
+            _name, moves, days_left = run
+            # The walk's own two tests: what the run made is still let
+            # through, and what it held back stays held back
+            return (all(price_move_reached(move, min_move) for move in moves)
+                    and all(days_left_reached(left, min_days) for left in days_left))
+
+        def read(min_days: int, min_move: float | None, wanted) -> dict:
+            """One sweep's cell at one choice and minimum over the caps wanted, counted into stats."""
+            swept = self.sweep(tier_floors=tier_floors, min_move=min_move,
+                               rebalance_min_days_to_maturity=min_days, caps=wanted)
+            cell = swept.cell(band, k)
+            if stats is not None:
+                stats["simulated"] += swept.simulated
+                stats["reused"] += swept.reused
+            return cell
+
+        def cells_at(min_days: int, min_move: float | None, row: dict) -> dict:
+            """Every cap of one (choice, minimum): a SameMaturity, or a simulated point; each cap's run joins `row`."""
+            out: dict[float, SweepPoint | SameMaturity] = {}
+            needed = []
+            for cap in chosen:
+                # The cell above, then (after the row's first cell) the cell
+                # to the left: this row's latest run
+                nearest = [above[cap][min_move]]
+                if row[cap]:
+                    nearest.append(next(reversed(row[cap].values())))
+                run = next((run for run in nearest if covers(run, min_move, min_days)), None)
+                if run is None:
+                    needed.append(cap)
+                else:
+                    out[cap] = run[0]
+                    row[cap][min_move] = run
+            if needed:
+                cell = read(min_days, min_move, needed)
+                for cap in needed:
+                    point = cell[cap]["all"]
+                    out[cap] = point
+                    row[cap][min_move] = (SameMaturity(min_move, min_days), point.moves,
+                                          point.rebalance_days_left)
+            if stats is not None:
+                stats["same"] += sum(isinstance(v, SameMaturity) for v in out.values())
+            return {cap: out[cap] for cap in chosen}
+
+        for min_days in self.maturity_days:
+            # Per cap, this row's runs by minimum, in the order read
+            row: dict[float, dict[float | None, tuple]] = {cap: {} for cap in chosen}
+            for min_move in minimums:
+                # Built inside the call, so between yields this frame holds no point
+                yield min_days, min_move, cells_at(min_days, min_move, row)
+            above = row
 
     def entry_events(self) -> set[tuple[str, str]]:
         """
@@ -4135,6 +4505,10 @@ class BacktestSweep:
         live_min_price_move (float | None): Their minimum price movement,
             up or down, before a rebalance, in dollars; None for no minimum
             (or not recorded).
+        live_rebalance_min_days_to_maturity (int | None): Their "Rebalance
+            until" setting: the fewest days a held position's later market
+            may be from its close for a rebalance (1 or 7); None for
+            "maturity", no days limit (or not recorded).
         live_sell_at (float | None): The saved live defaults' sell level, a
             share of potential profit; None if they never sell (or not recorded).
             Reporting only: this run's own points never sell.
@@ -4157,7 +4531,10 @@ class BacktestSweep:
             run_backtest_sweep(rebalance_sweep=True) ran on a feasible
             window. With move_sweep=True too, its min_moves hold every
             minimum price movement of config.MIN_PRICE_MOVES an add-on or a
-            trim can be made to wait for; otherwise they are empty.
+            trim can be made to wait for; otherwise they are empty. With
+            maturity_sweep=True, its maturity_days hold the "Rebalance
+            until" choices besides "maturity" (config.REBALANCE_MATURITY_DAYS);
+            otherwise they are empty.
         depth_model (DepthModel | None): The depth model every trade's
             synthetic order book came from (which snapshots, how many
             ladders, when they were taken), for the page's header; None when
@@ -4209,9 +4586,11 @@ class BacktestSweep:
     live_interval_discount: float | None = None
     live_size_cap: float | None = None
     live_same_title_size_cap: float | None = None
-    # The saved live defaults' rebalance, min_price_move, sell_at and sell_min_days
+    # The saved live defaults' rebalance, min_price_move,
+    # rebalance_min_days_to_maturity, sell_at and sell_min_days
     live_rebalance: bool | None = None
     live_min_price_move: float | None = None
+    live_rebalance_min_days_to_maturity: int | None = None
     live_sell_at: float | None = None
     live_sell_min_days: int | None = None
     # The dashboard's "Sell" family, lazy (None unless run_backtest_sweep(sell_sweep=True))
@@ -4658,6 +5037,41 @@ def _resolve_min_moves() -> tuple[float, ...]:
     return tuple(sorted(checked))
 
 
+def _resolve_maturity_days() -> tuple[int, ...]:
+    """
+    Name the "Rebalance until" choices the Rebalance family covers besides "maturity", ascending.
+
+    Reads this module's REBALANCE_MATURITY_DAYS when called (patch
+    backtester's, never config's): every choice a live run takes, each
+    checked as one simulation checks it (_resolve_rebalance_until), less
+    the one that holds nothing back ("maturity"), whose runs are the
+    family's plain ones. run_backtest_sweep calls it before its fetch when
+    the choices are on, and _sweep_from_candidates calls it again to build
+    the RebalanceSweep's maturity_days.
+
+    Returns:
+        tuple[int, ...]: The whole days, ascending, e.g. (1, 7).
+
+    Raises:
+        ValueError: If REBALANCE_MATURITY_DAYS is not a tuple, a value of it
+            is not an int (a bool, 7.0 or "7" included), or one is named twice.
+    """
+    if not isinstance(REBALANCE_MATURITY_DAYS, tuple):
+        raise ValueError("REBALANCE_MATURITY_DAYS must be a tuple of whole days, got "
+                         f"{REBALANCE_MATURITY_DAYS!r}")
+    # Every rebalancing run of the family adds and trims, so only "maturity"
+    # resolves to None (no days limit)
+    try:
+        held_back = [days for days in REBALANCE_MATURITY_DAYS
+                     if _resolve_rebalance_until(days, True) is not None]
+    except ValueError as e:
+        raise ValueError(f"each of REBALANCE_MATURITY_DAYS: {e}") from None
+    if len(set(held_back)) != len(held_back):
+        raise ValueError(f"REBALANCE_MATURITY_DAYS names a value twice: "
+                         f"{REBALANCE_MATURITY_DAYS!r}")
+    return tuple(sorted(held_back))
+
+
 def _moves_span(moves: Sequence[float]) -> str:
     """
     Name the range a set of minimum price movements covers, in cents, for a log line.
@@ -4710,6 +5124,8 @@ def _far_enough(position: list[BacktestTrade], day: date, min_days: int | None) 
     With no minimum, always. With one, only when the position has at least
     that many days left before its last market stops trading (_days_left);
     a position whose days left are unknown is never sold under a minimum.
+    The test is config.days_left_reached, the one "Rebalance until" asks
+    too (the walk's _rebalance_days_left gate, seller._too_near_maturity).
     The walk's sales (_simulate_at_discount) and its quick test at a
     checkpoint with no candidate (_position_sells) both ask here before they
     value the position, so they apply one rule.
@@ -4723,10 +5139,51 @@ def _far_enough(position: list[BacktestTrade], day: date, min_days: int | None) 
     Returns:
         bool: True when the position may be sold there.
     """
-    if min_days is None:
-        return True
-    left = _days_left(position, day)
-    return left is not None and left >= min_days
+    # config.days_left_reached: True with no minimum, never with unknown days,
+    # else whether the days left (0 or below for a market closing today or
+    # closed already) reach the minimum
+    return days_left_reached(_days_left(position, day), min_days)
+
+
+def _rebalance_days_left(trades: list[BacktestTrade], day: date,
+                         lone_ticker: str | None = None) -> int | None:
+    """
+    Days from `day` to the close date of a held position's later market: what "Rebalance until" tests.
+
+    A pair is judged on the later of its two markets' close dates, over
+    every trade of it (_days_left). A lone leg is judged on the market still
+    held alone, as a live run reads one (seller._too_near_maturity, whose
+    lone HeldPair holds that one market): its paid-out partner's close date
+    is not read, nor, for an add-on to it, the new market's (live does not
+    know which market an add-on will pair it with when it decides). The
+    partner's can be the later of the two: a same-event ladder is ordered
+    on its stated deadlines, not on close dates (DR-73), and a scheduled
+    close (_maturity_close) need not follow the order either. Whole
+    calendar days between UTC dates (config.days_to_maturity), as a
+    take-profit sale counts them. The walk works this out once per
+    position it may trim (planned_trims) and once per add-on (Pass 2), then
+    tests it with config.days_left_reached and records the same number on
+    every trim and add-on it makes (SweepPoint.rebalance_days_left).
+
+    Args:
+        trades (list[BacktestTrade]): The position's open trades: one exact
+            pair's, or those holding a lone leg's market.
+        day (date): The checkpoint date.
+        lone_ticker (str | None): The market a lone leg holds (market A in
+            one trade, market B in another); None for a pair.
+
+    Returns:
+        int | None: The days left (0 or below once the market closes on or
+            before `day`); None when a close date read is unknown (only a
+            hand-built trade lacks one), which no minimum lets through.
+    """
+    if lone_ticker is None:
+        # A pair: the later of its two markets
+        return _days_left(trades, day)
+    # A lone leg: its own market's close date, read from whichever leg of
+    # each trade holds it (config.days_to_maturity, which live reads too)
+    return days_to_maturity([t.close_date_a if t.ticker_a == lone_ticker else t.close_date_b
+                             for t in trades], day)
 
 
 def _hold_days_text(hold_days: int) -> str:
@@ -5329,6 +5786,60 @@ def _sold_copy(trade: BacktestTrade, day: date, sale: tuple) -> BacktestTrade:
 _NO_TRIM = KellyTrim(0, 0.0)
 
 
+def _lone_leg(trade: BacktestTrade, day: date) -> bool | None:
+    """
+    Whether an open trade is a lone leg the Kelly trim may sell at the checkpoint on `day`.
+
+    A lone leg is one market of a pair still held after the other market has
+    paid out. The trim sells part of one only as a live trim does
+    (seller._trim_one): the later market (B) of a time-series pair, still to
+    pay out, once the earlier market (A) has paid out $0 on the side held
+    there. That side lost, so the event the leg bets against has not happened
+    by A's deadline and the leg can still win. A's payout is read from its own
+    record (LegQuotes.paid_yes and paid_no), the one _position_sale_value pays
+    the leg from, so the trim and the money paid cannot disagree.
+
+    Args:
+        trade (BacktestTrade): An open trade.
+        day (date): A checkpoint date on its legs' weekly grid.
+
+    Returns:
+        bool | None: None when neither market has paid out by then (a pair,
+            judged as one) or the trade has no quotes; True for a lone leg the
+            trim may sell; False when a market has paid out and the trade is
+            no such lone leg: a same-title pair, an earlier market still open
+            beside a paid-out later one, both markets paid out, or a side held
+            on A that paid $1 (or an unknown payout).
+
+    Raises:
+        ValueError: From LegQuotes, for a day off the legs' checkpoint grid.
+    """
+    if trade.marks is None:
+        return None
+    paid = [quotes.paid_at_checkpoint(day) for quotes in trade.marks]
+    if not any(paid):
+        return None
+    if paid != [True, False] or trade.pair_type != "time_series":
+        return False
+    # What the side held on A paid (scanner.leg_sides: YES for a time-series pair)
+    quotes_a = trade.marks[0]
+    payout = quotes_a.paid_yes if leg_sides(trade.pair_type)[0] == "yes" else quotes_a.paid_no
+    return payout == 0.0
+
+
+def _settled_result(quotes: LegQuotes) -> str:
+    """
+    How a paid-out market settled, read from its own payout record.
+
+    Args:
+        quotes (LegQuotes): A market that has paid out, with a known payout.
+
+    Returns:
+        str: "yes" when a YES contract paid $1, otherwise "no".
+    """
+    return "yes" if quotes.paid_yes == 1.0 else "no"
+
+
 def _fresh_bids(trade: BacktestTrade, day: date, *,
                 stale_check: bool = True) -> tuple[float, float, float, float] | None:
     """
@@ -5340,6 +5851,13 @@ def _fresh_bids(trade: BacktestTrade, day: date, *,
     profit is read from. Fresh means from a candle within one candle period
     of the checkpoint (LegQuotes.bid_at_checkpoint), as a sale needs.
 
+    For a lone leg (_lone_leg) the paid-out earlier market has no bids: it
+    reads as its settlement price (config.settled_bids: a market that settled
+    "no" is a YES bid of 0 and a NO bid of 1), so the side held there adds $0
+    to a sale and the forecast reads the later market's quotes against a
+    market whose event did not happen. Only the open market is held to the
+    stale-quote check.
+
     Args:
         trade (BacktestTrade): An open trade.
         day (date): A checkpoint date on its legs' weekly grid.
@@ -5349,21 +5867,35 @@ def _fresh_bids(trade: BacktestTrade, day: date, *,
     Returns:
         tuple[float, float, float, float] | None: (market A's YES bid, its NO
             bid, market B's YES bid, its NO bid), in dollars; None for a trade
-            with no quotes, when either market's quote has not moved or traded
-            within the stale-quote limit (_quote_is_fresh), or when a side of
-            either market has no fresh bid.
+            with no quotes, one with a paid-out market that is no lone leg the
+            trim sells, when a market still to pay out has a quote that has
+            not moved or traded within the stale-quote limit
+            (_quote_is_fresh), or when a side of such a market has no fresh
+            bid.
 
     Raises:
         ValueError: From LegQuotes, for a day off the legs' checkpoint grid.
     """
     if trade.marks is None:
         return None
-    if stale_check and not all(_quote_is_fresh(quotes, day) for quotes in trade.marks):
+    lone = _lone_leg(trade, day)
+    if lone is False:
+        # A market has paid out, and what is left is no lone leg the trim sells
+        return None
+    # The markets still to pay out: both of a pair; the later one of a lone leg
+    paid = (True, False) if lone else (False, False)
+    if stale_check and not all(_quote_is_fresh(quotes, day)
+                               for quotes, done in zip(trade.marks, paid, strict=True) if not done):
         # A market whose quote has not moved or traded within the
         # stale-quote limit: no trim this Monday
         return None
-    bids = [quotes.bid_at_checkpoint(day, side) for quotes in trade.marks
-            for side in ("yes", "no")]
+    bids: list[float] = []
+    for quotes, done in zip(trade.marks, paid, strict=True):
+        if done:
+            # Cross-module: a paid-out market reads as its settlement price
+            bids += settled_bids(_settled_result(quotes))
+        else:
+            bids += [quotes.bid_at_checkpoint(day, side) for side in ("yes", "no")]
     # A missing bid is NaN, which is not equal to itself
     if any(bid != bid for bid in bids):
         return None
@@ -5375,8 +5907,9 @@ def _exact_pair(position: list[BacktestTrade]) -> bool:
     Whether every trade of a position is the same two markets bought the same way round.
 
     Such a position is one pair with whatever was added to it, held in equal
-    counts on both markets: what the Kelly trim sells part of. A position
-    that also holds an add-on to a lone leg (a third market) is not one.
+    counts on both markets: what the Kelly trim sells part of (once its
+    earlier market has paid out, as a lone leg: _lone_leg). A position that
+    also holds an add-on to a lone leg (a third market) is not one.
 
     Args:
         position (list[BacktestTrade]): One position's open trades (_positions).
@@ -5431,11 +5964,19 @@ def _kelly_trim(position: list[BacktestTrade], day: date, portfolio_value: float
     the modeled bid ladder. The latest trade's contracts go first
     (_last_bought_first).
 
+    A lone leg (_lone_leg: the later market of a time-series pair, its
+    earlier market paid out $0) is judged the same way, the paid-out market
+    read at its settlement price (_fresh_bids): it adds $0 to one contract
+    pair's sale value and nothing to a sale, so what is sold is contracts of
+    the open market alone.
+
     Left alone, with nothing sold: a position that is not one exact pair
     (_exact_pair), one with no quotes or without a fresh bid on both sides of
-    both markets, a time-series pair whose chance of paying cannot be read (a
-    crossed quote, or a mid spread not above zero), and one with a market
-    that has paid out.
+    each market still to pay out, a time-series pair whose chance of paying
+    cannot be read (a crossed quote, or a mid spread not above zero), and one
+    with a paid-out market that is no such lone leg (a same-title pair, the
+    earlier market still open, both paid out, or the earlier market's side
+    held paid $1).
 
     Args:
         position (list[BacktestTrade]): One position's open trades (_positions).
@@ -5460,6 +6001,8 @@ def _kelly_trim(position: list[BacktestTrade], day: date, portfolio_value: float
     bids = _fresh_bids(first, day, stale_check=stale_check) if _exact_pair(position) else None
     if bids is None:
         return _NO_TRIM, None
+    # A lone leg: market A has paid out, and the trim sells market B alone
+    lone = _lone_leg(first, day)
     yes_bid_a, no_bid_a, yes_bid_b, no_bid_b = bids
     # config.held_pair_win_prob: the chance a new trade of the pair is sized
     # with, at these quotes; each ask is 1 minus the other side's bid
@@ -5485,9 +6028,11 @@ def _kelly_trim(position: list[BacktestTrade], day: date, portfolio_value: float
         sold = _last_bought_first(position, pairs)
         valued = _position_sale_value(position, day, sold=sold, stale_check=stale_check,
                                       volume_cap=volume_cap)
-        # None: the bids hold fewer. A leg with no sale price has paid out,
-        # so there is no pair left to sell
-        if valued is None or any(None in sale[2] for sale in valued[0]):
+        # None: the bids hold fewer. A leg with no sale price has paid out:
+        # on a lone leg that is market A, worth its $0 payout; on a pair
+        # there is no pair left to sell
+        if valued is None or any(None in (sale[2][1:] if lone else sale[2])
+                                 for sale in valued[0]):
             return None
         sales[pairs] = (sold, valued[0])
         return valued[1]
@@ -5573,9 +6118,15 @@ def _price_move(position: list[BacktestTrade], day: date,
     after a trade counts from too). The price (_pair_price) is read the
     same way at that checkpoint and at this one — the ask of the side held on
     each market — so neither what a trade paid nor the gap between a market's
-    bid and ask counts as a move. config.pair_price_move sets the sign: the
-    result is negative when the price fell. The Kelly trim's gate and the
-    add-on gate both read it (an add-on through _held_pair_move).
+    bid and ask counts as a move. For a lone leg (_lone_leg: the earlier
+    market paid out $0, the later one still open) only the open market's ask
+    is read (_leg_mark), at both moments, as a live trim reads it: the
+    paid-out market sells nothing, so its payout is no move.
+    config.pair_price_move sets the sign: the result is negative when the
+    price fell. The Kelly trim's gate and the add-on gate both read it (an
+    add-on through _held_pair_move, which never reaches a lone leg on
+    Kalshi's settlement times, all written in UTC: an add-on to an exact pair
+    needs both settlement dates after the checkpoint date).
 
     Args:
         position (list[BacktestTrade]): One position's open trades
@@ -5602,6 +6153,11 @@ def _price_move(position: list[BacktestTrade], day: date,
         return None
     # The same day the wait after a trade counts from
     last_day = _last_trade_day(position, last_trim)
+    if _lone_leg(latest, day):
+        # A lone leg: its own market's price alone, then and now. The paid-out
+        # market sells nothing, so it counts 0 at both moments and its payout
+        # never reads as a move (as a live trim measures it)
+        return pair_price_move(_leg_mark(latest, 1, last_day), _leg_mark(latest, 1, day))
     # config.pair_price_move: the shared rule's own measure of a move
     return pair_price_move(_pair_price(latest, last_day), _pair_price(latest, day))
 
@@ -5803,6 +6359,68 @@ def _move_label(min_move: float) -> str:
             price move" for 0.10.
     """
     return f" only after a {_cap_percent(min_move)}c price move"
+
+
+def _resolve_rebalance_until(min_days: Any, rebalances: Any) -> int | None:
+    """
+    Check "Rebalance until": how near maturity a held pair may still be added to or trimmed.
+
+    The rule (_simulate_at_discount's rebalance_min_days_to_maturity,
+    CapSweep's) is the live setting's (LiveSettings.rebalance_min_days_to_maturity),
+    checked the same way: one of config.REBALANCE_MATURITY_DAYS, as a real
+    int. Its first choice, "maturity", always rebalances, so it reads as
+    None (no minimum) on any run. Any other choice holds a rebalance back,
+    so it means nothing on a run that neither adds to nor trims held pairs,
+    and is refused there, as a minimum price move is (_resolve_min_move).
+
+    Args:
+        min_days (Any): One of config.REBALANCE_MATURITY_DAYS, or None for
+            no minimum.
+        rebalances (Any): Whether the run adds to or trims held pairs
+            (add_to_held or trim_to_kelly); any true value means it does.
+
+    Returns:
+        int | None: The fewest whole days to maturity a rebalance needs;
+            None for no minimum (None or "maturity" given).
+
+    Raises:
+        ValueError: For a value that is not an int of
+            config.REBALANCE_MATURITY_DAYS (a bool, a float such as 7.0, a
+            string, a numpy integer, any other number), or for a minimum on
+            a run that neither adds to nor trims held pairs.
+    """
+    if min_days is None:
+        return None
+    # type() is int refuses a bool, a float such as 7.0 and a numpy integer
+    if type(min_days) is not int or min_days not in REBALANCE_MATURITY_DAYS:
+        raise ValueError(
+            "rebalance_min_days_to_maturity must be "
+            f"{', '.join(str(d) for d in REBALANCE_MATURITY_DAYS[:-1])} or "
+            f"{REBALANCE_MATURITY_DAYS[-1]}, got {min_days!r}")
+    if min_days == REBALANCE_MATURITY_DAYS[0]:
+        # "maturity": always rebalance, which is no minimum
+        return None
+    if not rebalances:
+        raise ValueError("rebalance_min_days_to_maturity needs add_to_held or trim_to_kelly: "
+                         "a run that neither adds to nor trims held pairs has nothing to "
+                         "hold back")
+    return min_days
+
+
+def _until_label(min_days: int) -> str:
+    """
+    Name a run's "Rebalance until" minimum in its completion line's label.
+
+    In the words of the live "Live settings:" line (config._rebalance_until_text).
+
+    Args:
+        min_days (int): A resolved minimum (_resolve_rebalance_until), not None.
+
+    Returns:
+        str: ", until 7 days before maturity"; ", until 1 day before
+            maturity" for 1.
+    """
+    return f", until {_rebalance_until_text(min_days)}"
 
 
 def _split_trade(trade: BacktestTrade, pairs: int) -> BacktestTrade:
@@ -10838,14 +11456,14 @@ def _live_rule_fields(live: LiveSettings | None) -> dict:
     Name the BacktestSweep keywords that record the saved live defaults.
 
     Both production BacktestSweep constructions spread this (beside
-    same_title_size_cap), so the twelve fields are recorded together from
+    same_title_size_cap), so the thirteen fields are recorded together from
     one read or not at all.
 
     Args:
         live (LiveSettings | None): _live_settings_for_report()'s result.
 
     Returns:
-        dict: The twelve live_* keywords from live; {} when live is None.
+        dict: The thirteen live_* keywords from live; {} when live is None.
     """
     if live is None:
         return {}
@@ -10855,6 +11473,7 @@ def _live_rule_fields(live: LiveSettings | None) -> dict:
             "live_size_cap": live.size_cap,
             "live_same_title_size_cap": live.same_title_size_cap,
             "live_rebalance": live.rebalance, "live_min_price_move": live.min_price_move,
+            "live_rebalance_min_days_to_maturity": live.rebalance_min_days_to_maturity,
             "live_sell_at": live.sell_at, "live_sell_min_days": live.sell_min_days}
 
 
@@ -10924,7 +11543,9 @@ def _live_rebalance_note(sweep: BacktestSweep) -> str:
     when the saved live defaults rebalance, the live-rule line ends with
     this clause, saying the primary differs from live there. A live run
     holds back its add-ons and its Kelly trims alike until the saved minimum
-    price movement is reached, so the clause names the minimum for both.
+    price movement is reached, and while the position's later market is
+    nearer its close than the saved "Rebalance until" days, so the clause
+    names the minimum and the days limit for both.
     _live_rule_line and dashboard._live_rule_html add it to the line.
 
     Args:
@@ -10932,15 +11553,20 @@ def _live_rebalance_note(sweep: BacktestSweep) -> str:
 
     Returns:
         str: "; the live defaults rebalance held pairs (only after a 10c
-            price move), which this run's primary does not" (the
-            parenthesis only with a minimum price movement), or "" when
+            price move, until 7 days before maturity), which this run's
+            primary does not" (the parenthesis only with a minimum price
+            movement or a days limit, naming each one set), or "" when
             live_rebalance is not True (off, or not recorded).
     """
     if sweep.live_rebalance is not True:
         return ""
     move = sweep.live_min_price_move
-    # _move_label reads " only after a 10c price move"
-    after = "" if move is None else f" ({_move_label(move).strip()})"
+    days = sweep.live_rebalance_min_days_to_maturity
+    # _move_label reads " only after a 10c price move"; _until_label, in the
+    # live "Live settings:" line's words, ", until 7 days before maturity"
+    parts = ([] if move is None else [_move_label(move).strip()]) + (
+        [] if days is None else [_until_label(days).removeprefix(", ")])
+    after = f" ({', '.join(parts)})" if parts else ""
     return (f"; the live defaults rebalance held pairs{after}, which this run's primary "
             "does not")
 
@@ -11879,6 +12505,7 @@ def _simulate_at_discount(
     sell_min_days: int | None = None,
     trim_to_kelly: bool = False,
     min_move: float | None = None,
+    rebalance_min_days_to_maturity: int | None = None,
 ) -> SweepPoint:
     """
     Choose, size and settle trades from prepared entries at one interval
@@ -11928,8 +12555,11 @@ def _simulate_at_discount(
       * a same-title pair also keeps its later passing Mondays with the same
         legs the same way round, which can only add to its open trade.
     An add-on is refused when its markets share no ladder label or another
-    open trade holds one. It is a rebalance, so it then waits as a Kelly
-    trim does: it is held back until REBALANCE_MIN_DAYS_SINCE_TRADE
+    open trade holds one. It is a rebalance, so it is then held back as a
+    Kelly trim is: first, with rebalance_min_days_to_maturity set, while
+    what it adds to is too near maturity (see trim_to_kelly below; for a
+    lone leg, its own market's close date alone, not the new market's);
+    then until REBALANCE_MIN_DAYS_SINCE_TRADE
     calendar days have passed since the last trade on what it adds to (the
     pair's latest purchase, add-on or trim; for a lone leg, the latest
     purchase or trim among the trades holding that market), and, with
@@ -12015,10 +12645,16 @@ def _simulate_at_discount(
         pair is sold down to sits above the size add_to_held buys up to, and
         between the two nothing trades;
       * only one exact pair is trimmed: every open trade of the position the
-        same two markets the same way round, neither paid out, with a fresh
-        bid on both sides of both. A lone leg, a position holding a third
-        market, and a time-series pair whose chance of paying cannot be read
-        (a crossed quote, or a mid spread not above zero) are left alone;
+        same two markets the same way round, with a fresh bid on both sides
+        of each market still to pay out. Once the earlier market of a
+        time-series pair has paid out $0 on the side held there, what is
+        left is a lone leg, trimmed the same way with that market read at
+        its settlement price (_lone_leg, _fresh_bids); its price move is the
+        open market's alone. Any other position with a paid-out market (a
+        same-title pair, the later market paid out first, or the earlier
+        market's side won), a position holding a third market, and a
+        time-series pair whose chance of paying cannot be read (a crossed
+        quote, or a mid spread not above zero) are left alone;
       * the part sold is a trade record of its own, exiting at the trim
         (_split_trade, _sold_copy), and the trade it came from keeps the
         rest. A position sold whole is freed as a take-profit sale frees it.
@@ -12029,10 +12665,24 @@ def _simulate_at_discount(
         config.rebalance_rested). Checkpoints are a week apart, so a wait
         of 7 days or fewer holds no trim back here. An add-on waits the
         same way (see add_to_held above); buying a new pair never waits;
+      * rebalance_min_days_to_maturity ("Rebalance until": None, the
+        default, or 0 sets no minimum; 1 or 7, config.REBALANCE_MATURITY_DAYS)
+        holds back, before the wait, every exact pair whose later market
+        closes fewer than that many whole days after the checkpoint's date
+        (for a lone leg, its own market's close date: _rebalance_days_left),
+        as live rebalancing holds one back (seller._too_near_maturity), with
+        config.days_left_reached, the test a take-profit sale's minimum of
+        days asks too (_far_enough). A position whose close date is unknown
+        is held back under any minimum. It reads dates alone, so it holds at
+        any trading frequency and never reads the cap. A position held back
+        is asked for no trim decision, and an add-on held back is never
+        sized. The days left behind every trim and add-on made are recorded
+        on the returned point's rebalance_days_left;
       * min_move (None, the default, sets no minimum) makes a trim
         wait for a price move, up or down. A held pair is looked at only
         once its total price — the ask of the side held on each of its two
-        markets, added (_pair_price) — is at least that many dollars above
+        markets, added (_pair_price); for a lone leg, its open market's ask
+        alone — is at least that many dollars above
         or below where it stood at the checkpoint of the last trade on the
         pair: its latest purchase or add-on, or a later trim (_price_move,
         config.price_move_reached). Short of the minimum the pair is not
@@ -12083,6 +12733,13 @@ def _simulate_at_discount(
             trim_to_kelly; None sets no minimum. Set, it adds " only after a <cents>c
             price move" to the label, after ", rebalancing", ", adding to held
             pairs" or ", trimming to Kelly".
+        rebalance_min_days_to_maturity (int | None): Keyword-only. "Rebalance
+            until": the fewest whole days a held position's later market must
+            be from its close date for the walk to add to it or trim it (see
+            above): 1 or 7, set only with add_to_held or trim_to_kelly; None
+            or 0 sets no minimum (0 is recorded as None). Set, it adds
+            ", until <N> day(s) before maturity" to the label, after the
+            minimum price move or, with none, after what it holds back.
 
     Returns:
         SweepPoint: The trades and daily equity curve, stamped with the resolved
@@ -12093,13 +12750,17 @@ def _simulate_at_discount(
             and above (cap_free_from), when it could sell early, a SaleCheck
             per position a take-profit sale sold (sales), and, when it could
             add to or trim held pairs, the price move behind each add-on and
-            trim it made (moves).
+            trim it made (moves), its "Rebalance until" minimum and the days
+            left at each add-on and trim it made (rebalance_days_left).
 
     Raises:
         ValueError: For an unknown population, a bad spread band, a bad size
             cap, a bad sell_at, a sell_min_days without sell_at or not a
             whole number of at least 1, a min_move without
-            add_to_held or trim_to_kelly or not a number in (0, 1], a k
+            add_to_held or trim_to_kelly or not a number in (0, 1], a
+            rebalance_min_days_to_maturity not an int of
+            config.REBALANCE_MATURITY_DAYS, or 1 or 7 without add_to_held or
+            trim_to_kelly, a k
             outside (0, 1], with sell_at, a bad TAKE_PROFIT_HOLD_DAYS, or,
             with add_to_held or trim_to_kelly, a bad
             REBALANCE_MIN_DAYS_SINCE_TRADE.
@@ -12132,6 +12793,10 @@ def _simulate_at_discount(
     # The least price move, up or down, an add-on or a Kelly trim needs
     # (None: any), refused on a run that does neither
     min_move = _resolve_min_move(min_move, add_to_held or trim_to_kelly)
+    # "Rebalance until": the fewest days to maturity an add-on or a Kelly trim
+    # needs (None: any, 0 included), refused on a run that does neither
+    until_days = _resolve_rebalance_until(rebalance_min_days_to_maturity,
+                                          add_to_held or trim_to_kelly)
     # Days a pair must go without a trade before an add-on or a trim (read
     # only on a run that does either)
     wait_days = _resolve_rebalance_min_days() if (add_to_held or trim_to_kelly) else 0
@@ -12565,9 +13230,10 @@ def _simulate_at_discount(
     # does — what a later add-on to a lone leg (its partner paid out) reads
     open_legs: dict[str, list[dict]] = {}
     add_ons = add_on_cap_skips = add_on_ladder_skips = 0
-    # Add-ons held back because what they add to traded too recently, and
-    # (with a minimum) because its price had not moved far enough since
-    adds_waiting = adds_held_back = 0
+    # Add-ons held back because what they add to was too near maturity ("Rebalance
+    # until"), because it traded too recently, and (with a minimum) because its
+    # price had not moved far enough since
+    adds_near_maturity = adds_waiting = adds_held_back = 0
     # Selling early or trimming (filled only when sell_at or trim_to_kelly
     # is set): each trade's pair, the sold copy that replaces a sold
     # trade in the results, the markets sold at the current checkpoint (not
@@ -12591,6 +13257,12 @@ def _simulate_at_discount(
     last_trim: dict[tuple[str, str], date] = {}
     held_back = 0
     moves: list[float] = []
+    # "Rebalance until": how many times a held position was too near maturity
+    # to be looked at for a trim (once per position per checkpoint), and the
+    # days left behind each trim and each add-on made, beside moves
+    # (SweepPoint.rebalance_days_left; None where a close date is unknown)
+    trims_near_maturity = 0
+    rebalance_days_left: list[int | None] = []
     # Times an exact pair was skipped for trading too recently (once per pair
     # per checkpoint)
     pairs_waiting = 0
@@ -12812,12 +13484,15 @@ def _simulate_at_discount(
         """
         The Kelly trim's decision for every open position at the checkpoint on `d`.
 
-        A pair is skipped, with no decision asked, when it traded fewer than
-        wait_days days before `d` (checked first, counted in pairs_waiting)
-        or else, with a minimum price move, when its price has not moved
-        that far, up or down, since (counted in held_back). Each sale
-        planned adds the pair's move to moves; the caller hands every
-        plan to trim.
+        A pair is skipped, with no decision asked, when its later market (a
+        lone leg's own) closes fewer than until_days days after `d`
+        ("Rebalance until", checked first, counted in trims_near_maturity),
+        or else when it traded fewer than wait_days days before `d`
+        (counted in pairs_waiting), or else, with a minimum price move,
+        when its price has not moved that far, up or down, since (counted
+        in held_back). Each sale planned adds the pair's move to moves and
+        its days left to rebalance_days_left; the caller hands every plan
+        to trim.
 
         Args:
             d (date): The checkpoint date.
@@ -12830,8 +13505,19 @@ def _simulate_at_discount(
                 (_kelly_trim); empty when none does.
         """
         nonlocal trim_floor, held_back, pairs_waiting, stale_trims, volume_trims
+        nonlocal trims_near_maturity
         planned = []
         for position in _positions(open_now):
+            # "Rebalance until": whole days from d to the close date of the
+            # position's later market — for a lone leg (market A paid out $0,
+            # _lone_leg), its own market B's — worked out once, so a trim
+            # records the very days its gate tested
+            left = _rebalance_days_left(
+                position, d, position[0].ticker_b if _lone_leg(position[0], d) else None)
+            # Skip a pair too near maturity (config.days_left_reached)
+            if _exact_pair(position) and not days_left_reached(left, until_days):
+                trims_near_maturity += 1
+                continue
             # Skip a pair that traded too recently (config.rebalance_rested)
             if _exact_pair(position) and not rebalance_rested(
                     _last_trade_day(position, last_trim), d, wait_days):
@@ -12868,6 +13554,8 @@ def _simulate_at_discount(
                 # A position with no move to measure is one _kelly_trim
                 # leaves alone, so the 0.0 only keeps this a list of numbers
                 moves.append(0.0 if move is None else move)
+                # ... and the days left its "Rebalance until" gate tested
+                rebalance_days_left.append(left)
         return planned
 
     def trim(d: date, planned: list) -> None:
@@ -13042,9 +13730,23 @@ def _simulate_at_discount(
             continue
 
         # How far the price of what an add-on adds to has moved since its
-        # last trade (None: no add-on, or no quotes to read a move from)
-        add_move = None
+        # last trade (None: no add-on, or no quotes to read a move from), and
+        # the days to its later market's close (None: no add-on, or unknown)
+        add_move = add_left = None
         if held is not None or lone_legs is not None:
+            # "Rebalance until": whole days from d to the close date of what it
+            # adds to — a pair's later market, or a lone leg's own market (not
+            # its paid-out partner's, nor the new market's: live judges the
+            # held leg) — worked out once, so an add-on records the very days
+            # its gate tested (config.days_left_reached); held back first,
+            # before anything else is read for it, as live holds one back
+            add_left = (_rebalance_days_left([t for t, _paid in held["trades"]], d)
+                        if lone_legs is None else
+                        _rebalance_days_left([leg["trade"] for leg in lone_legs], d,
+                                             lone_legs[0]["ticker"]))
+            if not days_left_reached(add_left, until_days):
+                adds_near_maturity += 1
+                continue
             # An add-on is a rebalance: it waits as long after the last trade
             # as a trim does (config.rebalance_rested) and, with a minimum,
             # until the price has moved that far, up or down, since then
@@ -13244,6 +13946,8 @@ def _simulate_at_discount(
                 # behind every rebalance it made (a move it could not read
                 # counts as 0.0, which no minimum lets through)
                 moves.append(0.0 if add_move is None else add_move)
+                # ... and the days left its "Rebalance until" gate tested
+                rebalance_days_left.append(add_left)
             # Add this trade, with what it paid (its contracts plus fees), and
             # its ladder holds to its pair's record (a new record for a new
             # pair, an add-on to a lone leg included)
@@ -13297,8 +14001,10 @@ def _simulate_at_discount(
     # after the sell level — so no two of them share a prefix. A minimum
     # price move (" only after a 10c price move", _move_label) follows
     # whichever of the three the run has, so it always sits beside what
-    # waits for it. The lazy size-cap runs are quiet (DEBUG).
-    move_label = "" if min_move is None else _move_label(min_move)
+    # waits for it, and "Rebalance until" (", until 7 days before maturity",
+    # _until_label) follows that. The lazy size-cap runs are quiet (DEBUG).
+    move_label = (("" if min_move is None else _move_label(min_move))
+                  + ("" if until_days is None else _until_label(until_days)))
     if add_to_held and trimming:
         held_label, trim_label = ", rebalancing" + move_label, ""
     elif add_to_held:
@@ -13398,9 +14104,17 @@ def _simulate_at_discount(
             "two markets share no ladder (%s): %d",
             run_label, add_on_ladder_skips,
         )
-    # Adds the wait after a trade, and the minimum price move, held back
-    # (each silent at zero). Real trades fall on weekly checkpoints, so at a
-    # wait of a week or less the first counts only hand-built entries
+    # Adds "Rebalance until", the wait after a trade, and the minimum price
+    # move held back (each silent at zero). Real trades fall on weekly
+    # checkpoints, so at a wait of a week or less the wait's counts only
+    # hand-built entries
+    if adds_near_maturity:
+        logging.log(
+            logging.DEBUG if quiet else logging.INFO,
+            "Adds skipped because the held position's later market matures within "
+            "%d day(s) (%s): %d",
+            until_days, run_label, adds_near_maturity,
+        )
     if adds_waiting:
         logging.log(
             logging.DEBUG if quiet else logging.INFO,
@@ -13436,6 +14150,17 @@ def _simulate_at_discount(
             logging.DEBUG if quiet else logging.INFO,
             "Positions trimmed to their Kelly size (%s): %d (contract pairs sold: %d)",
             run_label, positions_trimmed, pairs_trimmed,
+        )
+    # "Rebalance until": once per held position per checkpoint its later
+    # market was too near maturity for it to be looked at for a trim, whether
+    # or not it was past its Kelly size there (silent at zero, and never
+    # logged with no minimum)
+    if trims_near_maturity:
+        logging.log(
+            logging.DEBUG if quiet else logging.INFO,
+            "Held positions not checked for a trim because their later market matures "
+            "within %d day(s) (%s): %d",
+            until_days, run_label, trims_near_maturity,
         )
     # Pairs skipped for trading too recently (silent at zero). Real entries
     # and trims fall on weekly checkpoints, so at a wait of a week or less
@@ -13515,6 +14240,9 @@ def _simulate_at_discount(
         min_move=min_move,
         # Recorded only by a run that could add to or trim held pairs
         moves=tuple(moves) if (trimming or add_to_held) else None,
+        rebalance_min_days_to_maturity=until_days,
+        rebalance_days_left=(tuple(rebalance_days_left) if (trimming or add_to_held)
+                             else None),
     )
 
 
@@ -14129,14 +14857,15 @@ def _half_split(
     sell_min_days: int | None = None,
     trim_to_kelly: bool = False,
     min_move: float | None = None,
+    rebalance_min_days_to_maturity: int | None = None,
 ) -> HalfSplit:
     """
     Simulate each half of one scenario's entries alone and keep three numbers each.
 
     Both halves are simulated at the scenario's own size cap, tier-floor
     setting, add-on setting, sell level, minimum of days before maturity,
-    Kelly-trim setting and minimum price move before an add-on or a trim, forwarded
-    through _sim_options — which
+    Kelly-trim setting, minimum price move before an add-on or a trim and
+    "Rebalance until" days, forwarded through _sim_options — which
     forwards NOTHING on a default call, so the eager tier-on band sweep calls
     _simulate_at_discount with exactly the keywords it always did.
 
@@ -14182,6 +14911,10 @@ def _half_split(
             down, in a held pair's total price before both halves add to it
             or look at it for a trim, as the scenario did; forwarded only
             when set. Default None.
+        rebalance_min_days_to_maturity (int | None): Keyword-only. The fewest
+            days a held position's later market must be from its close for
+            both halves to add to it or trim it, as the scenario did;
+            forwarded only when set. Default None.
 
     Returns:
         HalfSplit: Each half's total return, trade count and entry count. The
@@ -14194,7 +14927,8 @@ def _half_split(
     options = _sim_options(size_cap, quiet, end_date=end_date, tier_floors=tier_floors,
                            add_to_held=add_to_held, sell_at=sell_at,
                            sell_min_days=sell_min_days, trim_to_kelly=trim_to_kelly,
-                           min_move=min_move)
+                           min_move=min_move,
+                           rebalance_min_days_to_maturity=rebalance_min_days_to_maturity)
     h1 = _simulate_at_discount(first, start_date, initial_balance, k=k,
                                spread_band=band, population=f"{population}/H1", **options)
     h2 = _simulate_at_discount(second, start_date, initial_balance, k=k,
@@ -14235,7 +14969,8 @@ def _ex_top_event(
     level and minimum of days before maturity (point.sell_at,
     point.sell_min_days), and trims to Kelly when the point did
     (point.trim_to_kelly), after the point's minimum price move
-    (point.min_move).
+    (point.min_move) and until its "Rebalance until" days
+    (point.rebalance_min_days_to_maturity).
 
     Args:
         point (SweepPoint): The scenario's "all" or "time_series" point.
@@ -14276,7 +15011,9 @@ def _ex_top_event(
                                                    sell_at=point.sell_at,
                                                    sell_min_days=point.sell_min_days,
                                                    trim_to_kelly=point.trim_to_kelly,
-                                                   min_move=point.min_move))
+                                                   min_move=point.min_move,
+                                                   rebalance_min_days_to_maturity=(
+                                                       point.rebalance_min_days_to_maturity)))
     return top, _total_return(without, initial_balance)
 
 
@@ -14444,6 +15181,7 @@ def _sweep_from_candidates(
     depth_model: DepthModel | None = None,
     rebalance_sweep: bool = False,
     move_sweep: bool = False,
+    maturity_sweep: bool = False,
 ) -> BacktestSweep:
     """
     Run every entry pass and every simulation of one backtest over one fetch.
@@ -14565,7 +15303,10 @@ def _sweep_from_candidates(
     held pairs together. With move_sweep as well it carries the minimum
     price movements the dashboard offers (RebalanceSweep.min_moves, from
     _resolve_min_moves), which are simulated only when a report reads
-    RebalanceSweep.move_grid.
+    RebalanceSweep.move_grid. With maturity_sweep it carries the "Rebalance
+    until" choices besides "maturity" (RebalanceSweep.maturity_days, from
+    _resolve_maturity_days), simulated only when a report reads
+    RebalanceSweep.maturity_grid.
 
     Args:
         candidates (_Candidates): _prepare_candidates() output. CONSUMED: its
@@ -14622,6 +15363,11 @@ def _sweep_from_candidates(
             required), the Rebalance family also carries the minimum price
             movements of this module's MIN_PRICE_MOVES
             (RebalanceSweep.min_moves). False (default) leaves them empty.
+        maturity_sweep (bool): Keyword-only. When True (rebalance_sweep
+            required), the Rebalance family also carries the "Rebalance
+            until" choices of this module's REBALANCE_MATURITY_DAYS besides
+            "maturity" (RebalanceSweep.maturity_days). False (default)
+            leaves them empty.
 
     Returns:
         BacktestSweep: primary, points (the primary band's k sweep),
@@ -14631,7 +15377,7 @@ def _sweep_from_candidates(
             (carried from candidates), config_same_event_ladders (the
             configured switch, read beside same_event_ladders's
             resolution), tier_off_scenarios, tier_off_calibrations_by_band,
-            cap_sweep, tier_off_cap_sweep, same_title_size_cap, the twelve
+            cap_sweep, tier_off_cap_sweep, same_title_size_cap, the thirteen
             live_* fields, entry_checkpoint, sell_sweep, depth_model and
             rebalance_sweep — see BacktestSweep.
 
@@ -14640,11 +15386,13 @@ def _sweep_from_candidates(
             family is a band-sweep family: its split date, rescans and cells
             are the band sweep's), checked first; if move_sweep is set
             without rebalance_sweep (the minimum price movements are part of
-            the Rebalance family), checked next; from
+            the Rebalance family), checked next, and so is maturity_sweep
+            without rebalance_sweep; from
             config.time_series_spread_band for an invalid band; from the
-            first simulation, for a bad SAME_TITLE_SIZE_CAP; or, with
+            first simulation, for a bad SAME_TITLE_SIZE_CAP; with
             move_sweep, from _resolve_min_moves for a bad
-            MIN_PRICE_MOVES.
+            MIN_PRICE_MOVES; or, with maturity_sweep, from
+            _resolve_maturity_days for a bad REBALANCE_MATURITY_DAYS.
         AttributeError: If candidates has already fed a sweep (its
             all_pairs and candles_by_ticker were deleted) — loud rather than
             a silent sweep with no pairs and therefore no entries.
@@ -14655,6 +15403,9 @@ def _sweep_from_candidates(
     if move_sweep and not rebalance_sweep:
         raise ValueError("move_sweep needs rebalance_sweep: the minimum price movements "
                          "are part of the Rebalance family")
+    if maturity_sweep and not rebalance_sweep:
+        raise ValueError("maturity_sweep needs rebalance_sweep: the \"Rebalance until\" "
+                         "choices are part of the Rebalance family")
     start_date = candidates.start_date
     primary_band = time_series_spread_band(spread_band)
     # The saved live defaults: run_backtest_sweep's read, or our own for a
@@ -15093,7 +15844,8 @@ def _sweep_from_candidates(
         # sold down to their Kelly size, the two together — over the same grid
         # as the sell family, tier floors on and off, and, when asked for, with
         # each minimum price movement an add-on or a trim can be made to wait
-        # for; nothing simulated here
+        # for and each "Rebalance until" choice that holds one back near
+        # maturity; nothing simulated here
         rebalance_caps = caps if cap_sweep else (primary.size_cap,)
         rebalanced = RebalanceSweep(
             caps=rebalance_caps, primary_cap=primary.size_cap, bands=tuple(bands),
@@ -15101,7 +15853,8 @@ def _sweep_from_candidates(
             start_date=start_date, initial_balance=initial_balance,
             entries_by_band=entries_by_band, off_entries_by_band=tier_off_entries,
             end_dates=lazy_end_dates, off_end_dates=lazy_off_end_dates,
-            min_moves=_resolve_min_moves() if move_sweep else ())
+            min_moves=_resolve_min_moves() if move_sweep else (),
+            maturity_days=_resolve_maturity_days() if maturity_sweep else ())
         logging.info("Rebalancing: %d size cap(s) x %d band(s) (%d with the tier floors off) "
                      "x %d k, each simulated when the dashboard reads it",
                      len(rebalance_caps), len(bands), len(tier_off_bands), len(grid))
@@ -15164,6 +15917,7 @@ def run_backtest_sweep(
     depth_model: DepthModel | None = None,
     rebalance_sweep: bool = False,
     move_sweep: bool = False,
+    maturity_sweep: bool = False,
     series_categories: dict | None = None,
     fee_multipliers: dict | None = None,
     scheduled_close: bool | None = None,
@@ -15248,7 +16002,9 @@ def run_backtest_sweep(
     trim_to_kelly, always together) — tier floors on and off, simulated only
     when the dashboard reads it. With move_sweep as well, it also covers
     every minimum price movement of config.MIN_PRICE_MOVES
-    (RebalanceSweep.min_moves). The run logs a setting line for the family
+    (RebalanceSweep.min_moves); with maturity_sweep, every "Rebalance until"
+    choice of config.REBALANCE_MATURITY_DAYS besides "maturity"
+    (RebalanceSweep.maturity_days). The run logs a setting line for the family
     (naming the wait after a trade, REBALANCE_MIN_DAYS_SINCE_TRADE), one
     saying whether the minimum price movements are on, and, from
     _sweep_from_candidates, one summary line.
@@ -15339,6 +16095,14 @@ def run_backtest_sweep(
             run itself. False (default) leaves min_moves empty. Validated at
             the TOP of this function, before anything is logged or fetched.
             Backtest-only.
+        maturity_sweep (bool): Keyword-only. When True (rebalance_sweep
+            required), BacktestSweep.rebalance_sweep also carries every
+            "Rebalance until" choice of config.REBALANCE_MATURITY_DAYS
+            besides "maturity" (RebalanceSweep.maturity_days). The flag adds
+            no simulation to the run itself. False (default) leaves
+            maturity_days empty. Validated at the TOP of this function, with
+            move_sweep. Backtest-only: a live run holds its rebalancing back
+            near maturity by its own saved rebalance_min_days_to_maturity.
         depth_model (DepthModel | None): Keyword-only. The depth model every
             trade's synthetic order book is built from
             (depth_model.load_depth_model()); None (default) fills every trade
@@ -15388,8 +16152,8 @@ def run_backtest_sweep(
 
     Raises:
         ValueError: Before any fetch or log line, if tier_off_sweep is set
-            without band_sweep, if move_sweep is set without
-            rebalance_sweep, if interval_discount is not a number in
+            without band_sweep, if move_sweep or maturity_sweep is set
+            without rebalance_sweep, if interval_discount is not a number in
             (0, 1], if this module's SAME_TITLE_SIZE_CAP is not on the 5%
             grid in (0, 1], if this module's REBALANCE_MIN_DAYS_SINCE_TRADE
             is not a whole number from 0 to
@@ -15401,7 +16165,10 @@ def run_backtest_sweep(
             TAKE_PROFIT_MIN_DAYS is not a non-empty collection of distinct
             whole numbers of at least 1, if move_sweep is set and this
             module's MIN_PRICE_MOVES is not a non-empty collection of
-            distinct real numbers in (0, 1], if stale_quote_max_age (or,
+            distinct real numbers in (0, 1], if maturity_sweep is set and
+            this module's REBALANCE_MATURITY_DAYS is not a tuple, holds a
+            value that is not an int or names one twice, if
+            stale_quote_max_age (or,
             with None, this module's BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS) is
             not a positive, finite number of seconds, None or False, if
             max_volume_share (or, with None, this module's
@@ -15451,6 +16218,10 @@ def run_backtest_sweep(
     if move_sweep and not rebalance_sweep:
         raise ValueError("move_sweep needs rebalance_sweep: the minimum price movements "
                          "are part of the Rebalance family")
+    # ... and so are its "Rebalance until" choices
+    if maturity_sweep and not rebalance_sweep:
+        raise ValueError("maturity_sweep needs rebalance_sweep: the \"Rebalance until\" "
+                         "choices are part of the Rebalance family")
     # The same for the extra same-title cap: refused here, not after the fetch
     same_title_cap = _resolve_same_title_size_cap()
     # ... and for the wait after a trade before an add-on or a trim, on every
@@ -15466,6 +16237,9 @@ def run_backtest_sweep(
     # ... and, when the Rebalance family carries them, for the minimum price
     # movements, which the dashboard likewise reads only after the run
     min_moves = _resolve_min_moves() if move_sweep else ()
+    # ... and for its "Rebalance until" choices, the same way
+    if maturity_sweep:
+        _resolve_maturity_days()
     # ... and for the stale-quote limit (None: the check is off)
     stale_limit = _resolve_stale_quote_max_age(stale_quote_max_age)
     # ... and for the volume cap (None: off)
@@ -15674,7 +16448,7 @@ def run_backtest_sweep(
             tier_off_sweep=tier_off_sweep, cap_sweep=cap_sweep,
             sell_sweep=sell_sweep, live=live,
             depth_model=depth_model, rebalance_sweep=rebalance_sweep,
-            move_sweep=move_sweep,
+            move_sweep=move_sweep, maturity_sweep=maturity_sweep,
         )
     # On every path, "none recorded" included, so the report never omits it
     logging.info("%s", _live_rule_line(result))

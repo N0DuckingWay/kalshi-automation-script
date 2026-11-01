@@ -3965,12 +3965,12 @@ def sell_positions(client: Any, plans: list, *, dry_run: bool) -> list[SaleResul
     Sell the held contracts each plan names, one plan at a time, in order.
 
     A plan is a take-profit sale of a whole position, or a Kelly trim, which
-    sells an exact held pair down to its Kelly size. main._run_prod calls
-    this before it buys anything. Each held market gets at most one order (a
-    partner that has paid out gets none), sent once, never retried; nothing
-    is sent for a position whose markets no longer hold what the plan was
-    made on, or while the V2 NO-leg mapping stands disproven
-    (_V2_NO_MAPPING_DISPROVEN).
+    sells an exact held pair, or a lone leg whose partner has paid out, down
+    to its Kelly size. main._run_prod calls this before it buys anything.
+    Each held market gets at most one order (a partner that has paid out
+    gets none), sent once, never retried; nothing is sent for a position
+    whose markets no longer hold what the plan was made on, or while the V2
+    NO-leg mapping stands disproven (_V2_NO_MAPPING_DISPROVEN).
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -3980,11 +3980,11 @@ def sell_positions(client: Any, plans: list, *, dry_run: bool) -> list[SaleResul
 
     Returns:
         list[SaleResult]: One per plan, in order: "sold" (all the plan set out
-            to sell), "partly_sold" (a pair's rest is still an exact pair),
-            "not_sold" (nothing sold or sent), "unbalanced" (a pair's second
-            order sold fewer than its first), "manual_review" (an order's count
-            is unknown) or "simulated"; "unbalanced" and "manual_review" log a
-            CRITICAL.
+            to sell), "partly_sold" (a pair's rest is still an exact pair, or a
+            lone market's order filled in part), "not_sold" (nothing sold or
+            sent), "unbalanced" (a pair's second order sold fewer than its
+            first), "manual_review" (an order's count is unknown) or
+            "simulated"; "unbalanced" and "manual_review" log a CRITICAL.
     """
     results = []
     for plan in plans:

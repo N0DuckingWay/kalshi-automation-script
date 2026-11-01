@@ -16,9 +16,10 @@ python3 -m kalshi_betting.main --mode dev --dry-run
 
 # Production live trading, from the saved live defaults (live_defaults.json in the
 # repo root: tier floors, spread band, k, per-trade and same-title caps, category/tag
-# filter, rebalancing and its minimum price movement (with it on, a production run trims
-# held pairs before it buys and may add to them), and the sell level and its minimum of
-# days — each overridable for one run by the flags below, which the run marks
+# filter, rebalancing with its minimum price movement and "rebalance until" days (with it
+# on, a production run trims held pairs before it buys and may add to them), and the sell
+# level and its minimum of days — each overridable for one run by the flags below, which
+# the run marks
 # "(default: X)" on its "Live settings:" line and, when it submits orders under one,
 # names in a WARNING). With no saved file, a refused one, or one an older version saved
 # (holding add_to_held_pairs, trim_to_kelly or trim_min_rise, which rebalance and
@@ -52,18 +53,21 @@ python3 -m kalshi_betting.main --mode prod --dry-run
 python3 -m kalshi_betting.main --mode prod --dry-run --result-file /tmp/run_result.json
 
 # Production dry run replaying the live rule as it stood before the 2026-09-27
-# decision, for this run only. It gives all eleven toggles, because a toggle no flag
+# decision, for this run only. It gives all twelve toggles, because a toggle no flag
 # gives keeps its saved value (--no-rebalance and --no-sell too, so a saved "yes" or a
 # saved sell level does not leak into a replay of a rule that never rebalanced or sold;
-# --no-rebalance clears the saved minimum price movement as well); each flag that
+# --no-rebalance clears the saved minimum price movement and "rebalance until" setting as
+# well); each flag that
 # departs from the saved live defaults is marked "(default: X)" on the "Live
 # settings:" line
 python3 -m kalshi_betting.main --mode prod --dry-run --tier-floors --spread-min 0 --spread-max 1 --interval-discount 0.75 --size-cap 20 --same-title-size-cap 100 --no-rebalance --no-sell --no-exclude-category --no-exclude-tag
 
 # Production dry run that rebalances (no orders, nothing saved): before buying, sell part of each
-# exact held pair that has outgrown its Kelly share of the portfolio value, by the backtest's rule
-# (config.kelly_trim_count), once 7 calendar days (config.REBALANCE_MIN_DAYS_SINCE_TRADE) have
-# passed since the last fill on either of its markets, a fill by hand included, and only if
+# exact held pair, and of each lone leg whose earlier market paid out $0 (the later market of a
+# time-series pair, still held), that has outgrown its Kelly share of the portfolio value, by the
+# backtest's rule (config.kelly_trim_count), once 7 calendar days
+# (config.REBALANCE_MIN_DAYS_SINCE_TRADE) have passed since the last fill on its markets, a fill
+# by hand included, and only if
 # Kalshi's list of the account's fills reaches back that far; and add to the pairs the account
 # already holds (exactly the same two markets, the same side on each, or a lone held market whose
 # partner has paid out), after the same wait since the last fill on their markets. It trims
@@ -81,7 +85,8 @@ python3 -m kalshi_betting.main --mode prod --dry-run --tier-floors --spread-min 
 # `Kelly trim sizes on $X = cash $Y + open positions $Z (Kalshi's value $A; $B at this run's bids)`
 # (a trim is sized on the larger of the two), one `Kelly trim check: ... -> sell N` (or `-> keep`)
 # line per pair, a `Not trimming ...: <reason>` line for a pair it leaves alone,
-# `Pairs to trim this run: N of M`, a `[DRY RUN] Would sell ...` line per trim (`(of N held)`
+# `Pairs to trim this run: N of M` (and `Lone legs to trim this run (partner paid out): N of M`
+# when a lone leg was looked at), a `[DRY RUN] Would sell ...` line per trim (`(of N held)`
 # follows each order's count) and, when something would sell,
 # `Dry run: sizing as if the sales filled — cash $X (+$Y)`: the buys are then sized on the cash
 # those trims would free, and the pairs trimmed stay held and are not added to. A saved file
@@ -94,8 +99,20 @@ python3 -m kalshi_betting.main --mode prod --dry-run --rebalance
 # price (the asks of the sides held, added; a lone leg's one market's ask) has moved that far, up or
 # down, since its last fill, and its check lines then read `price $0.74 then, $0.87 now (+13c,
 # minimum 10c)` (a fall shows as -12c, say). --no-rebalance neither trims nor adds to a held pair
-# this run whatever is saved (and clears the saved minimum price movement too)
+# this run whatever is saved (and clears the saved minimum price movement and "rebalance until"
+# setting too)
 python3 -m kalshi_betting.main --mode prod --dry-run --rebalance --min-price-move 10
+# The same with "Rebalance until": a held pair (or lone leg) whose later market closes in fewer than 7
+# days from today (whole UTC dates) is neither trimmed nor added to, and the log says so per position
+# before any book or fill is read for it (`Not trimming YES A / NO B: its later market closes in 5
+# day(s), and rebalancing stops 7 day(s) before maturity`; `Not adding to ...` for an add-on). 1 is
+# the other choice; 0 or --no-rebalance-min-days-to-maturity rebalances however near maturity (the
+# default unless saved otherwise). The "Live settings:" line reads `rebalance until 7 days before
+# maturity`. The backtest's walk applies the same rule (_simulate_at_discount's
+# rebalance_min_days_to_maturity), and its Rebalance family carries the runs, but the dashboard
+# does not offer it yet: its Save button leaves it as saved (a link naming rebalance=off clears
+# it), so a dashboard scenario shows none of its effect
+python3 -m kalshi_betting.main --mode prod --dry-run --rebalance --rebalance-min-days-to-maturity 7
 python3 -m kalshi_betting.main --mode prod --dry-run --no-rebalance
 
 # Production dry run that sells (no orders, nothing saved): judge every held position by the
@@ -231,6 +248,16 @@ python3 -m kalshi_betting.backtest --no-rebalance-sweep
 # --no-rebalance-sweep skips both. Backtest only
 python3 -m kalshi_betting.backtest --no-move-sweep
 
+# Backtest with the "Rebalance" family but without its "Rebalance until" choices (ON by default
+# with that family, and lazy the same way: BacktestSweep.rebalance_sweep.maturity_days holds
+# config.REBALANCE_MATURITY_DAYS less "maturity", 1 and 7 days, where a held position is added
+# to or trimmed only while its later market closes at least that many days away; each is
+# simulated only when a report reads it, at every minimum price movement, and only where it
+# changes a run). Skipping them skips the dashboard's "Rebalance until" select (and its Save
+# then keeps the saved days limit unless it turns rebalancing off); Rebalance itself is still
+# built, and --no-rebalance-sweep skips them too. Backtest only
+python3 -m kalshi_betting.backtest --no-maturity-sweep
+
 # Backtest without the dashboard's "Sell" family (ON by default in the CLI, and lazy like the
 # cap sweep: the run simulates nothing — the dashboard step then reads every sell level and
 # minimum of days to maturity of every scenario the filter bar shows that does not rebalance
@@ -259,7 +286,8 @@ python3 -m kalshi_betting.backtest --sell-workers 4
 python3 -m kalshi_betting.backtest --dashboard-only
 
 # The same, quickly, to check a small dashboard change: each of --no-sell-sweep,
-# --no-rebalance-sweep, --no-move-sweep and --no-cap-sweep drops that family from the saved run,
+# --no-rebalance-sweep, --no-move-sweep, --no-maturity-sweep and --no-cap-sweep drops that family
+# (or that part of it) from the saved run,
 # giving the page a run with that flag would have built (the Sell select alone took 1.4 to 4.6 h on
 # the last 365-day runs)
 python3 -m kalshi_betting.backtest --dashboard-only --no-sell-sweep --no-rebalance-sweep
@@ -331,7 +359,7 @@ python3 -m kalshi_betting.scheduler
 # saved-live-defaults paragraph under Key Patterns (--seed proposes Rebalance yes): with no
 # saved file, or one saved before Rebalance, every live run exits 2. Confirm and trade (on /confirm it saves
 # first; on /trade it trades the saved defaults) and Dry run (no orders, nothing saved) start
-# `python -m kalshi_betting.main --mode prod` with all eleven toggles as flags, in its own
+# `python -m kalshi_betting.main --mode prod` with all twelve toggles as flags, in its own
 # session; each run's folder is under live_runs/, and its page is /runs/<id>. Run it again
 # while this checkout's servers run and it only opens the page again (nothing started); a
 # defaults-server port held by that server running code from before a change to the
