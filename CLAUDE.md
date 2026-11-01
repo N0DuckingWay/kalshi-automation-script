@@ -21,7 +21,7 @@ The full description is in `docs/claude/overview.md`.
 
 ## Where the Detail Is
 
-Every file here was moved word for word from this file, and most start with a list of their paragraphs. Read the one for the code you are changing.
+Every file here but `writing-for-people.md` was moved word for word from this file, and most start with a list of their paragraphs. Read the one for the code you are changing.
 
 | File (under `docs/claude/`) | What it holds |
 |---|---|
@@ -29,6 +29,7 @@ Every file here was moved word for word from this file, and most start with a li
 | `what-not-to-do.md` | The full "What NOT To Do" rules (their short forms are below) |
 | `run-commands.md` | Every run command with its notes: live and dry runs, one-run overrides, every backtest flag, the dashboards, the probes |
 | `ci-and-packaging.md` | CI, packaging, every test file and fixture, `conftest.py`'s autouse fixtures, the golden dashboard digests, the tests that read these notes |
+| `writing-for-people.md` | How to write code comments, docstrings, commit messages, pull requests and GitHub replies that someone who has not read the code can follow: the rules, plain meanings for the project's terms, before-and-after examples |
 | `module-map/live-modules.md` | Module Map rows for `__init__`, `config`, `auth`, `_http`, `scanner`, `strategy`, `trader`, `reporter`, `seller`, `main`, `scheduler`, `run_lock` |
 | `module-map/backtest-modules.md` | Module Map rows for `historical`, `treasury`, `depth_model`, `eda`, `glossary`, `market_details`, `backtester`, `dashboard`, `backtest` |
 | `module-map/tools-modules.md` | Module Map rows for `v2_probe`, `defaults_server`, `live_portfolio`, `live_dashboard` |
@@ -193,6 +194,8 @@ The `dev_api_key` field is optional; if absent, `auth.py` falls back to `Kalshi-
 
 ## Documentation Standards
 
+**Write code comments, docstrings, commit messages, pull requests and GitHub replies so someone who has not read the code can follow them.** Use plain words and short sentences. Spell out each abbreviation and give each project term's plain meaning the first time (`kalshi_betting/glossary.py` has the dashboards' wording). Name a function, constant or file only where the reader needs it to find or check something, with its job in words beside it, and give every number its unit. Comments and docstrings say what the code does now and how it fits the rest, never its history (that goes in the commit message and the pull request). A commit or pull request title says what changes as a user would see it. A pull request description follows `.github/pull_request_template.md` (What changes, Why, Real money, How it works, Checked); its first three sections name no code and say plainly whether real money is affected. The full guide, with examples, is `docs/claude/writing-for-people.md`.
+
 **Every file must have a header comment block** at the top (after the shebang/encoding if any) following the pattern already established in every module:
 ```python
 """
@@ -201,7 +204,8 @@ Author: <name>
 Last edited by: <name>
 
 Purpose:
-    One paragraph describing what this module does and why it exists.
+    One plain paragraph: what this module does, why it exists and where it
+    fits in the bot.
 
 Dependencies:
     What it imports from the project and what imports from it.
@@ -217,8 +221,9 @@ def my_function(arg: type) -> ReturnType:
     """
     One-sentence summary of what the function does.
 
-    Longer explanation if the logic is non-trivial. Include the invariants
-    this function assumes and what it guarantees.
+    Longer explanation if the logic is non-trivial, in plain words: what
+    the function is for, who calls it, what it relies on and what it
+    promises.
 
     Args:
         arg (type): Description. Include valid range if numeric.
@@ -232,10 +237,13 @@ def my_function(arg: type) -> ReturnType:
 ```
 Functions that return `None` only on failure should document that: `Returns None if <condition>.`
 
-**Every cross-module function call must have an inline comment** explaining the *why*, not just the *what*. The existing codebase already follows this for critical calls (see `main.py` and `strategy.py`):
+**Every cross-module function call must have an inline comment** explaining the *why*, not just the *what*, in plain words. The existing codebase already follows this for critical calls (see `main.py` and `strategy.py`):
 ```python
-# Validate depth & replace best-ask with depth-weighted fill price
-pairs = scanner.enrich_with_orderbook_prices(client, pairs)
+# Price each pair from its order book, up to what one trade's budget could buy
+candidate_pairs = enrich_with_orderbook_prices(
+    client, candidate_pairs, portfolio_value_cents, settings=settings,
+    cash_cents=cash_cents,
+)
 ```
 Single-line calls to stdlib or well-known helpers (e.g. `logging.info(...)`, `sorted(...)`) don't need comments unless the arguments are surprising.
 
