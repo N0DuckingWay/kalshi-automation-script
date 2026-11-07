@@ -11916,6 +11916,7 @@ class TestPriceEpsilonThresholds:
         assert find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB]) == []
 
 
+@pytest.mark.usefixtures("pre_toggle_defaults")
 class TestValidatePairPriceReachableDepth:
     """
     The pre-execution re-check must ask the question the wire asks: will the
@@ -11923,67 +11924,55 @@ class TestValidatePairPriceReachableDepth:
     every contract that merely clears the gap let a spec whose top levels rest
     above its own FoK limit pass here and then be killed on the exchange,
     reported as "NO leg FoK not filled" (TS-08).
+
+    The pair is a time-series pair: YES on market A (its YES asks come from
+    A's resting NO bids) and NO on market B (its NO asks come from B's resting
+    YES bids). B's NO bids give the later market's YES ask, 0.70, which the
+    check needs so a time-series pair is not dropped for want of one.
+
+    Market B closes 10 days after market A. The 10-day gap's 15-cent floor
+    sets a price-sum ceiling of 0.85, which both levels (0.30 + 0.32 and
+    0.30 + 0.37) clear, so only the reach check drops the 600.
     """
 
     @staticmethod
-    def _client(a_yes_bids, b_no_bids):
-        client = MagicMock()
-
-        def _raw(ticker, *a, **k):
-            book = {"A1": {"yes": a_yes_bids, "no": []},
-                    "B1": {"yes": [], "no": b_no_bids}}[ticker]
-            return {"orderbook_fp": {"yes_dollars": book["yes"], "no_dollars": book["no"]}}
-
-        client._get = _raw
-        return client
-
-    @staticmethod
-    def _pair(nA, pB):
-        from datetime import UTC, datetime
+    def _pair(pA, nB):
+        from datetime import UTC, datetime, timedelta
         close = datetime(2026, 3, 1, tzinfo=UTC)
         mA = SimpleNamespace(ticker="A1", title="A", subtitle="", event_ticker="EV-A",
                              close_time=close, exchange_index=0,
                              price_level_structure="", price_ranges=None)
         mB = SimpleNamespace(ticker="B1", title="B", subtitle="", event_ticker="EV-B",
-                             close_time=close, exchange_index=0,
+                             close_time=close + timedelta(days=10), exchange_index=0,
                              price_level_structure="", price_ranges=None)
         return CandidatePair(
-            market_a=mA, market_b=mB, pA=1.0 - nA, pB=pB, nA=nA, nB=1.0 - pB,
+            market_a=mA, market_b=mB, pA=pA, pB=0.70, nA=1.0 - pA, nB=nB,
             tradeable=True, canonical_title="reachability pair",
-            pair_type="same_title",
+            pair_type="time_series",
         )
 
     def _run(self, monkeypatch, x):
-        # NO leg (market_a) ladders 0.32@300 then 0.37@300; YES leg flat 0.30.
-        # The spec is priced at the top level, so its NO cap is 0.33 and only
-        # the first 300 contracts are reachable.
-        pair = self._pair(nA=0.32, pB=0.30)
+        # NO leg (market_b) ladders 0.32@300 then 0.37@300; YES leg (market_a)
+        # flat 0.30@600. The spec is priced at the top level, so its NO cap is
+        # 0.33 and only the first 300 contracts are reachable.
+        pair = self._pair(pA=0.30, nB=0.32)
         spec = SimpleNamespace(pair=pair, x=x)
-        client = self._client(
-            a_yes_bids=[["0.68", "300"], ["0.63", "300"]],
-            b_no_bids=[["0.70", "600"]],
-        )
-        monkeypatch.setattr(scanner, "_fetch_orderbook",
-                            lambda c, t: {"A1": {"yes": [["0.68", "300"], ["0.63", "300"]], "no": []},
-                                          "B1": {"yes": [], "no": [["0.70", "600"]]}}[t])
-        return validate_pair_price(client, spec)
+        books = {
+            # Market A: NO bids 0.70 x 600 are YES asks of 0.30 x 600
+            "A1": {"yes": [], "no": [["0.70", "600"]]},
+            # Market B: YES bids 0.68 x 300 and 0.63 x 300 are NO asks of 0.32
+            # and 0.37; its NO bid 0.30 is the later YES ask of 0.70
+            "B1": {"yes": [["0.68", "300"], ["0.63", "300"]], "no": [["0.30", "10"]]},
+        }
+        monkeypatch.setattr(scanner, "_fetch_orderbook", lambda c, t: books[t])
+        return validate_pair_price(MagicMock(), spec)
 
-    def test_spec_within_reachable_depth_passes(self):
-        import pytest as _p
-        mp = _p.MonkeyPatch()
-        try:
-            assert self._run(mp, 300) is True
-        finally:
-            mp.undo()
+    def test_spec_within_reachable_depth_passes(self, monkeypatch):
+        assert self._run(monkeypatch, 300) is True
 
-    def test_spec_beyond_reachable_depth_is_dropped(self):
+    def test_spec_beyond_reachable_depth_is_dropped(self, monkeypatch):
         # 600 contracts clear the gap, but only 300 rest at or below the cap.
-        import pytest as _p
-        mp = _p.MonkeyPatch()
-        try:
-            assert self._run(mp, 600) is False
-        finally:
-            mp.undo()
+        assert self._run(monkeypatch, 600) is False
 
     def test_the_rejection_names_reachability_not_thin_depth(self, caplog, monkeypatch):
         with caplog.at_level(logging.WARNING):
