@@ -4282,26 +4282,21 @@ def _stated(market: Any, profile: tuple) -> date | None:
 
 def held_pair_kind(yes_market: Any, no_market: Any) -> tuple[str, Any, Any] | None:
     """
-    Read whether two held markets are a time-series pair held as one, and which is market A.
+    Read whether two held markets are a time-series pair, and which is market A.
 
-    The account's positions do not say how a held pair was bought.
-    seller.plan_trims needs the pair's type and its market A to read its
-    chance of paying, so this reads them back from the two markets by
+    The account's positions do not say how a pair was bought, so
+    seller.plan_trims reads it back from the markets by
     find_time_series_pairs' own tests. It answers only when the sides held
     are the sides a time-series pair buys (leg_sides): YES on the earlier
-    deadline (market A) and NO on the later (market B). Anything it cannot
-    show is None, never a guess. seller.plan_trims also asks it about a lone
-    leg: the held market and its paid-out partner (a settled market, taken
-    from the run's market list or looked up through market_for_labels), each
-    on the side it was held, so for two events the close the time-series test
-    compares is the one Kalshi records for the settled partner.
+    deadline (market A), NO on the later (market B). Anything it cannot show
+    is None, never a guess. plan_trims also asks about a lone leg: the held
+    market and its paid-out partner (from the run's market list or
+    market_for_labels), each on the side it was held.
 
-    Two identically worded markets (the same title, subtitle and event
-    title, as a same-title pair is) are always None. Identical wording
-    states one deadline, so they are never a time-series pair, and a live
-    run buys no other kind, so a held same-title pair, or a same-title lone
-    leg, is never trimmed (a saved sell level can still sell one whole: the
-    take-profit rule, seller.plan_sales, never asks this).
+    Two identically worded markets (same title, subtitle and event title) are
+    always None: they state one deadline, and a live run buys no other kind,
+    so a held same-title pair is never trimmed (a saved sell level can still
+    sell one whole; seller.plan_sales never asks this).
 
     Both markets need an event ticker: without one, two events cannot be told
     from two rungs of one event, which are ordered by different rules.
