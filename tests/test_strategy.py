@@ -62,23 +62,27 @@ _FROM_QUOTES = object()
 
 
 def make_pair(
-    pA: float = 0.70,
-    pB: float = 0.30,
+    pA: float = 0.30,
+    pB: float = 0.60,
     nA: float | None = None,
-    nB: float = 0.65,
+    nB: float = 0.40,
     tradeable: bool = True,
-    pair_type: str = "same_title",
+    pair_type: str = "time_series",
     max_contracts: int = 0,
     mid_spread: object = _FROM_QUOTES,
 ) -> MagicMock:
     """Factory for CandidatePair-like mocks; avoids importing the real dataclass.
 
+    The defaults are a time-series pair: YES on the earlier market at pA 0.30
+    and NO on the later at nB 0.40 (the later market's YES ask pB is 0.60), so
+    a contract pair costs $0.70 and the mid spread is 0.30.
+
     nB is set as a real float (never left to MagicMock auto-vivification):
     scanner.leg_prices reads it directly for time-series pairs.
 
-    nA defaults to 0.20 for same_title (its NO leg) and to 1 - pA for
-    time_series, so market A's quotes are a book with no width. A time-series
-    pair's mid_spread, the input its forecast reads, defaults to
+    nA defaults to 1 - pA for time_series, so market A's quotes are a book with
+    no width, and to 0.20 for same_title (its NO leg). A time-series pair's
+    mid_spread, the input its forecast reads, defaults to
     config.time_series_mid_spread over the four quotes, as enrichment writes it
     from the tops of the books; pass a value (None included) to set it
     instead. A same-title pair's is None.
@@ -245,27 +249,45 @@ class TestKellyP:
 
 @pytest.mark.usefixtures("pre_toggle_defaults")
 class TestComputeTrade:
-    """compute_trade's gates and caps under pre_toggle_defaults (k 0.75, 20% cap)."""
+    """compute_trade's gates and caps on a time-series pair, under
+    pre_toggle_defaults (k 0.75, 20% cap). The pair buys YES on the earlier
+    market at pA and NO on the later one at nB, so its cost per contract pair
+    is pA + nB and the pair wins $1 per contract pair when both markets
+    resolve the same way. make_pair's defaults are the reference pair: pA 0.30,
+    nB 0.40, later YES ask pB 0.60, earlier NO ask nA 0.70 (a book with no
+    width), so the mid spread is 0.30."""
 
     def test_returns_none_when_not_tradeable(self):
         pair = make_pair(tradeable=False)
         assert compute_trade(pair, 100_000) is None
 
     def test_returns_none_when_no_spread(self):
-        # nA + pB = 1.0 means zero gross spread
-        pair = make_pair(nA=0.50, pB=0.50)
+        # pA + nB = 0.50 + 0.50 = 1.0 means zero gross spread: a contract pair
+        # costs the $1 it can win. The mid spread is usable (0.60 / 0.50 on the
+        # later market gives a YES midpoint of 0.55, the earlier's is 0.50), so
+        # the refusal comes from the leg prices and not from a missing forecast
+        pair = make_pair(pA=0.50, pB=0.60, nB=0.50)
+        assert scanner.pair_mid_spread(pair) == pytest.approx(0.05)
         assert compute_trade(pair, 100_000) is None
 
     def test_returns_none_when_spread_negative(self):
-        # nA + pB > 1 means the bot pays more than it can earn
-        pair = make_pair(nA=0.60, pB=0.50)
+        # pA + nB = 0.60 + 0.50 = 1.10 > 1: the bot pays more than it can earn.
+        # The later market's YES midpoint is (0.80 + 0.50) / 2 = 0.65 and the
+        # earlier's is (0.60 + 0.60) / 2 = 0.60, a usable mid spread of 0.05
+        pair = make_pair(pA=0.60, pB=0.80, nB=0.50)
+        assert scanner.pair_mid_spread(pair) == pytest.approx(0.05)
         assert compute_trade(pair, 100_000) is None
 
     def test_returns_none_when_price_at_boundary(self):
-        assert compute_trade(make_pair(pB=0.0), 100_000) is None
-        assert compute_trade(make_pair(pB=1.0), 100_000) is None
-        assert compute_trade(make_pair(nA=0.0), 100_000) is None
-        assert compute_trade(make_pair(nA=1.0), 100_000) is None
+        # A leg price of 0 or 1 is a settled market and breaks the fee formula.
+        # The mid spread is held at the reference pair's 0.30 so each case
+        # reaches the leg-price check instead of stopping for want of a forecast
+        for kwargs in ({"pA": 0.0}, {"pA": 1.0}, {"nB": 0.0}, {"nB": 1.0}):
+            pair = make_pair(mid_spread=0.30, **kwargs)
+            assert compute_trade(pair, 1_000_000) is None, kwargs
+        # Control: a price just inside the boundary does size
+        assert compute_trade(make_pair(pA=0.01, mid_spread=0.30), 1_000_000) is not None
+        assert compute_trade(make_pair(nB=0.01, mid_spread=0.30), 1_000_000) is not None
 
     def test_time_series_boundary_checks_use_leg_prices(self):
         # For time_series the leg prices are pA/nB — a boundary nA or pB (not
@@ -282,9 +304,11 @@ class TestComputeTrade:
         assert compute_trade(make_pair(pA=0.30, pB=0.60, nB=1.0, pair_type="time_series",
                                        mid_spread=0.30), 1_000_000) is None
 
-    def test_returns_trade_spec_for_valid_same_title_pair(self):
-        # same_title pair: p=0.95 fixed prior; nA=0.20+pB=0.30=0.50 < 1, wide spread gives positive Kelly
-        pair = make_pair(nA=0.20, pB=0.30, pair_type="same_title")
+    def test_returns_trade_spec_for_valid_time_series_pair(self):
+        # Reference pair: p = 1 - 0.75 * 0.30 = 0.775 from the mid spread;
+        # pA + nB = 0.70 < 1, so a $0.30 gross win per contract pair gives a
+        # positive Kelly fraction (about 0.162)
+        pair = make_pair()
         result = compute_trade(pair, 100_000)
         assert result is not None
         assert result.x >= 1
@@ -292,42 +316,92 @@ class TestComputeTrade:
         assert result.min_payoff > 0
 
     def test_kelly_fraction_capped_at_budget_fraction(self):
-        # Even with a huge edge, the Kelly fraction must not exceed BUDGET_FRACTION
-        pair = make_pair(nA=0.01, pB=0.01)  # very cheap pair, massive edge
+        # When Kelly's f* is over the per-trade cap, the Kelly fraction must
+        # not exceed BUDGET_FRACTION (0.20 here). YES on the earlier market at
+        # 0.01 and NO on the later at 0.01: a contract pair costs $0.02 and
+        # wins $0.98. Both books have no width (the later YES ask 0.99 equals
+        # its YES bid, 1 - 0.01), so the mid spread is 0.99 - 0.01 = 0.98 and
+        # p = 1 - 0.75 * 0.98 = 0.265. The fee approximation is
+        # 0.07 * 2 * 0.01 * 0.99 = 0.001386, so b = (0.98 - 0.001386) /
+        # (0.02 + 0.001386) = 45.76 and f* = 0.265 - 0.735 / 45.76 = 0.249,
+        # over the 0.20 cap (on books that are not crossed a time-series f*
+        # stays under 1 - k = 0.25)
+        pair = make_pair(pA=0.01, pB=0.99, nB=0.01)
+        assert _ts_kelly_fraction(0.01, 0.99, 0.01) > config.BUDGET_FRACTION
         result = compute_trade(pair, 1_000_000)
         assert result is not None
         assert result.kelly_fraction <= config.BUDGET_FRACTION + 1e-9
+        assert result.kelly_fraction == pytest.approx(config.BUDGET_FRACTION)
 
     def test_respects_max_contracts_limit(self):
-        pair = make_pair(nA=0.20, pB=0.30, pair_type="same_title", max_contracts=2)
+        # $10,000 would buy about 2,200 contract pairs; the depth limit of 2 binds
+        pair = make_pair(max_contracts=2)
         result = compute_trade(pair, 1_000_000)
         assert result is not None
-        assert result.x <= 2
+        assert result.x == 2
 
     def test_returns_none_when_fees_eat_spread_at_small_n(self):
-        # At very tight spreads with n=1, ceiling-rounded fees can consume the profit.
-        # nA=0.49, pB=0.48 → spread ≈ 0.03, fees ≈ 0.02 per leg → marginal at n=1.
-        pair = make_pair(nA=0.49, pB=0.48)
-        # This may return None or a spec depending on exact fee math — just ensure no crash.
-        result = compute_trade(pair, 100)  # tiny balance forces n=1
-        if result is not None:
-            assert result.min_payoff > 0
+        # Ceiling-rounded fees can consume the profit at a small count even
+        # though the continuous fee approximation leaves an edge. YES on the
+        # earlier market at 0.97 and NO on the later at 0.015: a contract pair
+        # costs $0.985 and wins $1, a gross win of $0.015. Both books have no
+        # width (the later YES ask 0.985 equals its YES bid, 1 - 0.015), so the
+        # mid spread is 0.985 - 0.97 = 0.015 and p = 1 - 0.75 * 0.015 =
+        # 0.98875. The fee approximation 0.07 * (0.97 * 0.03 + 0.015 * 0.985)
+        # = 0.00307 leaves an edge of 0.01193 a pair, so b = 0.01193 /
+        # (0.985 + 0.00307) = 0.01207 and Kelly's f* = 0.98875 - 0.01125 /
+        # 0.01207 = 0.0569, under the 20% cap. At one contract pair each leg's
+        # exact fee (0.07 * 0.97 * 0.03 = $0.0020 and 0.07 * 0.015 * 0.985 =
+        # $0.0010) rounds UP to $0.01, so the win pays 0.015 - 0.02 = -$0.005:
+        # not worth buying
+        pair = make_pair(pA=0.97, pB=0.985, nB=0.015)
+        assert scanner.pair_mid_spread(pair) == pytest.approx(0.015)
+        fee = fee_per_pair_approx(0.97, 0.015)
+        b = ((1.0 - 0.985) - fee) / (0.985 + fee)
+        p = time_series_profit_prob(0.015)
+        f = p - (1.0 - p) / b
+        assert (1.0 - 0.985) - fee > 0
+        assert f == pytest.approx(0.0569, abs=1e-4)
+        assert fee_leg_exact(1, 0.97) == pytest.approx(0.01)
+        assert fee_leg_exact(1, 0.015) == pytest.approx(0.01)
+        # A $20 balance: budget 20 * 0.0569 = $1.138 buys floor(1.138 / 0.985)
+        # = 1 pair, which costs 0.985 + 0.01 + 0.01 = $1.005 and fits, so the
+        # refusal is the fee rounding and not the budget
+        assert max_affordable_pairs(2_000, 0.985, f) == 1
+        assert compute_trade(pair, 2_000) is None
+        # A $1,000 balance buys enough pairs (the fee rounds up at most a cent
+        # a leg) that the win pays: budget $56.90 buys floor(56.90 / 0.985) =
+        # 57 pairs, costing 57 * 0.985 = $56.145 plus fees of $0.12 (0.07 * 57
+        # * 0.97 * 0.03 = 0.1161) and $0.06 (0.07 * 57 * 0.015 * 0.985 =
+        # 0.0590), $56.325 in all, and the win pays 57 * 0.015 - 0.18 = $0.675
+        result = compute_trade(pair, 100_000)
+        assert result is not None
+        assert result.x == 57
+        assert result.min_payoff == pytest.approx(0.675)
+        assert result.min_payoff > 0
 
     def test_days_to_close_at_least_one(self):
-        pair = make_pair(nA=0.20, pB=0.30, pair_type="same_title")
+        # The later market closes in 30 days (the earlier in 15), and capital
+        # is tied up until both resolve, so the count is the whole days left
+        # until the later close, rounded down: 29, or 30 if no time passes
+        # between building the pair and sizing it
+        pair = make_pair()
         result = compute_trade(pair, 100_000)
         assert result is not None
         assert result.days_to_close >= 1
+        assert result.days_to_close in (29, 30)
 
     def test_returns_none_when_budget_cannot_afford_one_contract(self):
-        # Balance $1, Kelly cap 20% → budget $0.20 < one pair at $0.50.
-        # Forcing n=1 would silently exceed the Kelly fraction, so: None.
-        pair = make_pair(nA=0.20, pB=0.30, pair_type="same_title")
+        # Balance $1: the reference pair's Kelly fraction is about 0.162,
+        # under the 20% cap, so the budget is about $0.16, less than one pair
+        # at pA + nB = 0.30 + 0.40 = $0.70. Forcing n=1 would silently exceed
+        # the Kelly fraction, so: None.
+        pair = make_pair()
         assert compute_trade(pair, 100) is None
 
     def test_total_cost_with_fees_exceeds_total_cost(self):
         # The fee-inclusive cost must include both legs' exact taker fees
-        pair = make_pair(nA=0.20, pB=0.30, pair_type="same_title")
+        pair = make_pair()
         result = compute_trade(pair, 100_000)
         assert result is not None
         assert result.total_cost_with_fees > result.total_cost
@@ -336,7 +410,7 @@ class TestComputeTrade:
         # cost_with_fees_a + cost_with_fees_b must equal total_cost_with_fees —
         # same terms, same fee calls, just not summed together. This is the
         # invariant the collateral transfer planner relies on.
-        pair = make_pair(nA=0.20, pB=0.30, pair_type="same_title")
+        pair = make_pair()
         result = compute_trade(pair, 100_000)
         assert result is not None
         assert result.cost_with_fees_a + result.cost_with_fees_b == pytest.approx(
@@ -346,29 +420,40 @@ class TestComputeTrade:
     def test_per_leg_costs_match_component_construction(self):
         # Each leg's cost is that leg's own contracts-times-price plus its own
         # exact ceiling-rounded fee — verify against a direct re-derivation
-        # rather than trusting compute_trade's internal arithmetic.
-        pair = make_pair(nA=0.20, pB=0.30, pair_type="same_title")
+        # rather than trusting compute_trade's internal arithmetic. Market A's
+        # leg is the YES at pA; market B's is the NO at nB.
+        pair = make_pair()
         result = compute_trade(pair, 100_000)
         assert result is not None
         assert result.cost_with_fees_a == pytest.approx(
-            result.x * pair.nA + fee_leg_exact(result.x, pair.nA)
+            result.x * pair.pA + fee_leg_exact(result.x, pair.pA)
         )
         assert result.cost_with_fees_b == pytest.approx(
-            result.y * pair.pB + fee_leg_exact(result.y, pair.pB)
+            result.y * pair.nB + fee_leg_exact(result.y, pair.nB)
         )
 
     def test_fee_inclusive_cost_never_exceeds_kelly_budget(self):
-        # Regression: n was originally derived from budget_dollars / (nA + pB),
-        # which excludes fees entirely — fees were added on top afterward, so
-        # total_cost_with_fees could exceed the capped Kelly budget the fraction
-        # was supposed to bound. A $50.00 portfolio value with this pair
-        # reproduces the overshoot under the old (pre-fix) sizing: naive n=16
-        # costs $10.08 against a $10.00 budget.
-        pair = make_pair(nA=0.30, pB=0.30, pair_type="same_title")
-        result = compute_trade(pair, 5000)
+        # Regression: n must not be derived from budget_dollars / (pA + nB),
+        # which excludes fees entirely — fees added on top afterward could push
+        # total_cost_with_fees over the capped Kelly budget the fraction was
+        # supposed to bound. A $48.00 portfolio value with the reference pair
+        # reproduces the overshoot a fee-less count would make: Kelly fraction
+        # 0.1620 gives a budget of 48.00 * 0.1620 = $7.7765; the naive count is
+        # floor(7.7765 / 0.70) = 11 pairs, costing 11 * 0.70 = $7.70 plus exact
+        # fees ceil(0.07 * 11 * 0.30 * 0.70 = 0.1617) = $0.17 on the YES leg
+        # and ceil(0.07 * 11 * 0.40 * 0.60 = 0.1848) = $0.19 on the NO leg,
+        # $8.06 in all against the $7.7765 budget. Ten pairs fit: $7.00 +
+        # $0.15 + $0.17 = $7.32.
+        pair = make_pair()
+        result = compute_trade(pair, 4800)
         assert result is not None
-        budget_dollars = (5000 / 100.0) * result.kelly_fraction
+        budget_dollars = (4800 / 100.0) * result.kelly_fraction
+        assert result.x == 10
+        assert result.total_cost_with_fees == pytest.approx(7.32)
         assert result.total_cost_with_fees <= budget_dollars + 1e-9
+        # The overshoot the fee loop prevents: 11 pairs, fee-inclusive, do not fit
+        assert 11 * (_TS_PA + _TS_NB) + fee_leg_exact(11, _TS_PA) + fee_leg_exact(
+            11, _TS_NB) > budget_dollars
 
 
 @pytest.mark.usefixtures("pre_toggle_defaults")
@@ -504,21 +589,33 @@ class TestComputeTradeSettings:
         assert _ts_kelly_fraction(0.30, 0.85, 0.15) == pytest.approx(0.2163, abs=1e-4)
 
     def test_an_explicit_cap_binds_where_the_default_would(self):
-        st = make_pair(**self._ST)
-        default = compute_trade(st, 1_000_000)
-        assert default.kelly_fraction == pytest.approx(config.BUDGET_FRACTION)
-        wider = compute_trade(st, 1_000_000, settings=_live(cap=0.35))
-        assert wider.kelly_fraction == pytest.approx(0.35)
-        assert wider.x > default.x
-        # The time-series f* (~0.216) sits between the caps: 0.20 binds, 0.35 does not
         ts = make_pair(**self._TS_WIDE)
+        # The time-series f* (~0.216, at k 0.75) is over the default 20% cap
+        default = compute_trade(ts, 1_000_000)
+        assert default.kelly_fraction == pytest.approx(config.BUDGET_FRACTION)
+        # ... and sits between the caps: an explicit 0.20 binds, 0.35 does not
         assert compute_trade(ts, 1_000_000, settings=_live(cap=0.20)).kelly_fraction == \
             pytest.approx(0.20)
         assert compute_trade(ts, 1_000_000, settings=_live(cap=0.35)).kelly_fraction == \
             pytest.approx(_ts_kelly_fraction(0.30, 0.85, 0.15))
+        # At k 0.5 the same pair's mid spread 0.55 gives p = 1 - 0.5 * 0.55 =
+        # 0.725; the fee approximation is 0.07 * (0.30 * 0.70 + 0.15 * 0.85) =
+        # 0.0236, b = (0.55 - 0.0236) / (0.45 + 0.0236) = 1.111 and
+        # f* = 0.725 - 0.275 / 1.111 = 0.478, over both caps: an explicit 0.35
+        # binds where the default 0.20 would, and buys more
+        narrow = compute_trade(ts, 1_000_000, settings=_live(k=0.5, cap=0.20))
+        wider = compute_trade(ts, 1_000_000, settings=_live(k=0.5, cap=0.35))
+        assert narrow.kelly_fraction == pytest.approx(0.20)
+        assert wider.kelly_fraction == pytest.approx(0.35)
+        # Both 0.20 runs have a $2,000 budget at the same prices, so they buy
+        # the same count, and the 0.35 run buys more than either
+        assert narrow.x == default.x
+        assert wider.x > narrow.x
+        assert wider.x > default.x
         # ... on the booked path too (_solve_marginal_size -> _evaluate_size)
-        booked = make_booked_pair([(0.20, 0.30, 1_000_000.0)], pair_type="same_title")
-        assert compute_trade(booked, 1_000_000, settings=_live(cap=0.35)).kelly_fraction == \
+        booked = make_booked_pair([(0.30, 0.15, 1_000_000.0)], pB=0.85)
+        assert compute_trade(booked, 1_000_000,
+                             settings=_live(k=0.5, cap=0.35)).kelly_fraction == \
             pytest.approx(0.35)
 
     def test_k_changes_p(self):
@@ -568,6 +665,10 @@ class TestComputeTradeSettings:
         # Resolved at CALL time, from config.py's constants
         monkeypatch.setattr(config, "BUDGET_FRACTION", 0.35)
         assert compute_trade(make_pair(**self._ST), 1_000_000).kelly_fraction == \
+            pytest.approx(0.35)
+        # A time-series pair reads it too: at k 0.5 its f* (0.478) is over 0.35
+        monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.5)
+        assert compute_trade(make_pair(**self._TS_WIDE), 1_000_000).kelly_fraction == \
             pytest.approx(0.35)
         monkeypatch.setattr(config, "SAME_TITLE_SIZE_CAP", 0.10)
         assert compute_trade(make_pair(**self._ST), 1_000_000).kelly_fraction == \
@@ -1272,15 +1373,24 @@ class TestComputeTradeQuiet:
             assert _quiet_level_problems(mutant), name
 
 
-def _bookless_pair(nA: float = 0.30, pB: float = 0.30) -> CandidatePair:
-    """A real same-title CandidatePair with no book, on plain markets."""
+def _bookless_pair(pA: float = 0.30, nB: float = 0.30, pB: float | None = None) -> CandidatePair:
+    """A real time-series CandidatePair with no book, on plain markets.
+
+    It buys YES on the earlier market at pA and NO on the later one at nB. The
+    earlier market's book has no width (its NO ask is 1 - pA) and the later
+    market's YES ask pB defaults to its YES bid, 1 - nB, so that book has none
+    either. The mid spread is read off those four quotes, as enrichment writes
+    it, which makes it (pB + 1 - nB) / 2 - pA: 0.40 for the defaults.
+    """
+    pB = 1.0 - nB if pB is None else pB
     now = datetime.now(UTC)
     mA = SimpleNamespace(ticker="SA1", title="S", subtitle="", event_ticker="KXSA-1",
                          close_time=now + timedelta(days=15), exchange_index=0)
-    mB = SimpleNamespace(ticker="SB1", title="S", subtitle="", event_ticker="KXSB-1",
+    mB = SimpleNamespace(ticker="SB1", title="S later", subtitle="", event_ticker="KXSB-1",
                          close_time=now + timedelta(days=30), exchange_index=0)
-    return CandidatePair(market_a=mA, market_b=mB, pA=0.75, pB=pB, nA=nA, tradeable=True,
-                         canonical_title="bookless pair", pair_type="same_title", nB=0.70)
+    return CandidatePair(market_a=mA, market_b=mB, pA=pA, pB=pB, nA=1.0 - pA, tradeable=True,
+                         canonical_title="bookless pair", pair_type="time_series", nB=nB,
+                         mid_spread=config.time_series_mid_spread(pA, 1.0 - pA, pB, nB))
 
 
 def _shrunk_count(budget: float, price_a: float, price_b: float) -> int:
@@ -1300,10 +1410,14 @@ class TestKellyOnPortfolioValue:
     cash), config.kelly_budget. With no cash it sizes exactly as before."""
 
     def test_the_budget_is_the_smaller_of_the_share_and_the_cash(self):
-        # A 20%-capped same-title pair at 0.30 + 0.30 (its f* is ~0.87):
+        # A 20%-capped time-series pair, YES at 0.30 and NO at 0.30, at k 0.5:
+        # the later market's YES midpoint is 0.70 and the earlier's 0.30, a mid
+        # spread of 0.40, so p = 1 - 0.5 * 0.40 = 0.80; the fee approximation
+        # is 0.07 * 2 * 0.21 = 0.0294, b = (0.40 - 0.0294) / (0.60 + 0.0294)
+        # = 0.589 and f* = 0.80 - 0.20 / 0.589 = 0.46, over the cap.
         # $1,000 of value x 20% = $200, but only $50 of cash
         pair = _bookless_pair()
-        settings = _live(cap=0.20)
+        settings = _live(k=0.5, cap=0.20)
         capped = compute_trade(pair, 100_000, settings=settings, cash_cents=5_000)
         assert capped.kelly_fraction == pytest.approx(0.20)
         # (80 pairs cost $48.00 + 2 x $1.18 of fees = $50.36; 79 cost $49.74)
@@ -1323,25 +1437,27 @@ class TestKellyOnPortfolioValue:
         rng = random.Random(29)
         sized = 0
         for _ in range(200):
-            nA, pB = round(rng.uniform(0.05, 0.45), 2), round(rng.uniform(0.05, 0.45), 2)
-            pair = _bookless_pair(nA=nA, pB=pB)
+            pA, nB = round(rng.uniform(0.05, 0.45), 2), round(rng.uniform(0.05, 0.45), 2)
+            pair = _bookless_pair(pA=pA, nB=nB)
             value = rng.choice([2_000, 50_000, 1_000_000])
             settings = _live(cap=rng.choice([0.05, 0.20, 1.0]))
             plain = compute_trade(pair, value, settings=settings)
             if plain is None:
                 continue
             sized += 1
-            assert plain.x == _shrunk_count((value / 100.0) * plain.kelly_fraction, nA, pB)
+            assert plain.x == _shrunk_count((value / 100.0) * plain.kelly_fraction, pA, nB)
             assert compute_trade(pair, value, settings=settings, cash_cents=value) == plain
         assert sized > 100, sized
 
     def test_a_booked_pair_never_sizes_past_what_the_cash_buys(self):
         # The solver's every candidate is budgeted by the cash too: the
         # solved count is one max_affordable_pairs allows at that price
+        # (YES price on the earlier market, NO price on the later, contracts);
+        # the later YES ask 0.85 sits above its YES bid 1 - 0.20 = 0.80
         levels = [(0.30, 0.20, 50), (0.32, 0.22, 400), (0.35, 0.25, 2_000)]
         for cash in (500, 2_000, 10_000, 40_000):
-            pair = make_booked_pair(levels, pair_type="same_title")
-            spec = compute_trade(pair, 1_000_000, settings=_live(cap=1.0, st_cap=1.0),
+            pair = make_booked_pair(levels, pB=0.85)
+            spec = compute_trade(pair, 1_000_000, settings=_live(cap=1.0),
                                  cash_cents=cash)
             assert spec is not None
             assert spec.x <= max_affordable_pairs(1_000_000, sum(leg_prices(spec.pair)),
@@ -1350,7 +1466,8 @@ class TestKellyOnPortfolioValue:
     def test_every_spec_carries_what_its_orders_can_draw(self):
         pair = _bookless_pair()
         spec = compute_trade(pair, 100_000, settings=_live(cap=0.20), cash_cents=5_000)
-        # 79 pairs, each leg capped one cent over its 0.30 fill: per leg
+        # 79 pairs (the YES on market A and the NO on market B), each leg capped
+        # one cent over its 0.30 fill: per leg
         # 79 x 0.31 = $24.49 plus the fee at 0.31 (0.07 x 79 x 0.31 x 0.69 =
         # $1.1829, up to $1.19) = $25.68, or 2,568 cents; two legs 5,136
         assert spec.cash_need_cents == 5_136
@@ -2097,10 +2214,12 @@ class TestMarginalFillPricing:
         assert booked_spec.total_cost == pytest.approx(bare_spec.total_cost)
 
     def test_bookless_pair_leaves_its_pair_object_untouched(self):
-        # No book, nothing solved, so the spec carries the very same object —
-        # the property main's display_specs mapping used to rely on everywhere.
-        bare = make_pair(pair_type="same_title")
-        spec = compute_trade(bare, 100_000)
+        # No book, nothing solved, so the spec carries the very same object it
+        # was handed.
+        # Sized at k 0.75 and a 20% cap (_live), so the reference pair's f*
+        # (about 0.162) does not hang on config.py's own k
+        bare = make_pair()
+        spec = compute_trade(bare, 100_000, settings=_live())
         assert spec is not None
         assert spec.pair is bare
 
@@ -2138,37 +2257,76 @@ class TestRepricedCostFitsTheBudget:
     overrun the budget the shrink had just met. compute_trade must shrink
     again at the new prices until n stops moving.
 
-    The book is a reviewer's (2026-09-30), same-title, so levels are
-    (market_a NO price, market_b YES price, qty). The review quoted a balance
-    of 4738 cents; in this code that balance overruns at no cap on the 5% grid,
-    while 4082 cents with no caps reproduces its 41 contracts, $31.7644 at the
-    solved prices, re-priced NO leg 0.641463 and $0.67 fee exactly.
+    The book is a time-series pair's, so its levels are (YES price on the
+    earlier market, NO price on the later market, qty). The leg above 0.5 is
+    the YES on the earlier market, whose ask climbs from 0.64 to 0.653. The
+    later market's YES ask is 0.89, equal to its YES bid (1 - the best NO
+    price 0.11), so neither book is crossed: the mid spread is 0.89 - 0.64
+    = 0.25 and, at k 0.75, p = 1 - 0.75 * 0.25 = 0.8125 at every size. The
+    settings have no per-trade cap, so the budget is the uncapped Kelly
+    fraction of the balance (about 0.1684 at the prices of 42 contract pairs).
+    At a balance of 18,860 cents the budget is $31.7669.
     """
 
     LEVELS = ((0.64, 0.11, 31.0), (0.646, 0.11, 25.0), (0.653, 0.106, 32.0))
-    BALANCE_CENTS = 4_082
-    # No per-trade or same-title cap, so the budget is the uncapped Kelly
-    # fraction of the balance; k does not reach a same-title pair
-    SETTINGS = _live(cap=1.0, st_cap=1.0)
+    LATER_YES_ASK = 0.89
+    BALANCE_CENTS = 18_860
+    # No per-trade cap, so the budget is the uncapped Kelly fraction of the
+    # balance; k is 0.75, which sets p = 1 - 0.75 * mid spread
+    SETTINGS = _live(k=0.75, cap=1.0)
+
+    @classmethod
+    def _pair(cls) -> CandidatePair:
+        """The book as a real time-series pair, the later book of no width."""
+        return make_booked_pair(list(cls.LEVELS), pB=cls.LATER_YES_ASK)
 
     @staticmethod
     def _cost(n: int, price_a: float, price_b: float) -> float:
         """Fee-inclusive cost of n contract pairs, as compute_trade sums it."""
         return n * (price_a + price_b) + fee_leg_exact(n, price_a) + fee_leg_exact(n, price_b)
 
+    def _needs_a_second_shrink(self, balance: int) -> bool:
+        """True when, at this balance, the count the fee shrink first settles
+        on costs more than the budget once it is priced at its own fill."""
+        pair = self._pair()
+        sized = strategy._solve_marginal_size(pair, pair.depth_levels, balance, self.SETTINGS)
+        if sized is None:
+            return False
+        n = sized.n
+        while n > 0 and self._cost(n, sized.price_a, sized.price_b) > sized.budget_dollars:
+            n -= 1
+        if n < 1 or n == sized.n:
+            return False
+        price_a, price_b = prefix_fill_prices(pair.depth_levels, n)
+        return self._cost(n, price_a, price_b) > sized.budget_dollars
+
     def test_the_re_priced_count_is_shrunk_again(self):
-        pair = make_booked_pair(list(self.LEVELS), pair_type="same_title")
+        pair = self._pair()
         sized = strategy._solve_marginal_size(
             pair, pair.depth_levels, self.BALANCE_CENTS, self.SETTINGS)
+        # The search settles on 42 pairs: 31 at 0.64 and 11 at 0.646 average
+        # 0.64157 on the earlier market's YES, and the 0.11 NO ask is flat
         assert sized.n == 42
+        assert sized.price_a == pytest.approx((31 * 0.64 + 11 * 0.646) / 42)
+        assert sized.p == pytest.approx(0.8125)
+        # Kelly: fee approximation 0.07 * (0.64157 * 0.35843 + 0.11 * 0.89) =
+        # 0.02295, b = (1 - 0.75157 - 0.02295) / (0.75157 + 0.02295) = 0.2911,
+        # f* = 0.8125 - 0.1875 / 0.2911 = 0.1684; budget = $188.60 * 0.1684
+        assert sized.kelly_fraction == pytest.approx(0.1684, abs=1e-4)
         budget = sized.budget_dollars
-        assert budget == pytest.approx(31.768141, abs=1e-6)
+        assert budget == pytest.approx(31.766896, abs=1e-6)
 
-        # Premise: at the solved (42-contract) prices, 41 contracts fit...
+        # Premise: 42 pairs cost $32.536 at the solved prices, over the budget;
+        # at those same prices 41 contracts fit...
+        assert self._cost(42, sized.price_a, sized.price_b) > budget
         assert self._cost(41, sized.price_a, sized.price_b) == pytest.approx(31.7644, abs=1e-4)
         assert self._cost(41, sized.price_a, sized.price_b) <= budget
-        # ...but re-priced at 41 the cheaper NO leg's fee rounds up a cent
+        # ...but re-priced at 41 (31 at 0.64 and 10 at 0.646) the cheaper YES
+        # leg's fee rounds up a cent: 0.07 * 41 * 0.64157 * 0.35843 = $0.659978
+        # is $0.66 at the solved price, but 0.07 * 41 * 0.64146 * 0.35854 =
+        # $0.66007 rounds up to $0.67 at the re-priced one
         price_a_41, price_b_41 = prefix_fill_prices(pair.depth_levels, 41)
+        assert price_a_41 == pytest.approx((31 * 0.64 + 10 * 0.646) / 41)
         assert price_a_41 == pytest.approx(0.641463, abs=1e-6)
         assert fee_leg_exact(41, sized.price_a) == pytest.approx(0.66)
         assert fee_leg_exact(41, price_a_41) == pytest.approx(0.67)
@@ -2177,6 +2335,8 @@ class TestRepricedCostFitsTheBudget:
 
         spec = compute_trade(pair, self.BALANCE_CENTS, settings=self.SETTINGS)
         assert spec is not None
+        # 40 pairs: 31 at 0.64 and 9 at 0.646, YES cost 40 * 0.64135 = $25.654
+        # + fee $0.65, NO cost 40 * 0.11 = $4.40 + fee $0.28 -> $30.984
         assert spec.x == 40
         assert spec.total_cost_with_fees == pytest.approx(30.984)
         assert spec.total_cost_with_fees <= budget
@@ -2188,18 +2348,41 @@ class TestRepricedCostFitsTheBudget:
         assert spec.kelly_fraction == sized.kelly_fraction
 
     def test_no_balance_overruns_the_budget_on_this_book(self):
-        # Before the fix 3578, 4082 and 5591 cents all overran on this book.
-        # The shrink compares n * (price_a + price_b) + fee_a + fee_b with the
-        # budget in the same order total_cost_with_fees is summed, so no
-        # tolerance is needed.
-        for balance in range(100, 8_001):
-            pair = make_booked_pair(list(self.LEVELS), pair_type="same_title")
+        # Without the second shrink 18,860 cents (and the cents on either
+        # side of it) would overrun on this book. The shrink compares
+        # n * (price_a + price_b) + fee_a + fee_b with the budget in the same
+        # order total_cost_with_fees is summed, so no tolerance is needed. The
+        # sweep counts the balances that need the second shrink, so it cannot
+        # pass on a book that never reaches it.
+        #
+        # It runs to 43,777 cents, the first balance at which all 88 of the
+        # book's contracts fit the budget with their fees. 88 pairs average
+        # 0.646432 on the YES leg and 0.108545 on the NO leg (0.754977): the
+        # fee approximation is 0.07 * (0.646432 * 0.353568 + 0.108545 *
+        # 0.891455) = 0.022772, b = (1 - 0.754977 - 0.022772) / (0.754977 +
+        # 0.022772) = 0.285761 and f* = 0.8125 - 0.1875 / 0.285761 = 0.1563564.
+        # They cost $66.438 + fees $1.41 + $0.60 = $68.448, which the budget
+        # at 43,777 cents covers ($437.77 * 0.1563564 = $68.4481) and the one
+        # at 43,776 does not ($68.4466). Above it the count stays at the
+        # book's 88 and nothing shrinks, so the sweep covers every balance at
+        # which a shrink can happen.
+        top = 43_777
+        needed = []
+        for balance in range(100, top + 1):
+            pair = self._pair()
             spec = compute_trade(pair, balance, settings=self.SETTINGS)
             if spec is None:
                 continue
             assert spec.total_cost_with_fees <= (balance / 100.0) * spec.kelly_fraction, balance
             assert leg_prices(spec.pair) == pytest.approx(
                 prefix_fill_prices(pair.depth_levels, spec.x)), balance
+            if self._needs_a_second_shrink(balance):
+                needed.append(balance)
+        # The sweep ends where the whole book first fits
+        assert compute_trade(self._pair(), top, settings=self.SETTINGS).x == 88
+        assert compute_trade(self._pair(), top - 1, settings=self.SETTINGS).x < 88
+        assert {18_859, 18_860, 18_861} <= set(needed), needed
+        assert len(needed) >= 3, needed
 
 
 class TestTimeSeriesKellyParity:
@@ -5804,8 +5987,10 @@ class TestSelectPortfolioShrinksToCash:
         assert select_portfolio([spec], 1_001) == [spec]
 
     def test_a_bookless_spec_shrinks_at_its_stored_prices(self):
+        # At k 0.5 the pair's f* (about 0.46) is over the 20% cap, so the
+        # budget is $1,000 x 20% = $200, which buys 317 pairs at 0.30 + 0.30
         pair = _bookless_pair()
-        spec = compute_trade(pair, 100_000, settings=_live(cap=0.20))
+        spec = compute_trade(pair, 100_000, settings=_live(k=0.5, cap=0.20))
         assert spec.x == 317
         # Each leg: n x 0.31 plus the fee at 0.31. 77 pairs need 2 x 2,503 =
         # 5,006 cents; 76 need 2 x 2,470 = 4,940
@@ -6099,6 +6284,7 @@ class TestKellyOperandsShareOneSnapshot:
 # ---------------------------------------------------------------------------
 # TS-08: the sized count must be depth the V2 FoK limit can actually reach.
 # ---------------------------------------------------------------------------
+@pytest.mark.usefixtures("pre_toggle_defaults")
 class TestReachableDepthSizing:
     """
     A V2 taker order is ONE fill-or-kill limit per leg, so it buys only the
@@ -6109,9 +6295,19 @@ class TestReachableDepthSizing:
     killed, reported as "NO leg FoK not filled" and indistinguishable from a
     genuine price move (TS-08).
 
-    Fixtures are same_title, so market_a buys NO and market_b buys YES, and
-    depth_levels are (market_a price, market_b price, qty) in MARKET order.
+    Fixtures are time-series pairs, so market_a (the earlier deadline) buys
+    YES and market_b (the later) buys NO, and depth_levels are
+    (market_a YES price, market_b NO price, qty) in MARKET order. The NO leg
+    on market_b is sent first, so a kill there leaves nothing to unwind; the
+    YES leg on market_a goes second, and a kill there rolls the NO leg back.
+    The later market's YES ask is set to its YES bid (1 - the best NO price),
+    so no book is crossed, and k is 0.75 with a 20% cap (pre_toggle_defaults).
     """
+
+    @staticmethod
+    def _book(levels, **kwargs) -> CandidatePair:
+        """A time-series pair on these levels whose later book has no width."""
+        return make_booked_pair(levels, pB=1.0 - levels[0][1], **kwargs)
 
     @staticmethod
     def _reach(spec, levels):
@@ -6136,32 +6332,37 @@ class TestReachableDepthSizing:
         return sum(q for pa, pb, q in levels if pa <= cap_a + 1e-9 and pb <= cap_b + 1e-9)
 
     def test_no_leg_ladder_is_sized_to_reachable_depth(self):
-        # Priced over all 600 the NO leg averages 0.345, whose cap is 0.36 —
-        # which cannot reach the 0.37 level. Pre-fix this sized 600 and the
-        # fill-or-kill died with nothing to unwind (the NO leg goes first).
-        levels = [(0.32, 0.30, 300.0), (0.37, 0.30, 300.0)]
-        pair = make_booked_pair(levels, pair_type="same_title")
+        # Priced over all 600 the NO leg on market_b averages (0.32 + 0.37) / 2
+        # = 0.345, whose cap is 0.36 (0.345 rounded up to 0.35, plus one tick)
+        # — which cannot reach the 0.37 level. Sized at 600, the fill-or-kill
+        # would die with nothing to unwind (the NO leg goes first).
+        levels = [(0.30, 0.32, 300.0), (0.30, 0.37, 300.0)]
+        pair = self._book(levels)
+        assert strategy._reachable_contracts(pair, tuple(levels), 0.30, 0.345) == 300
         spec = compute_trade(pair, _AMPLE_BALANCE_CENTS)
         assert spec.x == 300
-        assert leg_prices(spec.pair)[0] == pytest.approx(0.32)
+        assert leg_prices(spec.pair)[1] == pytest.approx(0.32)
         assert self._reach(spec, levels) >= spec.x
 
     def test_yes_leg_ladder_is_sized_to_reachable_depth(self):
-        # The SAME defect with the ladder on the YES leg, which is the
-        # expensive half: the NO leg is submitted first and FILLS, then the YES
-        # leg is killed, so the pair unwinds. A rollback, not a skipped trade.
-        levels = [(0.32, 0.30, 300.0), (0.32, 0.35, 300.0)]
-        pair = make_booked_pair(levels, pair_type="same_title")
+        # The SAME defect with the ladder on the YES leg (market_a): the NO leg
+        # is submitted first and FILLS, then the YES leg is killed, so the pair
+        # unwinds. A rollback, not a skipped trade. Over all 600 the YES leg
+        # averages (0.30 + 0.35) / 2 = 0.325, rounded up to 0.33 and capped at
+        # 0.34, which cannot reach the 0.35 level.
+        levels = [(0.30, 0.32, 300.0), (0.35, 0.32, 300.0)]
+        pair = self._book(levels)
+        assert strategy._reachable_contracts(pair, tuple(levels), 0.325, 0.32) == 300
         spec = compute_trade(pair, _AMPLE_BALANCE_CENTS)
         assert spec.x == 300
-        assert leg_prices(spec.pair)[1] == pytest.approx(0.30)
+        assert leg_prices(spec.pair)[0] == pytest.approx(0.30)
         assert self._reach(spec, levels) >= spec.x
 
     def test_flat_book_is_unchanged(self):
         # GUARD: one level means the prefix average IS that level's price, so
         # the cap always covers it. The gate must be a no-op here.
-        levels = [(0.32, 0.30, 600.0)]
-        pair = make_booked_pair(levels, pair_type="same_title")
+        levels = [(0.30, 0.32, 600.0)]
+        pair = self._book(levels)
         spec = compute_trade(pair, _AMPLE_BALANCE_CENTS)
         assert spec.x == 600
 
@@ -6170,23 +6371,37 @@ class TestReachableDepthSizing:
         # prefix price and the cap already agree, so #51's affordability bound
         # masks TS-08 entirely. That is why a thin-balance dry run shows no
         # delta — the fix must not move this case either.
-        levels = [(0.32, 0.30, 300.0), (0.37, 0.30, 300.0)]
-        pair = make_booked_pair(levels, pair_type="same_title", max_contracts=161)
+        # Working, for a $500 balance on the first rung (YES 0.30, NO 0.32, so
+        # 0.62 a pair): the mid spread is 0.68 - 0.30 = 0.38 and
+        # p = 1 - 0.75 * 0.38 = 0.715; the fee approximation is
+        # 0.07 * (0.30 * 0.70 + 0.32 * 0.68) = 0.02993, b = (0.38 - 0.02993) /
+        # (0.62 + 0.02993) = 0.5386 and f* = 0.715 - 0.285 / 0.5386 = 0.1859,
+        # under the 20% cap. Budget $500 * 0.1859 = $92.94 buys
+        # floor(92.94 / 0.62) = 149 pairs, but 149 cost $92.38 + $2.20 + $2.27
+        # of exact fees = $96.85; 143 cost $88.66 + $2.11 + $2.18 = $92.95,
+        # still over; 142 cost $88.04 + $2.09 + $2.17 = $92.30, which fits.
+        # max_contracts 161 is the depth cap enrichment writes at this
+        # balance: $500 * min(0.20 cap, 1 - 0.75) / $0.62 = 161.3, rounded
+        # down. Kelly's own budget, 149 pairs, is lower, so it binds first.
+        levels = [(0.30, 0.32, 300.0), (0.30, 0.37, 300.0)]
+        pair = self._book(levels, max_contracts=161)
         spec = compute_trade(pair, 500_00)
-        assert spec.x == 153
+        assert spec.x == 142
+        assert spec.total_cost_with_fees == pytest.approx(92.30)
+        assert leg_prices(spec.pair) == pytest.approx((0.30, 0.32))
         assert self._reach(spec, levels) >= spec.x
 
     def test_the_supported_set_has_a_hole_and_the_search_lands_below_it(self):
         # Reachability is NOT downward-closed, which is why the post-shrink
-        # backstop exists. On this book n<=1000 is supported, 1001..1500 is
-        # not (the prefix average ceils to 0.31, capping at 0.32, which cannot
-        # reach the 0.33 level), and 1501..1600 is supported again (the average
-        # passes 0.31, capping at 0.33). _solve_marginal_size bisects, so it
-        # converges to the top of the LOWER island and never lands above the
-        # hole — which is precisely why the backstop has never been observed
-        # to fire on a real book.
-        levels = [(0.30, 0.30, 1000.0), (0.33, 0.30, 600.0)]
-        pair = make_booked_pair(levels, pair_type="same_title")
+        # backstop exists. On this book (the ladder on the NO leg, market_b)
+        # n<=1000 is supported, 1001..1500 is not (the prefix average ceils to
+        # 0.31, capping at 0.32, which cannot reach the 0.33 level), and
+        # 1501..1600 is supported again (the average passes 0.31, capping at
+        # 0.33). _solve_marginal_size bisects, so it converges to the top of
+        # the LOWER island and never lands above the hole — which is precisely
+        # why the backstop has never been observed to fire on a real book.
+        levels = [(0.30, 0.30, 1000.0), (0.30, 0.33, 600.0)]
+        pair = self._book(levels)
         supported = {
             n: strategy._reachable_contracts(
                 pair, tuple(levels), *prefix_fill_prices(tuple(levels), n)
@@ -6205,19 +6420,21 @@ class TestReachableDepthSizing:
         # a solved size inside the hole's upper island together with a budget
         # the fees overrun — exactly the shape the shrink loop would produce if
         # the search ever landed there.
-        levels = [(0.30, 0.30, 1000.0), (0.33, 0.30, 600.0)]
-        pair = make_booked_pair(levels, pair_type="same_title")
+        levels = [(0.30, 0.30, 1000.0), (0.30, 0.33, 600.0)]
+        pair = self._book(levels)
         price_a, price_b = prefix_fill_prices(tuple(levels), 1600)
         forced = strategy._Sizing(
             n=1600, target=1600, price_a=price_a, price_b=price_b,
-            p=SAME_TITLE_CO_RESOLVE_PROB, profit_ratio=0.05,
-            kelly_fraction=0.20, budget_dollars=940.0,
+            p=strategy._kelly_p_at(pair, live_settings().interval_discount),
+            profit_ratio=0.05, kelly_fraction=0.20, budget_dollars=940.0,
         )
         monkeypatch.setattr(strategy, "_solve_marginal_size",
                             lambda *a, **k: forced)
         spec = compute_trade(pair, _AMPLE_BALANCE_CENTS)
-        # The fee shrink alone would land in [1001, 1500] — unreachable. The
-        # backstop snaps to the reachable prefix instead.
+        # The fee shrink alone would land in [1001, 1500] — unreachable: 1500
+        # pairs at 0.30 + 0.31125 cost $916.88 + fees $22.05 + $22.51 =
+        # $961.44, over the $940 budget; 1450 cost $886.31 + $21.32 + $21.76 =
+        # $929.39, which fits. The backstop snaps to the reachable prefix instead.
         assert spec.x == 1000
         assert self._reach(spec, levels) >= spec.x
 
@@ -6229,12 +6446,12 @@ class TestReachableDepthSizing:
         # count overrun. Shrinking at 0.25 / 0.25 lands on 1140, in the hole;
         # re-priced there it is unreachable, the backstop snaps to 1000, and
         # 1000 at 0.30 / 0.30 costs $629.40 against a $600 budget.
-        levels = [(0.30, 0.30, 1000.0), (0.33, 0.30, 600.0)]
-        pair = make_booked_pair(levels, pair_type="same_title")
+        levels = [(0.30, 0.30, 1000.0), (0.30, 0.33, 600.0)]
+        pair = self._book(levels)
         forced = strategy._Sizing(
             n=1600, target=1600, price_a=0.25, price_b=0.25,
-            p=SAME_TITLE_CO_RESOLVE_PROB, profit_ratio=0.05,
-            kelly_fraction=0.20, budget_dollars=600.0,
+            p=strategy._kelly_p_at(pair, live_settings().interval_discount),
+            profit_ratio=0.05, kelly_fraction=0.20, budget_dollars=600.0,
         )
         monkeypatch.setattr(strategy, "_solve_marginal_size",
                             lambda *a, **k: forced)
@@ -6249,19 +6466,26 @@ class TestReachableDepthSizing:
         # The invariant, swept: whatever compute_trade returns on a booked
         # pair, the order it implies must be able to buy that many contracts.
         ladders = [
+            [(0.30, 0.30, 100.0), (0.30, 0.33, 100.0)],
+            [(0.30, 0.30, 1000.0), (0.30, 0.33, 600.0)],
+            [(0.30, 0.32, 300.0), (0.30, 0.37, 300.0)],
+            [(0.30, 0.30, 50.0), (0.30, 0.31, 50.0), (0.30, 0.36, 400.0)],
+            [(0.30, 0.25, 10.0), (0.31, 0.26, 20.0), (0.34, 0.27, 40.0)],
+            # The ladder on the YES leg too
             [(0.30, 0.30, 100.0), (0.33, 0.30, 100.0)],
-            [(0.30, 0.30, 1000.0), (0.33, 0.30, 600.0)],
-            [(0.32, 0.30, 300.0), (0.37, 0.30, 300.0)],
-            [(0.30, 0.30, 50.0), (0.31, 0.30, 50.0), (0.36, 0.30, 400.0)],
-            [(0.25, 0.30, 10.0), (0.26, 0.31, 20.0), (0.27, 0.34, 40.0)],
+            [(0.30, 0.32, 300.0), (0.35, 0.32, 300.0)],
         ]
+        sized = 0
         for levels in ladders:
             for balance in (20_000, 500_00, 100_000_00, 1_000_000_000):
-                pair = make_booked_pair(levels, pair_type="same_title")
+                pair = self._book(levels)
                 spec = compute_trade(pair, balance)
                 if spec is None:
                     continue
+                sized += 1
                 assert self._reach(spec, levels) >= spec.x, (levels, balance, spec.x)
+        # Not empty: every one of the 28 cases sizes
+        assert sized == 28, sized
 
 
 class TestPortfolioSummaryIsFeeInclusive:
@@ -6273,11 +6497,10 @@ class TestPortfolioSummaryIsFeeInclusive:
     """
 
     def test_summary_sums_the_fee_inclusive_cost(self, caplog):
+        # Two time-series specs on different markets, so neither blocks the other
         specs = [
-            make_spec(pair_type="same_title", total_cost=10.0,
-                      total_cost_with_fees=10.70),
-            make_spec(pair_type="same_title", total_cost=20.0,
-                      total_cost_with_fees=21.40),
+            make_spec(total_cost=10.0, total_cost_with_fees=10.70),
+            make_spec(total_cost=20.0, total_cost_with_fees=21.40),
         ]
         with caplog.at_level(logging.INFO):
             select_portfolio(specs, 100_000)

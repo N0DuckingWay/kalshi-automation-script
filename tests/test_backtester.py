@@ -2543,31 +2543,64 @@ class TestFindEntryHorizon:
         assert entry is None
 
 
+# Time-series fixture shared by the end-to-end profit test and the sizing-parity
+# tests. SA (earlier deadline, February 1) and SB (later deadline, February 14)
+# are worded as two cumulative "by <date>" deadlines of one question, on two
+# events of different series. Both settle YES, the cell where only the YES leg
+# on SA pays. The quotes are the candle closes on the first Monday, in dollars:
+#   SA: YES ask 0.30, NO ask 0.72  (YES bid 1 - 0.72 = 0.28, YES mid 0.29)
+#   SB: YES ask 0.60, NO ask 0.42  (YES bid 1 - 0.42 = 0.58, YES mid 0.59)
+# The bot buys YES on SA at 0.30 and NO on SB at 0.42: legs 0.72 per pair, a
+# 0.28 edge before fees. The mid spread is 0.59 - 0.29 = 0.30, so with the
+# default discount k = 0.80 the chance of profit is 1 - 0.80 x 0.30 = 0.76.
+# The 13-day deadline gap is in the short tier (spread at least 0.15, legs at
+# most 0.85), and neither book is crossed (each YES ask is at least its YES bid).
+# Kelly at 1000 dollars: fee approx 0.0318 per pair, b = (0.28 - 0.0318) / (0.72
+# + 0.0318) = 0.330, f* = 0.76 - 0.24 / 0.330 = 0.0332, so the budget is 33.22
+# dollars. The raw count int(33.22 / 0.72) = 46 costs 33.12 dollars before its
+# two exact fees (about 1.5 dollars), which overshoots the budget, so the fee
+# loop shrinks it.
+_PARITY_PA, _PARITY_NA, _PARITY_PB, _PARITY_NB = 0.30, 0.72, 0.60, 0.42
+
+
+def _time_series_markets(result_a: str = "yes", result_b: str = "yes") -> list[dict]:
+    """Two markets of one deadline ladder: SA ("by February 1, 2026") and SB
+    ("by February 14, 2026"), on events of different series, each paying out
+    twelve hours after it closes."""
+    return [
+        {"ticker": "SA", "event_ticker": "EA", "event_title": "EV",
+         "title": "Will the launch happen by February 1, 2026?", "subtitle": "",
+         "result": result_a,
+         "close_time": "2026-02-01T00:00:00+00:00",
+         "settlement_ts": "2026-02-01T12:00:00+00:00"},
+        {"ticker": "SB", "event_ticker": "EB", "event_title": "EV",
+         "title": "Will the launch happen by February 14, 2026?", "subtitle": "",
+         "result": result_b,
+         "close_time": "2026-02-14T00:00:00+00:00",
+         "settlement_ts": "2026-02-14T12:00:00+00:00"},
+    ]
+
+
+def _parity_candles() -> dict[str, list[dict]]:
+    """The first-Monday candles of the time-series fixture, keyed by ticker."""
+    return {
+        "SA": [_candle(_MONDAY_TS, _PARITY_PA, _PARITY_NA)],
+        "SB": [_candle(_MONDAY_TS, _PARITY_PB, _PARITY_NB)],
+    }
+
+
 class TestRunBacktestPnL:
     def test_profit_not_double_counted_and_cash_sized(self, monkeypatch):
-        """End-to-end regression for the P&L double-subtraction and sizing bugs.
+        """End-to-end check of the profit count and the sizing.
 
-        One same-title pair, both markets resolve YES (co-resolution): the
-        realized profit must equal the guaranteed floor (receipt n, cost+fees
-        out), the equity curve must end at initial_balance + profit, and the
-        trade must be sized against the running balance.
+        One time-series pair, both markets settle YES (the cell where only the
+        YES leg on the earlier market pays): the realized profit must equal
+        the win-cell profit (receipt n dollars, cost and fees taken out once),
+        the equity curve must end at initial_balance + profit, and the trade
+        must be sized against the running balance.
         """
-        markets = [
-            {"ticker": "SA", "event_ticker": "EA", "event_title": "EV",
-             "title": "Q", "subtitle": "", "result": "yes",
-             "close_time": "2026-02-01T00:00:00+00:00",
-             "settlement_ts": "2026-02-01T12:00:00+00:00"},
-            {"ticker": "SB", "event_ticker": "EB", "event_title": "EV",
-             "title": "Q", "subtitle": "", "result": "yes",
-             "close_time": "2026-02-01T00:00:00+00:00",
-             "settlement_ts": "2026-02-01T12:00:00+00:00"},
-        ]
-        candles = {
-            # SA is the expensive side: pA=0.70, nA=0.32
-            "SA": [_candle(_MONDAY_TS, 0.70, 0.32)],
-            # SB is the cheap side: pB=0.55
-            "SB": [_candle(_MONDAY_TS, 0.55, 0.47)],
-        }
+        markets = _time_series_markets()
+        candles = _parity_candles()
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: markets)
         monkeypatch.setattr(backtester, "fetch_candlesticks",
@@ -2580,6 +2613,7 @@ class TestRunBacktestPnL:
 
         assert len(trades) == 1
         t = trades[0]
+        assert (t.pair_type, t.ticker_a, t.ticker_b) == ("time_series", "SA", "SB")
         # Sized against the balance at entry, not hardcoded
         assert t.balance_at_entry == pytest.approx(1000.0)
         assert t.total_cost + t.fees <= 1000.0
@@ -2587,11 +2621,12 @@ class TestRunBacktestPnL:
         # against — fees ride on top of the contract cost, so this only holds
         # because Pass 2 shrinks n (see TestKellyShrinkParity)
         assert t.total_cost + t.fees <= 1000.0 * t.kelly_fraction + 1e-9
-        # Both YES → only the YES leg pays: receipt is exactly n dollars
+        # Both YES -> only the YES leg on SA pays: receipt is exactly n dollars
         assert t.actual_payoff == pytest.approx(float(t.n))
         # Profit deducts cost and fees exactly once
         assert t.profit == pytest.approx(t.actual_payoff - t.total_cost - t.fees)
-        # Both-YES is the guaranteed-floor scenario: profit == expected_payoff
+        # Both YES is a win cell: profit == expected_payoff, the win-cell profit
+        # n x (1 - 0.30 - 0.42) less fees
         assert t.profit == pytest.approx(t.expected_payoff)
         assert t.profit > 0
         assert t.slippage == pytest.approx(0.0, abs=1e-9)
@@ -2600,26 +2635,16 @@ class TestRunBacktestPnL:
         assert final_value == pytest.approx(1000.0 + t.profit)
 
     def test_max_horizon_days_threads_through_and_excludes_trade(self, monkeypatch):
-        # Same fixture as test_profit_not_double_counted_and_cash_sized: both
-        # legs close 2026-02-01, only candle is at _MONDAY_TS (2026-01-05),
-        # 27 days before close. A 3-day horizon excludes every checkpoint in
-        # the scan window (Jan 5 - Jan 31), so run_backtest must report zero
-        # trades even though the same fixture produces exactly one trade with
+        # Same fixture as test_profit_not_double_counted_and_cash_sized: the
+        # later deadline closes 2026-02-14 and the only candle is at
+        # _MONDAY_TS (2026-01-05). The scan window ends the day before the
+        # earlier close (Jan 31), where the later close is 14 days away, and
+        # the first Monday it is 40 days away. A 3-day horizon excludes every
+        # checkpoint in the window, so run_backtest must report zero trades
+        # even though the same fixture produces exactly one trade with
         # max_horizon_days=None.
-        markets = [
-            {"ticker": "SA", "event_ticker": "EA", "event_title": "EV",
-             "title": "Q", "subtitle": "", "result": "yes",
-             "close_time": "2026-02-01T00:00:00+00:00",
-             "settlement_ts": "2026-02-01T12:00:00+00:00"},
-            {"ticker": "SB", "event_ticker": "EB", "event_title": "EV",
-             "title": "Q", "subtitle": "", "result": "yes",
-             "close_time": "2026-02-01T00:00:00+00:00",
-             "settlement_ts": "2026-02-01T12:00:00+00:00"},
-        ]
-        candles = {
-            "SA": [_candle(_MONDAY_TS, 0.70, 0.32)],
-            "SB": [_candle(_MONDAY_TS, 0.55, 0.47)],
-        }
+        markets = _time_series_markets()
+        candles = _parity_candles()
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: markets)
         monkeypatch.setattr(backtester, "fetch_candlesticks",
@@ -2634,13 +2659,9 @@ class TestRunBacktestPnL:
         assert trades == []
 
 
-# Same-title fixture shared by the sizing-parity and malformed-timestamp tests:
-# SA is the expensive side (pA=0.70, nA=0.32), SB the cheap one (pB=0.55), both
-# resolving YES on 2026-02-01. These are the numbers TestRunBacktestPnL uses, so
-# the parity assertions below are pinned to the same trade that test checks.
-_PARITY_PA, _PARITY_NA, _PARITY_PB = 0.70, 0.32, 0.55
-
-
+# A same-title market list for the malformed-timestamp test: one exact-title
+# group of two markets; close_time_b is overridable so a malformed timestamp
+# can be injected on exactly one leg.
 def _same_title_markets(close_time_b: str = "2026-02-01T00:00:00+00:00") -> list[dict]:
     """Two markets in one exact-title group; close_time_b is overridable so a
     malformed timestamp can be injected on exactly one leg."""
@@ -2660,32 +2681,38 @@ class TestKellyShrinkParity:
     """Pass 2 must size a trade exactly like live strategy.compute_trade (BS-06).
 
     The Kelly budget covers the CONTRACTS only — the exact ceiling-rounded taker
-    fees are charged on top — so the raw n = int(budget / (nA + pB)) systematically
-    overshoots the cap. compute_trade shrinks n until the fee-inclusive cost fits
-    (CLAUDE.md forbids removing that loop); the backtest skipped the shrink
-    entirely and only rejected trades that didn't fit the whole CASH balance, so
-    every simulated trade was sized slightly above the Kelly fraction it reported.
+    fees are charged on top — so the raw n = int(budget / (pA + nB)) can
+    overshoot the budget once its fees are added, as it does at every balance
+    and cap below. compute_trade shrinks n until the fee-inclusive cost fits,
+    and the backtest must do the same: every simulated trade is sized within the
+    Kelly fraction it reports. One test has a size cap below Kelly's fraction,
+    so the cap, not Kelly, sets the budget on both paths.
 
     With a trade still open, Pass 2 sizes on the portfolio value (the cash plus
     that trade's cost) and the cash, as compute_trade sizes on the run's
     portfolio value and cash_cents; the last test pins the two counts equal.
+    The pair is the time-series fixture above (legs 0.30 and 0.42 dollars).
     """
 
     @staticmethod
     def _live_n(portfolio_value_cents: int, cash_cents: int | None = None) -> int:
         """The contract count live compute_trade picks for the same inputs:
         a portfolio value, and the cash on hand (None: the value is all cash)."""
-        def _market(ticker):
+        def _market(ticker, days):
             # compute_trade only reads .close_time (for days_to_close, which
             # doesn't affect n) and .ticker
             return SimpleNamespace(
-                ticker=ticker, close_time=datetime.now(UTC) + timedelta(days=27),
+                ticker=ticker, close_time=datetime.now(UTC) + timedelta(days=days),
             )
 
         pair = CandidatePair(
-            market_a=_market("SA"), market_b=_market("SB"),
-            pA=_PARITY_PA, pB=_PARITY_PB, nA=_PARITY_NA,
-            tradeable=True, canonical_title="Q", pair_type="same_title",
+            market_a=_market("SA", 27), market_b=_market("SB", 40),
+            pA=_PARITY_PA, pB=_PARITY_PB, nA=_PARITY_NA, nB=_PARITY_NB,
+            tradeable=True, canonical_title="Q", pair_type="time_series",
+            # The mid spread live enrichment writes from the two books' tops and
+            # the backtest reads from the same candle quotes: the later YES
+            # midpoint less the earlier one
+            mid_spread=time_series_mid_spread(_PARITY_PA, _PARITY_NA, _PARITY_PB, _PARITY_NB),
             # 0 = not depth-capped, which is the only state the backtest can
             # model (a backtest has candle closes, no orderbook)
             max_contracts=0,
@@ -2695,26 +2722,32 @@ class TestKellyShrinkParity:
         return spec.x
 
     @staticmethod
-    def _record(tickers: tuple[str, str], events: tuple[str, str], monday: date) -> dict:
-        """A prepared same-title record at the parity quotes, entering on one
-        Monday; both markets resolve YES on 2026-02-01, like the fixture's."""
+    def _record(tickers: tuple[str, str], events: tuple[str, str], monday: date,
+                subject: str = "launch") -> dict:
+        """A prepared time-series record at the parity quotes, entering on one
+        Monday; the earlier market closes 2026-02-01 and the later one
+        2026-02-14, both resolving YES, like the fixture's. The gap is the 13
+        days between the two closes. `subject` words the question, so two
+        records with different subjects and different events share no ladder
+        (a ladder is one event or one question)."""
         mA, mB = ({"ticker": ticker, "event_ticker": event, "event_title": "EV",
-                   "title": "Q", "subtitle": "", "result": "yes",
-                   "close_time": "2026-02-01T00:00:00+00:00",
-                   "settlement_ts": "2026-02-01T12:00:00+00:00"}
-                  for ticker, event in zip(tickers, events, strict=True))
-        return {"pair_type": "same_title", "canon": "Q", "group_key": ("EV", "Q", tickers[0]),
+                   "title": f"Will the {subject} happen by {deadline}?", "subtitle": "",
+                   "result": "yes", "close_time": close,
+                   "settlement_ts": close.replace("T00:00:00", "T12:00:00")}
+                  for ticker, event, deadline, close in zip(
+                      tickers, events, ("February 1, 2026", "February 14, 2026"),
+                      ("2026-02-01T00:00:00+00:00", "2026-02-14T00:00:00+00:00"),
+                      strict=True))
+        question = f"Will the {subject} happen by ?"
+        return {"pair_type": "time_series", "canon": question, "group_key": question,
                 "entry": {"entry_date": monday, "pA": _PARITY_PA, "pB": _PARITY_PB,
-                          "nA": _PARITY_NA, "nB": 0.47, "mA": mA, "mB": mB,
-                          "gap_days": None, "later": ()}}
+                          "nA": _PARITY_NA, "nB": _PARITY_NB, "mA": mA, "mB": mB,
+                          "gap_days": 13, "later": ()}}
 
     def test_backtest_n_matches_compute_trade_n(self, monkeypatch):
-        candles = {
-            "SA": [_candle(_MONDAY_TS, _PARITY_PA, _PARITY_NA)],
-            "SB": [_candle(_MONDAY_TS, _PARITY_PB, 0.47)],
-        }
+        candles = _parity_candles()
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
-                            lambda *a, **k: _same_title_markets())
+                            lambda *a, **k: _time_series_markets())
         monkeypatch.setattr(backtester, "fetch_candlesticks",
                             lambda _c, ticker, *a, **k: candles[ticker])
 
@@ -2725,48 +2758,104 @@ class TestKellyShrinkParity:
         assert len(trades) == 1
         t = trades[0]
 
-        # The load-bearing assertion: identical (nA, pB, kelly, balance) inputs
-        # must produce an identical contract count on both code paths.
+        # The load-bearing assertion: identical (pA, nB, mid spread, k, balance)
+        # inputs must produce an identical contract count on both code paths.
         assert t.n == self._live_n(100_000)
 
         # Guard against a vacuous pass: the shrink loop must actually have bitten
         # here, i.e. the un-shrunk n did NOT fit the Kelly budget once fees were
-        # added. (Pre-fix the backtest recorded exactly that raw n.)
+        # added.
         budget = 1000.0 * t.kelly_fraction
-        raw_n = int(budget / (_PARITY_NA + _PARITY_PB))
+        raw_n = int(budget / (_PARITY_PA + _PARITY_NB))
         assert raw_n > t.n
-        raw_cost = raw_n * (_PARITY_NA + _PARITY_PB)
-        raw_fees = fee_leg_exact(raw_n, _PARITY_NA) + fee_leg_exact(raw_n, _PARITY_PB)
+        raw_cost = raw_n * (_PARITY_PA + _PARITY_NB)
+        raw_fees = fee_leg_exact(raw_n, _PARITY_PA) + fee_leg_exact(raw_n, _PARITY_NB)
         assert raw_cost + raw_fees > budget
         # ...and the chosen n does fit, which is the invariant being restored
         assert t.total_cost + t.fees <= budget + 1e-9
 
     def test_shrunk_size_still_respects_the_budget_fraction(self, monkeypatch):
         # Second balance point, so the parity isn't an artifact of one number.
-        candles = {
-            "SA": [_candle(_MONDAY_TS, _PARITY_PA, _PARITY_NA)],
-            "SB": [_candle(_MONDAY_TS, _PARITY_PB, 0.47)],
-        }
+        # k and the size cap are set here, on config and on the backtest's
+        # own copies, so the figures below do not hang on config.py's values
+        for module in (config, backtester):
+            monkeypatch.setattr(module, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.80)
+            monkeypatch.setattr(module, "BUDGET_FRACTION", 1.0)
+        # At k 0.80 and no cap: p = 1 - 0.80 x 0.30 = 0.76, b = 0.2482 /
+        # 0.7518 = 0.3302 and f* = 0.76 - 0.24 / 0.3302 = 0.0332.
+        # By hand at $500: the budget is 0.0332 x $500 = $16.61. The raw
+        # int(16.61 / 0.72) = 23 pairs cost $16.56 plus exact fees of $0.34
+        # (0.07 x 23 x 0.30 x 0.70 = 0.3381, up to the cent) and $0.40
+        # (0.07 x 23 x 0.42 x 0.58 = 0.3922), $17.30, over the budget, so the
+        # fee loop shrinks to 22 pairs: $15.84 + $0.33 + $0.38 = $16.55.
+        candles = _parity_candles()
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
-                            lambda *a, **k: _same_title_markets())
+                            lambda *a, **k: _time_series_markets())
         monkeypatch.setattr(backtester, "fetch_candlesticks",
                             lambda _c, ticker, *a, **k: candles[ticker])
 
         trades, _ = run_backtest(
             hist_client=MagicMock(), live_client=MagicMock(),
-            start_date=date(2026, 1, 1), initial_balance=250.0,
+            start_date=date(2026, 1, 1), initial_balance=500.0,
         )
         assert len(trades) == 1
         t = trades[0]
-        assert t.n == self._live_n(25_000)
-        assert t.total_cost + t.fees <= 250.0 * t.kelly_fraction + 1e-9
+        assert t.n == self._live_n(50_000) == 22
+        budget = 500.0 * t.kelly_fraction
+        assert t.total_cost + t.fees <= budget + 1e-9
+        # Not vacuous: the un-shrunk count does not fit once its fees are added
+        raw_n = int(budget / (_PARITY_PA + _PARITY_NB))
+        assert raw_n == 23 > t.n
+        assert (raw_n * (_PARITY_PA + _PARITY_NB) + fee_leg_exact(raw_n, _PARITY_PA)
+                + fee_leg_exact(raw_n, _PARITY_NB)) > budget
+
+    def test_a_size_cap_below_kelly_sets_the_budget_on_both_paths(self, monkeypatch):
+        # Third point: a per-trade size cap below Kelly's fraction, so the cap
+        # sets the budget. At pre_toggle_defaults' k 0.75 (the test above runs
+        # at k 0.80, p 0.76) the chance of profit is p = 1 - 0.75 x 0.30 =
+        # 0.775, so f* = 0.775 - 0.225 / 0.330
+        # = 0.0936, above the smallest cap on the grid, 5%, set on both
+        # bindings (live sizing reads config's, the backtest its own copy).
+        # By hand at $1,000: the budget is 0.05 x $1,000 = $50.00. The raw
+        # int(50.00 / 0.72) = 69 pairs cost $49.68 plus exact fees of $1.02
+        # (0.07 x 69 x 0.21 = 1.0143, up to the cent) and $1.18 (0.07 x 69 x
+        # 0.2436 = 1.1766), $51.88, so the fee loop shrinks to 66 pairs:
+        # $47.52 + $0.98 + $1.13 = $49.63 (67 would cost $48.24 + $0.99 +
+        # $1.15 = $50.38).
+        apply_pre_toggle_defaults(monkeypatch)
+        monkeypatch.setattr(config, "BUDGET_FRACTION", 0.05)
+        monkeypatch.setattr(backtester, "BUDGET_FRACTION", 0.05)
+        candles = _parity_candles()
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: _time_series_markets())
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+
+        trades, _ = run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=date(2026, 1, 1), initial_balance=1000.0,
+        )
+        assert len(trades) == 1
+        t = trades[0]
+        # The cap, not Kelly, sized it
+        assert t.kelly_fraction == pytest.approx(0.05)
+        assert t.n == self._live_n(100_000) == 66
+        assert t.total_cost + t.fees == pytest.approx(49.63, abs=1e-9)
+        # The fee loop bit: the raw count does not fit the $50 budget with its fees
+        raw_n = int(50.0 / (_PARITY_PA + _PARITY_NB))
+        assert raw_n == 69 > t.n
+        assert (raw_n * (_PARITY_PA + _PARITY_NB) + fee_leg_exact(raw_n, _PARITY_PA)
+                + fee_leg_exact(raw_n, _PARITY_NB)) > 50.0
 
     def test_with_an_open_trade_n_matches_compute_trade_on_value_and_cash(self):
         # An opener entering on Monday 1 at the same quotes is still open on
-        # Monday 2 (it pays out on 02-01), so Monday 2's portfolio value is
+        # Monday 2 (it pays out on 02-14), so Monday 2's portfolio value is
         # the cash plus the opener's cost. The parity pair entering then must
         # get the count live compute_trade gives for that value and that cash.
-        opener = self._record(("OA", "OB"), ("EOA", "EOB"), date(2026, 1, 5))
+        # The two pairs share no event and no question wording, so the one-open-
+        # trade-per-ladder rule (DR-76) does not hold the second back.
+        opener = self._record(("OA", "OB"), ("EOA", "EOB"), date(2026, 1, 5),
+                              subject="opener")
         pair = self._record(("SA", "SB"), ("EA", "EB"), date(2026, 1, 12))
         point = backtester._simulate_at_discount([opener, pair], date(2026, 1, 1), 1000.0,
                                                  end_date=date(2026, 3, 1))
@@ -2851,87 +2940,113 @@ class TestRunBacktestMalformedTimestamps:
         assert any("SB" in msg and "close_time" in msg for msg in warnings)
 
 
+_M2_TS = int(datetime(2026, 1, 12, 9, 0, tzinfo=UTC).timestamp())
+
+
+def _tx_ty_tz_markets(tx_settlement: str) -> list[dict]:
+    """The same-title fixture of TestFindEntryRecordsEveryQualifyingMonday: TX
+    and TY share an exact title and one close instant (2026-02-02), TZ is
+    worded for a later month. TX settles at `tx_settlement`, TY on 2026-01-08."""
+    return [
+        {"ticker": "TX", "event_ticker": "EX", "event_title": "EV",
+         "title": "Team wins by March 2026", "subtitle": "", "result": "yes",
+         "open_time": "2026-01-01T00:00:00+00:00",
+         "close_time": "2026-02-02T00:00:00+00:00",
+         "settlement_ts": tx_settlement},
+        {"ticker": "TY", "event_ticker": "EY", "event_title": "EV",
+         "title": "Team wins by March 2026", "subtitle": "", "result": "yes",
+         "open_time": "2026-01-01T00:00:00+00:00",
+         "close_time": "2026-02-02T00:00:00+00:00",
+         "settlement_ts": "2026-01-08T12:00:00+00:00"},
+        {"ticker": "TZ", "event_ticker": "EZ", "event_title": "EV",
+         "title": "Team wins by April 2026", "subtitle": "", "result": "yes",
+         "open_time": "2026-01-01T00:00:00+00:00",
+         "close_time": "2026-02-20T00:00:00+00:00",
+         "settlement_ts": "2026-02-20T12:00:00+00:00"},
+    ]
+
+
+def _tx_ty_tz_candles() -> dict[str, list[dict]]:
+    """Candles for the markets above: TX/TY enter as a same-title pair on the
+    first Monday (TX the pricier side, 0.40 against 0.30); from the second
+    Monday TY is the pricier side (0.60), and TZ's first candle is the second
+    Monday."""
+    return {
+        "TX": [_candle(_MONDAY_TS, 0.40, 0.60)],
+        "TY": [_candle(_MONDAY_TS, 0.30, 0.70), _candle(_M2_TS, 0.60, 0.40)],
+        "TZ": [_candle(_M2_TS, 0.75, 0.25)],
+    }
+
+
 class TestActiveTickerRelease:
     """A ticker is blocked only while its position is OPEN (BS-24).
 
     Live, scanner.get_held_positions() reads positions with count_filter="position",
     so a ticker leaves the blocked set the moment its market settles. The
-    backtest used to add tickers to active_tickers and never remove them, so one
-    early trade blocked that ticker for the entire remaining simulation.
+    backtest must do the same: a ticker held by one trade blocks a second
+    trade only until the first pays out.
 
-    Fixture: TX/TY share an exact title and one close instant, 2026-02-02 (a
-    same-title pair, entering at the first Monday — the one close is what the
-    same-title close gate, DR-74, requires); TX/TZ share a normalized title
-    with an 18-day deadline gap (time-series pair, which can only enter at the
-    second Monday because TZ has no earlier candle). Both candidates therefore
-    contain TX, at different entry dates. TX settles before its close_time —
-    an early determination, which is what makes re-entry on a shared ticker
-    reachable at all (TY settles early too, on 2026-01-08).
+    Fixture: one question, "Team wins by <date>", asked at three deadlines on
+    three events of different series: TX (February 1), TY (February 10) and TZ
+    (February 20). Two of the three possible pairs enter, and both hold TX as
+    the earlier contract:
+      - TX/TY enters on the first Monday (2026-01-05): TZ has no candle yet.
+        The deadline gap is 9 days (short tier: price gap at least 0.15, legs
+        pA + nB at most 0.85). TX YES 0.30, TY YES 0.55 / NO 0.45: price gap
+        0.25, legs 0.30 + 0.45 = 0.75. The mid spread is 0.55 - 0.30 = 0.25
+        (every book is tight, NO ask = 1 - YES ask), so p = 1 - 0.80 x 0.25 =
+        0.80; fee about 0.032 per pair, b = (0.25 - 0.032) / (0.75 + 0.032) =
+        0.279, Kelly f* = 0.80 - 0.20 / 0.279 = 0.083, positive.
+      - TX/TZ enters on the second Monday (2026-01-12), the first with a TZ
+        candle. The gap is 19 days (long tier: price gap at least 0.30, legs at
+        most 0.70). TZ YES 0.75 / NO 0.25: price gap 0.45, legs 0.30 + 0.25 =
+        0.55. Mid spread 0.45, p = 1 - 0.80 x 0.45 = 0.64; fee about 0.028,
+        b = (0.45 - 0.028) / (0.55 + 0.028) = 0.73, Kelly f* = 0.64 - 0.36 /
+        0.73 = 0.147, positive.
+      - TY/TZ never enters: on the second Monday TY is quoted 0.65, only 0.10
+        under TZ's 0.75, below the short tier's 0.15.
+    TX and TY settle early (TY on 2026-01-08), which is what makes re-entry on
+    the shared ticker TX reachable at all.
 
-    Prices: TX yes 0.40 / no 0.60 throughout; TY yes 0.30 / no 0.70 at the
-    first Monday and 0.60 / 0.40 from the second; TZ yes 0.75 / no 0.25 from
-    the second Monday. Same-title TX/TY at the first Monday: TX is the pricier
-    side, gap 0.10 >= 0.05, legs nA+pB = 0.60+0.30 = 0.90 <= 0.95.
-    Time-series TX/TZ at the second Monday: TX is the earlier contract and TZ
-    (later) is priced 0.35 higher, clearing the 30% long-gap tier; legs
-    pA+nB = 0.40+0.25 = 0.65 <= 0.70, and under the interval discount
-    (p = 1 - 0.75*0.35) the Kelly fraction is ~0.180 — positive, so the pair
-    really is entered. TX/TY is never a time-series candidate: their titles
-    are identical, so they state one deadline ("by March 2026") twice and the
-    cumulative-deadline rule refuses them (DR-67). TY/TZ IS a candidate — TY
-    now closes with TX, 18 days before TZ, and the two are worded as two
-    different deadlines — which is why TY carries a second-Monday candle: at
-    0.60, TZ's 0.75 is only 0.15 above it, under the 30% long-gap tier, and at
-    the first Monday TZ has no candle at all. So TX/TZ is the only
-    time-series entry.
-
-    RE-DESIGNED (DR-74): TY used to close on 2026-01-20, 13 days before TX,
-    which the same-title close gate now refuses as two fixtures; aligning TY's
-    close alone was not enough, because it brought TY/TZ inside the 30-day
-    deadline-gap cap (it had been 31 days apart), where TY's first-Monday 0.30
-    would have entered it at the second Monday. Its second-Monday candle keeps
-    it out. No assertion changed.
+    Both entries hold TX, and they also share the question's ladder (DR-76:
+    two markets of one question are one ladder), so while the first trade is
+    open both the ticker rule and the ladder rule would refuse the second.
+    The ticker rule is checked first and refuses silently, while a ladder
+    refusal is counted on its own log line, so the first test can tell them
+    apart: with TX still open the second pair is refused and the ladder line is
+    absent, which fails if the ticker rule stops blocking. Once the first trade
+    has settled, both holds are released together, so the second test passes
+    only if the ticker (and the ladder) is freed; it cannot tell which of the
+    two releases is missing.
     """
-
-    _M2 = int(datetime(2026, 1, 12, 9, 0, tzinfo=UTC).timestamp())
 
     @staticmethod
     def _markets(tx_settlement: str) -> list[dict]:
+        def market(ticker, event, deadline, close, settle):
+            return {"ticker": ticker, "event_ticker": event, "event_title": "EV",
+                    "title": f"Team wins by {deadline}", "subtitle": "",
+                    "result": "yes", "open_time": "2026-01-01T00:00:00+00:00",
+                    "close_time": close, "settlement_ts": settle}
         return [
-            {"ticker": "TX", "event_ticker": "EX", "event_title": "EV",
-             "title": "Team wins by March 2026", "subtitle": "", "result": "yes",
-             "open_time": "2026-01-01T00:00:00+00:00",
-             "close_time": "2026-02-02T00:00:00+00:00",
-             "settlement_ts": tx_settlement},
-            {"ticker": "TY", "event_ticker": "EY", "event_title": "EV",
-             "title": "Team wins by March 2026", "subtitle": "", "result": "yes",
-             "open_time": "2026-01-01T00:00:00+00:00",
-             # TX's close instant: the same-title close gate (DR-74).
-             "close_time": "2026-02-02T00:00:00+00:00",
-             "settlement_ts": "2026-01-08T12:00:00+00:00"},
-            {"ticker": "TZ", "event_ticker": "EZ", "event_title": "EV",
-             "title": "Team wins by April 2026", "subtitle": "", "result": "yes",
-             "open_time": "2026-01-01T00:00:00+00:00",
-             "close_time": "2026-02-20T00:00:00+00:00",
-             "settlement_ts": "2026-02-20T12:00:00+00:00"},
+            market("TX", "EX", "February 1, 2026", "2026-02-01T00:00:00+00:00",
+                   tx_settlement),
+            market("TY", "EY", "February 10, 2026", "2026-02-10T00:00:00+00:00",
+                   "2026-01-08T12:00:00+00:00"),
+            market("TZ", "EZ", "February 20, 2026", "2026-02-20T00:00:00+00:00",
+                   "2026-02-20T12:00:00+00:00"),
         ]
 
-    @classmethod
-    def _candles(cls) -> dict[str, list[dict]]:
-        # Also used by TestFindEntryRecordsEveryQualifyingMonday: there the
-        # TX/TY same-title pair has A = TX on the first Monday and A = TY from
-        # the second, when TY becomes the pricier side.
+    @staticmethod
+    def _candles() -> dict[str, list[dict]]:
         return {
-            # TX: pricier than TY (same-title gap) yet cheaper than the
-            # later-closing TZ (time-series gap) — see the class docstring
-            "TX": [_candle(_MONDAY_TS, 0.40, 0.60)],
-            # TY: 0.30 at the first Monday (the same-title entry), then 0.60 —
-            # keeps TY/TZ (18 days apart, like TX/TZ) under the 30% tier at the
-            # second Monday; see the class docstring
-            "TY": [_candle(_MONDAY_TS, 0.30, 0.70), _candle(cls._M2, 0.60, 0.40)],
-            # TZ's first candle is the SECOND Monday, so the TX/TZ pair cannot
-            # enter until then
-            "TZ": [_candle(cls._M2, 0.75, 0.25)],
+            # TX: cheap earlier contract in both entries
+            "TX": [_candle(_MONDAY_TS, 0.30, 0.70)],
+            # TY: 0.55 at the first Monday (the TX/TY entry), then 0.65, which
+            # keeps TY/TZ under the short tier at the second Monday
+            "TY": [_candle(_MONDAY_TS, 0.55, 0.45), _candle(_M2_TS, 0.65, 0.35)],
+            # TZ's first candle is the SECOND Monday, so TX/TZ cannot enter
+            # until then
+            "TZ": [_candle(_M2_TS, 0.75, 0.25)],
         }
 
     def _run(self, monkeypatch, tx_settlement):
@@ -2951,7 +3066,7 @@ class TestActiveTickerRelease:
         trades = self._run(monkeypatch, "2026-01-08T12:00:00+00:00")
         assert len(trades) == 2
         first, second = trades
-        assert (first.pair_type, first.ticker_a, first.ticker_b) == ("same_title", "TX", "TY")
+        assert (first.pair_type, first.ticker_a, first.ticker_b) == ("time_series", "TX", "TY")
         assert first.entry_date == date(2026, 1, 5)
         assert first.exit_date == date(2026, 1, 8)
         # Same ticker, entered again after the first position closed
@@ -2959,13 +3074,22 @@ class TestActiveTickerRelease:
         assert second.entry_date == date(2026, 1, 12)
         assert second.entry_date > first.exit_date
 
-    def test_ticker_stays_blocked_while_its_trade_is_open(self, monkeypatch):
-        # Only change: TX settles 2026-02-02, i.e. AFTER the second pair's
+    def test_ticker_stays_blocked_while_its_trade_is_open(self, monkeypatch, caplog):
+        # Only change: TX settles 2026-02-01, i.e. AFTER the second pair's
         # entry date — the positions would overlap, so the second is skipped
-        trades = self._run(monkeypatch, "2026-02-02T12:00:00+00:00")
+        with caplog.at_level(logging.INFO):
+            trades = self._run(monkeypatch, "2026-02-01T12:00:00+00:00")
         assert len(trades) == 1
-        assert trades[0].pair_type == "same_title"
-        assert trades[0].exit_date == date(2026, 2, 2)
+        assert (trades[0].pair_type, trades[0].ticker_a, trades[0].ticker_b) == (
+            "time_series", "TX", "TY")
+        assert trades[0].exit_date == date(2026, 2, 1)
+        # Refused by the ticker rule itself: the ladder rule, which would also
+        # refuse it, never got to count it. The prefix is the shared
+        # _LADDER_LINE's, whose positive checks (TestOpenLadderExposure) fail if
+        # the bot's wording changes, so this check cannot go quietly stale
+        prefix = _LADDER_LINE.partition(" (")[0]
+        assert prefix.endswith("still held a trade on the same ladder")
+        assert not any(m.startswith(prefix) for m in caplog.messages)
 
 
 # Anchor Monday reused across the eligibility-prefilter tests below — matches
@@ -4834,40 +4958,39 @@ class TestFindEntrySameEventLadders:
 
 class TestRunBacktestEndToEndWithPrefilter:
     """The eligibility prefilter must not change results — only skip work.
-    A hourly-ladder flood sharing the same exact-title group as a genuinely
-    tradeable pair must be dropped before grouping/extraction/candlestick
-    fetching, leaving the recorded trade identical to the pre-filter
-    baseline in TestRunBacktestPnL.test_profit_not_double_counted_and_cash_sized.
+    A flood of two-hour markets asking the same question as a tradeable
+    time-series pair must be dropped before grouping, pair extraction and the
+    candle fetch, leaving the recorded trade identical to the one the pair
+    makes alone, the trade
+    TestRunBacktestPnL.test_profit_not_double_counted_and_cash_sized checks.
     """
 
     def test_hourly_noise_is_filtered_without_changing_the_trade(self, monkeypatch):
-        valid_markets = [
-            {"ticker": "SA", "event_ticker": "EA", "event_title": "EV",
-             "title": "Q", "subtitle": "", "result": "yes",
-             "close_time": "2026-02-01T00:00:00+00:00",
-             "settlement_ts": "2026-02-01T12:00:00+00:00"},
-            {"ticker": "SB", "event_ticker": "EB", "event_title": "EV",
-             "title": "Q", "subtitle": "", "result": "yes",
-             "close_time": "2026-02-01T00:00:00+00:00",
-             "settlement_ts": "2026-02-01T12:00:00+00:00"},
-        ]
-        # 200 intraday markets in the SAME exact-title group ("EV" | "Q") —
-        # each has an explicit open_time/close_time 2 hours apart, so
-        # _can_ever_enter drops every one of them before grouping.
+        # The time-series pair of TestRunBacktestPnL: SA ("by February 1,
+        # 2026") and SB ("by February 14, 2026"), at its first-Monday quotes
+        valid_markets = _time_series_markets()
+        # 200 markets asking the same question by an earlier deadline,
+        # January 10, 2026, each in an event of its own. Each opens and closes
+        # two hours apart that Saturday, so no Monday checkpoint falls inside
+        # its life and _can_ever_enter drops every one of them before grouping.
         noise_markets = [
             {"ticker": f"NOISE-{i}", "event_ticker": f"NEV-{i}", "event_title": "EV",
-             "title": "Q", "subtitle": "", "result": "yes",
+             "title": "Will the launch happen by January 10, 2026?", "subtitle": "",
+             "result": "yes",
              "open_time": "2026-01-10T00:00:00+00:00",
              "close_time": "2026-01-10T02:00:00+00:00",
              "settlement_ts": "2026-01-10T02:00:00+00:00"}
             for i in range(200)
         ]
         markets = valid_markets + noise_markets
+        # CONTROL: unfiltered, each noise market is an earlier deadline of SA's
+        # question (January 10, 22 days before SA's), so it would pair with SA
+        # and its candles would be fetched
+        unfiltered = _extract_pairs(_group_by_normalized_title(markets))
+        assert any(a["ticker"].startswith("NOISE-") and b["ticker"] == "SA"
+                   for a, b, *_ in unfiltered)
 
-        candles = {
-            "SA": [_candle(_MONDAY_TS, 0.70, 0.32)],
-            "SB": [_candle(_MONDAY_TS, 0.55, 0.47)],
-        }
+        candles = _parity_candles()
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: markets)
 
@@ -4886,12 +5009,20 @@ class TestRunBacktestEndToEndWithPrefilter:
 
         assert len(trades) == 1
         t = trades[0]
-        assert t.ticker_a == "SA"
-        assert t.ticker_b == "SB"
+        assert (t.pair_type, t.ticker_a, t.ticker_b) == ("time_series", "SA", "SB")
         assert t.balance_at_entry == pytest.approx(1000.0)
         assert t.profit == pytest.approx(t.expected_payoff)
         final_value = float(equity["portfolio_value"].iloc[-1])
         assert final_value == pytest.approx(1000.0 + t.profit)
+        # The same trade the pair makes with no noise beside it (BacktestTrade's
+        # equality compares every field but its quotes and its report-only ones)
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: valid_markets)
+        alone, _ = run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=date(2026, 1, 1), initial_balance=1000.0,
+        )
+        assert trades == alone
 
 
 class TestExtractPairsPerformanceSmoke:
@@ -7159,36 +7290,48 @@ class TestCheckpointOpeningBalanceSizing:
     feeding every compute_trade call), and never spend more than the running
     cash (live: strategy.select_portfolio shrinks a spec to the cash left).
     Nothing is open here, so the opening value is the opening cash. Sizes are
-    at pre_toggle_defaults' 20% cap for every pair, with no extra same-title
-    cap."""
+    at pre_toggle_defaults' k 0.75 and 20% cap unless a test says otherwise.
 
-    # Two same-title pairs whose only qualifying Monday is 2026-01-05. Distinct
-    # event_titles ("EV1"/"EV2") keep them in separate (event_title, title,
-    # subtitle) groups, so Pass 1's best-per-group filter keeps both.
+    Fixture: two time-series pairs that both trade on their first qualifying
+    Monday, 2026-01-05. Each market has one candle, at that checkpoint, which
+    stays every later Monday's latest quote, so each pair also qualifies on
+    01-12, 01-19 and 01-26, before its earlier market closes on February 1.
+    Each asks its own question ("Will the launch happen ...?", "Will the
+    landing happen ...?") by February 1 and by February 14, 2026, on two events
+    of different series, so the two pairs have no event and no question in
+    common: they share no ladder, and the one-open-trade-per-ladder rule
+    (DR-76) holds neither back. Every market settles YES. Both pairs have the
+    same first-Monday quotes, in dollars:
+      earlier market A: YES ask 0.20, NO ask 0.80 (YES bid 0.20, YES mid 0.20)
+      later market B:   YES ask 0.70, NO ask 0.30 (YES bid 0.70, YES mid 0.70)
+    The bot buys YES on A at 0.20 and NO on B at 0.30: legs $0.50 a contract
+    pair. The 13-day deadline gap is in the short tier (a price gap of at
+    least 0.15 and legs of at most 0.85; here 0.50 and 0.50), and neither
+    book is crossed. The mid spread is 0.70 - 0.20 = 0.50, the fee
+    approximation 0.07 x (0.20 x 0.80 + 0.30 x 0.70) = 0.0259 a pair, and
+    Kelly's b = (1 - 0.50 - 0.0259) / (0.50 + 0.0259) = 0.9015."""
+
     @staticmethod
     def _markets():
         out = []
-        for n, ev in ((1, "EV1"), (2, "EV2")):
-            out.append({"ticker": f"S{n}A", "event_ticker": f"E{n}A", "event_title": ev,
-                        "title": f"Q{n}", "subtitle": "", "result": "yes",
-                        "close_time": "2026-02-01T00:00:00+00:00",
-                        "settlement_ts": "2026-02-01T12:00:00+00:00"})
-            out.append({"ticker": f"S{n}B", "event_ticker": f"E{n}B", "event_title": ev,
-                        "title": f"Q{n}", "subtitle": "", "result": "yes",
-                        "close_time": "2026-02-01T00:00:00+00:00",
-                        "settlement_ts": "2026-02-01T12:00:00+00:00"})
+        for n, subject in ((1, "launch"), (2, "landing")):
+            for leg, deadline, close in (("A", "February 1, 2026", "2026-02-01"),
+                                         ("B", "February 14, 2026", "2026-02-14")):
+                out.append({"ticker": f"S{n}{leg}", "event_ticker": f"E{n}{leg}",
+                            "event_title": "EV",
+                            "title": f"Will the {subject} happen by {deadline}?",
+                            "subtitle": "", "result": "yes",
+                            "close_time": f"{close}T00:00:00+00:00",
+                            "settlement_ts": f"{close}T12:00:00+00:00"})
         return out
 
-    # Identical prices for both pairs: expensive leg yes 0.60 / no 0.40, cheap
-    # leg yes 0.35 — a 0.25 gap, so both clear SAME_TITLE_MIN_PRICE_DIFF and
-    # both land on the same capped Kelly fraction.
     @staticmethod
     def _candles():
         return {
-            "S1A": [_candle(_MONDAY_TS, 0.60, 0.40)],
-            "S1B": [_candle(_MONDAY_TS, 0.35, 0.65)],
-            "S2A": [_candle(_MONDAY_TS, 0.60, 0.40)],
-            "S2B": [_candle(_MONDAY_TS, 0.35, 0.65)],
+            "S1A": [_candle(_MONDAY_TS, 0.20, 0.80)],
+            "S1B": [_candle(_MONDAY_TS, 0.70, 0.30)],
+            "S2A": [_candle(_MONDAY_TS, 0.20, 0.80)],
+            "S2B": [_candle(_MONDAY_TS, 0.70, 0.30)],
         }
 
     def _patch(self, monkeypatch):
@@ -7204,6 +7347,15 @@ class TestCheckpointOpeningBalanceSizing:
         # and record the same balance_at_entry: the first's cost must not
         # lower the second's base. The cash left never binds here (20% + 20%
         # of $1,000 fits); the next test is the case where it does.
+        #
+        # By hand at k 0.75: p = 1 - 0.75 x 0.50 = 0.625, so f* = 0.625 -
+        # 0.375 / 0.9015 = 0.209, capped at 0.20: a $200 budget for each pair.
+        # 380 pairs cost $190.00 plus exact fees of $4.26 (0.07 x 380 x 0.20 x
+        # 0.80 = 4.256, up to the cent) and $5.59 (0.07 x 380 x 0.30 x 0.70 =
+        # 5.586), $199.85; 381 would cost $190.50 + $4.27 + $5.61 = $200.38.
+        # Sized on what the first pair left instead, the second would get less:
+        # 20% of the $800.15 cash, or of the $990.15 value with the first
+        # pair's $190.00 of contracts.
         self._patch(monkeypatch)
 
         trades, _ = run_backtest(
@@ -7212,9 +7364,13 @@ class TestCheckpointOpeningBalanceSizing:
         )
 
         assert len(trades) == 2
+        assert sorted((t.pair_type, t.ticker_a, t.ticker_b) for t in trades) == [
+            ("time_series", "S1A", "S1B"), ("time_series", "S2A", "S2B")]
         assert {t.entry_date for t in trades} == {date(2026, 1, 5)}
-        assert trades[0].n == trades[1].n
+        assert trades[0].n == trades[1].n == 380
         for t in trades:
+            assert t.kelly_fraction == pytest.approx(0.20)
+            assert t.total_cost + t.fees == pytest.approx(199.85, abs=1e-9)
             assert t.balance_at_entry == pytest.approx(1000.0)
             # Each trade's fee-inclusive outlay fits the Kelly budget taken off
             # the CHECKPOINT balance, not off whatever cash was left.
@@ -7226,16 +7382,21 @@ class TestCheckpointOpeningBalanceSizing:
         # the cap to 0.60 for this test only — backtester imports the constant
         # by value (`from .config import BUDGET_FRACTION`), so patching the
         # module attribute is what `_resolve_size_cap(None)` reads at call
-        # time, and Pass 1b sizes at `min(cap, kelly_f)` with that cap.
+        # time, and Pass 1b sizes at `min(cap, kelly_f)` with that cap. A
+        # time-series f* is always below 1 - k (0.25 at k 0.75), so k is
+        # lowered to 0.30 too, on config and on backtester's by-value copy.
         #
-        # Worked by hand. Each pair's legs are NO on A at 0.40 and YES on B at
-        # 0.35, $0.75 a contract pair; its Kelly fraction (p 0.95, about 0.77)
-        # is capped at 0.60. The first pair's budget is 0.60 x $1,000 = $600:
-        # 766 pairs cost $574.50 plus fees of $12.87 + $12.20 = $599.57, and
-        # 767 would cost $575.25 + $12.89 + $12.22 = $600.36. That leaves
-        # $400.43 of cash, under the second pair's $600 budget, so the second
-        # pair is sized on the cash: 511 pairs cost $383.25 + $8.59 + $8.14 =
-        # $399.98, and 512 would cost $384.00 + $8.61 + $8.16 = $400.77.
+        # Worked by hand. At k 0.30, p = 1 - 0.30 x 0.50 = 0.85, so f* = 0.85
+        # - 0.15 / 0.9015 = 0.684, capped at 0.60. The first pair's budget is
+        # 0.60 x $1,000 = $600: 1,140 pairs cost $570.00 plus exact fees of
+        # $12.77 (0.07 x 1,140 x 0.16 = 12.768, up to the cent) and $16.76
+        # (0.07 x 1,140 x 0.21 = 16.758), $599.53, and 1,141 would cost
+        # $570.50 + $12.78 + $16.78 = $600.06. That leaves $400.47 of cash,
+        # under the second pair's $600 budget, so the second pair is sized on
+        # the cash: 761 pairs cost $380.50 + $8.53 + $11.19 = $400.22, and 762
+        # would cost $381.00 + $8.54 + $11.21 = $400.75.
+        monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.30)
+        monkeypatch.setattr(backtester, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.30)
         monkeypatch.setattr(backtester, "BUDGET_FRACTION", 0.60)
         self._patch(monkeypatch)
 
@@ -7246,10 +7407,11 @@ class TestCheckpointOpeningBalanceSizing:
 
         # Both trade: the second is shrunk to the cash the first left, as
         # select_portfolio shrinks a spec that no longer fits
-        assert [t.n for t in trades] == [766, 511]
+        assert [t.n for t in trades] == [1140, 761]
         assert [t.total_cost + t.fees for t in trades] == [
-            pytest.approx(599.57), pytest.approx(399.98)]
+            pytest.approx(599.53), pytest.approx(400.22)]
         for t in trades:
+            assert t.pair_type == "time_series"
             assert t.kelly_fraction == pytest.approx(0.60)
             # Both are sized on the same checkpoint value
             assert t.balance_at_entry == pytest.approx(1000.0)
@@ -9080,8 +9242,8 @@ class TestFindEntryRecordsEveryQualifyingMonday:
     @staticmethod
     def _tx_ty():
         markets = {m["ticker"]: m
-                   for m in TestActiveTickerRelease._markets("2026-01-08T12:00:00+00:00")}
-        return markets, TestActiveTickerRelease._candles()
+                   for m in _tx_ty_tz_markets("2026-01-08T12:00:00+00:00")}
+        return markets, _tx_ty_tz_candles()
 
     def test_later_is_the_scan_restarted_after_each_monday(self, monkeypatch):
         # Every golden pair, at the default band and every grid band, with the
@@ -10976,50 +11138,69 @@ class TestAddToHeldPairs:
         assert spec.kelly_fraction == pytest.approx(add.kelly_fraction, abs=1e-12)
         assert spec.total_cost_with_fees == pytest.approx(add.total_cost + add.fees, abs=1e-9)
 
+    # Seven other time-series pairs (pA, pB, nB), each on its own ladder and
+    # sized at about 13.2% of the account at k 0.85 (see _cash_bound_fixture)
+    _R_QUOTE, _R_COUNT = (0.10, 0.85, 0.15), 7
+
     def _cash_bound_fixture(self):
-        """The widening pair P and a same-title pair R that asks another
-        question, both opening on Monday 1; R pays out on 2026-02-20, after
-        Monday 2. Run with no per-trade cap, R's Kelly fraction (about 0.93)
-        leaves P too little cash on Monday 2 to buy what it is missing of its
-        Kelly share: on the pair alone the cash can never bind, since
+        """The widening pair P and seven pairs R0 to R6, each asking its own
+        question in two events of its own, all opening on Monday 1; the R
+        pairs pay out on 2026-02-20, after Monday 2. Run with no per-trade
+        cap, each R stakes its Kelly fraction of the account at k 0.85
+        (about 0.132: a time-series fraction is below 1 - k = 0.15), and
+        together they leave P, whose first trade is about 4% of the account,
+        too little cash on Monday 2 to buy what it is missing of its Kelly
+        share. On the pair alone the cash can never bind, since
         f x value - stake is at most the cash when f is at most 1."""
-        title = "Will it hail by March 1, 2026?"
-        ra = _worded_market("RA", "EVR-1", title, "2026-02-20")
-        rb = _worded_market("RB", "EVS-1", title, "2026-02-20", result="yes")
-        r = _same_title_record([(_LADDER_M1, ra, rb, 0.85, 0.15)], group_key=("", title, ""))
-        return [self._widening_pair(), r]
+        pairs = [_ladder_record(_ladder_market(f"R{i}A", f"EVR{i}-1", "2026-02-20"),
+                                _ladder_market(f"R{i}B", f"EVR{i}-2", "2026-02-20"),
+                                f"r{i}", [(_LADDER_M1, *self._R_QUOTE)])
+                 for i in range(self._R_COUNT)]
+        return [self._widening_pair(), *pairs]
 
     def test_the_cash_left_limits_an_add_on_as_it_limits_live(self):
         entries = self._cash_bound_fixture()
-        p, r = entries
-        fr = _uncapped_kelly({"pair_type": "same_title", "entry": r["entry"]}, 0.85)
+        p, *rs = entries
+        fr = _uncapped_kelly(rs[0], 0.85)
         f2 = _uncapped_kelly({"pair_type": "time_series", "entry": p["entry"]["later"][0]}, 0.85)
-        assert 0.90 < fr < 0.95 and 0 < f2 < 0.20
+        # Seven R pairs at 0.132 of the account each take about 92.7% of it
+        assert 0.13 < fr < 0.135 and 0 < f2 < 0.20
         on = self._sim(entries, k=0.85, size_cap=1.0, add_to_held=True)
-        # R ranks first on Monday 1 (its monthly return is the larger)
-        assert _traded(on) == [("RA", _LADDER_M1), ("PA", _LADDER_M1), ("PA", _LADDER_M2)]
-        r_trade, first, add = on.trades
-        assert (r_trade.add_on, first.add_on, add.add_on) == (False, False, True)
-        # Monday 2: R and P's first trade are both open at contract cost
-        cash = 10_000.0 - (r_trade.total_cost + r_trade.fees) - (first.total_cost + first.fees)
+        # The R pairs rank first on Monday 1 (their monthly return is the
+        # larger). P's first trade buys its Kelly share (520 pairs, $404.84)
+        # out of the $733.75 they leave, and P adds on Monday 2
+        assert sorted(_traded(on)[:7]) == [(f"R{i}A", _LADDER_M1) for i in range(7)]
+        assert _traded(on)[7:] == [("PA", _LADDER_M1), ("PA", _LADDER_M2)]
+        *r_trades, first, add = on.trades
+        assert [t.add_on for t in on.trades] == [False] * 8 + [True]
+        # Monday 2: the R pairs and P's first trade are all open at contract cost
+        earlier = [*r_trades, first]
+        cash = 10_000.0 - sum(t.total_cost + t.fees for t in earlier)
         value = add.balance_at_entry
-        assert value == pytest.approx(cash + r_trade.total_cost + first.total_cost, abs=1e-9)
+        assert value == pytest.approx(cash + sum(t.total_cost for t in earlier), abs=1e-9)
         stake = first.total_cost + first.fees
         assert add.kelly_fraction == pytest.approx(
             held_pair_fraction(f2, stake, value), abs=1e-12)
         # The cash binds: the pair is missing more of its Kelly share than
-        # the cash left can buy (by hand, $575.37 of it against $328.24 of
-        # cash, the stake counting the first trade's $14.84 of fees)
+        # the cash left can buy (the stake counting the first trade's fees).
+        # By hand: each R buys 4,991 pairs for $1,247.75 plus $76.00 of fees,
+        # $1,323.75 against 13.24% of $10,000 (every Monday-1 trade is sized
+        # on the opening $10,000); seven of them and P's first trade (520
+        # pairs, $404.84 with fees) leave $328.91 of cash on Monday 2. P's
+        # share then is f2 = 10.36% of the $9,453.16 value, less its $404.84
+        # stake: $574.17 missing against $328.91 of cash, which buys 625 pairs
+        # ($312.50 plus $16.19 of fees; 626 would cost $329.23)
         assert cash < f2 * value - stake - 100.0
         assert kelly_budget(value, add.kelly_fraction, cash) == cash
         # The largest count whose contracts and exact fees fit the cash left
         legs = (add.entry_pA, add.entry_nB)
+        assert add.n > 0
         assert _pair_cost(add.n, *legs) <= cash + 1e-9 < _pair_cost(add.n + 1, *legs)
         # ... and what live compute_trade sizes on that value, cash and stake
         spec = _live_add_on(first, value, cash, k=0.85, size_cap=1.0, quotes=(0.20, 0.70, 0.30))
         assert spec.x == add.n
         assert spec.total_cost_with_fees == pytest.approx(add.total_cost + add.fees, abs=1e-9)
-        # CONTROL: without R the same add-on is not limited by the cash
+        # CONTROL: without the R pairs the same add-on is not limited by the cash
         alone = self._sim([self._widening_pair()], k=0.85, size_cap=1.0, add_to_held=True)
         assert alone.trades[1].add_on and alone.trades[1].n > add.n
 
@@ -11306,36 +11487,42 @@ class TestAddToHeldCapParity:
     def _cap_bound_fixture(self):
         """P passes at about +0.041 (Monday 1) and +0.104 (Monday 2) at k 0.85,
         so its add-on is bound by a cap of 5% or 10% and by nothing from 15%
-        up; R, on its own ladder, competes for the cash on Monday 1. U, a
-        same-title pair (whose Kelly fraction does not depend on k), opens on
-        Monday 3 at about +0.235 and adds on 2026-02-02, with the same legs, at
-        about +0.527: the caps from 25% to 50%, above its first Monday's
-        fraction and below its later one's, still bind its add-on, so only the
-        later Monday's fraction marks where the caps stop mattering. Under the
-        class's pre_toggle_defaults the extra same-title cap is 100%, so the
-        sweep's cap is U's only cap."""
+        up; R, on its own ladder, competes for the cash on Monday 1."""
         p = TestAddToHeldPairs()._widening_pair()
         r = _ladder_record(_ladder_market("RA", "EVR-1", "2026-02-20"),
                            _ladder_market("RB", "EVS-1", "2026-02-20"), "r", [_LADDER_M1])
+        return [p, r]
+
+    def _same_title_cap_bound_fixture(self):
+        """The cap-bound fixture and U, a same-title pair (whose Kelly fraction
+        does not depend on k) that opens on Monday 3 at about +0.235 and adds
+        on 2026-02-02, with the same legs, at about +0.527: the caps from 25%
+        to 50%, above its first Monday's fraction and below its later one's,
+        still bind its add-on, so only the later Monday's fraction marks where
+        the caps stop mattering. Under the class's pre_toggle_defaults the
+        extra same-title cap is 100%, so the sweep's cap is U's only cap."""
         ua = _worded_market("UA", "EVU-1", _RAIN, "2026-03-01")
         ub = _worded_market("UB", "EVV-1", _RAIN, "2026-03-01", result="yes")
         u = _same_title_record([(_LADDER_M3, ua, ub, 0.55, 0.45),
                                 (self._ST_M2, ua, ub, 0.57, 0.43)])
-        return [p, r, u]
+        return [*self._cap_bound_fixture(), u]
+
+    @staticmethod
+    def _add_on(cell, cap, ticker="PA"):
+        """The one add-on trade on market `ticker` in the cell's point at `cap`."""
+        (t,) = [t for t in cell[cap]["all"].trades if t.add_on and t.ticker_a == ticker]
+        return t
 
     def test_every_cap_of_a_cap_bound_add_on_equals_a_fresh_simulation(self):
         entries = self._cap_bound_fixture()
-        p, _r, u = entries
+        p, _r = entries
         cs = self._sweep(entries, (0.75, 0.85))
         assert self._assert_every_cap_is_fresh(cs, entries) > 0
         assert cs.simulated > 0 and cs.reused > 0
         # Not vacuous: at k 0.85 the cap binds P's add-on at 5% and 10% and
         # not from 15%, where every cap sizes it alike
         cell = cs.cell(self._BAND, 0.85)
-
-        def add_on(cap, ticker="PA"):
-            (t,) = [t for t in cell[cap]["all"].trades if t.add_on and t.ticker_a == ticker]
-            return t
+        add_on = functools.partial(self._add_on, cell)
 
         f2 = _uncapped_kelly({"pair_type": "time_series", "entry": p["entry"]["later"][0]}, 0.85)
         assert 0.10 < f2 < 0.15
@@ -11368,6 +11555,13 @@ class TestAddToHeldCapParity:
         # cap no longer binds and every cap adds 1,188
         assert [add_on(cap).n for cap in (0.05, 0.10, 0.15, 0.5, 1.0)] == [
             177, 1121, 1188, 1188, 1188]
+
+    def test_every_cap_of_a_same_title_add_on_equals_a_fresh_simulation(self):
+        entries = self._same_title_cap_bound_fixture()
+        u = entries[2]
+        cs = self._sweep(entries, (0.75, 0.85))
+        assert self._assert_every_cap_is_fresh(cs, entries) > 0
+        cell = cs.cell(self._BAND, 0.85)
         # The same-title add-on: its later Monday's fraction, not its first
         # one's, is the cell's peak, so the caps between the two are each
         # simulated rather than shared (a peak read off a same-title pair's
@@ -11376,15 +11570,15 @@ class TestAddToHeldCapParity:
                   for m in backtester._entry_mondays(u["entry"]))
         assert 0.20 < u1 < 0.25 < 0.50 < u2 < 0.55
         assert cell[1.0]["all"].peak_kelly_fraction == pytest.approx(u2, abs=1e-12)
-        st = {cap: add_on(cap, "UA") for cap in (0.25, 0.30, 0.40, 0.50, 0.55, 1.0)}
+        st = {cap: self._add_on(cell, cap, "UA") for cap in (0.25, 0.30, 0.40, 0.50, 0.55, 1.0)}
         assert all(t.entry_date == self._ST_M2 for t in st.values())
         assert (st[0.25].kelly_fraction < st[0.30].kelly_fraction
                 < st[0.40].kelly_fraction < st[0.50].kelly_fraction
                 < st[0.55].kelly_fraction == st[1.0].kelly_fraction)
 
     def test_every_cap_of_a_cash_bound_add_on_equals_a_fresh_simulation(self):
-        # TestAddToHeldPairs' cash-bound fixture: with no cap, R leaves P too
-        # little cash on Monday 2 to buy what it is missing of its share
+        # TestAddToHeldPairs' cash-bound fixture: with no cap, the seven R pairs
+        # leave P too little cash on Monday 2 to buy what it is missing of its share
         entries = TestAddToHeldPairs()._cash_bound_fixture()
         cs = self._sweep(entries, (0.85,))
         assert self._assert_every_cap_is_fresh(cs, entries) > 0
@@ -11505,7 +11699,16 @@ class TestAddToHeldCapParity:
         with pytest.raises(ValueError, match=r"end_dates has no day for .*0\.85, 'all'"):
             noisy.cell(self._BAND, 0.85)
         assert noisy.simulated == 0
+        # CONTROL: the exact keys end every curve on the day given
+        exact = self._plain_sweep(
+            entries, checks=False, st_entries=[], eager={}, add_to_held=True,
+            end_dates={(self._BAND, 0.85, pop): self._END for pop in self._POPS})
+        points = [p for by_pop in exact.cell(self._BAND, 0.85).values() for p in by_pop.values()]
+        assert points and all(p.equity_df["date"].iloc[-1] == self._END for p in points)
+
+    def test_an_add_on_same_title_cell_with_no_end_day_is_refused(self):
         # The same-title population needs its own day too
+        entries = [TestAddToHeldPairs()._widening_pair()]
         ua = _worded_market("UA", "EVU-1", _RAIN, "2026-03-01")
         ub = _worded_market("UB", "EVV-1", _RAIN, "2026-03-01", result="yes")
         st = [_same_title_record([(_LADDER_M3, ua, ub, 0.55, 0.45)])]
@@ -15358,10 +15561,11 @@ class TestLiveRuleLine:
     def test_the_thirteen_fields_are_recorded_from_one_read(self, monkeypatch, caplog):
         from kalshi_betting import config
         saved = config.save_live_defaults(
-            config.LiveSettings(False, (0.1, 0.8), 0.6, 0.35, 0.25, ("Economics",), ("Fed",),
+            config.LiveSettings(tier_floors=False, spread_band=(0.1, 0.8), interval_discount=0.6,
+                                size_cap=0.35, same_title_size_cap=0.25,
+                                exclude_categories=("Economics",), exclude_tags=("Fed",),
                                 rebalance=True, min_price_move=0.10,
-                                rebalance_min_days_to_maturity=7,
-                                sell_at=0.85, sell_min_days=3),
+                                rebalance_min_days_to_maturity=7, sell_at=0.85, sell_min_days=3),
             source="a note")
         reads: list = []
         real = config.read_saved_live_defaults
@@ -15877,7 +16081,8 @@ class TestLiveRuleLine:
         from kalshi_betting import config
         for categories, tags in [(None, None), (("Economics",), None), (None, ("Fed",)),
                                  (("Oil, Gas", "Sports"), ("a|b",))]:
-            settings = config.LiveSettings(True, (0.0, 1.0), 0.75, 0.2,
+            settings = config.LiveSettings(tier_floors=True, spread_band=(0.0, 1.0),
+                                           interval_discount=0.75, size_cap=0.2,
                                            exclude_categories=categories, exclude_tags=tags)
             assert backtester._live_filter_text(categories, tags) == \
                 config.describe_trade_filter(settings)
@@ -19963,37 +20168,53 @@ class TestWalkedTradeParity:
             assert not [m for m in caplog.messages if m.startswith("Trades refused when")]
 
     def test_a_walked_trade_the_cash_left_cannot_buy_is_counted_apart(self, caplog):
-        # On $2.80, a same-title pair on Monday 1 spends all but $0.59. On
-        # Monday 2 the largest Kelly share a time-series pair may take (25% of
-        # about $2.69) is more than that, and $0.59 cannot buy one contract
-        # pair at its best prices (0.20 + 0.40). The cash, not the book, stops it
+        # At k 0.05 and no cap, so that one time-series pair can spend most of
+        # the account (its Kelly share is below 1 - k = 0.95). On $2.80, the
+        # pair S (YES on SA at 0.20, NO on SB at 0.40), on a ladder of its own,
+        # spends all but $0.28 on Monday 1. By hand: the mid spread is 0.60 -
+        # 0.20 = 0.40, so p = 1 - 0.05 x 0.40 = 0.98; the fee approximation is
+        # 0.07 x (0.20 x 0.80 + 0.40 x 0.60) = 0.028 a pair, b = (0.40 -
+        # 0.028) / (0.60 + 0.028) = 0.5924 and f* = 0.98 - 0.02 / 0.5924 =
+        # 0.9462, a budget of $2.65. Four pairs fill at the best level of each
+        # book (it holds 60 contracts): $2.40 plus exact fees of $0.05 (0.07 x
+        # 4 x 0.16 = 0.0448, up to the cent) and $0.07 (0.07 x 4 x 0.24 =
+        # 0.0672), $2.52; five would cost $3.00 before fees. On Monday 2, at unchanged
+        # quotes, the portfolio is the $0.28 cash plus S at its asks (4 x 0.60
+        # = $2.40), $2.68. The largest Kelly share a time-series pair may take
+        # (95% of $2.68, $2.55) is more than the cash, and $0.28 cannot buy one
+        # contract pair at its best prices (0.20 + 0.40). The cash, not the
+        # book, stops it
         def records(model):
-            same = _ladder_same_title(_ladder_market("SA", "EVA-1", "2026-03-20"),
-                                      _ladder_market("SB", "EVB-1", "2026-03-20"), [_LADDER_M1])
+            sink = _ladder_record(_ladder_market("SA", "EVS-1", "2026-03-20"),
+                                  _ladder_market("SB", "EVS-2", "2026-03-20"), "s",
+                                  [(_LADDER_M1, 0.20, 0.60, 0.40)])
             ts = _ladder_record(_ladder_market("OA", "EVO-1", "2026-03-20"),
                                 _ladder_market("OB", "EVO-2", "2026-03-20"), "o",
                                 [(_LADDER_M2, 0.20, 0.60, 0.40)])
-            candles = {"SA": [_vol_candle(_LADDER_M1, 0.70, 0.30),
-                              _vol_candle(_LADDER_M2, 0.70, 0.30)],
-                       "SB": [_vol_candle(_LADDER_M1, 0.40, 0.60),
-                              _vol_candle(_LADDER_M2, 0.40, 0.60)],
+            candles = {"SA": [_vol_candle(_LADDER_M1, 0.20, 0.80),
+                              _vol_candle(_LADDER_M2, 0.20, 0.80)],
+                       "SB": [_vol_candle(_LADDER_M1, 0.60, 0.40),
+                              _vol_candle(_LADDER_M2, 0.60, 0.40)],
                        "OA": [_vol_candle(_LADDER_M2, 0.20, 0.80)],
                        "OB": [_vol_candle(_LADDER_M2, 0.60, 0.40)]}
-            return _walked([same, ts], candles, model)
+            return _walked([sink, ts], candles, model)
 
         def run(model, **kw):
-            return backtester._simulate_at_discount(records(model), self._START, 2.80, k=0.75,
+            return backtester._simulate_at_discount(records(model), self._START, 2.80, k=0.05,
                                                      size_cap=1.0, end_date=self._END, **kw)
 
         line = ("Trades skipped with no cash left for one contract pair "
-                "(k=0.750, band 0-1, all, no cap): 1")
+                "(k=0.050, band 0-1, all, no cap): 1")
         with caplog.at_level(logging.DEBUG):
             point = run(_walk_model())
         assert [(t.ticker_a, t.entry_date) for t in point.trades] == [("SA", _LADDER_M1)]
+        (spent,) = point.trades
+        assert (spent.pair_type, spent.n) == ("time_series", 4)
+        assert spent.total_cost + spent.fees == pytest.approx(2.52, abs=1e-9)
         assert line in caplog.messages
         # Counted by the test behind the live enrichment's own note
         assert any(m.startswith("No affordable contract pairs for")
-                   and "the $0.59 of cash binds" in m for m in caplog.messages)
+                   and "the $0.28 of cash binds" in m for m in caplog.messages)
         assert not [m for m in caplog.messages if m.startswith("Trades refused when")]
         # At the top of the book the same pair is skipped too, and neither line is logged
         caplog.clear()
@@ -20640,30 +20861,55 @@ class TestCapSweepSharesFromCapFreeFrom:
 class TestCashIsReadInWholeCents:
     """A trade is sized on the cash left in whole cents, as live's cash is, so
     a float cash a hair below a cent buys what that cent buys and is never
-    refused for float noise. Two same-title pairs on one Monday, no depth
-    model, no cap: the first leaves the cash just under $186.57."""
+    refused for float noise. Two time-series pairs on one Monday, no depth
+    model, no cap, at k 0.05 (so Kelly wants about 95% of the account for
+    each): the first leaves the cash just under $52.88."""
 
     @staticmethod
-    def _record(a: str, b: str, pA: float, pB: float) -> dict:
-        row = {"entry_date": _LADDER_M1, "pA": pA, "pB": pB, "nA": round(1.0 - pA, 4),
-               "nB": round(1.0 - pB, 4), "gap_days": None,
-               "mA": _ladder_market(a, f"EV{a}-1", "2026-03-20", result="yes"),
-               "mB": _ladder_market(b, f"EV{b}-1", "2026-03-20", result="yes")}
-        return {"pair_type": "same_title", "canon": a, "group_key": ("EV", a, a),
-                "entry": {**row, "later": ()}}
+    def _record(a: str, b: str, pA: float, pB: float, nB: float) -> dict:
+        """A prepared time-series record: markets a and b, each in an event of
+        its own, filed as one question named `a` (so two records with no
+        market in common share no ladder), quoted pA / pB / nB (the NO ask on B)
+        on the first Monday and both settling YES."""
+        return _ladder_record(
+            _ladder_market(a, f"EV{a}-1", "2026-03-20", result="yes"),
+            _ladder_market(b, f"EV{b}-1", "2026-03-20", result="yes"), a,
+            [(_LADDER_M1, pA, pB, nB)])
 
     def test_the_cash_left_to_the_cent_is_spent(self):
-        records = [self._record("SA", "SB", 0.70, 0.40), self._record("SC", "SD", 0.69, 0.39)]
-        point = backtester._simulate_at_discount(records, date(2026, 1, 1), 1_000.01, k=0.75,
+        # First pair: YES on SA at 0.20, NO on SB at 0.30. The mid spread is
+        # 0.70 - 0.20 = 0.50, so p = 1 - 0.05 x 0.50 = 0.975; with the fee
+        # approximation 0.0259 per pair, b = (0.50 - 0.0259) / (0.50 + 0.0259)
+        # = 0.9015 and f* = 0.975 - 0.025 / 0.9015 = 0.9473, a budget of
+        # $947.80 on $1,000.56: 1,802 pairs, which cost $901.00 plus exact
+        # fees of $20.19 and $26.49, $947.68 (1,803 would cost $948.21),
+        # leaving $52.88 as a float just under it, 52.87999999999988, which
+        # stays under the cent even times 100. The second pair (YES on SC at
+        # 0.30, NO on SD at 0.30) has a mid spread of 0.70 - 0.30 = 0.40, so
+        # p = 0.98; with the fee
+        # approximation 0.0294, b = 0.3706 / 0.6294 = 0.5888 and f* = 0.98 -
+        # 0.02 / 0.5888 = 0.9460, far more than the cash left, so the cash
+        # decides its size.
+        records = [self._record("SA", "SB", 0.20, 0.70, 0.30),
+                   self._record("SC", "SD", 0.30, 0.70, 0.30)]
+        point = backtester._simulate_at_discount(records, date(2026, 1, 1), 1_000.56, k=0.05,
                                                  size_cap=1.0, end_date=date(2026, 4, 1))
         first, second = point.trades
+        assert first.n == 1802
         # The cash left, as the walk spends it (the spec's cost with fees)
-        cash = 1_000.01 - (first.total_cost + fee_leg_exact(first.n, first.fill_price_a)
+        cash = 1_000.56 - (first.total_cost + fee_leg_exact(first.n, first.fill_price_a)
                            + fee_leg_exact(first.n, first.fill_price_b))
-        assert cash < 186.57 and backtester._cents(cash) == 18_657
-        # The second trade is what the live sizer buys with $186.57: every cent
-        assert (second.ticker_a, second.n) == ("SC", 255)
-        assert second.total_cost + second.fees == pytest.approx(186.57, abs=1e-9)
+        # Read in whole cents it is $52.88; cut to whole cents without the
+        # rounding _cents does first, the float noise would cost a cent
+        assert cash < 52.88 and backtester._cents(cash) == 5_288
+        assert math.floor(cash * 100) == 5_287
+        # The second trade is what the live sizer buys with $52.88: every cent.
+        # By hand, 84 pairs cost 84 x 0.60 = $50.40 plus two fees of $1.24
+        # (0.07 x 84 x 0.30 x 0.70 = 1.2348, up to the cent), $52.88; 85 would
+        # cost $51.00 + 2 x $1.25 = $53.50. With a cent less, $52.87, it would
+        # buy 83: $49.80 + 2 x $1.23 = $52.26
+        assert (second.ticker_a, second.n) == ("SC", 84)
+        assert second.total_cost + second.fees == pytest.approx(52.88, abs=1e-9)
 
 
 class TestBandReachesEveryResimulation:
@@ -20953,6 +21199,30 @@ class TestPositionSaleValueWalksTheLadder:
                                                         [0.38, 1000.0]]
         # Not a checkpoint of these quotes: no ladder
         assert quotes.sale_ladder(_LADDER_M3, 0.40) is None
+
+    def test_a_time_series_lone_leg_add_on_totals_by_ticker(self):
+        # X is held NO as market B of two time-series trades: the first pair
+        # (YES on Y) and a second trade (YES on W) that also holds NO on X, as
+        # an add-on to X would once Y had paid out. Their 160 NO
+        # contracts on X walk one ladder, though each trade's 80 fit its best
+        # level: 100 at the 0.60 bid and 60 one cent down, an average of
+        # (100 x 0.60 + 60 x 0.59) / 160 = 0.59625
+        levels = ((0.0, 100.0), (0.01, 1000.0))
+        model = _ladder_model(levels)
+        x = _sale_quotes("X", 0.38, 0.60, model)
+        first = _held_trade(80, _sale_quotes("Y", 0.40, 0.58, model), x)
+        add = _held_trade(80, _sale_quotes("W", 0.45, 0.53, model), x)
+        on_x = _walk_average(0.60, 160, levels)
+        assert on_x == pytest.approx(0.59625, abs=1e-12) and on_x < 0.60
+        (sale_1, sale_2), *_ = backtester._position_sale_value([first, add], _LADDER_M2)
+        assert sale_1[2] == (0.40, on_x) and sale_2[2] == (0.45, on_x)
+        # Alone, each trade's X sells at the best bid
+        assert backtester._position_sale_value([first], _LADDER_M2)[0][0][2] == (0.40, 0.60)
+        assert backtester._position_sale_value([add], _LADDER_M2)[0][0][2] == (0.45, 0.60)
+        # Together past the ladder's 1,100 contracts: not sold, though each fits alone
+        big = dc_replace(add, n=1050)
+        assert backtester._position_sale_value([big], _LADDER_M2) is not None
+        assert backtester._position_sale_value([first, big], _LADDER_M2) is None
 
     def test_a_lone_leg_add_on_totals_by_ticker(self):
         # X is held NO as market B of a time-series trade and as market A of a
@@ -21334,6 +21604,16 @@ class TestTrimHelpers:
         tight, _ = backtester._kelly_trim([trade], _LADDER_M2, 10_000.0, 0.75, 1.0, 0.10)
         assert tight.sell > loose.sell
 
+    def test_a_time_series_pair_is_capped_by_the_size_cap_alone(self):
+        trade = self._pair(5000)
+        loose, _ = backtester._kelly_trim([trade], _LADDER_M2, 10_000.0, 0.75, 1.0, 1.0)
+        tight, _ = backtester._kelly_trim([trade], _LADDER_M2, 10_000.0, 0.75, 0.10, 1.0)
+        assert tight.sell > loose.sell
+        # The extra same-title cap never reaches a time-series pair
+        same_title_tight, _ = backtester._kelly_trim(
+            [trade], _LADDER_M2, 10_000.0, 0.75, 1.0, 0.10)
+        assert same_title_tight == loose
+
     def test_a_thin_ladder_sells_no_more_than_it_holds(self):
         model = _ladder_model(((0.0, 100.0), (0.01, 200.0)))
         decision, (sold, _per_trade) = backtester._kelly_trim(
@@ -21622,6 +21902,50 @@ class TestTrimToKelly:
             "time_series", "TA", _LADDER_M3)
         assert f"contract pairs sold: {sold.n})" in caplog.text
 
+    def test_a_time_series_pair_the_trim_sells_whole_frees_its_markets(self, caplog):
+        # The class's pair on $15 under a 5% cap. Monday 1: Kelly's f* at the
+        # record's quotes (p = 1 - 0.75 x 0.40 = 0.70, f* about 0.19) is above
+        # the cap, so the budget is 0.05 x $15 = $0.75, and one
+        # contract pair (YES on SA at 0.20, NO on SB at 0.40) costs $0.60 plus
+        # two exact fees of $0.02 (0.07 x 0.20 x 0.80 = 0.0112 and 0.07 x 0.40
+        # x 0.60 = 0.0168, up to the cent), $0.64; two would cost $1.27.
+        # Monday 2: the portfolio is the $14.36 cash plus the pair at its asks
+        # (0.30 + 0.57), $15.23, so the cap lets the pair keep $0.76 (Kelly's
+        # own share, 44%, is far larger). The pair now sells for its bids less
+        # the fee per pair: 0.28 + 0.55 - 0.0314 = $0.80 at the best bids, and
+        # selling the one pair returns $0.26 + $0.53 = $0.79 after its exact
+        # fees. Either way one pair is worth more than the $0.76 it may keep,
+        # so the trim keeps none and sells it whole.
+        sa = _ladder_market("SA", "EVS-1", "2026-02-10")
+        # A time-series pair on SA's ladder (SA by an earlier deadline than a
+        # third market SC) passes on Mondays 2 and 3
+        sc = _ladder_market("SC", "EVS-3", "2026-03-25")
+        later = _ladder_record(sa, sc, "later", (_LADDER_M2, _LADDER_M3))
+        candles = dict(self._SUITE._candles(), SC=[_candle(_ck(_LADDER_M2), 0.60, 0.42)])
+        records = _quoted([self._SUITE._record(a=sa), later], candles)
+
+        def run(**kw):
+            return backtester._simulate_at_discount(
+                records, self._START, 15.0, k=0.75, size_cap=0.05,
+                end_date=date(2026, 4, 1), **kw)
+        base = run()
+        # Without the switch SA stays taken until it pays out: the second pair never trades
+        assert _traded(base) == [("SA", _LADDER_M1)]
+        assert base.trades[0].n == 1
+        with caplog.at_level(logging.INFO):
+            point = run(trim_to_kelly=True)
+        # Two trades: the pair, sold whole (no part of it is left held), and the later pair
+        sold, bought = point.trades
+        assert (sold.ticker_a, sold.ticker_b) == ("SA", "SB")
+        assert sold.sold and sold.exit_date == _LADDER_M2 and sold.n == base.trades[0].n
+        assert (sold.sale_price_a, sold.sale_price_b) == (0.28, 0.55)
+        assert sold.actual_payoff == _sale_value(1, ("bid", 0.28), ("bid", 0.55))
+        # SA is free again, but not at the checkpoint it was sold at
+        assert (bought.pair_type, bought.ticker_a, bought.ticker_b, bought.entry_date) == (
+            "time_series", "SA", "SC", _LADDER_M3)
+        assert (f"{self._LINE} ({_label(0.05)}, trimming to Kelly): 1 "
+                f"(contract pairs sold: {sold.n})") in caplog.text
+
     def test_with_adding_on_the_latest_contracts_are_sold_first(self):
         # The pair is bought on Monday 1 and added to on Monday 2, when its
         # quotes widen; on Monday 3 its bids are up and it is past its cap
@@ -21756,20 +22080,27 @@ class TestTrimMinMove:
     def test_the_pair_s_price_is_the_ask_of_each_side_it_holds(self):
         candles = self._TRIM._SUITE._candles()
         (held,) = self._plain(self._records()).trades
-        same_title = dc_replace(held, pair_type="same_title")
         for day, total in self._ASKS.items():
             (a,) = [c for c in candles["SA"] if c["ts"] == _ck(day)]
             (b,) = [c for c in candles["SB"] if c["ts"] == _ck(day)]
             # A time-series pair holds YES on its first market and NO on its second
             assert a["yes_ask_close"] + b["no_ask_close"] == pytest.approx(total, abs=1e-12)
             assert backtester._pair_price(held, day) == a["yes_ask_close"] + b["no_ask_close"]
-            # ... and a same-title pair NO on its first and YES on its second
-            assert backtester._pair_price(same_title, day) == (
-                a["no_ask_close"] + b["yes_ask_close"])
         # With no later candle the last asks stand; once SA has paid out
         # (02-10, "no"), its YES leg counts at its payout, nothing
         assert backtester._pair_price(held, date(2026, 2, 2)) == pytest.approx(0.77, abs=1e-12)
         assert backtester._pair_price(held, date(2026, 2, 16)) == pytest.approx(0.52, abs=1e-12)
+
+    def test_a_same_title_pair_s_price_is_the_ask_of_each_side_it_holds(self):
+        candles = self._TRIM._SUITE._candles()
+        (held,) = self._plain(self._records()).trades
+        same_title = dc_replace(held, pair_type="same_title")
+        for day in self._ASKS:
+            (a,) = [c for c in candles["SA"] if c["ts"] == _ck(day)]
+            (b,) = [c for c in candles["SB"] if c["ts"] == _ck(day)]
+            # A same-title pair holds NO on its first market and YES on its second
+            assert backtester._pair_price(same_title, day) == (
+                a["no_ask_close"] + b["yes_ask_close"])
 
     def test_no_minimum_is_the_default_and_the_run_without_the_keyword(self, caplog):
         default = inspect.signature(backtester._simulate_at_discount).parameters["min_move"]
@@ -23624,7 +23955,7 @@ class TestLoneLegTrim:
         # Nothing changed since Monday 3, so the 249 of the fresh Monday 3 above
         assert part.n == 249 and part.sale_price_a is None
 
-    def test_a_same_title_pair_or_a_lone_earlier_market_is_left_alone(self):
+    def test_a_lone_earlier_market_is_left_alone(self):
         # The earlier market still open beside a later one that paid out
         # first: its YES has grown past the cap (a YES bid of 0.78 on LA from
         # Monday 3), but it is no lone leg the trim sells
@@ -23638,7 +23969,8 @@ class TestLoneLegTrim:
         (held,) = point.trades
         assert backtester._lone_leg(held, _LADDER_M3) is False
         assert backtester._fresh_bids(held, _LADDER_M3) is None
-        # A same-title pair whose first market paid out: left alone too
+
+    def test_a_same_title_pair_whose_first_market_paid_out_is_left_alone(self):
         day = _LADDER_M2
         paid = _sale_quotes("QA", float("nan"), float("nan"), None, paid=True)
         trade = _held_trade(5000, paid, _sale_quotes("QB", 0.23, 0.75, None),
@@ -23872,10 +24204,15 @@ class TestAddOnWaitsForAMove:
         assert point.moves == (pytest.approx((-0.25,), abs=1e-12) if adds else ())
         assert len(self._lines(caplog, _ADD_ON_MOVE_LINE)) == (0 if adds else 1)
 
-    def test_a_lone_leg_s_move_reads_its_own_market_from_its_last_trade(self):
+    def _p_trade(self):
+        """P's first trade (YES PA / NO PB, Monday 1), carrying PB's quotes."""
         (p_trade,) = backtester._simulate_at_discount(
             self._lone()[:1], self._START, 10_000.0, k=0.85, size_cap=0.20,
             end_date=self._END).trades
+        return p_trade
+
+    def test_a_lone_leg_s_move_reads_its_own_market_from_its_last_trade(self):
+        p_trade = self._p_trade()
         legs = [{"trade": p_trade, "ticker": "PB"}]
         move = backtester._lone_leg_move
         # From P's purchase: PB's NO ask, 0.55 then and 0.25 on Monday 3
@@ -23885,18 +24222,25 @@ class TestAddOnWaitsForAMove:
         assert move(legs, _LADDER_M3, {("PA", "PB"): _LADDER_M2}) == (
             _LADDER_M2, pytest.approx(-0.05, abs=1e-12))
         assert move(legs, _LADDER_M3, {("QA", "PB"): _LADDER_M2})[0] == _LADDER_M1
+        # No quotes, no move
+        assert move([{"trade": dc_replace(p_trade, marks=None), "ticker": "PB"}],
+                    _LADDER_M3, {}) == (_LADDER_M1, None)
+
+    def test_a_lone_leg_s_move_reads_each_trade_s_own_side_of_a_same_title_leg(self):
         # The held market can be market A in one trade and market B in another:
         # each trade's own side of it is read (here a same-title trade holding NO
-        # on PB as its market A, bought on Monday 2)
+        # on PB as its market A, bought on Monday 2). A time-series trade holds
+        # NO only on its market B, so only a same-title trade can hold the same
+        # side of a market from the other slot.
+        p_trade = self._p_trade()
+        legs = [{"trade": p_trade, "ticker": "PB"}]
+        move = backtester._lone_leg_move
         flipped = dc_replace(p_trade, pair_type="same_title", ticker_a="PB", ticker_b="XB",
                              marks=(p_trade.marks[1], p_trade.marks[0]),
                              entry_date=_LADDER_M2)
         assert backtester.leg_sides("same_title")[0] == backtester.leg_sides("time_series")[1]
         both = [*legs, {"trade": flipped, "ticker": "PB"}]
         assert move(both, _LADDER_M3, {}) == (_LADDER_M2, pytest.approx(-0.05, abs=1e-12))
-        # No quotes, no move
-        assert move([{"trade": dc_replace(p_trade, marks=None), "ticker": "PB"}],
-                    _LADDER_M3, {}) == (_LADDER_M1, None)
 
     # ── The wait ──
 

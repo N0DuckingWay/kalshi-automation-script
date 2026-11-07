@@ -110,7 +110,8 @@ _BASE = {"tier_floors": "off", "spread_min": "0", "spread_max": "0.5", "k": "0.8
          "size_cap": "0.1"}
 # What _BASE proposes with nothing saved: the fields it leaves out take the
 # seed's values (20% same-title cap, rebalancing on with no minimum, no selling)
-_BASE_SETTINGS = LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True)
+_BASE_SETTINGS = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                              size_cap=0.1, same_title_size_cap=0.2, rebalance=True)
 # The ASCII digits as Arabic-Indic and as full-width digits (str.translate tables)
 _ARABIC_INDIC = str.maketrans("0123456789", "".join(chr(0x0660 + i) for i in range(10)))
 _FULL_WIDTH = str.maketrans("0123456789", "".join(chr(0xFF10 + i) for i in range(10)))
@@ -828,7 +829,8 @@ class TestConfirmPage:
     """GET /confirm: the defaults in force beside the proposed ones."""
 
     def test_with_a_file_saved_only_the_changed_rows_are_highlighted(self):
-        saved = _save(LiveSettings(True, (0.0, 1.0), 0.8, 0.1, 0.5), source=DASHBOARD_NOTE)
+        saved = _save(LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.8,
+                                   size_cap=0.1, same_title_size_cap=0.5), source=DASHBOARD_NOTE)
         response = _get(_app(), "/confirm?" + _query(same_title_size_cap="0.5",
                                                    source=DASHBOARD_NOTE))
         assert response.status == 200
@@ -851,7 +853,8 @@ class TestConfirmPage:
         assert page.cells["spread band"][:3] == ["spread band", "none", "0-0.5"]
 
     def test_the_changed_value_is_bold(self):
-        _save(LiveSettings(True, (0.0, 1.0), 0.8, 0.1, 0.5))
+        _save(LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.8,
+                           size_cap=0.1, same_title_size_cap=0.5))
         body = _get(_app(), "/confirm?" + _query(same_title_size_cap="0.5")).body
         assert '<td><b>off</b></td>' in body
         assert '<td><b>0.8</b></td>' not in body
@@ -874,7 +877,9 @@ class TestConfirmPage:
 
     def test_the_exposure_warning_shows(self):
         response = _get(_app(), "/confirm?" + _query(k="0.4", size_cap="1"))
-        warnings = config.live_rule_warnings(LiveSettings(False, (0.0, 0.5), 0.4, 1.0, 0.2))
+        warnings = config.live_rule_warnings(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5),
+                                                          interval_discount=0.4, size_cap=1.0,
+                                                          same_title_size_cap=0.2))
         assert warnings
         for sentence in warnings:
             assert f'<p class="warn">Warning: {sentence}.</p>' in response.body
@@ -883,7 +888,9 @@ class TestConfirmPage:
         assert 'class="warn"' not in _get(_app(), "/confirm?" + _query()).body
 
     # Saved defaults that rebalance: k 0.8, 20% per-trade and same-title caps
-    _REBALANCE_SAVED = LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, rebalance=True)
+    _REBALANCE_SAVED = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5),
+                                    interval_discount=0.8, size_cap=0.2, same_title_size_cap=0.2,
+                                    rebalance=True)
 
     @pytest.mark.parametrize("link, named, lone", [
         ({"size_cap": "0.1", "same_title_size_cap": "0.2"},
@@ -937,14 +944,16 @@ class TestConfirmPage:
         assert 'class="warn"' not in response.body
 
     def test_a_missing_same_title_cap_keeps_the_saved_value(self):
-        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.5))
+        _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                           size_cap=0.1, same_title_size_cap=0.5))
         page = _parse(_get(_app(), "/confirm?" + _query()).body)
         assert page.rows["same-title cap"] == "same"
         assert page.cells["same-title cap"][1:3] == ["50%", "50%"]
 
     @pytest.mark.parametrize("given, saved_on", [("on", False), ("off", True)])
     def test_a_named_rebalance_is_proposed(self, given, saved_on):
-        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=saved_on))
+        _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                           size_cap=0.1, same_title_size_cap=0.2, rebalance=saved_on))
         page = _parse(_get(_app(), "/confirm?" + _query(rebalance=given)).body)
         assert page.rows["rebalance"] == "changed"
         assert page.cells["rebalance"][1:3] == ["yes" if saved_on else "no",
@@ -955,7 +964,8 @@ class TestConfirmPage:
     def test_missing_sell_settings_keep_the_saved_values(self, saved):
         # A link that names neither (an older dashboard page, a hand-made link)
         # leaves selling exactly as saved, shown as no change
-        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, **saved))
+        _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                           size_cap=0.1, same_title_size_cap=0.2, **saved))
         page = _parse(_get(_app(), "/confirm?" + _query()).body)
         assert page.rows["sell at"] == page.rows["min days to maturity"] == "same"
         assert page.cells["sell at"][1] == page.cells["sell at"][2]
@@ -993,7 +1003,8 @@ class TestConfirmPage:
         assert page.cells["min days to maturity"][1:3] == ["—", days]
 
     def test_a_named_sell_level_over_a_saved_one_is_a_change(self):
-        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, sell_at=0.85, sell_min_days=3))
+        _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                           size_cap=0.1, same_title_size_cap=0.2, sell_at=0.85, sell_min_days=3))
         page = _parse(_get(_app(), "/confirm?" + _query(sell_at="0.9")).body)
         assert page.rows["sell at"] == "changed"
         assert page.cells["sell at"][1:3] == ["85% of potential profit", "90% of potential profit"]
@@ -1008,7 +1019,8 @@ class TestConfirmPage:
 
     def test_turning_the_level_off_but_keeping_a_saved_minimum_is_refused_with_the_reason(self):
         # The minimum was left out, so it stays at the saved 3 with no level
-        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, sell_at=0.85, sell_min_days=3))
+        _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                           size_cap=0.1, same_title_size_cap=0.2, sell_at=0.85, sell_min_days=3))
         response = _get(_app(), "/confirm?" + _query(sell_at="off"))
         assert response.status == 400
         assert "sell_min_days needs a sell level" in html.unescape(response.body)
@@ -1020,7 +1032,8 @@ class TestConfirmPage:
         # A link that names neither field (the dashboard's save button on a
         # page without the Rebalance view, a hand-made link) keeps both as
         # saved, either way, shown as no change
-        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, **saved))
+        _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                           size_cap=0.1, same_title_size_cap=0.2, **saved))
         page = _parse(_get(_app(), "/confirm?" + _query()).body)
         assert page.rows["rebalance"] == page.rows["min price movement"] == "same"
         assert page.cells["rebalance"][1] == page.cells["rebalance"][2] == (
@@ -1069,7 +1082,8 @@ class TestConfirmPage:
         assert "--min-price-move=10" in config.live_settings_argv(settings)
 
     def test_a_named_minimum_move_over_a_saved_one_is_a_change(self):
-        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True,
+        _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                           size_cap=0.1, same_title_size_cap=0.2, rebalance=True,
                            min_price_move=0.25))
         page = _parse(_get(_app(), "/confirm?" + _query(min_price_move="0.1")).body)
         assert page.rows["min price movement"] == "changed"
@@ -1086,7 +1100,8 @@ class TestConfirmPage:
     def test_turning_rebalancing_off_but_keeping_a_saved_minimum_is_refused_with_the_reason(
             self):
         # The minimum was left out, so it stays at the saved 25c with rebalancing off
-        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True,
+        _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                           size_cap=0.1, same_title_size_cap=0.2, rebalance=True,
                            min_price_move=0.25))
         response = _get(_app(), "/confirm?" + _query(rebalance="off"))
         assert response.status == 400
@@ -1097,7 +1112,8 @@ class TestConfirmPage:
     def test_a_minimum_move_with_rebalancing_off_is_refused_with_the_reason(self, saved_off):
         # Named off by the link, or saved off and left out by it
         if saved_off:
-            _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2))
+            _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                               size_cap=0.1, same_title_size_cap=0.2))
             given = {"min_price_move": "0.1"}
         else:
             given = {"rebalance": "off", "min_price_move": "0.1"}
@@ -1125,7 +1141,8 @@ class TestConfirmPage:
         # A link that leaves it out (an older dashboard page, a hand-made link)
         # keeps it as saved, shown as no change, exactly as the minimum price
         # movement is kept
-        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, **saved))
+        _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                           size_cap=0.1, same_title_size_cap=0.2, **saved))
         page = _parse(_get(_app(), "/confirm?" + _query()).body)
         words = {None: "maturity", 1: "1 day before maturity", 7: "7 days before maturity"}
         expected = words[saved.get("rebalance_min_days_to_maturity")]
@@ -1159,7 +1176,8 @@ class TestConfirmPage:
         assert _parse(response.body).cells["rebalance until"][1:3] == ["—", words]
 
     def test_a_named_rebalance_until_over_a_saved_one_is_the_only_change(self):
-        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True,
+        _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                           size_cap=0.1, same_title_size_cap=0.2, rebalance=True,
                            rebalance_min_days_to_maturity=7))
         response = _get(_app(), "/confirm?" + _query(rebalance_min_days_to_maturity="1"))
         page = _parse(response.body)
@@ -1177,7 +1195,8 @@ class TestConfirmPage:
         # A page built before this field existed says rebalance=off and
         # min_price_move=off and knows nothing of it: the limit goes with the
         # switch, so the link is not refused for "needs rebalance on"
-        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True,
+        _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                           size_cap=0.1, same_title_size_cap=0.2, rebalance=True,
                            min_price_move=0.25, rebalance_min_days_to_maturity=7))
         query = _query(rebalance="off", min_price_move="off")
         proposed, _ = defaults_server._proposal(defaults_server._params(query),
@@ -1198,7 +1217,8 @@ class TestConfirmPage:
 
     def test_a_saved_limit_is_kept_when_the_link_leaves_out_both(self):
         # The switch is left out as well, so nothing says it goes off
-        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True,
+        _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                           size_cap=0.1, same_title_size_cap=0.2, rebalance=True,
                            rebalance_min_days_to_maturity=7))
         proposed, _ = defaults_server._proposal(defaults_server._params(_query()),
                                                 config.read_saved_live_defaults())
@@ -1219,7 +1239,8 @@ class TestConfirmPage:
 
     def test_a_limit_with_rebalancing_saved_off_is_refused_with_the_reason(self):
         # The switch is left out, so it stays at the saved off
-        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2))
+        _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                           size_cap=0.1, same_title_size_cap=0.2))
         before = config.LIVE_DEFAULTS_FILE.read_bytes()
         response = _get(_app(), "/confirm?" + _query(rebalance_min_days_to_maturity="1"))
         assert response.status == 400
@@ -1251,7 +1272,9 @@ class TestConfirmPage:
         assert "rebalance_min_days_to_maturity is given 2 times" in response.body
 
     def test_a_missing_exclusion_proposes_none(self):
-        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, ("Sports",), ("Basketball",)))
+        _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                           size_cap=0.1, same_title_size_cap=0.2, exclude_categories=("Sports",),
+                           exclude_tags=("Basketball",)))
         page = _parse(_get(_app(), "/confirm?" + _query(same_title_size_cap="0.2")).body)
         assert page.rows["exclude categories"] == page.rows["exclude tags"] == "changed"
         assert page.cells["exclude categories"][1:3] == ["Sports", "none"]
@@ -1346,7 +1369,8 @@ class TestTradePage:
     """GET /trade: the saved live defaults, and the buttons that run the bot with them."""
 
     def test_it_shows_the_saved_defaults(self):
-        saved = _save(LiveSettings(False, (0.0, 0.5), 0.4, 1.0, 0.2), source=DASHBOARD_NOTE)
+        saved = _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.4,
+                                   size_cap=1.0, same_title_size_cap=0.2), source=DASHBOARD_NOTE)
         response = _get(_app(start_process=_Starter()), "/trade")
         assert response.status == 200
         page = _parse(response.body)
@@ -1762,7 +1786,8 @@ class TestConfirmRefusals:
             source=config.LIVE_DEFAULTS_SEED_SOURCE)).status == 200
         # ... but a same-title cap that falls back to a saved 50% is not the
         # seed's, so its note may not label it
-        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.5))
+        _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                           size_cap=0.1, same_title_size_cap=0.5))
         response = _get(_app(), "/confirm?" + _query(source=config.LIVE_DEFAULTS_SEED_SOURCE))
         assert response.status == 400
         assert "may label only the seed values" in response.body
@@ -2204,7 +2229,8 @@ class TestSeveralCategoriesAndTags:
     def test_a_stale_page_is_shown_again_with_every_name(self):
         app = _app()
         form = _page_form(app, _filter_query(self._CATEGORIES, self._TAGS))
-        _save(LiveSettings(True, (0.0, 1.0), 0.8, 0.1, 0.5))
+        _save(LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.8,
+                           size_cap=0.1, same_title_size_cap=0.5))
         response = _post(app, form)
         assert response.status == 409
         page = _parse(response.body)
@@ -2255,8 +2281,9 @@ _OLD_VERSION_BYTES = (
     b'  }\n'
     b'}\n')
 # What it reads as now: rebalance yes with the old 10c minimum, the rest as saved
-_OLD_VERSION_READS_AS = LiveSettings(False, (0.0, 0.8), 0.7, 0.15, 0.2, rebalance=True,
-                                     min_price_move=0.10)
+_OLD_VERSION_READS_AS = LiveSettings(tier_floors=False, spread_band=(0.0, 0.8),
+                                     interval_discount=0.7, size_cap=0.15, same_title_size_cap=0.2,
+                                     rebalance=True, min_price_move=0.10)
 # The notice the confirmation page shows above its table when it proposes them
 _OUTDATED_CONFIRM_NOTICE = (
     "The saved live defaults were saved before Rebalance. Below: their values, read as "
@@ -2906,13 +2933,15 @@ class TestSave:
         assert "rebalance_min_days_to_maturity" not in config.LIVE_DEFAULTS_FILE.read_text()
 
     def test_it_overwrites_the_defaults_in_force(self):
-        _save(LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0))
+        _save(LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                           size_cap=0.2, same_title_size_cap=1.0))
         app = _app()
         form = _page_form(app, _query(exclude_category="Sports", exclude_tag="Basketball",
                                       same_title_size_cap="0.5"))
         assert _post(app, form).status == 303
         assert config.read_saved_live_defaults() == LiveSettings(
-            False, (0.0, 0.5), 0.8, 0.1, 0.5, ("Sports",), ("Basketball",))
+            tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8, size_cap=0.1,
+            same_title_size_cap=0.5, exclude_categories=("Sports",), exclude_tags=("Basketball",))
 
     def test_a_form_with_a_charset_is_accepted(self):
         app = _app()
@@ -3043,7 +3072,8 @@ class TestSave:
     def test_a_stale_page_is_shown_again_against_the_defaults_in_force(self):
         app = _app()
         form = _page_form(app, _query())
-        other = _save(LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0))
+        other = _save(LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                                   size_cap=0.2, same_title_size_cap=1.0))
         before = config.LIVE_DEFAULTS_FILE.read_bytes()
         response = _post(app, form)
         assert response.status == 409
@@ -3056,11 +3086,13 @@ class TestSave:
         assert dict(again)["nonce"] != dict(form)["nonce"]
         # The page shown again saves
         assert _post(app, again).status == 303
-        assert config.read_saved_live_defaults() == LiveSettings(False, (0.0, 0.5), 0.8,
-                                                                 0.1, 1.0)
+        assert config.read_saved_live_defaults() == LiveSettings(
+            tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8, size_cap=0.1,
+            same_title_size_cap=1.0)
 
     def test_a_failed_save_is_a_500_and_keeps_the_old_file(self, monkeypatch):
-        _save(LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0))
+        _save(LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                           size_cap=0.2, same_title_size_cap=1.0))
         before = config.LIVE_DEFAULTS_FILE.read_bytes()
         app = _app()
         form = _page_form(app, _query())
@@ -3112,7 +3144,8 @@ class TestSave:
         assert _post(app, form).status == 200
 
     def test_the_save_is_logged_against_the_defaults_it_replaced(self, caplog):
-        _save(LiveSettings(True, (0.0, 0.5), 0.8, 0.1, 0.2))
+        _save(LiveSettings(tier_floors=True, spread_band=(0.0, 0.5), interval_discount=0.8,
+                           size_cap=0.1, same_title_size_cap=0.2))
         app = _app()
         form = _page_form(app, _query())
         with caplog.at_level(logging.INFO):
@@ -3154,7 +3187,8 @@ class TestSavedPage:
         assert str(config.LIVE_DEFAULTS_FILE.absolute()) in response.body
 
     def test_a_warning_is_shown_as_a_note_on_what_was_saved(self):
-        saved = _save(LiveSettings(False, (0.0, 0.5), 0.4, 1.0, 0.2))
+        saved = _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.4,
+                                   size_cap=1.0, same_title_size_cap=0.2))
         body = _get(_app(), "/saved").body
         sentences = config.live_rule_warnings(saved)
         assert sentences
@@ -3174,7 +3208,8 @@ class TestSeed:
         assert settings == config.LIVE_DEFAULTS_SEED
         assert source == config.LIVE_DEFAULTS_SEED_SOURCE
         # It names every field, so what is saved does not change it
-        saved = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0)
+        saved = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                             size_cap=0.2, same_title_size_cap=1.0)
         assert defaults_server._proposal(params, saved)[0] == config.LIVE_DEFAULTS_SEED
 
     def test_the_seed_query_spells_selling_off(self):
@@ -3319,13 +3354,17 @@ class TestHelpers:
     """The pieces the routes are built from."""
 
     @pytest.mark.parametrize("settings, written", [
-        (LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True), "0"),
-        (LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True,
+        (LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                      size_cap=0.1, same_title_size_cap=0.2, rebalance=True), "0"),
+        (LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                      size_cap=0.1, same_title_size_cap=0.2, rebalance=True,
                       rebalance_min_days_to_maturity=1), "1"),
-        (LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True, min_price_move=0.1,
+        (LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                      size_cap=0.1, same_title_size_cap=0.2, rebalance=True, min_price_move=0.1,
                       rebalance_min_days_to_maturity=7), "7"),
         # With rebalancing off there is no limit to write but "maturity"
-        (LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2), "0"),
+        (LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                      size_cap=0.1, same_title_size_cap=0.2), "0"),
     ])
     def test_the_settings_query_names_the_limit_and_reads_back(self, settings, written):
         query = defaults_server._settings_query(settings)
@@ -3335,7 +3374,9 @@ class TestHelpers:
         assert list(params).index("rebalance_min_days_to_maturity") == (
             list(params).index("min_price_move") + 1)
         # It proposes exactly these settings, whatever is saved
-        for saved in (None, LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0, rebalance=True,
+        for saved in (None, LiveSettings(tier_floors=True, spread_band=(0.0, 1.0),
+                                         interval_discount=0.75, size_cap=0.2,
+                                         same_title_size_cap=1.0, rebalance=True,
                                          rebalance_min_days_to_maturity=7)):
             assert defaults_server._proposal(params, saved) == (settings, "")
 
@@ -3833,7 +3874,8 @@ class TestActions:
 
     def test_the_trade_page_keeps_a_saved_rebalance_until(self):
         # /trade runs the saved defaults, flags and all
-        saved = _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True,
+        saved = _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                                   size_cap=0.1, same_title_size_cap=0.2, rebalance=True,
                                    rebalance_min_days_to_maturity=1))
         starter = _Starter()
         app = _app(start_process=starter)
@@ -3861,8 +3903,9 @@ class TestActions:
         run_id = _run_id(_post(app, form))
         saved = config.read_saved_live_defaults()
         # Nothing was saved before, so rebalancing is the seed's (on)
-        assert saved == LiveSettings(False, (0.0, 0.5), 0.75, 0.1, 0.2, ("Sports",),
-                                     rebalance=True)
+        assert saved == LiveSettings(tier_floors=False, spread_band=(0.0, 0.5),
+                                     interval_discount=0.75, size_cap=0.1, same_title_size_cap=0.2,
+                                     exclude_categories=("Sports",), rebalance=True)
         folder = _run_folder(run_id)
         [(argv, kwargs)] = starter.calls
         assert argv == [sys.executable, "-m", "kalshi_betting.main", "--mode", "prod",
@@ -3911,7 +3954,8 @@ class TestActions:
         assert starter.run_json[0]["saved_note"] == defaults_server._DRY_RUN_SAVED_NOTE
 
     def test_the_trade_page_starts_the_saved_defaults(self):
-        saved = _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.15, 0.2), source=DASHBOARD_NOTE)
+        saved = _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                                   size_cap=0.15, same_title_size_cap=0.2), source=DASHBOARD_NOTE)
         before = config.LIVE_DEFAULTS_FILE.read_bytes()
         starter = _Starter()
         app = _app(start_process=starter)
@@ -4133,7 +4177,8 @@ class TestBlockers:
         starter = _Starter()
         app = _app(start_process=starter)
         form = _trade_form(app)
-        other = _save(LiveSettings(False, (0.0, 0.5), 0.75, 0.1, 0.2))
+        other = _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5),
+                                   interval_discount=0.75, size_cap=0.1, same_title_size_cap=0.2))
         response = _post(app, form, target="/trade")
         assert response.status == 409
         assert defaults_server._STALE_BANNER in response.body

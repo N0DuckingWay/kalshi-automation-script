@@ -1039,7 +1039,8 @@ class TestLiveSettings:
             assert _settings(sell_at=level).sell_at == level
 
     def test_sell_at_defaults_to_never_selling(self):
-        s = LiveSettings(True, (0.0, 1.0), 0.75, 0.2)
+        s = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                         size_cap=0.2)
         assert s.sell_at is None and s.sell_min_days is None
         assert _settings().sell_at is None and _settings().sell_min_days is None
         # None is a value, and replace takes it back
@@ -1082,7 +1083,8 @@ class TestLiveSettings:
     def test_rebalancing_defaults_to_off_with_no_minimum(self):
         # A construction that names neither reads rebalancing as off with no
         # minimum (a saved file that leaves them out: TestSavedLiveDefaults)
-        s = LiveSettings(True, (0.0, 1.0), 0.75, 0.2)
+        s = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                         size_cap=0.2)
         assert s.rebalance is False and s.min_price_move is None
         assert _settings().rebalance is False and _settings().min_price_move is None
         on = _settings(rebalance=True)
@@ -1096,7 +1098,8 @@ class TestLiveSettings:
         assert not set(config._RETIRED_TOGGLES) & {f.name for f in dataclasses.fields(
             LiveSettings)}
         with pytest.raises(TypeError):
-            LiveSettings(True, (0.0, 1.0), 0.75, 0.2, add_to_held_pairs=True)
+            LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                         size_cap=0.2, add_to_held_pairs=True)
 
     # 0.07 and 0.125 sit between 5c steps; 1e-7 and 1e-6 round to zero steps;
     # 1.05 is past $1; 10 is ten dollars, not ten cents
@@ -1164,7 +1167,8 @@ class TestLiveSettings:
 
     def test_rebalance_until_defaults_to_maturity(self):
         # A construction that names no days reads "maturity": always rebalance
-        assert LiveSettings(True, (0.0, 1.0), 0.75, 0.2).rebalance_min_days_to_maturity is None
+        assert LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                            size_cap=0.2).rebalance_min_days_to_maturity is None
         assert _settings().rebalance_min_days_to_maturity is None
         assert _settings(rebalance=True).rebalance_min_days_to_maturity is None
 
@@ -1421,7 +1425,8 @@ class TestLiveSettings:
         assert _settings(same_title_size_cap=0.05 * 7).same_title_size_cap == 0.35
         assert type(_settings(same_title_size_cap=1).same_title_size_cap) is float
         # Naming only the first four fields adds no same-title cap
-        assert LiveSettings(True, (0.0, 1.0), 0.75, 0.2).same_title_size_cap == 1.0
+        assert LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                            size_cap=0.2).same_title_size_cap == 1.0
         # ... and replace re-validates it like every other field
         with pytest.raises(ValueError, match="same_title_size_cap"):
             dataclasses.replace(_settings(), same_title_size_cap=0.37)
@@ -1454,7 +1459,8 @@ class TestLiveSettings:
         assert getattr(_settings(**{field: None}), field) is None
 
     def test_a_construction_without_the_filters_filters_nothing(self):
-        s = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0)
+        s = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                         size_cap=0.2, same_title_size_cap=1.0)
         assert s.exclude_categories is None and s.exclude_tags is None
         assert s.rebalance is False and s.min_price_move is None
         assert s.rebalance_min_days_to_maturity is None
@@ -1466,8 +1472,9 @@ class TestLiveSettings:
             "exclude_categories", "exclude_tags", "rebalance", "min_price_move",
             "rebalance_min_days_to_maturity", "sell_at", "sell_min_days"]
         assert [f.name for f in dataclasses.fields(LiveSettings)][-1] == "origin"
-        assert LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0, ("Sports",),
-                            ("Hockey",)).exclude_tags == ("Hockey",)
+        assert LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                            size_cap=0.2, same_title_size_cap=1.0, exclude_categories=("Sports",),
+                            exclude_tags=("Hockey",)).exclude_tags == ("Hockey",)
 
     @pytest.mark.parametrize("name, value", [("TRADE_EXCLUDE_CATEGORIES", "Sports"),
                                              ("TRADE_EXCLUDE_TAGS", ())])
@@ -3570,7 +3577,8 @@ class TestRebalanceChangeWarnings:
     sentence names every such change, and nothing else is warned about."""
 
     # A per-trade and a same-title cap of 20%, k 0.8, rebalancing on
-    _NOW = LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, rebalance=True)
+    _NOW = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                        size_cap=0.2, same_title_size_cap=0.2, rebalance=True)
 
     @staticmethod
     def _sentence(named: str, lone: bool = True) -> list:
@@ -4028,7 +4036,8 @@ class TestLiveSettingsOrigin:
     ])
     def test_a_blank_multi_line_or_non_printable_origin_is_refused(self, bad):
         with pytest.raises(ValueError, match="origin"):
-            LiveSettings(True, (0.0, 1.0), 0.75, 0.2, origin=bad)
+            LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                         size_cap=0.2, origin=bad)
         with pytest.raises(ValueError, match="origin"):
             dataclasses.replace(_settings(), origin=bad)
 
@@ -5001,8 +5010,9 @@ class TestSavedLiveDefaults:
             spread_band=[0, 1], interval_discount=1, size_cap=1,
             exclude_categories=[" Sports "], exclude_tags=["Basketball"])))
         saved = config.read_saved_live_defaults()
-        assert saved == LiveSettings(False, (0.0, 1.0), 1.0, 1.0, 0.2, ("Sports",),
-                                     ("Basketball",))
+        assert saved == LiveSettings(tier_floors=False, spread_band=(0.0, 1.0),
+                                     interval_discount=1.0, size_cap=1.0, same_title_size_cap=0.2,
+                                     exclude_categories=("Sports",), exclude_tags=("Basketball",))
         assert saved.origin == "live_defaults.json, saved 2026-09-27T21:05:13Z"
 
 
@@ -5101,8 +5111,10 @@ class TestOutdatedSavedFile:
         assert err.retired == ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise",
                                "categories", "tags")
         # Every other setting as saved; the origin names the file as a read would
-        assert err.proposal == LiveSettings(False, (0.0, 0.8), 0.7, 0.15, 0.2,
-                                            rebalance=True, min_price_move=0.10)
+        assert err.proposal == LiveSettings(tier_floors=False, spread_band=(0.0, 0.8),
+                                            interval_discount=0.7, size_cap=0.15,
+                                            same_title_size_cap=0.2, rebalance=True,
+                                            min_price_move=0.10)
         assert err.proposal.origin == (
             "live_defaults.json, saved 2026-10-11T18:22:05Z from backtest dashboard for "
             "2025-10-11 to 2026-10-11")
@@ -5514,7 +5526,9 @@ class TestLiveDefaultsSeed:
 
     def test_the_seed_values(self):
         seed = config.LIVE_DEFAULTS_SEED
-        assert seed == LiveSettings(False, (0.0, 0.5), 0.8, 0.10, 0.20, rebalance=True)
+        assert seed == LiveSettings(tier_floors=False, spread_band=(0.0, 0.5),
+                                    interval_discount=0.8, size_cap=0.10, same_title_size_cap=0.20,
+                                    rebalance=True)
         assert seed.min_price_move is None
         assert seed.exclude_categories is None and seed.exclude_tags is None
         assert seed.origin == config.LIVE_DEFAULTS_FROM_CONFIG
