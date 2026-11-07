@@ -3847,6 +3847,26 @@ class TestReturnByTradeType:
     def test_type_lines_sum_to_the_total_return(self):
         start = date(2026, 1, 5)
         trades = [
+            _typed_trade("time_series", False, date(2026, 1, 6), date(2026, 1, 8), 30.0),
+            _typed_trade("time_series", True, date(2026, 1, 6), date(2026, 1, 9), -12.0),
+            _typed_trade("time_series", False, date(2026, 1, 7), date(2026, 1, 9), 5.0),
+            _typed_trade("time_series", True, date(2026, 1, 8), date(2026, 1, 9), -4.0),
+        ]
+        curve = backtester._build_equity_curve(trades, start, 1000.0)
+        lines = dashboard._return_by_trade_type(trades, curve, 1000.0)
+        assert [label for label, _, _ in lines] == [
+            "Time-series: ladder", "Time-series: cross-event"]
+        total = (curve["portfolio_value"] / 1000.0 - 1.0) * 100
+        summed = [sum(values) for values in zip(*(s for _, _, s in lines), strict=True)]
+        assert summed == pytest.approx(list(total), abs=1e-9)
+        # Each type ends at its own profit, in percent of the $1,000 start
+        ends = {label: s[-1] for label, _, s in lines}
+        assert ends["Time-series: ladder"] == pytest.approx((-12.0 - 4.0) / 10)
+        assert ends["Time-series: cross-event"] == pytest.approx((30.0 + 5.0) / 10)
+
+    def test_type_lines_with_a_same_title_line_sum_to_the_total_return(self):
+        start = date(2026, 1, 5)
+        trades = [
             _typed_trade("same_title", False, date(2026, 1, 6), date(2026, 1, 8), 30.0),
             _typed_trade("time_series", True, date(2026, 1, 6), date(2026, 1, 9), -12.0),
             _typed_trade("time_series", False, date(2026, 1, 7), date(2026, 1, 9), 5.0),
@@ -3866,23 +3886,44 @@ class TestReturnByTradeType:
         assert ends["Time-series: cross-event"] == pytest.approx(0.5)
 
     def test_only_types_with_trades_get_a_line(self):
+        start = date(2026, 1, 5)
+        for ladder, label in ((True, "Time-series: ladder"),
+                              (False, "Time-series: cross-event")):
+            trades = [_typed_trade("time_series", ladder, date(2026, 1, 6), date(2026, 1, 8),
+                                   3.0)]
+            curve = backtester._build_equity_curve(trades, start, 1000.0)
+            assert [x for x, _, _ in dashboard._return_by_trade_type(
+                trades, curve, 1000.0)] == [label]
+        assert dashboard._return_by_trade_type([], curve, 1000.0) == []
+
+    def test_a_lone_same_title_trade_gets_a_same_title_line(self):
         trades = [_typed_trade("same_title", False, date(2026, 1, 6), date(2026, 1, 8), 3.0)]
         curve = backtester._build_equity_curve(trades, date(2026, 1, 5), 1000.0)
         assert [x for x, _, _ in dashboard._return_by_trade_type(trades, curve, 1000.0)] == [
             "Same-title"]
-        assert dashboard._return_by_trade_type([], curve, 1000.0) == []
 
     def test_the_first_chart_carries_the_total_and_the_type_lines(self):
         trades = [
-            _typed_trade("same_title", False, date(2026, 1, 6), date(2026, 1, 8), 3.0),
+            _typed_trade("time_series", True, date(2026, 1, 6), date(2026, 1, 8), 3.0),
             _typed_trade("time_series", False, date(2026, 1, 6), date(2026, 1, 8), -1.0),
         ]
         curve = backtester._build_equity_curve(trades, date(2026, 1, 5), 1000.0)
         section = dashboard._section_performance(curve, trades, date(2026, 1, 5), 1000.0)
         data, layout = _first_figure(section)
         assert [tr["name"] for tr in data] == [
-            "Total return", "Same-title", "Time-series: cross-event"]
+            "Total return", "Time-series: ladder", "Time-series: cross-event"]
         assert layout["title"]["text"].startswith("Cumulative Return by Trade Type")
+
+    def test_the_first_chart_carries_a_same_title_line(self):
+        trades = [
+            _typed_trade("same_title", False, date(2026, 1, 6), date(2026, 1, 8), 3.0),
+            _typed_trade("time_series", False, date(2026, 1, 6), date(2026, 1, 8), -1.0),
+        ]
+        curve = backtester._build_equity_curve(trades, date(2026, 1, 5), 1000.0)
+        section = dashboard._section_performance(curve, trades, date(2026, 1, 5), 1000.0)
+        data, _ = _first_figure(section)
+        assert [tr["name"] for tr in data] == [
+            "Total return", "Same-title", "Time-series: cross-event"]
 
 
 class TestSectionDataHelpers:
@@ -3892,7 +3933,7 @@ class TestSectionDataHelpers:
 
     def _trades(self):
         return [
-            _typed_trade("same_title", False, date(2026, 1, 6), date(2026, 1, 8), 30.0),
+            _typed_trade("time_series", False, date(2026, 1, 6), date(2026, 1, 8), 30.0),
             _typed_trade("time_series", True, date(2026, 1, 6), date(2026, 1, 9), -12.0),
             _typed_trade("time_series", False, date(2026, 2, 7), date(2026, 2, 9), 5.0),
         ]
@@ -4629,14 +4670,22 @@ def _ftrade(event_ticker: str, pair_type: str, entry: date, exit_: date,
 
 
 def _flt_trades() -> list[BacktestTrade]:
+    """Five time-series trades: a ladder on the Hockey series and cross-event
+    pairs on the others — two Basketball trades, one Oil & Gas and one on a
+    series the map lacks (KXOTHER, filed under its fallback category)."""
     return [
-        _ftrade("KXNCAAMBGAME-1", "same_title", date(2026, 1, 6), date(2026, 1, 8), 30.0),
-        _ftrade("KXBRENTW-1", "same_title", date(2026, 1, 6), date(2026, 1, 9), -12.0),
+        _ftrade("KXNCAAMBGAME-1", "time_series", date(2026, 1, 6), date(2026, 1, 8), 30.0),
+        _ftrade("KXBRENTW-1", "time_series", date(2026, 1, 6), date(2026, 1, 9), -12.0),
         _ftrade("KXNHLHART-27", "time_series", date(2026, 1, 12), date(2026, 1, 20), 8.0,
                 ladder=True),
-        _ftrade("KXNCAAMBGAME-2", "same_title", date(2026, 1, 13), date(2026, 1, 14), -5.0),
+        _ftrade("KXNCAAMBGAME-2", "time_series", date(2026, 1, 13), date(2026, 1, 14), -5.0),
         _ftrade("KXOTHER-1", "time_series", date(2026, 1, 13), date(2026, 1, 16), 4.0),
     ]
+
+
+def _flt_narrow(trades: list[BacktestTrade]) -> list[BacktestTrade]:
+    """The trades the narrow bands hold: the Basketball and Oil & Gas ones."""
+    return [t for t in trades if t.event_ticker.startswith(("KXNCAAMBGAME", "KXBRENTW"))]
 
 
 # Implied gaps whose float sum depends on the order they are added in: the
@@ -4659,21 +4708,22 @@ def _flt_calibration(filed: list[tuple[str, str]]) -> IntervalCalibration:
 
 def _flt_sweep(size_cap: float | None = 0.2) -> BacktestSweep:
     """Three bands at k 0.75 — the primary, 0-1, holding every trade; 0.3-0.6
-    holding only the same-title ones; 0.3-1 an EQUAL copy of 0.3-0.6's list
-    — plus one more k at the primary band (0.60) and at 0.3-0.6 (1.00). The
-    bar's k axis is therefore 0.60 / 0.75 / 1.00 and the grid is ragged: (0-1,
-    1.00), (0.3-0.6, 0.60) and 0.3-1 at 0.60 and 1.00 were never simulated.
-    The k 0.60 and 1.00 points trade EQUAL lists (one same-title trade each),
-    which the bar still keeps apart: a list's Kelly scatter is priced at its
-    k. Two points the bar must never read: another population at 0.3-0.6 and
-    k 0.75, and a point with no band. Every point is stamped `size_cap` — the
+    holding only the three Basketball and Oil & Gas trades (_flt_narrow);
+    0.3-1 an EQUAL copy of 0.3-0.6's list — plus one more k at the primary
+    band (0.60) and at 0.3-0.6 (1.00). The bar's k axis is therefore 0.60 /
+    0.75 / 1.00 and the grid is ragged: (0-1, 1.00), (0.3-0.6, 0.60) and
+    0.3-1 at 0.60 and 1.00 were never simulated. The k 0.60 and 1.00 points
+    trade EQUAL lists (the first Basketball trade each), which the bar still
+    keeps apart: a list's Kelly scatter is priced at its k. Two points the
+    bar must never read: another population at 0.3-0.6 and k 0.75, and a
+    point with no band. Every point is stamped `size_cap` — the
     run's own cap, 0.2 as production stamps it (the summary then reads "20%
     cap per trade"; None pins "cap not recorded"). Only the primary band
     carries a k-hat population; KXSPACEX has no trade and no map entry, so its
     observation files under its fallback category, "Science", which no trade
     carries."""
     trades = _flt_trades()
-    st = [t for t in trades if t.pair_type == "same_title"]
+    st = _flt_narrow(trades)
     curve = backtester._build_equity_curve
 
     def point(k, listed, band, population="all"):
@@ -5012,7 +5062,7 @@ class TestFilterGrid:
         # same list at the same k: the shared chunk must keep the primary's
         # own curve (the page's), not the other band's (a curve built later can
         # run a day on)
-        st = [t for t in _flt_trades() if t.pair_type == "same_title"]
+        st = _flt_narrow(_flt_trades())
         page_curve = backtester._build_equity_curve(st, _FLT_START, 1000.0)
         other_curve = page_curve.assign(portfolio_value=page_curve["portfolio_value"] + 1.0)
         primary = SweepPoint(k=0.75, trades=st, equity_df=page_curve,
@@ -5115,7 +5165,29 @@ class TestFilterViews:
         assert _expand(view["total"], n)[-1] == pytest.approx(pnl / 1000.0 * 100, abs=1e-4)
         assert view["kpi"]["trades"] == "3"
         assert view["kpi"]["total_return"] == f"{pnl / 1000.0:+.1%}"
-        # Its type lines are only the types it holds
+        # Its type lines are the two types it holds: the Hockey ladder and
+        # the two Basketball cross-event pairs
+        assert [label for label, _ in view["types"]] == [
+            "Time-series: ladder", "Time-series: cross-event"]
+        # A slice holding one type draws only that type's line: Commodities
+        # holds the Oil & Gas cross-event pair alone, and no ladder
+        commodities = _view(base, chunks, *_FLT_PRIMARY, _key(base, "Commodities"))
+        assert commodities["n"] == 1
+        assert [label for label, _ in commodities["types"]] == ["Time-series: cross-event"]
+
+    def test_a_slice_with_same_title_trades_draws_their_line(self):
+        # The Basketball trades as same-title pairs: the Sports slice then
+        # holds same-title trades and the Hockey ladder, and draws a line for
+        # each of the two types
+        trades = [dataclasses.replace(t, pair_type="same_title")
+                  if t.event_ticker.startswith("KXNCAAMBGAME") else t for t in _flt_trades()]
+        curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+        sweep = BacktestSweep(
+            primary=SweepPoint(k=0.75, trades=trades, equity_df=curve, spread_band=(0.0, 1.0)),
+            points=[], calibration=None)
+        _, _, base, chunks = _flt_payload(sweep)
+        view = _view(base, chunks, 0, 0, 0, _key(base, "Sports"))
+        assert view["n"] == 3
         assert [label for label, _ in view["types"]] == ["Same-title", "Time-series: ladder"]
 
     def test_best_and_worst_rows_are_the_slices_own(self):
@@ -5216,16 +5288,20 @@ def _mix_axes(series: dict) -> tuple[list[str], list[tuple[str, str]]]:
 
 
 def _mix_trades(seed: int, n: int = 36, *, quoted: bool = False, spread: int = 60,
-                series: dict = _MIX_SERIES) -> list[BacktestTrade]:
+                series: dict = _MIX_SERIES, same_title_share: float = 0.0
+                ) -> list[BacktestTrade]:
     """
     Seeded trades over a series map's tags (_MIX_SERIES' seven by default):
-    both pair types and every
-    trade type, entry quotes on and between the price-bucket edges and in
-    several calibration bins, every settlement cell, trades entered and paid
-    out on one day, and profits that sit exactly on a rounding tie (12.5,
-    0.0). `quoted` gives three trades in four quotes that move while they are
-    held (a run valued at market); the fourth stays at cost. Entries fall in
-    the first `spread` days from _MIX_START.
+    time-series ladder and cross-event trades, entry quotes on and between
+    the price-bucket edges and in several calibration bins, every settlement
+    cell, trades entered and paid out on one day, and profits that sit
+    exactly on a rounding tie (12.5, 0.0). `quoted` gives three trades in
+    four quotes that move while they are held (a run valued at market); the
+    fourth stays at cost. Entries fall in the first `spread` days from
+    _MIX_START. `same_title_share` makes each trade a same-title one with
+    that chance, for the checks of a trade with no calibration pair and of
+    the "Same-title" type line; at 0, the default, no number is drawn for
+    it, so every trade is time-series.
     """
     rng = random.Random(seed)
     mark_rng = random.Random(seed + 1000)
@@ -5235,13 +5311,16 @@ def _mix_trades(seed: int, n: int = 36, *, quoted: bool = False, spread: int = 6
         ticker = rng.choice(names)
         entry = _MIX_START + timedelta(days=rng.randint(0, spread))
         held = rng.choice([0, 1, 3, 8, 21])
-        time_series = rng.random() < 0.6
+        # Time-series with chance 1 - same_title_share, drawn only when that
+        # share is above 0
+        time_series = not same_title_share or rng.random() < 1.0 - same_title_share
         profit = rng.choice([round(rng.gauss(0.0, 20.0), 2), rng.gauss(0.0, 5.0), 12.5, -12.5, 0.0])
         pA = rng.choice([0.05, 0.2, 0.25, 0.4, 0.55, 0.8, 0.9])
         if time_series:
             pB = min(0.95, round(pA + rng.choice([0.1, 0.15, 0.3]), 2))
             outcomes = rng.choice([("yes", "yes"), ("no", "no"), ("no", "yes")])
         else:
+            # A same-title pair's two markets settle alike
             pB = round(max(0.03, pA - 0.1), 2)
             outcomes = rng.choice([("yes", "yes"), ("no", "no")])
         base = _typed_trade("time_series" if time_series else "same_title", rng.random() < 0.5,
@@ -5298,9 +5377,13 @@ class TestMixData:
     the same curve: "eq", "total", "types" and "dd") and its table row, and
     the constants and markup Python renders with."""
 
+    @pytest.mark.parametrize("same_title_share", [0.0, 0.4],
+                             ids=["time-series", "with-same-title"])
     @pytest.mark.parametrize("quoted", [False, True], ids=["at-cost", "at-market"])
-    def test_the_per_trade_arrays_are_the_trades_own_figures(self, quoted):
-        trades = _mix_trades(1, quoted=quoted)
+    def test_the_per_trade_arrays_are_the_trades_own_figures(self, quoted, same_title_share):
+        trades = _mix_trades(1, quoted=quoted, same_title_share=same_title_share)
+        # Only the fixture with a same-title share holds a same-title trade
+        assert any(t.pair_type == "same_title" for t in trades) is bool(same_title_share)
         lst, axis, _ = _mix_list(trades)
         days = [d.date() for d in axis]
         assert lst["pf"] == [t.profit for t in trades]
@@ -5316,7 +5399,7 @@ class TestMixData:
                      labels=dashboard._PRICE_BUCKET_LABELS)
         assert [dashboard._PRICE_BUCKET_LABELS[b] for b in lst["pb"]] == list(cut)
         assert {0, 1, 2, 3, 4} == set(lst["pb"])
-        # A time-series trade's calibration pair; none for a same-title one
+        # A time-series trade's calibration pair; a same-title trade has none
         obs = iter(dashboard._spread_observations(trades))
         for t, cp, ca in zip(trades, lst["cp"], lst["ca"], strict=True):
             assert ((cp, ca) == next(obs)) if t.pair_type == "time_series" \
@@ -7116,7 +7199,7 @@ class TestFilterScript:
         assert snap["heights"]["dec-sub"] == snap["ownHeights"]["dec-sub"] == f"{h}px"
 
     def test_a_band_without_the_selection_shows_no_trades(self, monkeypatch, tmp_path):
-        # Band 1 holds only same-title trades: none of them is in "Other"
+        # Band 1 holds only the Basketball and Oil & Gas trades: none of them is in "Other"
         page = self._page(monkeypatch, tmp_path)
         data = TestFilterPage._data(page)
         other = str(data["categories"].index("Other"))
@@ -10884,7 +10967,12 @@ def _ex_sweep(*, raise_on=None) -> BacktestSweep:
                                         eq=rich if k == 0.75 else None)
         for cap in _EX_CAPS:
             points[(_KC_B1, k, cap)] = pops(_KC_B1, k, cap, empty if k == 0.6 else other)
-    st_lists = {0.05: [_flt_trades()[0]], 0.2: _flt_trades()[:2], 1.0: _flt_trades()[:2]}
+
+    def same_title(count):
+        # The first Basketball trade, then the Oil & Gas one, as same-title pairs
+        return [dataclasses.replace(t, pair_type="same_title") for t in _flt_trades()[:count]]
+
+    st_lists = {0.05: same_title(1), 0.2: same_title(2), 1.0: same_title(2)}
     st = {cap: SweepPoint(k=0.75, trades=listed, equity_df=curve(listed),
                           population="same_title", size_cap=cap)
           for cap, listed in st_lists.items()}
@@ -18659,7 +18747,7 @@ class TestFilterPageSize:
             s = rng.choice(series)
             entry = start + timedelta(days=rng.randint(0, 150))
             return dataclasses.replace(
-                _typed_trade(rng.choice(["same_title", "time_series"]), rng.random() < 0.5,
+                _typed_trade("time_series", rng.random() < 0.5,
                              entry, entry + timedelta(days=rng.randint(1, 30)),
                              rng.gauss(0, 20)),
                 event_ticker=f"{s}-{i}", ticker_a=f"{s}-{i}A", title_a=f"Question {i}?")
@@ -20103,12 +20191,11 @@ class TestOpenTradesAtMarket:
     _END = date(2026, 1, 15)
 
     @classmethod
-    def _trades(cls) -> list[BacktestTrade]:
+    def _three_time_series_trades(cls) -> tuple[BacktestTrade, BacktestTrade, BacktestTrade]:
         """
-        Four trades: a time-series ladder whose earlier leg dips while it is
-        held, a cross-event pair that falls before it loses, a same-title pair
-        with a day of no usable quote (it keeps the day before's ask), and a
-        cross-event pair with no quotes (carried at cost).
+        A time-series ladder whose earlier leg dips while it is held, a
+        cross-event pair that falls before it loses, and a cross-event pair
+        with no quotes (carried at cost).
         """
         base = make_trade()
         ladder = _marked(
@@ -20120,7 +20207,43 @@ class TestOpenTradesAtMarket:
                              -(base.total_cost + base.fees)),
                 ticker_a="CROSS-A", ticker_b="CROSS-B", outcome_a="no", outcome_b="yes"),
             [0.30, 0.15], [0.40, 0.20])
-        # A same-title pair priced consistently: NO on A at 0.45, YES on B at 0.40
+        plain = dataclasses.replace(
+            _typed_trade("time_series", False, date(2026, 1, 8), date(2026, 1, 12), 2.0),
+            ticker_a="PLAIN-A", ticker_b="PLAIN-B")
+        return ladder, cross, plain
+
+    @classmethod
+    def _trades(cls) -> list[BacktestTrade]:
+        """
+        Four trades: a time-series ladder whose earlier leg dips while it is
+        held, a cross-event pair that falls before it loses, a second
+        cross-event pair with a day of no usable quote (it keeps the day
+        before's ask), and a cross-event pair with no quotes (carried at cost).
+        """
+        base = make_trade()
+        ladder, cross, plain = cls._three_time_series_trades()
+        # A pair priced consistently: YES on A at 0.45, NO on B at 0.40, so
+        # it costs 5 x 0.85 = $4.25; it settles "no" on both, and B's NO pays $5
+        n = base.n
+        fees = fee_leg_exact(n, 0.45) + fee_leg_exact(n, 0.40)
+        gap = _marked(
+            dataclasses.replace(
+                _typed_trade("time_series", False, date(2026, 1, 6), date(2026, 1, 11), 0.0),
+                ticker_a="GAP-A", ticker_b="GAP-B", entry_pA=0.45, entry_nB=0.40,
+                total_cost=n * 0.85, fees=fees, outcome_a="no", outcome_b="no",
+                actual_payoff=float(n), profit=n - n * 0.85 - fees),
+            [0.45, 0.50, 0.60, 0.40, 0.48], [0.40, 0.42, float("nan"), 0.30, 0.35])
+        return [ladder, cross, gap, plain]
+
+    @classmethod
+    def _trades_with_a_same_title_pair(cls) -> list[BacktestTrade]:
+        """
+        The trades of _trades, the third one a same-title pair (NO on A at
+        0.45, YES on B at 0.40) with a day of no usable quote (it keeps the
+        day before's ask).
+        """
+        base = make_trade()
+        ladder, cross, plain = cls._three_time_series_trades()
         n = base.n
         fees = fee_leg_exact(n, 0.45) + fee_leg_exact(n, 0.40)
         same_title = _marked(
@@ -20130,9 +20253,6 @@ class TestOpenTradesAtMarket:
                 total_cost=n * 0.85, fees=fees, outcome_a="no", outcome_b="no",
                 actual_payoff=float(n), profit=n - n * 0.85 - fees),
             [0.45, 0.50, 0.60, 0.40, 0.48], [0.40, 0.42, float("nan"), 0.30, 0.35])
-        plain = dataclasses.replace(
-            _typed_trade("time_series", False, date(2026, 1, 8), date(2026, 1, 12), 2.0),
-            ticker_a="PLAIN-A", ticker_b="PLAIN-B")
         return [ladder, cross, same_title, plain]
 
     @staticmethod
@@ -20232,6 +20352,47 @@ class TestOpenTradesAtMarket:
 
     def test_the_curve_and_its_type_lines_value_open_trades_at_market(self):
         trades = self._trades()
+        ladder, cross, gap, plain = trades
+        curve = self._curve(trades)
+        days = list(curve["date"])
+        want = [self._cash(trades, d, 1000.0)
+                + sum(self._held_value(t, d) for t in trades if t.entry_date <= d < t.exit_date)
+                for d in days]
+        assert list(curve["portfolio_value"]) == pytest.approx(want, abs=1e-9)
+        # The leading row is the untouched start (DR-03), the last the start
+        # plus every trade's profit, as at cost
+        assert curve["portfolio_value"].iloc[0] == 1000.0
+        assert curve["portfolio_value"].iloc[-1] == pytest.approx(
+            1000.0 + sum(t.profit for t in trades), abs=1e-9)
+        at_cost = self._curve([dataclasses.replace(t, marks=None) for t in trades])
+        assert at_cost["portfolio_value"].iloc[-1] == pytest.approx(
+            curve["portfolio_value"].iloc[-1], abs=1e-9)
+        # The gap pair's NO leg on B has no usable ask on 01-08: it keeps
+        # 01-07's 0.42 (its last usable ask), not its 0.40 entry price
+        assert self._held_value(gap, date(2026, 1, 8)) == pytest.approx(
+            gap.n * (0.60 + 0.42))
+        row = days.index(date(2026, 1, 7))
+        assert curve["portfolio_value"].iloc[row] != pytest.approx(
+            at_cost["portfolio_value"].iloc[row], abs=1e-6)
+
+        lines = dashboard._return_by_trade_type(trades, curve, 1000.0)
+        assert [label for label, _, _ in lines] == [
+            "Time-series: ladder", "Time-series: cross-event"]
+        total = (curve["portfolio_value"] / 1000.0 - 1.0) * 100
+        summed = [sum(values) for values in zip(*(s for _, _, s in lines), strict=True)]
+        assert summed == pytest.approx(list(total), abs=1e-9)
+        by_label = {label: s for label, _, s in lines}
+        # Each type ends at its own profit
+        assert by_label["Time-series: ladder"][-1] == pytest.approx(ladder.profit / 10)
+        assert by_label["Time-series: cross-event"][-1] == pytest.approx(
+            (cross.profit + gap.profit + plain.profit) / 10)
+        # The ladder's line moves on a day it is held: its fees on entry, then
+        # its earlier leg's fall from 0.30 to 0.10 on 01-07
+        assert by_label["Time-series: ladder"][row] == pytest.approx(
+            (-ladder.fees + 5 * (0.10 + 0.40) - 5 * (0.30 + 0.40)) / 10)
+
+    def test_the_curve_and_its_type_lines_value_an_open_same_title_pair_at_market(self):
+        trades = self._trades_with_a_same_title_pair()
         ladder, cross, same_title, plain = trades
         curve = self._curve(trades)
         days = list(curve["date"])
@@ -20861,8 +21022,9 @@ class TestMixedSelection:
     script works out itself from the tags' views. These tests hold a mix to
     what Python computes for the same trades, part by part, on several
     fixtures — trades valued at cost, trades with quotes valued at market,
-    pages with T-bill rates, pages whose every month holds trades, and one
-    whose tags mostly tie on P&L — and pin the menus' behaviour (tags, and
+    pages with T-bill rates, pages whose every month holds trades, one with
+    same-title trades among its time-series ones, and one whose tags mostly
+    tie on P&L — and pin the menus' behaviour (tags, and
     categories, that differ only in letter case move together), the save
     button staying shut while a category is left out or a tag ticked, the
     k-hat figures of a mix and how many mixes a list remembers. Skipped
@@ -20871,22 +21033,31 @@ class TestMixedSelection:
 
     # name -> (seed, quotes that move, T-bill rates on the page, starting
     # balance, the days entries are spread over, the page's last day or None
-    # for today). With rates the balance is small and the yield steep (it
-    # changes inside the window), so the trades hold a share of the balance
-    # that the yield visibly moves each ratio by. The first four pages run
-    # to today with every trade in their first three months, so most of
-    # their months are flat and every Median Monthly Return reads +0.0%; the
-    # "every-month" pages end on a fixed day with trades in every month (five
-    # months on one, six on the other: an odd and an even count to take the
-    # median of), so that card is a real figure there, different from one
-    # mix to the next
+    # for today, the share of same-title trades). With rates the balance is
+    # small and the yield steep (it changes inside the window), so the
+    # trades hold a share of the balance that the yield visibly moves each
+    # ratio by. The pages that run to today hold every trade in their first
+    # three months, so most of their months are flat and every Median
+    # Monthly Return reads +0.0%; the "every-month" pages end on a fixed day
+    # with trades in every month (five months on one, six on the other: an
+    # odd and an even count to take the median of), so that card is a real
+    # figure there, different from one mix to the next. The page with
+    # same-title trades draws their "Same-title" line in a mix, and none of
+    # them has a calibration pair, so a mix's Brier score, log loss and
+    # reliability diagram must leave them out, as Python's do. Each seed's mixes
+    # are ones the page and Python date alike: where a mix's drawdown climbs
+    # back from its deepest value and later falls to exactly that value again,
+    # the page's script and Python can name different days for it, as they
+    # add the tags' curves in a different order
     FIXTURES = {
-        "at-cost": (21, False, False, _MIX_BALANCE, 60, None),
-        "at-market": (22, True, False, _MIX_BALANCE, 60, None),
-        "at-market-with-rates": (23, True, True, 400.0, 60, None),
-        "at-cost-with-rates": (24, False, True, 150.0, 60, None),
-        "every-month-at-cost": (25, False, False, 150.0, 120, date(2026, 5, 31)),
-        "every-month-at-market-with-rates": (26, True, True, 400.0, 150, date(2026, 6, 30)),
+        "at-cost": (21, False, False, _MIX_BALANCE, 60, None, 0.0),
+        "at-market": (22, True, False, _MIX_BALANCE, 60, None, 0.0),
+        "at-market-with-rates": (23, True, True, 400.0, 60, None, 0.0),
+        "at-cost-with-rates": (27, False, True, 150.0, 60, None, 0.0),
+        "at-cost-with-same-title": (21, False, False, _MIX_BALANCE, 60, None, 0.4),
+        "every-month-at-cost": (25, False, False, 150.0, 120, date(2026, 5, 31), 0.0),
+        "every-month-at-market-with-rates": (
+            26, True, True, 400.0, 150, date(2026, 6, 30), 0.0),
     }
     # The fixtures whose months all hold trades
     EVERY_MONTH = ("every-month-at-cost", "every-month-at-market-with-rates")
@@ -20918,9 +21089,9 @@ class TestMixedSelection:
     @pytest.mark.parametrize("fixture", sorted(FIXTURES))
     def test_a_mix_is_what_python_computes_for_the_same_trades(
             self, monkeypatch, tmp_path, fixture):
-        seed, quoted, kind, balance, spread, end = self.FIXTURES[fixture]
+        seed, quoted, kind, balance, spread, end, share = self.FIXTURES[fixture]
         rates = self._rates(kind)
-        trades = _mix_trades(seed, n=60, quoted=quoted, spread=spread)
+        trades = _mix_trades(seed, n=60, quoted=quoted, spread=spread, same_title_share=share)
         page = _mix_page(monkeypatch, tmp_path, trades, risk_free=rates, balance=balance,
                          end=end)
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
@@ -20935,6 +21106,7 @@ class TestMixedSelection:
         n_all = lst["views"]["all"]["n"]
         mixed = 0
         medians = set()
+        labels = set()
         for i, (cats, tags) in enumerate(sets):
             snap = snaps[f"mix{i}"]
             ref = _mix_reference(data, trades, cats, tags, risk_free=rates, balance=balance)
@@ -20945,11 +21117,16 @@ class TestMixedSelection:
             assert snap["text"]["flt-summary"] == _mix_summary(
                 data, cats, tags, ref["view"]["n"], n_all, mix=True)
             mixed += len(ref["view"]["types"]) > 1
+            labels.update(label for label, _ in ref["view"]["types"])
         # The fixture exercises what it claims to: several trade types in one
         # mix, a ratio that the hurdle moves when rates are on the page, and
         # — where every month holds trades — a Median Monthly Return that is
         # a real figure, different from one mix to the next
         assert mixed
+        # Some mix of the page with same-title trades draws their line, so a
+        # mix held trades with no calibration pair, which its calibration
+        # figures left out as Python's do; no other page draws that line
+        assert ("Same-title" in labels) is bool(share)
         if fixture in self.EVERY_MONTH:
             assert data["dates"][-1] == end.isoformat()
             assert len(medians - {"+0.0%", "-0.0%"}) >= 4, medians
@@ -21011,9 +21188,10 @@ class TestMixedSelection:
         # and the script works the four series it draws out of that. For
         # every tag of every parity fixture they are the very series
         # _view_payload computes for that tag
-        seed, quoted, kind, balance, spread, end = self.FIXTURES[fixture]
+        seed, quoted, kind, balance, spread, end, share = self.FIXTURES[fixture]
         views = self._each_tag_alone_is_pythons(
-            monkeypatch, tmp_path, _mix_trades(seed, n=60, quoted=quoted, spread=spread),
+            monkeypatch, tmp_path,
+            _mix_trades(seed, n=60, quoted=quoted, spread=spread, same_title_share=share),
             rates=self._rates(kind), balance=balance, end=end)
         # None of the four is shipped beside "m" on these pages
         assert not any(name in view for view in views.values()
@@ -22091,9 +22269,9 @@ class TestMixedSelection:
         # the live rule keeps over the categories kept, every figure
         # Python's own for them — drawn from Python's views where it has one
         # and, sent through the mix, the same
-        seed, quoted, kind, balance, spread, end = self.FIXTURES[fixture]
+        seed, quoted, kind, balance, spread, end, share = self.FIXTURES[fixture]
         rates = self._rates(kind)
-        trades = _mix_trades(seed, n=60, quoted=quoted, spread=spread)
+        trades = _mix_trades(seed, n=60, quoted=quoted, spread=spread, same_title_share=share)
         page = _mix_page(monkeypatch, tmp_path, trades, risk_free=rates, balance=balance,
                          end=end)
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
@@ -22509,8 +22687,8 @@ class TestMixedSelection:
                 n = len(trades)
                 entry = _MIX_START + timedelta(days=3 + (n * 7) % 120)
                 trades.append(dataclasses.replace(
-                    _typed_trade("time_series" if n % 2 == 0 else "same_title", n % 4 == 0,
-                                 entry, entry + timedelta(days=[0, 1, 5][n % 3]), profit),
+                    _typed_trade("time_series", n % 4 == 0, entry,
+                                 entry + timedelta(days=[0, 1, 5][n % 3]), profit),
                     event_ticker=f"{ticker}-{n}", ticker_a=f"{ticker}-{n}A",
                     ticker_b=f"{ticker}-{n}B", title_a=f"Question {n}?", category="Other"))
         trades.sort(key=lambda t: t.entry_date)

@@ -44,7 +44,6 @@ from kalshi_betting.scanner import (
     HeldPosition,
     Settlement,
     held_pairs,
-    leg_sides,
     market_ladder_keys,
 )
 
@@ -63,6 +62,12 @@ _A, _EV_A = "KXRKTA-26-JAN20", "KXRKTA-26"
 _B, _EV_B = "KXRKTB-26-JAN25", "KXRKTB-26"
 _A_CLOSE = datetime(2026, 1, 20, tzinfo=UTC)
 _B_CLOSE = datetime(2026, 1, 25, tzinfo=UTC)
+
+# The side held on market A and on market B: a time-series pair holds YES on
+# the earlier market and NO on the later; a same-title pair holds NO on A and
+# YES on B
+_YES_A_NO_B = ("yes", "no")
+_NO_A_YES_B = ("no", "yes")
 
 
 def _candle(ts: int, yes_ask: float, no_ask: float) -> dict:
@@ -239,12 +244,13 @@ class _Parity:
     A leg cost.
     """
 
-    def __init__(self, pair_type: str, *, candles_a: list, candles_b: list,
-                 price_a: float, price_b: float, n: int = 30, lone: bool = False,
-                 a_settles: datetime | None = None, a_result: str = "no",
-                 titles: tuple[str, str] | None = None) -> None:
+    def __init__(self, pair_type: str, *, sides: tuple[str, str], candles_a: list,
+                 candles_b: list, price_a: float, price_b: float, n: int = 30,
+                 lone: bool = False, a_settles: datetime | None = None,
+                 a_result: str = "no", titles: tuple[str, str] | None = None) -> None:
         self.n = n
-        self.side_a, self.side_b = leg_sides(pair_type)
+        # The side held on market A and on market B, named by each case
+        self.side_a, self.side_b = sides
         settle_a = a_settles or datetime(2026, 2, 20, 12, tzinfo=UTC)
         if titles is None:
             market_a = _rung(_A, _EV_A, "Jan 20, 2026", _A_CLOSE)
@@ -342,16 +348,18 @@ def _lone_case(a_settles: datetime, a_result: str, b_candles: list | None = None
                       _candle(_CK - 2 * _DAY - 3600, 0.16, 0.86),   # NO bid 0.84
                       _candle(_CK - _DAY - 1800, 0.14, 0.87),       # NO bid 0.86
                       _candle(_CK, 0.15, 0.86)]                     # NO bid 0.85
-    return _Parity("time_series", candles_a=a, candles_b=b, price_a=0.30, price_b=0.40,
-                   lone=True, a_settles=a_settles, a_result=a_result)
+    return _Parity("time_series", sides=_YES_A_NO_B, candles_a=a, candles_b=b,
+                   price_a=0.30, price_b=0.40, lone=True, a_settles=a_settles,
+                   a_result=a_result)
 
 
 def _same_title_lone_case(a_settles: datetime, a_result: str, a_candles: list,
                           b_candles: list) -> _Parity:
     """B held YES alone, its partner A (held NO) paid out at a_settles: the
     same-title sides, so the partner's NO cost, count and NO bid are read."""
-    return _Parity("same_title", candles_a=a_candles, candles_b=b_candles, price_a=0.40,
-                   price_b=0.35, lone=True, a_settles=a_settles, a_result=a_result,
+    return _Parity("same_title", sides=_NO_A_YES_B, candles_a=a_candles,
+                   candles_b=b_candles, price_a=0.40, price_b=0.35, lone=True,
+                   a_settles=a_settles, a_result=a_result,
                    titles=("Who wins the game?", "Who wins the game?"))
 
 
@@ -395,11 +403,12 @@ def _paid_between_case(settles_ts: int = _CK - _DAY - 12 * 3600) -> _Parity:
 
 _PARITY_CASES = {
     "exact time-series pair (YES A / NO B)": lambda: _Parity(
-        "time_series", candles_a=_time_series_candles()[0],
+        "time_series", sides=_YES_A_NO_B, candles_a=_time_series_candles()[0],
         candles_b=_time_series_candles()[1], price_a=0.30, price_b=0.40),
     "exact same-title pair (NO A / YES B)": lambda: _Parity(
-        "same_title", candles_a=_same_title_candles()[0], candles_b=_same_title_candles()[1],
-        price_a=0.50, price_b=0.40, titles=("Who wins the game?", "Who wins the game?")),
+        "same_title", sides=_NO_A_YES_B, candles_a=_same_title_candles()[0],
+        candles_b=_same_title_candles()[1], price_a=0.50, price_b=0.40,
+        titles=("Who wins the game?", "Who wins the game?")),
     "lone market with a $0 partner paid out before every check": lambda: _lone_case(
         datetime.fromtimestamp(_CK - 3 * _DAY, UTC), "no"),
     "lone market whose partner paid out between the checks": _paid_between_case,
@@ -562,7 +571,8 @@ class TestParityWithTheBacktest:
         b = [c for c in b if c["ts"] != _CK - _DAY - 1800]
         b = [_candle(_CK - 2 * _DAY, 0.50, 0.52) if c["ts"] == _CK - 2 * _DAY - 3600 else c
              for c in b]
-        case = _Parity("time_series", candles_a=a, candles_b=b, price_a=0.30, price_b=0.40)
+        case = _Parity("time_series", sides=_YES_A_NO_B, candles_a=a, candles_b=b,
+                       price_a=0.30, price_b=0.40)
         assert case.readings() is None
         with caplog.at_level(logging.INFO):
             assert case.world.plan(monkeypatch, 0.01) == []
@@ -573,7 +583,8 @@ class TestParityWithTheBacktest:
     @pytest.mark.parametrize("min_days", [12, 13, 14])
     def test_the_days_rule_at_below_and_above_its_boundary(self, monkeypatch, lone, min_days):
         case = (_lone_case(datetime.fromtimestamp(_CK - 3 * _DAY, UTC), "no") if lone
-                else _Parity("time_series", candles_a=_time_series_candles()[0],
+                else _Parity("time_series", sides=_YES_A_NO_B,
+                             candles_a=_time_series_candles()[0],
                              candles_b=_time_series_candles()[1], price_a=0.30,
                              price_b=0.40))
         # 13 days from Monday 01-12 to the last held market's close on 01-25
@@ -596,7 +607,7 @@ class TestParityWithTheBacktest:
 
 def _exact_pair_world() -> _World:
     """YES on A and NO on B, 30 each, at the parity case's prices and candles."""
-    case = _Parity("time_series", candles_a=_time_series_candles()[0],
+    case = _Parity("time_series", sides=_YES_A_NO_B, candles_a=_time_series_candles()[0],
                    candles_b=_time_series_candles()[1], price_a=0.30, price_b=0.40)
     return case.world
 
@@ -1406,12 +1417,19 @@ class _TrimCase:
     """
 
     def __init__(self, pair_type: str = "time_series", a_now: tuple = _A_NOW,
-                 b_now: tuple = _B_NOW, *, n: int = 30, a_then: tuple | None = None,
-                 b_then: tuple | None = None, model=None, price_a: float = 0.30,
-                 price_b: float = 0.40, positions_cents: int = 5_000) -> None:
+                 b_now: tuple = _B_NOW, *, sides: tuple[str, str] | None = None,
+                 n: int = 30, a_then: tuple | None = None, b_then: tuple | None = None,
+                 model=None, price_a: float = 0.30, price_b: float = 0.40,
+                 positions_cents: int = 5_000) -> None:
         self.n = n
         self.positions_cents = positions_cents
-        self.side_a, self.side_b = leg_sides(pair_type)
+        # The side held on each market; the pair type picks the two markets'
+        # wording and the backtest trade's type. Only a time-series pair may
+        # leave its sides out: YES on the earlier market, NO on the later
+        if sides is None:
+            assert pair_type == "time_series", "a same-title case names its sides"
+            sides = _YES_A_NO_B
+        self.side_a, self.side_b = sides
         if pair_type == "time_series":
             market_a = _rung(_A, _EV_A, "Jan 20, 2026", _A_CLOSE)
             market_b = _rung(_B, _EV_B, "Jan 25, 2026", _B_CLOSE)
@@ -1500,10 +1518,24 @@ _TRIM_PARITY_CASES = {
     # NO on A (best NO bid 0.50) and YES on B (best YES bid 0.40): held to the
     # 20% same-title cap of a $100 portfolio
     "a same-title pair past its size cap": (
-        lambda: _TrimCase("same_title", a_now=(0.50, 0.52), b_now=(0.42, 0.60)), 10_000, {}),
+        lambda: _TrimCase("same_title", sides=_NO_A_YES_B, a_now=(0.50, 0.52),
+                          b_now=(0.42, 0.60)),
+        10_000, {}),
     # Selling returns more than the pair is expected to pay: nothing is kept
     "a converged same-title pair": (
-        lambda: _TrimCase("same_title", a_now=(0.03, 0.98), b_now=(0.03, 0.98)), 10_000, {}),
+        lambda: _TrimCase("same_title", sides=_NO_A_YES_B, a_now=(0.03, 0.98),
+                          b_now=(0.03, 0.98)),
+        10_000, {}),
+    # The default quotes, as in "within its share": one contract pair sells
+    # for $0.9055 at the best bids ($0.42 + $0.52, less the $0.0345
+    # approximate fee) and pays with chance 1 - 0.8 x 0.045 (its mid spread)
+    # = 0.964, so Kelly alone would let it keep (0.964 - 0.9055) / (1 - 0.9055)
+    # = 61.9% of the portfolio. The portfolio is $15: $5 of cash and Kalshi's
+    # $10 for the open positions, enough to back the $9.05 the 10 pairs fetch.
+    # Under the smallest size cap, 5%, the pair may keep $0.75: 0.75 / 0.9055
+    # = 0.83 pairs, rounded down to none, so all 10 are sold
+    "a time-series pair whose size cap holds less than one pair": (
+        lambda: _TrimCase(n=10, positions_cents=1_000), 1_500, {"cap": 0.05}),
     # Market A's YES ask (0.40) sits below its own YES bid (0.45)
     "a crossed book": (
         lambda: _TrimCase(a_now=(0.40, 0.55)), 10_000, {"cap": 0.10}),
@@ -1532,6 +1564,7 @@ _TRIM_PARITY_SELLS = {
     "a time-series pair within its share": "none",
     "a same-title pair past its size cap": "part",
     "a converged same-title pair": "all",
+    "a time-series pair whose size cap holds less than one pair": "all",
     "a crossed book": "none",
     "a thin ladder": "part",
     "a ladder that reaches its last modeled distance": "part",
@@ -2285,12 +2318,25 @@ class TestPlanTrims:
         (plan,) = _TrimCase(**quotes).live(monkeypatch, 5_000, k=0.8)
         assert plan.count == 6 and [leg.held for leg in plan.legs] == [30, 30]
 
-    def test_a_pair_sold_whole_still_names_what_it_held(self, monkeypatch):
-        build, value_cents, caps = _TRIM_PARITY_CASES["a converged same-title pair"]
+    @pytest.mark.parametrize("name, legs", [
+        ("a time-series pair whose size cap holds less than one pair",
+         [(_A, "yes", 10, 10), (_B, "no", 10, 10)]),
+        ("a converged same-title pair", [(_A, "no", 30, 30), (_B, "yes", 30, 30)]),
+    ])
+    def test_a_pair_sold_whole_still_names_what_it_held(self, monkeypatch, name, legs):
+        build, value_cents, caps = _TRIM_PARITY_CASES[name]
         (plan,) = build().live(monkeypatch, value_cents, **caps)
-        assert [(leg.ticker, leg.side, leg.count, leg.held) for leg in plan.legs] == [
-            (_A, "no", 30, 30), (_B, "yes", 30, 30)]
+        assert [(leg.ticker, leg.side, leg.count, leg.held) for leg in plan.legs] == legs
         assert plan.kind == config.SALE_KIND_KELLY_TRIM
+
+    def test_a_larger_size_cap_keeps_one_pair_the_smallest_cap_sells(self, monkeypatch):
+        # The same $15 portfolio under a 10% cap may hold $1.50 = 1.66 pairs at
+        # $0.9055: one pair kept, 9 of the 10 sold, on both paths
+        build, value_cents, _caps = _TRIM_PARITY_CASES[
+            "a time-series pair whose size cap holds less than one pair"]
+        case = build()
+        (plan,) = case.live(monkeypatch, value_cents, cap=0.10)
+        assert plan.count == case.backtest(value_cents, cap=0.10)[0].sell == 9
 
     # ── Switched off, and what stops the run ─────────────────────────────────
 
@@ -2533,7 +2579,8 @@ class TestPlanTrims:
 
     def test_a_same_title_lone_leg_is_not_trimmed(self, monkeypatch, caplog):
         # B held YES alone after its same-title partner A (held NO) settled yes, paying $0
-        case = _TrimCase("same_title", a_now=(0.50, 0.52), b_now=(0.42, 0.60))
+        case = _TrimCase("same_title", sides=_NO_A_YES_B, a_now=(0.50, 0.52),
+                         b_now=(0.42, 0.60))
         world = case.world
         del world.positions[_A]
         world.settlements = [_settled(_A, _EV_A, yes=0.0, no=30.0, cost=15.0, result="yes")]
