@@ -380,20 +380,23 @@ def _save_live_defaults(**changes) -> LiveSettings:
                                      source="")
 
 
-def _seed_series_listing(series: dict, fetched_at: datetime | None = None) -> None:
+def _seed_series_listing(series: dict, fetched_at: datetime | None = None, *,
+                         fees: dict | None = None) -> None:
     """
     Seed historical.load_series_categories' cached /series listing (in tmp_path).
 
     Args:
         series (dict): series ticker -> [category, [tags...]].
         fetched_at (datetime | None): When it was fetched; None means now (fresh).
+        fees (dict | None): Keyword-only. series ticker -> the fee multiplier
+            listed for it; every other series is listed at the full fee (1).
     """
     stamp = datetime.now(UTC) if fetched_at is None else fetched_at
     historical._SERIES_CATEGORIES_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    # A "fees" block too (every series at the full fee), as the fetch writes it
+    # A "fees" block too, as the fetch writes it
     historical._SERIES_CATEGORIES_CACHE.write_text(json.dumps(
         {"fetched_at": stamp.isoformat(), "series": series,
-         "fees": {t: ["quadratic", 1] for t in series}}))
+         "fees": {t: ["quadratic", (fees or {}).get(t, 1)] for t in series}}))
 
 
 def _main_with(monkeypatch, argv: list, **patches) -> dict:
@@ -1278,7 +1281,7 @@ class TestLiveSettingsFlags:
         lone = "pair, or lone leg whose partner has paid out, worth more than its new Kelly"
         assert out.count(lone) == 2
         assert ("a higher k also sells: each exact held time-series " + lone) in out
-        assert ("a lower cap also sells: each exact held " + lone) in out
+        assert ("a lower cap also sells: each exact held time-series " + lone) in out
         assert ("a lower cap also sells: each exact held same-title pair worth more than "
                 "its new Kelly") in out
         assert out.count("With Rebalance yes (saved, or given with --rebalance), a ") == 3
@@ -1296,11 +1299,11 @@ class TestLiveSettingsFlags:
         # The rebalance flags. argparse may wrap a flag's name at a hyphen, so
         # the pinned words stop short of one
         assert ("Rebalance the held pairs this run: before buying, sell part of each exact "
-                "held pair, or lone leg whose partner has paid out, that has outgrown its "
-                "Kelly size, once config.REBALANCE_MIN_DAYS_SINCE_TRADE calendar days have "
-                "passed since its last trade, and let this run add to a pair the account "
-                "already holds (exactly the same two markets, the same side on each, or a "
-                "lone leg beside a market not held) after the same wait") in out
+                "held time-series pair, or lone leg whose partner has paid out, that has "
+                "outgrown its Kelly size, once config.REBALANCE_MIN_DAYS_SINCE_TRADE calendar "
+                "days have passed since its last trade, and let this run add to a pair the "
+                "account already holds (exactly the same two markets, the same side on each, "
+                "or a lone leg beside a market not held) after the same wait") in out
         assert ("neither trims nor adds to a held pair, and clears the saved minimum price "
                 "move and days to maturity too.") in out
         assert "no run acts on it" not in out
@@ -3406,9 +3409,11 @@ class TestSeriesLabelsAreAttached:
     """DR-79's wiring in both run modes: every run reads Kalshi's /series
     listing once, right after the market fetch (production with its own
     client, dev from the cached copy only), files every market by it
-    (main._attach_series_labels) before the sale block and the time-series
-    finder, and hands the same copy to the category/tag filter.
-    held_pair_kind then compares those labels (scanner._labels_differ)."""
+    (main._attach_series_labels, which also sets each market's fee
+    multiplier, read by every sale's fee) before the sale block and the
+    time-series finder, and hands the same copy to the category/tag filter.
+    Only scanner.find_same_title_pairs compares the labels
+    (scanner._labels_differ), and no run mode calls it."""
 
     @staticmethod
     def _spy(monkeypatch) -> list:
@@ -3416,8 +3421,9 @@ class TestSeriesLabelsAreAttached:
         Record, in order, each listing read, trim plan, finder call and filter call.
 
         The time-series finder and the trim planner record whether every
-        market they were handed carries a (category, tag) pair of strings;
-        the filter records the listing it was handed.
+        market they were handed carries a (category, tag) pair of strings,
+        and the trim planner each market's fee multiplier too; the filter
+        records the listing it was handed.
 
         Args:
             monkeypatch (pytest.MonkeyPatch): For the spies.
@@ -3453,7 +3459,10 @@ class TestSeriesLabelsAreAttached:
             return real_filter(pairs, settings, listing_client, **kwargs)
 
         def plan_trims(client, held_positions, held_labels, markets_by_ticker, **kwargs):
-            events.append(("plan_trims", labelled(list(markets_by_ticker.values()))))
+            markets = list(markets_by_ticker.values())
+            # Each market's fee multiplier as the planner finds it: every sale's fee reads it
+            events.append(("plan_trims", labelled(markets),
+                           {m.ticker: getattr(m, "_fee_multiplier", None) for m in markets}))
             return []
 
         monkeypatch.setattr(main, "load_series_categories", load)
@@ -3471,6 +3480,9 @@ class TestSeriesLabelsAreAttached:
         balance = {**_LIVE_BALANCE_PAYLOAD, "portfolio_value": 150}
         client = _live_shape_client(monkeypatch, balance_payload=balance,
                                     include_time_series=True)
+        # The Held Event's series listed at half the fee, so the planner can tell a
+        # market the attach has filed (0.5) from one it has not (ApiMarket's 1.0)
+        _seed_series_listing({"HELDEVT": ["Other", []]}, fees={"HELDEVT": 0.5})
         events = self._spy(monkeypatch)
         settings = dataclasses.replace(live_settings(), rebalance=True)
         with caplog.at_level(logging.INFO):
@@ -3483,8 +3495,15 @@ class TestSeriesLabelsAreAttached:
         # every market filed, then the filter, handed the very same copy
         assert [event[0] for event in events] == [
             "listing", "plan_trims", "time_series", "filter"]
-        assert events[1:3] == [("plan_trims", True), ("time_series", True)]
+        assert events[1][1] is True and events[2] == ("time_series", True)
         assert events[3][1] is listing
+        # ... and every market's fee multiplier set before the planner, each
+        # sale's fee reading it: the Held Event's two markets at the listed 0.5,
+        # every other market at the full fee
+        fees = events[1][2]
+        assert {t for t, fee in fees.items() if fee == 0.5} == {_TICKER_HELD_A,
+                                                              _TICKER_HELD_B}
+        assert {fee for t, fee in fees.items() if fee != 0.5} == {1.0}
 
     def test_a_dev_run_reads_the_cached_copy_once_and_files_every_market(
         self, monkeypatch, caplog,
@@ -11190,8 +11209,9 @@ class TestResultFile:
     def test_a_run_without_the_flag_reads_the_listing_once(self, monkeypatch, tmp_path,
                                                            caplog):
         # A scheduled run writes no result and sets no category/tag filter, and
-        # still reads the listing once (a cached copy, refreshed once a week),
-        # for the same-title sport check
+        # still reads the listing once (a cached copy, refreshed once a week):
+        # it files every market by it, and each market's fee multiplier is read
+        # from the copy that read refreshes
         reads = []
         seen, result, _ = self._run(
             monkeypatch, tmp_path, caplog, result_file=False,

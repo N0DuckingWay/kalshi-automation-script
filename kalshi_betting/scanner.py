@@ -79,7 +79,8 @@ Dependencies:
     Live trimming's helpers, all read-only: for seller.plan_trims,
     get_fill_times (when each market last traded), held_positions_bid_value
     (what the held markets would fetch at this run's bids) and held_pair_kind
-    (which kind of pair two held markets are); for main._run_prod,
+    (whether two held markets are a time-series pair, and which is market A;
+    two identically worded markets never are); for main._run_prod,
     get_resting_orders (a run trims nothing while an order rests). For
     seller.plan_add_ons, get_fill_times too and listed_ask (a held market's
     ask as this run's market list shows it).
@@ -122,9 +123,11 @@ Notes:
     because "<Team> wins" under "A vs B" names neither the sport nor the date
     and a football game and a women's volleyball match of the same two schools
     can close within an hour of each other. Both checks sit on the same-title
-    finder and held_pair_kind only, for the same reason as the close gate, and
-    fail closed; the backtester applies the same two definitions — see
-    CLAUDE.md's DR-79 gotcha.
+    finder only, for the same reason as the close gate, and fail closed; the
+    backtester applies the same two definitions — see CLAUDE.md's DR-79
+    gotcha. held_pair_kind needs neither: it reads two identically worded
+    held markets as no pair at all, so live trimming never trims a held
+    same-title pair.
 
     The time-series finder additionally requires both legs to be CUMULATIVE-
     deadline markets stating two DIFFERENT deadlines (deadline_phrasing,
@@ -1800,8 +1803,8 @@ def labels_differ(labels_a: Any, labels_b: Any) -> bool:
     Sports · Volleyball. The labels are historical.series_labels'
     (category, tag), the filing rule the dashboard and the live category/tag
     filter use, compared without regard to letter case. find_same_title_pairs
-    and held_pair_kind read it through _labels_differ; backtester._extract_pairs
-    calls it directly, on the labels it files each cached series by.
+    reads it through _labels_differ; backtester._extract_pairs calls it
+    directly, on the labels it files each cached series by.
 
     Fails closed: anything that is not a (category, tag) pair of strings
     reads as different, so a market whose labels were never attached is
@@ -1830,8 +1833,8 @@ def competitions_differ(competition_a: Any, competition_b: Any) -> bool:
     game, two leagues, or a league and a cup fixture of one matchup are told
     apart by the competition each event names (event_competition). One event
     naming a competition and the other naming none counts as different.
-    Letter case and surrounding spaces are ignored. find_same_title_pairs and
-    held_pair_kind read it through _competitions_differ;
+    Letter case and surrounding spaces are ignored. find_same_title_pairs
+    reads it through _competitions_differ;
     backtester._refuse_other_competitions calls it directly, on the labels
     historical.load_event_competitions reads.
 
@@ -1853,7 +1856,7 @@ def competitions_differ(competition_a: Any, competition_b: Any) -> bool:
 
 def _labels_differ(mA: Any, mB: Any) -> bool:
     """
-    Live reader of labels_differ over each market's ._series_labels.
+    find_same_title_pairs' reader of labels_differ over each market's ._series_labels.
 
     main._attach_series_labels sets that attribute on every market of a run
     before any pair is found. A market without it (or a MagicMock, whose
@@ -1872,7 +1875,7 @@ def _labels_differ(mA: Any, mB: Any) -> bool:
 
 def _competitions_differ(mA: Any, mB: Any) -> bool:
     """
-    Live reader of competitions_differ over each market's ._event_competition.
+    find_same_title_pairs' reader of competitions_differ over each market's ._event_competition.
 
     fetch_open_events_with_markets sets that attribute on every market it
     parses ("" for an event that names no competition, None for one whose
@@ -4279,31 +4282,29 @@ def _stated(market: Any, profile: tuple) -> date | None:
 
 def held_pair_kind(yes_market: Any, no_market: Any) -> tuple[str, Any, Any] | None:
     """
-    Read which kind of pair two held markets are, and which is market A.
+    Read whether two held markets are a time-series pair held as one, and which is market A.
 
-    The account's positions do not say whether a held pair was bought as a
-    same-title or a time-series pair, and the two are priced differently.
-    seller.plan_trims needs to know, so this reads the kind back from the two
-    markets by the finders' own tests. It answers only when the sides held are
-    the sides that kind buys (leg_sides): NO on A and YES on B for same-title,
-    YES on the earlier deadline (A) and NO on the later (B) for time-series.
-    Anything it cannot show is None, never a guess. seller.plan_trims also
-    asks it about a lone leg: the held market and its paid-out partner (a
-    settled market, taken from the run's market list or looked up through
-    market_for_labels), each on the side it was held, so for two events the
-    close the time-series test compares is the one Kalshi records for the
-    settled partner.
+    The account's positions do not say how a held pair was bought.
+    seller.plan_trims needs the pair's type and its market A to read its
+    chance of paying, so this reads them back from the two markets by
+    find_time_series_pairs' own tests. It answers only when the sides held
+    are the sides a time-series pair buys (leg_sides): YES on the earlier
+    deadline (market A) and NO on the later (market B). Anything it cannot
+    show is None, never a guess. seller.plan_trims also asks it about a lone
+    leg: the held market and its paid-out partner (a settled market, taken
+    from the run's market list or looked up through market_for_labels), each
+    on the side it was held, so for two events the close the time-series test
+    compares is the one Kalshi records for the settled partner.
+
+    Two identically worded markets (the same title, subtitle and event
+    title, as a same-title pair is) are always None. Identical wording
+    states one deadline, so they are never a time-series pair, and a live
+    run buys no other kind, so a held same-title pair, or a same-title lone
+    leg, is never trimmed (a saved sell level can still sell one whole: the
+    take-profit rule, seller.plan_sales, never asks this).
 
     Both markets need an event ticker: without one, two events cannot be told
     from two rungs of one event, which are ordered by different rules.
-
-    Same-title (find_same_title_pairs' rules): identical title, subtitle and
-    event title (with a title or subtitle to compare), on two different series,
-    closing within the same-title bound, both series filed under one Kalshi
-    category and tag, and both events naming the same competition or neither
-    naming one (DR-79). A held pair from two sports or two competitions is
-    therefore no known kind, and is never trimmed on the same-title chance of
-    paying.
 
     Time-series (find_time_series_pairs' rules): one group key and two
     different cumulative deadlines, then:
@@ -4327,8 +4328,9 @@ def held_pair_kind(yes_market: Any, no_market: Any) -> tuple[str, Any, Any] | No
 
     Returns:
         tuple[str, Any, Any] | None: (pair type, market A, market B), the type
-            "same_title" or "time_series"; None when the two cannot be shown
-            to be a pair of either kind held that way round.
+            always "time_series"; None when the two cannot be shown to be a
+            time-series pair held that way round, and for two identically
+            worded markets.
     """
     by_side = {"yes": yes_market, "no": no_market}
     # Both event tickers must be known
@@ -4337,20 +4339,9 @@ def held_pair_kind(yes_market: Any, no_market: Any) -> tuple[str, Any, Any] | No
         return None
     same_event = yes_market.event_ticker == no_market.event_ticker
     if _identical_wording(yes_market, no_market):
-        # The same-title finder needs a title or a subtitle to group on
-        if not ((getattr(yes_market, "title", "") or "")
-                or (getattr(yes_market, "subtitle", "") or "")):
-            return None
-        # Two events on two series, closing within the bound, filed alike and
-        # naming one competition. Identical wording states one deadline, so it
-        # is never a time-series pair
-        if (same_event or _same_series(yes_market, no_market)
-                or _closes_apart(yes_market, no_market)
-                or _labels_differ(yes_market, no_market)
-                or _competitions_differ(yes_market, no_market)):
-            return None
-        side_a, side_b = leg_sides("same_title")
-        return "same_title", by_side[side_a], by_side[side_b]
+        # Identical wording states one deadline, so it is never a time-series
+        # pair, and the bot trades no other kind: never trimmed
+        return None
 
     # One question at two cumulative deadlines: the finder's group key first
     keys = [time_series_group_key(pair_key(market), getattr(market, "subtitle", "") or "")

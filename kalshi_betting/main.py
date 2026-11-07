@@ -48,14 +48,16 @@ Purpose:
 
     Every run reads Kalshi's /series listing once, right after the market
     fetch, and files each market under its series' category and first tag
-    (_attach_series_labels): held_pair_kind, which live trimming reads,
-    refuses two markets filed differently (DR-79). The category/tag filter
-    and the run summary read the same copy. The same
+    (_attach_series_labels). Only scanner.find_same_title_pairs' sport check
+    compares those labels (DR-79), and no run mode calls that finder. The
+    category/tag filter and the run summary read the same copy. The same
     listing's fee multipliers are read beside it
     (historical.load_series_fee_multipliers) and set on each market as
     _fee_multiplier, which prices that market's leg fees
-    (scanner.leg_fee_multipliers) when config.CONFIRMED_FEE_MULTIPLIERS holds
-    it; any other multiplier is charged as the full fee.
+    (scanner.leg_fee_multipliers) and the fees of a sale on it
+    (scanner.market_fee_multiplier) when config.CONFIRMED_FEE_MULTIPLIERS
+    holds it; any other multiplier is charged as the full fee. That is why
+    every market is filed before the sale block as well as before the finder.
 
     A production run with sell_at set sells, before it buys, each held position
     (an exact held pair, or a lone held market whose partner has paid out)
@@ -63,8 +65,8 @@ Purpose:
     pays if it wins, less its cost); see CLAUDE.md, live selling.
 
     A production run with rebalance on also sells, before it buys, part
-    of each exact held pair (one YES and one NO of equal size on one
-    question), or of each lone leg (the later market of a time-series pair,
+    of each exact held time-series pair (one YES and one NO of equal size on
+    one question), or of each lone leg (the later market of a time-series pair,
     still held after the earlier one paid out $0), that has grown past its
     Kelly share of the portfolio value
     (seller.plan_trims, planned right after the take-profit plans and before
@@ -956,12 +958,17 @@ def _attach_series_labels(markets: list, series_categories: dict, *,
     """
     Attach to every market the Kalshi category and first tag its series is filed under.
 
-    The same-title sport check in held_pair_kind, which live trimming reads,
-    compares the two markets' labels (scanner._labels_differ) and refuses a
-    market that has none. The labels come from historical.series_labels, the
-    rule the dashboard and the category/tag filter file by: a series the
-    listing lacks is filed under its ticker-prefix category (infer_category)
-    and "General".
+    The same-title sport check of scanner.find_same_title_pairs compares two
+    markets' labels (scanner._labels_differ) and refuses a market that has
+    none; no run mode calls that finder, so nothing else in a run reads the
+    labels. The labels come from historical.series_labels, the rule the
+    dashboard and the category/tag filter file by: a series the listing lacks
+    is filed under its ticker-prefix category (infer_category) and "General".
+
+    It also sets each market's fee multiplier (fee_multipliers, below), which
+    every leg's fee and every sale's fee read (scanner.market_fee_multiplier),
+    so both run modes call it right after the market fetch, before any sale
+    is planned or any pair is looked for.
 
     With no listing at all (no cached copy, and a read that failed or, in
     dev, none made), every series is filed by its ticker prefix, so nearly
@@ -994,7 +1001,7 @@ def _attach_series_labels(markets: list, series_categories: dict, *,
     listed: list = []
     for market in markets:
         # A market with no event ticker is filed under "" (infer_category's
-        # "Other"); held_pair_kind refuses a market with no event ticker anyway
+        # "Other"); the same-title finder refuses it on its series anyway
         event = getattr(market, "event_ticker", "") or ""
         if event not in by_event:
             # Cross-module: the one filing rule the dashboard and the live filter share
@@ -1729,10 +1736,11 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     is sold when a held market was not identified or the listing was cut short.
 
     With settings.rebalance on and anything held, the same step also
-    trims: seller.plan_trims plans part sales of the exact held pairs, and of
-    the lone legs (the later market of a time-series pair, still held after the
-    earlier one paid out $0), grown past their Kelly share
-    (never a position the take-profit rule sells), sized on
+    trims: seller.plan_trims plans part sales of the exact held time-series
+    pairs, and of the lone legs (the later market of a time-series pair,
+    still held after the earlier one paid out $0), grown past their Kelly
+    share (never a position the take-profit rule sells, and never a held
+    same-title pair), sized on
     the cash and positions value read at the start, and trader.sell_positions
     sends them after the take-profit sales. Nothing is trimmed, with one
     WARNING, when a held market was not identified, the listing was cut
@@ -1772,10 +1780,11 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
 
     Every run reads Kalshi's /series listing once, right after the market
     fetch (a cached copy, refreshed once a week): it files each market under
-    its category and tag for the same-title sport check
-    (_attach_series_labels), and the category/tag filter and, handed a report
-    (--result-file), each trade's category and tag in the report read the
-    same copy. With no listing a trade's category is left unknown.
+    its category and tag (_attach_series_labels, which also sets each
+    market's fee multiplier, read by the sale block's fees and every leg's),
+    and the category/tag filter and, handed a report (--result-file), each
+    trade's category and tag in the report read the same copy. With no
+    listing a trade's category is left unknown.
 
     Args:
         client: KalshiClient for production, from auth.build_client("prod").
@@ -1903,9 +1912,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         return EXIT_NO_TRADEABLE_SHARDS
 
     # Kalshi's /series listing, once per run (cached a week): each market's
-    # category and tag, which the same-title sport check compares (before the
-    # sale block, since live trimming reads it through held_pair_kind), and
-    # what the category/tag filter and the run result file a pair by
+    # category and tag, and what the category/tag filter and the run result
+    # file a pair by. Read before the sale block, because the attach below
+    # also sets each market's fee multiplier, which every sale's fee reads
     series_categories = load_series_categories(client)
     # Each series' fee multiplier (each leg's fee, and a paid-out partner's in
     # the sale block, read it when confirmed), read from the cache file the
@@ -1988,10 +1997,10 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
                         "the account's resting orders could not be read" if resting is None
                         else f"{resting} order(s) rest on the account")
                 else:
-                    # Cross-module: part sales of the exact held pairs and lone legs grown
-                    # past their Kelly share (read-only requests), sized on the start-of-run
-                    # cash and value, skipping the take-profit plans' positions, whose sales
-                    # go first
+                    # Cross-module: part sales of the exact held time-series pairs and
+                    # lone legs grown past their Kelly share (read-only requests), sized
+                    # on the start-of-run cash and value, skipping the take-profit
+                    # plans' positions, whose sales go first
                     plans = plans + plan_trims(
                         client, held_positions, held_labels, markets_by_ticker,
                         settings=settings, now=moment, cash_cents=cash_cents,
@@ -2413,7 +2422,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--size-cap", type=int, default=None, metavar="PCT",
         help=f"Per-trade Kelly cap for every pair, in whole percent, in {cap_step}%% "
              "steps; 100 = no cap (default: the saved live defaults). "
-             + trim_sells.format("lower cap", "", lone_leg),
+             + trim_sells.format("lower cap", "time-series ", lone_leg),
     )
     live.add_argument(
         "--same-title-size-cap", type=int, default=None, metavar="PCT",
@@ -2425,8 +2434,8 @@ def _build_parser() -> argparse.ArgumentParser:
     live.add_argument(
         "--rebalance", action=argparse.BooleanOptionalAction, default=None,
         help="Rebalance the held pairs this run: before buying, sell part of each "
-             "exact held pair, or lone leg whose partner has paid out, that has "
-             "outgrown its Kelly size, once "
+             "exact held time-series pair, or lone leg whose partner has paid out, that "
+             "has outgrown its Kelly size, once "
              "config.REBALANCE_MIN_DAYS_SINCE_TRADE calendar days have passed since "
              "its last trade, and let this run add to a pair the account "
              "already holds (exactly the same two markets, the same side on each, or a "

@@ -2729,19 +2729,26 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(scanner, "find_same_title_pairs", "close_gap_bound_text")
         assert _function_calls(backtester, "_extract_pairs", "close_gap_bound_text")
 
-    def test_ast_both_same_title_readers_apply_the_sport_check(self):
+    def test_ast_the_same_title_finder_applies_the_sport_check(self):
         # DR-79: identical wording on two series that close together is one
         # question only when both series are filed alike and both events name
-        # one competition. The finder and held_pair_kind (which live trimming
-        # reads) are the two live readers of the same-title rules; leaving
-        # held_pair_kind out would let a trim price a held football/volleyball
-        # pair on the same-title chance of paying
-        for reader in ("find_same_title_pairs", "held_pair_kind"):
-            assert _function_calls(scanner, reader, "_labels_differ"), reader
-            assert _function_calls(scanner, reader, "_competitions_differ"), reader
-        # Each live reader goes through the one definition
+        # one competition. The same-title finder applies both checks
+        assert _function_calls(scanner, "find_same_title_pairs", "_labels_differ")
+        assert _function_calls(scanner, "find_same_title_pairs", "_competitions_differ")
+        # ... each through the one definition
         assert _function_calls(scanner, "_labels_differ", "labels_differ")
         assert _function_calls(scanner, "_competitions_differ", "competitions_differ")
+        # held_pair_kind (which live trimming reads) applies neither: it gives
+        # two identically worded markets no kind at all, so a held same-title
+        # pair is never trimmed, filed alike or not
+        for callee in ("_labels_differ", "labels_differ", "_competitions_differ",
+                       "competitions_differ"):
+            assert not _function_calls(scanner, "held_pair_kind", callee), callee
+        # ... and never names the same-title type, so it can only answer time-series
+        [kind] = [node for node in ast.walk(ast.parse(inspect.getsource(scanner)))
+                  if isinstance(node, ast.FunctionDef) and node.name == "held_pair_kind"]
+        assert not any(isinstance(node, ast.Constant) and node.value == "same_title"
+                       for node in ast.walk(kind))
         # Never on the time-series finder: identical wording is never a
         # time-series pair (DR-67), and two rungs of one question are filed alike
         for callee in ("_labels_differ", "labels_differ", "_competitions_differ",
@@ -2751,12 +2758,14 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(scanner, "fetch_open_events_with_markets", "event_competition")
 
     def test_ast_both_run_modes_file_every_market_before_they_pair(self):
-        # The labels the sport check compares are attached once per run, from
-        # the one filing rule, before the finder, and in production before the
-        # sale block too (seller.plan_trims reads them through held_pair_kind)
+        # Every market's labels and fee multiplier are attached once per run,
+        # from the one filing rule, before the finder, and in production before
+        # the sale block too, since every sale's fee reads the fee multiplier
+        # the attach sets (scanner.market_fee_multiplier)
         assert _function_calls(main, "_attach_series_labels", "series_labels")
         tree = ast.parse(inspect.getsource(main))
-        for mode, before in (("_run_prod", ("plan_trims", "find_time_series_pairs",
+        for mode, before in (("_run_prod", ("plan_sales", "plan_trims",
+                                            "find_time_series_pairs",
                                             "_filter_by_category")),
                              ("_run_dev", ("find_time_series_pairs", "_filter_by_category"))):
             func = next(node for node in tree.body if isinstance(node, ast.FunctionDef)

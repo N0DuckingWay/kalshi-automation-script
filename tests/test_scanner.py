@@ -1537,9 +1537,6 @@ class TestSameTitleSportCheck:
         with caplog.at_level(logging.INFO):
             assert len(find_same_title_pairs([weekly, monthly])) == 1
         assert self._sport_lines(caplog) == []
-        # held_pair_kind reads the held pair as same-title too
-        assert scanner.held_pair_kind(yes_market=monthly, no_market=weekly) == (
-            "same_title", weekly, monthly)
 
     def test_weekly_and_monthly_copper_listings_still_pair(self, caplog):
         # The same shape on copper, filed Commodities · Metals on both series
@@ -1669,26 +1666,6 @@ class TestSameTitleSportCheck:
             self._LABEL_LINE + "1",
             self._COMPETITION_LINE + "1",
         ])
-
-    def test_held_pair_kind_reads_a_held_incident_pair_as_no_kind(self):
-        by_ticker = {m.ticker: m for m in self._incident_markets()}
-        volleyball = by_ticker["KXNCAAWVMATCH-26OCT161900UKOU-UK"]
-        football = by_ticker["KXNCAAFGAME-26OCT16UKOKLA-UK"]
-        # Held either way round, the pair is no known kind, so it is never
-        # trimmed on the same-title chance of paying
-        assert scanner.held_pair_kind(yes_market=football, no_market=volleyball) is None
-        assert scanner.held_pair_kind(yes_market=volleyball, no_market=football) is None
-        # Each check refuses on its own. One competition, filed differently:
-        volleyball._event_competition = football._event_competition
-        assert scanner.held_pair_kind(yes_market=football, no_market=volleyball) is None
-        # Filed alike, naming two competitions:
-        volleyball._event_competition = "NCAA Volleyball (W)"
-        volleyball._series_labels = football._series_labels
-        assert scanner.held_pair_kind(yes_market=football, no_market=volleyball) is None
-        # Control: filed alike and one competition, and it reads as same-title
-        volleyball._event_competition = football._event_competition
-        assert scanner.held_pair_kind(yes_market=football, no_market=volleyball) == (
-            "same_title", volleyball, football)
 
     def test_ingest_attaches_each_events_competition(self, monkeypatch, caplog):
         # Both event loops read the competition from product_metadata: an event
@@ -10081,11 +10058,13 @@ def _cross(ticker, event, deadline_text, close, *, yes_ask=0.20, no_ask=None, ti
 
 
 class TestHeldPairKind:
-    """held_pair_kind tells, from two held markets alone, a same-title from a
-    time-series pair and which is market A. A wrong answer would trim on the
-    wrong chance of paying, so it uses the finders' own tests and gives None
-    when unsure. Pairs a finder forms are asserted to form first, so a None
-    here is this reader's refusal."""
+    """held_pair_kind tells, from two held markets alone, whether they are a
+    time-series pair held as one, and which is market A. Two identically
+    worded markets (a same-title pair) are never a pair to trim. A wrong
+    answer would trim on the wrong chance of paying, so it uses the
+    time-series finder's own tests and gives None when unsure. Pairs a finder
+    forms are asserted to form first, so a None here is this reader's
+    refusal."""
 
     _WIU = TestSameTitleCloseGap._wiu_markets
 
@@ -10107,17 +10086,17 @@ class TestHeldPairKind:
                 _ladder_rung("RUNG-LATE", late, yes_ask=0.60, no_ask=0.40, close=close_b,
                              event=event, event_title=event_title))
 
-    # ── same-title ──────────────────────────────────────────────────────────
+    # ── identically worded markets are never a pair to trim ─────────────────
 
-    def test_a_same_title_pair_reads_as_same_title_with_the_finders_a_and_b(self):
+    def test_a_same_title_pair_the_finder_forms_is_no_pair_to_trim(self):
         mens, womens = self._WIU(womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC))
         [pair] = find_same_title_pairs([mens, womens])
         assert pair.pair_type == "same_title"
-        kind = _kind_of(pair)
-        assert kind is not None and kind[0] == "same_title"
-        # A is the market held NO, B the one held YES, as the finder has them
-        assert kind[1] is pair.market_a and kind[2] is pair.market_b
-        assert (kind[1], kind[2]) == (mens, womens)
+        assert (pair.market_a, pair.market_b) == (mens, womens)
+        # Held as the finder buys it (NO on A, YES on B), or the other way round
+        assert _kind_of(pair) is None
+        assert scanner.held_pair_kind(yes_market=womens, no_market=mens) is None
+        assert scanner.held_pair_kind(yes_market=mens, no_market=womens) is None
 
     def test_a_weekly_and_a_monthly_listing_at_one_close(self):
         close = datetime(2026, 9, 25, 21, tzinfo=UTC)
@@ -10131,34 +10110,35 @@ class TestHeldPairKind:
             subtitle="$70 or above", event_title="Brent crude oil price", yes_ask=0.35,
             no_ask=0.65, close_time=close)
         [pair] = find_same_title_pairs([weekly, monthly])
-        assert _kind_of(pair) == ("same_title", weekly, monthly)
-        # Snapshot wording ("price on <date>") is never time-series: the
-        # identical wording alone makes it same-title
+        # The finder's same-title pair, held either way round, is no pair to trim
+        assert _kind_of(pair) is None
+        assert scanner.held_pair_kind(yes_market=weekly, no_market=monthly) is None
+        assert scanner.held_pair_kind(yes_market=monthly, no_market=weekly) is None
+        # Snapshot wording ("price on <date>") is never time-series either
         assert scanner._market_deadline_profile(weekly)[0] == scanner.DEADLINE_SNAPSHOT
 
-    def test_a_same_title_pair_is_read_from_the_sides_held(self):
-        # A is the market held NO (leg_sides), even where today's prices would
-        # make the other one the finder's A
+    def test_a_same_title_pair_is_no_pair_whichever_side_is_held(self):
+        # Neither the sides the finder buys (NO on A, YES on B) nor the other
+        # way round, whatever today's prices would make the finder's A
         mens, womens = self._WIU(womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC))
+        [pair] = find_same_title_pairs([mens, womens])
         assert leg_sides("same_title") == ("no", "yes")
-        assert scanner.held_pair_kind(yes_market=mens, no_market=womens) == (
-            "same_title", womens, mens)
-        assert scanner.held_pair_kind(yes_market=womens, no_market=mens) == (
-            "same_title", mens, womens)
+        assert (pair.market_a, pair.market_b) == (mens, womens)
+        assert scanner.held_pair_kind(yes_market=mens, no_market=womens) is None
+        assert scanner.held_pair_kind(yes_market=womens, no_market=mens) is None
 
-    @pytest.mark.parametrize("gap_seconds, reads", [(0, True), (3_600, True), (3_601, False),
+    @pytest.mark.parametrize("gap_seconds, forms", [(0, True), (3_600, True), (3_601, False),
                                                     (9_000, False)])
-    def test_identical_wording_closing_apart_is_no_pair(self, gap_seconds, reads):
-        # The same-title close gate, bound included; identical wording is never
-        # time-series either
+    def test_identical_wording_is_no_pair_at_any_close_gap(self, gap_seconds, forms):
+        # The finder forms the pair only within the same-title close gate,
+        # bound included; held, identical wording is no pair at any gap, and
+        # never time-series either
         mens, womens = self._WIU(
             womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC)
             - timedelta(seconds=gap_seconds))
-        assert len(find_same_title_pairs([mens, womens])) == (1 if reads else 0)
+        assert len(find_same_title_pairs([mens, womens])) == (1 if forms else 0)
         for held in ((mens, womens), (womens, mens)):
-            kind = scanner.held_pair_kind(*held)
-            assert (kind is not None) is reads
-            assert kind is None or kind[0] == "same_title"
+            assert scanner.held_pair_kind(*held) is None
 
     def test_identical_wording_in_one_series_is_no_pair(self):
         # Two game days of one recurring fixture (DR-02): two questions
@@ -10173,10 +10153,12 @@ class TestHeldPairKind:
         assert find_same_title_pairs([one, two]) == []
         assert scanner.held_pair_kind(one, two) is None
         assert scanner.held_pair_kind(two, one) is None
-        # Control: the same two markets on two series are a same-title pair
+        # Control: on two series the finder forms the same-title pair, and
+        # held, it is still no pair
         two.event_ticker = "KXNPBALT-26SEP150500FUKORI"
         assert len(find_same_title_pairs([one, two])) == 1
-        assert scanner.held_pair_kind(two, one) == ("same_title", one, two)
+        assert scanner.held_pair_kind(two, one) is None
+        assert scanner.held_pair_kind(one, two) is None
 
     @pytest.mark.parametrize("event_a, event_b", [
         ("KXAA-1", "KXAA-1"),    # one event's own markets
@@ -10206,10 +10188,12 @@ class TestHeldPairKind:
         assert find_same_title_pairs([a, b]) == []
         assert scanner.held_pair_kind(a, b) is None
         assert scanner.held_pair_kind(b, a) is None
-        # Control: a subtitle alone is wording enough, as it is for the finder
+        # Control: a subtitle alone is wording enough for the finder, and held,
+        # the pair it forms is still no pair
         a.subtitle = b.subtitle = "Team A"
         assert len(find_same_title_pairs([a, b])) == 1
-        assert scanner.held_pair_kind(b, a) == ("same_title", a, b)
+        assert scanner.held_pair_kind(b, a) is None
+        assert scanner.held_pair_kind(a, b) is None
 
     def test_one_market_is_never_its_own_pair(self):
         mens, _womens = self._WIU()
@@ -10459,10 +10443,12 @@ class TestHeldPairKind:
         assert _kind_of(pair) == (("time_series", dated, respelled) if reads else None)
         assert scanner.held_pair_kind(respelled, dated) is None
         # Spelled alike, they are the same-title pair they may have been bought
-        # as, inside the bound
+        # as inside the bound, which the finder forms there: identically
+        # worded, never a pair to trim, at any gap
         respelled.subtitle = dated.subtitle
-        assert scanner.held_pair_kind(respelled, dated) == (
-            None if reads else ("same_title", dated, respelled))
+        assert len(find_same_title_pairs([dated, respelled])) == (0 if reads else 1)
+        assert scanner.held_pair_kind(respelled, dated) is None
+        assert scanner.held_pair_kind(dated, respelled) is None
 
     @pytest.mark.parametrize("close_a, close_b", [
         (None, datetime(2026, 3, 9, tzinfo=UTC)),
@@ -10552,13 +10538,14 @@ class TestHeldPairKind:
 
     # ── every pair the finders form ─────────────────────────────────────────
 
-    def test_every_pair_the_finders_form_reads_as_its_own_kind(self, monkeypatch):
-        # Seeded sweep of the three shapes a run can hold. Same-title pairs and
-        # ladders read as their own kind, A and B as the finder has them. A
-        # cross-event pair reads as time-series exactly when its stated days
-        # read, differ and agree with its closes, or (a day unread) its closes
-        # are past the same-title bound; otherwise as no pair. Never the other
-        # kind, and a time-series pair held the other way round never reads
+    def test_every_pair_the_finders_form_reads_as_time_series_or_as_no_pair(self, monkeypatch):
+        # Seeded sweep of the three shapes an account can hold. A same-title
+        # pair reads as no pair, held either way round. A ladder reads as
+        # time-series, A and B as the finder has them. A cross-event pair
+        # reads as time-series exactly when its stated days read, differ and
+        # agree with its closes, or (a day unread) its closes are past the
+        # same-title bound; otherwise as no pair. Never as same-title, and a
+        # time-series pair held the other way round never reads
         rng = random.Random(2026)
         base = datetime(2026, 3, 1, 12, tzinfo=UTC)
         bound = config.SAME_TITLE_MAX_CLOSE_GAP_SECONDS
@@ -10584,7 +10571,9 @@ class TestHeldPairKind:
                                      event_title=f"Game {n}", yes_ask=p_low,
                                      no_ask=round(1.0 - p_low, 2), close_time=base + close_gap)
                 [pair] = find_same_title_pairs(rng.sample([dear, cheap], 2))
-                assert _kind_of(pair) == ("same_title", dear, cheap)
+                assert (pair.market_a, pair.market_b) == (dear, cheap)
+                assert _kind_of(pair) is None
+                assert scanner.held_pair_kind(dear, cheap) is None
                 assert self._ts([dear, cheap], monkeypatch) == []
                 seen["same_title"] += 1
                 continue

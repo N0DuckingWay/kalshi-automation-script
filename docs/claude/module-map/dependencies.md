@@ -17,7 +17,7 @@ config.py, _http.py
                       └─ main.py, scheduler.py
 
 historical.py → auth.py (build_client, wrapped by build_historical_client/build_prod_live_client)
-main.py → historical.py (load_series_categories, series_labels, infer_category — every run files each market by them for the same-title sport check, DR-79; the live category/tag filter files a pair by the backtest dashboard's own rule, and a run started with --result-file records each trade's category and tag by it)
+main.py → historical.py (load_series_categories, series_labels, infer_category — every run files each market by them, though only scanner.find_same_title_pairs' sport check, which no run mode calls, compares those labels (DR-79); the live category/tag filter files a pair by the backtest dashboard's own rule, and a run started with --result-file records each trade's category and tag by it)
 dashboard.py → historical.py (series_labels, the one filing rule the live filter shares)
 historical.py → scanner.py (event_series, the ONE definition of an event's series identity, so the event-title fallback's combo test — DR-51 — can never disagree with the one-series rule about what a combo is; event_competition, the ONE reading of an event's competition label, so load_event_competitions reads the backtest's labels as live ingest reads them, DR-79)
 historical.py → backtester.py → dashboard.py → backtest.py (backtester reads historical's series_labels, load_series_categories and load_event_competitions for the same-title sport check, DR-79; backtest.py reads the /series listing once and hands it to both run_backtest_sweep and generate_dashboard)
