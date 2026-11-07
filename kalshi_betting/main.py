@@ -958,17 +958,14 @@ def _attach_series_labels(markets: list, series_categories: dict, *,
     """
     Attach to every market the Kalshi category and first tag its series is filed under.
 
-    The same-title sport check of scanner.find_same_title_pairs compares two
-    markets' labels (scanner._labels_differ) and refuses a market that has
-    none; no run mode calls that finder, so nothing else in a run reads the
-    labels. The labels come from historical.series_labels, the rule the
-    dashboard and the category/tag filter file by: a series the listing lacks
-    is filed under its ticker-prefix category (infer_category) and "General".
+    The labels come from historical.series_labels, the rule the dashboard and
+    the category/tag filter file by: a series the listing lacks is filed under
+    its ticker-prefix category (infer_category) and "General". Only the
+    same-title finder reads them, and no run mode calls it.
 
     It also sets each market's fee multiplier (fee_multipliers, below), which
-    every leg's fee and every sale's fee read (scanner.market_fee_multiplier),
-    so both run modes call it right after the market fetch, before any sale
-    is planned or any pair is looked for.
+    every leg's and sale's fee reads, so both run modes call it right after
+    the market fetch, before any sale is planned or pair looked for.
 
     With no listing at all (no cached copy, and a read that failed or, in
     dev, none made), every series is filed by its ticker prefix, so nearly
