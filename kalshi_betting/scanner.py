@@ -65,10 +65,10 @@ Dependencies:
     is told to add to. get_held_positions() reads each held market's side and
     cost (get_held_tickers() is its tickers), and held_pairs() finds what a
     run may add to (HeldPosition, HeldPair, pair_held): exact held pairs, and
-    lone legs whose partner has paid out. main._run_prod passes them as each
-    finder's keyword-only add_on_pairs when the run's rebalance setting is
-    on, which lets such a pair through, and only with the side already held
-    on each held market.
+    lone legs whose partner has paid out. main._run_prod passes them as
+    find_time_series_pairs' keyword-only add_on_pairs when the run's
+    rebalance setting is on, which lets such a pair through, and only with
+    the side already held on each held market.
     historical.py imports event_series too, so the backtest's event-title
     lookup budget tells a combo ticker from any other exactly as the
     one-series rule does (DR-51).
@@ -1606,9 +1606,8 @@ def close_gap_bound_text(seconds: int | None = None) -> str:
     scanner.SAME_TITLE_MAX_CLOSE_GAP_SECONDS narrows the gate and both lines
     together (DR-74). Resolved at call time, never bound as a def-time
     default, for the same reason time_series_profit_prob's k is: a default
-    would freeze the value at import and ignore a patch. A caller that
-    describes a bound it holds itself (main._no_pairs_msg, reading its own
-    binding like every other threshold it names) passes it in.
+    would freeze the value at import and ignore a patch. The seconds
+    argument renders any other bound (the tests pass one).
 
     A whole number of minutes prints as minutes ("60 minutes", "1 minute");
     anything else prints in seconds ("90 seconds"), so the text never
@@ -1857,7 +1856,7 @@ def _labels_differ(mA: Any, mB: Any) -> bool:
     Live reader of labels_differ over each market's ._series_labels.
 
     main._attach_series_labels sets that attribute on every market of a run
-    before either finder runs. A market without it (or a MagicMock, whose
+    before any pair is found. A market without it (or a MagicMock, whose
     auto-attribute is not a tuple) fails closed.
 
     Args:
@@ -2927,9 +2926,9 @@ def _filter_active_markets(
             no tickers are excluded.
         warn_missing_close (bool): Whether to emit the missing-close_time
             summary WARNING. Keyword-only, and True by default so any
-            standalone caller keeps the signal. Both run modes call this on the
-            SAME market list twice — once per finder — so the second caller
-            passes False to keep it at ONE line per run, which is what
+            standalone caller keeps the signal. find_same_title_pairs passes
+            False, leaving the line to find_time_series_pairs, the finder
+            every run mode calls, so a run logs it ONCE, which is what
             CLAUDE.md specifies. This flag NEVER changes which markets are
             dropped, only whether the drop is reported (TS-22).
 
@@ -2973,9 +2972,8 @@ def filter_markets_within_horizon(markets: list, max_horizon_days: int | None) -
 
     Optional opt-in bet-horizon cap for the live trading path: when set, drops
     any market whose close_time is farther out than max_horizon_days from the
-    moment this function runs. Applied upstream of both find_time_series_pairs
-    and find_same_title_pairs so both bet types see an identical filtered list
-    and a single cutoff timestamp.
+    moment this function runs. Applied upstream of find_time_series_pairs, so
+    the finder sees one filtered list and a single cutoff timestamp.
 
     Args:
         markets (list): List of ApiMarket objects to filter.
@@ -4707,9 +4705,9 @@ def check_shard_coverage(
         A shard the exchange advertises as `trading_active=True` but that
         produced zero ingested markets is a genuine coverage gap ONLY when it
         also holds account funds — money sitting on a shard whose order book
-        we never scanned is a real blind spot, because a same-title or
-        time-series pair on that shard could exist and go undetected. When no
-        funds are parked there, an empty active shard is business-as-usual
+        we never scanned is a real blind spot, because a time-series pair on
+        that shard could exist and go undetected. When no funds are parked
+        there, an empty active shard is business-as-usual
         during the shard rollout — it would be wrong to CRITICAL-alert every
         single week on an expected transient state, so that case is a warning
         instead. The same empty-vs-funded split applies to a market or balance
@@ -5125,14 +5123,12 @@ def find_time_series_pairs(
          lives outside the wording entirely, so these are two instances of one
          recurring fixture rather than one question at two deadlines and there
          is no cumulative-deadline premise (DR-02, DR-54). find_same_title_pairs
-         refuses the same shape; if only it did, this finder would simply
-         relabel the pair as a time-series bet and main._dedup_pairs — which
-         drops the time-series copy only when a same-title copy exists — would
-         have nothing to drop it against. Such candidates are counted and
-         reported once after the loop on their own silent-at-zero INFO line
-         (M10), as find_same_title_pairs reports its own one-series skips;
-         backtester._extract_pairs logs its sweep's count on a line that
-         differs only in its parenthesis.
+         refuses the same shape; were this finder not to refuse it too, it
+         would trade such a pair as a time-series bet. Such candidates are
+         counted and reported once after the loop on their own silent-at-zero
+         INFO line (M10), as find_same_title_pairs reports its own one-series
+         skips; backtester._extract_pairs logs its sweep's count on a line
+         that differs only in its parenthesis.
       4. Both legs are CUMULATIVE-deadline markets ("will X happen BY
          <date>") stating two DIFFERENT deadlines — cumulative_deadline_pair
          over deadline_phrasing. Kalshi also lists SNAPSHOT markets ("Bitcoin
@@ -5188,9 +5184,7 @@ def find_time_series_pairs(
     pair costs, NOT that the pair
     cannot lose: this is a directional bet whose expected value is negative
     at market prices unless the market overstates the in-between probability
-    (config.time_series_profit_prob). Same-title pairs (no deadline gap,
-    simpler co-resolution model) are preferred over time-series ones wherever
-    both exist.
+    (config.time_series_profit_prob).
 
     Args:
         client (Any): Authenticated KalshiClient, used only when markets is None.
@@ -5546,13 +5540,11 @@ def find_time_series_pairs(
                         mA, mB = mB, mA
                 else:
                     # Identical wording across two events of one series is the
-                    # same-title shape find_same_title_pairs now refuses (DR-02,
+                    # same-title shape find_same_title_pairs refuses too (DR-02,
                     # DR-54): the deadline lives outside the wording, so these are
                     # two instances of one recurring fixture and there is no
                     # cumulative-deadline premise to trade. Without this conjunct
-                    # the same-title gate would merely RELABEL such a pair as a
-                    # time-series bet — main._dedup_pairs only ever dropped the
-                    # time-series copy because a same-title copy existed.
+                    # this finder would trade such a pair as a time-series bet.
                     if _identical_wording(mA, mB) and _same_series(mA, mB):
                         series_skips += 1
                         continue
@@ -6027,11 +6019,10 @@ def find_same_title_pairs(
             category, tag and competition.
     """
     # Remove markets already held and those priced at 0¢/100¢ (settled/illiquid)
-    # warn_missing_close=False: both run modes call find_time_series_pairs on
-    # this SAME list immediately before this call (main._run_dev, _run_prod),
-    # and it has already emitted the summary WARNING. One line per run, as
-    # CLAUDE.md specifies — not one per finder. The markets are still dropped
-    # here either way; only the report is suppressed (TS-22).
+    # warn_missing_close=False: the summary WARNING is find_time_series_pairs',
+    # the finder every run mode calls (main._run_dev, _run_prod). One line per
+    # run, as CLAUDE.md specifies — not one per finder. The markets are still
+    # dropped here either way; only the report is suppressed (TS-22).
     active = _filter_active_markets(markets, held_tickers, warn_missing_close=False)
     # What the run may add to, and its markets: one of an exact pair pairs only
     # with its own partner, a lone leg only with a market not held

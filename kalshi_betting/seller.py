@@ -38,7 +38,7 @@ Purpose:
     the same number of calendar days after the last fill on the pair's
     markets and, with a minimum price move, until the pair's price has moved
     that far since, up or down. It sends nothing and sizes nothing: the
-    finders and the sizer do the rest. With
+    time-series finder and the sizer do the rest. With
     LiveSettings.rebalance_min_days_to_maturity set ("Rebalance until"),
     neither a trim nor an add-on is made once the position's later market
     closes fewer than that many days from today (UTC dates).
@@ -1694,10 +1694,10 @@ def _add_on_one(pair: HeldPair, reads: _Reads, fills: FillTimes, *,
       1. The wait: enough calendar days since its last trade (_last_fill, the
          Kelly trim's own reading: the last fill on both of an exact pair's
          markets; for a lone leg, on its own market and any market of its
-         ladder in this run's list, since the finders pair a lone leg only
-         with one of those, so a partner sold by hand restarts the wait).
-         With no fill listed, it last traded no later than the fills list's
-         oldest fill.
+         ladder in this run's list, since the time-series finder pairs a lone
+         leg only with one of those, so a partner sold by hand restarts the
+         wait). With no fill listed, it last traded no later than the fills
+         list's oldest fill.
       2. With a minimum price move set: a fill is listed, so its price when it
          last traded can be read.
       3. Its price now: the ask of the side held on each market, from this
@@ -1813,8 +1813,8 @@ def plan_add_ons(client: Any, add_on_pairs: dict, markets_by_ticker: dict, *,
     the last fill on any of its markets, by the bot or by hand
     (config.rebalance_rested, on the bot's own clock; for a lone leg, also on
     any market of its ladder in this run's list, the one kind of market the
-    finders pair it with, so a partner sold by hand is not bought back the
-    next day), and, with
+    time-series finder pairs it with, so a partner sold by hand is not
+    bought back the next day), and, with
     settings.min_price_move, a move of at least that many dollars, up or
     down, since that fill (config.pair_price_move, price_move_reached). An
     exact pair's price is the asks of the sides held on its two markets,

@@ -620,8 +620,8 @@ class TestOneEventSeriesIsTwoFixtures:
 
     Both finders must refuse it. Gating only find_same_title_pairs would merely
     relabel the trade: the same two tickers also clear the time-series filter
-    (gap 1 day, pB - pA = 0.96), and main._dedup_pairs only ever dropped that
-    copy because a same-title copy existed.
+    (gap 1 day, pB - pA = 0.96), so the time-series finder would trade them
+    as a time-series bet unless it refuses them on its own.
     """
 
     # The real pair the 2026-09-15 prod dry run selected and sized: one
@@ -659,15 +659,6 @@ class TestOneEventSeriesIsTwoFixtures:
         # markets close 1 day apart and pB - pA = 0.96 clears the 15% tier.
         mA, mB = self._npb_markets()
         assert find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB]) == []
-
-    def test_dedup_has_nothing_left_to_relabel(self):
-        # End state on the live path: both finders come back empty, so the
-        # merge main performs produces no trade at all.
-        from kalshi_betting.main import _dedup_pairs
-        mA, mB = self._npb_markets()
-        same = find_same_title_pairs([mA, mB])
-        ts = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
-        assert _dedup_pairs(same, ts) == []
 
     def test_the_skip_is_reported_once_with_a_count(self, caplog):
         mA, mB = self._npb_markets()
@@ -952,8 +943,8 @@ class TestOneEventSeriesIsTwoFixtures:
         )
         assert (pair.market_a.ticker, pair.market_b.ticker) == ("KXZ-A-T", "KXZ-C-T")
         assert pair.pB - pair.pA == pytest.approx(0.30)
-        # The look-alike is gone from the same-title side too, so dedup has
-        # nothing to prefer over the promoted time-series pair.
+        # The look-alike is gone from the same-title side too: neither finder
+        # forms a pair from it.
         assert find_same_title_pairs([mA, mB, mC]) == []
 
     def test_a_differing_subtitle_breaks_the_identical_wording_half(self):
@@ -3742,13 +3733,10 @@ class TestDeadlineGuardFinders:
         # are mutually exclusive on one ticker pair (DR-67: identical wording
         # states the same deadline spans, or none), the refused same-title
         # copy cannot come back as a time-series pair either — undated ("Q",
-        # unknown wording) or dated (one deadline stated twice). So nothing
-        # reaches main._dedup_pairs, and a same-title-only gate cannot
-        # relabel the trade. Mirror of test_backtester.py::
-        # TestRunBacktestCrossTypeDedup::
+        # unknown wording) or dated (one deadline stated twice). So a
+        # same-title-only gate cannot relabel the trade. Mirror of
+        # test_backtester.py::TestRunBacktestCrossTypeDedup::
         # test_identical_wording_closing_apart_forms_no_pair_of_either_type.
-        from kalshi_betting.main import _dedup_pairs
-
         mA = _mock_market(
             ticker="A1", event_ticker="EVA-1", title=title, event_title="EV",
             yes_ask=0.30, no_ask=0.70, close_time=datetime(2026, 12, 1, tzinfo=UTC),
@@ -3767,7 +3755,6 @@ class TestDeadlineGuardFinders:
         )
         assert same_title == []
         assert time_series == []
-        assert _dedup_pairs(same_title, time_series) == []
 
         # Positive control: B moved onto A's close instant, nothing else
         # changed — the same-title pair forms, so the [] above is the close
@@ -11993,8 +11980,9 @@ class TestValidatePairPriceReachableDepth:
 class TestCloseTimeWarningOncePerRun:
     """
     TS-22: _filter_active_markets emits one summary WARNING naming how many
-    markets it dropped for a missing close_time. Both finders call it on the
-    SAME list in one run, so the line appeared TWICE. CLAUDE.md specifies one
+    markets it dropped for a missing close_time. Both finders call it, and
+    find_same_title_pairs keeps quiet (warn_missing_close=False), so the two
+    finders run on one list log that line once. CLAUDE.md specifies one
     summary WARNING carrying the count.
     """
 
@@ -12027,10 +12015,10 @@ class TestCloseTimeWarningOncePerRun:
                                 close_time=None)
         return [good_a, good_b, bad_1, bad_2]
 
-    def test_one_warning_across_both_finders_in_one_run(self, caplog):
+    def test_one_warning_across_both_finders_over_one_list(self, caplog):
         # The duplication happens one level up from _filter_active_markets, so
         # a test that invokes it once is tautologically satisfied and cannot
-        # see this. Drive BOTH finders on one list, as both run modes do.
+        # see this. Drive BOTH finders on one list.
         markets = self._markets()
         with caplog.at_level(logging.WARNING):
             find_time_series_pairs(MagicMock(), held_tickers=set(), markets=markets)

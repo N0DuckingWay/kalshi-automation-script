@@ -6,12 +6,12 @@ Last edited by: Zachary Hoffman
 Purpose:
     Runs the live trading bot from the command line. Dev mode scans the
     sandbox exchange and writes a simulation to Excel. Prod mode scans the
-    real exchange, finds pairs of contracts to trade (same-title pairs: one
-    question listed twice at different prices; time-series pairs: one
-    question at two deadlines), sizes each trade with the Kelly rule (a
-    formula for how much of the money to bet), sends the orders and adds the
-    results to the Excel trade log. The exit code tells the scheduler how the
-    run went (the EXIT_* constants in config.py); an unexpected error exits 1.
+    real exchange, finds pairs of contracts to trade (time-series pairs: one
+    question at two deadlines, bought YES on the earlier market and NO on the
+    later), sizes each trade with the Kelly rule (a formula for how much of
+    the money to bet), sends the orders and adds the results to the Excel
+    trade log. The exit code tells the scheduler how the run went (the EXIT_*
+    constants in config.py); an unexpected error exits 1.
 
     A production run sizes each trade on the account's portfolio value (the
     cash on every exchange shard plus what Kalshi says the open positions are
@@ -43,14 +43,14 @@ Purpose:
     a toggle flag overrides one of them for this run only. With no saved
     file, a refused file or a bad flag, the run exits 2 before logging
     anything; it never falls back to config.py's values. The scheduler passes
-    no toggle flags. Between finding pairs and pricing them, _dedup_pairs and
-    _filter_by_category trim the list.
+    no toggle flags. Between finding pairs and pricing them,
+    _filter_by_category trims the list.
 
     Every run reads Kalshi's /series listing once, right after the market
     fetch, and files each market under its series' category and first tag
-    (_attach_series_labels): the same-title finder, and held_pair_kind for
-    live trimming, refuse two markets filed differently (DR-79). The
-    category/tag filter and the run summary read the same copy. The same
+    (_attach_series_labels): held_pair_kind, which live trimming reads,
+    refuses two markets filed differently (DR-79). The category/tag filter
+    and the run summary read the same copy. The same
     listing's fee multipliers are read beside it
     (historical.load_series_fee_multipliers) and set on each market as
     _fee_multiplier, which prices that market's leg fees
@@ -82,8 +82,8 @@ Purpose:
     A production run keeps every market the account holds out of new trades,
     except, when the run's rebalance setting is on, the markets it
     may add to (scanner.held_pairs): the two markets of an exact held pair,
-    which each finder lets through only as that same pair, and a lone held
-    leg whose partner has paid out, which each finder lets through only
+    which the time-series finder lets through only as that same pair, and a
+    lone held leg whose partner has paid out, which it lets through only
     beside a market the account does not hold (add_on_pairs). It adds to
     none when Kalshi's value of the open positions was not read or was
     refused, since an add-on is sized on the portfolio value. An add-on
@@ -96,8 +96,8 @@ Dependencies:
     Imports auth.py (the client, and the one balance read, which also checks
     the credentials), config.py (constants, exit codes, the order-path check
     and the live-settings helpers), historical.py (Kalshi's series categories,
-    for the same-title sport check, the category/tag filter and each trade's
-    category in the run summary),
+    which file each market, decide the category/tag filter and name each
+    trade's category in the run summary),
     reporter.py (Excel output and the run summary), _http.py (a one-line
     description of an error), scanner.py (finding markets and pairs, and
     pricing them from the order book), seller.py (which held positions to
@@ -173,8 +173,6 @@ from .config import (
     REBALANCE_MATURITY_DAYS,
     SALE_KIND_KELLY_TRIM,
     SALE_READ_BACK_RECHECK_SECONDS,
-    SAME_TITLE_MAX_CLOSE_GAP_SECONDS,
-    SAME_TITLE_MIN_PRICE_DIFF,
     SELL_AT_STEP,
     SIZE_CAP_STEP,
     TAG_SCOPE_SEPARATOR,
@@ -216,13 +214,11 @@ from .reporter import (
 )
 from .scanner import (
     check_shard_coverage,
-    close_gap_bound_text,
     display_title,
     enrich_with_orderbook_prices,
     fetch_open_events_with_markets,
     fetch_shard_statuses,
     filter_markets_within_horizon,
-    find_same_title_pairs,
     find_time_series_pairs,
     get_held_positions,
     get_resting_orders,
@@ -890,13 +886,9 @@ def _no_pairs_msg(sandbox: bool = False, settings: LiveSettings | None = None, *
 
     Words the time-series rule as the finder's "Time-series entry rule" line
     does, and names the cumulative-deadline requirement so a reader does not
-    blame the price rule for what the wording decided. Names the
-    same-title pairing rules for the same reason: a same-title pair also needs
-    two different event series, filed under one Kalshi category, tag and
-    competition, whose markets close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS
-    of each other (DR-02/DR-54, DR-79, DR-74), with the bound read from that
-    constant and rendered by scanner.close_gap_bound_text. A set category/tag
-    filter is named too, since it can empty the list on its own.
+    blame the price rule for what the wording decided. A set category/tag
+    filter is named too, since it can empty the list on its own, but only
+    after a search: a run that asked no finder had no list for it to empty.
 
     Args:
         sandbox (bool): True to phrase the message for a dev/sandbox run
@@ -925,67 +917,15 @@ def _no_pairs_msg(sandbox: bool = False, settings: LiveSettings | None = None, *
     else:
         time_series = ("time-series: not searched this run, because a held market "
                        "could not be identified (see the ERROR above)")
-    thresholds = (
-        f"{time_series}"
-        " — or same-title: "
-        f"≥{SAME_TITLE_MIN_PRICE_DIFF:.0%} price diff on two different series "
-        "filed under one Kalshi category, tag and competition, "
-        # This module's own binding, like the same-title threshold above; the scanner
-        # helper only renders it, in the words the refusal lines use.
-        f"closing within {close_gap_bound_text(SAME_TITLE_MAX_CLOSE_GAP_SECONDS)}"
-    )
-    if settings.exclude_categories is not None or settings.exclude_tags is not None:
+    thresholds = time_series
+    if time_series_searched and (settings.exclude_categories is not None
+                                 or settings.exclude_tags is not None):
         # The run's category/tag filter, in the "Live settings:" line's words
         thresholds += (f" — among pairs filed under the run's category/tag filter "
                        f"({describe_trade_filter(settings)})")
     if sandbox:
         return f"No qualifying pairs found in sandbox ({thresholds})."
     return f"No qualifying pairs found ({thresholds})."
-
-
-def _dedup_pairs(primary: list, secondary: list) -> list:
-    """
-    Merge two pair lists, excluding any pair from secondary that already appears in primary.
-
-    A duplicate is defined as any pair whose frozenset of {ticker_a, ticker_b} already
-    exists in primary. Since DR-67 the two finders cannot produce a cross-type
-    collision on one ticker pair: a same-title pair requires identical wording,
-    a time-series pair requires two DIFFERENT stated deadlines, and identical
-    wording states identical deadline spans, or none — never two different
-    ones. This function stays as a guard against a collision arising another
-    way (both finders have their own defences too — see the one-series and
-    cumulative-deadline gotchas in CLAUDE.md), and its preference is the same
-    as before: were a collision to occur, the same-title pair would be kept
-    because it is the near-arbitrage — identical questions must co-resolve, so
-    its payoff is a floor — whereas the time-series pair is a directional bet
-    whose sizing rests on the discounted mid-spread estimate of the in-between
-    probability (config.time_series_profit_prob). This matches the
-    same_title > time_series tie-break already used by strategy.select_portfolio().
-
-    Args:
-        primary (list): List of CandidatePair objects from find_same_title_pairs().
-            These are always kept.
-        secondary (list): List of CandidatePair objects from find_time_series_pairs().
-            Entries whose ticker pair already appears in primary are dropped.
-
-    Returns:
-        list: Combined list with primary entries first, then non-duplicate secondary
-            entries appended in their original order.
-    """
-    seen: set = set()
-    result = []
-    for pair in primary:
-        key = frozenset([pair.market_a.ticker, pair.market_b.ticker])
-        seen.add(key)
-        result.append(pair)
-    for pair in secondary:
-        key = frozenset([pair.market_a.ticker, pair.market_b.ticker])
-        # Only add if this exact ticker pair was not already found by the
-        # same-title scanner (the primary list, which is kept on conflict)
-        if key not in seen:
-            seen.add(key)
-            result.append(pair)
-    return result
 
 
 def _pair_labels(pair, series_categories: dict) -> tuple[str, str]:
@@ -1016,12 +956,12 @@ def _attach_series_labels(markets: list, series_categories: dict, *,
     """
     Attach to every market the Kalshi category and first tag its series is filed under.
 
-    The same-title sport check compares the two markets' labels
-    (scanner._labels_differ) in find_same_title_pairs and in held_pair_kind,
-    which live trimming reads, and refuses a market that has none. The labels
-    come from historical.series_labels, the rule the dashboard and the
-    category/tag filter file by: a series the listing lacks is filed under
-    its ticker-prefix category (infer_category) and "General".
+    The same-title sport check in held_pair_kind, which live trimming reads,
+    compares the two markets' labels (scanner._labels_differ) and refuses a
+    market that has none. The labels come from historical.series_labels, the
+    rule the dashboard and the category/tag filter file by: a series the
+    listing lacks is filed under its ticker-prefix category (infer_category)
+    and "General".
 
     With no listing at all (no cached copy, and a read that failed or, in
     dev, none made), every series is filed by its ticker prefix, so nearly
@@ -1054,7 +994,7 @@ def _attach_series_labels(markets: list, series_categories: dict, *,
     listed: list = []
     for market in markets:
         # A market with no event ticker is filed under "" (infer_category's
-        # "Other"); the same-title finder refuses it on its series anyway
+        # "Other"); held_pair_kind refuses a market with no event ticker anyway
         event = getattr(market, "event_ticker", "") or ""
         if event not in by_event:
             # Cross-module: the one filing rule the dashboard and the live filter share
@@ -1103,7 +1043,7 @@ def _filter_by_category(pairs: list, settings: LiveSettings, listing_client, *,
     not one series' labels together.
 
     Args:
-        pairs (list): CandidatePairs after dedup, before enrichment.
+        pairs (list): CandidatePairs from the time-series finder, before enrichment.
         settings (LiveSettings): The run's toggles.
         listing_client: A production KalshiClient, or None to read the cached
             /series listing only (dev: the sandbox key never signs a prod request).
@@ -1695,27 +1635,23 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
         return EXIT_NO_TRADEABLE_SHARDS
 
     # Kalshi's /series listing, the cached copy only (the sandbox key never signs
-    # a production request): each market's category and tag, which the
-    # same-title sport check compares, and what the category/tag filter files by
+    # a production request): each market's category and tag, and what the
+    # category/tag filter files by
     series_categories = load_series_categories(None)
     # Each series' fee multiplier, from the same cached copy (each leg's fee reads it when confirmed)
     fee_multipliers = load_series_fee_multipliers(None)
     _attach_series_labels(markets, series_categories, fee_multipliers=fee_multipliers)
 
-    # Optional opt-in cap so both bet types only see markets closing within
-    # the requested window — a no-op (returns markets unchanged) when unset
+    # Optional opt-in cap so the finder only sees markets closing within the
+    # requested window — a no-op (returns markets unchanged) when unset
     markets = filter_markets_within_horizon(markets, args.max_horizon_days)
 
     # Skip held-positions filter — sandbox requires a separate account and credentials.
     # Pass an empty set so _filter_active_markets does not exclude any tickers.
     # The run's settings decide the time-series entry rule (tier floors, band)
-    time_series_pairs = find_time_series_pairs(
+    candidate_pairs   = find_time_series_pairs(
         client, held_tickers=set(), markets=markets, settings=settings,
     )
-    # Detect same-title pairs separately — uses a different grouping key (exact title match)
-    same_title_pairs  = find_same_title_pairs(markets, held_tickers=set())
-    # Merge both lists, preferring same_title when both scanners found the same pair
-    candidate_pairs   = _dedup_pairs(same_title_pairs, time_series_pairs)
     # Category/tag filter, on the listing read above; no listing client, so the
     # sandbox key never signs a prod request
     candidate_pairs   = _filter_by_category(candidate_pairs, settings, None,
@@ -1779,11 +1715,11 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     """
     Run one production scan and trade on the real Kalshi account.
 
-    Reads the balance, skips markets already held, finds same-title and
-    time-series pairs, sizes each trade with the Kelly rule (a formula for
-    how much to bet), sends the orders (the NO leg first, then the YES leg)
-    and adds the results to trade_log.xlsx. With --dry-run everything runs
-    except sending orders.
+    Reads the balance, skips markets already held, finds time-series pairs,
+    sizes each trade with the Kelly rule (a formula for how much to bet),
+    sends the orders (the NO leg first, then the YES leg) and adds the
+    results to trade_log.xlsx. With --dry-run everything runs except sending
+    orders.
 
     With settings.sell_at set it sells before it buys: seller.plan_sales picks
     the positions, trader.sell_positions sends the orders, the trade log records
@@ -2214,25 +2150,20 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     blocked_tickers   = (held_tickers - add_on_tickers) | sold_tickers
     markets           = [m for m in markets if m.ticker not in blocked_tickers]
 
-    # Optional opt-in cap so both bet types only see markets closing within
-    # the requested window — a no-op (returns markets unchanged) when unset
+    # Optional opt-in cap so the finder only sees markets closing within the
+    # requested window — a no-op (returns markets unchanged) when unset
     markets           = filter_markets_within_horizon(markets, args.max_horizon_days)
 
-    # Run both pair detection paths: time-series (the run's entry rule, and no
-    # pair on a ladder we hold but one adding to an exact held pair or a lone
-    # held leg) and same-title (a held pair's markets pair only with each
-    # other, a lone leg only with a market not held)
+    # Find time-series pairs (the run's entry rule, and no pair on a ladder we
+    # hold but one adding to an exact held pair or a lone held leg); none at
+    # all when a held market could not be identified
     if held_ladders is None:
-        time_series_pairs = []
+        candidate_pairs = []
     else:
-        time_series_pairs = find_time_series_pairs(
+        candidate_pairs = find_time_series_pairs(
             client, blocked_tickers, markets, settings=settings, held_ladders=held_ladders,
             add_on_pairs=add_on_pairs,
         )
-    same_title_pairs  = find_same_title_pairs(markets, blocked_tickers,
-                                              add_on_pairs=add_on_pairs)
-    # Merge both lists, preferring same_title when both scanners found the same pair
-    candidate_pairs   = _dedup_pairs(same_title_pairs, time_series_pairs)
     # Category/tag filter, on the listing read above, before enrichment so a
     # dropped pair costs no book request
     candidate_pairs   = _filter_by_category(candidate_pairs, settings, client,
@@ -2294,7 +2225,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         logging.info("%s", message)
         report.message = message
         # Never a bare return: sys.exit(None) exits 0, which would hide
-        # EXIT_TIME_SERIES_SKIPPED
+        # EXIT_TRADES_NEED_ATTENTION when a sale needs a person
         return clean_exit
 
     # Recorded before the first order is sent, so a result written after an
@@ -2408,11 +2339,11 @@ def _build_parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(
         description=(
-            "Kalshi Arbitrage Bot — scans for two kinds of mispriced contract "
-            "pairs (same-title near-arbitrage pairs, and directional "
-            "time-series pairs betting against the market's implied chance "
-            "that an event first happens between two deadlines), sizes them "
-            "with the Kelly criterion, and submits fill-or-kill orders."
+            "Kalshi Arbitrage Bot — scans for mispriced time-series contract "
+            "pairs (one question at two deadlines: a directional bet against "
+            "the market's implied chance that the event first happens between "
+            "them), sizes them with the Kelly criterion, and submits "
+            "fill-or-kill orders."
         ),
     )
     parser.add_argument(
@@ -2652,8 +2583,8 @@ def _setup_logging(log_path: pathlib.Path) -> None:
 def main() -> None:
     """
     CLI entry point for the Kalshi Arbitrage Bot — the live pipeline that
-    scans for same-title near-arbitrage pairs and directional time-series
-    pairs, sizes them, and trades them.
+    scans for directional time-series pairs (one question at two deadlines),
+    sizes them, and trades them.
 
     Parses command-line arguments (--mode, --dry-run, --sandbox-balance,
     --max-horizon-days, and the "live trading toggles" group), exits 2 if
