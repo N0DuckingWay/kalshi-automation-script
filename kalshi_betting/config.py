@@ -1836,9 +1836,10 @@ EXIT_TRADES_NEED_ATTENTION    = 20
 # everything, found no edge": scheduler.run_job maps this to a WARNING, never
 # counts the weekly slot as satisfied, and retries it.
 EXIT_NO_TRADEABLE_SHARDS      = 30
-# No time-series trade: a held market's ladder could not be identified.
-# Same-title still ran, so the scheduler logs an ERROR but counts the slot as
-# done (a retry would most likely fail the same lookup).
+# No pair bought: a held market's ladder could not be identified, so the run
+# could not tell which ladders it already holds. It did scan the markets, so
+# the scheduler logs an ERROR but counts the slot as done (a retry would most
+# likely fail the same lookup).
 EXIT_TIME_SERIES_SKIPPED      = 40
 # Another live trading run on this machine held the run lock (run_lock.py), so
 # this one stopped before building a client or making any request. Only a

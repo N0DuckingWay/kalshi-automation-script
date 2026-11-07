@@ -63,9 +63,9 @@ python3 -m kalshi_betting.main --mode prod --dry-run --result-file /tmp/run_resu
 python3 -m kalshi_betting.main --mode prod --dry-run --tier-floors --spread-min 0 --spread-max 1 --interval-discount 0.75 --size-cap 20 --same-title-size-cap 100 --no-rebalance --no-sell --no-exclude-category --no-exclude-tag
 
 # Production dry run that rebalances (no orders, nothing saved): before buying, sell part of each
-# exact held pair, and of each lone leg whose earlier market paid out $0 (the later market of a
-# time-series pair, still held), that has outgrown its Kelly share of the portfolio value, by the
-# backtest's rule (config.kelly_trim_count), once 7 calendar days
+# exact held time-series pair, and of each lone leg whose earlier market paid out $0 (the later
+# market of a time-series pair, still held), that has outgrown its Kelly share of the portfolio
+# value, by the backtest's rule (config.kelly_trim_count), once 7 calendar days
 # (config.REBALANCE_MIN_DAYS_SINCE_TRADE) have passed since the last fill on its markets, a fill
 # by hand included, and only if
 # Kalshi's list of the account's fills reaches back that far; and add to the pairs the account
