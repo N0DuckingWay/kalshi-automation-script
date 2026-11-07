@@ -1440,7 +1440,8 @@ class _TrimCase:
             market_b = _rung(_B, _EV_B, "", _B_CLOSE, title="Who wins the game?",
                              subtitle="Team A")
             # Both series filed alike, as a run files its markets before it
-            # trims (main._attach_series_labels)
+            # trims (main._attach_series_labels), so the pair passes the
+            # same-title finder's sport check (DR-79) too
             market_a._series_labels = market_b._series_labels = ("Sports", "Football")
         candles_a = [_candle(_FIRST, *(a_then or a_now)), _candle(_CK, *a_now)]
         candles_b = [_candle(_FIRST, *(b_then or b_now)), _candle(_CK, *b_now)]
@@ -1515,17 +1516,6 @@ _TRIM_PARITY_CASES = {
         lambda: _TrimCase(a_now=(0.30, 0.72), b_now=(0.62, 0.40)), 5_000, {}),
     "a time-series pair within its share": (
         lambda: _TrimCase(), 100_000, {}),
-    # NO on A (best NO bid 0.50) and YES on B (best YES bid 0.40): held to the
-    # 20% same-title cap of a $100 portfolio
-    "a same-title pair past its size cap": (
-        lambda: _TrimCase("same_title", sides=_NO_A_YES_B, a_now=(0.50, 0.52),
-                          b_now=(0.42, 0.60)),
-        10_000, {}),
-    # Selling returns more than the pair is expected to pay: nothing is kept
-    "a converged same-title pair": (
-        lambda: _TrimCase("same_title", sides=_NO_A_YES_B, a_now=(0.03, 0.98),
-                          b_now=(0.03, 0.98)),
-        10_000, {}),
     # The default quotes, as in "within its share": one contract pair sells
     # for $0.9055 at the best bids ($0.42 + $0.52, less the $0.0345
     # approximate fee) and pays with chance 1 - 0.8 x 0.045 (its mid spread)
@@ -1562,8 +1552,6 @@ _TRIM_PARITY_SELLS = {
     "a time-series pair past its size cap": "part",
     "a time-series pair past its Kelly share, under its cap": "part",
     "a time-series pair within its share": "none",
-    "a same-title pair past its size cap": "part",
-    "a converged same-title pair": "all",
     "a time-series pair whose size cap holds less than one pair": "all",
     "a crossed book": "none",
     "a thin ladder": "part",
@@ -2318,15 +2306,12 @@ class TestPlanTrims:
         (plan,) = _TrimCase(**quotes).live(monkeypatch, 5_000, k=0.8)
         assert plan.count == 6 and [leg.held for leg in plan.legs] == [30, 30]
 
-    @pytest.mark.parametrize("name, legs", [
-        ("a time-series pair whose size cap holds less than one pair",
-         [(_A, "yes", 10, 10), (_B, "no", 10, 10)]),
-        ("a converged same-title pair", [(_A, "no", 30, 30), (_B, "yes", 30, 30)]),
-    ])
-    def test_a_pair_sold_whole_still_names_what_it_held(self, monkeypatch, name, legs):
-        build, value_cents, caps = _TRIM_PARITY_CASES[name]
+    def test_a_pair_sold_whole_still_names_what_it_held(self, monkeypatch):
+        build, value_cents, caps = _TRIM_PARITY_CASES[
+            "a time-series pair whose size cap holds less than one pair"]
         (plan,) = build().live(monkeypatch, value_cents, **caps)
-        assert [(leg.ticker, leg.side, leg.count, leg.held) for leg in plan.legs] == legs
+        assert [(leg.ticker, leg.side, leg.count, leg.held) for leg in plan.legs] == [
+            (_A, "yes", 10, 10), (_B, "no", 10, 10)]
         assert plan.kind == config.SALE_KIND_KELLY_TRIM
 
     def test_a_larger_size_cap_keeps_one_pair_the_smallest_cap_sells(self, monkeypatch):
@@ -2578,7 +2563,9 @@ class TestPlanTrims:
         assert world.calls["book"] == []
 
     def test_a_same_title_lone_leg_is_not_trimmed(self, monkeypatch, caplog):
-        # B held YES alone after its same-title partner A (held NO) settled yes, paying $0
+        # B held YES alone after its same-title partner A (held NO) settled yes,
+        # paying $0. The partner is found, but the two markets are identically
+        # worded, so they are no kind a trim reads and the leg is never trimmed
         case = _TrimCase("same_title", sides=_NO_A_YES_B, a_now=(0.50, 0.52),
                          b_now=(0.42, 0.60))
         world = case.world
@@ -2586,11 +2573,16 @@ class TestPlanTrims:
         world.settlements = [_settled(_A, _EV_A, yes=0.0, no=30.0, cost=15.0, result="yes")]
         with caplog.at_level(logging.INFO):
             assert world.trims(monkeypatch, _trim_settings(cap=0.10)) == []
-        assert (f"Not trimming YES {_B} (alone: NO {_A} paid out $0): a lone leg is trimmed "
-                "only as the later market of a time-series pair") in caplog.text
+        assert (f"Not trimming YES {_B} (alone: NO {_A} paid out $0): its two markets cannot "
+                "be shown to be a time-series pair held this way round, so its chance of "
+                "paying cannot be read") in caplog.text
+        assert "Kelly trim check" not in caplog.text
+        # Refused before any order book is read
         assert world.calls["book"] == []
-        # The two markets read as the same-title pair they were bought as
-        assert seller.held_pair_kind(world.markets[_B], world.markets[_A])[0] == "same_title"
+        assert "Lone legs to trim this run (partner paid out): 0 of 1" in caplog.text
+        # The two markets are no kind, whichever side each is held on
+        assert seller.held_pair_kind(world.markets[_B], world.markets[_A]) is None
+        assert seller.held_pair_kind(world.markets[_A], world.markets[_B]) is None
 
     def test_a_lone_leg_trimmed_before_is_trimmed_again_with_its_partners_share(
             self, monkeypatch, caplog):
@@ -3011,6 +3003,35 @@ class TestPlanTrims:
         assert len(world.trims(monkeypatch, settings, cash_cents=5_000,
                                positions_value_cents=6_400)) == 2
 
+    def test_a_held_same_title_pair_never_counts_in_the_value_check(self, monkeypatch,
+                                                                     caplog):
+        # The rain pair would trim on the $30 Kalshi gives all open positions. Beside
+        # it, a held same-title pair (one question on two series, NO on ST-A and YES
+        # on ST-B, 60 each) with no quotes on the market list, whose books alone
+        # would fetch about $57, more than that value. It stops at its kind before
+        # any book is read, so its bids never reach the value check: the rain pair
+        # trims, and no WARNING cancels it
+        world = _World()
+        world.fills = _fills()
+        rain = _weather_pair(world, "rain", 30)
+        for ticker, event, count in (("ST-A", "KXSTA-26", -60), ("ST-B", "KXSTB-26", 60)):
+            market = ApiMarket(ticker=ticker, event_ticker=event, title="Who wins the game?",
+                               subtitle="Team A", status="active", close_time=_B_CLOSE)
+            market._series_labels = ("Sports", "Football")
+            world.hold(market, count, 60 * 0.45, 0.60)
+            world.books[ticker] = {"yes": [["0.48", "100000"]], "no": [["0.50", "100000"]]}
+        # Its two held sides' best bids (0.50 NO on ST-A, 0.48 YES on ST-B) after the fee
+        top = 0.50 + 0.48 - config.fee_per_pair_approx(0.50, 0.48)
+        assert 60 * top > 30
+        with caplog.at_level(logging.INFO):
+            plans = world.trims(monkeypatch, _trim_settings(cap=0.05), cash_cents=5_000,
+                                positions_value_cents=3_000)
+        assert [plan.legs[0].ticker for plan in plans] == [rain[0]]
+        assert _warnings(caplog) == []
+        assert ("Not trimming NO ST-A / YES ST-B: its two markets cannot be shown to be a "
+                "time-series pair held this way round") in caplog.text
+        assert not {"ST-A", "ST-B"} & set(world.calls["book"])
+
     def test_a_minimum_price_move_never_lets_through_a_trim_the_value_guard_stops(
             self, monkeypatch, caplog):
         # The snow pair alone fetches about $36, above the $30 all open positions
@@ -3118,8 +3139,38 @@ class TestPlanTrims:
         with caplog.at_level(logging.INFO):
             assert case.live(monkeypatch, 10_000, cap=0.10) == []
         assert (f"Not trimming NO {_A} / YES {_B}: its two markets cannot be shown to be a "
-                "same-title or a time-series pair held this way round") in caplog.text
+                "time-series pair held this way round, so its chance of paying cannot be "
+                "read") in caplog.text
         assert case.world.calls["book"] == []
+
+    @pytest.mark.parametrize("a_now, b_now, backtest_sells", [
+        # NO on A (best NO bid 0.50) and YES on B (best YES bid 0.40): past the
+        # 20% same-title cap of a $100 portfolio, so the backtest sells part of it
+        ((0.50, 0.52), (0.42, 0.60), "part"),
+        # Converged: selling returns more than the pair is expected to pay, so
+        # the backtest keeps none of it
+        ((0.03, 0.98), (0.03, 0.98), "all"),
+    ], ids=["past its size cap", "converged"])
+    def test_an_exact_held_same_title_pair_is_never_trimmed(self, monkeypatch, caplog, a_now,
+                                                            b_now, backtest_sells):
+        # One question listed on two series, held NO on A and YES on B, 30 each,
+        # both series filed alike and closing at one moment, last traded 7 days
+        # ago. Two identically worded markets are no kind a trim reads, so the
+        # pair is never trimmed, and no order book is read for it
+        case = _TrimCase("same_title", sides=_NO_A_YES_B, a_now=a_now, b_now=b_now)
+        # Control: the backtest's trim, which holds the pair by its type, sells
+        # this very pair at this portfolio value
+        sold = case.backtest(10_000)[0].sell
+        assert (0 < sold < case.n) if backtest_sells == "part" else sold == case.n
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000) == []
+        assert (f"Not trimming NO {_A} / YES {_B}: its two markets cannot be shown to be a "
+                "time-series pair held this way round, so its chance of paying cannot be "
+                "read") in caplog.text
+        assert "Kelly trim check" not in caplog.text
+        assert "Pairs to trim this run: 0 of 1" in caplog.text
+        assert case.world.calls["book"] == []
+        assert seller.held_pair_kind(case.world.markets[_B], case.world.markets[_A]) is None
 
     def test_a_book_that_cannot_be_read_is_not_trimmed(self, monkeypatch, caplog):
         case = _TrimCase()

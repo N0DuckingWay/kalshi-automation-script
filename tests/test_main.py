@@ -5,7 +5,7 @@ Last edited by: Zachary Hoffman
 
 Purpose:
     Offline tests for kalshi_betting.main — the live-pipeline orchestrator's
-    pure helpers (_truncate, _format_deadline, _dedup_pairs,
+    pure helpers (_truncate, _format_deadline,
     _compute_trade_specs, _no_pairs_msg), its logging setup (_setup_logging,
     including the BS-25 rotating file handler), its process exit-code contract
     (BS-14), and end-to-end "live-shape replay" runs of _run_dev/_run_prod
@@ -137,8 +137,6 @@ from kalshi_betting.config import (
     MIN_PRICE_DIFF_LONG_GAP,
     MIN_PRICE_DIFF_SHORT_GAP,
     ORDER_API_VERSION,
-    SAME_TITLE_MAX_CLOSE_GAP_SECONDS,
-    SAME_TITLE_MIN_PRICE_DIFF,
     TRANSFER_PATH,
     V2_ORDER_PATH,
     LiveSettings,
@@ -177,13 +175,14 @@ def _held_positions(*tickers: str, count: float = 1.0):
     return fake
 
 
-def make_pair(ticker_a: str, ticker_b: str, pair_type: str = "time_series"):
-    """Minimal stand-in for a CandidatePair — only the attributes
-    _dedup_pairs actually reads (market_a.ticker, market_b.ticker)."""
+def make_pair(ticker_a: str, ticker_b: str):
+    """Minimal stand-in for a time-series CandidatePair — two markets with
+    tickers. _compute_trade_specs' tests only hand it on to a stand-in
+    compute_trade, so nothing more is needed."""
     return SimpleNamespace(
         market_a=SimpleNamespace(ticker=ticker_a),
         market_b=SimpleNamespace(ticker=ticker_b),
-        pair_type=pair_type,
+        pair_type="time_series",
     )
 
 
@@ -223,32 +222,6 @@ class TestTruncate:
 class TestFormatDeadline:
     def test_format_deadline_none(self):
         assert main._format_deadline(None) == "?"
-
-
-class TestDedupPairs:
-    def test_dedup_pairs_prefers_same_title(self):
-        # Same ticker pair detected by both scanners — the same-title (primary)
-        # entry must win, and the time-series (secondary) duplicate must be dropped.
-        same_title = make_pair("TICK-A", "TICK-B", pair_type="same_title")
-        time_series_dup = make_pair("TICK-A", "TICK-B", pair_type="time_series")
-
-        result = main._dedup_pairs([same_title], [time_series_dup])
-
-        assert result == [same_title]
-
-    def test_dedup_pairs_preserves_order_and_appends_unique_secondary(self):
-        primary_1 = make_pair("A1", "A2", pair_type="same_title")
-        primary_2 = make_pair("B1", "B2", pair_type="same_title")
-        # Duplicate of primary_1's ticker pair — must be dropped, order-independent of tickers
-        secondary_dup = make_pair("A2", "A1", pair_type="time_series")
-        # Genuinely unique pair — must be appended after all primary entries
-        secondary_unique = make_pair("C1", "C2", pair_type="time_series")
-
-        result = main._dedup_pairs(
-            [primary_1, primary_2], [secondary_dup, secondary_unique],
-        )
-
-        assert result == [primary_1, primary_2, secondary_unique]
 
 
 class TestComputeTradeSpecs:
@@ -297,26 +270,13 @@ class TestNoPairsMsg:
         for msg in (prod_msg, dev_msg):
             assert f"{MIN_PRICE_DIFF_SHORT_GAP:.0%}" in msg
             assert f"{MIN_PRICE_DIFF_LONG_GAP:.0%}" in msg
-            assert f"{SAME_TITLE_MIN_PRICE_DIFF:.0%}" in msg
-            # DR-74 and DR-79: the same-title rule also needs two different
-            # series filed under one Kalshi category, tag and competition,
-            # whose markets close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS —
-            # named in the message, with the minutes derived from the constant.
-            assert (
-                f"same-title: ≥{SAME_TITLE_MIN_PRICE_DIFF:.0%} price diff on two "
-                f"different series filed under one Kalshi category, tag and "
-                f"competition, closing within "
-                f"{SAME_TITLE_MAX_CLOSE_GAP_SECONDS // 60} minutes"
-            ) in msg
+            # A run looks for time-series pairs alone, so the message names no
+            # same-title rule (no price diff on two series, no close gap)
+            assert "same-title" not in msg.lower()
+            assert "closing within" not in msg and "two different series" not in msg
 
         assert "sandbox" in dev_msg
         assert "sandbox" not in prod_msg
-
-    def test_the_close_gap_clause_follows_the_constant(self, monkeypatch):
-        # Derived, not spelled: a different bound changes the message.
-        monkeypatch.setattr(main, "SAME_TITLE_MAX_CLOSE_GAP_SECONDS", 15 * 60)
-        assert "closing within 15 minutes" in main._no_pairs_msg()
-        assert "closing within 60 minutes" not in main._no_pairs_msg()
 
     def test_the_time_series_clause_is_the_runs_own_rule(self):
         # The rule the run applied, never the tiers alone when it dropped them
@@ -324,12 +284,16 @@ class TestNoPairsMsg:
                                                       interval_discount=0.75, size_cap=0.2))
         off = main._no_pairs_msg(settings=LiveSettings(tier_floors=False, spread_band=(0.0, 0.5),
                                                        interval_discount=0.75, size_cap=0.2))
-        assert config.describe_time_series_rule(True, (0.0, 1.0)) in on
-        assert config.describe_time_series_rule(False, (0.0, 0.5)) in off
+        rule_on = config.describe_time_series_rule(True, (0.0, 1.0))
+        rule_off = config.describe_time_series_rule(False, (0.0, 0.5))
+        assert rule_on in on
+        assert rule_off in off
         assert "tier floors off" in off and "spread band 0-0.5" in off
         assert f"≥{MIN_PRICE_DIFF_SHORT_GAP:.0%}" not in off
-        # The same-title clause is the same under any time-series rule
-        assert off.endswith(on[on.index(" — or same-title"):])
+        # The message ends with the rule, and nothing else in it moves with
+        # the rule: the two are one sentence, each with its own rule's words
+        assert on.endswith(f"{rule_on}).")
+        assert off == on.replace(rule_on, rule_off)
 
     def test_no_settings_reads_config_at_call_time(self, monkeypatch):
         # Both values, so the test cannot pass on whichever one config.py ships
@@ -343,12 +307,14 @@ class TestNoPairsMsg:
                                 size_cap=0.2)
         searched = main._no_pairs_msg(settings=settings)
         skipped = main._no_pairs_msg(settings=settings, time_series_searched=False)
-        assert skipped.startswith(
+        # The whole message: the not-searched clause, and nothing after it
+        assert skipped == (
             "No qualifying pairs found (time-series: not searched this run, because a "
-            "held market could not be identified (see the ERROR above)")
+            "held market could not be identified (see the ERROR above)).")
         assert config.describe_time_series_rule(True, (0.0, 1.0)) not in skipped
-        # The same-title clause does not change
-        assert skipped.endswith(searched[searched.index(" — or same-title"):])
+        # A run that searched names its rule in the same place, the clause's end
+        assert searched.startswith("No qualifying pairs found (time-series: both legs worded")
+        assert searched.endswith(f"{config.describe_time_series_rule(True, (0.0, 1.0))}).")
 
     def test_a_category_or_tag_filter_is_named_only_when_set(self):
         # A filter alone can empty the list: named when set, unmentioned when not
@@ -364,6 +330,20 @@ class TestNoPairsMsg:
                     f"({config.describe_trade_filter(settings)})") in msg
             # Everything before the clause is the unfiltered message's
             assert msg.startswith(plain[:-2])
+
+    def test_a_run_that_did_not_search_names_no_filter(self):
+        # A run that asked no finder had no list for a filter to empty, so the
+        # not-searched message is the same with a filter set as without one
+        plain = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                             size_cap=0.2)
+        for excluded, tags in ((("Politics",), None), (None, ("Oil & Gas",))):
+            filtered = dataclasses.replace(plain, exclude_categories=excluded,
+                                           exclude_tags=tags)
+            skipped = main._no_pairs_msg(settings=filtered, time_series_searched=False)
+            assert skipped == main._no_pairs_msg(settings=plain, time_series_searched=False)
+            assert "category/tag filter" not in skipped
+            # A run that searched names the same filter
+            assert "category/tag filter" in main._no_pairs_msg(settings=filtered)
 
 
 @pytest.fixture
@@ -400,20 +380,23 @@ def _save_live_defaults(**changes) -> LiveSettings:
                                      source="")
 
 
-def _seed_series_listing(series: dict, fetched_at: datetime | None = None) -> None:
+def _seed_series_listing(series: dict, fetched_at: datetime | None = None, *,
+                         fees: dict | None = None) -> None:
     """
     Seed historical.load_series_categories' cached /series listing (in tmp_path).
 
     Args:
         series (dict): series ticker -> [category, [tags...]].
         fetched_at (datetime | None): When it was fetched; None means now (fresh).
+        fees (dict | None): Keyword-only. series ticker -> the fee multiplier
+            listed for it; every other series is listed at the full fee (1).
     """
     stamp = datetime.now(UTC) if fetched_at is None else fetched_at
     historical._SERIES_CATEGORIES_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    # A "fees" block too (every series at the full fee), as the fetch writes it
+    # A "fees" block too, as the fetch writes it
     historical._SERIES_CATEGORIES_CACHE.write_text(json.dumps(
         {"fetched_at": stamp.isoformat(), "series": series,
-         "fees": {t: ["quadratic", 1] for t in series}}))
+         "fees": {t: ["quadratic", (fees or {}).get(t, 1)] for t in series}}))
 
 
 def _main_with(monkeypatch, argv: list, **patches) -> dict:
@@ -1298,7 +1281,7 @@ class TestLiveSettingsFlags:
         lone = "pair, or lone leg whose partner has paid out, worth more than its new Kelly"
         assert out.count(lone) == 2
         assert ("a higher k also sells: each exact held time-series " + lone) in out
-        assert ("a lower cap also sells: each exact held " + lone) in out
+        assert ("a lower cap also sells: each exact held time-series " + lone) in out
         assert ("a lower cap also sells: each exact held same-title pair worth more than "
                 "its new Kelly") in out
         assert out.count("With Rebalance yes (saved, or given with --rebalance), a ") == 3
@@ -1316,11 +1299,11 @@ class TestLiveSettingsFlags:
         # The rebalance flags. argparse may wrap a flag's name at a hyphen, so
         # the pinned words stop short of one
         assert ("Rebalance the held pairs this run: before buying, sell part of each exact "
-                "held pair, or lone leg whose partner has paid out, that has outgrown its "
-                "Kelly size, once config.REBALANCE_MIN_DAYS_SINCE_TRADE calendar days have "
-                "passed since its last trade, and let this run add to a pair the account "
-                "already holds (exactly the same two markets, the same side on each, or a "
-                "lone leg beside a market not held) after the same wait") in out
+                "held time-series pair, or lone leg whose partner has paid out, that has "
+                "outgrown its Kelly size, once config.REBALANCE_MIN_DAYS_SINCE_TRADE calendar "
+                "days have passed since its last trade, and let this run add to a pair the "
+                "account already holds (exactly the same two markets, the same side on each, "
+                "or a lone leg beside a market not held) after the same wait") in out
         assert ("neither trims nor adds to a held pair, and clears the saved minimum price "
                 "move and days to maturity too.") in out
         assert "no run acts on it" not in out
@@ -2456,7 +2439,7 @@ def _stub_ingest() -> list:
     Tests that stub the pair finders out still have to hand _run_dev/_run_prod
     a NON-empty ingest: a run whose ingest produced zero markets scanned
     nothing and is now reported as a blind run (EXIT_NO_TRADEABLE_SHARDS,
-    VI-02), and "zero ingested markets but the finders returned pairs" is not
+    VI-02), and "zero ingested markets but the finder returned pairs" is not
     a shape the live pipeline can ever take. Only .ticker (prod's held-ticker
     filter) and .exchange_index (the coverage census) are read on those
     stubbed paths.
@@ -3426,18 +3409,21 @@ class TestSeriesLabelsAreAttached:
     """DR-79's wiring in both run modes: every run reads Kalshi's /series
     listing once, right after the market fetch (production with its own
     client, dev from the cached copy only), files every market by it
-    (main._attach_series_labels) before the sale block and both finders, and
-    hands the same copy to the category/tag filter. The same-title finder and
-    held_pair_kind then compare those labels (scanner._labels_differ)."""
+    (main._attach_series_labels, which also sets each market's fee
+    multiplier, read by every sale's fee) before the sale block and the
+    time-series finder, and hands the same copy to the category/tag filter.
+    Only scanner.find_same_title_pairs compares the labels
+    (scanner._labels_differ), and no run mode calls it."""
 
     @staticmethod
     def _spy(monkeypatch) -> list:
         """
         Record, in order, each listing read, trim plan, finder call and filter call.
 
-        Each finder and the trim planner records whether every market it was
-        handed carries a (category, tag) pair of strings; the filter records the
-        listing it was handed.
+        The time-series finder and the trim planner record whether every
+        market they were handed carries a (category, tag) pair of strings,
+        and the trim planner each market's fee multiplier too; the filter
+        records the listing it was handed.
 
         Args:
             monkeypatch (pytest.MonkeyPatch): For the spies.
@@ -3458,17 +3444,13 @@ class TestSeriesLabelsAreAttached:
                 scanner_mod._is_label_pair(getattr(m, "_series_labels", None))
                 for m in markets)
 
-        real_ts, real_st = main.find_time_series_pairs, main.find_same_title_pairs
+        real_ts = main.find_time_series_pairs
 
         def time_series(*args, **kwargs):
             # Production passes the markets third, dev by keyword
             markets = kwargs["markets"] if "markets" in kwargs else args[2]
             events.append(("time_series", labelled(markets)))
             return real_ts(*args, **kwargs)
-
-        def same_title(markets, *args, **kwargs):
-            events.append(("same_title", labelled(markets)))
-            return real_st(markets, *args, **kwargs)
 
         real_filter = main._filter_by_category
 
@@ -3477,12 +3459,14 @@ class TestSeriesLabelsAreAttached:
             return real_filter(pairs, settings, listing_client, **kwargs)
 
         def plan_trims(client, held_positions, held_labels, markets_by_ticker, **kwargs):
-            events.append(("plan_trims", labelled(list(markets_by_ticker.values()))))
+            markets = list(markets_by_ticker.values())
+            # Each market's fee multiplier as the planner finds it: every sale's fee reads it
+            events.append(("plan_trims", labelled(markets),
+                           {m.ticker: getattr(m, "_fee_multiplier", None) for m in markets}))
             return []
 
         monkeypatch.setattr(main, "load_series_categories", load)
         monkeypatch.setattr(main, "find_time_series_pairs", time_series)
-        monkeypatch.setattr(main, "find_same_title_pairs", same_title)
         monkeypatch.setattr(main, "_filter_by_category", category_filter)
         monkeypatch.setattr(main, "plan_trims", plan_trims)
         monkeypatch.setattr(main, "append_to_prod_log",
@@ -3496,6 +3480,9 @@ class TestSeriesLabelsAreAttached:
         balance = {**_LIVE_BALANCE_PAYLOAD, "portfolio_value": 150}
         client = _live_shape_client(monkeypatch, balance_payload=balance,
                                     include_time_series=True)
+        # The Held Event's series listed at half the fee, so the planner can tell a
+        # market the attach has filed (0.5) from one it has not (ApiMarket's 1.0)
+        _seed_series_listing({"HELDEVT": ["Other", []]}, fees={"HELDEVT": 0.5})
         events = self._spy(monkeypatch)
         settings = dataclasses.replace(live_settings(), rebalance=True)
         with caplog.at_level(logging.INFO):
@@ -3504,13 +3491,19 @@ class TestSeriesLabelsAreAttached:
         reads = [event for event in events if event[0] == "listing"]
         assert len(reads) == 1 and reads[0][1] is client
         listing = reads[0][2]
-        # The listing first, then the trim planner and both finders, every
-        # market filed, then the filter, handed the very same copy
+        # The listing first, then the trim planner and the time-series finder,
+        # every market filed, then the filter, handed the very same copy
         assert [event[0] for event in events] == [
-            "listing", "plan_trims", "time_series", "same_title", "filter"]
-        assert events[1:4] == [("plan_trims", True), ("time_series", True),
-                               ("same_title", True)]
-        assert events[4][1] is listing
+            "listing", "plan_trims", "time_series", "filter"]
+        assert events[1][1] is True and events[2] == ("time_series", True)
+        assert events[3][1] is listing
+        # ... and every market's fee multiplier set before the planner, each
+        # sale's fee reading it: the Held Event's two markets at the listed 0.5,
+        # every other market at the full fee
+        fees = events[1][2]
+        assert {t for t, fee in fees.items() if fee == 0.5} == {_TICKER_HELD_A,
+                                                              _TICKER_HELD_B}
+        assert {fee for t, fee in fees.items() if fee != 0.5} == {1.0}
 
     def test_a_dev_run_reads_the_cached_copy_once_and_files_every_market(
         self, monkeypatch, caplog,
@@ -3526,9 +3519,9 @@ class TestSeriesLabelsAreAttached:
         reads = [event for event in events if event[0] == "listing"]
         assert len(reads) == 1 and reads[0][1] is None
         assert [event[0] for event in events] == [
-            "listing", "time_series", "same_title", "filter"]
-        assert events[1:3] == [("time_series", True), ("same_title", True)]
-        assert events[3][1] is reads[0][2]
+            "listing", "time_series", "filter"]
+        assert events[1] == ("time_series", True)
+        assert events[2][1] is reads[0][2]
 
     _NO_LISTING = ("Same-title sport check: no /series listing this run, so every series "
                    "is filed by its ticker prefix and only the competition check tells "
@@ -3658,69 +3651,104 @@ class TestSeriesLabelsAreAttached:
         # No client: the sandbox key never signs a production request
         assert reads == [None]
 
-    def test_two_series_filed_differently_form_no_same_title_pair(self, monkeypatch, caplog):
-        # Two same-title groups, each one question listed on two series and
-        # closing with the rest: "Will X happen?" (SAME-EXP / SAME-CHEAP,
-        # priced to trade, with an order book behind each market) and "Tick
-        # Test Market" (ST-TICK-A / ST-TICK-B, priced not to). The first
-        # pair's two series are filed under two different tags: the finder
-        # refuses it on its label line. The main pair is left out, so the
-        # refused pair is the only one that could trade, and nothing is traded
-        same_title_events = (
-            _ev("Recurring Q", _mk_market(
-                "SAME-EXP", "EXPEVT-1", "Will X happen?", "Outcome Main", "0.50", "0.45",
-                price_level_structure="linear_cent")),
-            _ev("Recurring Q", _mk_market(
-                "SAME-CHEAP", "CHEAPEVT-1", "Will X happen?", "Outcome Main", "0.20", "0.75",
-                price_level_structure="linear_cent")),
-            _ev("Tick Event", _mk_market(
-                "ST-TICK-A", "TICKAEVT-1", "Tick Test Market", "Outcome", "0.90", "0.85")),
-            _ev("Tick Event", _mk_market(
-                "ST-TICK-B", "TICKBEVT-1", "Tick Test Market", "Outcome", "0.50", "0.45")),
-        )
-        client = _live_shape_client(monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD,
-                                    main_pair=False, extra_events=same_title_events)
-        # The refused pair buys NO on SAME-EXP (the pricier YES) and YES on
-        # SAME-CHEAP. SAME-EXP's YES bids at 0.55 give its NO ask of 0.45 and
-        # SAME-CHEAP's NO bids at 0.80 its YES ask of 0.20, 100 contracts
-        # each, so the pair would trade if the finder let it through
-        books = {
-            "SAME-EXP": {"orderbook_fp": {"yes_dollars": [["0.55", "100"]],
-                                          "no_dollars": []}},
-            "SAME-CHEAP": {"orderbook_fp": {"yes_dollars": [],
-                                            "no_dollars": [["0.80", "100"]]}},
-        }
+    # One question, "Will X happen?", on two events of two series (EXPEVT and
+    # CHEAPEVT) closing together: a same-title pair, which would buy NO on
+    # SAME-EXP (the pricier YES) and YES on SAME-CHEAP. SAME-EXP's YES bids at
+    # 0.55 give its NO ask of 0.45 and SAME-CHEAP's NO bids at 0.80 its YES
+    # ask of 0.20, 100 contracts each
+    _SAME_TITLE_EVENTS = (
+        _ev("Recurring Q", _mk_market(
+            "SAME-EXP", "EXPEVT-1", "Will X happen?", "Outcome Main", "0.50", "0.45",
+            price_level_structure="linear_cent")),
+        _ev("Recurring Q", _mk_market(
+            "SAME-CHEAP", "CHEAPEVT-1", "Will X happen?", "Outcome Main", "0.20", "0.75",
+            price_level_structure="linear_cent")),
+    )
+    _SAME_TITLE_BOOKS = {
+        "SAME-EXP": {"orderbook_fp": {"yes_dollars": [["0.55", "100"]], "no_dollars": []}},
+        "SAME-CHEAP": {"orderbook_fp": {"yes_dollars": [], "no_dollars": [["0.80", "100"]]}},
+    }
+    _SAME_TITLE_TICKERS = frozenset({"SAME-EXP", "SAME-CHEAP"})
+
+    @pytest.mark.parametrize("mode", ["prod dry run", "prod live", "dev"])
+    def test_a_same_title_pair_is_never_priced_or_bought(self, monkeypatch, caplog, mode):
+        """
+        Pins that no run mode looks for, prices or buys a same-title pair.
+
+        The run's market list is one same-title pair and nothing else, its two
+        series filed alike (Sports, Football), so the sport check (DR-79)
+        refuses nothing: scanner.find_same_title_pairs forms the pair over the
+        very list the run hands the time-series finder (the positive control).
+        Still, enrich_with_orderbook_prices is handed no candidate on either
+        market, nothing is traded or simulated, no order is sent, and the run
+        ends on its "No qualifying pairs found" line with exit 0.
+        """
+        # All the cash on shard 0, where both markets are, and nothing held
+        client = _live_shape_client(
+            monkeypatch, balance_payload={**_SHARD1_EMPTY_BALANCE, "portfolio_value": 0},
+            include_held_position=False)
+        # The events page lists the pair's two markets alone, so no pair of
+        # the fixed set (time-series pairs all) can form beside it
+        client.get_events_without_preload_content = MagicMock(
+            return_value=_raw_events_page(list(self._SAME_TITLE_EVENTS)))
         client.get_market_orderbook_without_preload_content = MagicMock(
-            side_effect=lambda ticker: _raw_json_response(books.get(
+            side_effect=lambda ticker: _raw_json_response(self._SAME_TITLE_BOOKS.get(
                 ticker, {"orderbook_fp": {"yes_dollars": [], "no_dollars": []}})))
         _seed_series_listing({"EXPEVT": ["Sports", ["Football"]],
-                              "CHEAPEVT": ["Sports", ["Volleyball"]]})
-        found: list = []
-        real_st = main.find_same_title_pairs
+                              "CHEAPEVT": ["Sports", ["Football"]]})
+        searched: list = []
+        real_ts = main.find_time_series_pairs
 
-        def same_title(markets, *args, **kwargs):
-            pairs = real_st(markets, *args, **kwargs)
-            found.extend(pairs)
-            return pairs
+        def time_series(*args, **kwargs):
+            # Production passes the markets third, dev by keyword
+            searched.append(list(kwargs["markets"] if "markets" in kwargs else args[2]))
+            return real_ts(*args, **kwargs)
 
-        captured: dict = {}
+        priced: list = []
+        real_enrich = main.enrich_with_orderbook_prices
 
-        def append(results, *args, **kwargs):
-            captured["results"] = results
-            return pathlib.Path("/fake/trade_log.xlsx")
+        def enrich(client_, pairs, *args, **kwargs):
+            # Every candidate a run found is priced here, before it is sized
+            priced.append(_candidate_tickers(pairs))
+            return real_enrich(client_, pairs, *args, **kwargs)
 
-        monkeypatch.setattr(main, "find_same_title_pairs", same_title)
-        monkeypatch.setattr(main, "append_to_prod_log", append)
+        executed: list = []
+        real_execute = main.execute_trades
+
+        def execute(*args, **kwargs):
+            executed.append(args)
+            return real_execute(*args, **kwargs)
+
+        logged: list = []
+        monkeypatch.setattr(main, "find_time_series_pairs", time_series)
+        monkeypatch.setattr(main, "enrich_with_orderbook_prices", enrich)
+        monkeypatch.setattr(main, "execute_trades", execute)
+        monkeypatch.setattr(main, "append_to_prod_log",
+                            lambda *a, **k: logged.append(a) or pathlib.Path("/fake"))
+        simulation = _capture_dev_simulation(monkeypatch)
         with caplog.at_level(logging.INFO):
-            main._run_prod(client, _args(dry_run=True))
-        assert ("Same-title candidates refused because the two series are filed under "
-                "different Kalshi categories or tags (two different sports or subjects, "
-                "not one question listed twice): 1") in caplog.messages
-        assert "SAME-EXP" not in _candidate_tickers(found)
-        # The other same-title group still pairs, its two series filed alike by prefix
-        assert _candidate_tickers(found) == {"ST-TICK-A", "ST-TICK-B"}
-        assert "results" not in captured
+            if mode == "dev":
+                code = main._run_dev(client, SimpleNamespace(sandbox_balance=1000.0,
+                                                             max_horizon_days=None))
+            else:
+                code = main._run_prod(client, _args(dry_run=mode == "prod dry run"))
+        # Positive control: over the list the run searched, the same-title
+        # finder forms the pair and marks it tradeable
+        [markets] = searched
+        [pair] = [p for p in scanner_mod.find_same_title_pairs(markets)
+                  if {p.market_a.ticker, p.market_b.ticker} == self._SAME_TITLE_TICKERS]
+        assert pair.tradeable
+        # The run priced no candidate at all, so none on either market
+        assert priced == [set()]
+        # Nothing traded or simulated, and no order sent
+        assert executed == [] and logged == []
         assert client.rest_client.request.call_count == 0
+        if mode == "dev":
+            assert simulation["results"] == [] and simulation["all_candidates"] == []
+        [line] = [r.getMessage() for r in caplog.records
+                  if r.getMessage().startswith("No qualifying pairs found")]
+        assert "same-title" not in line.lower()
+        assert code == EXIT_OK
 
 
 class TestRunProdLiveV2Replay:
@@ -4763,26 +4791,10 @@ class TestRunProdHeldLadders:
                    and "no time-series trade will be made this run" in e for e in errors), errors
         assert "Time-series entry rule:" not in caplog.text
         assert "Open ladder exposure" not in caplog.text
-
-    def test_a_failed_lookup_with_no_pair_says_time_series_was_not_searched(
-            self, monkeypatch, caplog):
-        client = _live_shape_client(
-            monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD, include_time_series=True,
-            extra_held=("TS-GONE",),
-        )
-        client.get_market_without_preload_content = MagicMock(
-            return_value=_raw_json_response({"error": "not found"}, status=404,
-                                            reason="Not Found"))
-        # Every pair the fixture offers is a time-series pair, which the run
-        # does not search for, so it ends on its "no pairs" line (this stand-in
-        # finds no same-title pair either)
-        monkeypatch.setattr(main, "find_same_title_pairs",
-                            lambda markets, held, *, add_on_pairs=None: [])
-        assert self._dry_run(client, monkeypatch, caplog,
-                             expected_code=EXIT_TIME_SERIES_SKIPPED) == []
+        # So the run has no pair at all and ends on its "no pairs" line, which
+        # does not describe a time-series rule the run never applied
         [line] = [r.getMessage() for r in caplog.records
                   if r.getMessage().startswith("No qualifying pairs found")]
-        # The line does not describe a time-series rule the run never applied
         assert ("time-series: not searched this run, because a held market could not "
                 "be identified") in line
         assert "worded as cumulative deadlines" not in line
@@ -4860,13 +4872,15 @@ class TestRunProdAddsToHeldPairs:
         Returns:
             tuple[list, dict]: The simulated results, and what the run handed
                 on: "held_pairs" (each call's positions), "markets" (the
-                tickers of each call's market map), "ts" and "st" (the
-                add_on_pairs each finder was handed, per call), and "blocked"
-                (each finder call's blocked tickers and market tickers).
+                tickers of each call's market map), "ts" (the add_on_pairs
+                the time-series finder was handed, per call), "blocked"
+                (each of its calls' blocked tickers and market tickers) and
+                "searched" (each of its calls' market list).
         """
-        seen: dict = {"held_pairs": [], "markets": [], "ts": [], "st": [], "blocked": []}
+        seen: dict = {"held_pairs": [], "markets": [], "ts": [], "blocked": [],
+                      "searched": []}
         real_held_pairs = main.held_pairs
-        real_ts, real_st = main.find_time_series_pairs, main.find_same_title_pairs
+        real_ts = main.find_time_series_pairs
 
         def held_pairs_spy(positions, labels, markets_by_ticker):
             seen["held_pairs"].append(dict(positions))
@@ -4877,13 +4891,8 @@ class TestRunProdAddsToHeldPairs:
             seen["ts"].append(add_on_pairs)
             # (client, blocked tickers, markets)
             seen["blocked"].append((set(args[1]), {m.ticker for m in args[2]}))
+            seen["searched"].append(list(args[2]))
             return real_ts(*args, add_on_pairs=add_on_pairs, **kwargs)
-
-        def st_spy(*args, add_on_pairs=None, **kwargs):
-            seen["st"].append(add_on_pairs)
-            # (markets, blocked tickers)
-            seen["blocked"].append((set(args[1]), {m.ticker for m in args[0]}))
-            return real_st(*args, add_on_pairs=add_on_pairs, **kwargs)
 
         captured: dict = {}
 
@@ -4896,7 +4905,6 @@ class TestRunProdAddsToHeldPairs:
 
         monkeypatch.setattr(main, "held_pairs", held_pairs_spy)
         monkeypatch.setattr(main, "find_time_series_pairs", ts_spy)
-        monkeypatch.setattr(main, "find_same_title_pairs", st_spy)
         monkeypatch.setattr(main, "append_to_prod_log", fake_append_to_prod_log)
         reference = live_settings()
         settings = dataclasses.replace(reference, rebalance=add_on, **changes)
@@ -4991,7 +4999,8 @@ class TestRunProdAddsToHeldPairs:
         # pairs at 0.30 + 0.40 plus $1.47 + $1.68 of fees
         assert (add_on.spec.x, add_on.spec.y) == (100, 100)
         assert add_on.spec.total_cost_with_fees == pytest.approx(73.15)
-        # One held_pairs call over every held market, and both finders handed its pair
+        # One held_pairs call over every held market, and the time-series
+        # finder handed its pair
         assert [sorted(positions) for positions in seen["held_pairs"]] == [
             [_TICKER_HELD_A, _TICKER_TS_EARLY, _TICKER_TS_LATE]]
         # ... valued from the whole market list, read before held markets are dropped
@@ -4999,7 +5008,6 @@ class TestRunProdAddsToHeldPairs:
         assert {_TICKER_HELD_A, _TICKER_TS_EARLY, _TICKER_TS_LATE} <= markets
         key = frozenset((_TICKER_TS_EARLY, _TICKER_TS_LATE))
         assert [set(pairs) for pairs in seen["ts"]] == [{key}]
-        assert seen["st"] == seen["ts"]
         # The log names the held pair, its cost and fees, its worth at today's
         # prices and the add-on
         assert ("Held pair to add to: YES TS-EARLY / NO TS-LATE, 30 contracts each, "
@@ -5014,17 +5022,17 @@ class TestRunProdAddsToHeldPairs:
         """
         Pins that a held pair whose markets last traded three days ago is not
         added to: an add-on waits, as a trim does, until 7 calendar days have
-        passed since the last fill on its markets. Neither finder is handed
-        it, its two markets stay blocked from both, and the main pair still
-        trades. Rested ten days, the same pair is added to.
+        passed since the last fill on its markets. The time-series finder is
+        not handed it, its two markets stay blocked from the finder, and the
+        main pair still trades. Rested ten days, the same pair is added to.
         """
         held = (_TICKER_HELD_A, _TICKER_TS_EARLY, _TICKER_TS_LATE)
         client = self._client(monkeypatch, fill_rows=_trim_fills(*held, days_ago=3))
         results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True)
         assert self._traded(results) == {self._MAIN}
-        assert seen["ts"] == seen["st"] == [{}]
+        assert seen["ts"] == [{}]
         ts = {_TICKER_TS_EARLY, _TICKER_TS_LATE}
-        assert len(seen["blocked"]) == 2
+        assert len(seen["blocked"]) == 1
         for blocked, markets in seen["blocked"]:
             assert ts <= blocked and not markets & ts
         [line] = [r.getMessage() for r in caplog.records
@@ -5034,7 +5042,7 @@ class TestRunProdAddsToHeldPairs:
         assert "Held pairs that may be added to this run: 0 of 1" in caplog.text
         assert "adds to" not in caplog.text
         assert self._warned(caplog) == []
-        # Control: rested ten days, the pair is handed to both finders and added to
+        # Control: rested ten days, the pair is handed to the finder and added to
         caplog.clear()
         results, seen = self._dry_run(self._client(monkeypatch), monkeypatch, caplog,
                                       add_on=True)
@@ -5049,9 +5057,9 @@ class TestRunProdAddsToHeldPairs:
         """
         Pins that the held pair TS-EARLY / TS-LATE (its later market closes
         2026-12-11) is not added to 5 days before, under a 7-day minimum:
-        neither finder is handed it, its markets stay blocked from both, and
-        the main pair still trades. Under a 1-day minimum, the same pair is
-        added to.
+        the time-series finder is not handed it, its markets stay blocked
+        from the finder, and the main pair still trades. Under a 1-day
+        minimum, the same pair is added to.
         """
         # Noon, 5 days before TS-LATE closes (_CLOSE_LATE)
         moment = datetime.fromisoformat(_CLOSE_LATE) - timedelta(days=5) + timedelta(hours=12)
@@ -5063,7 +5071,7 @@ class TestRunProdAddsToHeldPairs:
         results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True,
                                       rebalance_min_days_to_maturity=7)
         assert self._traded(results) == {self._MAIN}
-        assert seen["ts"] == seen["st"] == [{}]
+        assert seen["ts"] == [{}]
         ts = {_TICKER_TS_EARLY, _TICKER_TS_LATE}
         for blocked, markets in seen["blocked"]:
             assert ts <= blocked and not markets & ts
@@ -5116,7 +5124,7 @@ class TestRunProdAddsToHeldPairs:
         TS-EARLY, NO ask 0.40 on TS-LATE, from hourly candles) and it is at
         $0.70 now (the market list's 0.30 and 0.40): the 10c move lets the
         add-on through at a 10c minimum and holds it back at 15c, its markets
-        then blocked from both finders.
+        then blocked from the time-series finder.
         """
         client = self._client(monkeypatch)
         client.rest_client.request = MagicMock(side_effect=self._candles({
@@ -5132,7 +5140,7 @@ class TestRunProdAddsToHeldPairs:
                       if r.getMessage().startswith("Add-on check: ")]
             assert line.endswith(f"{prices} -> may add")
         else:
-            assert seen["ts"] == seen["st"] == [{}]
+            assert seen["ts"] == [{}]
             for blocked, markets in seen["blocked"]:
                 assert ts <= blocked and not markets & ts
             assert self._traded(results) == {self._MAIN}
@@ -5151,7 +5159,7 @@ class TestRunProdAddsToHeldPairs:
         client.rest_client.request = MagicMock(side_effect=self._candles({}))
         results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True,
                                       min_price_move=0.10)
-        assert seen["ts"] == seen["st"] == [{}]
+        assert seen["ts"] == [{}]
         assert self._traded(results) == {self._MAIN}
         assert ("Not adding to YES TS-EARLY / NO TS-LATE: the YES ask on TS-EARLY when it "
                 "last traded (") in caplog.text
@@ -5165,7 +5173,7 @@ class TestRunProdAddsToHeldPairs:
         client = self._client(monkeypatch, fill_rows=None)
         del client.get_fills_without_preload_content
         results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True)
-        assert seen["ts"] == seen["st"] == [{}]
+        assert seen["ts"] == [{}]
         assert self._traded(results) == {self._MAIN}
         assert self._warned(caplog) == [
             "Not adding to held pairs this run: the account's fills could not be read, so "
@@ -5177,12 +5185,12 @@ class TestRunProdAddsToHeldPairs:
         assert self._traded(results) == {self._MAIN}
         # No held_pairs call, nothing handed on, no line of the add-on's own
         assert seen["held_pairs"] == []
-        assert seen["ts"] == seen["st"] == [{}]
+        assert seen["ts"] == [{}]
         for text in ("Account value for sizing held pairs", "Held pair",
                      "Time-series pairs that add to a held pair", "adds to",
                      "Not adding to held pairs", "at today's prices"):
             assert text not in caplog.text, text
-        # Both held markets were dropped before either finder saw them, as before
+        # Both held markets were dropped before the finder saw them, as before
         assert "Open ladder exposure: 3 held market(s)" in caplog.text
 
     def test_the_no_flag_turns_saved_defaults_off_for_one_run(self, monkeypatch, caplog):
@@ -5221,7 +5229,7 @@ class TestRunProdAddsToHeldPairs:
         results, seen = self._dry_run(self._client(monkeypatch, held_rows=held_rows),
                                       monkeypatch, caplog, add_on=True)
         assert self._traded(results) == {self._MAIN}
-        assert seen["ts"] == seen["st"] == [{}]
+        assert seen["ts"] == [{}]
         assert f"Held pairs to add to: 0 (other held markets, never added to: {others})" in (
             caplog.text)
         assert self._warned(caplog) == []
@@ -5236,8 +5244,53 @@ class TestRunProdAddsToHeldPairs:
                                         "fees_paid_dollars": "0.05"}))
         results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True)
         assert self._traded(results) == {self._MAIN}
-        assert seen["ts"] == seen["st"] == [{}]
+        assert seen["ts"] == [{}]
         assert "Held pairs to add to: 0 (other held markets, never added to: 4)" in caplog.text
+
+    # One question listed on two series, closing at one moment: the pair the
+    # same-title finder forms, NO on the pricier ST-A and YES on ST-B
+    _SAME_TITLE_EVENTS = tuple(
+        _ev("Bitcoin", _mk_market(ticker, event, "Bitcoin high?", "$80,000 by Dec 10, 2026",
+                                  yes_ask, no_ask, price_level_structure="linear_cent"))
+        for ticker, event, yes_ask, no_ask in (("ST-A", "KXSTA-26DEC10", "0.60", "0.42"),
+                                               ("ST-B", "KXSTB-26DEC10", "0.20", "0.82")))
+
+    def test_an_identically_worded_held_same_title_pair_is_never_added_to(
+            self, monkeypatch, caplog):
+        # That pair held, 30 each, its two series filed alike, last traded ten
+        # days ago: an exact held pair the run may add to. The time-series
+        # finder, the one finder a run asks, never pairs two identically
+        # worded markets, so nothing is bought on either market
+        held_rows = (
+            {"ticker": "ST-A", "position_fp": "-30.00", "market_exposure_dollars": "12.60",
+             "fees_paid_dollars": "0.30"},
+            {"ticker": "ST-B", "position_fp": "30.00", "market_exposure_dollars": "6.00",
+             "fees_paid_dollars": "0.30"},
+        )
+        # Kalshi's value: 30 NO on ST-A at its 0.42 ask and 30 YES on ST-B at 0.20
+        client = self._client(monkeypatch, positions_value=1_860, held_rows=held_rows,
+                              extra_events=self._SAME_TITLE_EVENTS,
+                              include_held_position=False)
+        _seed_series_listing({"KXSTA": ["Crypto", ["BTC"]], "KXSTB": ["Crypto", ["BTC"]]})
+        results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True)
+        key = frozenset({"ST-A", "ST-B"})
+        # It passed every add-on check and was handed to the finder to add to
+        [check] = [m for m in caplog.messages if m.startswith("Add-on check: ")]
+        assert "ST-A" in check and "ST-B" in check and check.endswith("-> may add")
+        [add_on_pairs] = seen["ts"]
+        assert set(add_on_pairs) == {key}
+        # ... which formed no pair adding to it, and bought nothing on either market
+        assert "Time-series pairs that add to a held pair: 0" in caplog.messages
+        traded = self._traded(results)
+        assert self._MAIN in traded
+        assert not {ticker for _, a, b in traded for ticker in (a, b)} & key
+        # Control: over the very list the finder searched, the same-title finder
+        # forms the held pair as an add-on to it, buying the sides held
+        [searched] = seen["searched"]
+        [pair] = [p for p in scanner_mod.find_same_title_pairs(
+                      searched, seen["blocked"][0][0], add_on_pairs=add_on_pairs)
+                  if {p.market_a.ticker, p.market_b.ticker} == key]
+        assert scanner_mod.pair_held(pair) is add_on_pairs[key]
 
     def test_a_failed_held_market_lookup_means_no_add_on(self, monkeypatch, caplog):
         # A held market that cannot be looked up could share the pair's
@@ -5250,7 +5303,7 @@ class TestRunProdAddsToHeldPairs:
         results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True,
                                       expected_code=EXIT_TIME_SERIES_SKIPPED)
         assert self._traded(results) == set()
-        assert seen["held_pairs"] == [] and seen["ts"] == [] and seen["st"] == [{}]
+        assert seen["held_pairs"] == [] and seen["ts"] == []
         assert self._warned(caplog) == [
             "Not adding to held pairs this run: a market the account holds could not "
             "be looked up"]
@@ -5268,7 +5321,7 @@ class TestRunProdAddsToHeldPairs:
         results, seen = self._dry_run(self._client(monkeypatch), monkeypatch, caplog,
                                       add_on=True)
         assert self._traded(results) == {self._MAIN}
-        assert seen["held_pairs"] == [] and seen["ts"] == seen["st"] == [{}]
+        assert seen["held_pairs"] == [] and seen["ts"] == [{}]
         assert self._warned(caplog) == [
             "Not adding to held pairs this run: the list of the account's positions was "
             "cut short, so a held market may be missing from it"]
@@ -5316,7 +5369,7 @@ class TestRunProdAddsToHeldPairs:
                 "cost $1980.00 (fees $30.00), worth $1950.00 at today's prices") in caplog.text
         assert "Held pairs to add to: 1 (other held markets, never added to: 0)" in caplog.text
         assert "Held pairs already at their size cap, not added to this run: 1" in caplog.text
-        assert seen["ts"] == seen["st"] == [{}]
+        assert seen["ts"] == [{}]
         # The one pair the ladder's other rungs form (HELD-C / HELD-D) is
         # refused on the held ladder
         assert ("Time-series candidates refused because one of their markets is on a "
@@ -5372,7 +5425,7 @@ class TestRunProdAddsToHeldPairs:
         # the two pairs off the ladder trade, so no market of the ladder is
         # traded as either leg
         assert "Held pairs already at their size cap, not added to this run: 1" in caplog.text
-        assert seen["ts"] == seen["st"] == [{}]
+        assert seen["ts"] == [{}]
         assert ("Time-series candidates refused because one of their markets is on a "
                 "ladder we already hold (counted before every other check): 1") in caplog.text
         traded = self._traded(results)
@@ -5464,14 +5517,14 @@ class TestRunProdAddsToHeldPairs:
         value of them (not read, or refused as more than the 63 contracts held
         can be worth) adds to no held pair: an add-on is sized on the
         portfolio value, which then leaves out what the account holds. One
-        WARNING names the cause, held_pairs is never called, neither finder
-        is handed a pair, and the main pair still trades on the cash.
+        WARNING names the cause, held_pairs is never called, the time-series
+        finder is handed no pair, and the main pair still trades on the cash.
         """
         results, seen = self._dry_run(
             self._client(monkeypatch, positions_value=positions_value), monkeypatch, caplog,
             add_on=True)
         assert self._traded(results) == {self._MAIN}
-        assert seen["held_pairs"] == [] and seen["ts"] == seen["st"] == [{}]
+        assert seen["held_pairs"] == [] and seen["ts"] == [{}]
         assert self._warned(caplog) == [f"Not adding to held pairs this run: {cause}"]
         # The one WARNING that says why the run sizes on the cash alone
         assert why in [r.getMessage() for r in caplog.records
@@ -5499,24 +5552,19 @@ class TestRunProdAddsToHeldPairs:
     def test_a_dev_run_reads_no_positions_even_with_it_on(self, monkeypatch, caplog):
         # A dev run trades the sandbox account, which holds nothing of
         # production's: with the setting on it still reads no positions, looks
-        # up no held market and hands neither finder a held pair
+        # up no held market and hands the time-series finder no held pair
         calls: list = []
         for name in ("get_held_positions", "resolve_held_ladders", "held_pairs"):
             monkeypatch.setattr(main, name,
                                 lambda *a, _name=name, **k: calls.append(_name))
-        seen: dict = {"ts": [], "st": []}
-        real_ts, real_st = main.find_time_series_pairs, main.find_same_title_pairs
+        seen: dict = {"ts": []}
+        real_ts = main.find_time_series_pairs
 
         def ts_spy(*args, add_on_pairs=None, **kwargs):
             seen["ts"].append(add_on_pairs)
             return real_ts(*args, add_on_pairs=add_on_pairs, **kwargs)
 
-        def st_spy(*args, add_on_pairs=None, **kwargs):
-            seen["st"].append(add_on_pairs)
-            return real_st(*args, add_on_pairs=add_on_pairs, **kwargs)
-
         monkeypatch.setattr(main, "find_time_series_pairs", ts_spy)
-        monkeypatch.setattr(main, "find_same_title_pairs", st_spy)
         captured = _capture_dev_simulation(monkeypatch)
         reference = live_settings()
         settings = dataclasses.replace(reference, rebalance=True)
@@ -5526,8 +5574,8 @@ class TestRunProdAddsToHeldPairs:
                                  settings, reference)
         assert code == EXIT_OK
         assert calls == []
-        assert len(seen["ts"]) == len(seen["st"]) == 1
-        assert not seen["ts"][0] and not seen["st"][0]
+        assert len(seen["ts"]) == 1
+        assert not seen["ts"][0]
         # The run still trades as a dev run does, and says nothing of held pairs
         assert captured["results"]
         for text in ("Not adding to held pairs", "Held pair", "adds to"):
@@ -5673,10 +5721,6 @@ class TestRunProdAddsToHeldPairsLive:
         client.get_settlements_without_preload_content = MagicMock(
             return_value=_raw_json_response({"settlements": [], "cursor": None}))
         monkeypatch.setattr(trader_mod, "_V2_NO_MAPPING_CONFIRMED", mapping_confirmed)
-        if not main_pair:
-            # The same-title finder finds nothing either
-            monkeypatch.setattr(main, "find_same_title_pairs",
-                                lambda markets, held, *, add_on_pairs=None: [])
         captured: dict = {}
 
         def fake_append_to_prod_log(results, balance_before, balance_after, *, run_note=""):
@@ -6245,18 +6289,19 @@ def _run_selling(exchange: _SellExchange, monkeypatch, caplog, *, dry_run: bool,
             keywords, as a dict), "enrich" and "specs" (each call's portfolio
             value and cash), "portfolio"
             (select_portfolio's cash), "shards" (the shard cash handed to
-            ensure_shard_collateral), "ts" and "st" (each finder call's blocked
-            set, market tickers and add_on_pairs), "ladders" (each time-series
-            finder call's held_ladders) and "log" (each trade-log write: its
-            trades, cash before and after, and sales); and the run result.
+            ensure_shard_collateral), "ts" (each time-series finder call's
+            blocked set, market tickers and add_on_pairs), "ladders" (each
+            time-series finder call's held_ladders) and "log" (each trade-log
+            write: its trades, cash before and after, and sales); and the run
+            result.
     """
     seen: dict = {key: [] for key in ("plan_sales", "plan_trims", "enrich", "specs",
-                                      "portfolio", "shards", "ts", "st", "ladders", "log")}
+                                      "portfolio", "shards", "ts", "ladders", "log")}
     real_plan, real_enrich = main.plan_sales, main.enrich_with_orderbook_prices
     real_trims = main.plan_trims
     real_specs, real_select = main._compute_trade_specs, main.select_portfolio
     real_collateral = main.ensure_shard_collateral
-    real_ts, real_st = main.find_time_series_pairs, main.find_same_title_pairs
+    real_ts = main.find_time_series_pairs
 
     def plan_spy(client_, positions, labels, by_ticker, *, settings, now, fee_multipliers):
         seen["plan_sales"].append(settings)
@@ -6294,10 +6339,6 @@ def _run_selling(exchange: _SellExchange, monkeypatch, caplog, *, dry_run: bool,
         seen["ladders"].append(kwargs.get("held_ladders"))
         return real_ts(client_, blocked, markets, **kwargs)
 
-    def st_spy(markets, blocked, *, add_on_pairs=None):
-        seen["st"].append((set(blocked), {m.ticker for m in markets}, add_on_pairs))
-        return real_st(markets, blocked, add_on_pairs=add_on_pairs)
-
     def fake_log(results, before, after, *, run_note="", sales=()):
         seen["log"].append((list(results), before, after, list(sales)))
         return pathlib.Path("/fake/trade_log.xlsx")
@@ -6306,8 +6347,7 @@ def _run_selling(exchange: _SellExchange, monkeypatch, caplog, *, dry_run: bool,
                       ("enrich_with_orderbook_prices", enrich_spy),
                       ("_compute_trade_specs", specs_spy), ("select_portfolio", select_spy),
                       ("ensure_shard_collateral", collateral_spy),
-                      ("find_time_series_pairs", ts_spy), ("find_same_title_pairs", st_spy),
-                      ("append_to_prod_log", fake_log)):
+                      ("find_time_series_pairs", ts_spy), ("append_to_prod_log", fake_log)):
         monkeypatch.setattr(main, name, spy)
     # Every NO fill is checked against the ledger once per process; this one has been
     monkeypatch.setattr(trader_mod, "_V2_NO_MAPPING_CONFIRMED", True)
@@ -6630,14 +6670,14 @@ class TestRunProdSellsInADryRun:
         assert seen["shards"] == [{0: 25_000 + _SELL_PROCEEDS_CENTS, 1: 999_900}]
         assert "Dry run: sizing as if the sales filled — cash $10277.06 (+$28.06)" in messages
         # The markets it would sell, and the held pair below its level, are
-        # out of both finders' markets
+        # out of the time-series finder's markets
         held = _SELL_TICKERS | {_TICKER_TS_EARLY, _TICKER_TS_LATE}
-        assert len(seen["ts"]) == len(seen["st"]) == 1
+        assert len(seen["ts"]) == 1
         # The ladder it would sell is free again; the one it keeps is not
         [ladders] = seen["ladders"]
         assert ("event", "EVS-SELL-EARLY") not in ladders
         assert ("event", "EVT-TS-EARLY") in ladders
-        for blocked, markets, add_on_pairs in seen["ts"] + seen["st"]:
+        for blocked, markets, add_on_pairs in seen["ts"]:
             assert held <= blocked
             assert not markets & held
             assert not add_on_pairs
@@ -6679,7 +6719,8 @@ class TestRunProdSellsInADryRun:
         assert code == EXIT_OK
         assert "Held pairs picked for sale this run, not added to: 1" in _messages(caplog)
         ts_key = frozenset((_TICKER_TS_EARLY, _TICKER_TS_LATE))
-        for blocked, markets, add_on_pairs in seen["ts"] + seen["st"]:
+        assert len(seen["ts"]) == 1
+        for blocked, markets, add_on_pairs in seen["ts"]:
             assert set(add_on_pairs) == {ts_key}
             assert _SELL_TICKERS <= blocked and not markets & _SELL_TICKERS
             # The held pair below its level is added to, so its markets are in
@@ -6797,9 +6838,9 @@ class TestRunProdSellsLive:
         assert ("After the sales: portfolio value $10277.06 = cash $10277.06 + open "
                 "positions $0.00") in _messages(caplog)
         # The pair's ladder is free again, as the backtest frees it; its own
-        # markets stay out of both finders
+        # markets stay out of the time-series finder
         assert seen["ladders"] == [frozenset()]
-        for blocked, markets, _pairs in seen["ts"] + seen["st"]:
+        for blocked, markets, _pairs in seen["ts"]:
             assert _SELL_TICKERS <= blocked and not markets & _SELL_TICKERS
         # The sale is on record before any trade, and the run began sending orders
         assert report.submission_started is True
@@ -6816,8 +6857,6 @@ class TestRunProdSellsLive:
         # The main pair is left out, so the run has nothing to buy
         exchange = _SellExchange(monkeypatch, held_rows=_SELL_ROWS, before=self._BEFORE,
                                  after=after, fills={_TICKER_SELL_LATE: 10}, main_pair=False)
-        monkeypatch.setattr(main, "find_same_title_pairs",
-                            lambda markets, held, *, add_on_pairs=None: [])
         code, _seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
                                            sell_at=0.80)
         assert code == EXIT_TRADES_NEED_ATTENTION
@@ -6845,8 +6884,8 @@ class TestRunProdSellsLive:
         # The second order of the pair's sale fills nothing: SELL-EARLY is sold
         # out, and SELL-LATE still holds its 30 NO, alone on its ladder. It is
         # what a person must sort out, so it is not added to as a lone held
-        # market, nor let into either finder, though adding to held pairs is
-        # on and Kalshi's value of it is read and kept
+        # market, nor let into the time-series finder, though adding to held
+        # pairs is on and Kalshi's value of it is read and kept
         after = {**_AFTER_SALE_BALANCE, "portfolio_value": 1_200}
         exchange = _SellExchange(monkeypatch, held_rows=_SELL_ROWS, before=self._BEFORE,
                                  after=after, fills={_TICKER_SELL_LATE: 0})
@@ -6859,7 +6898,8 @@ class TestRunProdSellsLive:
         # Kalshi's value of what is left is kept, so the add-on rule was asked
         assert ("After the sales: portfolio value $10289.06 = cash $10277.06 + open "
                 "positions $12.00") in _messages(caplog)
-        for blocked, markets, add_on_pairs in seen["ts"] + seen["st"]:
+        assert len(seen["ts"]) == 1
+        for blocked, markets, add_on_pairs in seen["ts"]:
             assert _SELL_TICKERS <= blocked and not markets & _SELL_TICKERS
             assert not any(_TICKER_SELL_LATE in key for key in add_on_pairs or {})
         _sales, buys = exchange.orders()
@@ -6871,8 +6911,6 @@ class TestRunProdSellsLive:
         exchange = _SellExchange(monkeypatch, held_rows=_SELL_ROWS, before=self._BEFORE,
                                  raises={_TICKER_SELL_EARLY},
                                  unreadable_after={_TICKER_SELL_EARLY: 1}, main_pair=False)
-        monkeypatch.setattr(main, "find_same_title_pairs",
-                            lambda markets, held, *, add_on_pairs=None: [])
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
                                           sell_at=0.80)
         assert code == EXIT_TRADES_NEED_ATTENTION
@@ -6894,8 +6932,6 @@ class TestRunProdSellsLive:
         exchange = _SellExchange(monkeypatch, held_rows=_SELL_ROWS, before=self._BEFORE,
                                  fills_then_raises={_TICKER_SELL_EARLY},
                                  unreadable_after={_TICKER_SELL_EARLY: 1}, main_pair=False)
-        monkeypatch.setattr(main, "find_same_title_pairs",
-                            lambda markets, held, *, add_on_pairs=None: [])
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
                                           sell_at=0.80)
         assert code == EXIT_TRADES_NEED_ATTENTION
@@ -6932,7 +6968,7 @@ class TestRunProdSellsLive:
         assert len(reads) == 2 and reads[1] == {}
         [ladders] = seen["ladders"]
         assert ("event", "EVS-SELL-EARLY") in ladders and ("event", "EVS-SELL-LATE") in ladders
-        for blocked, _markets, add_on_pairs in seen["ts"] + seen["st"]:
+        for blocked, _markets, add_on_pairs in seen["ts"]:
             assert _SELL_TICKERS <= blocked and not add_on_pairs
         assert ("Not adding to held pairs this run: the list of the account's positions was "
                 "cut short, so a held market may be missing from it") in _messages(caplog)
@@ -7014,7 +7050,7 @@ class TestRunProdSellsLive:
         # blocked, and nothing is added to
         [ladders] = seen["ladders"]
         assert ("event", "EVS-SELL-EARLY") in ladders
-        for blocked, _markets, add_on_pairs in seen["ts"] + seen["st"]:
+        for blocked, _markets, add_on_pairs in seen["ts"]:
             assert _SELL_TICKERS <= blocked and not add_on_pairs
 
     @staticmethod
@@ -7042,8 +7078,6 @@ class TestRunProdSellsLive:
             monkeypatch, ticker=_TICKER_SELL_EARLY, lag_reads=2, shown_sold=shown_sold,
             held_rows=_SELL_ROWS, before=self._BEFORE, after=_AFTER_SALE_BALANCE,
             fills_then_raises={_TICKER_SELL_EARLY}, main_pair=False)
-        monkeypatch.setattr(main, "find_same_title_pairs",
-                            lambda markets, held, *, add_on_pairs=None: [])
         code, _seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
                                            sell_at=0.80)
         assert code == EXIT_OK, _messages(caplog)[-5:]
@@ -7098,7 +7132,8 @@ class TestRunProdSellsLive:
         row = reporter._sale_to_row(logged, datetime.now(UTC))
         assert row[16] == "check" and "the account shows more sold than recorded" in row[17]
         # Its markets stay out of every purchase, and the closing line says so
-        for blocked, markets, _pairs in seen["ts"] + seen["st"]:
+        assert len(seen["ts"]) == 1
+        for blocked, markets, _pairs in seen["ts"]:
             assert _SELL_TICKERS <= blocked and not markets & _SELL_TICKERS
         _sales, buys = exchange.orders()
         assert not [b for b in buys if b["ticker"] in _SELL_TICKERS]
@@ -7142,8 +7177,6 @@ class TestRunProdSellsLive:
                                  after={**_AFTER_SALE_BALANCE, "portfolio_value": 1_600},
                                  fills={_TICKER_SELL_EARLY: 10},
                                  fills_then_raises={_TICKER_SELL_EARLY}, main_pair=False)
-        monkeypatch.setattr(main, "find_same_title_pairs",
-                            lambda markets, held, *, add_on_pairs=None: [])
         code, _seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
                                            sell_at=0.80)
         assert code == EXIT_OK
@@ -7171,8 +7204,6 @@ class TestRunProdSellsLive:
         _trader_sleeps, main_sleeps = self._pauses(monkeypatch)
         exchange = _SellExchange(monkeypatch, held_rows=_SELL_ROWS, before=self._BEFORE,
                                  raises={_TICKER_SELL_EARLY}, main_pair=False)
-        monkeypatch.setattr(main, "find_same_title_pairs",
-                            lambda markets, held, *, add_on_pairs=None: [])
         code, _seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
                                            sell_at=0.80)
         assert code == EXIT_OK
@@ -7204,8 +7235,6 @@ class TestRunProdSellsLive:
             before=self._BEFORE, after=_AFTER_SALE_BALANCE,
             fills_then_raises={_TICKER_SELL_EARLY}, main_pair=False)
         reads, sleeps = self._lagging_listing(monkeypatch, stale_reads=stale_reads)
-        monkeypatch.setattr(main, "find_same_title_pairs",
-                            lambda markets, held, *, add_on_pairs=None: [])
         code, _seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
                                            sell_at=0.80)
         assert exchange.ledger[_TICKER_SELL_EARLY] == 0
@@ -7266,8 +7295,6 @@ class TestRunProdSellsLive:
             return positions
 
         monkeypatch.setattr(main, "get_held_positions", cut_short)
-        monkeypatch.setattr(main, "find_same_title_pairs",
-                            lambda markets, held, *, add_on_pairs=None: [])
         code, _seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
                                            sell_at=0.80)
         assert exchange.ledger[_TICKER_SELL_EARLY] == 30
@@ -7359,8 +7386,8 @@ class TestLiveAndDryRunsAgree:
         assert [r.status for r in report2.sales] == ["simulated"]
         assert "Held pairs picked for sale this run, not added to: 1" in _messages(caplog)
         for run in (seen, seen2):
-            assert run["ts"] and run["st"]
-            for blocked, markets, add_on_pairs in run["ts"] + run["st"]:
+            assert run["ts"]
+            for blocked, markets, add_on_pairs in run["ts"]:
                 assert key not in (add_on_pairs or {})
                 assert _SELL_TICKERS <= blocked and not markets & _SELL_TICKERS
 
@@ -7415,8 +7442,8 @@ class TestLiveAndDryRunsAgree:
             assert not any(m.startswith("Held pairs picked for sale this run") for m in lines)
             [ladders] = run["ladders"]
             assert {("event", "EVT-TS-EARLY"), ("event", "EVT-TS-LATE")} <= ladders
-            assert run["ts"] and run["st"]
-            for blocked, markets, add_on_pairs in run["ts"] + run["st"]:
+            assert run["ts"]
+            for blocked, markets, add_on_pairs in run["ts"]:
                 assert not add_on_pairs
                 assert ts <= blocked and not markets & ts
 
@@ -7712,10 +7739,10 @@ class TestRunProdTrimsInADryRun:
         assert seen["shards"] == [{0: 4_000 + _TRIM_PROCEEDS_CENTS, 1: 2_000}]
         assert "Dry run: sizing as if the sales filled — cash $70.28 (+$10.28)" in messages
         # The pair stays held, as a live run would read it back: its ladder
-        # stays held and its markets stay out of both finders
+        # stays held and its markets stay out of the time-series finder
         [ladders] = seen["ladders"]
         assert {("event", "EVS-SELL-EARLY"), ("event", "EVS-SELL-LATE")} <= ladders
-        for blocked, markets, _pairs in seen["ts"] + seen["st"]:
+        for blocked, markets, _pairs in seen["ts"]:
             assert _SELL_TICKERS <= blocked and not markets & _SELL_TICKERS
         # On record before any trade: the run result and the trade log's sale row
         [record] = report.sales
@@ -7749,7 +7776,8 @@ class TestRunProdTrimsInADryRun:
         assert not any(m.startswith("Held pairs picked for sale this run") for m in messages)
         assert not any(m.startswith("Held pairs already at their size cap") for m in messages)
         ts = {_TICKER_TS_EARLY, _TICKER_TS_LATE}
-        for blocked, markets, add_on_pairs in seen["ts"] + seen["st"]:
+        assert len(seen["ts"]) == 1
+        for blocked, markets, add_on_pairs in seen["ts"]:
             assert not add_on_pairs
             assert ts <= blocked and not markets & ts
 
@@ -7820,8 +7848,6 @@ class TestRunProdTrimsInADryRun:
         exchange = _trim_exchange(monkeypatch,
                                   before={**_TRIM_BEFORE, "balance_breakdown": breakdown},
                                   after=_AFTER_TRIM_BALANCE, main_pair=False)
-        monkeypatch.setattr(main, "find_same_title_pairs",
-                            lambda markets, held, *, add_on_pairs=None: [])
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=dry_run,
                                           rebalance=True)
         assert code == EXIT_OK
@@ -7989,10 +8015,10 @@ class TestRunProdTrimsInADryRun:
         assert seen["enrich"] == [(14_800, cash)] and seen["portfolio"] == [cash]
         assert "Dry run: sizing as if the sales filled — cash $133.29 (+$73.29)" in messages
         # The 100 are still held (a dry run takes out only what its sales empty): the
-        # ladder stays held and the market stays out of both finders and add-ons
+        # ladder stays held and the market stays out of the finder and of add-ons
         [ladders] = seen["ladders"]
         assert ("event", "EVL-LONE") in ladders
-        for blocked, markets, add_on_pairs in seen["ts"] + seen["st"]:
+        for blocked, markets, add_on_pairs in seen["ts"]:
             assert _TICKER_LONE_LATE in blocked and _TICKER_LONE_LATE not in markets
             assert not add_on_pairs
         assert "Held pairs already at their size cap, not added to this run: 1" in messages
@@ -8024,7 +8050,8 @@ class TestRunProdTrimsInADryRun:
         assert "41 NO contracts (of 100 held) on LONE-LATE" in would
         assert "Held pairs picked for a Kelly trim this run, not added to: 1" in messages
         assert not any(m.startswith("Held pairs already at their size cap") for m in messages)
-        for blocked, markets, add_on_pairs in seen["ts"] + seen["st"]:
+        assert len(seen["ts"]) == 1
+        for blocked, markets, add_on_pairs in seen["ts"]:
             assert not add_on_pairs
             assert _TICKER_LONE_LATE in blocked and _TICKER_LONE_LATE not in markets
 
@@ -8103,7 +8130,7 @@ class TestRunProdTrimsLive:
         # markets stay out of every purchase
         [ladders] = seen["ladders"]
         assert {("event", "EVS-SELL-EARLY"), ("event", "EVS-SELL-LATE")} <= ladders
-        for blocked, markets, _pairs in seen["ts"] + seen["st"]:
+        for blocked, markets, _pairs in seen["ts"]:
             assert _SELL_TICKERS <= blocked and not markets & _SELL_TICKERS
         assert not [b for b in buys if b["ticker"] in _SELL_TICKERS]
         # The trim is on record before any trade, and the run began sending orders
@@ -8122,8 +8149,6 @@ class TestRunProdTrimsLive:
         # Nothing is bought (the main pair is left out), so the trim's orders
         # are the run's only ones
         exchange = _trim_exchange(monkeypatch, after=_AFTER_TRIM_BALANCE, main_pair=False)
-        monkeypatch.setattr(main, "find_same_title_pairs",
-                            lambda markets, held, *, add_on_pairs=None: [])
         code, _seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
                                            rebalance=True)
         assert code == EXIT_OK
@@ -8169,7 +8194,7 @@ class TestRunProdTrimsLive:
         # every purchase and is not added to
         [ladders] = seen["ladders"]
         assert ("event", "EVL-LONE") in ladders
-        for blocked, markets, add_on_pairs in seen["ts"] + seen["st"]:
+        for blocked, markets, add_on_pairs in seen["ts"]:
             assert _TICKER_LONE_LATE in blocked and _TICKER_LONE_LATE not in markets
             assert not add_on_pairs
         assert not [b for b in buys if b["ticker"] in (_TICKER_LONE_LATE, _TICKER_LONE_PAID)]
@@ -8192,8 +8217,6 @@ class TestRunProdTrimsLive:
             self, monkeypatch, caplog, status, exchange_kwargs):
         exchange = _trim_exchange(monkeypatch, after=_AFTER_TRIM_BALANCE, main_pair=False,
                                   **exchange_kwargs)
-        monkeypatch.setattr(main, "find_same_title_pairs",
-                            lambda markets, held, *, add_on_pairs=None: [])
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
                                           rebalance=True)
         assert code == EXIT_TRADES_NEED_ATTENTION
@@ -8283,8 +8306,6 @@ class TestRunProdTrimsLive:
         exchange = _trim_exchange(monkeypatch, after=_AFTER_TRIM_BALANCE,
                                   resting_orders=(_resting_order("OTHER-MKT"),),
                                   main_pair=False)
-        monkeypatch.setattr(main, "find_same_title_pairs",
-                            lambda markets, held, *, add_on_pairs=None: [])
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=dry_run,
                                           rebalance=True)
         assert code == EXIT_OK
@@ -8305,8 +8326,6 @@ class TestRunProdTrimsLive:
         monkeypatch.setattr("kalshi_betting._http.time.sleep", lambda seconds: None)
         exchange = _trim_exchange(monkeypatch, after=_AFTER_TRIM_BALANCE,
                                   orders_unreadable=unreadable, main_pair=False)
-        monkeypatch.setattr(main, "find_same_title_pairs",
-                            lambda markets, held, *, add_on_pairs=None: [])
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
                                           rebalance=True)
         assert code == EXIT_OK
@@ -8451,8 +8470,6 @@ class TestRunProdTrimsOnAnyDay:
         exchange = _trim_exchange(monkeypatch, main_pair=False, fill_rows=(
             _fill_row("OLD-MKT", bought - timedelta(days=30)),
             _fill_row(_TICKER_SELL_EARLY, bought), _fill_row(_TICKER_SELL_LATE, bought)))
-        monkeypatch.setattr(main, "find_same_title_pairs",
-                            lambda markets, held, *, add_on_pairs=None: [])
         sent: dict = {}
         lines: dict = {}
         for day in range(1, 9):
@@ -8827,7 +8844,7 @@ class TestLiveRebalanceTextsSayWhatARunDoes:
         assert (readme.index("seller.plan_sales()")
                 < readme.index("seller.plan_trims() — with rebalance on")
                 < readme.index("trader.sell_positions()"))
-        # ... and the add-on step after the held pairs are found, before either finder
+        # ... and the add-on step after the held pairs are found, before the finder
         assert (readme.index("scanner.held_pairs() — with rebalance on")
                 < readme.index("seller.plan_add_ons() — with rebalance on")
                 < readme.index("scanner.find_time_series_pairs()"))
@@ -9206,7 +9223,6 @@ class TestRunProdExitCodes:
     @patch("kalshi_betting.main.select_portfolio")
     @patch("kalshi_betting.main.compute_trade")
     @patch("kalshi_betting.main.enrich_with_orderbook_prices")
-    @patch("kalshi_betting.main.find_same_title_pairs")
     @patch("kalshi_betting.main.find_time_series_pairs")
     @patch("kalshi_betting.main.filter_markets_within_horizon")
     @patch("kalshi_betting.main.fetch_shard_statuses", return_value=None)
@@ -9221,7 +9237,6 @@ class TestRunProdExitCodes:
         mock_shard_statuses,
         mock_filter_horizon,
         mock_find_ts,
-        mock_find_st,
         mock_enrich,
         mock_compute,
         mock_select,
@@ -9238,7 +9253,6 @@ class TestRunProdExitCodes:
         # make_spec's time-series pair, the one pair the run finds
         spec = make_spec()
         mock_find_ts.return_value = [spec.pair]
-        mock_find_st.return_value = []
         mock_enrich.return_value = [spec.pair]
         mock_compute.return_value = spec
         mock_select.return_value = [spec]
@@ -9260,7 +9274,6 @@ class TestRunProdExitCodes:
     @patch("kalshi_betting.main.select_portfolio")
     @patch("kalshi_betting.main.compute_trade")
     @patch("kalshi_betting.main.enrich_with_orderbook_prices")
-    @patch("kalshi_betting.main.find_same_title_pairs")
     @patch("kalshi_betting.main.find_time_series_pairs")
     @patch("kalshi_betting.main.filter_markets_within_horizon")
     @patch("kalshi_betting.main.fetch_shard_statuses", return_value=None)
@@ -9275,7 +9288,6 @@ class TestRunProdExitCodes:
         mock_shard_statuses,
         mock_filter_horizon,
         mock_find_ts,
-        mock_find_st,
         mock_enrich,
         mock_compute,
         mock_select,
@@ -9295,7 +9307,6 @@ class TestRunProdExitCodes:
         # make_spec's time-series pair, the one pair the run finds
         spec = make_spec()
         mock_find_ts.return_value = [spec.pair]
-        mock_find_st.return_value = []
         mock_enrich.return_value = [spec.pair]
         mock_compute.return_value = spec
         mock_select.return_value = [spec]
@@ -9327,7 +9338,6 @@ class TestRunProdExitCodes:
     @patch("kalshi_betting.main.select_portfolio")
     @patch("kalshi_betting.main.compute_trade")
     @patch("kalshi_betting.main.enrich_with_orderbook_prices")
-    @patch("kalshi_betting.main.find_same_title_pairs")
     @patch("kalshi_betting.main.find_time_series_pairs")
     @patch("kalshi_betting.main.filter_markets_within_horizon")
     @patch("kalshi_betting.main.fetch_shard_statuses", return_value=None)
@@ -9342,7 +9352,6 @@ class TestRunProdExitCodes:
         mock_shard_statuses,
         mock_filter_horizon,
         mock_find_ts,
-        mock_find_st,
         mock_enrich,
         mock_compute,
         mock_select,
@@ -9357,7 +9366,6 @@ class TestRunProdExitCodes:
         # make_spec's time-series pair, the one pair the run finds
         spec = make_spec()
         mock_find_ts.return_value = [spec.pair]
-        mock_find_st.return_value = []
         mock_enrich.return_value = [spec.pair]
         mock_compute.return_value = spec
         mock_select.return_value = [spec]
@@ -9385,7 +9393,6 @@ class TestRunProdExitCodes:
             ),
             patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
             patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
-            patch("kalshi_betting.main.find_same_title_pairs", return_value=[]),
         ):
             code = main._run_prod(MagicMock(), _args())
 
@@ -9395,26 +9402,23 @@ class TestRunProdExitCodes:
 class TestRunProdTimeSeriesSkippedCode:
     """A production run that could not identify a held market makes no
     time-series trade and exits EXIT_TIME_SERIES_SKIPPED, not EXIT_OK, so the
-    scheduler's own log says so. A sale or a same-title trade that needs a
-    human still wins."""
+    scheduler's own log says so. A sale that needs a human still wins."""
 
     @staticmethod
-    def _run(monkeypatch, *, dry_run, status="simulated", held_ladders=None, sale_status=None,
-             same_title=False):
+    def _run(monkeypatch, *, dry_run, status="simulated", held_ladders=None, sale_status=None):
         """
         Run _run_prod with every request stubbed and return what it did.
 
         The time-series finder, when the run asks it, finds make_spec()'s
         time-series pair, and every trade ends with the given status. A run
-        that never asks the finder therefore has no pair at all to trade,
-        unless same_title is set. Without sale_status the account holds
-        HELD-X and the held-market lookup returns held_ladders (None: it
-        failed). With it, the lookup works at the start, and the run's sell
-        level picks one sale (_helper_sale's: 30 YES on SELL-A and 30 NO on
-        SELL-B), which ends with sale_status. The positions read after the
-        sale list NEW-X alone, a market the run did not hold at the start, so
-        the run cannot identify its ladder and asks the time-series finder
-        nothing.
+        that never asks the finder therefore has no pair at all to trade.
+        Without sale_status the account holds HELD-X and the held-market
+        lookup returns held_ladders (None: it failed). With it, the lookup
+        works at the start, and the run's sell level picks one sale
+        (_helper_sale's: 30 YES on SELL-A and 30 NO on SELL-B), which ends
+        with sale_status. The positions read after the sale list NEW-X alone,
+        a market the run did not hold at the start, so the run cannot identify
+        its ladder and asks the time-series finder nothing.
 
         Args:
             monkeypatch (pytest.MonkeyPatch): For the stand-ins.
@@ -9424,13 +9428,6 @@ class TestRunProdTimeSeriesSkippedCode:
                 lookup returns when there is no sale; None means it failed.
             sale_status (str | None): Keyword-only. The sale's status ("sold",
                 "manual_review"), or None for a run that sells nothing.
-            same_title (bool): Keyword-only. Whether the same-title finder
-                also finds make_spec()'s pair, which stands in for a
-                same-title pair: a run that skips the time-series search
-                still searches for same-title pairs, so that is the only kind
-                such a run can trade. The pair keeps its time-series type,
-                since the stand-in sizing step hands on make_spec()'s trade
-                for any pair.
 
         Returns:
             tuple[int, list]: The exit code, and the keywords of each call to
@@ -9483,9 +9480,6 @@ class TestRunProdTimeSeriesSkippedCode:
             return [spec.pair]
 
         monkeypatch.setattr(main, "find_time_series_pairs", time_series)
-        monkeypatch.setattr(main, "find_same_title_pairs",
-                            lambda markets, held, *, add_on_pairs=None:
-                            [spec.pair] if same_title else [])
         monkeypatch.setattr(main, "enrich_with_orderbook_prices",
                             lambda client, pairs, value, *, settings, cash_cents: pairs)
         monkeypatch.setattr(main, "compute_trade",
@@ -9530,22 +9524,6 @@ class TestRunProdTimeSeriesSkippedCode:
         # Control: the same run, its sale gone through, exits 40
         code, ts_calls = self._run(monkeypatch, dry_run=False, sale_status="sold")
         assert code == EXIT_TIME_SERIES_SKIPPED
-        assert ts_calls == []
-
-    @pytest.mark.parametrize("dry_run, status, expected", [
-        (True, "simulated", EXIT_TIME_SERIES_SKIPPED),
-        (False, "executed", EXIT_TIME_SERIES_SKIPPED),
-        (False, "manual_review", EXIT_TRADES_NEED_ATTENTION),
-    ], ids=["dry", "live", "needs-a-human"])
-    def test_a_same_title_trade_exits_40_unless_it_needs_a_human(
-            self, monkeypatch, dry_run, status, expected):
-        # The held-market lookup fails, so no time-series pair is searched
-        # for, but the same-title search still runs and its pair trades. The
-        # run still exits 40, unless that trade needs a person, which wins
-        # with 20
-        code, ts_calls = self._run(monkeypatch, dry_run=dry_run, status=status,
-                                   same_title=True)
-        assert code == expected
         assert ts_calls == []
 
     def test_every_clean_exit_after_the_lookup_uses_the_run_code(self):
@@ -9644,8 +9622,6 @@ class TestSizesOnPortfolioValue:
                             lambda client, markets, held, *, labels_out=None: frozenset())
         monkeypatch.setattr(main, "filter_markets_within_horizon", lambda m, d: m)
         monkeypatch.setattr(main, "find_time_series_pairs", lambda *a, **k: [spec.pair])
-        monkeypatch.setattr(main, "find_same_title_pairs",
-                            lambda markets, held, *, add_on_pairs=None: [])
         monkeypatch.setattr(main, "enrich_with_orderbook_prices", enrich)
         monkeypatch.setattr(main, "compute_trade", sized)
         monkeypatch.setattr(main, "select_portfolio", select)
@@ -9921,8 +9897,6 @@ class TestSizesOnPortfolioValue:
                             lambda client, inactive_shards: _stub_ingest())
         monkeypatch.setattr(main, "filter_markets_within_horizon", lambda m, d: m)
         monkeypatch.setattr(main, "find_time_series_pairs", lambda *a, **k: [spec.pair])
-        monkeypatch.setattr(main, "find_same_title_pairs",
-                            lambda markets, held_tickers: [])
         monkeypatch.setattr(main, "enrich_with_orderbook_prices", enrich)
         monkeypatch.setattr(main, "compute_trade", sized)
         monkeypatch.setattr(main, "select_portfolio", select)
@@ -10290,7 +10264,6 @@ class TestRunDevExitCode:
             ),
             patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
             patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
-            patch("kalshi_betting.main.find_same_title_pairs", return_value=[]),
             patch("kalshi_betting.main.enrich_with_orderbook_prices", return_value=[]),
             patch("kalshi_betting.main.write_dev_simulation", return_value="dev_sim.xlsx"),
         ):
@@ -10304,7 +10277,6 @@ class TestRunDevExitCode:
 class TestMainEntryPoint:
     @patch("kalshi_betting.main.write_dev_simulation")
     @patch("kalshi_betting.main.enrich_with_orderbook_prices")
-    @patch("kalshi_betting.main.find_same_title_pairs")
     @patch("kalshi_betting.main.find_time_series_pairs")
     @patch("kalshi_betting.main.filter_markets_within_horizon")
     @patch("kalshi_betting.main.fetch_shard_statuses", return_value=None)
@@ -10317,7 +10289,6 @@ class TestMainEntryPoint:
         mock_shard_statuses,
         mock_filter_horizon,
         mock_find_ts,
-        mock_find_st,
         mock_enrich,
         mock_write_sim,
         tmp_path,
@@ -10327,7 +10298,6 @@ class TestMainEntryPoint:
         mock_fetch.return_value = _stub_ingest()
         mock_filter_horizon.side_effect = lambda m, d: m
         mock_find_ts.return_value = []
-        mock_find_st.return_value = []
         mock_enrich.return_value = []
         mock_write_sim.return_value = "dev_sim.xlsx"
 
@@ -10635,8 +10605,6 @@ class TestResultFile:
                 lambda client, markets, held, *, labels_out=None: frozenset(),
             "filter_markets_within_horizon": lambda markets, days: markets,
             "find_time_series_pairs": lambda *a, **k: [spec.pair],
-            "find_same_title_pairs":
-                lambda markets, held, *, add_on_pairs=None: [],
             "enrich_with_orderbook_prices":
                 lambda client, pairs, value, *, settings, cash_cents: pairs,
             "compute_trade": lambda pair, value, *, settings, cash_cents: spec,
@@ -10752,8 +10720,7 @@ class TestResultFile:
 
     def test_no_pairs(self, monkeypatch, tmp_path, caplog):
         seen, result, records = self._run(
-            monkeypatch, tmp_path, caplog, find_time_series_pairs=lambda *a, **k: [],
-            find_same_title_pairs=lambda markets, held, *, add_on_pairs=None: [])
+            monkeypatch, tmp_path, caplog, find_time_series_pairs=lambda *a, **k: [])
         assert seen["code"] == result["exit_code"] == EXIT_OK
         assert result["message"].startswith("No qualifying pairs found (")
         self._logged_once(records, result["message"], logging.INFO)
@@ -10849,24 +10816,6 @@ class TestResultFile:
         self._logged_once(records, result["message"], logging.INFO)
         assert result["trades"] == []
         assert result["balance_after"] is None
-
-    def test_time_series_skipped_after_a_same_title_trade(self, monkeypatch, tmp_path, caplog):
-        # The same run, but the same-title search, which still runs when the
-        # time-series one is skipped, finds make_spec()'s pair (standing in
-        # for a same-title pair) and it trades: the result records the trade
-        # and the balance after it, and the run still exits 40
-        seen, result, records = self._run(
-            monkeypatch, tmp_path, caplog,
-            resolve_held_ladders=lambda client, markets, held, *, labels_out=None: None,
-            find_same_title_pairs=lambda markets, held, *, add_on_pairs=None: [
-                make_spec().pair])
-        assert seen["code"] == result["exit_code"] == EXIT_TIME_SERIES_SKIPPED
-        assert result["message"] == (
-            "Submitted 1 of 1 order pair(s) successfully. 0 rolled back, "
-            "0 rollback failure(s), 0 unknown fill state(s).")
-        self._logged_once(records, result["message"], logging.INFO)
-        assert result["trades"] == [self._trade("executed")]
-        assert result["balance_after"] == self._AFTER / 100
 
     def test_a_failed_balance_read_after_trading_is_not_known(self, monkeypatch, tmp_path,
                                                               caplog):
@@ -11187,9 +11136,9 @@ class TestResultFile:
                              ids=["no-filter", "category-filter"])
     def test_the_listing_is_read_once_before_any_book(self, monkeypatch, tmp_path, caplog,
                                                        argv):
-        # One read with the run's own client, right after the finders' pairs
-        # are merged and before enrichment reads a book, even when a category
-        # filter needs the listing too
+        # One read with the run's own client, before enrichment reads a book
+        # for the pairs the finder found, even when a category filter needs
+        # the listing too
         client = MagicMock()
         events = []
 
@@ -11247,13 +11196,12 @@ class TestResultFile:
 
     def test_a_run_with_no_candidate_pairs_reads_the_listing_once(self, monkeypatch,
                                                                   tmp_path, caplog):
-        # Every run reads the listing once, right after the market fetch: the
-        # same-title sport check files each market by it before any pair is
-        # found, so a run that finds none still read it
+        # Every run reads the listing once, right after the market fetch, and
+        # files each market by it before any pair is found, so a run that
+        # finds none still read it
         reads = []
         seen, result, _ = self._run(
             monkeypatch, tmp_path, caplog, find_time_series_pairs=lambda *a, **k: [],
-            find_same_title_pairs=lambda markets, held, *, add_on_pairs=None: [],
             load_series_categories=lambda client: reads.append(client) or {})
         assert seen["code"] == result["exit_code"] == EXIT_OK
         assert len(reads) == 1 and result["trades"] == []
@@ -11261,8 +11209,9 @@ class TestResultFile:
     def test_a_run_without_the_flag_reads_the_listing_once(self, monkeypatch, tmp_path,
                                                            caplog):
         # A scheduled run writes no result and sets no category/tag filter, and
-        # still reads the listing once (a cached copy, refreshed once a week),
-        # for the same-title sport check
+        # still reads the listing once (a cached copy, refreshed once a week):
+        # it files every market by it, and each market's fee multiplier is read
+        # from the copy that read refreshes
         reads = []
         seen, result, _ = self._run(
             monkeypatch, tmp_path, caplog, result_file=False,
@@ -11679,7 +11628,6 @@ class TestDevSimulationLoggedOnce:
             ),
             patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
             patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
-            patch("kalshi_betting.main.find_same_title_pairs", return_value=[]),
             patch("kalshi_betting.main.enrich_with_orderbook_prices", return_value=[]),
             patch("kalshi_betting.main.write_dev_simulation", side_effect=_fake_write_dev_simulation),
         ):
@@ -11700,7 +11648,6 @@ class TestDevSimulationLoggedOnce:
             ),
             patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
             patch("kalshi_betting.main.find_time_series_pairs", return_value=[pair]),
-            patch("kalshi_betting.main.find_same_title_pairs", return_value=[]),
             patch("kalshi_betting.main.enrich_with_orderbook_prices", return_value=[pair]),
             patch("kalshi_betting.main.compute_trade", return_value=None),
             patch("kalshi_betting.main.select_portfolio", return_value=[]),
@@ -11723,7 +11670,6 @@ class TestDevSimulationLoggedOnce:
             ),
             patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
             patch("kalshi_betting.main.find_time_series_pairs", return_value=[spec.pair]),
-            patch("kalshi_betting.main.find_same_title_pairs", return_value=[]),
             patch("kalshi_betting.main.enrich_with_orderbook_prices", return_value=[spec.pair]),
             patch("kalshi_betting.main.compute_trade", return_value=spec),
             patch("kalshi_betting.main.select_portfolio", return_value=[spec]),
@@ -11796,7 +11742,6 @@ class TestLoggingRotation:
                 ),
                 patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
                 patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
-                patch("kalshi_betting.main.find_same_title_pairs", return_value=[]),
                 patch("kalshi_betting.main.enrich_with_orderbook_prices", return_value=[]),
                 patch("kalshi_betting.main.write_dev_simulation", return_value="dev_sim.xlsx"),
             ):
@@ -11841,7 +11786,6 @@ class TestDryRunInertInDev:
             ),
             patch("kalshi_betting.main.filter_markets_within_horizon", side_effect=lambda m, d: m),
             patch("kalshi_betting.main.find_time_series_pairs", return_value=[]),
-            patch("kalshi_betting.main.find_same_title_pairs", return_value=[]),
             patch("kalshi_betting.main.enrich_with_orderbook_prices", return_value=[]),
             patch("kalshi_betting.main.write_dev_simulation", return_value="dev_sim.xlsx"),
         ):

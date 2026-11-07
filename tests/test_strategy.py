@@ -1546,17 +1546,18 @@ def _keyword_values(module, func_name: str, callee: str, keyword: str, *,
 
 def _add_on_unblocking_problems(source: str) -> list[str]:
     """
-    Check how main._run_prod decides which held markets the finders may see.
+    Check how main._run_prod decides which held markets the finder may see.
 
-    A held market is kept out of both finders only by blocked_tickers (the
-    same-title finder has no ladder refusal of its own), so the markets the
-    run lets back in must be exactly those of the add_on_pairs it hands the
-    finders, as that dict stands after its last change (the drops of pairs
-    already at their size cap and of pairs sold this run). A set built from
-    held_pairs' own result, or before the drops, lets a full pair's markets
-    back in with nothing to protect them: an ordinary pair could then buy
-    more of a held market. Every market sold this run (sold_tickers) stays
-    blocked too, since a live run may no longer hold it.
+    A held market is kept out of the time-series finder by blocked_tickers,
+    beside the finder's own refusal of any pair on a held ladder. The
+    markets the run lets back in must be exactly those of the add_on_pairs
+    it hands the finder, as that dict stands after its last change (the
+    drops of pairs already at their size cap and of pairs sold this run). A
+    set built from held_pairs' own result, or before the drops, lets a full
+    pair's markets back in with only the ladder refusal left to keep an
+    ordinary pair from buying more of a held market. Every market sold this
+    run (sold_tickers) stays blocked too, since a live run may no longer
+    hold it.
 
     Args:
         source (str): Source text holding a def _run_prod (main.py's own, or
@@ -1594,14 +1595,13 @@ def _add_on_unblocking_problems(source: str) -> list[str]:
     if [ast.unparse(value) for _, value in blocked] != [
             "held_tickers - add_on_tickers | sold_tickers"]:
         problems.append("blocked_tickers is not (held_tickers - add_on_tickers) | sold_tickers")
-    # Both finders take the blocked set as their held-markets argument, and
-    # the market list they read is filtered by it
-    for finder in ("find_time_series_pairs", "find_same_title_pairs"):
-        calls = [n for n in ast.walk(func) if isinstance(n, ast.Call)
-                 and getattr(n.func, "id", getattr(n.func, "attr", None)) == finder]
-        if not calls or any(len(c.args) < 2 or not isinstance(c.args[1], ast.Name)
-                            or c.args[1].id != "blocked_tickers" for c in calls):
-            problems.append(f"{finder} is not handed blocked_tickers")
+    # The finder takes the blocked set as its held-markets argument, and the
+    # market list it reads is filtered by it
+    calls = [n for n in ast.walk(func) if isinstance(n, ast.Call)
+             and getattr(n.func, "id", getattr(n.func, "attr", None)) == "find_time_series_pairs"]
+    if not calls or any(len(c.args) < 2 or not isinstance(c.args[1], ast.Name)
+                        or c.args[1].id != "blocked_tickers" for c in calls):
+        problems.append("find_time_series_pairs is not handed blocked_tickers")
     if not any("blocked_tickers" in ast.unparse(value)
                for _, value in assigned.get("markets", [])):
         problems.append("the market list is not filtered by blocked_tickers")
@@ -2566,11 +2566,11 @@ class TestTimeSeriesKellyParity:
         # DR-02/DR-54: identical wording across two events of ONE series is two
         # instances of a recurring fixture. Gating only the same-title finder
         # would merely RELABEL such a pair as a time-series bet — the same two
-        # tickers also qualify there, and main._dedup_pairs only ever dropped
-        # the time-series copy because a same-title copy existed. Both live
-        # finders must therefore reach scanner._same_series, and the
-        # backtester's _extract_pairs must reach its dict-world mirror on both
-        # of its branches (one function, so one pin covers both).
+        # tickers also qualify there, so the time-series finder would trade
+        # them unless it refuses them on its own. Both scanner finders must
+        # therefore reach scanner._same_series, and the backtester's
+        # _extract_pairs must reach its dict-world mirror on both of its
+        # branches (one function, so one pin covers both).
         assert _function_calls(scanner, "find_same_title_pairs", "_same_series")
         assert _function_calls(scanner, "find_time_series_pairs", "_same_series")
         assert _function_calls(scanner, "find_time_series_pairs", "_identical_wording")
@@ -2729,19 +2729,26 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(scanner, "find_same_title_pairs", "close_gap_bound_text")
         assert _function_calls(backtester, "_extract_pairs", "close_gap_bound_text")
 
-    def test_ast_both_same_title_readers_apply_the_sport_check(self):
+    def test_ast_the_same_title_finder_applies_the_sport_check(self):
         # DR-79: identical wording on two series that close together is one
         # question only when both series are filed alike and both events name
-        # one competition. The finder and held_pair_kind (which live trimming
-        # reads) are the two live readers of the same-title rules; leaving
-        # held_pair_kind out would let a trim price a held football/volleyball
-        # pair on the same-title chance of paying
-        for reader in ("find_same_title_pairs", "held_pair_kind"):
-            assert _function_calls(scanner, reader, "_labels_differ"), reader
-            assert _function_calls(scanner, reader, "_competitions_differ"), reader
-        # Each live reader goes through the one definition
+        # one competition. The same-title finder applies both checks
+        assert _function_calls(scanner, "find_same_title_pairs", "_labels_differ")
+        assert _function_calls(scanner, "find_same_title_pairs", "_competitions_differ")
+        # ... each through the one definition
         assert _function_calls(scanner, "_labels_differ", "labels_differ")
         assert _function_calls(scanner, "_competitions_differ", "competitions_differ")
+        # held_pair_kind (which live trimming reads) applies neither: it gives
+        # two identically worded markets no kind at all, so a held same-title
+        # pair is never trimmed, filed alike or not
+        for callee in ("_labels_differ", "labels_differ", "_competitions_differ",
+                       "competitions_differ"):
+            assert not _function_calls(scanner, "held_pair_kind", callee), callee
+        # ... and never names the same-title type, so it can only answer time-series
+        [kind] = [node for node in ast.walk(ast.parse(inspect.getsource(scanner)))
+                  if isinstance(node, ast.FunctionDef) and node.name == "held_pair_kind"]
+        assert not any(isinstance(node, ast.Constant) and node.value == "same_title"
+                       for node in ast.walk(kind))
         # Never on the time-series finder: identical wording is never a
         # time-series pair (DR-67), and two rungs of one question are filed alike
         for callee in ("_labels_differ", "labels_differ", "_competitions_differ",
@@ -2751,15 +2758,16 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(scanner, "fetch_open_events_with_markets", "event_competition")
 
     def test_ast_both_run_modes_file_every_market_before_they_pair(self):
-        # The labels the sport check compares are attached once per run, from
-        # the one filing rule, before the finders, and in production before the
-        # sale block too (seller.plan_trims reads them through held_pair_kind)
+        # Every market's labels and fee multiplier are attached once per run,
+        # from the one filing rule, before the finder, and in production before
+        # the sale block too, since every sale's fee reads the fee multiplier
+        # the attach sets (scanner.market_fee_multiplier)
         assert _function_calls(main, "_attach_series_labels", "series_labels")
         tree = ast.parse(inspect.getsource(main))
-        for mode, before in (("_run_prod", ("plan_trims", "find_time_series_pairs",
-                                            "find_same_title_pairs", "_filter_by_category")),
-                             ("_run_dev", ("find_time_series_pairs", "find_same_title_pairs",
-                                           "_filter_by_category"))):
+        for mode, before in (("_run_prod", ("plan_sales", "plan_trims",
+                                            "find_time_series_pairs",
+                                            "_filter_by_category")),
+                             ("_run_dev", ("find_time_series_pairs", "_filter_by_category"))):
             func = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
                         and node.name == mode)
             [read] = _calls_to(func, "load_series_categories")
@@ -5101,18 +5109,17 @@ class TestTimeSeriesKellyParity:
         assert ast.unparse(portfolio_value) in {"held_ladders", "held_ladders or frozenset()"}
         # The run reads its positions with their sides and costs, finds the
         # exact held pairs it may add to through the one definition, and hands
-        # them to BOTH finders under their own name: a dropped or renamed
-        # keyword would silently add to nothing, since both default to none
+        # them to the time-series finder under their own name: a dropped or
+        # renamed keyword would silently add to nothing, since it defaults to none
         assert _function_calls(main, "_run_prod", "get_held_positions")
         assert _function_calls(main, "_run_prod", "held_pairs")
         assert not _function_calls(main, "_run_prod", "get_held_tickers")
-        for finder in ("find_time_series_pairs", "find_same_title_pairs"):
-            [value] = _keyword_values(main, "_run_prod", finder, "add_on_pairs")
-            assert isinstance(value, ast.Name) and value.id == "add_on_pairs", finder
-            # ... and each finder reads the pairs it is handed
-            tree = ast.parse(inspect.getsource(getattr(scanner, finder)))
-            assert any(isinstance(n, ast.Name) and n.id == "add_on_pairs"
-                       and isinstance(n.ctx, ast.Load) for n in ast.walk(tree)), finder
+        [value] = _keyword_values(main, "_run_prod", "find_time_series_pairs", "add_on_pairs")
+        assert isinstance(value, ast.Name) and value.id == "add_on_pairs"
+        # ... and the finder reads the pairs it is handed
+        tree = ast.parse(inspect.getsource(scanner.find_time_series_pairs))
+        assert any(isinstance(n, ast.Name) and n.id == "add_on_pairs"
+                   and isinstance(n.ctx, ast.Load) for n in ast.walk(tree))
         # Both rules read the ladder labels through the one definition
         assert _function_calls(scanner, "find_time_series_pairs", "ladder_keys")
         assert _function_calls(strategy, "select_portfolio", "pair_ladder_keys")
@@ -5120,10 +5127,10 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(scanner, "market_ladder_keys", "ladder_keys")
         assert _function_calls(scanner, "market_ladder_keys", "time_series_group_key")
 
-    def test_ast_the_run_lets_back_in_only_the_pairs_it_hands_the_finders(self):
+    def test_ast_the_run_lets_back_in_only_the_pairs_it_hands_the_finder(self):
         # main._run_prod lets back into the market list exactly the markets of
-        # the add_on_pairs it hands both finders, after the at-cap drop, and
-        # blocks every other held market from both finders
+        # the add_on_pairs it hands the time-series finder, after the at-cap
+        # drop, and blocks every other held market from it
         source = inspect.getsource(main)
         assert _add_on_unblocking_problems(source) == []
         # The check itself: each of these changed copies of _run_prod is caught
@@ -5150,21 +5157,37 @@ class TestTimeSeriesKellyParity:
             "sold let in": source.replace(
                 "blocked_tickers   = (held_tickers - add_on_tickers) | sold_tickers",
                 "blocked_tickers   = held_tickers - add_on_tickers"),
-            # One finder handed the full held set instead of the blocked one
+            # The finder handed the full held set instead of the blocked one
             "finder held set": source.replace(
-                "find_same_title_pairs(markets, blocked_tickers,",
-                "find_same_title_pairs(markets, held_tickers,"),
+                "client, blocked_tickers, markets, settings=settings, held_ladders=held_ladders,",
+                "client, held_tickers, markets, settings=settings, held_ladders=held_ladders,"),
         }
         for name, mutant in mutants.items():
             assert mutant != source, name
             assert _add_on_unblocking_problems(mutant), name
 
+    def test_ast_no_run_mode_looks_for_same_title_pairs(self):
+        # A live or dev run buys only time-series pairs: main does not import
+        # the same-title finder and names it nowhere, so neither run mode can
+        # call it, by a bare name or through scanner
+        assert not hasattr(main, "find_same_title_pairs")
+        tree = ast.parse(inspect.getsource(main))
+        names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+        names |= {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+        names |= {alias.name for node in ast.walk(tree)
+                  if isinstance(node, ast.ImportFrom) for alias in node.names}
+        assert "find_same_title_pairs" not in names
+        for mode in ("_run_dev", "_run_prod"):
+            assert not _function_calls(main, mode, "find_same_title_pairs"), mode
+            # Non-vacuous: each run mode does call the time-series finder
+            assert _function_calls(main, mode, "find_time_series_pairs"), mode
+
     def test_ast_the_live_run_sells_before_it_buys(self):
-        # main._run_prod plans and sends its sales before either finder runs
-        # and before it looks for held pairs to add to, as the backtest sells
-        # before it buys; a dry run sends no sale order; the markets it sold
-        # stay blocked from both finders; and the held pairs it may add to
-        # pass seller.plan_add_ons (the wait and the price move) first
+        # main._run_prod plans and sends its sales before the time-series
+        # finder runs and before it looks for held pairs to add to, as the
+        # backtest sells before it buys; a dry run sends no sale order; the
+        # markets it sold stay blocked from the finder; and the held pairs it
+        # may add to pass seller.plan_add_ons (the wait and the price move) first
         [plan] = _call_nodes(main, "_run_prod", "plan_sales")
         [sell] = _call_nodes(main, "_run_prod", "sell_positions")
         [settings_value] = [k.value for k in plan.keywords if k.arg == "settings"]
@@ -5191,10 +5214,9 @@ class TestTimeSeriesKellyParity:
         assert trim_keywords["skip"] == "_plan_tickers(plans)"
         assert _function_calls(main, "_run_prod", "_emptied_tickers")
         later = (_call_nodes(main, "_run_prod", "find_time_series_pairs")
-                 + _call_nodes(main, "_run_prod", "find_same_title_pairs")
                  + _call_nodes(main, "_run_prod", "held_pairs")
                  + _call_nodes(main, "_run_prod", "execute_trades"))
-        assert len(later) == 4
+        assert len(later) == 3
         assert all(sell.lineno < call.lineno for call in later)
         # A live run's positions are read again after the sales through the
         # one positions reader, then the balance (the cash the buys spend and
@@ -5218,13 +5240,11 @@ class TestTimeSeriesKellyParity:
         assert "sold_tickers" in {n.id for n in ast.walk(blocked.value)
                                   if isinstance(n, ast.Name)}
         # The held pairs a run may add to wait as a trim does: asked once, after
-        # held_pairs found them and before either finder, with the run's own
+        # held_pairs found them and before the finder, with the run's own
         # settings and moment, its result the add_on_pairs every later step reads
         [add_ons] = _call_nodes(main, "_run_prod", "plan_add_ons")
-        finders = (_call_nodes(main, "_run_prod", "find_time_series_pairs")
-                   + _call_nodes(main, "_run_prod", "find_same_title_pairs"))
-        assert len(finders) == 2
-        assert pairs.lineno < add_ons.lineno < min(call.lineno for call in finders)
+        [finder] = _call_nodes(main, "_run_prod", "find_time_series_pairs")
+        assert pairs.lineno < add_ons.lineno < finder.lineno
         # ... and after the pairs already at their size cap, and those picked for a
         # sale or a trim, are taken out, so it reads and logs only pairs the run may
         # still add to
