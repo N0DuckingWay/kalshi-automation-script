@@ -15358,10 +15358,11 @@ class TestLiveRuleLine:
     def test_the_thirteen_fields_are_recorded_from_one_read(self, monkeypatch, caplog):
         from kalshi_betting import config
         saved = config.save_live_defaults(
-            config.LiveSettings(False, (0.1, 0.8), 0.6, 0.35, 0.25, ("Economics",), ("Fed",),
+            config.LiveSettings(tier_floors=False, spread_band=(0.1, 0.8), interval_discount=0.6,
+                                size_cap=0.35, same_title_size_cap=0.25,
+                                exclude_categories=("Economics",), exclude_tags=("Fed",),
                                 rebalance=True, min_price_move=0.10,
-                                rebalance_min_days_to_maturity=7,
-                                sell_at=0.85, sell_min_days=3),
+                                rebalance_min_days_to_maturity=7, sell_at=0.85, sell_min_days=3),
             source="a note")
         reads: list = []
         real = config.read_saved_live_defaults
@@ -15877,7 +15878,8 @@ class TestLiveRuleLine:
         from kalshi_betting import config
         for categories, tags in [(None, None), (("Economics",), None), (None, ("Fed",)),
                                  (("Oil, Gas", "Sports"), ("a|b",))]:
-            settings = config.LiveSettings(True, (0.0, 1.0), 0.75, 0.2,
+            settings = config.LiveSettings(tier_floors=True, spread_band=(0.0, 1.0),
+                                           interval_discount=0.75, size_cap=0.2,
                                            exclude_categories=categories, exclude_tags=tags)
             assert backtester._live_filter_text(categories, tags) == \
                 config.describe_trade_filter(settings)

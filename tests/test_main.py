@@ -289,7 +289,8 @@ class TestComputeTradeSpecs:
 class TestNoPairsMsg:
     def test_no_pairs_log_lines_format_thresholds_from_config(self):
         # A tier-on rule, the only one whose wording names the tier thresholds
-        tiers_on = LiveSettings(True, (0.0, 1.0), 0.75, 0.2)
+        tiers_on = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                                size_cap=0.2)
         prod_msg = main._no_pairs_msg(settings=tiers_on)
         dev_msg = main._no_pairs_msg(sandbox=True, settings=tiers_on)
 
@@ -319,8 +320,10 @@ class TestNoPairsMsg:
 
     def test_the_time_series_clause_is_the_runs_own_rule(self):
         # The rule the run applied, never the tiers alone when it dropped them
-        on = main._no_pairs_msg(settings=LiveSettings(True, (0.0, 1.0), 0.75, 0.2))
-        off = main._no_pairs_msg(settings=LiveSettings(False, (0.0, 0.5), 0.75, 0.2))
+        on = main._no_pairs_msg(settings=LiveSettings(tier_floors=True, spread_band=(0.0, 1.0),
+                                                      interval_discount=0.75, size_cap=0.2))
+        off = main._no_pairs_msg(settings=LiveSettings(tier_floors=False, spread_band=(0.0, 0.5),
+                                                       interval_discount=0.75, size_cap=0.2))
         assert config.describe_time_series_rule(True, (0.0, 1.0)) in on
         assert config.describe_time_series_rule(False, (0.0, 0.5)) in off
         assert "tier floors off" in off and "spread band 0-0.5" in off
@@ -336,7 +339,8 @@ class TestNoPairsMsg:
         assert "tier floors on" in main._no_pairs_msg()
 
     def test_a_run_that_did_not_search_time_series_says_so(self):
-        settings = LiveSettings(True, (0.0, 1.0), 0.75, 0.2)
+        settings = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                                size_cap=0.2)
         searched = main._no_pairs_msg(settings=settings)
         skipped = main._no_pairs_msg(settings=settings, time_series_searched=False)
         assert skipped.startswith(
@@ -348,10 +352,12 @@ class TestNoPairsMsg:
 
     def test_a_category_or_tag_filter_is_named_only_when_set(self):
         # A filter alone can empty the list: named when set, unmentioned when not
-        plain = main._no_pairs_msg(settings=LiveSettings(True, (0.0, 1.0), 0.75, 0.2))
+        plain = main._no_pairs_msg(settings=LiveSettings(tier_floors=True, spread_band=(0.0, 1.0),
+                                                         interval_discount=0.75, size_cap=0.2))
         assert "category/tag filter" not in plain
         for excluded, tags in ((("Economics",), None), (None, ("Oil & Gas",))):
-            settings = LiveSettings(True, (0.0, 1.0), 0.75, 0.2,
+            settings = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0),
+                                    interval_discount=0.75, size_cap=0.2,
                                     exclude_categories=excluded, exclude_tags=tags)
             msg = main._no_pairs_msg(settings=settings)
             assert (f"among pairs filed under the run's category/tag filter "
@@ -1458,8 +1464,9 @@ class TestLogLiveSettings:
         assert warned == [
             f"Live settings: {text}"
             for text in config.live_rule_warnings(LiveSettings(
-                config.TIME_SERIES_TIER_FLOORS, config.TIME_SERIES_SPREAD_BAND, 0.4, 0.6,
-                config.SAME_TITLE_SIZE_CAP))
+                tier_floors=config.TIME_SERIES_TIER_FLOORS,
+                spread_band=config.TIME_SERIES_SPREAD_BAND, interval_discount=0.4, size_cap=0.6,
+                same_title_size_cap=config.SAME_TITLE_SIZE_CAP))
         ]
         assert any("one time-series pair may stake up to 60%" in w for w in warned)
 
@@ -1468,8 +1475,10 @@ class TestLogLiveSettings:
     ):
         def tripwire():
             raise AssertionError("_log_live_settings read settings of its own")
-        s = LiveSettings(False, (0.0, 0.5), 0.8, 1.0, 0.2)
-        r = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0, origin=self._ORIGIN)
+        s = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                         size_cap=1.0, same_title_size_cap=0.2)
+        r = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                         size_cap=0.2, same_title_size_cap=1.0, origin=self._ORIGIN)
         for name in ("live_settings", "live_defaults"):
             monkeypatch.setattr(main, name, tripwire)
         for name in ("live_settings", "live_defaults", "read_saved_live_defaults"):
@@ -1487,8 +1496,10 @@ class TestLogLiveSettings:
     def test_a_config_reference_keeps_the_config_mark_and_warning(self, caplog):
         # A reference built from config.py's constants (origin "config.py"):
         # marked "(config: X)", and the WARNING names config.py
-        s = LiveSettings(False, (0.0, 0.5), 0.8, 1.0, 0.2)
-        r = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0)
+        s = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                         size_cap=1.0, same_title_size_cap=0.2)
+        r = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                         size_cap=0.2, same_title_size_cap=1.0)
         with caplog.at_level(logging.INFO):
             main._log_live_settings(s, r, real_money=True)
         assert f"Live defaults: {config.LIVE_DEFAULTS_FROM_CONFIG}" in caplog.text
@@ -1502,8 +1513,10 @@ class TestLogLiveSettings:
             "configuration"]
 
     def test_the_saved_warning_is_worded_for_the_saved_defaults(self, caplog):
-        s = LiveSettings(False, (0.0, 0.5), 0.8, 1.0, 0.2)
-        r = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0, origin=self._ORIGIN)
+        s = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                         size_cap=1.0, same_title_size_cap=0.2)
+        r = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                         size_cap=0.2, same_title_size_cap=1.0, origin=self._ORIGIN)
         with caplog.at_level(logging.INFO):
             main._log_live_settings(s, r, real_money=True)
         warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
@@ -1530,7 +1543,8 @@ class TestLogLiveSettings:
         self, caplog, change, named, lone,
     ):
         # A real-money run whose flags lower a cap or raise k warns that it can sell
-        saved = LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, rebalance=True,
+        saved = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                             size_cap=0.2, same_title_size_cap=0.2, rebalance=True,
                              origin=self._ORIGIN)
         with caplog.at_level(logging.INFO):
             main._log_live_settings(dataclasses.replace(saved, **change), saved,
@@ -1548,21 +1562,31 @@ class TestLogLiveSettings:
 
     @pytest.mark.parametrize("saved, run, real_money", [
         # Rebalancing off: a lower cap only makes purchases smaller
-        (LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2),
-         LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2), True),
+        (LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                      size_cap=0.2, same_title_size_cap=0.2),
+         LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                      size_cap=0.1, same_title_size_cap=0.2), True),
         # A cap raised, and k lowered: nothing more is sold
-        (LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, rebalance=True),
-         LiveSettings(False, (0.0, 0.5), 0.8, 0.3, 0.2, rebalance=True), True),
-        (LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, rebalance=True),
-         LiveSettings(False, (0.0, 0.5), 0.7, 0.2, 0.2, rebalance=True), True),
+        (LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                      size_cap=0.2, same_title_size_cap=0.2, rebalance=True),
+         LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                      size_cap=0.3, same_title_size_cap=0.2, rebalance=True), True),
+        (LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                      size_cap=0.2, same_title_size_cap=0.2, rebalance=True),
+         LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.7,
+                      size_cap=0.2, same_title_size_cap=0.2, rebalance=True), True),
         # A lower same-title cap the per-trade cap already holds below
-        (LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 1.0, rebalance=True),
-         LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.5, rebalance=True), True),
+        (LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                      size_cap=0.2, same_title_size_cap=1.0, rebalance=True),
+         LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                      size_cap=0.2, same_title_size_cap=0.5, rebalance=True), True),
         # The seed, as saved and run
         (config.LIVE_DEFAULTS_SEED, config.LIVE_DEFAULTS_SEED, True),
         # A dry run sends no order
-        (LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, rebalance=True),
-         LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, rebalance=True), False),
+        (LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                      size_cap=0.2, same_title_size_cap=0.2, rebalance=True),
+         LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                      size_cap=0.1, same_title_size_cap=0.2, rebalance=True), False),
     ], ids=["rebalancing off", "cap raised", "k lowered", "same-title cap held below",
             "seed", "dry run"])
     def test_nothing_is_said_when_no_more_is_sold(self, caplog, saved, run, real_money):
@@ -1703,8 +1727,9 @@ def _filter_pair(event_ticker: str) -> SimpleNamespace:
 
 def _filtered(pairs: list, exclude_categories=None, exclude_tags=None, listing_client=None) -> list:
     """Run main._filter_by_category with only the category/tag fields set."""
-    settings = LiveSettings(True, (0.0, 1.0), 0.75, 0.2,
-                            exclude_categories=exclude_categories, exclude_tags=exclude_tags)
+    settings = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                            size_cap=0.2, exclude_categories=exclude_categories,
+                            exclude_tags=exclude_tags)
     return main._filter_by_category(pairs, settings, listing_client)
 
 
@@ -2210,7 +2235,8 @@ class TestCategoryFilter:
 
         monkeypatch.setattr(main, "load_series_categories", no_read)
         listing = {t: (c, tuple(tags)) for t, (c, tags) in self.LISTING.items()}
-        settings = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, exclude_categories=("sports",))
+        settings = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                                size_cap=0.2, exclude_categories=("sports",))
         with caplog.at_level(logging.INFO):
             out = main._filter_by_category(self._pairs(), settings, MagicMock(),
                                            series_categories=listing)
@@ -2218,7 +2244,8 @@ class TestCategoryFilter:
         assert "kept 4 of 10 candidate pairs" in caplog.text
         # No filter set: the pairs come back untouched, whatever is handed in
         pairs = self._pairs()
-        no_filter = LiveSettings(True, (0.0, 1.0), 0.75, 0.2)
+        no_filter = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                                 size_cap=0.2)
         assert main._filter_by_category(pairs, no_filter, MagicMock(),
                                         series_categories=listing) is pairs
         # An empty listing handed in is no listing: nothing is kept, and it says why
