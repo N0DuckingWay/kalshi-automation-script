@@ -20,10 +20,11 @@ Purpose:
     over a modeled book, delegates the full backtest
     simulation to backtester.run_backtest_sweep(), saves what the dashboard is
     handed (config.BACKTEST_SWEEP_FILENAME), and then calls
-    dashboard.generate_dashboard() to produce the interactive HTML report and,
-    when the sell family is on, the sidecar chunk files its Sell select loads
-    (a folder beside the page, config.DASHBOARD_FILES_DIRNAME, which must be
-    kept with it). With --dashboard-only it runs no backtest: it rebuilds the
+    dashboard.generate_dashboard() to produce the interactive HTML report and
+    the folder of chunk files beside it (config.DASHBOARD_FILES_DIRNAME, which
+    must be kept with it): every scenario's chunk but the run's own, and, when
+    the sell family is on, the Sell select's. With --dashboard-only it runs no
+    backtest: it rebuilds the
     page from the inputs the last full run saved, and then the Data page from
     the saved sweep and listing too, unless --no-eda. A full run likewise
     rebuilds the Data page (eda.build_eda_page, the live dashboard's Data tab)

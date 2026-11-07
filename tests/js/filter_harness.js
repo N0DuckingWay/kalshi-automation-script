@@ -45,15 +45,19 @@
 // purpose. Every other block inflates at once.
 //
 // Sidecar files (__SIDECARS): a <script> element the page appends to
-// document.head loads the file its src names — a chunk the Sell select reads
-// from beside the page — as a browser would: asynchronously, the file's one
+// document.head loads the file its src names — a chunk beside the page: any
+// scenario's but the page's first, or the Sell select's — as a browser would:
+// asynchronously, the file's one
 // call to window.__dashChunk running with document.currentScript set to that
 // element (handing over the chunk, already inflated, which the script's
 // inflateText — replaced by __inflateText below — passes through), then the
 // element's onload. A src not in __SIDECARS fires onerror instead; one in
 // __SIDECAR_EMPTY runs without handing anything over (onload alone); one in
-// __SIDECAR_DEFERRED waits for a ["resolve_file", src] or ["reject_file", src]
-// step. Every src loaded is recorded, in order (a snapshot's "files").
+// __SIDECAR_DAMAGED hands over a block that cannot be inflated, as a damaged
+// gzip block's would (until a ["repair_file", src] step), its error naming the
+// block as a damaged page block's does; one in __SIDECAR_DEFERRED waits for
+// a ["resolve_file", src] or ["reject_file", src] step. Every src loaded is
+// recorded, in order (a snapshot's "files").
 
 var __emit = (typeof print === 'function') ? print : function(s) { console.log(s); };
 var __elements = {};
@@ -74,10 +78,12 @@ var __inflated = [];
 // Every window.open call since the last snapshot, in order
 var __opened = [];
 // The sidecar files the page may load (src -> chunk), the ones that hand
-// nothing over, the ones whose load waits for a step, the loads waiting, by
-// src, and every src loaded, in order
+// nothing over, the ones that hand over a block that cannot be inflated, the
+// ones whose load waits for a step, the loads waiting, by src, and every src
+// loaded, in order
 var __SIDECARS = {};
 var __SIDECAR_EMPTY = {};
+var __SIDECAR_DAMAGED = {};
 var __SIDECAR_DEFERRED = {};
 var __FILE_PENDING = {};
 var __files = [];
@@ -246,7 +252,9 @@ function __runFile(el, fails) {
   if (!__SIDECAR_EMPTY[src]) {
     document.currentScript = el;
     try {
-      window.__dashChunk(el, JSON.parse(JSON.stringify(__SIDECARS[src])));
+      window.__dashChunk(el, __SIDECAR_DAMAGED[src]
+        ? {__damaged: src.replace(/^.*chunk-(\d+)\.js$/, 'dash-chunk-$1')}
+        : JSON.parse(JSON.stringify(__SIDECARS[src])));
     } finally {
       document.currentScript = null;
     }
@@ -405,8 +413,10 @@ function __inflate(el) {
 }
 
 // The filter script's inflateText(text): a sidecar file's chunk, which the
-// file handed over already inflated (a fresh copy, as a real inflate parses one)
+// file handed over already inflated (a fresh copy, as a real inflate parses
+// one). A damaged file's block throws, as a damaged block's inflate does.
 function __inflateText(text) {
+  if (text && text.__damaged) { throw new Error('damaged block ' + text.__damaged); }
   return Promise.resolve(JSON.parse(JSON.stringify(text)));
 }
 
@@ -552,7 +562,8 @@ function __spin(ticks, next) {
 // a damaged block's would — after a settle, so every load already started has
 // reached its inflate, and followed by one; nothing waiting is an error),
 // ["resolve_file", src] / ["reject_file", src] (a deferred sidecar file's
-// waiting loads finish, or fail to load, the same way),
+// waiting loads finish, or fail to load, the same way), ["repair_file", src]
+// (a damaged sidecar file reads again),
 // ["call", name, args] (a page script's window function, called as another
 // script would — the filter's window.dashScenarioSelect call, with any
 // labels), ["click", id] (a reader clicking that element: its click
@@ -635,6 +646,8 @@ function __step(steps, i) {
     document.getElementById(s[1]).data[0].selectedpoints = [0, 1];
   } else if (s[0] === 'repair') {
     delete __DAMAGED[s[1]];
+  } else if (s[0] === 'repair_file') {
+    delete __SIDECAR_DAMAGED[s[1]];
   } else if (s[0] === 'call') {
     window[s[1]].apply(null, s[2]);
   } else if (s[0] === 'click') {
