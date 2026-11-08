@@ -12503,8 +12503,8 @@ def _simulate_at_discount(
                                        for pair_type in sorted(walk_types))])
 
     # Keep only the best same-title candidate per title group, as the live
-    # finders keep one pair per group; this ranks by expected monthly return
-    # (what Pass 2 orders on), the live finders by price gap. The key includes
+    # finder keeps one pair per group; this ranks by expected monthly return
+    # (what Pass 2 orders on), the live finder by price gap. The key includes
     # the event title, so one option label in two events stays two groups.
     # The winner can be dated after a group-mate that passed the gate earlier,
     # which the live bot could not have known. Time-series candidates skip

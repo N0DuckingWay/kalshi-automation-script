@@ -310,11 +310,9 @@ def series_labels(
     The one filing rule behind the backtest dashboard's categories and tags,
     main._filter_by_category's live filter (which states its own matching),
     each trade's category and tag in a production run's result (both through
-    main._pair_labels), the Live trading tab's categories
-    (live_portfolio.build_live_view, which takes the category alone) and the
-    same-title sport check (DR-79), which refuses two series filed under
-    different labels, through the labels main._attach_series_labels attaches.
-    First tag only, so every breakdown partitions what it breaks down.
+    main._pair_labels) and the Live trading tab's categories
+    (live_portfolio.build_live_view, which takes the category alone). First
+    tag only, so every breakdown partitions what it breaks down.
 
     Args:
         event_ticker (str): The event whose series (series_ticker) is looked up.
@@ -640,7 +638,7 @@ def load_series_fee_multipliers(
     all, 0.5 on MLB game and prop series, 0 on a few yearly crypto series on
     2026-10-16). It sits in the same backtest_cache/series_categories.json
     that load_series_categories reads, in a "fees" block beside "series".
-    Nothing prices, sizes or logs a trade on it yet; main._attach_series_labels
+    Nothing prices, sizes or logs a trade on it yet; main._attach_fee_multipliers
     and the backtester carry it so a later change can.
 
     This reader is a companion of load_series_categories, which a run calls

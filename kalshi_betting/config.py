@@ -230,34 +230,37 @@ SAME_TITLE_MIN_PRICE_DIFF     = 0.05
 
 # Prior probability that a same-title pair co-resolves (i.e. both YES or both NO).
 # Set at 95% — divergence is an anomaly, so we assume high correlation by default.
-# It applies only to a pair that passed all three pairing rules: its two event
+# It holds only for a pair meeting all three pairing rules: its two event
 # tickers belong to two DIFFERENT series (the one-series rule, DR-02/DR-54),
 # its two markets close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other
 # (DR-74), and both series are filed under one Kalshi category and first tag
 # while both events name the same competition, or neither names one (DR-79).
-# The live finder applies all three; the backtest finds no same-title pairs.
-# Identical wording that fails any of them is two different games or
-# questions, for which this prior is simply false.
+# No code forms a same-title pair: the live finder and the backtest look for
+# time-series pairs only. Identical wording that fails any of the rules is
+# two different games or questions, for which this prior is simply false.
 SAME_TITLE_CO_RESOLVE_PROB    = 0.95
 
 # Largest gap between the two markets' close times that a same-title pair may
-# have, in seconds (DR-74). Identical wording on two DIFFERENT series is one
-# question only when both markets resolve at the same moment: a men's and a
-# women's college basketball game between the same two schools (KXNCAAMBGAME /
-# KXNCAAWBGAME, "Western Illinois at Eastern Illinois Winner?") share title,
-# subtitle and event title, and so do the Champions League and La Liga
-# "Atletico vs Barcelona" matches. On the 365-day backtest (start 2025-09-24,
-# the backtest's population: event_title blank on ~95% of eligible records)
-# the 1,906 same-title candidates closed either at the identical instant (245
-# pairs, 243 settled the same way — including 226/226 commodity and 15/15
-# financial; the other 2 are the KXRTBLACKPHONE2/KXBLACKPHONE2 anomaly) or at
-# least 1.17 h (4,217 s) apart (1,661 pairs, 60.7% settled the same way).
-# Live close_time is the SCHEDULED close — for a game, tip-off plus a fixed
-# number of days, which keeps a doubleheader's two games hours apart (checked
-# on archived pairs) — and the backtest measurement above read the REALIZED
-# close. Not covered:
-# futures decided early, whose live close_time is a family-wide placeholder
-# (all KXOSCAR* at 2027-12-31T15:00Z), pass live at a 0 s gap.
+# have, in seconds (DR-74). scanner.closes_apart reads it for held_pair_kind
+# alone: two held markets on two events that close within it, either one's
+# stated deadline unread, are not read as a time-series pair, since they could
+# be a same-title pair respelled on one market. Identical wording on two
+# DIFFERENT series is one question only when both markets resolve at the same
+# moment: a men's and a women's college basketball game between the same two
+# schools (KXNCAAMBGAME / KXNCAAWBGAME, "Western Illinois at Eastern Illinois
+# Winner?") share title, subtitle and event title, and so do the Champions
+# League and La Liga "Atletico vs Barcelona" matches. On the 365-day backtest
+# (start 2025-09-24, the backtest's population: event_title blank on ~95% of
+# eligible records) the 1,906 same-title candidates closed either at the
+# identical instant (245 pairs, 243 settled the same way — including 226/226
+# commodity and 15/15 financial; the other 2 are the
+# KXRTBLACKPHONE2/KXBLACKPHONE2 anomaly) or at least 1.17 h (4,217 s) apart
+# (1,661 pairs, 60.7% settled the same way). Live close_time is the SCHEDULED
+# close — for a game, tip-off plus a fixed number of days, which keeps a
+# doubleheader's two games hours apart (checked on archived pairs) — and the
+# backtest measurement above read the REALIZED close. Not covered: futures
+# decided early, whose live close_time is a family-wide placeholder (all
+# KXOSCAR* at 2027-12-31T15:00Z), read live as a 0 s gap.
 SAME_TITLE_MAX_CLOSE_GAP_SECONDS = 60 * 60
 
 # Maximum number of calendar days allowed between the deadlines of the two legs
@@ -1221,7 +1224,7 @@ LARGE_GROUP_WARN_THRESHOLD    = 1000
 # Whether to include multivariate (multi-choice) markets in scanning and backtesting.
 # When True, markets are grouped by (event_title + market_title) so cross-event
 # option-label collisions (e.g. "Trump" in two unrelated events) cannot false-positive
-# into a same-title or time-series pair. When False, mve_filter="exclude" is passed
+# into a time-series pair. When False, mve_filter="exclude" is passed
 # to all market-fetch APIs, the backtester's MVE event-title listing is skipped,
 # the assembled backtest cache filename gains a trailing "_nomve" marker (DR-57 —
 # the flag changes WHAT IS FETCHED, so a cache built under one setting must never
@@ -1260,8 +1263,8 @@ INCLUDE_MVE_MARKETS           = True
 # under TWO literal KXMVE prefixes — every one of them KXMVECROSSCATEGORY x
 # KXMVECROSSCATEGORY0. Those wordings form 26,072 cross-prefix market pairs, of
 # which 17,829 co-resolved and 8,243 settled DIFFERENTLY: a 68.4%
-# co-resolution rate against the 0.95 prior the same-title finder would have
-# priced them on.
+# co-resolution rate against the 0.95 prior a same-title pair is priced on
+# (SAME_TITLE_CO_RESOLVE_PROB).
 #
 # A FAMILY PREFIX rather than an enumerated allowlist, deliberately. Enumerating
 # the combo series would BE an allowlist, and the codebase's own prior belief
@@ -2803,7 +2806,7 @@ def unconfirmed_fee_multipliers_text(listed: Iterable) -> str | None:
 
     Counts each listed multiplier that is a real, finite number other than 1.0
     and that confirmed_fee_multiplier() does not confirm (so the market is charged the
-    full fee), by multiplier. A live run (main._attach_series_labels) and a
+    full fee), by multiplier. A live run (main._attach_fee_multipliers) and a
     backtest (backtester._prepare_candidates) log it once each, at INFO.
 
     Args:

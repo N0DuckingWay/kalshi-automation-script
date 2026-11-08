@@ -2316,7 +2316,7 @@ class TestSetupLogging:
 #       dev run, which drops no held market, finds it; a prod run, where the
 #       account holds HELD-A, does not. Tests that need a pair on these
 #       markets to be tradeable add books for them (_HELD_GROUP_BOOKS).
-# No two markets share a title, so no same-title pair can form.
+# No two markets share a title.
 #
 # An OPT-IN fifth group (_live_shape_client(include_time_series=True)) adds
 # a second tradeable time-series pair, TS-EARLY (YES 0.30) / TS-LATE (YES
@@ -2348,8 +2348,7 @@ _TICKER_HELD_B = "HELD-B"
 _TICKER_TS_EARLY = "TS-EARLY"
 _TICKER_TS_LATE = "TS-LATE"
 # Titles differ only by their date token, so normalize_title collapses both
-# to the same key (a time-series group) while the exact-title same-title
-# grouping keeps them apart.
+# to the same key (a time-series group).
 _TITLE_TS_EARLY = "Will Z happen by December 1, 2026?"
 _TITLE_TS_LATE = "Will Z happen by December 11, 2026?"
 
@@ -2846,8 +2845,9 @@ def _live_shape_client(
     # A fresh cached /series listing, which every run reads right after the
     # market fetch: a production run then makes no listing request, so
     # client.rest_client.request serves the order POSTs alone. It lists no
-    # series of the fixed set, so each market is filed by its ticker prefix,
-    # every pair's two markets alike; a test seeds its own listing to file them
+    # series of the fixed set, so a pair is filed by its ticker prefix and
+    # every market is charged the full fee; a test seeds its own listing to
+    # file pairs or list fee multipliers
     _seed_series_listing({"KXNOTLISTED": ["Other", []]})
 
     client = MagicMock()
@@ -3405,25 +3405,46 @@ class TestRunProdDryRunLiveShapeReplay:
         assert client.rest_client.request.call_count == 0
 
 
-class TestSeriesLabelsAreAttached:
-    """DR-79's wiring in both run modes: every run reads Kalshi's /series
-    listing once, right after the market fetch (production with its own
-    client, dev from the cached copy only), files every market by it
-    (main._attach_series_labels, which also sets each market's fee
-    multiplier, read by every sale's fee) before the sale block and the
-    time-series finder, and hands the same copy to the category/tag filter.
-    Only scanner.find_same_title_pairs compares the labels
-    (scanner._labels_differ), and no run mode calls it."""
+def _assert_same_title_pair(dear, cheap) -> None:
+    """
+    Assert two markets are the pair a same-title search would buy.
+
+    One wording (title, subtitle and event title) on two different series,
+    closing within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other, their YES
+    asks at least SAME_TITLE_MIN_PRICE_DIFF apart, and a NO on the pricier
+    plus a YES on the other costing less than $1 after the fee.
+
+    Args:
+        dear: The market with the higher YES ask, bought NO.
+        cheap: The other market, bought YES.
+    """
+    assert scanner_mod._identical_wording(dear, cheap)
+    assert not scanner_mod._same_series(dear, cheap)
+    assert not scanner_mod._closes_apart(dear, cheap)
+    assert (float(dear.yes_ask_dollars) - float(cheap.yes_ask_dollars)
+            >= config.SAME_TITLE_MIN_PRICE_DIFF - config.PRICE_EPSILON)
+    no_ask, yes_ask = float(dear.no_ask_dollars), float(cheap.yes_ask_dollars)
+    assert 1.0 - no_ask - yes_ask > config.fee_per_pair_approx(
+        no_ask, yes_ask, multiplier_a=scanner_mod.market_fee_multiplier(dear),
+        multiplier_b=scanner_mod.market_fee_multiplier(cheap))
+
+
+class TestFeeMultipliersAreAttached:
+    """Both run modes read Kalshi's /series listing once, right after the
+    market fetch (production with its own client, dev from the cached copy
+    only), set every market's fee multiplier from the same cache file
+    (main._attach_fee_multipliers) before the sale block, whose fees read it,
+    and before the time-series finder, and hand the same copy of the listing
+    to the category/tag filter."""
 
     @staticmethod
     def _spy(monkeypatch) -> list:
         """
         Record, in order, each listing read, trim plan, finder call and filter call.
 
-        The time-series finder and the trim planner record whether every
-        market they were handed carries a (category, tag) pair of strings,
-        and the trim planner each market's fee multiplier too; the filter
-        records the listing it was handed.
+        The time-series finder and the trim planner record each market they
+        were handed, by ticker, with its fee multiplier as they find it; the
+        filter records the listing it was handed.
 
         Args:
             monkeypatch (pytest.MonkeyPatch): For the spies.
@@ -3439,17 +3460,16 @@ class TestSeriesLabelsAreAttached:
             events.append(("listing", client, listing))
             return listing
 
-        def labelled(markets) -> bool:
-            return bool(markets) and all(
-                scanner_mod._is_label_pair(getattr(m, "_series_labels", None))
-                for m in markets)
+        def multipliers(markets) -> dict:
+            # Each market's fee multiplier as the step finds it
+            return {m.ticker: getattr(m, "_fee_multiplier", None) for m in markets}
 
         real_ts = main.find_time_series_pairs
 
         def time_series(*args, **kwargs):
             # Production passes the markets third, dev by keyword
             markets = kwargs["markets"] if "markets" in kwargs else args[2]
-            events.append(("time_series", labelled(markets)))
+            events.append(("time_series", multipliers(markets)))
             return real_ts(*args, **kwargs)
 
         real_filter = main._filter_by_category
@@ -3459,10 +3479,8 @@ class TestSeriesLabelsAreAttached:
             return real_filter(pairs, settings, listing_client, **kwargs)
 
         def plan_trims(client, held_positions, held_labels, markets_by_ticker, **kwargs):
-            markets = list(markets_by_ticker.values())
-            # Each market's fee multiplier as the planner finds it: every sale's fee reads it
-            events.append(("plan_trims", labelled(markets),
-                           {m.ticker: getattr(m, "_fee_multiplier", None) for m in markets}))
+            # Every sale's fee reads each market's fee multiplier
+            events.append(("plan_trims", multipliers(markets_by_ticker.values())))
             return []
 
         monkeypatch.setattr(main, "load_series_categories", load)
@@ -3473,15 +3491,16 @@ class TestSeriesLabelsAreAttached:
                             lambda *a, **k: pathlib.Path("/fake/trade_log.xlsx"))
         return events
 
-    def test_a_production_run_files_every_market_before_it_trims_or_pairs(
+    def test_a_production_run_sets_every_fee_multiplier_before_it_trims_or_pairs(
         self, monkeypatch, caplog,
     ):
         # Kalshi values HELD-A at $1.50, so a run that trims asks the planner
         balance = {**_LIVE_BALANCE_PAYLOAD, "portfolio_value": 150}
         client = _live_shape_client(monkeypatch, balance_payload=balance,
                                     include_time_series=True)
-        # The Held Event's series listed at half the fee, so the planner can tell a
-        # market the attach has filed (0.5) from one it has not (ApiMarket's 1.0)
+        # The Held Event's series listed at half the fee, so the planner and the
+        # finder can tell a market the attach has set (0.5) from one it has not
+        # (ApiMarket's 1.0)
         _seed_series_listing({"HELDEVT": ["Other", []]}, fees={"HELDEVT": 0.5})
         events = self._spy(monkeypatch)
         settings = dataclasses.replace(live_settings(), rebalance=True)
@@ -3492,24 +3511,29 @@ class TestSeriesLabelsAreAttached:
         assert len(reads) == 1 and reads[0][1] is client
         listing = reads[0][2]
         # The listing first, then the trim planner and the time-series finder,
-        # every market filed, then the filter, handed the very same copy
+        # then the filter, handed the very same copy
         assert [event[0] for event in events] == [
             "listing", "plan_trims", "time_series", "filter"]
-        assert events[1][1] is True and events[2] == ("time_series", True)
         assert events[3][1] is listing
-        # ... and every market's fee multiplier set before the planner, each
-        # sale's fee reading it: the Held Event's two markets at the listed 0.5,
-        # every other market at the full fee
-        fees = events[1][2]
+        # Every market's fee multiplier is set before the planner, each sale's
+        # fee reading it: the Held Event's two markets at the listed 0.5, every
+        # other market at the full fee
+        fees = events[1][1]
         assert {t for t, fee in fees.items() if fee == 0.5} == {_TICKER_HELD_A,
                                                               _TICKER_HELD_B}
         assert {fee for t, fee in fees.items() if fee != 0.5} == {1.0}
+        # ... and before the finder, which sees every market but the held HELD-A
+        searched = events[2][1]
+        assert {t for t, fee in searched.items() if fee == 0.5} == {_TICKER_HELD_B}
+        assert {fee for t, fee in searched.items() if fee != 0.5} == {1.0}
 
-    def test_a_dev_run_reads_the_cached_copy_once_and_files_every_market(
+    def test_a_dev_run_reads_the_cached_copy_once_and_sets_every_fee_multiplier(
         self, monkeypatch, caplog,
     ):
         client = _live_shape_client(monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD,
                                     include_time_series=True)
+        # The Held Event's series listed at half the fee in the cached copy
+        _seed_series_listing({"HELDEVT": ["Other", []]}, fees={"HELDEVT": 0.5})
         _capture_dev_simulation(monkeypatch)
         events = self._spy(monkeypatch)
         with caplog.at_level(logging.INFO):
@@ -3520,40 +3544,13 @@ class TestSeriesLabelsAreAttached:
         assert len(reads) == 1 and reads[0][1] is None
         assert [event[0] for event in events] == [
             "listing", "time_series", "filter"]
-        assert events[1] == ("time_series", True)
+        # Every market's fee multiplier is set before the finder: dev drops no
+        # held market, so it sees both of the Held Event's at 0.5
+        searched = events[1][1]
+        assert {t for t, fee in searched.items() if fee == 0.5} == {_TICKER_HELD_A,
+                                                                  _TICKER_HELD_B}
+        assert {fee for t, fee in searched.items() if fee != 0.5} == {1.0}
         assert events[2][1] is reads[0][2]
-
-    _NO_LISTING = ("Same-title sport check: no /series listing this run, so every series "
-                   "is filed by its ticker prefix and only the competition check tells "
-                   "two series apart")
-
-    def test_no_listing_files_by_ticker_prefix_and_says_so(self, caplog):
-        markets = [SimpleNamespace(event_ticker="KXBTCD-26SEP1517"),
-                   SimpleNamespace(event_ticker="KXNCAAFGAME-26OCT16UKOKLA")]
-        with caplog.at_level(logging.INFO):
-            main._attach_series_labels(markets, {})
-        assert [m._series_labels for m in markets] == [
-            (infer_category("KXBTCD-26SEP1517"), "General"),
-            (infer_category("KXNCAAFGAME-26OCT16UKOKLA"), "General")]
-        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert [r.getMessage() for r in warnings] == [self._NO_LISTING]
-
-    def test_a_listing_draws_no_warning(self, caplog):
-        markets = [SimpleNamespace(event_ticker="KXNCAAFGAME-26OCT16UKOKLA")]
-        with caplog.at_level(logging.INFO):
-            main._attach_series_labels(markets, {"KXNCAAFGAME": ("Sports", ("Football",))})
-        assert markets[0]._series_labels == ("Sports", "Football")
-        assert self._NO_LISTING not in caplog.messages
-
-    def test_a_dev_run_with_no_cached_listing_says_so_once(self, monkeypatch, caplog):
-        client = _live_shape_client(monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD)
-        # No cached copy at all: a dev run makes no request, so it has no listing
-        historical._SERIES_CATEGORIES_CACHE.unlink()
-        _capture_dev_simulation(monkeypatch)
-        with caplog.at_level(logging.INFO):
-            main._run_dev(client, SimpleNamespace(sandbox_balance=1000.0,
-                                                  max_horizon_days=None))
-        assert caplog.messages.count(self._NO_LISTING) == 1
 
     def test_each_market_carries_its_series_fee_multiplier(self):
         # 1.0, the full fee, for a series the map lacks; the listed one otherwise
@@ -3564,8 +3561,8 @@ class TestSeriesLabelsAreAttached:
                    SimpleNamespace(event_ticker="KXNCAAFGAME-26OCT16UKOKLA",
                                    _event_fee_override=None),
                    SimpleNamespace(event_ticker="", _event_fee_override=None)]
-        main._attach_series_labels(
-            markets, {}, fee_multipliers={"KXMLBGAME": 0.5, "KXBTCY": 0.0})
+        main._attach_fee_multipliers(
+            markets, fee_multipliers={"KXMLBGAME": 0.5, "KXBTCY": 0.0})
         assert [m._fee_multiplier for m in markets] == [0.5, 0.0, 1.0, 1.0]
 
     def test_an_event_override_wins_and_an_unknown_one_is_the_full_fee(self):
@@ -3577,7 +3574,7 @@ class TestSeriesLabelsAreAttached:
                                    _event_fee_override="unknown"),
                    # A market not from the run's event listing carries none
                    SimpleNamespace(event_ticker="KXMLBGAME-26OCT19LADNYM")]
-        main._attach_series_labels(markets, {}, fee_multipliers={"KXMLBGAME": 0.5})
+        main._attach_fee_multipliers(markets, fee_multipliers={"KXMLBGAME": 0.5})
         assert [m._fee_multiplier for m in markets] == [1.0, 0.0, 1.0, 1.0]
 
     def test_markets_whose_multiplier_is_not_confirmed_are_counted_once(self, caplog):
@@ -3585,8 +3582,8 @@ class TestSeriesLabelsAreAttached:
                    for t in ("KXMLBGAME-26OCT16LADNYM", "KXMLBGAME-26OCT17LADNYM",
                              "KXBTCY-26DEC31", "KXNCAAFGAME-26OCT16UKOKLA")]
         with caplog.at_level(logging.INFO):
-            main._attach_series_labels(
-                markets, {}, fee_multipliers={"KXMLBGAME": 0.5, "KXBTCY": 0.0})
+            main._attach_fee_multipliers(
+                markets, fee_multipliers={"KXMLBGAME": 0.5, "KXBTCY": 0.0})
         line = ("Fee multipliers listed but not confirmed (charged in full): 3 markets "
                 "(multipliers: 0.5 x 2, 0 x 1)")
         assert caplog.messages.count(line) == 1
@@ -3594,14 +3591,13 @@ class TestSeriesLabelsAreAttached:
     def test_no_unconfirmed_multiplier_logs_no_count(self, caplog):
         markets = [SimpleNamespace(event_ticker="KXNCAAFGAME-26OCT16UKOKLA")]
         with caplog.at_level(logging.INFO):
-            main._attach_series_labels(markets, {}, fee_multipliers={"KXMLBGAME": 0.5})
+            main._attach_fee_multipliers(markets, fee_multipliers={"KXMLBGAME": 0.5})
         assert not any("Fee multipliers listed" in m for m in caplog.messages)
 
     def test_no_multipliers_given_means_the_full_fee(self):
         markets = [SimpleNamespace(event_ticker="KXMLBGAME-26OCT16LADNYM")]
-        main._attach_series_labels(markets, {"KXMLBGAME": ("Sports", ("Baseball",))})
+        main._attach_fee_multipliers(markets)
         assert markets[0]._fee_multiplier == 1.0
-        assert markets[0]._series_labels == ("Sports", "Baseball")
 
     @staticmethod
     def _spy_multipliers(monkeypatch) -> list:
@@ -3673,15 +3669,15 @@ class TestSeriesLabelsAreAttached:
     @pytest.mark.parametrize("mode", ["prod dry run", "prod live", "dev"])
     def test_a_same_title_pair_is_never_priced_or_bought(self, monkeypatch, caplog, mode):
         """
-        Pins that no run mode looks for, prices or buys a same-title pair.
+        Pins that no run mode prices or buys a same-title pair.
 
-        The run's market list is one same-title pair and nothing else, its two
-        series filed alike (Sports, Football), so the sport check (DR-79)
-        refuses nothing: scanner.find_same_title_pairs forms the pair over the
-        very list the run hands the time-series finder (the positive control).
-        Still, enrich_with_orderbook_prices is handed no candidate on either
-        market, nothing is traded or simulated, no order is sent, and the run
-        ends on its "No qualifying pairs found" line with exit 0.
+        The run's market list is one same-title pair and nothing else: the
+        list the run hands the time-series finder holds both markets, the
+        pair a same-title search would buy (_assert_same_title_pair, the
+        positive control). Still, enrich_with_orderbook_prices is handed no
+        candidate on either market, nothing is traded or simulated, no order
+        is sent, and the run ends on its "No qualifying pairs found" line
+        with exit 0.
         """
         # All the cash on shard 0, where both markets are, and nothing held
         client = _live_shape_client(
@@ -3694,8 +3690,6 @@ class TestSeriesLabelsAreAttached:
         client.get_market_orderbook_without_preload_content = MagicMock(
             side_effect=lambda ticker: _raw_json_response(self._SAME_TITLE_BOOKS.get(
                 ticker, {"orderbook_fp": {"yes_dollars": [], "no_dollars": []}})))
-        _seed_series_listing({"EXPEVT": ["Sports", ["Football"]],
-                              "CHEAPEVT": ["Sports", ["Football"]]})
         searched: list = []
         real_ts = main.find_time_series_pairs
 
@@ -3732,12 +3726,12 @@ class TestSeriesLabelsAreAttached:
                                                              max_horizon_days=None))
             else:
                 code = main._run_prod(client, _args(dry_run=mode == "prod dry run"))
-        # Positive control: over the list the run searched, the same-title
-        # finder forms the pair and marks it tradeable
+        # Positive control: the list the run searched holds both markets, the
+        # pair a same-title search would buy
         [markets] = searched
-        [pair] = [p for p in scanner_mod.find_same_title_pairs(markets)
-                  if {p.market_a.ticker, p.market_b.ticker} == self._SAME_TITLE_TICKERS]
-        assert pair.tradeable
+        by_ticker = {m.ticker: m for m in markets}
+        assert self._SAME_TITLE_TICKERS <= set(by_ticker)
+        _assert_same_title_pair(by_ticker["SAME-EXP"], by_ticker["SAME-CHEAP"])
         # The run priced no candidate at all, so none on either market
         assert priced == [set()]
         # Nothing traded or simulated, and no order sent
@@ -5247,8 +5241,8 @@ class TestRunProdAddsToHeldPairs:
         assert seen["ts"] == [{}]
         assert "Held pairs to add to: 0 (other held markets, never added to: 4)" in caplog.text
 
-    # One question listed on two series, closing at one moment: the pair the
-    # same-title finder forms, NO on the pricier ST-A and YES on ST-B
+    # One question listed on two series, closing at one moment: a same-title
+    # pair, bought NO on the pricier ST-A and YES on ST-B
     _SAME_TITLE_EVENTS = tuple(
         _ev("Bitcoin", _mk_market(ticker, event, "Bitcoin high?", "$80,000 by Dec 10, 2026",
                                   yes_ask, no_ask, price_level_structure="linear_cent"))
@@ -5257,10 +5251,10 @@ class TestRunProdAddsToHeldPairs:
 
     def test_an_identically_worded_held_same_title_pair_is_never_added_to(
             self, monkeypatch, caplog):
-        # That pair held, 30 each, its two series filed alike, last traded ten
-        # days ago: an exact held pair the run may add to. The time-series
-        # finder, the one finder a run asks, never pairs two identically
-        # worded markets, so nothing is bought on either market
+        # That pair held, 30 each, last traded ten days ago: an exact held
+        # pair the run may add to. The time-series finder, the one finder a
+        # run asks, never pairs two identically worded markets, so nothing is
+        # bought on either market
         held_rows = (
             {"ticker": "ST-A", "position_fp": "-30.00", "market_exposure_dollars": "12.60",
              "fees_paid_dollars": "0.30"},
@@ -5271,7 +5265,6 @@ class TestRunProdAddsToHeldPairs:
         client = self._client(monkeypatch, positions_value=1_860, held_rows=held_rows,
                               extra_events=self._SAME_TITLE_EVENTS,
                               include_held_position=False)
-        _seed_series_listing({"KXSTA": ["Crypto", ["BTC"]], "KXSTB": ["Crypto", ["BTC"]]})
         results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True)
         key = frozenset({"ST-A", "ST-B"})
         # It passed every add-on check and was handed to the finder to add to
@@ -5284,13 +5277,14 @@ class TestRunProdAddsToHeldPairs:
         traded = self._traded(results)
         assert self._MAIN in traded
         assert not {ticker for _, a, b in traded for ticker in (a, b)} & key
-        # Control: over the very list the finder searched, the same-title finder
-        # forms the held pair as an add-on to it, buying the sides held
+        # Control: the very list the finder searched holds both markets,
+        # neither blocked: the pair a same-title search would add to, held on
+        # the sides such a pair buys (NO on the pricier ST-A, YES on ST-B)
         [searched] = seen["searched"]
-        [pair] = [p for p in scanner_mod.find_same_title_pairs(
-                      searched, seen["blocked"][0][0], add_on_pairs=add_on_pairs)
-                  if {p.market_a.ticker, p.market_b.ticker} == key]
-        assert scanner_mod.pair_held(pair) is add_on_pairs[key]
+        by_ticker = {m.ticker: m for m in searched}
+        assert key <= set(by_ticker) and not key & seen["blocked"][0][0]
+        _assert_same_title_pair(by_ticker["ST-A"], by_ticker["ST-B"])
+        assert add_on_pairs[key].matches(by_ticker["ST-A"], by_ticker["ST-B"], "same_title")
 
     def test_a_failed_held_market_lookup_means_no_add_on(self, monkeypatch, caplog):
         # A held market that cannot be looked up could share the pair's
@@ -11210,8 +11204,7 @@ class TestResultFile:
                                                            caplog):
         # A scheduled run writes no result and sets no category/tag filter, and
         # still reads the listing once (a cached copy, refreshed once a week):
-        # it files every market by it, and each market's fee multiplier is read
-        # from the copy that read refreshes
+        # each market's fee multiplier is read from the copy that read refreshes
         reads = []
         seen, result, _ = self._run(
             monkeypatch, tmp_path, caplog, result_file=False,

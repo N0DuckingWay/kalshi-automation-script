@@ -6320,7 +6320,7 @@ class TestIdenticalWordingFormsNoTimeSeriesPair:
         # from the spans-differ conjunct alone (the two spans are equal) — the
         # one-series rule does not fire here, since _same_series_dicts is
         # False on two different series. Mirror of test_scanner.py::
-        # TestDeadlineGuardFinders::test_dated_identical_wording_is_same_title_only.
+        # TestDeadlineGuardFinders::test_dated_identical_wording_is_no_time_series_pair.
         title = "Will X happen by Dec 31, 2026?"
         mA = _md("A1", "EVA-1", title=title, event_title="EV")
         mA["close_time"] = "2026-12-01T00:00:00Z"
@@ -6353,7 +6353,7 @@ class TestIdenticalWordingFormsNoTimeSeriesPair:
         # time-series rule refuses identical wording whether it states no
         # deadline ("Q") or one deadline twice. Mirror of test_scanner.py::
         # TestDeadlineGuardFinders::
-        # test_identical_wording_closing_apart_forms_no_pair_of_either_type.
+        # test_identical_wording_closing_apart_forms_no_time_series_pair.
         mA = _md("A1", "EVA-1", title=title, event_title="EV")
         mA["close_time"] = "2026-12-01T00:00:00Z"
         mB = _md("B1", "EVB-1", title=title, event_title="EV")

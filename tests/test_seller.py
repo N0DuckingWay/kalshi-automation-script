@@ -1439,10 +1439,6 @@ class _TrimCase:
                              subtitle="Team A")
             market_b = _rung(_B, _EV_B, "", _B_CLOSE, title="Who wins the game?",
                              subtitle="Team A")
-            # Both series filed alike, as a run files its markets before it
-            # trims (main._attach_series_labels), so the pair passes the
-            # same-title finder's sport check (DR-79) too
-            market_a._series_labels = market_b._series_labels = ("Sports", "Football")
         candles_a = [_candle(_FIRST, *(a_then or a_now)), _candle(_CK, *a_now)]
         candles_b = [_candle(_FIRST, *(b_then or b_now)), _candle(_CK, *b_now)]
         # The backtest: one trade, each market's quotes from its candles
@@ -2666,7 +2662,7 @@ class TestPlanTrims:
 
     def test_a_lone_legs_wait_counts_a_later_fill_on_its_ladder(self, monkeypatch, caplog):
         # A, the rocket question at Jan 20, is in the run's market list (not held) and
-        # traded yesterday: a market the finders could pair B with, so B's last trade
+        # traded yesterday: a market the finder could pair B with, so B's last trade
         # is yesterday's, for the trim as for the add-on
         world = _lone_trim(_lone_partner())
         world.list(_rung(_A, _EV_A, "Jan 20, 2026", _A_CLOSE))
@@ -3017,7 +3013,6 @@ class TestPlanTrims:
         for ticker, event, count in (("ST-A", "KXSTA-26", -60), ("ST-B", "KXSTB-26", 60)):
             market = ApiMarket(ticker=ticker, event_ticker=event, title="Who wins the game?",
                                subtitle="Team A", status="active", close_time=_B_CLOSE)
-            market._series_labels = ("Sports", "Football")
             world.hold(market, count, 60 * 0.45, 0.60)
             world.books[ticker] = {"yes": [["0.48", "100000"]], "no": [["0.50", "100000"]]}
         # Its two held sides' best bids (0.50 NO on ST-A, 0.48 YES on ST-B) after the fee
@@ -3154,9 +3149,9 @@ class TestPlanTrims:
     def test_an_exact_held_same_title_pair_is_never_trimmed(self, monkeypatch, caplog, a_now,
                                                             b_now, backtest_sells):
         # One question listed on two series, held NO on A and YES on B, 30 each,
-        # both series filed alike and closing at one moment, last traded 7 days
-        # ago. Two identically worded markets are no kind a trim reads, so the
-        # pair is never trimmed, and no order book is read for it
+        # both closing at one moment, last traded 7 days ago. Two identically
+        # worded markets are no kind a trim reads, so the pair is never
+        # trimmed, and no order book is read for it
         case = _TrimCase("same_title", sides=_NO_A_YES_B, a_now=a_now, b_now=b_now)
         # Control: the backtest's trim, which holds the pair by its type, sells
         # this very pair at this portfolio value
@@ -3797,7 +3792,7 @@ class TestPlanAddOns:
     def test_a_lone_leg_whose_partner_was_sold_by_hand_yesterday_waits(self, monkeypatch,
                                                                       caplog):
         # Sold by hand, A leaves the positions listing just as a paid-out partner does,
-        # so B reads as a lone leg. The finders may pair B with A again (A is on B's own
+        # so B reads as a lone leg. The finder may pair B with A again (A is on B's own
         # ladder), so A's fill yesterday restarts the wait: the bot does not buy A back
         # the day after it was sold
         case = _lone(_add_on_case())
