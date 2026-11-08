@@ -1153,6 +1153,34 @@ class TestPartners:
         reads.labels(_SAME_EVENT_2)
         assert (reads.lookups, reads.wider_lookups) == (1, 1)
 
+    def test_every_lookup_of_one_planner_call_shares_one_memo_of_event_titles(
+            self, monkeypatch):
+        # Every lookup of one planner call, in either partner search, is
+        # handed one memo of each looked-up event's title, which
+        # scanner.market_for_labels fills, so two settled markets of one event
+        # cost one event request; another planner call starts with an empty
+        # memo of its own
+        handed: list = []
+
+        def lookup(client, ticker, markets, titles):
+            # Each memo handed, and what it held then; then what the real
+            # lookup stores in it, the event's title by event ticker
+            handed.append((titles, dict(titles)))
+            titles[_EV_B] = "Rocket launches"
+            return _OWN_EVENT_RUNGS[ticker]
+
+        monkeypatch.setattr(seller, "market_for_labels", lookup)
+        reads = seller._Reads(MagicMock(), {}, {}, _CK, 0)
+        reads.labels(_SAME_EVENT)
+        reads.labels(_SAME_EVENT_2, wider=True)
+        (first, held_first), (second, held_second) = handed
+        # The second lookup was handed the same memo, holding what the first kept
+        assert second is first
+        assert (held_first, held_second) == ({}, {_EV_B: "Rocket launches"})
+        seller._Reads(MagicMock(), {}, {}, _CK, 0).labels(_SAME_EVENT)
+        third, held_third = handed[2]
+        assert third is not first and held_third == {}
+
     def test_unreadable_settlements_sell_no_lone_market_and_warn_once(self, monkeypatch,
                                                                       caplog):
         world = _lone_world()

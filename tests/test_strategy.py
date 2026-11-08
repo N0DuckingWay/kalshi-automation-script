@@ -2722,8 +2722,8 @@ class TestTimeSeriesKellyParity:
     def test_ast_the_same_title_search_and_its_sport_check_are_gone(self):
         # No code looks for same-title pairs: scanner defines neither the
         # search nor its close-gap bound text nor its sport and competition
-        # check, a market carries no series labels, and main files no market
-        # by them
+        # check, a market carries no series labels, main files no market by
+        # them, and nothing reads an event's competition
         for gone in ("find_same_title_pairs", "close_gap_bound_text", "labels_differ",
                      "competitions_differ", "_labels_differ", "_competitions_differ",
                      "_is_label_pair"):
@@ -2739,8 +2739,18 @@ class TestTimeSeriesKellyParity:
         assert not any(isinstance(node, ast.Constant) and node.value == "same_title"
                        for node in ast.walk(kind))
         assert _function_calls(scanner, "held_pair_kind", "_identical_wording")
-        # Ingest reads each event's competition through the one reader
-        assert _function_calls(scanner, "fetch_open_events_with_markets", "event_competition")
+        # Nothing reads an event's competition: scanner has no reader for it,
+        # a market carries none, and the market builder takes none (the event
+        # title is its only argument after the market reply, the fee override
+        # its only keyword)
+        assert not hasattr(scanner, "event_competition")
+        assert "_event_competition" not in {
+            f.name for f in dataclasses.fields(scanner.ApiMarket)}
+        assert [(p.name, p.kind) for p in
+                inspect.signature(scanner._market_from_dict).parameters.values()] == [
+            ("m", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+            ("event_title", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+            ("event_fee_override", inspect.Parameter.KEYWORD_ONLY)]
 
     def test_ast_both_run_modes_set_every_fee_multiplier_before_they_pair(self):
         # Every market's fee multiplier is set once per run, through the one

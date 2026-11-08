@@ -466,6 +466,9 @@ class _Reads:
         self._settlements_read = False
         self._settlements_problem = ""
         self._labels: dict = {}
+        # Each looked-up event's title, by event ticker: the memo every
+        # market_for_labels call of this planner call shares, so two settled
+        # markets of one event cost one event request
         self._event_titles: dict = {}
 
     def candles(self, ticker: str, event_ticker: str) -> list | None:

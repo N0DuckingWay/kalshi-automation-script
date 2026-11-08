@@ -973,160 +973,6 @@ class TestClosesApart:
         assert scanner._closes_apart(dated, SimpleNamespace()) is True
 
 
-# The two events of the 2026-10-16 incident, as Kalshi's /events replies
-# carried them (the fields ingest reads). One title, "Kentucky vs Oklahoma",
-# over a women's college volleyball match and a college football game; each
-# event's product_metadata names its competition.
-_VOLLEYBALL_EVENT = {
-    "event_ticker": "KXNCAAWVMATCH-26OCT161900UKOU",
-    "series_ticker": "KXNCAAWVMATCH",
-    "title": "Kentucky vs Oklahoma",
-    "sub_title": "UK vs OU (Oct 16)",
-    "category": "Sports",
-    "product_metadata": {"competition": "NCAA Volleyball (W)", "competition_scope": "Game"},
-    "markets": [
-        {"ticker": "KXNCAAWVMATCH-26OCT161900UKOU-UK",
-         "event_ticker": "KXNCAAWVMATCH-26OCT161900UKOU", "title": "Kentucky wins",
-         "yes_sub_title": "Kentucky", "no_sub_title": "Kentucky", "status": "active",
-         "close_time": "2026-10-18T23:00:00Z", "yes_ask_dollars": "0.9600",
-         "no_ask_dollars": "0.2900", "yes_bid_dollars": "0.7100", "exchange_index": 0,
-         "price_level_structure": "linear_cent",
-         "price_ranges": [{"end": "1.0000", "start": "0.0000", "step": "0.0100"}]},
-        {"ticker": "KXNCAAWVMATCH-26OCT161900UKOU-OU",
-         "event_ticker": "KXNCAAWVMATCH-26OCT161900UKOU", "title": "Oklahoma wins",
-         "yes_sub_title": "Oklahoma", "no_sub_title": "Oklahoma", "status": "active",
-         "close_time": "2026-10-18T23:00:00Z", "yes_ask_dollars": "0.1700",
-         "no_ask_dollars": "0.9600", "yes_bid_dollars": "0.0400", "exchange_index": 0,
-         "price_level_structure": "linear_cent",
-         "price_ranges": [{"end": "1.0000", "start": "0.0000", "step": "0.0100"}]},
-    ],
-}
-_FOOTBALL_EVENT = {
-    "event_ticker": "KXNCAAFGAME-26OCT16UKOKLA",
-    "series_ticker": "KXNCAAFGAME",
-    "title": "Kentucky vs Oklahoma",
-    "sub_title": "UK vs OKLA (Oct 16)",
-    "category": "Sports",
-    "product_metadata": {"competition": "NCAA Football", "competition_scope": "Game"},
-    "markets": [
-        {"ticker": "KXNCAAFGAME-26OCT16UKOKLA-UK",
-         "event_ticker": "KXNCAAFGAME-26OCT16UKOKLA", "title": "Kentucky wins",
-         "yes_sub_title": "Kentucky", "no_sub_title": "Kentucky", "status": "active",
-         "close_time": "2026-10-19T00:00:00Z", "yes_ask_dollars": "0.3200",
-         "no_ask_dollars": "0.6900", "yes_bid_dollars": "0.3100", "exchange_index": 0,
-         "price_level_structure": "linear_cent",
-         "price_ranges": [{"end": "1.0000", "start": "0.0000", "step": "0.0100"}]},
-        {"ticker": "KXNCAAFGAME-26OCT16UKOKLA-OKLA",
-         "event_ticker": "KXNCAAFGAME-26OCT16UKOKLA", "title": "Oklahoma wins",
-         "yes_sub_title": "Oklahoma", "no_sub_title": "Oklahoma", "status": "active",
-         "close_time": "2026-10-19T00:00:00Z", "yes_ask_dollars": "0.6900",
-         "no_ask_dollars": "0.3200", "yes_bid_dollars": "0.6800", "exchange_index": 0,
-         "price_level_structure": "linear_cent",
-         "price_ranges": [{"end": "1.0000", "start": "0.0000", "step": "0.0100"}]},
-    ],
-}
-
-
-class TestSameTitleSportCheck:
-    """Each market's _event_competition, the competition its event names, as
-    fetch_open_events_with_markets attaches it on ingest and
-    scanner._fetch_held_market on a lookup ("" for none, None for a label
-    that is not text), and the ingest's count of the markets whose event
-    names one."""
-
-    def test_ingest_attaches_each_events_competition(self, monkeypatch, caplog):
-        # Both event loops read the competition from product_metadata: an event
-        # with none gives "", and one whose label is not a string gives None
-        # (unknown)
-        monkeypatch.setattr(scanner, "INCLUDE_MVE_MARKETS", True)
-        standard = [
-            _VOLLEYBALL_EVENT,
-            {"title": "Weather Event", "markets": [_raw_market("STD-NONE", "Rain tomorrow")]},
-            {"title": "Odd Event", "product_metadata": {"competition": 7},
-             "markets": [_raw_market("STD-ODD", "Snow tomorrow")]},
-        ]
-        mve = [
-            {"title": "Parlay", "product_metadata": {"competition": "  NBA  "},
-             "markets": [_raw_market("MVE-NBA", "All legs hit")]},
-            {"title": "Parlay 2", "markets": [_raw_market("MVE-NONE", "All legs hit")]},
-        ]
-        client = MagicMock()
-        client.get_events_without_preload_content = MagicMock(return_value=_raw_page(standard))
-        client.get_multivariate_events_without_preload_content = MagicMock(
-            return_value=_raw_page(mve))
-        with caplog.at_level(logging.INFO):
-            by_ticker = {m.ticker: m for m in fetch_open_events_with_markets(client)}
-        assert {t: m._event_competition for t, m in by_ticker.items()} == {
-            "KXNCAAWVMATCH-26OCT161900UKOU-UK": "NCAA Volleyball (W)",
-            "KXNCAAWVMATCH-26OCT161900UKOU-OU": "NCAA Volleyball (W)",
-            "STD-NONE": "", "STD-ODD": None, "MVE-NBA": "NBA", "MVE-NONE": ""}
-        # One always-logged count of the markets whose event names a
-        # competition, and a WARNING for the label it could not read
-        assert "Markets whose event names a competition: 3 of 6" in caplog.messages
-        assert ("Markets whose event's competition label is not text: 1 (read as "
-                "unknown)") in caplog.messages
-
-    def test_the_competition_count_is_logged_at_zero_with_no_warning(self, monkeypatch,
-                                                                     caplog):
-        # Every event naming none: the count reads 0, the shape a label Kalshi
-        # moved or renamed would show, and nothing is unreadable
-        monkeypatch.setattr(scanner, "INCLUDE_MVE_MARKETS", False)
-        client = MagicMock()
-        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([
-            {"title": "Weather Event", "markets": [_raw_market("STD-NONE", "Rain tomorrow")]},
-        ]))
-        with caplog.at_level(logging.INFO):
-            fetch_open_events_with_markets(client)
-        assert "Markets whose event names a competition: 0 of 1" in caplog.messages
-        assert not any("competition label is not text" in m for m in caplog.messages)
-
-    def test_a_looked_up_held_market_carries_its_events_competition(self):
-        # A held market missing from the run's list is read with its event, as
-        # the market list reads it, so its competition is the event's own
-        raw = dict(_FOOTBALL_EVENT["markets"][0])
-        event = {k: v for k, v in _FOOTBALL_EVENT.items() if k != "markets"}
-        client = MagicMock()
-        client.get_market_without_preload_content.return_value = _json_reply({"market": raw})
-        client.get_event_without_preload_content.return_value = _json_reply({"event": event})
-        memo: dict = {}
-        market = scanner.market_for_labels(client, raw["ticker"], {}, memo)
-        assert market._event_competition == "NCAA Football"
-        assert memo == {raw["event_ticker"]: ("Kentucky vs Oklahoma", "NCAA Football")}
-
-
-class TestEventCompetition:
-    """scanner.event_competition: the competition an event names, "" when it
-    names none, and None when a label is there but cannot be read."""
-
-    @pytest.mark.parametrize("event,label", [
-        ({"product_metadata": {"competition": "NCAA Football"}}, "NCAA Football"),
-        ({"product_metadata": {"competition": "  College Basketball (W)\n"}},
-         "College Basketball (W)"),
-        ({"product_metadata": {"competition": ""}}, ""),
-        ({"product_metadata": {"cadence": "weekly"}}, ""),
-        ({"product_metadata": {"competition": None}}, ""),
-        ({"product_metadata": {"competition": "   "}}, ""),
-        ({"product_metadata": None}, ""),
-        ({"title": "No metadata"}, ""),
-        ({}, ""),
-        # A label that is there but is not text: unknown, never "names none"
-        ({"product_metadata": {"competition": 3}}, None),
-        ({"product_metadata": {"competition": ["NCAA Football"]}}, None),
-        ({"product_metadata": {"competition": {"name": "NCAA Football"}}}, None),
-        ({"product_metadata": {"competition": True}}, None),
-        ({"product_metadata": ["competition"]}, None),
-        ({"product_metadata": "NCAA Football"}, None),
-        (None, None),
-        ([], None),
-        ("NCAA Football", None),
-    ])
-    def test_it_reads_a_string_label_and_nothing_else(self, event, label):
-        assert scanner.event_competition(event) == label
-
-    def test_a_mock_event_reads_as_unknown(self):
-        assert scanner.event_competition(MagicMock()) is None
-
-
 class TestTimeSeriesGroupKey:
     """Unit-level contract of scanner.time_series_group_key()."""
 
@@ -6778,6 +6624,37 @@ class TestFetchOpenEventsMveStatusFilter:
         assert m.close_time == datetime(2026, 6, 1, 12, 30, tzinfo=UTC)
         assert m.event_ticker == "EVT-STD-1"
 
+    def test_each_market_carries_its_own_events_title_in_both_loops(self, monkeypatch,
+                                                                     caplog):
+        # Both event loops put each event's title on every market of that
+        # event, the title its ladder labels are read from; an event with no
+        # title gives "", as it does for a looked-up held market. An event
+        # that names a competition gives its markets nothing more: no market
+        # carries the label and no line mentions it
+        monkeypatch.setattr(scanner, "INCLUDE_MVE_MARKETS", True)
+        league = {"competition": "NBA"}
+        standard = [
+            {"title": "Weather Event", "markets": [_raw_market("STD-RAIN", "Rain tomorrow"),
+                                                   _raw_market("STD-SNOW", "Snow tomorrow")]},
+            {"title": "Other Event", "product_metadata": league,
+             "markets": [_raw_market("STD-HAIL", "Hail tomorrow")]},
+            {"markets": [_raw_market("STD-NONE", "Fog tomorrow")]},
+        ]
+        mve = [{"title": "Parlay", "product_metadata": league,
+                "markets": [_raw_market("MVE-1", "All legs hit")]}]
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page(standard))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page(mve))
+        with caplog.at_level(logging.INFO):
+            by_ticker = {m.ticker: m for m in fetch_open_events_with_markets(client)}
+        assert {t: m._event_title for t, m in by_ticker.items()} == {
+            "STD-RAIN": "Weather Event", "STD-SNOW": "Weather Event",
+            "STD-HAIL": "Other Event", "STD-NONE": "", "MVE-1": "Parlay"}
+        assert not any(hasattr(m, "_event_competition") for m in by_ticker.values())
+        assert caplog.messages
+        assert not any("competition" in message.lower() for message in caplog.messages)
+
     def test_pagination_follows_cursor(self):
         # Two pages on the standard endpoint: the fetch must request the second
         # page with the cursor from the first and concatenate the markets.
@@ -7862,8 +7739,8 @@ class TestMarketForLabels:
         # Its labels are its listed ladder-mate's: the same event and question
         assert market_ladder_keys(got) == market_ladder_keys(
             _star_rung(_RUNG_EARLY, "Mar 1, 2026"))
-        # The memo keeps each event's title and the competition it names
-        assert titles == {_STAR_EVENT: (_STAR_TITLE, "")}
+        # The memo keeps each looked-up event's title, and nothing else
+        assert titles == {_STAR_EVENT: _STAR_TITLE}
 
     def test_one_event_is_asked_about_once(self):
         raws = {t: _star_raw(t, d) for t, d in
@@ -7900,6 +7777,116 @@ class TestMarketForLabels:
         client = MagicMock()
         assert scanner.market_for_labels(client, ticker, {}, {}) is None
         client.get_market_without_preload_content.assert_not_called()
+
+
+def _market_fields(market) -> dict:
+    """Every field of an ApiMarket by name, so a mismatch names the field that differs."""
+    return {f.name: getattr(market, f.name) for f in dataclasses.fields(scanner.ApiMarket)}
+
+
+class TestHeldMarketLookupMemo:
+    """Two markets of one event that the run's market list lacks, looked up
+    one after the other with one memo of event titles: the first lookup
+    reads the event and keeps its title in the memo, and the second builds
+    its market from that kept title without asking for the event again.
+    Both looked-up markets must be exactly the markets built from their own
+    replies and the event's title. A market built from a wrong title asks a
+    different question, so its question label matches none of its
+    ladder-mates': the run would not know the account holds that question,
+    so the time-series finder could buy a second pair on it, and a held pair
+    on two events would read as two lone legs."""
+
+    # Two rungs of the Starship ladder on one event; NOV30 sorts first, so a
+    # held-ladder read looks it up first
+    _RAWS = {t: _star_raw(t, d) for t, d in
+             (("KXSTAR-14-NOV30", "Nov 30, 2026"), ("KXSTAR-14-OCT16", "Oct 16, 2026"))}
+
+    # The requests both lookups make together: one per market, and one event
+    # request, made by the first lookup
+    _REQUESTS = [
+        ("get_market_without_preload_content", {"ticker": "KXSTAR-14-NOV30"}),
+        ("get_event_without_preload_content", {"event_ticker": _STAR_EVENT}),
+        ("get_market_without_preload_content", {"ticker": "KXSTAR-14-OCT16"}),
+    ]
+
+    @staticmethod
+    def _requests(client) -> list:
+        """The client's requests in the order they were made, as (method, keywords)."""
+        return [(name, kwargs) for name, _args, kwargs in client.mock_calls]
+
+    def _built(self, title: str = _STAR_TITLE) -> dict:
+        """Each ticker's market as _market_from_dict builds it from its own reply and this title."""
+        return {t: _market_from_dict(raw, title) for t, raw in self._RAWS.items()}
+
+    def test_one_held_ladder_read_asks_for_the_event_once_and_builds_both_markets(
+            self, monkeypatch):
+        client = _lookup_client(self._RAWS)
+        # Keep each market the held-market lookup returns, and the memo it is handed
+        found: list = []
+        real_lookup = scanner._fetch_held_market
+
+        def lookup(client_, ticker, event_titles, **kwargs):
+            market = real_lookup(client_, ticker, event_titles, **kwargs)
+            found.append((ticker, market, event_titles))
+            return market
+
+        monkeypatch.setattr(scanner, "_fetch_held_market", lookup)
+        labels: dict = {}
+        keys = resolve_held_ladders(client, [], set(self._RAWS), labels_out=labels)
+        # One market request per ticker and one event request in all: the
+        # second lookup took the event's title from the memo
+        assert self._requests(client) == self._REQUESTS
+        assert [ticker for ticker, _, _ in found] == sorted(self._RAWS)
+        # Each looked-up market, the first and the one built from the memo,
+        # is the market built from its own reply and its event's title
+        built = self._built()
+        for ticker, market, _ in found:
+            assert _market_fields(market) == _market_fields(built[ticker]), ticker
+        # Both lookups shared one memo, which keeps the event's title alone
+        assert found[0][2] is found[1][2]
+        assert found[0][2] == {_STAR_EVENT: _STAR_TITLE}
+        # So each market's ladder labels are those of the market built from
+        # its reply, and the labels returned and filled in are exactly those
+        want = {ticker: market_ladder_keys(market) for ticker, market in built.items()}
+        assert labels == want
+        assert keys == frozenset().union(*want.values())
+        # The two share their event, and both ask their listed ladder-mate's question
+        first, second = (labels[ticker] for ticker in sorted(self._RAWS))
+        assert ("event", _STAR_EVENT) in first & second
+        assert _question_label(_star_rung(_RUNG_EARLY, "Mar 1, 2026")) in first & second
+
+    def test_one_shared_memo_through_market_for_labels_asks_for_the_event_once(self):
+        # As seller.plan_sales and seller.plan_trims use it: one memo for
+        # every lookup of one call, beside a ladder-mate that is in the run's
+        # market list
+        listed = _star_rung(_RUNG_EARLY, "Mar 1, 2026")
+        client = _lookup_client(self._RAWS)
+        memo: dict = {}
+        got = {ticker: scanner.market_for_labels(client, ticker, {listed.ticker: listed}, memo)
+               for ticker in (listed.ticker, *sorted(self._RAWS))}
+        # The listed market needs no request; the other two cost one each,
+        # and one event request in all
+        assert got[listed.ticker] is listed
+        assert self._requests(client) == self._REQUESTS
+        built = self._built()
+        for ticker in self._RAWS:
+            assert _market_fields(got[ticker]) == _market_fields(built[ticker]), ticker
+            assert market_ladder_keys(got[ticker]) == market_ladder_keys(built[ticker]), ticker
+        assert memo == {_STAR_EVENT: _STAR_TITLE}
+        first, second = (market_ladder_keys(got[ticker]) for ticker in sorted(self._RAWS))
+        assert ("event", _STAR_EVENT) in first & second
+        assert _question_label(listed) in first & second
+
+    def test_a_title_already_in_the_memo_is_used_with_no_event_request(self):
+        # An event an earlier lookup of the same caller read: its title, a
+        # plain string in the memo, is the looked-up market's event title
+        client = _lookup_client(self._RAWS)
+        memo = {_STAR_EVENT: "Kept title"}
+        market = scanner.market_for_labels(client, "KXSTAR-14-OCT16", {}, memo)
+        assert _market_fields(market) == _market_fields(self._built("Kept title")["KXSTAR-14-OCT16"])
+        assert self._requests(client) == [
+            ("get_market_without_preload_content", {"ticker": "KXSTAR-14-OCT16"})]
+        assert memo == {_STAR_EVENT: "Kept title"}
 
 
 # Five settlements as the live reply sent them (GET /portfolio/settlements, read

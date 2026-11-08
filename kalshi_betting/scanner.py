@@ -41,8 +41,7 @@ Dependencies:
     same-event deadline ladder's leg order and gap (DR-73), and
     ladder_keys, which ladders a market is on). closes_apart is the one
     definition of the close-time test held_pair_kind applies to two held
-    markets whose stated deadline cannot be read, and event_competition reads
-    the competition an event names.
+    markets whose stated deadline cannot be read.
     pair_gap_days() is the single reader of that gap for everything
     downstream of pair formation, and pair_mid_spread() the single reader of
     the mid spread on a time-series pair (the later market's midpoint minus
@@ -1676,42 +1675,6 @@ def market_event_fee_override(market: Any) -> float | None | str:
         float | None | str: What the market carries, or EVENT_FEE_OVERRIDE_UNKNOWN.
     """
     return getattr(market, "_event_fee_override", EVENT_FEE_OVERRIDE_UNKNOWN)
-
-
-def event_competition(event: Any) -> str | None:
-    """
-    The competition an event names, such as "NCAA Football" or "NCAA Volleyball (W)".
-
-    Kalshi keeps it in the event's product_metadata. Sports events carry it
-    (a men's and a women's game of one sport are two competitions); most
-    other events carry none. fetch_open_events_with_markets attaches it to
-    every market it parses, as ApiMarket._event_competition, and counts the
-    markets whose event names one on one INFO line.
-
-    An event that names no competition (no product_metadata, or none in it,
-    or a null one) reads as "". A label that is there but cannot be read (a
-    product_metadata that is not an object, a competition that is not a
-    string, or an event that is not an object at all) reads as None
-    (unknown), never as naming none.
-
-    Args:
-        event (Any): One event object from an /events reply.
-
-    Returns:
-        str | None: The label with surrounding spaces removed; "" when the
-            event names none; None when the label cannot be read.
-    """
-    if not isinstance(event, dict):
-        return None
-    meta = event.get("product_metadata")
-    if meta is None:
-        return ""
-    if not isinstance(meta, dict):
-        return None
-    label = meta.get("competition")
-    if label is None:
-        return ""
-    return label.strip() if isinstance(label, str) else None
 
 
 def _field_phrasing(text: Any) -> str | None:
@@ -3541,10 +3504,6 @@ class ApiMarket:
             its own market's shard (see trader._build_no_order_v2).
             DEFAULT_EXCHANGE_INDEX when the payload omits the field.
         _event_title (str): Parent event title attached for pair_key grouping.
-        _event_competition (str | None): The competition the parent event
-            names (event_competition), "" when it names none, None when its
-            label cannot be read. fetch_open_events_with_markets counts the
-            markets whose event names one.
         _event_fee_override (float | None | str): The fee multiplier override
             its event sets (event_fee_override): None for none, and
             EVENT_FEE_OVERRIDE_UNKNOWN (the default, for a market not built
@@ -3571,15 +3530,13 @@ class ApiMarket:
     price_ranges: Any = None  # list[PriceRange] | None — None = unknown
     exchange_index: int = DEFAULT_EXCHANGE_INDEX
     _event_title: str = field(default="")
-    _event_competition: str | None = field(default="")
     # The event's fee override as read; unknown (the full fee) by default
     _event_fee_override: Any = field(default=EVENT_FEE_OVERRIDE_UNKNOWN)
     # main._attach_fee_multipliers sets it; 1.0 (the full fee) until then
     _fee_multiplier: float = field(default=1.0)
 
 
-def _market_from_dict(m: dict, event_title: str,
-                      event_competition: str | None = "", *,
+def _market_from_dict(m: dict, event_title: str, *,
                       event_fee_override: Any = EVENT_FEE_OVERRIDE_UNKNOWN) -> ApiMarket:
     """
     Build an ApiMarket from one raw market JSON dict.
@@ -3592,10 +3549,6 @@ def _market_from_dict(m: dict, event_title: str,
     Args:
         m (dict): One market from a raw market or event reply.
         event_title (str): Parent event's title, attached as _event_title.
-        event_competition (str | None): The competition the parent event
-            names (event_competition), attached as _event_competition. ""
-            (the default) when it names none or the caller did not read it;
-            None when it could not be read.
         event_fee_override (Any): Keyword-only. The parent event's fee
             override (event_fee_override), attached as _event_fee_override;
             EVENT_FEE_OVERRIDE_UNKNOWN (the default) when the caller did not
@@ -3632,7 +3585,6 @@ def _market_from_dict(m: dict, event_title: str,
         # planner read it later
         exchange_index=_shard_index(m),
         _event_title=event_title,
-        _event_competition=event_competition,
         _event_fee_override=event_fee_override,
     )
 
@@ -3670,18 +3622,22 @@ def _error_text(exc: BaseException) -> str:
 def _fetch_held_market(client: Any, ticker: str, event_titles: dict, *,
                        noun: str = "held market") -> ApiMarket | None:
     """
-    Ask the exchange for one held market and its event's title and competition.
+    Ask the exchange for one held market and its event's title.
 
     The event title is part of the question label, so without it the label
-    would not match the market's ladder-mates. The competition is kept as the
-    market list keeps it (event_competition). `event_titles` caches both by
-    event.
+    would not match the market's ladder-mates. `event_titles` is a memo of
+    each looked-up event's title, which a caller keeps across its lookups
+    (resolve_held_ladders keeps one for each call; seller.plan_sales and
+    seller.plan_trims each keep one for each call, in seller._Reads, and pass
+    it through market_for_labels): the first lookup of an event reads the
+    event and stores its title there, and a later lookup of another market of
+    that event reads the title from it, with no second event request.
 
     Args:
         client (Any): An authenticated Kalshi client.
         ticker (str): The held market's ticker.
-        event_titles (dict): Each event already fetched, by event ticker:
-            its (title, competition).
+        event_titles (dict): Each looked-up event's title (a str), by event
+            ticker; a lookup of an event not in it adds that event's title.
         noun (str): Keyword-only. What the failure lines call the market:
             "held market", or "market" for one that may no longer be held.
 
@@ -3711,15 +3667,13 @@ def _fetch_held_market(client: Any, ticker: str, event_titles: dict, *,
                 logging.warning("Could not look up %s %s: the reply for its event "
                                 "%s had no event", noun, ticker, event_ticker)
                 return None
-            # A title-less event reads as "", as in the market list, and its
-            # competition is read as the market list reads it
-            event_titles[event_ticker] = (event.get("title") or "",
-                                          event_competition(event))
-        title, competition = event_titles[event_ticker]
+            # A title-less event reads as "", as in the market list
+            event_titles[event_ticker] = event.get("title") or ""
+        title = event_titles[event_ticker]
         # Parsed like the market list, so its labels match its ladder-mates'.
         # Its event fee override stays unknown (the full fee): a market
         # looked up outside the run's list is never charged a reduced fee
-        return _market_from_dict(raw, title, competition)
+        return _market_from_dict(raw, title)
     except Exception as exc:
         logging.warning("Could not look up %s %s: %s", noun, ticker, _error_text(exc))
         return None
@@ -3730,17 +3684,19 @@ def market_for_labels(client: Any, ticker: Any, markets_by_ticker: dict,
     """
     Find a market by ticker: in this run's market list, else from the exchange.
 
-    seller.plan_sales gets a paid-out market's ladder labels through it. A
-    market missing from the list is looked up as resolve_held_ladders looks up
-    a held market (event title included), so its labels match its ladder-mates'.
+    seller.plan_sales and seller.plan_trims get a paid-out market's ladder
+    labels through it. A market missing from the list is looked up as
+    resolve_held_ladders looks up a held market (event title included), so its
+    labels match its ladder-mates'.
 
     Args:
         client (Any): An authenticated Kalshi client.
         ticker (Any): The market's ticker; anything but a non-empty string
             names no market.
         markets_by_ticker (dict): This run's markets by ticker, before held ones are removed.
-        event_titles (dict): Each looked-up event's (title, competition), by
-            event ticker; a lookup adds to it.
+        event_titles (dict): Each looked-up event's title (a str), by event
+            ticker; a lookup adds to it. One memo serves every call a caller
+            makes, so two markets of one event cost one event request.
 
     Returns:
         ApiMarket | None: The market, or None when the ticker names none or
@@ -3760,9 +3716,11 @@ def resolve_held_ladders(client: Any, markets: list, held_tickers: set, *,
     Return the ladder labels of every market we currently hold.
 
     Reads this run's market list, and asks the exchange about any held
-    market missing from it (one closed but not yet paid out, say). Returns
-    None if a held market can't be identified: the caller must then make no
-    time-series trade.
+    market missing from it (one closed but not yet paid out, say). Those
+    lookups share one memo of each looked-up event's title, so two held
+    markets of one event cost one event request. Returns None if a held
+    market can't be identified: the caller must then make no time-series
+    trade.
 
     Args:
         client (Any): An authenticated Kalshi client.
@@ -3777,6 +3735,7 @@ def resolve_held_ladders(client: Any, markets: list, held_tickers: set, *,
         frozenset | None: Every held market's labels, or None if one is unknown.
     """
     by_ticker = {m.ticker: m for m in markets}
+    # Each looked-up event's title, by event ticker, shared by this call's lookups
     event_titles: dict = {}
     keys: set = set()
     looked_up = 0
@@ -4606,10 +4565,6 @@ def fetch_open_events_with_markets(
     allows MVE (multivariate) markets to be safely scanned: pair-grouping uses
     `event_title + market_title`, so an option label two unrelated events
     share (e.g. "Trump") does not put their markets in one time-series group.
-    Each market also gets the competition its event names
-    (event_competition: "" for none, None for a label it cannot read) as
-    `_event_competition`; one always-logged line counts the markets whose
-    event names one.
 
     Uses the SDK's raw-response variants + ApiMarket parsing instead of the
     modeled `get_events` call — the pinned SDK's Market model can no longer
@@ -4647,10 +4602,8 @@ def fetch_open_events_with_markets(
     Returns:
         list: Flat list of ApiMarket objects for all open markets, each with
             `_event_title` set to its parent event's full title (may be empty
-            string if the event had no title), `_event_competition` set to the
-            competition that event names ("" for none, None when unreadable)
-            and `exchange_index` set to its shard. May contain thousands of
-            items.
+            string if the event had no title) and `exchange_index` set to its
+            shard. May contain thousands of items.
     """
     markets: list = []
     # Normalize once so both loops below do a plain set membership test
@@ -4681,8 +4634,6 @@ def fetch_open_events_with_markets(
         pages += 1
         for ev in data.get("events") or []:
             ev_title = ev.get("title") or ""
-            # The competition the event names, kept on each of its markets
-            ev_competition = event_competition(ev)
             # The fee multiplier the event sets over its series', if any
             ev_fee_override = event_fee_override(ev)
             for m in ev.get("markets") or []:
@@ -4701,9 +4652,8 @@ def fetch_open_events_with_markets(
                     skipped_shard += 1
                     continue
                 # Parse into ApiMarket with the parent event title attached so
-                # pair_key()/display_title() can find it, and its competition
-                markets.append(_market_from_dict(m, ev_title, ev_competition,
-                                                 event_fee_override=ev_fee_override))
+                # pair_key()/display_title() can find it
+                markets.append(_market_from_dict(m, ev_title, event_fee_override=ev_fee_override))
         if pages % SCANNER_PROGRESS_LOG_EVERY_PAGES == 0:
             logging.info("Open-events fetch: %d pages, %d markets so far", pages, len(markets))
         new_cursor = data.get("cursor")
@@ -4771,8 +4721,6 @@ def fetch_open_events_with_markets(
             page_active_count = 0
             for ev in events:
                 ev_title = ev.get("title") or ""
-                # The competition the event names, as in the standard loop
-                ev_competition = event_competition(ev)
                 ev_fee_override = event_fee_override(ev)
                 for m in ev.get("markets") or []:
                     # Only include markets that are still open — MVE response may
@@ -4787,7 +4735,7 @@ def fetch_open_events_with_markets(
                             skipped_shard += 1
                             continue
                         markets.append(_market_from_dict(
-                            m, ev_title, ev_competition, event_fee_override=ev_fee_override))
+                            m, ev_title, event_fee_override=ev_fee_override))
                         mve_market_count += 1
                         page_active_count += 1
             if mve_pages % SCANNER_PROGRESS_LOG_EVERY_PAGES == 0:
@@ -4851,19 +4799,6 @@ def fetch_open_events_with_markets(
         "Ingested markets by shard: %s",
         dict(sorted(Counter(m.exchange_index for m in markets).items())),
     )
-    # How many markets' events name a competition. Always logged, so a label
-    # Kalshi moved or renamed (every event then reads as naming none) shows as
-    # a count near zero
-    logging.info(
-        "Markets whose event names a competition: %d of %d",
-        sum(1 for m in markets if m._event_competition), len(markets),
-    )
-    unreadable_competitions = sum(1 for m in markets if m._event_competition is None)
-    if unreadable_competitions:
-        logging.warning(
-            "Markets whose event's competition label is not text: %d (read as "
-            "unknown)", unreadable_competitions,
-        )
     logging.info("Fetched %d open markets (MVE included: %s)", len(markets), INCLUDE_MVE_MARKETS)
     return markets
 

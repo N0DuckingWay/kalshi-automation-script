@@ -249,7 +249,7 @@ main.py
   │                                   (exit 10)
   ├─ scanner.fetch_shard_statuses() — read GET /exchange/status per-shard trading/transfer flags (fail-soft)
   ├─ scanner.inactive_shard_indexes() — derive the trading-inactive shard set from the statuses above
-  ├─ scanner.fetch_open_events_with_markets() — fetch open events + their markets from EVERY exchange shard, tagged (attaches event titles for MVE grouping, and each event's competition, counted on one log line; drops only markets on trading-inactive shards)
+  ├─ scanner.fetch_open_events_with_markets() — fetch open events + their markets from EVERY exchange shard, tagged (attaches event titles for MVE grouping; drops only markets on trading-inactive shards)
   ├─ main._log_shard_coverage()    — audit advertised shards vs ingested markets/funds (reports, never aborts)
   ├─ historical.load_series_categories() — read Kalshi's /series listing once per run (prod: the cached copy,
   │                                   refreshed once a week; dev: the cached copy only); a run stopped below $50, or one
