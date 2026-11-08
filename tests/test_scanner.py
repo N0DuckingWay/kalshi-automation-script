@@ -1077,8 +1077,7 @@ class TestSameTitleCloseGap:
     is false for them: on the 365-day backtest 17 of 21 trades were such M/W
     pairs. scanner.closes_apart is the one definition of the gate, and
     find_same_title_pairs reads it through _closes_apart, right after the
-    series test. Live close_time is the SCHEDULED close. Mirror:
-    test_backtester.py::TestSameTitleCloseGapBacktest.
+    series test. Live close_time is the SCHEDULED close.
     """
 
     _WIU_TITLE = "Western Illinois at Eastern Illinois Winner?"
@@ -3658,9 +3657,10 @@ class TestDeadlineGuardFinders:
         # _same_series is False and would not refuse the pair on its own;
         # only the spans-differ check does. Both legs close at the SAME
         # instant, so the same-title close gate (DR-74) admits the same-title
-        # copy — the one-pair, one-type exclusivity DR-67 guarantees. Mirror
-        # of test_backtester.py::TestRunBacktestCrossTypeDedup::
-        # test_dated_identical_wording_is_same_title_only.
+        # copy — the one-pair, one-type exclusivity DR-67 guarantees. The
+        # time-series half's mirror is test_backtester.py::
+        # TestIdenticalWordingFormsNoTimeSeriesPair::
+        # test_dated_identical_wording_is_no_time_series_pair.
         title = "Will X happen by Dec 31, 2026?"
         close = datetime(2026, 12, 1, tzinfo=UTC)
         mA = _mock_market(
@@ -3711,9 +3711,10 @@ class TestDeadlineGuardFinders:
         # states the same deadline spans, or none), the refused same-title
         # copy cannot come back as a time-series pair either — undated ("Q",
         # unknown wording) or dated (one deadline stated twice). So a
-        # same-title-only gate cannot relabel the trade. Mirror of
-        # test_backtester.py::TestRunBacktestCrossTypeDedup::
-        # test_identical_wording_closing_apart_forms_no_pair_of_either_type.
+        # same-title-only gate cannot relabel the trade. The time-series
+        # half's mirror is test_backtester.py::
+        # TestIdenticalWordingFormsNoTimeSeriesPair::
+        # test_identical_wording_closing_apart_forms_no_time_series_pair.
         mA = _mock_market(
             ticker="A1", event_ticker="EVA-1", title=title, event_title="EV",
             yes_ask=0.30, no_ask=0.70, close_time=datetime(2026, 12, 1, tzinfo=UTC),

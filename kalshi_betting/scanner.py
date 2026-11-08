@@ -42,17 +42,14 @@ Dependencies:
     DEADLINE_SNAPSHOT/DEADLINE_UNKNOWN verdict constants, so the two can agree
     on WHY a candidate was refused (DR-72), and stated_deadline/
     same_event_ladder with the SAME_DAY sentinel, the one definition of a
-    same-event deadline ladder's leg order and gap (DR-73), and closes_apart,
-    the one definition of the same-title close gate, with
-    close_gap_bound_text, the bound its refusal line prints (DR-74), and
-    ladder_keys, which ladders a market is on). labels_differ and
+    same-event deadline ladder's leg order and gap (DR-73), and
+    ladder_keys, which ladders a market is on). closes_apart is the one
+    definition of the same-title close gate, with close_gap_bound_text, the
+    bound its refusal line prints (DR-74). labels_differ and
     competitions_differ are the same-title sport check (DR-79), and
     event_competition reads the competition an event names.
     main._attach_series_labels sets each market's _series_labels, which the
-    sport check compares. backtester.py imports labels_differ and
-    competitions_differ too, so both paths refuse the same two-sport and
-    two-competition pairs, and historical.py imports event_competition, so
-    load_event_competitions reads a label as ingest does.
+    sport check compares.
     pair_gap_days() is the single reader of that gap for everything
     downstream of pair formation, and pair_mid_spread() the single reader of
     the mid spread on a time-series pair (the later market's midpoint minus
@@ -114,8 +111,7 @@ Notes:
     fixtures of one matchup, days apart. The gate is on the same-title finder
     only, deliberately: identical wording can never form a time-series pair
     (DR-67), so it cannot relabel the trade. It fails closed on a close time
-    it cannot compare, and the backtester mirrors it through the same
-    closes_apart — see CLAUDE.md's DR-74 gotcha.
+    it cannot compare — see CLAUDE.md's DR-74 gotcha.
 
     Closing together is still not sufficient: the two series must be filed
     under one Kalshi category and first tag (labels_differ) and the two events
@@ -123,11 +119,10 @@ Notes:
     because "<Team> wins" under "A vs B" names neither the sport nor the date
     and a football game and a women's volleyball match of the same two schools
     can close within an hour of each other. Both checks sit on the same-title
-    finder only, for the same reason as the close gate, and fail closed; the
-    backtester applies the same two definitions — see CLAUDE.md's DR-79
-    gotcha. held_pair_kind needs neither: it reads two identically worded
-    held markets as no pair at all, so live trimming never trims a held
-    same-title pair.
+    finder only, for the same reason as the close gate, and fail closed —
+    see CLAUDE.md's DR-79 gotcha. held_pair_kind needs neither: it reads two
+    identically worded held markets as no pair at all, so live trimming
+    never trims a held same-title pair.
 
     The time-series finder additionally requires both legs to be CUMULATIVE-
     deadline markets stating two DIFFERENT deadlines (deadline_phrasing,
@@ -1531,14 +1526,14 @@ def closes_apart(close_a: Any, close_b: Any) -> bool:
     True when two close times are more than SAME_TITLE_MAX_CLOSE_GAP_SECONDS
     apart, or when they cannot be compared.
 
-    The single definition of the same-title close gate (DR-74), used by both
-    paths: find_same_title_pairs reads it through _closes_apart, and
-    backtester._extract_pairs' same-title branch calls it directly on the
-    close times it has already parsed. Identical wording on two DIFFERENT
-    series is one question only when both markets resolve at the same moment
-    — a men's and a women's college basketball game between the same two
-    schools share title, subtitle and event title and close hours apart, and
-    two competitions' fixtures of one matchup close days apart.
+    The single definition of the same-title close gate (DR-74):
+    find_same_title_pairs reads it through _closes_apart, as held_pair_kind
+    does for a held pair whose stated day cannot be read. Identical wording
+    on two DIFFERENT series is one question only when both markets resolve
+    at the same moment — a men's and a women's college basketball game
+    between the same two schools share title, subtitle and event title and
+    close hours apart, and two competitions' fixtures of one matchup close
+    days apart.
 
     Fails CLOSED, like _same_series: a same-title pair is priced on the
     SAME_TITLE_CO_RESOLVE_PROB prior only when both markets DEMONSTRABLY
@@ -1577,14 +1572,11 @@ def _closes_apart(mA: Any, mB: Any) -> bool:
     market with a missing close_time before grouping, and Kalshi's close
     strings end in "Z", so _market_from_dict parses them aware.
 
-    Unlike the backtest, the live finder has ONE refusal line for this gate,
-    so a pair whose closes cannot be compared (a non-datetime, or one naive
-    beside one aware) is counted on the close-gap line, whose wording says the
-    two markets "close more than N minutes apart" — where
-    backtester._extract_pairs counts the same shape on its backtest-only
-    unreadable-close line. The two close-gap lines are therefore verbatim
-    twins for READABLE closes only. That case is unreachable live today (see
-    above), and it fails closed on both paths either way.
+    The live finder has ONE refusal line for this gate, so a pair whose
+    closes cannot be compared (a non-datetime, or one naive beside one aware)
+    is counted on the close-gap line, whose wording says the two markets
+    "close more than N minutes apart". That case is unreachable live today
+    (see above), and it fails closed either way.
 
     Args:
         mA (Any): First market object with a .close_time attribute.
@@ -1603,11 +1595,10 @@ def close_gap_bound_text(seconds: int | None = None) -> str:
 
     With no argument it reads SAME_TITLE_MAX_CLOSE_GAP_SECONDS from THIS
     module at call time — the binding closes_apart reads — so the bound a
-    refusal line prints is always the one its gate applied, on both paths:
-    find_same_title_pairs and backtester._extract_pairs format their
-    verbatim-twin close-gap lines with it, and a test that narrows
-    scanner.SAME_TITLE_MAX_CLOSE_GAP_SECONDS narrows the gate and both lines
-    together (DR-74). Resolved at call time, never bound as a def-time
+    refusal line prints is always the one its gate applied:
+    find_same_title_pairs formats its close-gap line with it, and a test that
+    narrows scanner.SAME_TITLE_MAX_CLOSE_GAP_SECONDS narrows the gate and the
+    line together (DR-74). Resolved at call time, never bound as a def-time
     default, for the same reason time_series_profit_prob's k is: a default
     would freeze the value at import and ignore a patch. The seconds
     argument renders any other bound (the tests pass one).
@@ -1748,8 +1739,7 @@ def event_competition(event: Any) -> str | None:
     (a men's and a women's game of one sport are two competitions); most
     other events carry none. fetch_open_events_with_markets attaches it to
     every market it parses, as ApiMarket._event_competition, for the
-    same-title competition check (competitions_differ, DR-79), and
-    historical.load_event_competitions reads the backtest's labels with it.
+    same-title competition check (competitions_differ, DR-79).
 
     An event that names no competition (no product_metadata, or none in it,
     or a null one) reads as "". A label that is there but cannot be read (a
@@ -1803,8 +1793,7 @@ def labels_differ(labels_a: Any, labels_b: Any) -> bool:
     Sports · Volleyball. The labels are historical.series_labels'
     (category, tag), the filing rule the dashboard and the live category/tag
     filter use, compared without regard to letter case. find_same_title_pairs
-    reads it through _labels_differ; backtester._extract_pairs calls it
-    directly, on the labels it files each cached series by.
+    reads it through _labels_differ.
 
     Fails closed: anything that is not a (category, tag) pair of strings
     reads as different, so a market whose labels were never attached is
@@ -1834,9 +1823,7 @@ def competitions_differ(competition_a: Any, competition_b: Any) -> bool:
     apart by the competition each event names (event_competition). One event
     naming a competition and the other naming none counts as different.
     Letter case and surrounding spaces are ignored. find_same_title_pairs
-    reads it through _competitions_differ;
-    backtester._refuse_other_competitions calls it directly, on the labels
-    historical.load_event_competitions reads.
+    reads it through _competitions_differ.
 
     Fails closed: anything that is not a str (an unknown label, such as the
     None event_competition gives for one it cannot read) reads as different.
@@ -5931,14 +5918,10 @@ def find_same_title_pairs(
     compare. find_time_series_pairs deliberately carries no twin: identical
     wording states the same deadline spans, or none, so it can never form a
     time-series pair (DR-67), and a same-title-only gate cannot relabel the
-    trade. All three lines are silent at zero, and backtester._extract_pairs
-    logs all three verbatim for its same-title branch (plus a backtest-only
-    line for a close_time it cannot read, which the live finder never reaches
-    because _filter_active_markets drops such a market before grouping). The
-    close-gap line is a verbatim twin for READABLE closes: a naive close
-    beside an aware one — unreachable live today — is counted on it here and
-    on the backtest's unreadable line there (see _closes_apart). Both paths
-    print its bound through close_gap_bound_text, from this module's binding.
+    trade. All three lines are silent at zero. A naive close beside an aware
+    one — unreachable live today — is counted on the close-gap line (see
+    _closes_apart), which prints its bound through close_gap_bound_text, from
+    this module's binding.
 
     Closing together is not enough either: the two markets must be about the
     same sport or subject in the same competition (DR-79). Both series must be

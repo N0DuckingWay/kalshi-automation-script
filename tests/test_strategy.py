@@ -2552,15 +2552,13 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(scanner, "find_time_series_pairs", "time_series_group_key")
         # SS-1 moved the backtester's call into _ts_group_key, its one
         # definition of the key, so the pin is a two-link chain — and it now
-        # also covers _index_eligible_keys, which decides from the SAME two
-        # key helpers which records are materialized for grouping at all. A
-        # key computed differently there would silently drop records the
-        # grouping needs, so both pass-1 keys are pinned beside both groupings.
+        # also covers _index_eligible_keys, which decides from the SAME key
+        # helper which records are materialized for grouping at all. A key
+        # computed differently there would silently drop records the grouping
+        # needs, so the pass-1 key is pinned beside the grouping.
         assert _function_calls(backtester, "_ts_group_key", "time_series_group_key")
         assert _function_calls(backtester, "_group_by_normalized_title", "_ts_group_key")
-        assert _function_calls(backtester, "_group_by_exact_title", "_st_group_key")
         assert _function_calls(backtester, "_index_eligible_keys", "_ts_group_key")
-        assert _function_calls(backtester, "_index_eligible_keys", "_st_group_key")
 
     def test_ast_both_finders_apply_the_one_series_rule(self):
         # DR-02/DR-54: identical wording across two events of ONE series is two
@@ -2569,8 +2567,8 @@ class TestTimeSeriesKellyParity:
         # tickers also qualify there, so the time-series finder would trade
         # them unless it refuses them on its own. Both scanner finders must
         # therefore reach scanner._same_series, and the backtester's
-        # _extract_pairs must reach its dict-world mirror on both of its
-        # branches (one function, so one pin covers both).
+        # _extract_pairs (time-series groups only) must reach its dict-world
+        # mirror of the time-series conjunct.
         assert _function_calls(scanner, "find_same_title_pairs", "_same_series")
         assert _function_calls(scanner, "find_time_series_pairs", "_same_series")
         assert _function_calls(scanner, "find_time_series_pairs", "_identical_wording")
@@ -2698,17 +2696,14 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(backtester, "_same_series_dicts", "event_series")
         assert _function_calls(scanner, "_same_series", "event_series")
 
-    def test_ast_both_paths_apply_the_same_title_close_gap(self):
+    def test_ast_the_live_finder_applies_the_same_title_close_gap(self):
         # DR-74: identical wording on two DIFFERENT series is one question only
         # when both markets close at the same moment (a men's and a women's
-        # game between the same schools close hours apart). Gating only the
-        # live finder would leave the backtester replaying the M/W trades
-        # instead of detecting them — 17 of its 21 trades on the 365-day run.
-        # The live finder reaches the gate through its attribute reader; the
-        # backtester calls the one definition directly on parsed closes.
+        # game between the same schools close hours apart). The live finder
+        # reaches the gate through its attribute reader; the backtest finds
+        # no same-title pairs, so it has no gate (pinned by
+        # test_ast_the_backtest_looks_for_time_series_pairs_only).
         assert _function_calls(scanner, "find_same_title_pairs", "_closes_apart")
-        assert _function_calls(backtester, "_extract_pairs", "closes_apart")
-        assert _function_calls(backtester, "_extract_pairs", "_comparable_closes_dicts")
         # And deliberately NOT on the time-series finder: identical wording can
         # never form a time-series pair (DR-67), so a same-title-only gate
         # cannot relabel the trade, and a close gate there would refuse every
@@ -2722,12 +2717,10 @@ class TestTimeSeriesKellyParity:
         # function, so the two can never disagree about which pair closes at
         # one moment. Same shape as the series-prefix pin above.
         assert _function_calls(scanner, "_closes_apart", "closes_apart")
-        # And the bound each path's refusal line PRINTS comes from the one
-        # renderer, which reads the binding closes_apart reads — so neither
-        # line can state a bound its gate did not apply, and the two stay
-        # verbatim twins under a patched bound.
+        # And the bound the refusal line PRINTS comes from the one renderer,
+        # which reads the binding closes_apart reads — so the line cannot
+        # state a bound its gate did not apply, even under a patched bound.
         assert _function_calls(scanner, "find_same_title_pairs", "close_gap_bound_text")
-        assert _function_calls(backtester, "_extract_pairs", "close_gap_bound_text")
 
     def test_ast_the_same_title_finder_applies_the_sport_check(self):
         # DR-79: identical wording on two series that close together is one
@@ -2800,8 +2793,7 @@ class TestTimeSeriesKellyParity:
                      if isinstance(node, ast.FunctionDef)}
         readers = {name for name, node in functions.items()
                    if name != "_maturity_close" and _calls_to(node, "_maturity_close")}
-        assert readers == {"_find_entry", "_simulate_at_discount", "_close_gate_and_labels",
-                           "_apply_scheduled_closes"}
+        assert readers == {"_find_entry", "_simulate_at_discount", "_apply_scheduled_closes"}
         for name in ("_can_ever_enter", "_checkpoint_floor", "_fetch_candles_parallel",
                      "_candle_window_open", "_extract_pairs", "_attach_leg_quotes",
                      "_leg_quotes", "_prepare_candidates"):
@@ -2823,59 +2815,48 @@ class TestTimeSeriesKellyParity:
                          for t in n.targets) and isinstance(n.value, ast.Call)}
         assert reads == {"_parse_iso_date(mA.get('close_time'))",
                          "_parse_iso_date(mB.get('close_time'))"}
-        # The deferred gate runs after both extractions and before the
-        # competitions are read, and the rule is the one market_details defines
-        prepare = functions["_prepare_candidates"]
-        [gate] = _calls_to(prepare, "_close_gate_and_labels")
-        [read] = _calls_to(prepare, "load_event_competitions")
-        assert all(c.lineno < gate.lineno for c in _calls_to(prepare, "_extract_pairs"))
-        assert gate.lineno < read.lineno
-        assert _function_calls(backtester, "_close_gate_and_labels", "closes_apart")
-        assert _function_calls(backtester, "_close_gate_and_labels", "labels_differ")
+        # The rule is the one market_details defines
         assert _function_calls(backtester, "_write_scheduled_close", "scheduled_close")
         assert _function_calls(backtester, "_prepare_candidates", "load_close_rules")
 
-    def test_ast_the_backtest_applies_the_sport_check(self):
-        # DR-79's backtest half, through the definitions the live finder uses:
-        # the label half inside _extract_pairs' same-title branch, right after
-        # the close gate, over historical.series_labels' filing
+    def test_ast_the_backtest_looks_for_time_series_pairs_only(self):
+        # The backtest finds no same-title pairs: _prepare_candidates groups
+        # the settled markets once, on the time-series key, and extracts pairs
+        # from that one grouping in one _extract_pairs call
         tree = ast.parse(inspect.getsource(backtester))
-        extract = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
-                       and node.name == "_extract_pairs")
-        assert _function_calls(backtester, "_extract_pairs", "_series_label_filer")
-        assert _function_calls(backtester, "_series_label_filer", "series_labels")
-        assert _function_calls(backtester, "_close_gate_and_labels", "_series_label_filer")
-        [labels] = _calls_to(extract, "labels_differ")
-        [closes] = _calls_to(extract, "closes_apart")
-        assert closes.lineno < labels.lineno
-        # The competition half, on the extracted same-title pairs
-        assert _function_calls(backtester, "_refuse_other_competitions", "competitions_differ")
         prepare = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
                        and node.name == "_prepare_candidates")
-        [read] = _calls_to(prepare, "load_event_competitions")
-        [refuse] = _calls_to(prepare, "_refuse_other_competitions")
-        [candles] = _calls_to(prepare, "_fetch_candles_parallel")
-        extracts = _calls_to(prepare, "_extract_pairs")
-        # Read after both extractions, refused before any candle is fetched
-        assert all(call.lineno < read.lineno for call in extracts)
-        assert read.lineno < refuse.lineno < candles.lineno
-        # The same-title extraction is handed the listing; the time-series one
-        # needs none (identical wording is never a time-series pair, DR-67)
-        handed = [[ast.unparse(k.value) for k in call.keywords if k.arg == "series_categories"]
-                  for call in extracts]
-        assert sorted(handed) == [[], ["series_categories"]]
-        # The labels are read as live ingest reads them
-        assert _function_calls(historical, "load_event_competitions",
-                               "_fetch_event_competition")
-        assert _function_calls(historical, "_fetch_event_competition", "event_competition")
-        # Every entry point hands its listing on to _prepare_candidates
-        for entry in ("run_backtest_sweep", "_prepare_entries"):
-            assert [ast.unparse(v) for v in _keyword_values(
-                backtester, entry, "_prepare_candidates", "series_categories")] == [
-                "series_categories"], entry
-        assert [ast.unparse(v) for v in _keyword_values(
-            backtester, "run_backtest", "_prepare_entries", "series_categories")] == [
-            "series_categories"]
+        [extract] = _calls_to(prepare, "_extract_pairs")
+        [grouping] = _calls_to(prepare, "_group_by_normalized_title")
+        assert grouping.lineno < extract.lineno
+        assert [ast.unparse(arg) for arg in extract.args] == ["ts_groups"]
+        # ... and nothing in the backtester names the same-title search, its
+        # close gate, its sport and competition check or the /series listing
+        # that check filed series by
+        named = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                named.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                named.add(node.attr)
+            elif isinstance(node, ast.alias):
+                named.add(node.name)
+            elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                named.add(node.name)
+            elif isinstance(node, ast.arg):
+                named.add(node.arg)
+            elif isinstance(node, ast.keyword) and node.arg:
+                named.add(node.arg)
+        assert "_extract_pairs" in named and "_group_by_normalized_title" in named
+        for gone in ("_group_by_exact_title", "_st_group_key", "closes_apart",
+                     "close_gap_bound_text", "labels_differ", "competitions_differ",
+                     "load_event_competitions", "series_labels",
+                     "load_series_categories", "series_categories"):
+            assert gone not in named, gone
+        # historical defines no competition download either
+        for gone in ("load_event_competitions", "_fetch_event_competition",
+                     "_EVENT_COMPETITIONS_CACHE"):
+            assert not hasattr(historical, gone), gone
 
     def test_ast_backtest_band_reaches_find_entry_through_config(self):
         # The backtest band's halves each have ONE home in config: the band is

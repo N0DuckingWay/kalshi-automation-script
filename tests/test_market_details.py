@@ -1671,10 +1671,15 @@ class TestBacktesterUse:
 
     def test_prepare_candidates_loads_reports_and_carries_the_side_data(
             self, exchange, monkeypatch, caplog):
-        da = {"ticker": "DA", "event_ticker": "EA", "event_title": "EV", "title": "Q",
+        # One time-series pair: one question at two deadlines, on two events
+        da = {"ticker": "DA", "event_ticker": "EA", "event_title": "EV",
+              "title": "Will the launch happen by February 1, 2026?",
               "subtitle": "", "result": "yes", "close_time": "2026-02-01T00:00:00+00:00",
               "settlement_ts": "2026-02-01T12:00:00+00:00"}
-        db = {**da, "ticker": "DB", "event_ticker": "EB"}
+        db = {**da, "ticker": "DB", "event_ticker": "EB",
+              "title": "Will the launch happen by February 14, 2026?",
+              "close_time": "2026-02-14T00:00:00+00:00",
+              "settlement_ts": "2026-02-14T12:00:00+00:00"}
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: [dict(da), dict(db)])
         full = _mlb_candles()

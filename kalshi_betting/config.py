@@ -235,10 +235,9 @@ SAME_TITLE_MIN_PRICE_DIFF     = 0.05
 # its two markets close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other
 # (DR-74), and both series are filed under one Kalshi category and first tag
 # while both events name the same competition, or neither names one (DR-79).
-# The live finder and the backtest apply all three (the backtest's competition
-# check runs on the pairs _extract_pairs returns, once their events' labels
-# are read). Identical wording that fails any of them is two different games
-# or questions, for which this prior is simply false.
+# The live finder applies all three; the backtest finds no same-title pairs.
+# Identical wording that fails any of them is two different games or
+# questions, for which this prior is simply false.
 SAME_TITLE_CO_RESOLVE_PROB    = 0.95
 
 # Largest gap between the two markets' close times that a same-title pair may
@@ -255,7 +254,8 @@ SAME_TITLE_CO_RESOLVE_PROB    = 0.95
 # least 1.17 h (4,217 s) apart (1,661 pairs, 60.7% settled the same way).
 # Live close_time is the SCHEDULED close — for a game, tip-off plus a fixed
 # number of days, which keeps a doubleheader's two games hours apart (checked
-# on archived pairs) — and the backtest's is the REALIZED close. Not covered:
+# on archived pairs) — and the backtest measurement above read the REALIZED
+# close. Not covered:
 # futures decided early, whose live close_time is a family-wide placeholder
 # (all KXOSCAR* at 2027-12-31T15:00Z), pass live at a 0 s gap.
 SAME_TITLE_MAX_CLOSE_GAP_SECONDS = 60 * 60
@@ -1982,10 +1982,10 @@ DASHBOARD_SELL_MAX_WORKERS = 8
 # half of _prepare_entries) warns the operator about the RAM the
 # grouping/pairing step holds, and the per-record estimate the warning
 # multiplies by. Groupable = the eligible markets (those passing
-# _can_ever_enter) whose time-series or same-title grouping key is shared with
-# another eligible market: since SS-1 they are the only records
-# _prepare_candidates builds a list of for grouping, because every other
-# eligible record would form a single-member group, which both groupings drop.
+# _can_ever_enter) whose time-series grouping key is shared with another
+# eligible market: since SS-1 they are the only records _prepare_candidates
+# builds a list of for grouping, because every other eligible record would
+# form a single-member group, which the grouping drops.
 # The warning used to count every ELIGIBLE record, which matched what was then
 # held for grouping; since SS-1 the subset is what stays resident from the
 # warning onward, so the eligible count would over-state it. A 7-day window
@@ -1993,9 +1993,10 @@ DASHBOARD_SELL_MAX_WORKERS = 8
 # 184,255 share a key — the gap between those two numbers is what counting
 # eligible records over-stated on that run. Both were measured under the pre-P5
 # prefilter (SETTLED_PREFILTER_CACHE_TAG "monday-eligibility-v1"), which also
-# admitted markets opened after that window's only checkpoint; the current
-# prefilter admits a subset, so both numbers and the gap between them are
-# smaller now (not re-measured).
+# admitted markets opened after that window's only checkpoint, and the 184,255
+# counted records sharing a same-title key as well as a time-series one; the
+# current prefilter admits a subset and the grouping keys records on the
+# time-series key alone, so both numbers are smaller now (not re-measured).
 #
 # Known residual, narrowed by SS-1's Commit C: fetch_all_settled_markets now
 # returns a historical.SettledCorpus that streams the assembled
@@ -2063,9 +2064,8 @@ BACKTEST_RECORD_BYTES_ESTIMATE = 2_700
 # (the first half of _prepare_entries) escalates its coverage census from INFO
 # to WARNING (DR-66).
 #
-# The subtitle is the outcome discriminator in BOTH backtest grouping keys —
-# the time-series key scanner.time_series_group_key() builds, and the third
-# component of the same-title key (event_title, title, subtitle). A record whose
+# The subtitle is the outcome discriminator in the backtest's grouping key,
+# the time-series key scanner.time_series_group_key() builds. A record whose
 # subtitle is blank keys by title alone, which is exactly the pre-DR-01
 # strike-blind grouping the live scanner was fixed to stop using. So a backtest
 # over a cache written before the 2026-08-14 yes_sub_title ingest fix silently
@@ -2090,8 +2090,8 @@ BACKTEST_RECORD_BYTES_ESTIMATE = 2_700
 # key regardless of what the rest of it does.
 #
 # event_title coverage is censused on the same INFO line but deliberately does
-# NOT escalate, even though a blank event_title collapses the same-title key
-# toward (title, subtitle) — the TS-11 direction. It is legitimately near zero
+# NOT escalate, even though a blank event_title drops the event from the
+# grouping key — the TS-11 direction. It is legitimately near zero
 # on a HEALTHY cache (0.57% and 2.87% on the two post-fix caches above), because
 # the corpus is overwhelmingly MVE combo markets, whose titles the bulk
 # get_events listings exclude by API design and whose per-ticker lookups are
@@ -2231,9 +2231,8 @@ SETTLED_PREFILTER_CACHE_TAG = "checkpoint-v3"
 # How long historical.load_series_categories reuses its cached copy of Kalshi's
 # /series listing (every series' official category and tags — 14,391 series in
 # ONE response, measured 2026-09-25) before fetching it again. It feeds the
-# backtest dashboard's category/tag views, the same-title sport check of every
-# live run (main._attach_series_labels, DR-79) and of every backtest
-# (backtester._extract_pairs) and, with a live filter set,
+# backtest dashboard's category/tag views, each trade of a production run's
+# result file, the Live trading tab's categories and, with a live filter set,
 # main._filter_by_category (a dev run reads the cached copy however old). A
 # series' category rarely changes, so a week is plenty; a series the copy lacks
 # is filed by historical.series_labels' fallback until the next refresh.
@@ -2258,9 +2257,9 @@ SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS = 7 * 86_400
 # longer unresolved, and under --no-cache (which re-resolves every requested
 # ticker) because the never-answered ones outrank those it already holds.
 # A combo's event title has no measured effect on which pairs form: the
-# one-series rule refuses every combo-vs-combo same-title pair (DR-54/DR-55),
-# and on the 2026-09-08/09 day slices no combo record shared even the coarser
-# time-series grouping key with any non-combo record (CLAUDE.md, DR-67 notes).
+# backtest forms no same-title pairs, and on the 2026-09-08/09 day slices no
+# combo record shared the time-series grouping key with any non-combo record
+# (CLAUDE.md, DR-67 notes).
 # A non-combo title can (TS-11), and the old single sorted list spent the whole
 # cap on the tickers sorting before "KXMVE" plus the head of the combo block:
 # on the 2026-09-24 7-day run 3,987,139 tickers reached the fallback, 5,000
@@ -2308,16 +2307,16 @@ EVENT_TITLE_FALLBACK_MAX_WORKERS = 8
 # the budget rule above: combo tickers no longer reach the fallback at all.
 EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS = 0.15
 
-# Most events a backtest reads its competition label for from Kalshi in one run
-# (historical.load_event_competitions, DR-79); events already in its cache
-# file do not count. Cached markets carry no competition, so the backtest asks
-# Kalshi for the events of the same-title pairs backtester._extract_pairs
-# returns (every pairing check passed, before any price filter): about 28
-# events for the 365-day window, and each answer is cached, so a later run asks
-# only for new events. The reads use the event-title fallback's workers and
-# pause (EVENT_TITLE_FALLBACK_MAX_WORKERS,
-# EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS).
-# An event past the cap has no known label, so its pairs are refused.
+# Most events a backtest reads from Kalshi's /events/{ticker} in one run, for
+# each of the two per-event reads: each pair market's event fee multiplier
+# override (historical.load_event_fee_overrides) and its settlement facts
+# (historical.load_event_facts, report only). Events already in a read's cache
+# file do not count, and each answer is cached, so a later run asks only for
+# new events. The reads use the event-title fallback's workers and pause
+# (EVENT_TITLE_FALLBACK_MAX_WORKERS,
+# EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS). An event past the cap is
+# unknown: its markets are charged the full fee, and the report leaves its
+# pairs out of the checks it counts.
 EVENT_COMPETITION_MAX_LOOKUPS = 2_000
 
 # Abandon a bulk event listing after this many CONSECUTIVE pages that resolve
