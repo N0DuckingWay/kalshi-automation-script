@@ -910,7 +910,8 @@ class TestEventSeries:
 class TestClosesApart:
     """Unit contract of scanner.closes_apart — the ONE definition of the
     close-time test held_pair_kind applies when a stated deadline cannot be
-    read — and its reader _closes_apart (DR-74's bound)."""
+    read, against the held-pair close bound (HELD_PAIR_CLOSE_GAP_SECONDS, one
+    hour) — and of its reader _closes_apart."""
 
     _T = datetime(2026, 9, 25, 21, tzinfo=UTC)
 
@@ -945,6 +946,15 @@ class TestClosesApart:
         assert cest.hour == 23
         assert scanner.closes_apart(self._T, cest) is False
 
+    def test_the_bound_is_one_hour(self):
+        # The held-pair close bound ships at one hour, and scanner's copy, the
+        # one closes_apart reads, is config's
+        assert config.HELD_PAIR_CLOSE_GAP_SECONDS == 60 * 60 == 3_600
+        assert scanner.HELD_PAIR_CLOSE_GAP_SECONDS == config.HELD_PAIR_CLOSE_GAP_SECONDS
+        # The bound has this one name in both modules
+        for module in (config, scanner):
+            assert not hasattr(module, "SAME_TITLE_MAX_CLOSE_GAP_SECONDS"), module.__name__
+
     @pytest.mark.parametrize("seconds,apart", [
         (0, False), (3_600, False), (3_601, True), (-3_600, False), (-3_601, True),
     ])
@@ -957,10 +967,10 @@ class TestClosesApart:
         # called, so a test narrows the bound by patching scanner's name (the
         # TIME_SERIES_SAME_EVENT_LADDERS precedent). Patching config's copy
         # changes nothing: a 61-second gap is still within scanner's hour
-        monkeypatch.setattr(config, "SAME_TITLE_MAX_CLOSE_GAP_SECONDS", 60)
+        monkeypatch.setattr(config, "HELD_PAIR_CLOSE_GAP_SECONDS", 60)
         assert scanner.closes_apart(self._T, self._T + timedelta(seconds=61)) is False
         # A 60-second bound in scanner admits a 60-second gap and refuses 61
-        monkeypatch.setattr(scanner, "SAME_TITLE_MAX_CLOSE_GAP_SECONDS", 60)
+        monkeypatch.setattr(scanner, "HELD_PAIR_CLOSE_GAP_SECONDS", 60)
         assert scanner.closes_apart(self._T, self._T + timedelta(seconds=60)) is False
         assert scanner.closes_apart(self._T, self._T + timedelta(seconds=61)) is True
 
@@ -9219,9 +9229,9 @@ class TestHeldPairKind:
         Assert two markets have the shape of a same-title pair, dear the pricier.
 
         One wording (title, subtitle and event title) on two different
-        series, the two closing within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of
-        each other: a pair an account can hold, bought NO on the market with
-        the higher YES ask and YES on the other.
+        series, the two closing within an hour of each other: a pair an
+        account can hold, bought NO on the market with the higher YES ask and
+        YES on the other.
 
         Args:
             dear: The market with the higher YES ask.
@@ -9297,9 +9307,9 @@ class TestHeldPairKind:
     @pytest.mark.parametrize("gap_seconds, within", [(0, True), (3_600, True), (3_601, False),
                                                      (9_000, False)])
     def test_identical_wording_is_no_pair_at_any_close_gap(self, gap_seconds, within):
-        # A same-title pair closes within SAME_TITLE_MAX_CLOSE_GAP_SECONDS,
-        # bound included; held, identical wording is no pair at any gap, and
-        # never time-series either
+        # Within the held-pair close bound (an hour, the bound included) or
+        # past it, held identical wording is no pair, and never time-series
+        # either
         mens, womens = self._wiu_markets(
             womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC)
             - timedelta(seconds=gap_seconds))
@@ -9569,20 +9579,51 @@ class TestHeldPairKind:
     ])
     @pytest.mark.parametrize("gap_seconds, reads", [(1_800, False), (3_600, False),
                                                     (3_601, True), (7_200, True)])
-    def test_an_unread_stated_day_needs_closes_past_the_same_title_bound(
+    def test_an_unread_stated_day_needs_closes_past_the_held_pair_close_bound(
             self, monkeypatch, wording_a, wording_b, gap_seconds, reads):
-        # With no stated day to tell them apart, closes within the same-title
-        # bound could be one question respelled: not shown to be time-series
+        # With no stated day to tell them apart, closes within the held-pair
+        # close bound (an hour) could be one question respelled: not shown to
+        # be time-series
         close = datetime(2027, 3, 31, 12, tzinfo=UTC)
         a = _cross("X-A", "KXAA-1", wording_a, close)
         b = _cross("X-B", "KXBB-1", wording_b, close + timedelta(seconds=gap_seconds),
                    yes_ask=0.60)
-        assert config.SAME_TITLE_MAX_CLOSE_GAP_SECONDS == 3_600
+        assert config.HELD_PAIR_CLOSE_GAP_SECONDS == 3_600
         # The finder forms the pair either way
         [pair] = self._ts([a, b], monkeypatch)
         assert (pair.market_a, pair.market_b) == (a, b)
         assert _kind_of(pair) == (("time_series", a, b) if reads else None)
         assert scanner.held_pair_kind(b, a) is None
+
+    @pytest.mark.parametrize("bound", [60, 7_200])
+    def test_the_unread_day_refusal_moves_with_scanners_bound(self, monkeypatch, bound):
+        # held_pair_kind reads scanner's own copy of the held-pair close bound
+        # each time it is called, so the refusal moves with it, narrower or
+        # wider than the hour: with a stated day unread, closes up to the
+        # bound apart are no pair, and closes a second past it read
+        close = datetime(2027, 3, 31, 12, tzinfo=UTC)
+
+        def kind_at(gap_seconds):
+            """held_pair_kind of a year-less pair closing gap_seconds apart, and its time-series kind."""
+            a = _cross("X-A", "KXAA-1", "by March 1", close)
+            b = _cross("X-B", "KXBB-1", "by March 9", close + timedelta(seconds=gap_seconds),
+                       yes_ask=0.60)
+            # The finder forms the pair at every gap, A the first to close
+            [pair] = self._ts([a, b], monkeypatch)
+            assert (pair.market_a, pair.market_b) == (a, b)
+            return _kind_of(pair), ("time_series", a, b)
+
+        # Patching config's copy moves nothing: scanner's hour still decides
+        monkeypatch.setattr(config, "HELD_PAIR_CLOSE_GAP_SECONDS", bound)
+        for gap_seconds in (bound, bound + 1):
+            kind, as_time_series = kind_at(gap_seconds)
+            assert kind == (as_time_series if gap_seconds > 3_600 else None), gap_seconds
+        # Scanner's copy moves it, on both sides of the bound and of the hour
+        monkeypatch.setattr(scanner, "HELD_PAIR_CLOSE_GAP_SECONDS", bound)
+        for gap_seconds, reads in ((bound, False), (bound + 1, True),
+                                   (3_600, 3_600 > bound), (3_601, 3_601 > bound)):
+            kind, as_time_series = kind_at(gap_seconds)
+            assert kind == (as_time_series if reads else None), gap_seconds
 
     @pytest.mark.parametrize("gap_seconds, reads", [(1_800, False), (3_600, False),
                                                     (3_601, True)])
@@ -9590,7 +9631,7 @@ class TestHeldPairKind:
             self, monkeypatch, gap_seconds, reads):
         # One question on two series, one label respelled without its year:
         # the finder sees two deadlines, but one states no calendar day, so
-        # within the same-title bound it is no pair
+        # within the held-pair close bound (an hour) it is no pair
         close = datetime(2027, 3, 31, 12, tzinfo=UTC)
 
         def listing(ticker, event, label, close_time, yes_ask):
@@ -9716,12 +9757,12 @@ class TestHeldPairKind:
         # time-series, A and B as the finder has them. A cross-event pair
         # reads as time-series exactly when its stated days read, differ and
         # agree with its closes, or (a day unread) its closes are further
-        # apart than SAME_TITLE_MAX_CLOSE_GAP_SECONDS; otherwise as no pair.
-        # Never as same-title, and a time-series pair held the other way round
+        # apart than the held-pair close bound; otherwise as no pair. Never
+        # as same-title, and a time-series pair held the other way round
         # never reads
         rng = random.Random(2026)
         base = datetime(2026, 3, 1, 12, tzinfo=UTC)
-        bound = config.SAME_TITLE_MAX_CLOSE_GAP_SECONDS
+        bound = config.HELD_PAIR_CLOSE_GAP_SECONDS
         seen = {"same_title": 0, "ladder": 0, "cross_read": 0, "cross_refused": 0}
 
         def spelled(day, dated):

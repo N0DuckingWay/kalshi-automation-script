@@ -3410,9 +3410,9 @@ def _assert_same_title_pair(dear, cheap) -> None:
     Assert two markets are the pair a same-title search would buy.
 
     One wording (title, subtitle and event title) on two different series,
-    closing within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other, their YES
-    asks at least SAME_TITLE_MIN_PRICE_DIFF apart, and a NO on the pricier
-    plus a YES on the other costing less than $1 after the fee.
+    closing within an hour of each other, their YES asks at least
+    SAME_TITLE_MIN_PRICE_DIFF apart, and a NO on the pricier plus a YES on
+    the other costing less than $1 after the fee.
 
     Args:
         dear: The market with the higher YES ask, bought NO.

@@ -173,8 +173,8 @@ def _kelly_p_at(pair: CandidatePair, k: float | None) -> float | None:
 
     same_title: the fixed SAME_TITLE_CO_RESOLVE_PROB prior. It is only valid
     for two markets that ask one question — same wording, different series,
-    closing within SAME_TITLE_MAX_CLOSE_GAP_SECONDS (DR-02, DR-74); no finder
-    forms such a pair.
+    closing within an hour of each other (DR-02, DR-74); no finder forms such
+    a pair.
 
     Args:
         pair (CandidatePair): Supplies pair_type and, for time_series, mid_spread.

@@ -232,36 +232,28 @@ SAME_TITLE_MIN_PRICE_DIFF     = 0.05
 # Set at 95% — divergence is an anomaly, so we assume high correlation by default.
 # It holds only for a pair meeting all three pairing rules: its two event
 # tickers belong to two DIFFERENT series (the one-series rule, DR-02/DR-54),
-# its two markets close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other
-# (DR-74), and both series are filed under one Kalshi category and first tag
-# while both events name the same competition, or neither names one (DR-79).
+# its two markets close within an hour of each other (DR-74), and both
+# series are filed under one Kalshi category and first tag while both events
+# name the same competition, or neither names one (DR-79).
 # No code forms a same-title pair: the live finder and the backtest look for
 # time-series pairs only. Identical wording that fails any of the rules is
 # two different games or questions, for which this prior is simply false.
 SAME_TITLE_CO_RESOLVE_PROB    = 0.95
 
-# Largest gap between the two markets' close times that a same-title pair may
-# have, in seconds (DR-74). scanner.closes_apart reads it for held_pair_kind
-# alone: two held markets on two events that close within it, either one's
-# stated deadline unread, are not read as a time-series pair, since they could
-# be a same-title pair respelled on one market. Identical wording on two
-# DIFFERENT series is one question only when both markets resolve at the same
-# moment: a men's and a women's college basketball game between the same two
-# schools (KXNCAAMBGAME / KXNCAAWBGAME, "Western Illinois at Eastern Illinois
-# Winner?") share title, subtitle and event title, and so do the Champions
-# League and La Liga "Atletico vs Barcelona" matches. On the 365-day backtest
-# (start 2025-09-24, the backtest's population: event_title blank on ~95% of
-# eligible records) the 1,906 same-title candidates closed either at the
-# identical instant (245 pairs, 243 settled the same way — including 226/226
-# commodity and 15/15 financial; the other 2 are the
-# KXRTBLACKPHONE2/KXBLACKPHONE2 anomaly) or at least 1.17 h (4,217 s) apart
-# (1,661 pairs, 60.7% settled the same way). Live close_time is the SCHEDULED
-# close — for a game, tip-off plus a fixed number of days, which keeps a
-# doubleheader's two games hours apart (checked on archived pairs) — and the
-# backtest measurement above read the REALIZED close. Not covered: futures
-# decided early, whose live close_time is a family-wide placeholder (all
-# KXOSCAR* at 2027-12-31T15:00Z), read live as a 0 s gap.
-SAME_TITLE_MAX_CLOSE_GAP_SECONDS = 60 * 60
+# The held-pair close bound, in seconds: one hour. held_pair_kind (which
+# tells live trimming whether two held markets are a time-series pair held as
+# one) gives no kind to two held markets on two events that close within it
+# of each other while either one's stated deadline cannot be read, so live
+# trimming never trims them. They could be a same-title pair (one question
+# listed by two different series, whose two markets close at one moment)
+# whose wording Kalshi respelled on one market, which the wording checks
+# would read as two deadlines. The hour rests on a recorded finding about
+# close times (DR-74): one question listed by two series closes at one
+# instant, while two different games close more than an hour apart.
+# scanner.closes_apart is its one reader (a gap of exactly the bound counts
+# as within it); scanner binds it by value, so a test patches scanner's copy,
+# never config's.
+HELD_PAIR_CLOSE_GAP_SECONDS = 60 * 60
 
 # Maximum number of calendar days allowed between the deadlines of the two legs
 # in a time-series pair. The wider the gap, the more of the market-implied

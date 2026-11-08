@@ -124,9 +124,10 @@ Notes:
     the time-series finder's own checks. It gives two identically worded
     markets no kind at all, so live trimming never trims a held same-title
     pair. Nor does it read two held markets on two events as a time-series
-    pair when a stated deadline cannot be read and the two close within
-    SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other (closes_apart): they could
-    be a same-title pair respelled on one market.
+    pair when a stated deadline cannot be read and the two close within the
+    held-pair close bound (HELD_PAIR_CLOSE_GAP_SECONDS, one hour) of each
+    other (closes_apart): they could be a same-title pair respelled on one
+    market.
 
     Market fetching deliberately bypasses the SDK's response models: as of
     2026-07 the API stopped sending the legacy integer-cent price fields the
@@ -167,6 +168,7 @@ from .config import (
     EXCHANGE_FLAG_TRUE_TOKENS,
     FILLS_EARLIEST_YEAR,
     FILLS_PAGE_SIZE,
+    HELD_PAIR_CLOSE_GAP_SECONDS,
     INCLUDE_MVE_MARKETS,
     MARKET_PAGE_SIZE,
     MAX_ACTIVE_PRICE_DOLLARS,
@@ -178,7 +180,6 @@ from .config import (
     POSITION_PAGE_SIZE,
     PRICE_EPSILON,
     SAME_TITLE_LEG_SIDES,
-    SAME_TITLE_MAX_CLOSE_GAP_SECONDS,
     SAME_TITLE_MIN_PRICE_DIFF,
     SCANNER_MAX_PAGES,
     SCANNER_PROGRESS_LOG_EVERY_PAGES,
@@ -1508,18 +1509,18 @@ def _same_series(mA: Any, mB: Any) -> bool:
 
 def closes_apart(close_a: Any, close_b: Any) -> bool:
     """
-    True when two close times are more than SAME_TITLE_MAX_CLOSE_GAP_SECONDS
+    True when two close times are more than HELD_PAIR_CLOSE_GAP_SECONDS
     apart, or when they cannot be compared.
 
-    The one definition of this close-time test. held_pair_kind reads it,
-    through _closes_apart, for two held markets on two events when either
-    one's stated deadline cannot be read: closing within the bound, they
-    could be a same-title pair respelled on one market, so they are not read
-    as a time-series pair, and such a pair is never trimmed as one. The bound
-    is DR-74's: identical wording on two DIFFERENT series is one question
-    only when both markets resolve at the same moment, since a men's and a
-    women's college basketball game between the same two schools share
-    title, subtitle and event title and close hours apart.
+    The one definition of the held-pair check's close-time test.
+    held_pair_kind reads it, through _closes_apart, for two held markets on
+    two events when either one's stated deadline cannot be read: closing
+    within the bound (one hour), they could be a same-title pair (one
+    question listed by two different series, whose two markets close at one
+    moment) whose wording Kalshi respelled on one market, so they are not
+    read as a time-series pair, and such a pair is never trimmed as one. The
+    bound is scanner's own binding of config.HELD_PAIR_CLOSE_GAP_SECONDS,
+    read each time this is called.
 
     Anything that is not a datetime, and a naive/aware mix (whose subtraction
     would raise), reads as "apart": the two cannot be shown to close
@@ -1533,10 +1534,10 @@ def closes_apart(close_a: Any, close_b: Any) -> bool:
 
     Returns:
         bool: True when the two closes are more than
-            SAME_TITLE_MAX_CLOSE_GAP_SECONDS apart (strictly: a gap of exactly
-            the bound is NOT apart), or when either is not a datetime, or when
-            one is naive and the other aware. False only for two comparable
-            closes within the bound.
+            HELD_PAIR_CLOSE_GAP_SECONDS apart (strictly: a gap of exactly the
+            bound is NOT apart), or when either is not a datetime, or when one
+            is naive and the other aware. False only for two comparable closes
+            within the bound.
     """
     if not isinstance(close_a, datetime) or not isinstance(close_b, datetime):
         return True
@@ -1544,7 +1545,7 @@ def closes_apart(close_a: Any, close_b: Any) -> bool:
     # unreadable gap is not a demonstrated same-moment resolution.
     if (close_a.utcoffset() is None) != (close_b.utcoffset() is None):
         return True
-    return abs((close_a - close_b).total_seconds()) > SAME_TITLE_MAX_CLOSE_GAP_SECONDS
+    return abs((close_a - close_b).total_seconds()) > HELD_PAIR_CLOSE_GAP_SECONDS
 
 
 def _closes_apart(mA: Any, mB: Any) -> bool:
@@ -4086,7 +4087,8 @@ def held_pair_kind(yes_market: Any, no_market: Any) -> tuple[str, Any, Any] | No
       finder, so a same-title pair respelled on one market is never read as
       time-series: stated days that both read must differ and agree with the
       closes, and with a stated day unread the closes must be further apart
-      than SAME_TITLE_MAX_CLOSE_GAP_SECONDS (closes_apart).
+      than the held-pair close bound, HELD_PAIR_CLOSE_GAP_SECONDS (one hour;
+      closes_apart).
 
     No price test, no deadline-gap cap, and TIME_SERIES_SAME_EVENT_LADDERS is
     not read: those decide what may be bought, not what is held.
@@ -4136,8 +4138,8 @@ def held_pair_kind(yes_market: Any, no_market: Any) -> tuple[str, Any, Any] | No
     # Across events: stated days that both read must differ, A's the earlier
     if ladder is SAME_DAY or (ladder is not None and ladder[0]):
         return None
-    # A stated day unread and closes within SAME_TITLE_MAX_CLOSE_GAP_SECONDS
-    # of each other: this could be a same-title pair respelled on one market
+    # A stated day unread and closes within the held-pair close bound of each
+    # other: this could be a same-title pair respelled on one market
     if ladder is None and not _closes_apart(market_a, market_b):
         return None
     close_a = getattr(market_a, "close_time", None)
