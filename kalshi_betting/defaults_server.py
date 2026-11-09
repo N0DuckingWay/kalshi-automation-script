@@ -2395,7 +2395,7 @@ def _hang_limit_text() -> str:
     Say how long a run may take before a page calls it possibly hung.
 
     Returns:
-        str: SCHEDULER_JOB_TIMEOUT_SECONDS in words, e.g. "1 h 00 min".
+        str: SCHEDULER_JOB_TIMEOUT_SECONDS in words, e.g. "4 h 00 min".
     """
     return _duration_text(SCHEDULER_JOB_TIMEOUT_SECONDS)
 
