@@ -1497,10 +1497,11 @@ V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS = (1.0, 2.0, 4.0)
 # dozens of killed legs at normal speed (operator decision, 2026-09-28). When
 # every position read fails, pairs take ~2 min each, so about 3 run alone
 # before the rest start: 7 pairs take ~10-13 min instead of ~2, and 30
-# pairs ~15 min, inside the scheduler's one-hour
-# SCHEDULER_JOB_TIMEOUT_SECONDS. A stuck order POST holds the other pairs
-# back for at most this long; execute_trades itself still returns only when
-# that POST does, since order POSTs carry no request timeout.
+# pairs ~15 min, inside the scheduler's four-hour
+# SCHEDULER_JOB_TIMEOUT_SECONDS even after the longest market fetch (about
+# 2 hours 30 minutes). A stuck order POST holds the other pairs back for at
+# most this long; execute_trades itself still returns only when that POST
+# does, since order POSTs carry no request timeout.
 V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS = 300.0
 
 # How often, in seconds, trader.execute_trades looks at whether the pair
@@ -1788,10 +1789,18 @@ class ScheduledRun:
 # backtester.SCHEDULED_RUN, never config.*.
 SCHEDULED_RUN = ScheduledRun(weekday=0, hour=9, minute=0, timezone="America/Los_Angeles")
 
-# Maximum seconds a scheduler-spawned bot run may take before being killed.
-# Prevents a hung run (e.g. a network stall inside the SDK) from blocking the
-# weekly scheduler daemon forever.
-SCHEDULER_JOB_TIMEOUT_SECONDS = 3600
+# Maximum seconds a run the scheduler starts may take before it is killed (4
+# hours), so a hung run (for example a network stall inside the SDK) cannot
+# block the weekly scheduler daemon forever. The kill is a hard stop wherever
+# the run has got to, even in the middle of sending orders, where it can leave
+# a bought leg without its partner, so the limit must cover a slow but healthy
+# run: reading up to SCANNER_MAX_PAGES (20,000) pages of the combo events
+# listing can take about 2 hours 30 minutes, and trading 30 pairs takes about
+# 15 minutes more when every position read fails
+# (V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS). The scheduler and the dashboard's
+# pages also call a run that has held the live-run lock for longer than this
+# possibly hung.
+SCHEDULER_JOB_TIMEOUT_SECONDS = 4 * 60 * 60
 
 # The scheduler's record of its claimed weekly slot (scheduler.py), under
 # PROJECT_ROOT: the slot, when its run started and finished, its exit code and
@@ -1910,14 +1919,23 @@ ORDERS_PAGE_SIZE = 200
 # the reader cannot read.
 FILLS_EARLIEST_YEAR = 2021
 
-# Hard ceiling on pages walked by scanner.py's cursor loops (open events, MVE
-# events, positions, settlements, fills, resting orders). Each loop also
+# The most pages one cursor-paged listing walk reads: scanner.py's loops (open
+# events, combo (MVE, multivariate) events, positions, settlements, fills,
+# resting orders), live_portfolio.py's account listings and market_details.py's
+# walks (one market's trades, the open markets' close times). Each walk also
 # remembers every cursor it has used, which catches a stuck or cycling cursor
-# (A, B, A, B, ...); this cap bounds the walk regardless (TS-05). At
-# MARKET_PAGE_SIZE (200) it is 1,000,000 markets, far above a full prod ingest
-# (~135k markets). Same bound-the-work-then-say-so idiom as
-# EVENT_TITLE_FALLBACK_MAX_LOOKUPS.
-SCANNER_MAX_PAGES  = 5000
+# (A, B, A, B, ...); this cap bounds the walk regardless (TS-05), and a walk it
+# stops says so in a WARNING or an error. Same bound-the-work-then-say-so idiom
+# as EVENT_TITLE_FALLBACK_MAX_LOOKUPS.
+#
+# The combo events listing (200 events a page, MARKET_PAGE_SIZE) is the one
+# walk long enough to reach this cap, and reading 20,000 of its pages can take
+# about 2 hours 30 minutes; docs/claude/known-gotchas/kalshi-api-and-shards.md
+# has the measurements. A run the scheduler starts is killed after
+# SCHEDULER_JOB_TIMEOUT_SECONDS (4 hours), even in the middle of sending
+# orders, so that limit must stay well above this walk's time. A run started
+# from the dashboard or by hand has no time limit.
+SCANNER_MAX_PAGES  = 20000
 
 # Cap on the number of multivariate-events pages the backtester's event-title
 # lookup will scan (historical._load_or_build_event_titles). The MVE listing is
