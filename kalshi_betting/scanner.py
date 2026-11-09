@@ -4,25 +4,21 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Fetches all open Kalshi markets from the REST API and identifies pairs of
-    contracts for the bot's two pair strategies: (1) time-series pairs —
-    contracts that ask the same question about the same OUTCOME at different
-    deadlines, identified by stripping date tokens from their titles and
-    exact-matching the remainder together with the market's outcome label
-    (time_series_group_key), traded as a directional bet (YES on the earlier
-    contract, NO on the later) when the later contract is priced well above
-    the earlier AND both legs' wording states a CUMULATIVE deadline
-    ("by <date>") — deadline_phrasing refuses a snapshot family
+    Fetches all open Kalshi markets from the REST API and finds the bot's
+    time-series pairs: contracts that ask the same question about the same
+    OUTCOME at different deadlines, identified by stripping date tokens from
+    their titles and exact-matching the remainder together with the market's
+    outcome label (time_series_group_key), traded as a directional bet (YES
+    on the earlier contract, NO on the later) when the later contract is
+    priced well above the earlier AND both legs' wording states a CUMULATIVE
+    deadline ("by <date>") — deadline_phrasing refuses a snapshot family
     ("price ON <date>"), whose probabilities do not nest and which the date
-    stripping would otherwise collapse into one group; and (2)
-    same-title pairs — contracts with identical title and subtitle on
-    different event tickers of DIFFERENT event series whose two markets close
-    within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other (DR-74) and are
-    about one sport or subject in one competition (DR-79), traded as a
-    near-arbitrage (NO on the pricier, YES on the cheaper) when their prices
-    diverge. Both paths then check the live order book to replace best-ask
-    prices with depth-weighted fill prices and confirm the edge survives real
-    liquidity.
+    stripping would otherwise collapse into one group. It then checks the
+    live order book to replace best-ask prices with depth-weighted fill
+    prices and confirm the edge survives real liquidity. The pricing, side
+    and fee helpers also read a same-title pair (two identically worded
+    markets on two different series, bought NO on the pricier and YES on the
+    cheaper), a pair type no finder forms.
 
 Dependencies:
     Imports constants, the leg-side tuples, fee helpers and the live toggles
@@ -42,17 +38,10 @@ Dependencies:
     DEADLINE_SNAPSHOT/DEADLINE_UNKNOWN verdict constants, so the two can agree
     on WHY a candidate was refused (DR-72), and stated_deadline/
     same_event_ladder with the SAME_DAY sentinel, the one definition of a
-    same-event deadline ladder's leg order and gap (DR-73), and closes_apart,
-    the one definition of the same-title close gate, with
-    close_gap_bound_text, the bound its refusal line prints (DR-74), and
-    ladder_keys, which ladders a market is on). labels_differ and
-    competitions_differ are the same-title sport check (DR-79), and
-    event_competition reads the competition an event names.
-    main._attach_series_labels sets each market's _series_labels, which the
-    sport check compares. backtester.py imports labels_differ and
-    competitions_differ too, so both paths refuse the same two-sport and
-    two-competition pairs, and historical.py imports event_competition, so
-    load_event_competitions reads a label as ingest does.
+    same-event deadline ladder's leg order and gap (DR-73), and
+    ladder_keys, which ladders a market is on). closes_apart is the one
+    definition of the close-time test held_pair_kind applies to two held
+    markets whose stated deadline cannot be read.
     pair_gap_days() is the single reader of that gap for everything
     downstream of pair formation, and pair_mid_spread() the single reader of
     the mid spread on a time-series pair (the later market's midpoint minus
@@ -95,39 +84,16 @@ Notes:
     (its subtitle) is the other half, because a daily strike family shares one
     title and differs only there — see time_series_group_key().
 
-    Neither finder pairs two events of ONE series (event_series(): the ticker
-    prefix before the first "-", with every combo (KXMVE*) prefix collapsed
-    onto one family — see config.MVE_SERIES_FAMILY_PREFIX) whose wording is
-    identical. Two events of one series are two instances of one recurring
-    fixture — two ball games, two 15-minute price windows, two combo tickets
-    whose wording names their legs but never their date — so identical wording
-    across them is the same question about two DIFFERENT events, and neither
-    the 95% co-resolution prior nor the cumulative-deadline premise applies. Both
-    finders carry the rule because the same two tickers qualify for both; see
-    _same_series()/_identical_wording() and CLAUDE.md's one-series gotcha.
-
-    Different series is necessary for a same-title pair but not sufficient:
-    the two markets must also close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of
-    each other (closes_apart, DR-74). A men's and a women's college basketball
-    game between the same two schools share every word of the same-title key
-    on two different series, and close hours apart; so do two competitions'
-    fixtures of one matchup, days apart. The gate is on the same-title finder
-    only, deliberately: identical wording can never form a time-series pair
-    (DR-67), so it cannot relabel the trade. It fails closed on a close time
-    it cannot compare, and the backtester mirrors it through the same
-    closes_apart — see CLAUDE.md's DR-74 gotcha.
-
-    Closing together is still not sufficient: the two series must be filed
-    under one Kalshi category and first tag (labels_differ) and the two events
-    must name one competition, or neither name one (competitions_differ),
-    because "<Team> wins" under "A vs B" names neither the sport nor the date
-    and a football game and a women's volleyball match of the same two schools
-    can close within an hour of each other. Both checks sit on the same-title
-    finder only, for the same reason as the close gate, and fail closed; the
-    backtester applies the same two definitions — see CLAUDE.md's DR-79
-    gotcha. held_pair_kind needs neither: it reads two identically worded
-    held markets as no pair at all, so live trimming never trims a held
-    same-title pair.
+    The time-series finder never pairs two events of ONE series
+    (event_series(): the ticker prefix before the first "-", with every combo
+    (KXMVE*) prefix collapsed onto one family — see
+    config.MVE_SERIES_FAMILY_PREFIX) whose wording is identical. Two events of
+    one series are two instances of one recurring fixture — two ball games,
+    two 15-minute price windows, two combo tickets whose wording names their
+    legs but never their date — so identical wording across them is the same
+    question about two DIFFERENT events, and the cumulative-deadline premise
+    does not apply. See _same_series()/_identical_wording() and CLAUDE.md's
+    one-series gotcha.
 
     The time-series finder additionally requires both legs to be CUMULATIVE-
     deadline markets stating two DIFFERENT deadlines (deadline_phrasing,
@@ -153,6 +119,15 @@ Notes:
     them — the arithmetic DR-73 needs to pair two rungs of ONE event's
     deadline ladder, where close_time cannot order them because a settled
     event closes every rung at one instant.
+
+    held_pair_kind reads two held markets back as a time-series pair only on
+    the time-series finder's own checks. It gives two identically worded
+    markets no kind at all, so live trimming never trims a held same-title
+    pair. Nor does it read two held markets on two events as a time-series
+    pair when a stated deadline cannot be read and the two close within the
+    held-pair close bound (HELD_PAIR_CLOSE_GAP_SECONDS, one hour) of each
+    other (closes_apart): they could be a same-title pair respelled on one
+    market.
 
     Market fetching deliberately bypasses the SDK's response models: as of
     2026-07 the API stopped sending the legacy integer-cent price fields the
@@ -193,6 +168,7 @@ from .config import (
     EXCHANGE_FLAG_TRUE_TOKENS,
     FILLS_EARLIEST_YEAR,
     FILLS_PAGE_SIZE,
+    HELD_PAIR_CLOSE_GAP_SECONDS,
     INCLUDE_MVE_MARKETS,
     MARKET_PAGE_SIZE,
     MAX_ACTIVE_PRICE_DOLLARS,
@@ -204,7 +180,6 @@ from .config import (
     POSITION_PAGE_SIZE,
     PRICE_EPSILON,
     SAME_TITLE_LEG_SIDES,
-    SAME_TITLE_MAX_CLOSE_GAP_SECONDS,
     SAME_TITLE_MIN_PRICE_DIFF,
     SCANNER_MAX_PAGES,
     SCANNER_PROGRESS_LOG_EVERY_PAGES,
@@ -850,8 +825,8 @@ class HeldPair:
     - A lone leg: one held market whose partner is gone from the positions
       listing (it paid out). A candidate adds to it when it buys the side
       held on that market and pairs it with a market the account does not
-      hold (matches); the finders also check that the new market sits on no
-      other held ladder.
+      hold (matches); find_time_series_pairs also checks that the new market
+      sits on no other held ladder.
 
     Its stake (stake_dollars, the worth plus the fees) is what sizing and the
     at-cap check subtract.
@@ -962,8 +937,8 @@ def _add_on_for(add_on_pairs: dict, add_on_tickers: set, ticker_a: Any,
     market whose partner has paid out) is found by its one ticker, and only
     when the candidate's other market is not held itself: a candidate
     touching two held markets that are not one exact pair adds to nothing.
-    The finders still check the sides (HeldPair.matches) and, for a lone
-    leg, the new market's ladders.
+    find_time_series_pairs still checks the sides (HeldPair.matches) and,
+    for a lone leg, the new market's ladders.
 
     Args:
         add_on_pairs (dict): held_pairs' result, frozenset of held tickers ->
@@ -1002,15 +977,12 @@ class CandidatePair:
     leg_sides() / leg_prices(), never by position:
 
       same_title:  NO on market_a (the pricier side by YES ask) at nA, YES on
-                   market_b (the cheaper side) at pB. Both legs pay when the
-                   two identical questions co-resolve, so the trade is a
+                   market_b (the cheaper side) at pB: two identically worded
+                   markets on two DIFFERENT event series. Both legs pay when
+                   the two identical questions co-resolve, so the trade is a
                    near-arbitrage priced on the SAME_TITLE_CO_RESOLVE_PROB
-                   prior — which is why the finder only forms such a pair
-                   across two DIFFERENT event series (see _same_series) whose
-                   two markets close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS
-                   of each other (see closes_apart, DR-74): identical wording
-                   on two series closing hours apart is two games, not one
-                   question listed twice.
+                   prior. No finder forms one: find_time_series_pairs forms
+                   time_series pairs only.
       time_series: YES on market_a (the EARLIER contract) at pA, NO on
                    market_b (the later one) at nB. "Earlier" means earlier by
                    close_time for a cross-event pair, and earlier by STATED
@@ -1094,8 +1066,8 @@ class CandidatePair:
             (scanner.prefix_fill_prices) instead of reusing one scalar average
             computed over depth the trade could never reach.
         held (HeldPair | None): The held pair (or lone held leg) this
-            candidate adds to, set by the finders only for one in their
-            add_on_pairs; None for every other pair. Read it through pair_held(), by type.
+            candidate adds to, set by find_time_series_pairs only for one in
+            its add_on_pairs; None for every other pair. Read it through pair_held(), by type.
             Enrichment and compute_trade copy it through dc_replace, so it
             reaches spec.pair.
         mid_spread (float | None): For a time-series pair, the later
@@ -1107,8 +1079,8 @@ class CandidatePair:
             writes it from the tops of the two order books it fetched, once it
             has priced the pair at its fills and found a YES ask on the later
             book; the backtest writes it from that Monday's candle quotes.
-            None before that, and always None for same_title. The finders
-            never set it. Read it through pair_mid_spread(), by type: the
+            None before that, and always None for same_title. The finder
+            never sets it. Read it through pair_mid_spread(), by type: the
             sizer refuses a time-series pair without a usable one.
     """
     market_a: Any           # same_title: pricier side by YES ask | time_series: EARLIER contract (close_time, or STATED deadline for a DR-73 ladder)
@@ -1128,9 +1100,9 @@ class CandidatePair:
     # and chose the tier; None = tier this pair on close_time. Read via
     # pair_gap_days(), never by truthiness (a 0-day stated gap is falsy).
     stated_gap_days: int | None = None
-    # The held pair or lone held leg this candidate adds to (set by the
-    # finders only for one in their add_on_pairs); None for every other pair.
-    # Read via pair_held(), by type.
+    # The held pair or lone held leg this candidate adds to (set by
+    # find_time_series_pairs only for one in its add_on_pairs); None for every
+    # other pair. Read via pair_held(), by type.
     held: HeldPair | None = None
     # A time-series pair's later market's YES midpoint minus the earlier
     # one's (config.time_series_mid_spread), the forecast's input: written by
@@ -1193,7 +1165,7 @@ def market_fee_multiplier(market: Any) -> float:
     Return the fee multiplier one market's leg is charged at.
 
     The one reader of a market's _fee_multiplier (set by
-    main._attach_series_labels live and backtester._candidate_pair in the
+    main._attach_fee_multipliers live and backtester._candidate_pair in the
     backtest), read by type: a market that carries none, a test double's
     auto-attribute or anything that is not a number reads 1.0, and a listed
     multiplier counts only when config.CONFIRMED_FEE_MULTIPLIERS holds it
@@ -1389,7 +1361,8 @@ def pair_key(market: Any) -> str:
     """
     Combined grouping key — event title joined with market title.
 
-    Used by the pair-finders to ensure two markets with the same option label in
+    Used by find_time_series_pairs' grouping key (and by market_ladder_keys
+    and held_pair_kind) to ensure two markets with the same option label in
     different unrelated events (e.g. "Trump" in "2024 Election" vs. "Trump" in
     "2024 Time Person of the Year") do NOT get grouped as the same question.
     Falls back to the bare market_title when `_event_title` is missing — this
@@ -1421,8 +1394,8 @@ def event_series(event_ticker: Any) -> str:
     series are two instances of ONE recurring fixture (two ball games, two
     15-minute price windows, two combo tickets), which is what makes identical
     wording across them two different questions rather than one question listed
-    twice — see find_same_title_pairs and CLAUDE.md's one-series gotcha
-    (DR-02, DR-54).
+    twice — see _same_series, find_time_series_pairs' one-series check and
+    CLAUDE.md's one-series gotcha (DR-02, DR-54).
 
     Kalshi lists its multi-leg COMBO (parlay) markets under several prefixes,
     all beginning config.MVE_SERIES_FAMILY_PREFIX ("KXMVE"). The literal prefix
@@ -1474,6 +1447,10 @@ def _identical_wording(mA: Any, mB: Any) -> bool:
     """
     True when two markets carry the same raw (title, subtitle, event title).
 
+    find_time_series_pairs reads it twice (with _same_series across two
+    events, and alone for two rungs of one event), and held_pair_kind reads
+    it to give two identically worded held markets no kind.
+
     Compares the RAW strings, not the date-stripped ones: the point of the test
     is that the deadline does not appear anywhere in the wording, so two
     contracts worded identically cannot be "the same question at two
@@ -1509,10 +1486,14 @@ def _same_series(mA: Any, mB: Any) -> bool:
     combo (KXMVE*) prefix collapses onto one family, so two combo tickets share
     a series while sharing no literal prefix (DR-55).
 
+    find_time_series_pairs reads it with _identical_wording: identical
+    wording on two events of one series is refused as two instances of one
+    recurring fixture (DR-02, DR-54).
+
     Fails CLOSED: a pair whose fixture identity cannot be read (an empty or
     non-string event_ticker on either side) reads as the same series and is
-    therefore refused, because pricing it on the 95% co-resolution prior
-    requires PROVING the two events are different fixtures.
+    therefore refused, since nothing then shows the two events are different
+    fixtures.
 
     Args:
         mA (Any): First market object with an .event_ticker attribute.
@@ -1528,22 +1509,23 @@ def _same_series(mA: Any, mB: Any) -> bool:
 
 def closes_apart(close_a: Any, close_b: Any) -> bool:
     """
-    True when two close times are more than SAME_TITLE_MAX_CLOSE_GAP_SECONDS
+    True when two close times are more than HELD_PAIR_CLOSE_GAP_SECONDS
     apart, or when they cannot be compared.
 
-    The single definition of the same-title close gate (DR-74), used by both
-    paths: find_same_title_pairs reads it through _closes_apart, and
-    backtester._extract_pairs' same-title branch calls it directly on the
-    close times it has already parsed. Identical wording on two DIFFERENT
-    series is one question only when both markets resolve at the same moment
-    — a men's and a women's college basketball game between the same two
-    schools share title, subtitle and event title and close hours apart, and
-    two competitions' fixtures of one matchup close days apart.
+    The one definition of the held-pair check's close-time test.
+    held_pair_kind reads it, through _closes_apart, for two held markets on
+    two events when either one's stated deadline cannot be read: closing
+    within the bound (one hour), they could be a same-title pair (one
+    question listed by two different series, whose two markets close at one
+    moment) whose wording Kalshi respelled on one market, so they are not
+    read as a time-series pair, and such a pair is never trimmed as one. The
+    bound is scanner's own binding of config.HELD_PAIR_CLOSE_GAP_SECONDS,
+    read each time this is called.
 
-    Fails CLOSED, like _same_series: a same-title pair is priced on the
-    SAME_TITLE_CO_RESOLVE_PROB prior only when both markets DEMONSTRABLY
-    resolve at the same moment, so anything that is not a datetime, and a
-    naive/aware mix (whose subtraction would raise), reads as "apart".
+    Anything that is not a datetime, and a naive/aware mix (whose subtraction
+    would raise), reads as "apart": the two cannot be shown to close
+    together. held_pair_kind then needs two comparable closes anyway, so a
+    close it cannot compare gives no kind.
 
     Args:
         close_a (Any): The first market's close time; a datetime to be
@@ -1552,10 +1534,10 @@ def closes_apart(close_a: Any, close_b: Any) -> bool:
 
     Returns:
         bool: True when the two closes are more than
-            SAME_TITLE_MAX_CLOSE_GAP_SECONDS apart (strictly: a gap of exactly
-            the bound is NOT apart), or when either is not a datetime, or when
-            one is naive and the other aware. False only for two comparable
-            closes within the bound.
+            HELD_PAIR_CLOSE_GAP_SECONDS apart (strictly: a gap of exactly the
+            bound is NOT apart), or when either is not a datetime, or when one
+            is naive and the other aware. False only for two comparable closes
+            within the bound.
     """
     if not isinstance(close_a, datetime) or not isinstance(close_b, datetime):
         return True
@@ -1563,28 +1545,17 @@ def closes_apart(close_a: Any, close_b: Any) -> bool:
     # unreadable gap is not a demonstrated same-moment resolution.
     if (close_a.utcoffset() is None) != (close_b.utcoffset() is None):
         return True
-    return abs((close_a - close_b).total_seconds()) > SAME_TITLE_MAX_CLOSE_GAP_SECONDS
+    return abs((close_a - close_b).total_seconds()) > HELD_PAIR_CLOSE_GAP_SECONDS
 
 
 def _closes_apart(mA: Any, mB: Any) -> bool:
     """
-    Live reader of the same-title close gate: closes_apart over .close_time.
+    held_pair_kind's reader of closes_apart over each market's .close_time.
 
     The attribute is read by TYPE, not presence — closes_apart tests
     isinstance(datetime) — so a MagicMock's auto-attribute, which is not a
-    datetime, fails closed rather than comparing two mocks. The live finder
-    only ever reaches readable, aware closes: _filter_active_markets drops a
-    market with a missing close_time before grouping, and Kalshi's close
-    strings end in "Z", so _market_from_dict parses them aware.
-
-    Unlike the backtest, the live finder has ONE refusal line for this gate,
-    so a pair whose closes cannot be compared (a non-datetime, or one naive
-    beside one aware) is counted on the close-gap line, whose wording says the
-    two markets "close more than N minutes apart" — where
-    backtester._extract_pairs counts the same shape on its backtest-only
-    unreadable-close line. The two close-gap lines are therefore verbatim
-    twins for READABLE closes only. That case is unreachable live today (see
-    above), and it fails closed on both paths either way.
+    datetime, reads as apart rather than comparing two mocks, and a missing
+    attribute reads as None (apart too).
 
     Args:
         mA (Any): First market object with a .close_time attribute.
@@ -1595,39 +1566,6 @@ def _closes_apart(mA: Any, mB: Any) -> bool:
             attribute read as None (and therefore apart).
     """
     return closes_apart(getattr(mA, "close_time", None), getattr(mB, "close_time", None))
-
-
-def close_gap_bound_text(seconds: int | None = None) -> str:
-    """
-    The same-title close gate's bound as a log line or message prints it.
-
-    With no argument it reads SAME_TITLE_MAX_CLOSE_GAP_SECONDS from THIS
-    module at call time — the binding closes_apart reads — so the bound a
-    refusal line prints is always the one its gate applied, on both paths:
-    find_same_title_pairs and backtester._extract_pairs format their
-    verbatim-twin close-gap lines with it, and a test that narrows
-    scanner.SAME_TITLE_MAX_CLOSE_GAP_SECONDS narrows the gate and both lines
-    together (DR-74). Resolved at call time, never bound as a def-time
-    default, for the same reason time_series_profit_prob's k is: a default
-    would freeze the value at import and ignore a patch. The seconds
-    argument renders any other bound (the tests pass one).
-
-    A whole number of minutes prints as minutes ("60 minutes", "1 minute");
-    anything else prints in seconds ("90 seconds"), so the text never
-    truncates a bound into a different, false one.
-
-    Args:
-        seconds (int | None): The bound to render, in seconds. None (the
-            default) renders this module's SAME_TITLE_MAX_CLOSE_GAP_SECONDS.
-
-    Returns:
-        str: e.g. "60 minutes" for the shipped 3,600-second bound.
-    """
-    bound = SAME_TITLE_MAX_CLOSE_GAP_SECONDS if seconds is None else seconds
-    if bound % 60 == 0:
-        minutes = bound // 60
-        return f"{minutes} minute{'' if minutes == 1 else 's'}"
-    return f"{bound} second{'' if bound == 1 else 's'}"
 
 
 # An event's fee override that is not known: the market was not built from an
@@ -1705,7 +1643,7 @@ def listed_fee_multiplier(series_listed: Any, event_override: Any) -> float:
     """
     The fee multiplier a market is listed at: its event's override, else its series'.
 
-    The one rule both paths file a market's multiplier by (main._attach_series_labels
+    The one rule both paths file a market's multiplier by (main._attach_fee_multipliers
     live, backtester._prepare_candidates in the backtest, seller for a paid-out
     partner). An override that is not known (EVENT_FEE_OVERRIDE_UNKNOWN, or
     anything that is neither None nor a valid multiplier) gives 1.0, the full
@@ -1738,159 +1676,6 @@ def market_event_fee_override(market: Any) -> float | None | str:
         float | None | str: What the market carries, or EVENT_FEE_OVERRIDE_UNKNOWN.
     """
     return getattr(market, "_event_fee_override", EVENT_FEE_OVERRIDE_UNKNOWN)
-
-
-def event_competition(event: Any) -> str | None:
-    """
-    The competition an event names, such as "NCAA Football" or "NCAA Volleyball (W)".
-
-    Kalshi keeps it in the event's product_metadata. Sports events carry it
-    (a men's and a women's game of one sport are two competitions); most
-    other events carry none. fetch_open_events_with_markets attaches it to
-    every market it parses, as ApiMarket._event_competition, for the
-    same-title competition check (competitions_differ, DR-79), and
-    historical.load_event_competitions reads the backtest's labels with it.
-
-    An event that names no competition (no product_metadata, or none in it,
-    or a null one) reads as "". A label that is there but cannot be read (a
-    product_metadata that is not an object, a competition that is not a
-    string, or an event that is not an object at all) reads as None, which
-    competitions_differ treats as unknown, so a reshaped payload refuses
-    pairs rather than letting two events read as naming none.
-
-    Args:
-        event (Any): One event object from an /events reply.
-
-    Returns:
-        str | None: The label with surrounding spaces removed; "" when the
-            event names none; None when the label cannot be read.
-    """
-    if not isinstance(event, dict):
-        return None
-    meta = event.get("product_metadata")
-    if meta is None:
-        return ""
-    if not isinstance(meta, dict):
-        return None
-    label = meta.get("competition")
-    if label is None:
-        return ""
-    return label.strip() if isinstance(label, str) else None
-
-
-def _is_label_pair(labels: Any) -> bool:
-    """
-    True for a (category, tag) tuple of two strings, the shape series_labels returns.
-
-    Args:
-        labels (Any): A market's ._series_labels, or anything else.
-
-    Returns:
-        bool: True only for a tuple of exactly two strings.
-    """
-    return (isinstance(labels, tuple) and len(labels) == 2
-            and all(isinstance(part, str) for part in labels))
-
-
-def labels_differ(labels_a: Any, labels_b: Any) -> bool:
-    """
-    True unless two series are filed under one Kalshi category and first tag.
-
-    Half of the same-title sport check (DR-79). Identical wording on two
-    series is one question only when both series are about the same thing:
-    "Kentucky vs Oklahoma: Kentucky wins" is a football game in one series
-    and a women's volleyball match in another, filed Sports · Football and
-    Sports · Volleyball. The labels are historical.series_labels'
-    (category, tag), the filing rule the dashboard and the live category/tag
-    filter use, compared without regard to letter case. find_same_title_pairs
-    reads it through _labels_differ; backtester._extract_pairs calls it
-    directly, on the labels it files each cached series by.
-
-    Fails closed: anything that is not a (category, tag) pair of strings
-    reads as different, so a market whose labels were never attached is
-    never paired.
-
-    Args:
-        labels_a (Any): The first series' (category, tag).
-        labels_b (Any): The second series' (category, tag).
-
-    Returns:
-        bool: False only when both are (category, tag) pairs of strings that
-            match once letter case is ignored.
-    """
-    if not (_is_label_pair(labels_a) and _is_label_pair(labels_b)):
-        return True
-    return (tuple(part.casefold() for part in labels_a)
-            != tuple(part.casefold() for part in labels_b))
-
-
-def competitions_differ(competition_a: Any, competition_b: Any) -> bool:
-    """
-    True unless two events name the same competition, or neither names one.
-
-    The other half of the same-title sport check (DR-79). Two series of one
-    sport share a tag ("Basketball", "Soccer"), so a men's and a women's
-    game, two leagues, or a league and a cup fixture of one matchup are told
-    apart by the competition each event names (event_competition). One event
-    naming a competition and the other naming none counts as different.
-    Letter case and surrounding spaces are ignored. find_same_title_pairs
-    reads it through _competitions_differ;
-    backtester._refuse_other_competitions calls it directly, on the labels
-    historical.load_event_competitions reads.
-
-    Fails closed: anything that is not a str (an unknown label, such as the
-    None event_competition gives for one it cannot read) reads as different.
-
-    Args:
-        competition_a (Any): The first event's label; "" when it names none.
-        competition_b (Any): The second event's label, same shape.
-
-    Returns:
-        bool: False only when both are strings that match once letter case
-            and surrounding spaces are ignored (two "" match).
-    """
-    if not isinstance(competition_a, str) or not isinstance(competition_b, str):
-        return True
-    return competition_a.strip().casefold() != competition_b.strip().casefold()
-
-
-def _labels_differ(mA: Any, mB: Any) -> bool:
-    """
-    find_same_title_pairs' reader of labels_differ over each market's ._series_labels.
-
-    main._attach_series_labels sets that attribute on every market of a run
-    before any pair is found. A market without it (or a MagicMock, whose
-    auto-attribute is not a tuple) fails closed.
-
-    Args:
-        mA (Any): First market object.
-        mB (Any): Second market object.
-
-    Returns:
-        bool: labels_differ of the two markets' labels, a missing one read as None.
-    """
-    return labels_differ(getattr(mA, "_series_labels", None),
-                         getattr(mB, "_series_labels", None))
-
-
-def _competitions_differ(mA: Any, mB: Any) -> bool:
-    """
-    find_same_title_pairs' reader of competitions_differ over each market's ._event_competition.
-
-    fetch_open_events_with_markets sets that attribute on every market it
-    parses ("" for an event that names no competition, None for one whose
-    label cannot be read). None, a market without the attribute, or a
-    MagicMock (whose auto-attribute is not a str) fails closed.
-
-    Args:
-        mA (Any): First market object.
-        mB (Any): Second market object.
-
-    Returns:
-        bool: competitions_differ of the two markets' labels, a missing one read as None.
-    """
-    return competitions_differ(getattr(mA, "_event_competition", None),
-                               getattr(mB, "_event_competition", None))
 
 
 def _field_phrasing(text: Any) -> str | None:
@@ -2047,7 +1832,8 @@ def deadline_profile(event_title: Any, title: Any, subtitle: Any) -> tuple:
     """
     A market's phrasing verdict and its deadline spans, computed in one call.
 
-    The memoizable unit: both finders classify each market ONCE into one of
+    The memoizable unit: both time-series finders (find_time_series_pairs
+    and backtester._extract_pairs) classify each market ONCE into one of
     these and then compare the cheap results pairwise. That is a hard
     requirement rather than a tidy-up — the backtester's pair sweep runs on the
     order of a million comparisons for a single large group, where re-running
@@ -2184,7 +1970,8 @@ def cumulative_deadline_pair(profile_a: tuple, profile_b: tuple) -> bool:
     """
     True when two markets are one question asked at two different CUMULATIVE deadlines.
 
-    The eligibility rule for a time-series pair, applied by BOTH finders on
+    The eligibility rule for a time-series pair, applied by BOTH time-series
+    finders (find_time_series_pairs and backtester._extract_pairs) on
     precomputed deadline_profile() results. Defined through
     deadline_pair_refusal() (DR-72): True exactly when that function returns
     None, so the two can never disagree about which pairs are eligible. In
@@ -2596,9 +2383,9 @@ def stated_deadline(
 
     Args:
         profile (tuple): The market's (verdict, spans) from deadline_profile()
-            — passed in rather than recomputed, because both finders classify
-            each market exactly ONCE and compare the cheap results pairwise
-            (DR-70).
+            — passed in rather than recomputed, because both time-series
+            finders classify each market exactly ONCE and compare the cheap
+            results pairwise (DR-70).
         event_title (Any): The market's parent event title. Non-str reads as absent.
         title (Any): The market's own question text. Non-str reads as absent.
         subtitle (Any): The market's outcome label / sub-contract. Non-str reads
@@ -2915,25 +2702,24 @@ def _filter_active_markets(
     them offers no edge. Markets whose tickers are in excluded_tickers are already
     held in the portfolio and must not be traded again. A market whose close_time
     is None (missing or unparseable in the API payload, see _market_from_dict) is
-    also dropped here: this filter is the first thing both find_time_series_pairs
-    and find_same_title_pairs call, and every downstream consumer treats
-    close_time as a real datetime — the close_time sort and deadline-gap
-    arithmetic in the finders, _pair_max_sum's tiered ceiling, and
-    strategy.compute_trade's days-to-close normalization all raise on None.
-    Dropping such markets keeps the finders' "skip bad markets, don't raise"
-    contract.
+    also dropped here: this filter is the first thing find_time_series_pairs
+    calls, and every downstream consumer treats close_time as a real
+    datetime — the close_time sort and deadline-gap arithmetic in the finder,
+    _pair_max_sum's tiered ceiling, and strategy.compute_trade's
+    days-to-close normalization all raise on None. Dropping such markets keeps
+    the finder's "skip bad markets, don't raise" contract.
 
     Args:
         markets (list): List of Kalshi market API objects to filter.
         excluded_tickers (set | None): Set of ticker strings to skip. If None,
             no tickers are excluded.
         warn_missing_close (bool): Whether to emit the missing-close_time
-            summary WARNING. Keyword-only, and True by default so any
-            standalone caller keeps the signal. find_same_title_pairs passes
-            False, leaving the line to find_time_series_pairs, the finder
-            every run mode calls, so a run logs it ONCE, which is what
-            CLAUDE.md specifies. This flag NEVER changes which markets are
-            dropped, only whether the drop is reported (TS-22).
+            summary WARNING. Keyword-only, and True by default, the value
+            find_time_series_pairs (the finder every run mode calls once)
+            runs it with: a run logs the line ONCE, as CLAUDE.md specifies.
+            False drops the same markets without the line; this flag NEVER
+            changes which markets are dropped, only whether the drop is
+            reported (TS-22).
 
     Returns:
         list: Subset of markets that have a non-None close_time and a parseable
@@ -3719,14 +3505,6 @@ class ApiMarket:
             its own market's shard (see trader._build_no_order_v2).
             DEFAULT_EXCHANGE_INDEX when the payload omits the field.
         _event_title (str): Parent event title attached for pair_key grouping.
-        _event_competition (str | None): The competition the parent event
-            names (event_competition), "" when it names none, None when its
-            label cannot be read. Read by the same-title competition check
-            (_competitions_differ), which refuses None.
-        _series_labels: The (category, tag) the market's series is filed
-            under in Kalshi's /series listing (historical.series_labels),
-            set by main._attach_series_labels; None until then, which the
-            same-title sport check (_labels_differ) reads as unknown.
         _event_fee_override (float | None | str): The fee multiplier override
             its event sets (event_fee_override): None for none, and
             EVENT_FEE_OVERRIDE_UNKNOWN (the default, for a market not built
@@ -3734,7 +3512,7 @@ class ApiMarket:
         _fee_multiplier (float): The fee multiplier the market is listed at
             (listed_fee_multiplier: its event's override, else its series' in
             Kalshi's /series listing, historical.load_series_fee_multipliers),
-            set by main._attach_series_labels; 1.0, the full fee, for a series
+            set by main._attach_fee_multipliers; 1.0, the full fee, for a series
             the listing does not give one for, an event override not known,
             and until it is set. Read only
             through market_fee_multiplier (leg_fee_multipliers), which charges
@@ -3753,17 +3531,13 @@ class ApiMarket:
     price_ranges: Any = None  # list[PriceRange] | None — None = unknown
     exchange_index: int = DEFAULT_EXCHANGE_INDEX
     _event_title: str = field(default="")
-    _event_competition: str | None = field(default="")
-    # (category, tag); main._attach_series_labels sets it
-    _series_labels: Any = field(default=None)
     # The event's fee override as read; unknown (the full fee) by default
     _event_fee_override: Any = field(default=EVENT_FEE_OVERRIDE_UNKNOWN)
-    # main._attach_series_labels sets it; 1.0 (the full fee) until then
+    # main._attach_fee_multipliers sets it; 1.0 (the full fee) until then
     _fee_multiplier: float = field(default=1.0)
 
 
-def _market_from_dict(m: dict, event_title: str,
-                      event_competition: str | None = "", *,
+def _market_from_dict(m: dict, event_title: str, *,
                       event_fee_override: Any = EVENT_FEE_OVERRIDE_UNKNOWN) -> ApiMarket:
     """
     Build an ApiMarket from one raw market JSON dict.
@@ -3776,10 +3550,6 @@ def _market_from_dict(m: dict, event_title: str,
     Args:
         m (dict): One market from a raw market or event reply.
         event_title (str): Parent event's title, attached as _event_title.
-        event_competition (str | None): The competition the parent event
-            names (event_competition), attached as _event_competition. ""
-            (the default) when it names none or the caller did not read it;
-            None when it could not be read.
         event_fee_override (Any): Keyword-only. The parent event's fee
             override (event_fee_override), attached as _event_fee_override;
             EVENT_FEE_OVERRIDE_UNKNOWN (the default) when the caller did not
@@ -3800,9 +3570,10 @@ def _market_from_dict(m: dict, event_title: str,
         title=m.get("title") or "",
         # The API dropped `subtitle` from market payloads (2026-08 drift);
         # yes_sub_title carries the same intra-title outcome label (e.g. the
-        # option name in a multi-choice event) and is the discriminator
-        # same-title grouping depends on. no_sub_title is deliberately NOT
-        # used — it is the negated phrasing and would yield asymmetric keys.
+        # option name in a multi-choice event) and is the outcome
+        # discriminator the time-series grouping key depends on
+        # (time_series_group_key). no_sub_title is deliberately NOT used — it
+        # is the negated phrasing and would yield asymmetric keys.
         subtitle=m.get("subtitle") or m.get("yes_sub_title") or "",
         status=m.get("status") or "",
         close_time=close_dt,
@@ -3815,7 +3586,6 @@ def _market_from_dict(m: dict, event_title: str,
         # planner read it later
         exchange_index=_shard_index(m),
         _event_title=event_title,
-        _event_competition=event_competition,
         _event_fee_override=event_fee_override,
     )
 
@@ -3853,18 +3623,22 @@ def _error_text(exc: BaseException) -> str:
 def _fetch_held_market(client: Any, ticker: str, event_titles: dict, *,
                        noun: str = "held market") -> ApiMarket | None:
     """
-    Ask the exchange for one held market and its event's title and competition.
+    Ask the exchange for one held market and its event's title.
 
     The event title is part of the question label, so without it the label
-    would not match the market's ladder-mates. The competition is kept as the
-    market list keeps it (event_competition), for the same-title sport check.
-    `event_titles` caches both by event.
+    would not match the market's ladder-mates. `event_titles` is a memo of
+    each looked-up event's title, which a caller keeps across its lookups
+    (resolve_held_ladders keeps one for each call; seller.plan_sales and
+    seller.plan_trims each keep one for each call, in seller._Reads, and pass
+    it through market_for_labels): the first lookup of an event reads the
+    event and stores its title there, and a later lookup of another market of
+    that event reads the title from it, with no second event request.
 
     Args:
         client (Any): An authenticated Kalshi client.
         ticker (str): The held market's ticker.
-        event_titles (dict): Each event already fetched, by event ticker:
-            its (title, competition).
+        event_titles (dict): Each looked-up event's title (a str), by event
+            ticker; a lookup of an event not in it adds that event's title.
         noun (str): Keyword-only. What the failure lines call the market:
             "held market", or "market" for one that may no longer be held.
 
@@ -3894,15 +3668,13 @@ def _fetch_held_market(client: Any, ticker: str, event_titles: dict, *,
                 logging.warning("Could not look up %s %s: the reply for its event "
                                 "%s had no event", noun, ticker, event_ticker)
                 return None
-            # A title-less event reads as "", as in the market list, and its
-            # competition is read as the market list reads it
-            event_titles[event_ticker] = (event.get("title") or "",
-                                          event_competition(event))
-        title, competition = event_titles[event_ticker]
+            # A title-less event reads as "", as in the market list
+            event_titles[event_ticker] = event.get("title") or ""
+        title = event_titles[event_ticker]
         # Parsed like the market list, so its labels match its ladder-mates'.
         # Its event fee override stays unknown (the full fee): a market
         # looked up outside the run's list is never charged a reduced fee
-        return _market_from_dict(raw, title, competition)
+        return _market_from_dict(raw, title)
     except Exception as exc:
         logging.warning("Could not look up %s %s: %s", noun, ticker, _error_text(exc))
         return None
@@ -3913,17 +3685,19 @@ def market_for_labels(client: Any, ticker: Any, markets_by_ticker: dict,
     """
     Find a market by ticker: in this run's market list, else from the exchange.
 
-    seller.plan_sales gets a paid-out market's ladder labels through it. A
-    market missing from the list is looked up as resolve_held_ladders looks up
-    a held market (event title included), so its labels match its ladder-mates'.
+    seller.plan_sales and seller.plan_trims get a paid-out market's ladder
+    labels through it. A market missing from the list is looked up as
+    resolve_held_ladders looks up a held market (event title included), so its
+    labels match its ladder-mates'.
 
     Args:
         client (Any): An authenticated Kalshi client.
         ticker (Any): The market's ticker; anything but a non-empty string
             names no market.
         markets_by_ticker (dict): This run's markets by ticker, before held ones are removed.
-        event_titles (dict): Each looked-up event's (title, competition), by
-            event ticker; a lookup adds to it.
+        event_titles (dict): Each looked-up event's title (a str), by event
+            ticker; a lookup adds to it. One memo serves every call a caller
+            makes, so two markets of one event cost one event request.
 
     Returns:
         ApiMarket | None: The market, or None when the ticker names none or
@@ -3943,9 +3717,11 @@ def resolve_held_ladders(client: Any, markets: list, held_tickers: set, *,
     Return the ladder labels of every market we currently hold.
 
     Reads this run's market list, and asks the exchange about any held
-    market missing from it (one closed but not yet paid out, say). Returns
-    None if a held market can't be identified: the caller must then make no
-    time-series trade.
+    market missing from it (one closed but not yet paid out, say). Those
+    lookups share one memo of each looked-up event's title, so two held
+    markets of one event cost one event request. Returns None if a held
+    market can't be identified: the caller must then make no time-series
+    trade.
 
     Args:
         client (Any): An authenticated Kalshi client.
@@ -3960,6 +3736,7 @@ def resolve_held_ladders(client: Any, markets: list, held_tickers: set, *,
         frozenset | None: Every held market's labels, or None if one is unknown.
     """
     by_ticker = {m.ticker: m for m in markets}
+    # Each looked-up event's title, by event ticker, shared by this call's lookups
     event_titles: dict = {}
     keys: set = set()
     looked_up = 0
@@ -4310,7 +4087,8 @@ def held_pair_kind(yes_market: Any, no_market: Any) -> tuple[str, Any, Any] | No
       finder, so a same-title pair respelled on one market is never read as
       time-series: stated days that both read must differ and agree with the
       closes, and with a stated day unread the closes must be further apart
-      than the same-title bound.
+      than the held-pair close bound, HELD_PAIR_CLOSE_GAP_SECONDS (one hour;
+      closes_apart).
 
     No price test, no deadline-gap cap, and TIME_SERIES_SAME_EVENT_LADDERS is
     not read: those decide what may be bought, not what is held.
@@ -4360,8 +4138,8 @@ def held_pair_kind(yes_market: Any, no_market: Any) -> tuple[str, Any, Any] | No
     # Across events: stated days that both read must differ, A's the earlier
     if ladder is SAME_DAY or (ladder is not None and ladder[0]):
         return None
-    # A stated day unread and closes within the same-title bound: this could
-    # be a same-title pair respelled on one market
+    # A stated day unread and closes within the held-pair close bound of each
+    # other: this could be a same-title pair respelled on one market
     if ladder is None and not _closes_apart(market_a, market_b):
         return None
     close_a = getattr(market_a, "close_time", None)
@@ -4787,12 +4565,8 @@ def fetch_open_events_with_markets(
     response contains its constituent markets. Each market gets the parent event's
     title attached as a `_event_title` attribute — this is the key change that
     allows MVE (multivariate) markets to be safely scanned: pair-grouping uses
-    `event_title + market_title`, so cross-event option-label collisions (e.g.
-    "Trump" in two unrelated events) no longer false-positive into a same-title
-    or time-series pair. Each market also gets the competition its event names
-    (event_competition: "" for none, None for a label it cannot read) as
-    `_event_competition`, which the same-title sport check compares; one
-    always-logged line counts the markets whose event names one.
+    `event_title + market_title`, so an option label two unrelated events
+    share (e.g. "Trump") does not put their markets in one time-series group.
 
     Uses the SDK's raw-response variants + ApiMarket parsing instead of the
     modeled `get_events` call — the pinned SDK's Market model can no longer
@@ -4830,10 +4604,8 @@ def fetch_open_events_with_markets(
     Returns:
         list: Flat list of ApiMarket objects for all open markets, each with
             `_event_title` set to its parent event's full title (may be empty
-            string if the event had no title), `_event_competition` set to the
-            competition that event names ("" for none, None when unreadable)
-            and `exchange_index` set to its shard. May contain thousands of
-            items.
+            string if the event had no title) and `exchange_index` set to its
+            shard. May contain thousands of items.
     """
     markets: list = []
     # Normalize once so both loops below do a plain set membership test
@@ -4864,8 +4636,6 @@ def fetch_open_events_with_markets(
         pages += 1
         for ev in data.get("events") or []:
             ev_title = ev.get("title") or ""
-            # The competition the event names, for the same-title sport check
-            ev_competition = event_competition(ev)
             # The fee multiplier the event sets over its series', if any
             ev_fee_override = event_fee_override(ev)
             for m in ev.get("markets") or []:
@@ -4884,9 +4654,8 @@ def fetch_open_events_with_markets(
                     skipped_shard += 1
                     continue
                 # Parse into ApiMarket with the parent event title attached so
-                # pair_key()/display_title() can find it, and its competition
-                markets.append(_market_from_dict(m, ev_title, ev_competition,
-                                                 event_fee_override=ev_fee_override))
+                # pair_key()/display_title() can find it
+                markets.append(_market_from_dict(m, ev_title, event_fee_override=ev_fee_override))
         if pages % SCANNER_PROGRESS_LOG_EVERY_PAGES == 0:
             logging.info("Open-events fetch: %d pages, %d markets so far", pages, len(markets))
         new_cursor = data.get("cursor")
@@ -4954,8 +4723,6 @@ def fetch_open_events_with_markets(
             page_active_count = 0
             for ev in events:
                 ev_title = ev.get("title") or ""
-                # The competition the event names, as in the standard loop
-                ev_competition = event_competition(ev)
                 ev_fee_override = event_fee_override(ev)
                 for m in ev.get("markets") or []:
                     # Only include markets that are still open — MVE response may
@@ -4970,7 +4737,7 @@ def fetch_open_events_with_markets(
                             skipped_shard += 1
                             continue
                         markets.append(_market_from_dict(
-                            m, ev_title, ev_competition, event_fee_override=ev_fee_override))
+                            m, ev_title, event_fee_override=ev_fee_override))
                         mve_market_count += 1
                         page_active_count += 1
             if mve_pages % SCANNER_PROGRESS_LOG_EVERY_PAGES == 0:
@@ -5034,19 +4801,6 @@ def fetch_open_events_with_markets(
         "Ingested markets by shard: %s",
         dict(sorted(Counter(m.exchange_index for m in markets).items())),
     )
-    # How many markets' events name a competition, which the same-title sport
-    # check compares. Always logged, so a label Kalshi moved or renamed (every
-    # event then reads as naming none) shows as a count near zero
-    logging.info(
-        "Markets whose event names a competition: %d of %d",
-        sum(1 for m in markets if m._event_competition), len(markets),
-    )
-    unreadable_competitions = sum(1 for m in markets if m._event_competition is None)
-    if unreadable_competitions:
-        logging.warning(
-            "Markets whose event's competition label is not text: %d (read as "
-            "unknown, so none of them forms a same-title pair)", unreadable_competitions,
-        )
     logging.info("Fetched %d open markets (MVE included: %s)", len(markets), INCLUDE_MVE_MARKETS)
     return markets
 
@@ -5108,12 +4862,11 @@ def find_time_series_pairs(
          every combo (KXMVE*) prefix onto one family — DR-55), the deadline
          lives outside the wording entirely, so these are two instances of one
          recurring fixture rather than one question at two deadlines and there
-         is no cumulative-deadline premise (DR-02, DR-54). find_same_title_pairs
-         refuses the same shape; were this finder not to refuse it too, it
-         would trade such a pair as a time-series bet. Such candidates are
-         counted and reported once after the loop on their own silent-at-zero
-         INFO line (M10), as find_same_title_pairs reports its own one-series
-         skips; backtester._extract_pairs logs its sweep's count on a line
+         is no cumulative-deadline premise (DR-02, DR-54). Item 4 would refuse
+         identical wording too (it states one deadline, or none); this check
+         runs first and names the reason. Such candidates are counted and
+         reported once after the loop on their own silent-at-zero INFO line
+         (M10); backtester._extract_pairs logs its sweep's count on a line
          that differs only in its parenthesis.
       4. Both legs are CUMULATIVE-deadline markets ("will X happen BY
          <date>") stating two DIFFERENT deadlines — cumulative_deadline_pair
@@ -5312,9 +5065,8 @@ def find_time_series_pairs(
     # two legs naming the SAME deadline are three different findings with
     # three different remedies, and collapsing them hid which one applied.
     # Plus the price-sum skip below. All reported once after the loop
-    # (silent at zero) — the same summary idiom find_same_title_pairs uses
-    # for its series skips. The checks themselves are NOT reordered: the
-    # wording check still runs strictly before the price-sum check, so this
+    # (silent at zero). The checks themselves are NOT reordered: the
+    # wording check runs strictly before the price-sum check, so this
     # split cannot shift any candidate's count into price_sum_skips.
     snapshot_skips = 0
     no_deadline_skips = 0
@@ -5327,11 +5079,9 @@ def find_time_series_pairs(
     gap_cap_skips = 0
     price_sum_skips = 0
     # Cross-event candidates refused by the one-series conjunct (M10):
-    # identical wording across two events of one series. It was the one
-    # refusal ahead of the price filters in this branch with no count, so a
-    # run whose time-series zero it caused logged no cause; counted where it
-    # fires, before the wording check, exactly as find_same_title_pairs
-    # counts its own series skips. (The price-parse `continue` and the
+    # identical wording across two events of one series. Counted where it
+    # fires, before the wording check, so a run whose time-series zero it
+    # causes logs the cause. (The price-parse `continue` and the
     # non-positive-spread `continue` further down stay uncounted.)
     series_skips = 0
     # The spread rule's counted refusals (below the floor, above the ceiling);
@@ -5391,8 +5141,6 @@ def find_time_series_pairs(
                 # same-event ladder is ordered by STATED deadline and may swap
                 # its legs below, and swapping the OUTER loop variable in
                 # place would leak into every later m_inner of this iteration.
-                # find_same_title_pairs already uses this idiom for exactly
-                # the same reason.
                 mA, mB = m_outer, m_inner
                 # A same-event ladder's gap is its STATED deadline gap; None
                 # means "this pair is tiered on close_time" (pair_gap_days).
@@ -5525,12 +5273,12 @@ def find_time_series_pairs(
                         # which a ladder's rungs can share outright.
                         mA, mB = mB, mA
                 else:
-                    # Identical wording across two events of one series is the
-                    # same-title shape find_same_title_pairs refuses too (DR-02,
+                    # Identical wording across two events of one series (DR-02,
                     # DR-54): the deadline lives outside the wording, so these are
                     # two instances of one recurring fixture and there is no
-                    # cumulative-deadline premise to trade. Without this conjunct
-                    # this finder would trade such a pair as a time-series bet.
+                    # cumulative-deadline premise to trade. The wording check
+                    # below would refuse identical wording too; this one runs
+                    # first and counts it on a line of its own.
                     if _identical_wording(mA, mB) and _same_series(mA, mB):
                         series_skips += 1
                         continue
@@ -5719,10 +5467,9 @@ def find_time_series_pairs(
         )
     # The one-series conjunct's count (M10), silent at zero: the same line
     # backtester._extract_pairs logs for its sweep, whose parenthesis says
-    # "within the deadline-gap window" instead, as its DR-72 lines do. The
-    # words "two instances of one event series" are shared on purpose with
-    # find_same_title_pairs' line, so one grep finds the rule on both paths
-    # and in both finders.
+    # "within the deadline-gap window" instead, as its DR-72 lines do, so one
+    # grep for "two instances of one event series" finds the rule on both
+    # paths.
     if series_skips:
         logging.info(
             "Time-series candidates skipped as two instances of one event "
@@ -5730,8 +5477,7 @@ def find_time_series_pairs(
             "gap and price filters): %d",
             series_skips,
         )
-    # Three separate INFO lines, each silent at zero (DR-72) — the same
-    # summary idiom find_same_title_pairs uses for its series skips, split by
+    # Three separate INFO lines, each silent at zero (DR-72), split by
     # REASON instead of folded into one "not a cumulative-deadline pair"
     # count so a reader can tell a wording problem (snapshot families, no
     # recognised deadline, one deadline said twice) from a distance problem
@@ -5885,358 +5631,6 @@ def find_time_series_pairs(
 
     logging.info(
         "Time-series pairs: %d total, %d tradeable",
-        len(candidate_pairs),
-        sum(1 for p in candidate_pairs if p.tradeable),
-    )
-    return candidate_pairs
-
-
-def find_same_title_pairs(
-    markets: list,
-    held_tickers: set | None = None,
-    *,
-    add_on_pairs: dict | None = None,
-) -> list:
-    """
-    Find pairs of markets with *exactly* the same title (no normalization),
-    where the YES ask price differs by >= SAME_TITLE_MIN_PRICE_DIFF (5%).
-
-    Both markets should resolve identically (same question), so buying NO on the
-    expensive market and YES on the cheap market pays on at least one leg
-    whenever they co-resolve — a profit when nA+pB<1 (a near-arbitrage priced
-    on the SAME_TITLE_CO_RESOLVE_PROB prior). The legs are NO on market_a at nA
-    and YES on market_b at pB; nB is populated fail-soft for reporting only.
-
-    The two event tickers must belong to DIFFERENT series (_same_series). Two
-    events of one series are two instances of one recurring fixture — two ball
-    games, two 15-minute price windows, two MVE combos of different games — so
-    identical wording across them is one question asked about two different
-    events and the co-resolution prior does not apply at all: the 2026-09-15
-    sweep's own NPB pair was quoted 0.97 and 0.01 (DR-02, DR-54). Such
-    candidates are skipped and counted, and the count is reported once at the
-    end as an INFO line. So are candidates whose two markets carry the SAME
-    event ticker (M10), on a line of their own: before M10 that skip was the
-    one refusal ahead of the price filters here with no count (the price and
-    5% gate `continue`s are still uncounted).
-
-    Different series is NECESSARY, not sufficient: the two markets must also
-    close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other (_closes_apart,
-    over the one definition closes_apart, DR-74). A men's and a women's college
-    basketball game between the same two schools (KXNCAAMBGAME / KXNCAAWBGAME)
-    share title, subtitle and event title on two different series, and so do
-    the Champions League and La Liga fixtures of one matchup — two games that
-    close hours or days apart, for which the co-resolution prior is false.
-    Refused candidates are counted after the series test on a third INFO
-    line of their own. The gate fails closed on a close time it cannot read or
-    compare. find_time_series_pairs deliberately carries no twin: identical
-    wording states the same deadline spans, or none, so it can never form a
-    time-series pair (DR-67), and a same-title-only gate cannot relabel the
-    trade. All three lines are silent at zero, and backtester._extract_pairs
-    logs all three verbatim for its same-title branch (plus a backtest-only
-    line for a close_time it cannot read, which the live finder never reaches
-    because _filter_active_markets drops such a market before grouping). The
-    close-gap line is a verbatim twin for READABLE closes: a naive close
-    beside an aware one — unreachable live today — is counted on it here and
-    on the backtest's unreadable line there (see _closes_apart). Both paths
-    print its bound through close_gap_bound_text, from this module's binding.
-
-    Closing together is not enough either: the two markets must be about the
-    same sport or subject in the same competition (DR-79). Both series must be
-    filed under one Kalshi category and first tag (_labels_differ, over the
-    labels main._attach_series_labels sets from Kalshi's /series listing), and
-    both events must name the same competition, or neither name one
-    (_competitions_differ, over the label fetch_open_events_with_markets sets
-    from the event's product_metadata). Kalshi titles a game "<Team> wins"
-    under an event "A vs B", which names neither the sport nor the date, so
-    the same two schools word a football game and a women's volleyball match
-    identically, and a scheduled close is the start time plus a fixed offset,
-    so two sports starting within an hour of each other pass the close gate.
-    Each check fails closed (a market with no labels, or a label that is not
-    a string, is never paired), and each has an INFO line of its own after
-    the close-gap line, silent at zero.
-
-    Grouping key is (event_title, title, subtitle). The event_title component is
-    what prevents cross-event option-label collisions in MVE markets — e.g. two
-    markets both titled "Trump" in unrelated events will have different event
-    titles and therefore won't be grouped together. The subtitle component is
-    sourced from the API's `yes_sub_title` field post-2026-08 drift (see
-    `_market_from_dict`) — it is the only intra-title discriminator, so without
-    it two DIFFERENT outcomes sharing one question title (e.g. two candidates
-    under "Who will the next Pope be?") on different event tickers would be
-    falsely paired as the same contract under the 95% co-resolution assumption.
-
-    Filters: different event_ticker (to exclude multi-choice options), different
-    event SERIES (to exclude two instances of one recurring fixture), closes
-    within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other (to exclude two
-    different games or instants on two series, DR-74), one Kalshi category,
-    tag and competition (to exclude two sports or two competitions, DR-79),
-    both actively priced
-    (1%-99%), not in held_tickers. One best pair per title group — so refusing
-    a group's best candidate PROMOTES its runner-up.
-
-    A market of an exact held pair in add_on_pairs pairs only with its own
-    partner, and a lone held leg in add_on_pairs (its partner paid out) only
-    with a market the account does not hold: every other candidate touching
-    one is refused first, before every other check and before the group
-    contest, so the group's next best pair can still win. A pair that adds
-    to either is judged by every rule above, and is refused too when its
-    prices have crossed so that it would buy a held market on the other side
-    from what is held (HeldPair.matches); a kept one carries the HeldPair on
-    CandidatePair.held.
-
-    Args:
-        markets (list): ApiMarket objects to scan (already fetched by the
-            caller — unlike find_time_series_pairs, this function never
-            fetches).
-        held_tickers (set | None): Tickers to exclude: the held positions,
-            less the markets in add_on_pairs (which must stay in for a pair
-            to add to them). None or empty means exclude nothing.
-        add_on_pairs (dict | None): Keyword-only. What this run may add to,
-            from held_pairs: {frozenset of the held tickers: HeldPair}, two
-            for an exact pair, one for a lone leg. None or empty adds to
-            nothing.
-
-    Returns:
-        list: CandidatePair objects, one per (event_title, title, subtitle)
-            group that produced a pair, each carrying pair_type="same_title".
-            Empty if no group has two markets on different event_tickers of
-            different event series that close within
-            SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other and share a
-            category, tag and competition.
-    """
-    # Remove markets already held and those priced at 0¢/100¢ (settled/illiquid)
-    # warn_missing_close=False: the summary WARNING is find_time_series_pairs',
-    # the finder every run mode calls (main._run_dev, _run_prod). One line per
-    # run, as CLAUDE.md specifies — not one per finder. The markets are still
-    # dropped here either way; only the report is suppressed (TS-22).
-    active = _filter_active_markets(markets, held_tickers, warn_missing_close=False)
-    # What the run may add to, and its markets: one of an exact pair pairs only
-    # with its own partner, a lone leg only with a market not held
-    add_on_pairs = add_on_pairs or {}
-    add_on_tickers = {ticker for key in add_on_pairs for ticker in key}
-
-    # Group by exact (event_title, title, subtitle) tuple — no normalization.
-    # Three-element key: event_title prevents MVE cross-event collisions; the
-    # (title, subtitle) pair distinguishes markets within an event.
-    by_terms: dict = defaultdict(list)
-    for m in active:
-        event_title = getattr(m, "_event_title", "") or ""
-        title    = m.title or ""
-        subtitle = m.subtitle or ""
-        if title or subtitle:
-            by_terms[(event_title, title, subtitle)].append(m)
-
-    candidate_pairs: list = []
-    # Counted, not logged per pair. The rejection below fires per CANDIDATE
-    # pair — before the price parse and the 5% gate, so more often than the
-    # one-best-pair-per-group rows a run finally reports, of which the
-    # 2026-09-15 prod dry run had 71 of 75 pairing two DIFFERENT deadlines,
-    # i.e. two instances of one recurring fixture. One line each would bury the
-    # run's real output; one summary INFO after the loop instead.
-    series_skips = 0
-    # Same event ticker on both markets (M10) — counted for the same reason,
-    # with the same one-summary-line idiom: a refusal nothing reports cannot
-    # be told apart, in the log, from a grouping that never formed a group.
-    same_event_skips = 0
-    # Two different series whose markets close more than
-    # SAME_TITLE_MAX_CLOSE_GAP_SECONDS apart (DR-74) — two games or two
-    # instants that share every word of the key. Counted after the series test,
-    # so each candidate lands on exactly one of the refusal lines below and the
-    # two older counts do not move.
-    close_gap_skips = 0
-    # Two series filed under different Kalshi categories or tags, and two
-    # events naming different competitions (DR-79). Counted after the close
-    # gate, so every candidate still lands on exactly one line
-    label_skips = 0
-    competition_skips = 0
-    # Candidates touching one market of a held pair the run may add to, other
-    # than that pair itself; and held pairs whose prices would buy them the
-    # other way round
-    held_skips = 0
-    add_on_side_skips = 0
-    # members = all active markets that share this exact (event_title, title, subtitle)
-    # key. Each entry is a separate market object from a different event — any two of
-    # them are candidates for a same-title pair if their prices diverge.
-    for (_event_title, title, subtitle), members in by_terms.items():
-        # Use whichever of title or subtitle is non-empty as the display label
-        raw_title = title or subtitle
-        # Need at least two markets in a group to form any pair
-        if len(members) < 2:
-            continue
-
-        group_pairs: list = []
-        for i, m_outer in enumerate(members):
-            for m_inner in members[i + 1:]:
-                # Counted before every other check, so the group's next best
-                # pair can win. Nothing to look up when there is no held pair
-                # to add to
-                add_on = None
-                if add_on_pairs:
-                    add_on = _add_on_for(add_on_pairs, add_on_tickers,
-                                         m_outer.ticker, m_inner.ticker)
-                    if add_on is None and (m_outer.ticker in add_on_tickers
-                                           or m_inner.ticker in add_on_tickers):
-                        held_skips += 1
-                        continue
-
-                # Same event_ticker means these are options in the same multi-choice event,
-                # not separate markets asking the same question — skip them
-                if m_outer.event_ticker == m_inner.event_ticker:
-                    same_event_skips += 1
-                    continue
-
-                # Same wording, same series, different event: two instances of
-                # one recurring fixture (NPB game days, table-tennis matches,
-                # 15-minute price windows, MVE combos of different games) —
-                # two questions about two events, not one question listed
-                # twice, so the SAME_TITLE_CO_RESOLVE_PROB prior does not apply
-                # (DR-02, DR-54). The group key already guarantees the wording
-                # is identical, so the series test is the whole rule here.
-                if _same_series(m_outer, m_inner):
-                    series_skips += 1
-                    continue
-
-                # Same wording on two DIFFERENT series is one question only when
-                # both resolve at the same moment: a men's and a women's game
-                # between the same schools, or two competitions' fixtures of one
-                # matchup, share every word of the key and close hours or days
-                # apart (DR-74). find_time_series_pairs needs no twin: identical
-                # wording cannot form a time-series pair (DR-67).
-                if _closes_apart(m_outer, m_inner):
-                    close_gap_skips += 1
-                    continue
-
-                # Same wording on two series is one question only when both
-                # series are filed alike and both events name one competition
-                # (DR-79): the same two schools meet in football and in
-                # women's volleyball on one evening, under one event title
-                if _labels_differ(m_outer, m_inner):
-                    label_skips += 1
-                    continue
-                if _competitions_differ(m_outer, m_inner):
-                    competition_skips += 1
-                    continue
-
-                try:
-                    p_outer = float(m_outer.yes_ask_dollars)
-                    p_inner = float(m_inner.yes_ask_dollars)
-                except (ValueError, TypeError):
-                    continue
-
-                # Canonicalize so market_a is always the more expensive side (higher YES ask).
-                # Use fresh locals per iteration so the swap does not leak into the next mB.
-                if p_outer >= p_inner:
-                    mA, mB, pA, pB = m_outer, m_inner, p_outer, p_inner
-                else:
-                    mA, mB, pA, pB = m_inner, m_outer, p_inner, p_outer
-
-                # Enforce the minimum 5% YES price difference for same-title pairs.
-                # A smaller gap is within normal bid-ask spread noise.
-                # Same float-noise tolerance as the time-series tier test:
-                # 0.35 - 0.30 == 0.04999999999999999, which a bare < rejects
-                # at the documented 5% threshold (TS-09).
-                if pA - pB < SAME_TITLE_MIN_PRICE_DIFF - PRICE_EPSILON:
-                    continue
-
-                # A is the pricier market this run; an add-on must still buy NO
-                # on the market held NO and YES on the one held YES
-                if add_on is not None and not add_on.matches(mA, mB, "same_title"):
-                    add_on_side_skips += 1
-                    continue
-
-                try:
-                    nA = float(mA.no_ask_dollars)
-                except (ValueError, TypeError):
-                    continue
-
-                # nB is reporting-only for a same-title pair (never priced or
-                # submitted), so an unparseable value must not cost a candidate:
-                # fail-soft to the dataclass default instead of `continue`.
-                try:
-                    nB = float(mB.no_ask_dollars)
-                except (ValueError, TypeError, AttributeError):
-                    nB = 0.0
-
-                # tradeable=True when buying NO on A and YES on B covers all costs.
-                # fee_per_pair_approx returns a continuous estimate of total taker fees.
-                tradeable = (1.0 - nA - pB) > fee_per_pair_approx(
-                    nA, pB, multiplier_a=market_fee_multiplier(mA),
-                    multiplier_b=market_fee_multiplier(mB))
-                group_pairs.append(
-                    CandidatePair(
-                        market_a=mA,
-                        market_b=mB,
-                        pA=pA,
-                        pB=pB,
-                        nA=nA,
-                        tradeable=tradeable,
-                        canonical_title=raw_title,
-                        pair_type="same_title",
-                        nB=nB,
-                        # The held pair it adds to, or None
-                        held=add_on,
-                    )
-                )
-
-        if not group_pairs:
-            continue
-
-        # Keep only the best pair per exact title group — largest price gap among
-        # tradeable pairs wins; tradeable is preferred over non-tradeable
-        group_pairs.sort(key=lambda p: (p.tradeable, p.pA - p.pB), reverse=True)
-        candidate_pairs.append(group_pairs[0])
-
-    if same_event_skips:
-        logging.info(
-            "Same-title candidates skipped because both markets carry the "
-            "same event ticker (one event's own markets, not one question "
-            "listed by two events): %d",
-            same_event_skips,
-        )
-    if series_skips:
-        logging.info(
-            "Same-title candidates skipped as two instances of one event series "
-            "(identical wording, different fixture): %d", series_skips,
-        )
-    # Worded apart from the two lines above on purpose: its own prefix, and
-    # neither "one event series" nor "same event ticker", which tests pin as
-    # ABSENT from runs that never skip on those rules (DR-74). The bound is
-    # printed through close_gap_bound_text, which reads the same binding the
-    # gate did, so the line can never state a bound the gate did not apply.
-    if close_gap_skips:
-        logging.info(
-            "Same-title candidates refused because the two markets close more "
-            "than %s apart (two different games or instants, not one "
-            "question listed twice): %d",
-            close_gap_bound_text(), close_gap_skips,
-        )
-    # Each with a prefix of its own, and none of the substrings other tests
-    # pin as absent ("one event series", "same event ticker", "close more than")
-    if label_skips:
-        logging.info(
-            "Same-title candidates refused because the two series are filed under "
-            "different Kalshi categories or tags (two different sports or subjects, "
-            "not one question listed twice): %d", label_skips,
-        )
-    if competition_skips:
-        logging.info(
-            "Same-title candidates refused because the two events name different "
-            "competitions (two leagues, genders or formats, not one question listed "
-            "twice): %d", competition_skips,
-        )
-    if held_skips:
-        logging.info(
-            "Same-title candidates refused because they pair a held pair's market "
-            "with another market: %d", held_skips,
-        )
-    if add_on_side_skips:
-        logging.info(
-            "Same-title candidates refused for buying a held pair's sides the wrong "
-            "way round: %d", add_on_side_skips,
-        )
-
-    logging.info(
-        "Same-title pairs: %d total, %d tradeable",
         len(candidate_pairs),
         sum(1 for p in candidate_pairs if p.tradeable),
     )
@@ -7203,8 +6597,8 @@ def _enrich_pair(
         # (_kelly_p uses the fixed co-resolution prior here) and it is NOT
         # guarded above, but it is the operand of the reported pA - pB
         # "Price Diff", which otherwise subtracts a scan-time quote from a
-        # depth-weighted fill and can print a negative gap for a pair that
-        # passed the finder's directional filter. Refreshed for coherence.
+        # depth-weighted fill and can print a negative gap for a pair whose
+        # market A had the higher YES ask. Refreshed for coherence.
         if ref_yes is not None:
             leg_updates["pA"] = ref_yes
     return dc_replace(

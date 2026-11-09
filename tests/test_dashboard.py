@@ -1867,10 +1867,10 @@ class TestSplitHalfDegeneracy:
         assert dashboard._measured_half(-0.2, 3) == -0.2
 
     def test_the_golden_fixture_s_empty_h1_reaches_the_page_as_null(self, monkeypatch):
-        # The backtester's golden fixture: four of the primary band's five
-        # entries (three of its four time-series ones) enter on the first
-        # Monday, so the median_low split date IS that Monday and every
-        # cell's H1 is empty. Run through the real sweep and rendered.
+        # The backtester's golden fixture: three of the primary band's four
+        # entries (every one a time-series entry) enter on the first Monday,
+        # so the median_low split date IS that Monday and every cell's H1 is
+        # empty. Run through the real sweep and rendered.
         from . import test_backtester as tb
         golden = tb.TestPrepareEntriesGolden()
         golden._patch(monkeypatch)
@@ -18391,10 +18391,10 @@ class TestSellEndToEnd:
     every (level, minimum, cap) chunk is what a fresh simulation selling at
     that level with that minimum (and neither adding to held pairs nor
     trimming) produces — a sidecar file where it sells, the page's own chunk
-    where it does not. The fixture's sales come 13, 20,
-    26, 33, 53 and 60 days before maturity, so 1, 14 and 30 days give cells
-    that are simulated, cells that repeat an earlier run and cells that sell
-    nothing; the build's closing line says so."""
+    where it does not. The fixture's sales come 26, 33,
+    53 and 60 days before maturity, so 1, 14 and 30 days give cells that are
+    simulated, cells that repeat an earlier run and cells that sell nothing;
+    the build's closing line says so."""
 
     _START = _tb.TestPrepareEntriesGolden._START
     _DAYS = (1, 14, 30)

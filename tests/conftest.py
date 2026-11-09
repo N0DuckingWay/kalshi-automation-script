@@ -5,22 +5,25 @@ Last edited by: Zachary Hoffman
 
 Purpose:
     Suite-wide pytest fixtures and two helpers. Thirteen autouse guards
-    (_offline_event_competitions_for_the_session,
+    (_offline_event_reads_for_the_session,
     _isolate_event_title_accumulator, _isolate_treasury_rates,
     _fresh_order_write_pacer, _fresh_v2_mapping_disproof_state,
     _isolate_live_defaults_for_the_session, _isolate_live_defaults,
     _isolate_live_runs, _isolate_live_dashboard,
     _offline_market_details_for_the_session, _isolate_market_details,
     _stale_quote_check_off_for_the_session and
-    _volume_cap_off_for_the_session, in the order described here): one answers every event-competition read with "" (an event naming
-    no competition) and points the competition cache and Kalshi's cached
-    /series listing at an empty session directory, in force during class
-    setup too, so no test reaches Kalshi for a label and no class-scoped
-    backtest reads the operator's listing; one points
+    _volume_cap_off_for_the_session, in the order described here): one
+    answers every per-event read the backtest makes (each pair market's
+    event fee override as none, its facts as no settlement source and no
+    mutually_exclusive flag) and points those reads' caches and Kalshi's
+    cached /series listing at an empty session directory, in force during
+    class setup too, so no test reaches Kalshi for an event's fee override
+    or facts and no class-scoped backtest reads the operator's listing; one points
     the event-title accumulator, Kalshi's cached /series listing and the
-    event-competition cache at a
+    per-event caches at a
     per-test tmp_path, so no test can touch the operator's real event-title
-    accumulators, series_categories.json or event_competitions.json; one keeps every test off the
+    accumulators, series_categories.json, event_fee_overrides.json or
+    event_facts.json; one keeps every test off the
     Treasury API and the real rates cache; one gives every test a full,
     fresh order-write pacer, so no test waits on writes an earlier test made;
     one clears trader's disproven-mapping latch and its record of unchecked
@@ -60,8 +63,9 @@ Purpose:
     the live defaults, for a test that needs a saved file.
 
 Dependencies:
-    Imports kalshi_betting.historical (the four cache paths, and
-    _fetch_event_competition, which the session guard replaces),
+    Imports kalshi_betting.historical (its cache paths, and
+    _fetch_event_fee_override and _fetch_event_facts, which the session
+    guard replaces),
     kalshi_betting.treasury (its _RATES_CACHE path and _get_json),
     kalshi_betting.market_details (its request function and three cache
     locations), kalshi_betting.trader (its _WritePacer, _ORDER_WRITE_PACER,
@@ -93,13 +97,13 @@ Notes:
     same two names to the same tmp_path and returns the v2 path.
 
     A test that needs a /series listing seeds historical._SERIES_CATEGORIES_CACHE
-    (its tmp_path) itself, or hands the listing in. A test of the
-    event-competition read replaces historical._fetch_event_competition with
-    its own monkeypatch, or puts back the real reader (taken at import, as
-    test_historical.py's _REAL_FETCH_EVENT_COMPETITION) and patches
-    historical._historical_get beneath it; patching _historical_get alone
-    changes nothing, since the session stub never calls it. The session stub
-    returns once the test's monkeypatch is undone.
+    (its tmp_path) itself, or hands the listing in. A test of a per-event
+    read replaces its reader (historical._fetch_event_fee_override or
+    _fetch_event_facts) with its own monkeypatch, or puts back the real
+    reader (taken at import, as test_historical.py's _REAL_FETCH_EVENT_FACTS)
+    and patches historical._historical_get beneath it; patching
+    _historical_get alone changes nothing, since the session stub never calls
+    it. The session stub returns once the test's monkeypatch is undone.
 """
 from pathlib import Path
 
@@ -118,26 +122,23 @@ from kalshi_betting import (
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _offline_event_competitions_for_the_session(tmp_path_factory):
+def _offline_event_reads_for_the_session(tmp_path_factory):
     """
-    Answer every event-competition read with "" and keep the label caches off the checkout.
+    Answer every per-event read the backtest makes and keep its caches off the checkout.
 
-    The backtest reads each same-title pair's events' competition labels from
-    Kalshi (historical.load_event_competitions, through
-    _fetch_event_competition) and files each series by the cached /series
-    listing. Session-scoped, like the saved live defaults' redirect below,
-    because the backtester's class-scoped sweep fixtures run whole backtests
-    before any function-scoped fixture is active. The stub answers "" (an
-    event that names no competition), so every existing same-title fixture
-    keeps pairing exactly as before; a test of the read itself replaces it.
-    Each pair market's event's fee override (load_event_fee_overrides,
-    through _fetch_event_fee_override) is answered as none, so every market
-    keeps its series' multiplier, and its facts (load_event_facts, through
-    _fetch_event_facts) as no settlement source and no mutually_exclusive
-    flag. The caches point at an empty session directory, so class setup never
-    reads the operator's series_categories.json or writes an
-    event_competitions.json into the checkout; each test body sees its own
-    tmp_path (the redirect below).
+    The backtest reads each pair market's event from Kalshi twice: its fee
+    multiplier override (historical.load_event_fee_overrides, through
+    _fetch_event_fee_override), answered here as none, so every market keeps
+    its series' multiplier, and its report-only facts
+    (historical.load_event_facts, through _fetch_event_facts), answered as no
+    settlement source and no mutually_exclusive flag. Session-scoped, like
+    the saved live defaults' redirect below, because the backtester's
+    class-scoped sweep fixtures run whole backtests before any
+    function-scoped fixture is active; a test of a read itself replaces its
+    stub. Those reads' caches and Kalshi's cached /series listing point at
+    an empty session directory, so class setup never reads the operator's
+    series_categories.json or writes an event cache into the checkout; each
+    test body sees its own tmp_path (the redirect below).
 
     Args:
         tmp_path_factory (pytest.TempPathFactory): pytest's session-wide
@@ -147,12 +148,10 @@ def _offline_event_competitions_for_the_session(tmp_path_factory):
         None: The stub and the redirect hold until the session ends.
     """
     mp = pytest.MonkeyPatch()
-    folder = tmp_path_factory.mktemp("label-caches")
-    mp.setattr(historical, "_EVENT_COMPETITIONS_CACHE", folder / "event_competitions.json")
+    folder = tmp_path_factory.mktemp("event-caches")
     mp.setattr(historical, "_SERIES_CATEGORIES_CACHE", folder / "series_categories.json")
-    mp.setattr(historical, "_fetch_event_competition", lambda client, event_ticker: "")
-    # The pair markets' events' fee overrides, read the same way: answered as
-    # an event that sets none (None), with their cache off the checkout too
+    # The pair markets' events' fee overrides: answered as an event that sets
+    # none (None), with their cache off the checkout too
     mp.setattr(historical, "_EVENT_FEE_OVERRIDES_CACHE", folder / "event_fee_overrides.json")
     mp.setattr(historical, "_fetch_event_fee_override", lambda client, event_ticker: None)
     # The pair markets' events' report-only facts (load_event_facts): answered
@@ -164,7 +163,7 @@ def _offline_event_competitions_for_the_session(tmp_path_factory):
 
     # Nothing is saved into the session directory. A class-scoped fixture that
     # runs a backtest twice would otherwise see its second run read what its
-    # first run wrote (an "Event competitions: N events, C from the cache" line
+    # first run wrote (an "Event fee overrides: N events, C from the cache" line
     # that differs between the two runs, and that depends on which tests ran
     # first). A test body saves into its own tmp_path, which this does not touch.
     real_save = historical._save_json_cache
@@ -213,7 +212,7 @@ def _offline_market_details_for_the_session(tmp_path_factory):
     """
     Keep market_details off the network and off the checkout, for the whole session.
 
-    Session-scoped, like the event-competition stub above, because the
+    Session-scoped, like the per-event read stubs above, because the
     backtester's class-scoped sweep fixtures run whole backtests (and so the
     side-data loaders) before any function-scoped fixture is active. Replaces
     market_details._get with _offline_market_details_get, points the three
@@ -302,7 +301,7 @@ def _isolate_market_details(tmp_path, monkeypatch):
 def _isolate_event_title_accumulator(tmp_path, monkeypatch):
     """
     Redirect both event-title accumulator paths, the /series listing and the
-    event-competition cache to tmp_path.
+    per-event caches (fee overrides, facts) to tmp_path.
 
     Args:
         tmp_path (Path): pytest's per-test temporary directory.
@@ -314,8 +313,6 @@ def _isolate_event_title_accumulator(tmp_path, monkeypatch):
                         tmp_path / "event_titles.json")
     monkeypatch.setattr(historical, "_SERIES_CATEGORIES_CACHE",
                         tmp_path / "series_categories.json")
-    monkeypatch.setattr(historical, "_EVENT_COMPETITIONS_CACHE",
-                        tmp_path / "event_competitions.json")
     monkeypatch.setattr(historical, "_EVENT_FEE_OVERRIDES_CACHE",
                         tmp_path / "event_fee_overrides.json")
     monkeypatch.setattr(historical, "_EVENT_FACTS_CACHE", tmp_path / "event_facts.json")

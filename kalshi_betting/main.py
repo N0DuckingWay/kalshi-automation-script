@@ -47,17 +47,16 @@ Purpose:
     _filter_by_category trims the list.
 
     Every run reads Kalshi's /series listing once, right after the market
-    fetch, and files each market under its series' category and first tag
-    (_attach_series_labels). Only scanner.find_same_title_pairs' sport check
-    compares those labels (DR-79), and no run mode calls that finder. The
-    category/tag filter and the run summary read the same copy. The same
+    fetch: the category/tag filter and the run summary file each pair under
+    its series' category and first tag from it (_pair_labels). The same
     listing's fee multipliers are read beside it
     (historical.load_series_fee_multipliers) and set on each market as
-    _fee_multiplier, which prices that market's leg fees
-    (scanner.leg_fee_multipliers) and the fees of a sale on it
+    _fee_multiplier (_attach_fee_multipliers), which prices that market's
+    leg fees (scanner.leg_fee_multipliers) and the fees of a sale on it
     (scanner.market_fee_multiplier) when config.CONFIRMED_FEE_MULTIPLIERS
     holds it; any other multiplier is charged as the full fee. That is why
-    every market is filed before the sale block as well as before the finder.
+    every market's multiplier is set before the sale block as well as before
+    the finder.
 
     A production run with sell_at set sells, before it buys, each held position
     (an exact held pair, or a lone held market whose partner has paid out)
@@ -98,8 +97,8 @@ Dependencies:
     Imports auth.py (the client, and the one balance read, which also checks
     the credentials), config.py (constants, exit codes, the order-path check
     and the live-settings helpers), historical.py (Kalshi's series categories,
-    which file each market, decide the category/tag filter and name each
-    trade's category in the run summary),
+    which decide the category/tag filter and name each trade's category in
+    the run summary, and each series' fee multiplier),
     reporter.py (Excel output and the run summary), _http.py (a one-line
     description of an error), scanner.py (finding markets and pairs, and
     pricing them from the order book), seller.py (which held positions to
@@ -953,58 +952,34 @@ def _pair_labels(pair, series_categories: dict) -> tuple[str, str]:
     return series_labels(event, infer_category(event), series_categories)
 
 
-def _attach_series_labels(markets: list, series_categories: dict, *,
-                          fee_multipliers: dict | None = None) -> None:
+def _attach_fee_multipliers(markets: list, *, fee_multipliers: dict | None = None) -> None:
     """
-    Attach to every market the Kalshi category and first tag its series is filed under.
+    Set on every market the fee multiplier it is listed at.
 
-    The labels come from historical.series_labels, the rule the dashboard and
-    the category/tag filter file by: a series the listing lacks is filed under
-    its ticker-prefix category (infer_category) and "General". Only the
-    same-title finder reads them, and no run mode calls it.
-
-    It also sets each market's fee multiplier (fee_multipliers, below), which
-    every leg's and sale's fee reads, so both run modes call it right after
-    the market fetch, before any sale is planned or pair looked for.
-
-    With no listing at all (no cached copy, and a read that failed or, in
-    dev, none made), every series is filed by its ticker prefix, so nearly
-    every pair of series is filed alike and only the competition check tells
-    them apart; one WARNING says so.
+    Each market gets a _fee_multiplier attribute (scanner.listed_fee_multiplier):
+    the multiplier its event's override sets, else its series' multiplier,
+    and 1.0 (the full fee) for a series the map lacks, when no map is given,
+    or when the market carries no event override that was read
+    (_event_fee_override unknown). Every leg's fee reads it through
+    scanner.leg_fee_multipliers and every sale's through
+    scanner.market_fee_multiplier, and only a multiplier in
+    config.CONFIRMED_FEE_MULTIPLIERS lowers a fee, so both run modes call this
+    right after the market fetch, before any sale is planned or pair looked
+    for. One INFO line counts the markets whose listed multiplier is charged
+    in full (silent at zero).
 
     Args:
         markets (list): The run's markets, before any is dropped; each gets
-            a _series_labels attribute.
-        series_categories (dict): Kalshi's /series listing (load_series_categories).
+            a _fee_multiplier attribute.
         fee_multipliers (dict | None): Keyword-only. series ticker -> fee
-            multiplier (historical.load_series_fee_multipliers). Each market
-            also gets a _fee_multiplier attribute (scanner.listed_fee_multiplier):
-            the multiplier its event's override sets, else its series'
-            multiplier, and 1.0 (the full fee) for a series the map lacks, when
-            no map is given, or when the market carries no event override that
-            was read (_event_fee_override unknown). A leg's fee reads it through
-            scanner.leg_fee_multipliers, and only a multiplier in
-            config.CONFIRMED_FEE_MULTIPLIERS lowers a fee; one INFO line
-            counts the markets whose listed multiplier is charged in full.
+            multiplier (historical.load_series_fee_multipliers). None gives
+            every market the full fee.
     """
-    if not series_categories:
-        logging.warning(
-            "Same-title sport check: no /series listing this run, so every series is "
-            "filed by its ticker prefix and only the competition check tells two "
-            "series apart")
-    # Many markets share an event, so each event is filed once
-    by_event: dict = {}
     # Each market's listed fee multiplier, for the unconfirmed-multiplier count
     listed: list = []
     for market in markets:
-        # A market with no event ticker is filed under "" (infer_category's
-        # "Other"); the same-title finder refuses it on its series anyway
+        # Its event ticker; one with none names no series the map lists
         event = getattr(market, "event_ticker", "") or ""
-        if event not in by_event:
-            # Cross-module: the one filing rule the dashboard and the live filter share
-            by_event[event] = series_labels(event, infer_category(event), series_categories)
-        market._series_labels = by_event[event]
-        # The series' fee multiplier; the full fee when the listing gives none
         # Cross-module: the event's override when its event was read with one,
         # else the series' (1.0 when the listing gives none); an override not
         # known (a market not from the run's event listing) is the full fee
@@ -1639,12 +1614,12 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
         return EXIT_NO_TRADEABLE_SHARDS
 
     # Kalshi's /series listing, the cached copy only (the sandbox key never signs
-    # a production request): each market's category and tag, and what the
-    # category/tag filter files by
+    # a production request): what the category/tag filter files each pair by
     series_categories = load_series_categories(None)
     # Each series' fee multiplier, from the same cached copy (each leg's fee reads it when confirmed)
     fee_multipliers = load_series_fee_multipliers(None)
-    _attach_series_labels(markets, series_categories, fee_multipliers=fee_multipliers)
+    # Every market's listed fee multiplier, set before the finder prices any pair
+    _attach_fee_multipliers(markets, fee_multipliers=fee_multipliers)
 
     # Optional opt-in cap so the finder only sees markets closing within the
     # requested window — a no-op (returns markets unchanged) when unset
@@ -1776,12 +1751,12 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     stay blocked.
 
     Every run reads Kalshi's /series listing once, right after the market
-    fetch (a cached copy, refreshed once a week): it files each market under
-    its category and tag (_attach_series_labels, which also sets each
-    market's fee multiplier, read by the sale block's fees and every leg's),
-    and the category/tag filter and, handed a report (--result-file), each
-    trade's category and tag in the report read the same copy. With no
-    listing a trade's category is left unknown.
+    fetch (a cached copy, refreshed once a week): the category/tag filter
+    and, handed a report (--result-file), each trade's category and tag in
+    the report read it. Each market's fee multiplier, from the same cache
+    file, is set right after (_attach_fee_multipliers), before the sale
+    block, whose fees read it as every leg's does. With no listing a trade's
+    category is left unknown.
 
     Args:
         client: KalshiClient for production, from auth.build_client("prod").
@@ -1908,17 +1883,19 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         report.message = blind_reason
         return EXIT_NO_TRADEABLE_SHARDS
 
-    # Kalshi's /series listing, once per run (cached a week): each market's
-    # category and tag, and what the category/tag filter and the run result
-    # file a pair by. Read before the sale block, because the attach below
-    # also sets each market's fee multiplier, which every sale's fee reads
+    # Kalshi's /series listing, once per run (cached a week): what the
+    # category/tag filter and the run result file a pair by. Read first,
+    # because its weekly refresh writes the cache file the fee multipliers
+    # below are read from
     series_categories = load_series_categories(client)
     # Each series' fee multiplier (each leg's fee, and a paid-out partner's in
     # the sale block, read it when confirmed), read from the cache file the
     # listing above refreshed: no request of its own on a live run, so an old
     # file without fees gives {} (every market the full fee)
     fee_multipliers = load_series_fee_multipliers(client)
-    _attach_series_labels(markets, series_categories, fee_multipliers=fee_multipliers)
+    # Every market's listed fee multiplier, set before the sale block: every
+    # sale's fee reads it, as every leg's does
+    _attach_fee_multipliers(markets, fee_multipliers=fee_multipliers)
 
     # Our positions' ladders, read before held markets are dropped; None
     # means one could not be identified, so no time-series trade this run.

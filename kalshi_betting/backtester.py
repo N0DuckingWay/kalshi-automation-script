@@ -4,9 +4,9 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Replays both pair strategies — same-title co-resolution pairs and the
-    directional time-series bet — on the full history of settled Kalshi markets.
-    Groups settled markets into potential time-series and same-title pairs, fetches
+    Replays the directional time-series pair strategy (one question at two
+    deadlines) on the full history of settled Kalshi markets. Groups settled
+    markets into potential time-series pairs, fetches
     hourly candlestick price series for each involved market, then scans weekly
     Monday snapshots to find every date each pair was tradeable at the required
     threshold. Applies Kelly sizing to compute trade size, records actual P&L from
@@ -29,16 +29,8 @@ Dependencies:
     constants, and stated_deadline / same_event_ladder with its SAME_DAY
     sentinel (the single definition of which calendar day a rung's deadline
     names and of how two rungs of one event are ordered and gapped, so the
-    live and backtest ladder rules can never disagree), and
-    closes_apart (the single definition of the same-title close gate,
-    so the two paths can never disagree about which cross-series pair closes
-    at one moment) with close_gap_bound_text (the bound its refusal line
-    prints, read from the same scanner binding the gate reads, so the line
-    stays the live one's verbatim twin), ladder_keys (which ladders a
-    market is on, shared with the live rule), and labels_differ and
-    competitions_differ (the single definitions of the same-title sport
-    check, DR-79, so the two paths refuse the same two-sport and
-    two-competition pairs), from
+    live and backtest ladder rules can never disagree), and ladder_keys
+    (which ladders a market is on, shared with the live rule), from
     scanner.py; fee/model helpers
     (fee_leg_exact, fee_per_pair_approx, min_price_diff_for_gap — whose
     spread_min and tier_floors keywords apply this module's bands and
@@ -77,12 +69,8 @@ Dependencies:
     SHORT_DEADLINE_GAP_DAYS, TIME_SERIES_INTERVAL_PROB_DISCOUNT and
     TIME_SERIES_SAME_EVENT_LADDERS from config.py; fetch_all_settled_markets(),
     fetch_candlesticks(), and infer_category() from historical.py, with
-    series_labels() and load_series_categories() (the filing rule and the
-    /series listing the same-title label check reads, the dashboard's own)
-    and load_event_competitions() (each event's competition label, read and
-    cached for the same-title competition check) and load_event_facts()
-    (each event's settlement sources and mutually_exclusive flag, read and
-    cached for the report only), plus its
+    load_event_facts() (each event's settlement sources and
+    mutually_exclusive flag, read and cached for the report only), plus its
     SettledCorpus (read by TYPE, to take the corpus's provenance) and
     CorpusProvenance (carried out on
     BacktestSweep.corpus_provenance and re-exported to dashboard.py, which
@@ -131,8 +119,8 @@ Notes:
     a time-series pair keeps every Monday with a positive Kelly fraction, a
     same-title pair only its first (with add_to_held, also its later Mondays
     with the same legs, as add-ons), and only the best same-title pair per
-    title group survives. Pass 1 also drops a time-series candidate whose
-    tickers were found as a same-title pair, as the live run does.
+    title group survives. The backtest itself finds no same-title pairs, so
+    only an entry a caller builds by hand is one.
 
     Pass 2 walks the candidates in date order, best expected return first
     within a date, with a running cash balance. Each trade is sized by the
@@ -213,8 +201,8 @@ Notes:
     and candlesticks — returned as a _Candidates. _entries_for_band() is the
     _find_entry sweep at ONE spread band (the band acts only there; it holds
     no probability model, so its entries are k-independent).
-    _simulate_at_discount() is everything that reads k — the Kelly gate, the
-    dedups, Pass 2 and the equity curve — and returns a SweepPoint stamped
+    _simulate_at_discount() is everything that reads k — the Kelly gate,
+    Pass 2 and the equity curve — and returns a SweepPoint stamped
     with the resolved discount, band, population and tier-floor setting.
     run_backtest() is a thin
     wrapper over _prepare_entries() (_prepare_candidates() plus one
@@ -334,7 +322,7 @@ Notes:
     _can_ever_enter(), a cheap per-market PREFILTER that drops only markets no
     entry checkpoint can reach, given Kalshi's observed candle behaviour (that
     function gives the argument): they can never appear in any entered pair,
-    as either leg, in either pair type, so dropping them up front avoids
+    as either leg, so dropping them up front avoids
     materializing them into any group at all. A normalized-title group can
     hold tens of thousands of markets (intraday crypto ladders), and without
     the prefilter and _extract_pairs' close-time window, pair extraction is
@@ -344,15 +332,16 @@ Notes:
     Only the GROUPABLE eligible records are then grouped, and this
     module builds no list of every eligible record of its own: the corpus is
     walked twice. The first walk (_index_eligible_keys) hashes each eligible
-    record's time-series and same-title grouping keys — through
-    _ts_group_key/_st_group_key, the very helpers the two grouping functions
-    group on — and the second (_materialize_groupable) keeps only the records
-    whose key hash is shared with another eligible record. Both groupings
-    drop every single-member group, so a record sharing neither key can never
-    appear in any pair. The subset holds every member of every group
-    of two or more, in order, so the groups and pairs are exactly those of
-    the whole eligible list; a hash collision can only keep an extra record,
-    which the exact grouping then drops. The corpus itself is whatever
+    record's time-series grouping key — through _ts_group_key, the very
+    helper the grouping function groups on — and the second
+    (_materialize_groupable) keeps only the records whose key hash is shared
+    with another eligible record. The grouping drops every single-member
+    group, so a record whose key no other eligible record shares can never
+    appear in any pair. The subset holds every member of every time-series
+    group of two or more, in order, so every group, its members, their order
+    and so every time-series pair are exactly those of the whole eligible
+    list; a hash collision can only keep an extra record, which the exact
+    grouping then drops. The corpus itself is whatever
     historical.fetch_all_settled_markets returns — a disk-backed
     historical.SettledCorpus that streams the assembled
     settled_markets_*.jsonl.gz cache afresh on each walk, so the eligible set
@@ -489,12 +478,9 @@ from .historical import (
     fetch_all_settled_markets,
     fetch_candlesticks,
     infer_category,
-    load_event_competitions,
     load_event_facts,
     load_event_fee_overrides,
-    load_series_categories,
     load_series_fee_multipliers,
-    series_labels,
     series_ticker,
     usable_candle_ask,
 )
@@ -514,14 +500,10 @@ from .scanner import (
     _cash_binds,
     _enrich_pair,
     _market_from_dict,
-    close_gap_bound_text,
-    closes_apart,
-    competitions_differ,
     cumulative_deadline_pair,
     deadline_pair_refusal,
     deadline_profile,
     event_series,
-    labels_differ,
     ladder_keys,
     leg_prices,
     leg_sides,
@@ -2396,8 +2378,8 @@ class OutcomeLabelCoverage:
     The population is the ELIGIBLE-MARKET CORPUS — every record of
     _prepare_candidates' corpus that passes the _can_ever_enter prefilter,
     counted during its first pass. Since SS-1 that is a SUPERSET of what the
-    two grouping calls receive (only the eligible records that share a
-    grouping key are materialized for them), but it is the same population
+    grouping call receives (only the eligible records that share a
+    grouping key are materialized for it), but it is the same population
     this census has always covered: every eligible record, whether or not it
     can group. It is NOT the population the empirical k-hat is
     computed over (_interval_calibration measures over entered, binarily
@@ -2409,10 +2391,10 @@ class OutcomeLabelCoverage:
         total (int): Eligible markets censused. Zero means the corpus was
             empty, not that the census failed to run.
         with_subtitle (int): Records carrying a non-blank `subtitle` — the
-            outcome discriminator in the time-series key and the third
-            component of the same-title key.
+            outcome discriminator in the time-series key.
         with_event_title (int): Records carrying a non-blank `event_title` —
-            the first component of the same-title key.
+            the first part of the combined title the time-series key is
+            built from (_pair_key).
         subtitle_fraction (float | None): with_subtitle / total, or None when
             total is 0. None rather than 0.0 because the fraction is UNDEFINED
             on an empty corpus, matching the helper's own empty-list branch,
@@ -2476,7 +2458,8 @@ class ExtraDataReport:
     Built by _prepare_candidates once the side data is loaded and carried on
     BacktestSweep.extra_data_report for the dashboard header. Report only:
     no trade, size or pair reads it. Scalars and tuples only, so it holds no
-    market record alive.
+    market record alive. The four same-title counts are always 0: the
+    backtest finds no same-title pairs.
 
     Attributes:
         strikes_differ (int): Same-title pairs whose two markets' strike
@@ -2567,8 +2550,8 @@ class _Candidates:
 
     Attributes:
         all_pairs (list): [((mA, mB, canon, group_key), pair_type), ...] — every
-            candidate pair _extract_pairs proposed, in scan order: every
-            time-series pair, then every same-title pair.
+            candidate pair _extract_pairs proposed, in scan order, each a
+            time-series pair labelled "time_series".
         candles_by_ticker (dict): Ticker -> hourly candle list, from
             _fetch_candles_parallel; every ticker of every pair in all_pairs
             is a key.
@@ -2584,7 +2567,7 @@ class _Candidates:
             forwarded to every _find_entry call. None applies no cap.
         same_event_ladders (bool | None): The ladder flag EXACTLY as
             _prepare_candidates received it — UNRESOLVED, None included — the
-            same argument both _extract_pairs calls were handed and every
+            same argument the _extract_pairs call was handed and every
             entry pass hands _find_entry (see above for when None resolves
             the same way in both).
         corpus_provenance (CorpusProvenance | None): What the fetched corpus
@@ -6860,46 +6843,6 @@ def _same_series_dicts(mA: dict, mB: dict) -> bool:
     return not sa or not sb or sa == sb
 
 
-def _comparable_closes_dicts(mA: dict, mB: dict) -> tuple[datetime, datetime] | None:
-    """
-    Both records' close_time parsed, or None when they cannot be compared.
-
-    The dict-world READER of the same-title close gate (DR-74): the verdict
-    itself is scanner.closes_apart, called by _extract_pairs on what this
-    returns, so the live finder and this one can never disagree about which
-    cross-series pair closes at one moment. Readability is split out here,
-    rather than left to closes_apart's own fail-closed branch, because the two
-    paths do NOT see the same population: the live finder never reaches a
-    market without a close_time (_filter_active_markets drops it before
-    grouping, with its own WARNING), while the backtest's same-title groups
-    are not close-filtered — _can_ever_enter keeps a market whose close_time
-    it cannot parse. So an unreadable close is counted on its own
-    backtest-only line, and the close-gap line stays verbatim with the live
-    one for every READABLE pair. One shape splits the two paths' lines: a
-    naive close beside an aware one lands here, on the unreadable line,
-    while the live finder, whose gate has one line only, counts it on its
-    close-gap line. Both refuse it, and the live path cannot reach it today
-    (Kalshi's close strings end in "Z"; every cached close does too). The
-    backtest reads the REALIZED close Kalshi recorded for a settled market,
-    where the live finder reads the SCHEDULED close of an open one.
-
-    Args:
-        mA (dict): A market dict in the compact historical._market_to_dict form.
-        mB (dict): A second market dict, same form.
-
-    Returns:
-        tuple[datetime, datetime] | None: (close_a, close_b) parsed by
-            _parse_iso_datetime. None when either close_time is absent or
-            unparseable, or when one parses naive and the other aware (their
-            subtraction would raise). Never raises.
-    """
-    ca = _parse_iso_datetime(mA.get("close_time"))
-    cb = _parse_iso_datetime(mB.get("close_time"))
-    if ca is None or cb is None or (ca.utcoffset() is None) != (cb.utcoffset() is None):
-        return None
-    return ca, cb
-
-
 # The private key a pair market's record carries its scheduled close under
 # (whole Unix seconds), written by _prepare_candidates only while the
 # scheduled-close switch is on and its series' rule gives one; popped otherwise
@@ -6911,8 +6854,8 @@ def _maturity_close(m: dict, *, as_date: bool = False) -> datetime | date | None
     The close a live run would have read for a market: its scheduled close, else its realized one.
 
     With the switch off, records carry no scheduled close, so this is the
-    realized close, as before. Used for days-to-maturity, ranking, cross-event
-    pair order, gap and horizon, and the same-title close gate. The exchange's
+    realized close, as before. Used for days-to-maturity, ranking, and
+    cross-event pair order, gap and horizon. The exchange's
     own timing (candle windows, scan end, prefilter, payouts) keeps the
     realized close.
 
@@ -7054,10 +6997,10 @@ def _ts_group_key(m: dict) -> str:
     this module.
 
     Read by BOTH _group_by_normalized_title, which groups on it, and
-    _index_eligible_keys, which decides from it (and _st_group_key) which
-    eligible records are worth materializing at all (SS-1). One definition is
-    what makes that decision exact: a key the index computed differently from
-    the grouping would drop a record the grouping needs.
+    _index_eligible_keys, which decides from it which eligible records are
+    worth materializing at all (SS-1). One definition is what makes that
+    decision exact: a key the index computed differently from the grouping
+    would drop a record the grouping needs.
 
     The key itself is scanner.time_series_group_key — the same helper the live
     finder calls, pinned by AST in tests/test_strategy.py — over _pair_key
@@ -7081,33 +7024,6 @@ def _ts_group_key(m: dict) -> str:
     return time_series_group_key(_pair_key(m), m.get("subtitle") or "")
 
 
-def _st_group_key(m: dict) -> tuple[str, str, str] | None:
-    """
-    The same-title grouping key of one market dict — the single definition in
-    this module.
-
-    Read by BOTH _group_by_exact_title and _index_eligible_keys, for the same
-    reason _ts_group_key is shared: the groupable-subset decision (SS-1) is
-    only exact if it is taken on the very key the grouping uses.
-
-    Args:
-        m (dict): A market dict in the compact historical._market_to_dict form.
-            Every field reads through `or ""`, so a cached None, a blank string
-            and an absent key are all the same "no value".
-
-    Returns:
-        tuple[str, str, str] | None: (event_title, title, subtitle), or None
-            when title and subtitle are both empty — such a market carries no
-            wording to match on and is not grouped for same-title detection.
-    """
-    event_title = m.get("event_title") or ""
-    title = m.get("title") or ""
-    subtitle = m.get("subtitle") or ""
-    if not (title or subtitle):
-        return None
-    return (event_title, title, subtitle)
-
-
 def _ladder_keys_dict(m: dict, question_key: str | None = None) -> frozenset:
     """
     Return the ladder labels of one cached market, through scanner.ladder_keys.
@@ -7125,39 +7041,6 @@ def _ladder_keys_dict(m: dict, question_key: str | None = None) -> frozenset:
     """
     return ladder_keys(m.get("event_ticker"),
                        _ts_group_key(m) if question_key is None else question_key)
-
-
-def _group_by_exact_title(markets: Iterable[dict]) -> dict[tuple, list[dict]]:
-    """
-    Group markets by exact (event_title, title, subtitle) tuple for same-title pair detection.
-
-    Three-element key: the event_title component prevents cross-event option-label
-    collisions in MVE markets; (title, subtitle) distinguishes markets within an event.
-    The key is _st_group_key's, shared with _index_eligible_keys so the
-    groupable-subset decision in _prepare_candidates is taken on this exact key.
-
-    Grouping is deliberately unchanged by the one-series rule (DR-02, DR-54)
-    and by the close gate (DR-74): two events of one recurring fixture, and
-    two games on two series closing hours apart, still land in one group, and
-    _extract_pairs is what refuses to pair them. Keeping each rule in one
-    place mirrors the live scanner, where find_same_title_pairs groups first
-    and filters inside its inner loop.
-
-    Args:
-        markets (Iterable[dict]): Market dicts in the compact
-            historical._market_to_dict form, walked once.
-
-    Returns:
-        dict[tuple, list[dict]]: Mapping of (event_title, title, subtitle) ->
-            member markets, for groups with >= 2 members and at least one of
-            title/subtitle non-empty. Single-member groups are dropped.
-    """
-    groups: dict = defaultdict(list)
-    for m in markets:
-        key = _st_group_key(m)
-        if key is not None:
-            groups[key].append(m)
-    return {k: v for k, v in groups.items() if len(v) >= 2}
 
 
 def _group_by_normalized_title(markets: Iterable[dict]) -> dict[str, list[dict]]:
@@ -7198,340 +7081,96 @@ def _group_by_normalized_title(markets: Iterable[dict]) -> dict[str, list[dict]]
     return {k: v for k, v in groups.items() if len(v) >= 2}
 
 
-def _drop_cross_type_duplicates(candidates: list[dict]) -> list[dict]:
-    """
-    Drop time-series candidates whose ticker pair was also found as a same-title candidate.
-
-    Mirrors main._dedup_pairs on the live path: when both scanners detect the
-    same two markets, the same-title pair is kept because its co-resolution
-    model is simpler (identical questions must co-resolve) than the directional
-    time-series bet, whose edge depends on the interval discount behind
-    config.time_series_profit_prob — see CLAUDE.md, "Pair dedup prefers
-    same-title", and the same_title > time_series tie-break in
-    strategy.select_portfolio(). Duplicate identity is the frozenset of the two
-    tickers, so a pair discovered with its legs in the opposite order still
-    matches.
-
-    This has to happen in Pass 1, not Pass 2: Pass 2's ticker-conflict filter
-    only prevents both copies being OPEN at the same time. Whenever the
-    same-title copy is skipped there for sizing reasons (n < 1, or a
-    non-positive expected payoff), it never claims the tickers, so the
-    time-series duplicate is entered instead — a candidate the live pipeline
-    would never have had at all.
-
-    The count it logs is of candidates: a time-series pair has one per
-    passing Monday.
-
-    Args:
-        candidates (list[dict]): Pass 1 candidate dicts, each carrying
-            "pair_type" ("same_title" or "time_series") and the "mA"/"mB"
-            market dicts (which carry "ticker").
-
-    Returns:
-        list[dict]: Every same-title candidate plus every time-series candidate
-            whose ticker pair is not already covered by a same-title candidate,
-            in the input's original order.
-    """
-    same_title_keys = {
-        frozenset((c["mA"]["ticker"], c["mB"]["ticker"]))
-        for c in candidates
-        if c["pair_type"] == "same_title"
-    }
-    kept = [
-        c for c in candidates
-        if c["pair_type"] == "same_title"
-        or frozenset((c["mA"]["ticker"], c["mB"]["ticker"])) not in same_title_keys
-    ]
-    dropped = len(candidates) - len(kept)
-    if dropped:
-        logging.info(
-            "Dropped %d time-series candidate(s) already covered by a same-title candidate",
-            dropped,
-        )
-    return kept
-
-
-def _series_label_filer(series_categories: dict | None) -> Callable[[dict], tuple[str, str]]:
-    """
-    A function giving the (category, tag) a market's series is filed under, worked out once per series.
-
-    Used so each series is looked up once, not once per candidate pair. The
-    returned function keeps the per-series cache between calls.
-
-    Args:
-        series_categories (dict | None): Kalshi's /series listing; None or {}
-            files every series by its ticker prefix, as
-            historical.series_labels does.
-
-    Returns:
-        Callable[[dict], tuple[str, str]]: market record -> (category, tag).
-    """
-    listing = series_categories or {}
-    labels_by_series: dict[str, tuple[str, str]] = {}
-
-    def _labels(m: dict) -> tuple[str, str]:
-        """The (category, tag) a market's series is filed under."""
-        event = m.get("event_ticker") or ""
-        series = series_ticker(event)
-        if series not in labels_by_series:
-            # Cross-module: the one filing rule the live run attaches to its
-            # markets (main._attach_series_labels) and the dashboard files by
-            labels_by_series[series] = series_labels(event, infer_category(event), listing)
-        return labels_by_series[series]
-
-    return _labels
-
-
-def _log_close_gap_refusals(count: int) -> None:
-    """
-    The same-title close-gap line for the deferred gate (silent at zero).
-
-    Word for word the line _extract_pairs and scanner.find_same_title_pairs
-    log (tests/test_backtester.py pins the three equal).
-    """
-    if count:
-        # The bound is printed through scanner.close_gap_bound_text, which
-        # reads the binding closes_apart read — this module holds no copy of
-        # the constant, so the line cannot state a bound its gate did not use.
-        logging.info(
-            "Same-title candidates refused because the two markets close more "
-            "than %s apart (two different games or instants, not one "
-            "question listed twice): %d",
-            close_gap_bound_text(), count,
-        )
-
-
-def _log_label_refusals(count: int) -> None:
-    """
-    The same-title label line for the deferred gate (silent at zero).
-
-    Word for word the line _extract_pairs and scanner.find_same_title_pairs
-    log (tests/test_backtester.py pins the three equal).
-    """
-    if count:
-        logging.info(
-            "Same-title candidates refused because the two series are filed under "
-            "different Kalshi categories or tags (two different sports or subjects, "
-            "not one question listed twice): %d", count,
-        )
-
-
-def _close_gate_and_labels(pairs: list, series_categories: dict | None) -> list:
-    """
-    Apply the same-title close gate on the scheduled closes, then the label check.
-
-    The deferred half of _extract_pairs' same-title branch, used while the
-    scheduled close is on and some series has a rule: _extract_pairs (with
-    defer_close_gate) hands back the candidates that passed every check up to
-    the close gate, _prepare_candidates writes their markets' scheduled
-    closes, and this applies scanner.closes_apart to the closes a live run
-    would have read (_maturity_close: the scheduled close where one is
-    carried, else the realized one), then scanner.labels_differ, in the order
-    and with the very lines _extract_pairs uses, so each refused candidate
-    still lands on one line. One more silent-at-zero line counts the pairs
-    the gate judged otherwise than it would have on the realized closes.
-
-    Args:
-        pairs (list): (market_a, market_b, canonical_title, group_key) tuples
-            from _extract_pairs(..., defer_close_gate=True), every one with
-            readable, comparable realized closes.
-        series_categories (dict | None): Kalshi's /series listing, as handed
-            to _extract_pairs.
-
-    Returns:
-        list: The pairs that pass both checks, in their order.
-    """
-    _labels = _series_label_filer(series_categories)
-    kept: list = []
-    gap_skips = label_skips = admitted = refused = 0
-    for pair in pairs:
-        mA, mB = pair[0], pair[1]
-        realized = _comparable_closes_dicts(mA, mB)  # realized closes, for the count below
-        # The gate: are the closes a live run would have seen too far apart?
-        apart = closes_apart(_maturity_close(mA), _maturity_close(mB))
-        apart_realized = realized is None or closes_apart(*realized)
-        if apart != apart_realized:
-            if apart:
-                refused += 1
-            else:
-                admitted += 1
-        if apart:
-            gap_skips += 1
-            continue
-        if labels_differ(_labels(mA), _labels(mB)):
-            label_skips += 1
-            continue
-        kept.append(pair)
-    _log_close_gap_refusals(gap_skips)
-    _log_label_refusals(label_skips)
-    if admitted or refused:
-        logging.info(
-            "Scheduled close: same-title candidates the close gate judged otherwise "
-            "than on their realized closes: %d admitted, %d refused", admitted, refused)
-    return kept
-
-
 def _extract_pairs(
     groups: dict, *, same_event_ladders: bool | None = None,
-    series_categories: dict | None = None, defer_close_gate: bool = False,
-) -> list[tuple[dict, dict, str, object]]:
+) -> list[tuple[dict, dict, str, str]]:
     """
     Return list of (market_a, market_b, canonical_title, group_key) tuples where
     the two markets have different event_tickers — or, with same-event deadline
     ladders enabled, are two dated cumulative rungs of ONE event — AND are not
-    two events of one series worded identically, AND, for a same-title group,
-    close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other (DR-74) and
-    belong to two series filed under one Kalshi category and first tag
-    (DR-79). No price filtering at this stage.
+    two events of one series worded identically, AND state two different
+    cumulative deadlines. No price filtering at this stage.
 
-    The one-series rule (DR-02, DR-54) mirrors both live finders through
-    _same_series_dicts / _identical_wording_dicts: two events resolving to one
-    series are two instances of one recurring fixture, so identical wording
-    across them is one question about two DIFFERENT events. Two combo tickets
-    resolve to one series while sharing no literal prefix (DR-55). The 3-tuple
-    (same-title) branch tests the series alone, because its group key already
-    guarantees the wording is identical; the string (time-series) branch tests
-    the conjunct, because there the wording is only date-stripped-equal and a
-    genuine cumulative pair (deadline IN the wording) must survive.
+    Every group is a time-series group: one question, date stripped, plus its
+    outcome label, keyed by the normalized string _group_by_normalized_title
+    builds (time_series_group_key, the live finder's own key).
 
-    The same-title close gate (DR-74) mirrors scanner.find_same_title_pairs
-    through the ONE definition, scanner.closes_apart, on the close times
-    _comparable_closes_dicts parses: identical wording on two DIFFERENT series
-    is one question only when both markets close at the same moment — a men's
-    and a women's college basketball game between the same two schools
-    (KXNCAAMBGAME / KXNCAAWBGAME) share every word of the key and close hours
-    apart, and two competitions' fixtures of one matchup days apart. It runs
-    after the series test, on the 3-tuple branch only: identical wording can
-    never form a time-series pair (DR-67), so the time-series branch needs no
-    twin. The backtest reads REALIZED closes where the live finder reads
-    SCHEDULED ones (see CLAUDE.md's DR-74 gotcha for what that difference
-    admits and refuses).
+    The one-series rule (DR-02, DR-54) mirrors the live time-series finder
+    through _same_series_dicts / _identical_wording_dicts: two events
+    resolving to one series are two instances of one recurring fixture, so
+    identical wording across them is one question about two DIFFERENT events.
+    Two combo tickets resolve to one series while sharing no literal prefix
+    (DR-55). The test is the conjunct of the two, because the wording here is
+    only date-stripped-equal and a genuine cumulative pair (deadline IN the
+    wording) must survive.
 
-    The same-title sport check's label half (DR-79) runs right after the
-    close gate, through the ONE definition scanner.labels_differ: both
-    series must be filed under one Kalshi category and first tag, worked out
-    by historical.series_labels (the filing rule the live run attaches to
-    its markets) from series_categories, once per series. "Kentucky vs
-    Oklahoma: Kentucky wins" is a football game in one series and a women's
-    volleyball match in another, filed Sports · Football and Sports ·
-    Volleyball. Its other half, the competition each event names, is not
-    here: cached markets carry no competition, so _prepare_candidates reads
-    the labels for the pairs this function returns and drops the
-    mismatches in _refuse_other_competitions.
+    Both legs must also be CUMULATIVE-deadline markets ("will X happen BY
+    <date>") stating two DIFFERENT deadlines — scanner.cumulative_deadline_pair
+    over scanner.deadline_phrasing, the same helper find_time_series_pairs'
+    item 4 calls, applied here through _deadline_profile_dict (DR-67). A
+    snapshot family ("price ON <date>") groups here exactly as it does live —
+    the grouping key is untouched — and is refused here exactly as it is live,
+    a heuristic over wording rather than a proof.
 
-    For string-keyed (time-series) groups only, both legs must also be
-    CUMULATIVE-deadline markets ("will X happen BY <date>") stating two
-    DIFFERENT deadlines — scanner.cumulative_deadline_pair over
-    scanner.deadline_phrasing, the same helper find_time_series_pairs' item 4
-    calls, applied here through _deadline_profile_dict (DR-67). A snapshot
-    family ("price ON <date>") groups here exactly as it does live — the
-    grouping key is untouched — and is refused here exactly as it is live,
-    a heuristic over wording rather than a proof. 3-tuple-keyed (same-title)
-    groups have no deadline concept and are untouched by this rule.
+    The pair type is NOT a parameter: every pair returned is a time-series
+    pair, and _prepare_candidates attaches the "time_series" label to each
+    returned tuple itself. Each group's key is returned as the pair's
+    canonical title and as its group_key.
 
-    The pair type is NOT a parameter: the shape of each group key (see below)
-    decides which sweep applies, and run_backtest() attaches the pair_type
-    label to each returned tuple itself.
-
-    Group keys may be:
-      - a string (normalized title+outcome group from
-        _group_by_normalized_title), or
-      - a 3-tuple (event_title, title, subtitle) from _group_by_exact_title.
-    For the 3-tuple form, the display canonical is taken from title-or-subtitle,
-    but the FULL 3-tuple (including event_title) is also returned as group_key —
-    the one-pair-per-group dedup in run_backtest must key on the full group, not
-    just the display title, or two unrelated events sharing an option label
-    (e.g. "Trump" in two different events) would collide into a single group
-    and silently drop one of the two legitimate pairs.
-
-    For string-keyed (time-series) groups, members are sorted ascending by
-    close_time and swept with a two-pointer window bounded by
-    MAX_DEADLINE_GAP_DAYS + 1 day of margin: _find_entry() unconditionally
-    rejects any time-series pair whose close dates differ by more than
-    MAX_DEADLINE_GAP_DAYS, so pairs outside that window can never produce an
-    entry and are skipped without ever being materialized as a candidate
-    pair (they are counted, never enumerated — see below). The window reads
-    the REALIZED close dates even with the scheduled close on, so a pair
-    whose realized closes are beyond it but whose scheduled closes sit within
-    MAX_DEADLINE_GAP_DAYS is never visited (a recorded residual; it can only
-    miss trades — see _maturity_close). The +1 day margin
+    Members are sorted ascending by close_time and swept with a two-pointer
+    window bounded by MAX_DEADLINE_GAP_DAYS + 1 day of margin: _find_entry()
+    unconditionally rejects any cross-event pair whose close dates differ by
+    more than MAX_DEADLINE_GAP_DAYS, so pairs outside that window can never
+    produce an entry and are skipped without ever being materialized as a
+    candidate pair (they are counted, never enumerated — see below). The
+    window reads the REALIZED close dates even with the scheduled close on,
+    so a pair whose realized closes are beyond it but whose scheduled closes
+    sit within MAX_DEADLINE_GAP_DAYS is never visited (a recorded residual;
+    it can only miss trades — see _maturity_close). The +1 day margin
     is slack only (it can never cause a pair within the true limit to be
     skipped) — _find_entry() still applies the exact
     `.days > MAX_DEADLINE_GAP_DAYS` cutoff itself. Members with a missing or
     unparseable close_time are dropped from this sweep, and counted
-    (group-local only — _group_by_exact_title's same-title groups are
-    untouched), because _find_entry() unconditionally requires close_time on
-    both legs and returns None immediately without it, regardless of pair
-    type.
-
-    3-tuple-keyed (same-title) groups have no deadline-gap concept, so they
-    are swept naively — every pair of members is visited — and the
-    eligibility prefilter (_can_ever_enter, applied in run_backtest before
-    grouping) keeps these groups small in practice. Their pairs ARE gated on
-    close time (DR-74 above), but per visited candidate, not by a sorted
-    window: the gate is a one-hour bound that refuses most candidates, not a
-    performance bound, and these groups are not close-filtered at all — a
-    member whose close_time cannot be parsed is kept in the group and
-    refused per candidate on its own line.
+    (group-local only), because _find_entry() unconditionally requires
+    close_time on both legs and returns None immediately without it.
 
     EVERY PAIR OF A GROUP'S MEMBERS IS ACCOUNTED FOR (M10). Each count below
     is reported once, at the end of the call, on its own silent-at-zero INFO
     line, and together with the pairs returned they cover every pair of
-    members of every group this call receives:
-      - a same-title group is swept naively, so each of its pairs is visited
-        and is either returned or refused as both markets on one event
-        ticker, as two events of one series (DR-02, DR-54), as two markets
-        whose close_time cannot be read or compared, as two markets
-        closing more than SAME_TITLE_MAX_CLOSE_GAP_SECONDS apart (DR-74), or
-        as two series filed under different Kalshi categories or tags
-        (DR-79);
-      - a time-series group first sets aside its members with no readable
-        close_time (counted as MEMBERS, not pairs — no pair involving one is
-        ever formed), then splits the pairs of the rest at the sweep's
-        close-date window: the pairs beyond it are counted as never visited
-        (no rule is evaluated on them — the window is a performance bound:
-        _find_entry rejects a cross-event pair that far apart anyway, and a
-        same-event one would be refused with the ladder switch off and is
-        judged by the ladder sub-pass with it on), and each pair inside it
-        is either returned or refused as both markets on one event ticker
-        (counted only while the ladder switch is off; with it on the pair
-        belongs to the ladder sub-pass, which counts it there), as two
-        events of one series worded identically, or for one of the three
-        DR-72 wording reasons. With the switch on, the sub-pass's own lines
-        count every same-event pair of the group, INCLUDING those the
-        sweep's window excludes, so its population overlaps the
-        never-visited count by exactly the same-event pairs beyond the
-        window.
+    members of every group this call receives. A group first sets aside its
+    members with no readable close_time (counted as MEMBERS, not pairs — no
+    pair involving one is ever formed), then splits the pairs of the rest at
+    the sweep's close-date window: the pairs beyond it are counted as never
+    visited (no rule is evaluated on them — the window is a performance
+    bound: _find_entry rejects a cross-event pair that far apart anyway, and
+    a same-event one would be refused with the ladder switch off and is
+    judged by the ladder sub-pass with it on), and each pair inside it is
+    either returned or refused as both markets on one event ticker (counted
+    only while the ladder switch is off; with it on the pair belongs to the
+    ladder sub-pass, which counts it there), as two events of one series
+    worded identically, or for one of the three DR-72 wording reasons. With
+    the switch on, the sub-pass's own lines count every same-event pair of
+    the group, INCLUDING those the sweep's window excludes, so its
+    population overlaps the never-visited count by exactly the same-event
+    pairs beyond the window.
     The one exception is the `seen` guard, an uncounted `continue` that can
     fire only on a ticker listed twice in one group — a corpus the assembly's
     first-wins ticker dedup never produces — and that cannot cause a zero
     even then, since `seen` holds only pairs already returned for the group
     and so refuses nothing but a repeat of one. And a grouping with NO group
-    of two or more members reaches this function as an empty dict, which
-    says nothing about which kind of grouping it was, so _prepare_candidates
-    logs both groupings' sizes on every run before calling it; between that
-    line and these, every zero "Potential pairs" count has a logged cause.
+    of two or more members reaches this function as an empty dict, so
+    _prepare_candidates logs the grouping's size on every run before calling
+    it; between that line and these, every zero "Potential pairs" count has a
+    logged cause.
 
-    The one-series and same-event checks used to be bare `continue`s, so a
-    corpus whose candidates they refused — the shape a combo-heavy window
-    takes, where identically worded KXMVE tickets share a group key —
-    reported "Potential pairs: 0" with no logged cause at all (DR-66).
-    M10's counting changed no control flow: it added counts only, so every
-    check, its order and every pair returned stayed exactly as before it
-    (DR-74's close gate, which came later, is a new check and does refuse
-    pairs). The same-title one-series line is the verbatim mirror of
-    scanner.find_same_title_pairs', and so is the same-title close-gap line
-    (DR-74) for READABLE closes, and so is the same-title label line (DR-79);
-    the same-title close-time readability line
-    has no live twin, because the live finder drops a market without a
-    close_time before grouping and so never reaches such a pair (and
-    Kalshi's live close strings are all aware) — a naive close beside an
-    aware one lands on this line here, but on the live finder's close-gap
-    line, the only line the live gate has; the same-title
-    same-event and time-series one-series lines mirror the lines M10 added to
-    the two live finders; the time-series same-event line has no live twin
-    that counts the same thing — the live finder's disabled-ladder count is
-    unwindowed and over actively priced markets — and neither do the
+    Each refusal is counted where it fires, so a corpus whose candidates are
+    all refused — the shape a combo-heavy window takes, where identically
+    worded KXMVE tickets share a group key — still says why its "Potential
+    pairs" count is 0 (DR-66). Counting moves no check and changes no pair
+    returned. The one-series line mirrors the line find_time_series_pairs
+    logs for its one-series conjunct (M10); the same-event line has no live
+    twin that counts the same thing — the live finder's disabled-ladder count
+    is unwindowed and over actively priced markets — and neither do the
     never-visited and no-close_time lines, since the live finder sweeps
     every pair of a group (its gap cap is a counted rule, applied after the
     wording check) and drops a market without a close_time before grouping,
@@ -7593,9 +7232,9 @@ def _extract_pairs(
 
     Args:
         groups (dict): Mapping of group key -> list of market dicts (the
-            compact historical._market_to_dict form). Keys are either a
-            normalized title+outcome string (time-series groups) or an
-            (event_title, title, subtitle) 3-tuple (same-title groups).
+            compact historical._market_to_dict form): the normalized
+            title+outcome strings and members _group_by_normalized_title
+            returns.
         same_event_ladders (bool | None): Whether to run the same-event ladder
             sub-pass. None (the default) resolves THIS MODULE's
             TIME_SERIES_SAME_EVENT_LADDERS — the by-value binding of
@@ -7605,39 +7244,18 @@ def _extract_pairs(
             Patching config.TIME_SERIES_SAME_EVENT_LADDERS is a silent no-op
             here, exactly as it is for scanner: this is NOT the
             time_series_profit_prob(k=None) idiom, which works only because
-            that helper lives in config.py and reads config's own global. Has
-            no effect on 3-tuple-keyed (same-title) groups, which have no
-            deadline concept.
-        series_categories (dict | None): Keyword-only. Kalshi's /series
-            listing (historical.load_series_categories), which files each
-            same-title market's series for the label check. None (the
-            default) or {} files every series by its ticker prefix
-            (historical.series_labels' fallback), so nearly every pair of
-            series is filed alike. Has no effect on string-keyed
-            (time-series) groups.
-        defer_close_gate (bool): Keyword-only. Return same-title candidates
-            before the close gate and the label check, so that
-            _close_gate_and_labels can run them on scheduled closes. Those need
-            each market's timing record, which is loaded only for these
-            candidates (too costly for every market). False (the default)
-            runs both checks here, on the realized closes.
+            that helper lives in config.py and reads config's own global.
 
     Returns:
-        list[tuple[dict, dict, str, object]]: One (market_a, market_b,
+        list[tuple[dict, dict, str, str]]: One (market_a, market_b,
             canonical_title, group_key) tuple per candidate pair, in group
             iteration order — the cross-event sweep's pairs for a group first,
             then that group's ladder pairs. Empty if no group has two members
-            on different event_tickers of different event series whose
-            wording, for a string-keyed group, states two different cumulative
-            deadlines, or whose closes, for a 3-tuple-keyed group, are readable
-            and within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other and whose
-            series are filed alike, and no group holds an admissible ladder.
+            on different event_tickers whose wording states two different
+            cumulative deadlines (and that are not two events of one series
+            worded identically), and no group holds an admissible ladder.
     """
     pairs = []
-    # Each series' (category, tag), worked out once per series for the
-    # same-title label check (DR-79); an empty listing files every series by
-    # its ticker prefix, as historical.series_labels does
-    _labels = _series_label_filer(series_categories)
 
     # Resolved at CALL time, never bound as a def-time default: the constant
     # is what a test monkeypatches and what --same-event-ladders overrides for
@@ -7657,12 +7275,9 @@ def _extract_pairs(
     same_deadline_skips = 0
     # The one-series and same-event refusals (M10), counted where they fire,
     # per CANDIDATE pair, and reported beside the three above (silent at
-    # zero). They were bare `continue`s, so the 2026-09-24 7-day run logged
-    # "Potential pairs: 0 time-series, 0 same-title" over 184,178 groupable
-    # markets with 748 time-series wording refusals and nothing that named a
-    # cause for the rest of that zero. A counter is only ever incremented
-    # immediately before the `continue` it explains, so no check moves and
-    # no pair changes.
+    # zero), so a zero "Potential pairs" count always has a logged cause. A
+    # counter is only ever incremented immediately before the `continue` it
+    # explains, so no check moves and no pair changes.
     #
     # ts_same_event_skips counts ONLY while the ladder switch is off: with it
     # on, a same-event candidate is not refused here but handed to the ladder
@@ -7670,20 +7285,6 @@ def _extract_pairs(
     # lines, so counting it here as well would report it twice.
     ts_same_event_skips = 0
     ts_series_skips = 0
-    st_same_event_skips = 0
-    st_series_skips = 0
-    # The same-title close gate (DR-74), counted after the series test so the
-    # two counts above do not move and each candidate lands on one line.
-    # st_undated_skips is backtest-only: a same-title group is not
-    # close-filtered (_can_ever_enter keeps a market whose close_time it cannot
-    # parse), while the live finder drops such a market before grouping — so
-    # readability is counted apart, and st_close_gap_skips stays the verbatim
-    # twin of the live finder's close-gap count.
-    st_undated_skips = 0
-    st_close_gap_skips = 0
-    # The same-title label check (DR-79), counted after the close gate so the
-    # counts above do not move; the verbatim twin of the live finder's count
-    st_label_skips = 0
     # The two things the time-series sweep drops BEFORE any candidate is
     # visited (M10), so that a zero caused by them has a cause in the log
     # too. ts_undated_members counts MEMBERS (a member without a readable
@@ -7719,19 +7320,14 @@ def _extract_pairs(
     ladder_same_day_skips = 0
     ladder_gap_cap_skips = 0
     ladder_pairs = 0
-    # Whether this CALL saw any time-series group at all. _prepare_candidates
-    # (the first half of _prepare_entries) calls this function twice — once
-    # per grouping — and the ladder rule applies only to string keys, so
-    # without this the same-title call would log a permanent "ladder
-    # candidates: 0" that reads as the ladder pass having found nothing when
-    # it never ran.
+    # Whether this CALL saw any group at all. With no group the ladder
+    # sub-pass never runs, so its always-logged count below stays silent
+    # rather than logging a "ladder candidates: 0" that reads as the pass
+    # having run and found nothing; _prepare_candidates' "Groups of two or
+    # more markets" line explains an empty grouping instead.
     saw_time_series_group = False
     for key, members in groups.items():
-        if isinstance(key, str):
-            canon = key
-        else:
-            # 3-tuple (event_title, title, subtitle) — use title-or-subtitle for display
-            canon = key[1] or key[2]
+        canon = key
 
         if len(members) > LARGE_GROUP_WARN_THRESHOLD:
             # Visibility only — not a cap. Confirms the prefilter/windowing
@@ -7744,296 +7340,242 @@ def _extract_pairs(
 
         seen: set[frozenset] = set()
 
-        if isinstance(key, str):
-            saw_time_series_group = True
-            # Time-series: sort by close_time and sweep only the pairs within
-            # the deadline-gap window (see docstring above) instead of the
-            # naive O(n^2) double loop over the whole group.
-            dated = [(_parse_iso_date(m.get("close_time")), m) for m in members]
-            dated = [(d, m) for d, m in dated if d is not None]
-            # Members the sweep cannot place (M10): counted, never paired.
-            ts_undated_members += len(members) - len(dated)
-            dated.sort(key=lambda pair: pair[0])
-            margin = timedelta(days=MAX_DEADLINE_GAP_DAYS + 1)
-            n = len(dated)
-            # Classify each member's wording ONCE, positionally, then compare
-            # the cheap results pairwise below. The sweep is O(n * window), so
-            # classifying per CANDIDATE would re-run the regex tables about 60x
-            # more often than per member (2 legs x ~31 in-window neighbours on
-            # TestExtractPairsPerformanceSmoke's 50,000-member group). Scoped to
-            # this group and dropped with it: a corpus-wide ticker->verdict map
-            # would add residency in exactly the place TS-07 did work to
-            # reduce it.
-            group_profiles = [_deadline_profile_dict(m) for _d, m in dated]
-            for i in range(n):
-                close_a, mA = dated[i]
-                # The first index the window excludes for this mA; n when the
-                # window reaches the end of the group (M10's never-visited
-                # count — set only at the `break`, so no candidate pays for it).
-                stop = n
-                for j in range(i + 1, n):
-                    close_b, mB = dated[j]
-                    if close_b - close_a > margin:
-                        # Sorted ascending by close_time — every further j is
-                        # at least this far from mA, so nothing later qualifies.
-                        stop = j
-                        break
-                    if mA["event_ticker"] == mB["event_ticker"]:
-                        # Two markets of ONE event: refused here with the
-                        # ladder switch off; with it on, the ladder sub-pass
-                        # below judges (and counts) the candidate instead.
-                        if not ladders_on:
-                            ts_same_event_skips += 1
-                        continue
-                    # Mirror of the scanner's time-series conjunct: identical
-                    # wording across two events of one series is two instances
-                    # of one recurring fixture, not one question at two
-                    # deadlines (DR-02, DR-54).
-                    if _identical_wording_dicts(mA, mB) and _same_series_dicts(mA, mB):
-                        ts_series_skips += 1
-                        continue
-                    # Mirror of the scanner's cumulative-deadline rule, through
-                    # the SAME scanner.cumulative_deadline_pair: the two legs
-                    # must be one question at two different "by <date>"
-                    # deadlines. A snapshot family ("price ON <date>") groups
-                    # here exactly as it does live — the grouping key is
-                    # untouched — and is refused here exactly as it is live.
-                    # Deliberately a separate check from the one-series
-                    # conjunct above, not fused into it: they refuse different
-                    # shapes for different reasons.
-                    if not cumulative_deadline_pair(
+        saw_time_series_group = True
+        # Time-series: sort by close_time and sweep only the pairs within
+        # the deadline-gap window (see docstring above) instead of the
+        # naive O(n^2) double loop over the whole group.
+        dated = [(_parse_iso_date(m.get("close_time")), m) for m in members]
+        dated = [(d, m) for d, m in dated if d is not None]
+        # Members the sweep cannot place (M10): counted, never paired.
+        ts_undated_members += len(members) - len(dated)
+        dated.sort(key=lambda pair: pair[0])
+        margin = timedelta(days=MAX_DEADLINE_GAP_DAYS + 1)
+        n = len(dated)
+        # Classify each member's wording ONCE, positionally, then compare
+        # the cheap results pairwise below. The sweep is O(n * window), so
+        # classifying per CANDIDATE would re-run the regex tables about 60x
+        # more often than per member (2 legs x ~31 in-window neighbours on
+        # TestExtractPairsPerformanceSmoke's 50,000-member group). Scoped to
+        # this group and dropped with it: a corpus-wide ticker->verdict map
+        # would add residency in exactly the place TS-07 did work to
+        # reduce it.
+        group_profiles = [_deadline_profile_dict(m) for _d, m in dated]
+        for i in range(n):
+            close_a, mA = dated[i]
+            # The first index the window excludes for this mA; n when the
+            # window reaches the end of the group (M10's never-visited
+            # count — set only at the `break`, so no candidate pays for it).
+            stop = n
+            for j in range(i + 1, n):
+                close_b, mB = dated[j]
+                if close_b - close_a > margin:
+                    # Sorted ascending by close_time — every further j is
+                    # at least this far from mA, so nothing later qualifies.
+                    stop = j
+                    break
+                if mA["event_ticker"] == mB["event_ticker"]:
+                    # Two markets of ONE event: refused here with the
+                    # ladder switch off; with it on, the ladder sub-pass
+                    # below judges (and counts) the candidate instead.
+                    if not ladders_on:
+                        ts_same_event_skips += 1
+                    continue
+                # Mirror of the scanner's time-series conjunct: identical
+                # wording across two events of one series is two instances
+                # of one recurring fixture, not one question at two
+                # deadlines (DR-02, DR-54).
+                if _identical_wording_dicts(mA, mB) and _same_series_dicts(mA, mB):
+                    ts_series_skips += 1
+                    continue
+                # Mirror of the scanner's cumulative-deadline rule, through
+                # the SAME scanner.cumulative_deadline_pair: the two legs
+                # must be one question at two different "by <date>"
+                # deadlines. A snapshot family ("price ON <date>") groups
+                # here exactly as it does live — the grouping key is
+                # untouched — and is refused here exactly as it is live.
+                # Deliberately a separate check from the one-series
+                # conjunct above, not fused into it: they refuse different
+                # shapes for different reasons.
+                if not cumulative_deadline_pair(
+                    group_profiles[i], group_profiles[j]
+                ):
+                    # Same decision as cumulative_deadline_pair, re-asked
+                    # for its REASON (DR-72) through the one shared
+                    # deadline_pair_refusal, so the verdict here and the
+                    # boolean just tested can never disagree.
+                    reason = deadline_pair_refusal(
                         group_profiles[i], group_profiles[j]
-                    ):
-                        # Same decision as cumulative_deadline_pair, re-asked
-                        # for its REASON (DR-72) through the one shared
-                        # deadline_pair_refusal, so the verdict here and the
-                        # boolean just tested can never disagree.
-                        reason = deadline_pair_refusal(
+                    )
+                    if reason == REFUSED_SNAPSHOT:
+                        snapshot_skips += 1
+                    elif reason == REFUSED_NO_STATED_DEADLINE:
+                        no_deadline_skips += 1
+                    elif reason == REFUSED_SAME_DEADLINE:
+                        same_deadline_skips += 1
+                    continue
+                pair_key = frozenset([mA["ticker"], mB["ticker"]])
+                if pair_key in seen:
+                    continue
+                seen.add(pair_key)
+                pairs.append((mA, mB, canon, key))
+            # Indexes stop..n-1 were never visited for this mA.
+            ts_beyond_window += n - stop
+
+        # ── DR-73: the same-event deadline ladder sub-pass ────────────
+        # A SEPARATE pass, not a relaxation of the sweep above, for two
+        # reasons. The sweep's `continue` on equal event tickers stays
+        # exactly as it was, so every cross-event count and every
+        # cross-event pair is untouched; and this pass is deliberately
+        # UNWINDOWED, because a ladder is capped on its STATED gap while
+        # the window bounds the CLOSE gap, and the two disagree
+        # routinely (see the docstring's measured 463-against-1).
+        #
+        # Gated on the resolved flag, and the gate wraps the BUCKETING as
+        # well as the pairwise loops: on a strike-blind legacy slice one
+        # event bucket reaches 75 members and a whole slice reaches
+        # 615,266 same-event candidate pairs, so a disabled census here
+        # would cost real time on every switch-off run to report a number
+        # nobody asked for. The live finder keeps that census instead,
+        # where its memoized profiles make it free.
+        if ladders_on:
+            # Positional indexes, NOT members: group_profiles is indexed
+            # by position in `dated`, and the stated-deadline memo below
+            # keys the same way.
+            event_buckets: dict[str, list[int]] = defaultdict(list)
+            for idx, (_d, m) in enumerate(dated):
+                event_buckets[m.get("event_ticker") or ""].append(idx)
+
+            for event_ticker, idxs in event_buckets.items():
+                if len(idxs) < 2:
+                    continue
+                if not event_ticker:
+                    # Two members sharing an EMPTY event ticker share no
+                    # event at all, so nothing identifies the ladder they
+                    # would belong to. Fails closed, exactly as it did
+                    # before this pass existed; counted per CANDIDATE
+                    # pair so the number means the same thing as the live
+                    # finder's.
+                    ladder_no_event_skips += len(idxs) * (len(idxs) - 1) // 2
+                    continue
+                if len(idxs) > LARGE_GROUP_WARN_THRESHOLD:
+                    # Visibility only, not a cap — the
+                    # LARGE_GROUP_WARN_THRESHOLD idiom applied to the one
+                    # quadratic loop in this function that has no window
+                    # bounding it. Measured maxima are 26 live and 75 on
+                    # a strike-blind legacy slice, so this cannot fire on
+                    # any corpus on disk today; it exists so a future one
+                    # cannot reintroduce the blow-up silently.
+                    logging.warning(
+                        "Same-event ladder bucket %r in group %r holds %d dated "
+                        "rungs — the ladder sub-pass is O(B^2) and unwindowed; "
+                        "verify this event is a deadline ladder and not a "
+                        "strike family grouped strike-blind",
+                        event_ticker, canon, len(idxs),
+                    )
+                # Each rung's stated deadline, read ONCE per member and
+                # only for the members that actually land in a >= 2
+                # bucket (DR-70's rule: a group of N members yields
+                # O(N^2) candidates, and one event's ladder is the
+                # densest such group there is; an index appears in
+                # exactly one bucket, so this whole map is one read per
+                # member). Each value is a PAIR of readings — the
+                # cross-checked deadline, and the same read with the
+                # cross-check disarmed (stated_deadline consults only its
+                # three FIELD arguments, so "" for all three leaves the
+                # deciding field's own day) — which is what separates
+                # "this rung states no placeable day" from "this rung's
+                # own fields name irreconcilable days" when a refusal is
+                # counted. Same two-value shape, and the same second
+                # read, as the live finder's ladder_deadlines map.
+                rung_deadlines = {
+                    idx: (
+                        _stated_deadline_dict(dated[idx][1], group_profiles[idx]),
+                        stated_deadline(group_profiles[idx], "", "", ""),
+                    )
+                    for idx in idxs
+                }
+                for x, i in enumerate(idxs):
+                    for j in idxs[x + 1:]:
+                        # Fresh per-candidate locals, never the bucket
+                        # entries: a ladder may SWAP its legs below, and
+                        # the same index reappears in every later
+                        # candidate of this bucket.
+                        mA = dated[i][1]
+                        mB = dated[j][1]
+                        if _identical_wording_dicts(mA, mB):
+                            # Same event AND identical wording: the
+                            # deadline is not in the wording, so there is
+                            # nothing here to order two rungs by (DR-02's
+                            # reasoning, one level in).
+                            # cumulative_deadline_pair below would refuse
+                            # it too, but counting it here keeps the
+                            # ladder counters about ladders — it is the
+                            # largest single ladder refusal live.
+                            ladder_identical_wording_skips += 1
+                            continue
+                        if not cumulative_deadline_pair(
                             group_profiles[i], group_profiles[j]
-                        )
-                        if reason == REFUSED_SNAPSHOT:
-                            snapshot_skips += 1
-                        elif reason == REFUSED_NO_STATED_DEADLINE:
-                            no_deadline_skips += 1
-                        elif reason == REFUSED_SAME_DEADLINE:
-                            same_deadline_skips += 1
-                        continue
-                    pair_key = frozenset([mA["ticker"], mB["ticker"]])
-                    if pair_key in seen:
-                        continue
-                    seen.add(pair_key)
-                    pairs.append((mA, mB, canon, key))
-                # Indexes stop..n-1 were never visited for this mA.
-                ts_beyond_window += n - stop
-
-            # ── DR-73: the same-event deadline ladder sub-pass ────────────
-            # A SEPARATE pass, not a relaxation of the sweep above, for two
-            # reasons. The sweep's `continue` on equal event tickers stays
-            # exactly as it was, so every cross-event count and every
-            # cross-event pair is untouched; and this pass is deliberately
-            # UNWINDOWED, because a ladder is capped on its STATED gap while
-            # the window bounds the CLOSE gap, and the two disagree
-            # routinely (see the docstring's measured 463-against-1).
-            #
-            # Gated on the resolved flag, and the gate wraps the BUCKETING as
-            # well as the pairwise loops: on a strike-blind legacy slice one
-            # event bucket reaches 75 members and a whole slice reaches
-            # 615,266 same-event candidate pairs, so a disabled census here
-            # would cost real time on every switch-off run to report a number
-            # nobody asked for. The live finder keeps that census instead,
-            # where its memoized profiles make it free.
-            if ladders_on:
-                # Positional indexes, NOT members: group_profiles is indexed
-                # by position in `dated`, and the stated-deadline memo below
-                # keys the same way.
-                event_buckets: dict[str, list[int]] = defaultdict(list)
-                for idx, (_d, m) in enumerate(dated):
-                    event_buckets[m.get("event_ticker") or ""].append(idx)
-
-                for event_ticker, idxs in event_buckets.items():
-                    if len(idxs) < 2:
-                        continue
-                    if not event_ticker:
-                        # Two members sharing an EMPTY event ticker share no
-                        # event at all, so nothing identifies the ladder they
-                        # would belong to. Fails closed, exactly as it did
-                        # before this pass existed; counted per CANDIDATE
-                        # pair so the number means the same thing as the live
-                        # finder's.
-                        ladder_no_event_skips += len(idxs) * (len(idxs) - 1) // 2
-                        continue
-                    if len(idxs) > LARGE_GROUP_WARN_THRESHOLD:
-                        # Visibility only, not a cap — the
-                        # LARGE_GROUP_WARN_THRESHOLD idiom applied to the one
-                        # quadratic loop in this function that has no window
-                        # bounding it. Measured maxima are 26 live and 75 on
-                        # a strike-blind legacy slice, so this cannot fire on
-                        # any corpus on disk today; it exists so a future one
-                        # cannot reintroduce the blow-up silently.
-                        logging.warning(
-                            "Same-event ladder bucket %r in group %r holds %d dated "
-                            "rungs — the ladder sub-pass is O(B^2) and unwindowed; "
-                            "verify this event is a deadline ladder and not a "
-                            "strike family grouped strike-blind",
-                            event_ticker, canon, len(idxs),
-                        )
-                    # Each rung's stated deadline, read ONCE per member and
-                    # only for the members that actually land in a >= 2
-                    # bucket (DR-70's rule: a group of N members yields
-                    # O(N^2) candidates, and one event's ladder is the
-                    # densest such group there is; an index appears in
-                    # exactly one bucket, so this whole map is one read per
-                    # member). Each value is a PAIR of readings — the
-                    # cross-checked deadline, and the same read with the
-                    # cross-check disarmed (stated_deadline consults only its
-                    # three FIELD arguments, so "" for all three leaves the
-                    # deciding field's own day) — which is what separates
-                    # "this rung states no placeable day" from "this rung's
-                    # own fields name irreconcilable days" when a refusal is
-                    # counted. Same two-value shape, and the same second
-                    # read, as the live finder's ladder_deadlines map.
-                    rung_deadlines = {
-                        idx: (
-                            _stated_deadline_dict(dated[idx][1], group_profiles[idx]),
-                            stated_deadline(group_profiles[idx], "", "", ""),
-                        )
-                        for idx in idxs
-                    }
-                    for x, i in enumerate(idxs):
-                        for j in idxs[x + 1:]:
-                            # Fresh per-candidate locals, never the bucket
-                            # entries: a ladder may SWAP its legs below, and
-                            # the same index reappears in every later
-                            # candidate of this bucket.
-                            mA = dated[i][1]
-                            mB = dated[j][1]
-                            if _identical_wording_dicts(mA, mB):
-                                # Same event AND identical wording: the
-                                # deadline is not in the wording, so there is
-                                # nothing here to order two rungs by (DR-02's
-                                # reasoning, one level in).
-                                # cumulative_deadline_pair below would refuse
-                                # it too, but counting it here keeps the
-                                # ladder counters about ladders — it is the
-                                # largest single ladder refusal live.
-                                ladder_identical_wording_skips += 1
-                                continue
-                            if not cumulative_deadline_pair(
+                        ):
+                            # The same three DR-72 reasons as the sweep
+                            # above, through the same one shared
+                            # deadline_pair_refusal, on their own
+                            # counters.
+                            reason = deadline_pair_refusal(
                                 group_profiles[i], group_profiles[j]
+                            )
+                            if reason == REFUSED_SNAPSHOT:
+                                ladder_snapshot_skips += 1
+                            elif reason == REFUSED_NO_STATED_DEADLINE:
+                                ladder_no_deadline_skips += 1
+                            elif reason == REFUSED_SAME_DEADLINE:
+                                ladder_same_deadline_skips += 1
+                            continue
+                        deadline_a, deciding_a = rung_deadlines[i]
+                        deadline_b, deciding_b = rung_deadlines[j]
+                        ladder = same_event_ladder(deadline_a, deadline_b)
+                        if ladder is None:
+                            # Two findings with different remedies,
+                            # counted apart: a rung whose wording states
+                            # no placeable day (a parser gap — year-less
+                            # wording, mostly) against one whose own
+                            # fields name irreconcilable days (stale
+                            # wording in one of them).
+                            if (deadline_a is None and deciding_a is not None) or (
+                                deadline_b is None and deciding_b is not None
                             ):
-                                # The same three DR-72 reasons as the sweep
-                                # above, through the same one shared
-                                # deadline_pair_refusal, on their own
-                                # counters.
-                                reason = deadline_pair_refusal(
-                                    group_profiles[i], group_profiles[j]
-                                )
-                                if reason == REFUSED_SNAPSHOT:
-                                    ladder_snapshot_skips += 1
-                                elif reason == REFUSED_NO_STATED_DEADLINE:
-                                    ladder_no_deadline_skips += 1
-                                elif reason == REFUSED_SAME_DEADLINE:
-                                    ladder_same_deadline_skips += 1
-                                continue
-                            deadline_a, deciding_a = rung_deadlines[i]
-                            deadline_b, deciding_b = rung_deadlines[j]
-                            ladder = same_event_ladder(deadline_a, deadline_b)
-                            if ladder is None:
-                                # Two findings with different remedies,
-                                # counted apart: a rung whose wording states
-                                # no placeable day (a parser gap — year-less
-                                # wording, mostly) against one whose own
-                                # fields name irreconcilable days (stale
-                                # wording in one of them).
-                                if (deadline_a is None and deciding_a is not None) or (
-                                    deadline_b is None and deciding_b is not None
-                                ):
-                                    ladder_field_conflict_skips += 1
-                                else:
-                                    ladder_undated_skips += 1
-                                continue
-                            if ladder is SAME_DAY:
-                                # Both rungs name ONE calendar day — one
-                                # deadline spelled two ways ("by Mar 31,
-                                # 2027" beside "before Apr 1, 2027"), not a
-                                # two-rung ladder. Compared with `is`, never
-                                # truthiness: SAME_DAY is a non-empty string.
-                                ladder_same_day_skips += 1
-                                continue
-                            swap, stated_gap = ladder
-                            if stated_gap > MAX_DEADLINE_GAP_DAYS:
-                                # The ladder's OWN cap, on the STATED gap.
-                                # _find_entry re-applies it on the same
-                                # arithmetic, so this is the sweep's
-                                # window-plus-exact-cutoff contract mirrored
-                                # for ladders.
-                                ladder_gap_cap_skips += 1
-                                continue
-                            if swap:
-                                # market_a must be the EARLIER contract,
-                                # which for a ladder means the earlier STATED
-                                # deadline: the close_time sort above cannot
-                                # order rungs that close at one instant.
-                                mA, mB = mB, mA
-                            pair_key = frozenset([mA["ticker"], mB["ticker"]])
-                            if pair_key in seen:
-                                continue
-                            seen.add(pair_key)
-                            ladder_pairs += 1
-                            pairs.append((mA, mB, canon, key))
-        else:
-            # Same-title: no deadline-gap concept, so swept naively — but each
-            # candidate is gated on close-time proximity below (DR-74).
-            for i, mA in enumerate(members):
-                for mB in members[i + 1:]:
-                    if mA["event_ticker"] == mB["event_ticker"]:
-                        # Mirror of scanner.find_same_title_pairs' same-event
-                        # skip, counted as it now is there (M10).
-                        st_same_event_skips += 1
-                        continue
-                    # Mirror of scanner.find_same_title_pairs' one-series rule:
-                    # the group key already guarantees identical wording, so
-                    # two events of one series are two fixtures (DR-02, DR-54).
-                    if _same_series_dicts(mA, mB):
-                        st_series_skips += 1
-                        continue
-                    # Mirror of find_same_title_pairs' close gate (DR-74): same
-                    # wording on two series is one question only when both close
-                    # at the same moment. An unreadable close is refused on its
-                    # own backtest-only line (no live twin: the live finder drops
-                    # a missing close before grouping).
-                    closes = _comparable_closes_dicts(mA, mB)
-                    if closes is None:
-                        st_undated_skips += 1
-                        continue
-                    # With the gate deferred, the rest (the gate on the
-                    # scheduled closes, then the label check) is
-                    # _close_gate_and_labels', after _prepare_candidates has
-                    # read the scheduled closes
-                    if defer_close_gate:
+                                ladder_field_conflict_skips += 1
+                            else:
+                                ladder_undated_skips += 1
+                            continue
+                        if ladder is SAME_DAY:
+                            # Both rungs name ONE calendar day — one
+                            # deadline spelled two ways ("by Mar 31,
+                            # 2027" beside "before Apr 1, 2027"), not a
+                            # two-rung ladder. Compared with `is`, never
+                            # truthiness: SAME_DAY is a non-empty string.
+                            ladder_same_day_skips += 1
+                            continue
+                        swap, stated_gap = ladder
+                        if stated_gap > MAX_DEADLINE_GAP_DAYS:
+                            # The ladder's OWN cap, on the STATED gap.
+                            # _find_entry re-applies it on the same
+                            # arithmetic, so this is the sweep's
+                            # window-plus-exact-cutoff contract mirrored
+                            # for ladders.
+                            ladder_gap_cap_skips += 1
+                            continue
+                        if swap:
+                            # market_a must be the EARLIER contract,
+                            # which for a ladder means the earlier STATED
+                            # deadline: the close_time sort above cannot
+                            # order rungs that close at one instant.
+                            mA, mB = mB, mA
                         pair_key = frozenset([mA["ticker"], mB["ticker"]])
                         if pair_key in seen:
                             continue
                         seen.add(pair_key)
+                        ladder_pairs += 1
                         pairs.append((mA, mB, canon, key))
-                        continue
-                    # The ONE definition of the gate, shared with the live finder
-                    # so the two paths cannot disagree on "one moment".
-                    if closes_apart(*closes):
-                        st_close_gap_skips += 1
-                        continue
-                    # Mirror of find_same_title_pairs' label check (DR-79),
-                    # through the same scanner.labels_differ: same wording on two
-                    # series closing together is one question only when both
-                    # series are filed under one Kalshi category and tag
-                    if labels_differ(_labels(mA), _labels(mB)):
-                        st_label_skips += 1
-                        continue
-                    pair_key = frozenset([mA["ticker"], mB["ticker"]])
-                    if pair_key in seen:
-                        continue
-                    seen.add(pair_key)
-                    pairs.append((mA, mB, canon, key))
     # What the time-series sweep set aside before visiting anything (M10),
     # each silent at zero: without these, a zero caused by an unreadable
     # close_time or by a group whose members all close too far apart logged
@@ -8060,13 +7602,10 @@ def _extract_pairs(
             "the same-event ones): %d",
             MAX_DEADLINE_GAP_DAYS + 1, MAX_DEADLINE_GAP_DAYS, ts_beyond_window,
         )
-    # The one-series and same-event refusals (M10), each silent at zero.
-    # _prepare_candidates hands each call ONE grouping (the time-series or
-    # the same-title one), so a production call logs at most one pair of
-    # these. The time-series lines say "within the deadline-gap window,
-    # before price filters" like the DR-72 lines below, because the windowed
-    # sweep never visits a candidate beyond that window; the same-title lines
-    # are unwindowed, like the branch that counts them.
+    # The one-series and same-event refusals (M10), each silent at zero. They
+    # say "within the deadline-gap window, before price filters" like the
+    # DR-72 lines below, because the windowed sweep never visits a candidate
+    # beyond that window.
     if ts_same_event_skips:
         # Backtest-only: the live finder's nearest line ("Same-event
         # candidates skipped because same-event deadline ladders are
@@ -8090,49 +7629,6 @@ def _extract_pairs(
             "series (identical wording, different fixture; within the "
             "deadline-gap window, before price filters): %d",
             ts_series_skips,
-        )
-    if st_same_event_skips:
-        # Verbatim mirror of find_same_title_pairs' same-event line (M10).
-        logging.info(
-            "Same-title candidates skipped because both markets carry the "
-            "same event ticker (one event's own markets, not one question "
-            "listed by two events): %d",
-            st_same_event_skips,
-        )
-    if st_series_skips:
-        # Verbatim mirror of find_same_title_pairs' long-standing one-series
-        # line: both count every refused candidate before any price filter
-        # (this function applies none), so the two numbers mean the same.
-        logging.info(
-            "Same-title candidates skipped as two instances of one event series "
-            "(identical wording, different fixture): %d", st_series_skips,
-        )
-    if st_close_gap_skips:
-        # Verbatim mirror of find_same_title_pairs' close-gap line (DR-74).
-        # The bound is printed through scanner.close_gap_bound_text, which
-        # reads the binding closes_apart read — this module holds no copy of
-        # the constant, so the line cannot state a bound its gate did not use.
-        logging.info(
-            "Same-title candidates refused because the two markets close more "
-            "than %s apart (two different games or instants, not one "
-            "question listed twice): %d",
-            close_gap_bound_text(), st_close_gap_skips,
-        )
-    if st_label_skips:
-        # Verbatim twin of find_same_title_pairs' label line (DR-79)
-        logging.info(
-            "Same-title candidates refused because the two series are filed under "
-            "different Kalshi categories or tags (two different sports or subjects, "
-            "not one question listed twice): %d", st_label_skips,
-        )
-    if st_undated_skips:
-        # Backtest-only (DR-74): the live finder never reaches a market
-        # without a close_time, so this has no live twin.
-        logging.info(
-            "Same-title candidate pairs refused because a market's close_time "
-            "cannot be read (fail closed; the live finder drops such markets "
-            "before grouping): %d",
-            st_undated_skips,
         )
     # Mirror of the live scanner's three-way split (DR-72), each silent at
     # zero: within the deadline-gap window this sweep already restricted
@@ -8226,76 +7722,18 @@ def _extract_pairs(
             ladder_gap_cap_skips,
         )
     if ladders_on and saw_time_series_group:
-        # ALWAYS logged while the switch is on, zero included: a switch that
-        # silently produces nothing must be distinguishable from one that is
-        # working and finding nothing (DR-66). The live finder's counterpart
-        # counts pairs that SURVIVED its one-best-per-group contest; this one
-        # counts candidates, because which rung of a ladder trades is decided
-        # later here, in _simulate_at_discount.
+        # ALWAYS logged while the switch is on and the call saw a group, zero
+        # included: a switch that silently produces nothing must be
+        # distinguishable from one that is working and finding nothing
+        # (DR-66). The live finder's counterpart counts pairs that SURVIVED
+        # its one-best-per-group contest; this one counts candidates, because
+        # which rung of a ladder trades is decided later here, in
+        # _simulate_at_discount.
         logging.info(
             "Same-event ladder candidates among the time-series candidates: %d",
             ladder_pairs,
         )
     return pairs
-
-
-def _refuse_other_competitions(pairs: list, competitions: dict) -> list:
-    """
-    Drop the same-title pairs whose two events name different competitions (DR-79).
-
-    The backtest's twin of the competition check in
-    scanner.find_same_title_pairs, through the same scanner.competitions_differ:
-    two series of one sport share a tag, so a men's and a women's game, or two
-    leagues of one matchup, are told apart by the competition each event names
-    ("College Basketball (M)" and "College Basketball (W)"). One event naming a
-    competition and the other none counts as different. It runs on
-    _extract_pairs' same-title output, because cached markets carry no
-    competition and historical.load_event_competitions reads the labels only
-    for the events those pairs touch. A pair with an event whose label is not
-    known (its read failed, or was not made) is refused on a backtest-only
-    line: live ingest reads every event's label as it lists the markets, and
-    refuses a label it cannot read on the competition line, so this line has
-    no live twin. Each line is silent at zero.
-
-    Args:
-        pairs (list): _extract_pairs' same-title (market_a, market_b,
-            canonical_title, group_key) tuples.
-        competitions (dict): event ticker -> label ("" when the event names
-            none), from load_event_competitions; an event missing from it is
-            unknown.
-
-    Returns:
-        list: The pairs kept, in their order.
-    """
-    kept = []
-    competition_skips = 0
-    unknown_skips = 0
-    for pair in pairs:
-        event_a = pair[0].get("event_ticker") or ""
-        event_b = pair[1].get("event_ticker") or ""
-        if event_a not in competitions or event_b not in competitions:
-            # Fail closed: a label that was never read cannot show one competition
-            unknown_skips += 1
-            continue
-        # Cross-module: the ONE definition the live finder compares labels with
-        if competitions_differ(competitions[event_a], competitions[event_b]):
-            competition_skips += 1
-            continue
-        kept.append(pair)
-    if competition_skips:
-        # Verbatim twin of find_same_title_pairs' competition line
-        logging.info(
-            "Same-title candidates refused because the two events name different "
-            "competitions (two leagues, genders or formats, not one question listed "
-            "twice): %d", competition_skips,
-        )
-    if unknown_skips:
-        # Backtest-only: the live finder reads every event's label at ingest
-        logging.info(
-            "Same-title candidate pairs refused because an event's competition could "
-            "not be read from Kalshi (fail closed): %d", unknown_skips,
-        )
-    return kept
 
 
 # ─── Entry point detection from candlestick data ──────────────────────────────
@@ -9283,8 +8721,8 @@ def _find_entry(
 
         # Enforce the minimum price gap for this pair type (directional in
         # both cases — the gap above is signed, never an absolute value).
-        # PRICE_EPSILON mirrors scanner.find_time_series_pairs /
-        # find_same_title_pairs: candle prices are floats too, so a gap sitting
+        # PRICE_EPSILON mirrors scanner.find_time_series_pairs: candle
+        # prices are floats too, so a gap sitting
         # exactly on the tier can evaluate a hair under it and be rejected for
         # representation noise. The AST parity pins do NOT check this constant,
         # so a missed mirror here is silent divergence (TS-09).
@@ -9670,10 +9108,9 @@ def _fetch_candles_parallel(
     is what the sequential version did — there is no window to request. A
     present-but-unparseable close_time is handled the same way (with a warning):
     it is a data defect in one market, not a reason to abort the whole run from
-    the main thread before any worker starts (BS-07). Since DR-74 no candidate
-    pair of either type carries such a market — the time-series sweep sets it
-    aside and the same-title close gate refuses the pair — so this branch is
-    defence in depth for a caller that hands one over directly.
+    the main thread before any worker starts (BS-07). No candidate pair
+    carries such a market — the time-series sweep sets it aside — so this
+    branch is defence in depth for a caller that hands one over directly.
 
     Worker exceptions are deliberately NOT caught: fetch_candlesticks already
     fail-softs network errors to an empty list internally, so anything that
@@ -9928,8 +9365,8 @@ class _OutcomeLabelTally:
         # 2026-09-08 day slice, 2026-09-22), so a walk of its own would add
         # little; what bounds the census on a multi-million-record corpus is
         # the classifier's cost. Since SS-1 the pass that feeds it in a
-        # backtest is _index_eligible_keys, which also computes both grouping
-        # keys per eligible record — and on a combo-heavy corpus the
+        # backtest is _index_eligible_keys, which also computes the grouping
+        # key per eligible record — and on a combo-heavy corpus the
         # time-series key dominates that pass (~135 us/record, normalize_title
         # on long combo titles, measured on the 2026-09-17 7-day window), so
         # there the census is the smaller share.
@@ -10023,8 +9460,7 @@ def _report_outcome_label_coverage(tally: _OutcomeLabelTally) -> OutcomeLabelCov
             "Outcome-label coverage is %.2f%%, below the %.2f%% floor: most "
             "eligible markets carry no subtitle, so the time-series key falls "
             "back to the bare normalized title — the strike-blind grouping the "
-            "live scanner no longer uses — and the same-title key loses its "
-            "outcome discriminator. Treat this run's potential-pair counts, "
+            "live scanner no longer uses. Treat this run's potential-pair counts, "
             "trades, returns and empirical interval-discount recommendation as "
             "describing a different strategy from the shipped one. Remedy: "
             "delete backtest_cache/archive_days/ and backtest_cache/live_days/, "
@@ -10054,15 +9490,14 @@ def _log_outcome_label_coverage(markets: Iterable[dict]) -> OutcomeLabelCoverage
     Census how many eligible markets carry an outcome label and how their
     deadline wording classifies, and warn when few carry a label.
 
-    Both backtest grouping keys are built from fields a stale cache may simply
+    The backtest's grouping key is built from fields a stale cache may simply
     not have. `subtitle` is the outcome discriminator in the time-series key
-    (scanner.time_series_group_key) and the third component of the same-title
-    key (event_title, title, subtitle); `event_title` is the first component of
-    the latter. A record whose subtitle is blank keys by title alone — the
-    pre-DR-01 strike-blind grouping the live scanner was fixed to stop using —
-    and a blank event_title collapses the same-title key toward (title,
-    subtitle), the direction that manufactures cross-event false positives
-    under the 0.95 co-resolution prior (TS-11).
+    (scanner.time_series_group_key), and `event_title` the first part of the
+    combined title it is built from (_pair_key). A record whose subtitle is
+    blank keys by title alone — the pre-DR-01 strike-blind grouping the live
+    scanner was fixed to stop using — and a blank event_title drops the
+    event from the key, so two unrelated events' markets that share a title
+    can land in one group (TS-11).
 
     The defect this closes is the SILENCE, not the grouping (DR-66). A backtest
     over a cache written before the 2026-08-14 yes_sub_title ingest fix reports
@@ -10135,25 +9570,25 @@ class _EligibleKeyIndex:
     order the corpus yielded them — the positional contract the second pass,
     _materialize_groupable, reads back. Holds no record, only fixed-width
     numbers per eligible record, which is the whole point on a corpus of
-    millions (SS-1). While the first pass builds it, it holds about 27 bytes
-    per eligible record (three int64 arrays and two flag bytes; 187 MiB for
-    7,260,952 eligible records, measured on synthetic keys on 2026-09-24),
-    and computing `keep` from those buffers adds a transient of about
-    74 bytes per record (np.unique inside _shared_key_mask; 515 MiB at that
-    count). Once built it keeps only `keep` (1 byte) and `identities`
-    (8 bytes) per eligible record.
+    millions (SS-1). While the first pass builds it, it holds two int64
+    arrays and one flag byte per eligible record (about 17 bytes), and
+    computing `keep` from those buffers adds a transient of about 74 bytes
+    per record (np.unique inside _shared_key_mask; 515 MiB for 7,260,952
+    eligible records, measured on synthetic keys on 2026-09-24). Once built
+    it keeps only `keep` (1 byte) and `identities` (8 bytes) per eligible
+    record.
 
     Attributes:
         total (int): Every record the first pass walked, eligible or not — the
             figure "Markets to analyze" reports.
         eligible (int): Records that passed _can_ever_enter.
-        groupable (int): Eligible records whose time-series key OR same-title
-            key hash is shared with another eligible record — how many the
-            second pass will materialize.
+        groupable (int): Eligible records whose time-series key hash is
+            shared with another eligible record — how many the second pass
+            will materialize.
         keep (bytes): One byte per eligible record, 1 when that record is
             groupable, else 0.
         identities (array): _corpus_identity() of each eligible record, int64
-            — one hash over its ticker and every field either grouping key
+            — one hash over its ticker and every field the grouping key
             reads — which the second pass compares position by position, so a
             corpus that does not re-iterate identically in anything the keep
             flags were chosen from is refused rather than silently misaligned.
@@ -10169,12 +9604,11 @@ def _shared_key_mask(hashes: array, valid: bytearray) -> np.ndarray:
     """
     Flag every key hash that occurs at least twice among the VALID keys.
 
-    A record can only ever land in a group of two or more — and both grouping
-    functions drop every single-member group — if some OTHER eligible record
+    A record can only ever land in a group of two or more — and the grouping
+    function drops every single-member group — if some OTHER eligible record
     carries the same key. So "this record's key is shared" is exactly "this
-    record can appear in a group", and a record whose time-series key and
-    same-title key are both unshared can never appear in any pair of either
-    type.
+    record can appear in a group", and a record whose time-series key is
+    unshared can never appear in any pair.
 
     Hashes stand in for the keys to keep this compact (8 bytes per record
     instead of a multi-hundred-byte string; np.unique's sort, inverse and
@@ -10194,8 +9628,7 @@ def _shared_key_mask(hashes: array, valid: bytearray) -> np.ndarray:
             Positions whose key is invalid hold a placeholder that is never
             read.
         valid (bytearray): One byte per position: 1 when that record has a
-            key of this kind at all (a non-empty time-series key; a same-title
-            key that is not None), else 0.
+            key at all (a non-empty time-series key), else 0.
 
     Returns:
         np.ndarray: Boolean, one per position — True exactly when the position
@@ -10216,7 +9649,7 @@ def _shared_key_mask(hashes: array, valid: bytearray) -> np.ndarray:
 
 def _corpus_identity(m: dict) -> int:
     """
-    One hash over a record's ticker and every field either grouping key reads.
+    One hash over a record's ticker and every field the grouping key reads.
 
     _materialize_groupable applies the first pass's keep flags BY POSITION, so
     it must be able to tell when the second walk is not the corpus the flags
@@ -10227,8 +9660,8 @@ def _corpus_identity(m: dict) -> int:
     the ones the first pass hashed — dropping a record whose NEW key is shared
     — with nothing raised. So the identity covers exactly what the flags
     depend on: the ticker (position) plus event_title, title and subtitle,
-    which are every field _ts_group_key (through _pair_key, whose last
-    fallback is the ticker) and _st_group_key read. Eligibility, the only
+    which are every field _ts_group_key reads (through _pair_key, whose last
+    fallback is the ticker). Eligibility, the only
     other input, is re-applied by the second pass itself, and a change in it
     shifts the eligible sequence, which this comparison or the count check
     catches. No other field is compared: none can change which records are
@@ -10255,16 +9688,19 @@ def _index_eligible_keys(
 ) -> _EligibleKeyIndex:
     """
     First pass over the corpus: count it, prefilter it, census it, and hash
-    every eligible record's two grouping keys.
+    every eligible record's time-series grouping key.
 
-    The keys are the same _ts_group_key / _st_group_key the two grouping
-    functions group on, computed once per eligible record here — the SAME
-    per-record cost the time-series grouping used to pay over the whole
-    eligible list (the normalize_title inside the time-series key dominates
-    it), so this pass adds a walk, not a second keying. Only hashes and flags
-    are kept, never a record — about 27 bytes per eligible record while the
-    pass runs, plus the transient of computing the keep flags (see
-    _EligibleKeyIndex for both measurements).
+    The key is the same _ts_group_key the grouping function groups on,
+    computed once per eligible record here — the SAME per-record cost the
+    grouping would pay over the whole eligible list (the normalize_title
+    inside the key dominates it), so this pass adds a walk, not a second
+    keying. Only hashes and flags are kept, never a record — about 17 bytes
+    per eligible record while the pass runs, plus the transient of computing
+    the keep flags (see _EligibleKeyIndex). The groupable subset this picks
+    is every eligible record whose key another eligible record shares: every
+    member of every time-series group of two or more, so every time-series
+    group, its members, their order and every time-series pair are exactly
+    those of the whole eligible list.
 
     Args:
         markets (Iterable[dict]): The settled-market corpus, in the compact
@@ -10285,8 +9721,6 @@ def _index_eligible_keys(
     identities = array("q")
     ts_hashes = array("q")
     ts_valid = bytearray()
-    st_hashes = array("q")
-    st_valid = bytearray()
     for m in markets:
         total += 1
         if not _can_ever_enter(m, start_date):
@@ -10298,10 +9732,7 @@ def _index_eligible_keys(
         # either; its placeholder hash is masked out by the validity flag.
         ts_hashes.append(hash(ts_key) if ts_key else 0)
         ts_valid.append(1 if ts_key else 0)
-        st_key = _st_group_key(m)
-        st_hashes.append(0 if st_key is None else hash(st_key))
-        st_valid.append(0 if st_key is None else 1)
-    keep = _shared_key_mask(ts_hashes, ts_valid) | _shared_key_mask(st_hashes, st_valid)
+    keep = _shared_key_mask(ts_hashes, ts_valid)
     return _EligibleKeyIndex(
         total=total,
         eligible=len(identities),
@@ -10320,15 +9751,15 @@ def _materialize_groupable(
 
     The keep decision is read by POSITION among eligible records from the first
     pass's index — the expensive keys are never recomputed for the millions of
-    records that are dropped. Because every member of every group of two or
-    more is kept, and kept in its original relative order, the two grouping
-    functions return the same keys, the same members in the same order and the
-    same insertion order over this subset as they would over the whole
-    eligible list, and so _extract_pairs returns the same pairs.
+    records that are dropped. Because every member of every time-series group
+    of two or more is kept, and kept in its original relative order, the
+    grouping function returns the same keys, the same members in the same
+    order and the same insertion order over this subset as it would over the
+    whole eligible list, and so _extract_pairs returns the same pairs.
 
     Position is only meaningful if the corpus re-iterates identically, so this
     fails LOUDLY rather than misalign: each eligible record's _corpus_identity
-    — its ticker and every field either grouping key reads — must match the
+    — its ticker and every field the grouping key reads — must match the
     one the first pass recorded at that position, and the eligible count must
     match in full. That covers everything the keep flags were chosen from;
     a field no key reads is not compared, because it cannot change which
@@ -10342,8 +9773,8 @@ def _materialize_groupable(
 
     Returns:
         list[dict]: The groupable records — every eligible record whose
-            time-series or same-title key is shared with another eligible
-            record — in corpus order.
+            time-series key is shared with another eligible record — in
+            corpus order.
 
     Raises:
         RuntimeError: When the corpus did not iterate identically twice — an
@@ -10694,11 +10125,14 @@ def _report_pair_facts(ts_pairs: list, same_pairs: list, details: dict,
     naming both tickers: same-title pairs whose strikes differ, same-title
     pairs whose events' settlement sources differ, time-series pairs whose
     rules texts differ beyond their dates, and same-event ladder pairs whose
-    event is a set of mutually exclusive options.
+    event is a set of mutually exclusive options. _prepare_candidates hands
+    it no same-title pairs (the backtest finds none), so the two same-title
+    lines read 0 of 0.
 
     Args:
         ts_pairs (list): The time-series candidate pairs (mA, mB, canon, key).
-        same_pairs (list): The same-title candidate pairs.
+        same_pairs (list): Same-title candidate pairs; empty from
+            _prepare_candidates.
         details (dict): Ticker -> full market_details record.
         facts (dict): Event ticker -> historical.load_event_facts' facts.
 
@@ -10778,8 +10212,7 @@ def _write_scheduled_close(m: dict, timing: tuple | None, rules: dict) -> int | 
 
 
 def _apply_scheduled_closes(needed_tickers: dict, details: dict, rules: dict | None,
-                            known: dict, known_timing: dict, ts_pairs: list,
-                            ladders_on: bool) -> int | None:
+                            ts_pairs: list, ladders_on: bool) -> int | None:
     """
     Write each pair market's scheduled close on its record (or pop it), and log what that changes.
 
@@ -10793,8 +10226,6 @@ def _apply_scheduled_closes(needed_tickers: dict, details: dict, rules: dict | N
         needed_tickers (dict): Ticker -> record, every pair market.
         details (dict): Ticker -> full market_details record.
         rules (dict | None): The learned rules; None with the switch off.
-        known (dict): Ticker -> scheduled close already worked out.
-        known_timing (dict): Ticker -> the timing_epochs those were worked out from.
         ts_pairs (list): The time-series candidate pairs.
         ladders_on (bool): The resolved same-event ladder switch (a ladder
             keeps its stated deadlines, so it is not counted).
@@ -10809,12 +10240,8 @@ def _apply_scheduled_closes(needed_tickers: dict, details: dict, rules: dict | N
         return None
     used = no_rule = mismatched = 0
     for ticker, m in needed_tickers.items():
-        if ticker in known:
-            timing = known_timing.get(ticker)
-            epoch = known[ticker]
-        else:
-            timing = market_details.timing_epochs(details.get(ticker))
-            epoch = _write_scheduled_close(m, timing, rules)
+        timing = market_details.timing_epochs(details.get(ticker))
+        epoch = _write_scheduled_close(m, timing, rules)
         series = series_ticker(m.get("event_ticker") or "")
         if epoch is not None:
             used += 1
@@ -10867,7 +10294,6 @@ def _prepare_candidates(
     max_horizon_days: int | None,
     same_event_ladders: bool | None = None,
     *,
-    series_categories: dict | None = None,
     fee_multipliers: dict | None = None,
     scheduled_close: bool | None = None,
     stale_quote_max_age: Any = None,
@@ -10877,33 +10303,29 @@ def _prepare_candidates(
     Run the half of the backtest that depends on neither the band nor k.
 
     The schedule and feasibility checks, the settled-market fetch, the
-    prefilter, the outcome-label census, both groupings, pair extraction and
+    prefilter, the outcome-label census, the grouping, pair extraction and
     the candlestick fetch depend only on which markets exist and when they
     traded, not on the spread band or k, so one call can feed an entry pass
     per band through _entries_for_band().
 
-    The same-title sport check (DR-79) runs here as it does live. Its label
-    half is inside the same-title _extract_pairs call, over
-    series_categories; its competition half reads the competition each
-    event of the surviving same-title pairs names
-    (historical.load_event_competitions, cached, through live_client) and
-    drops the mismatches (_refuse_other_competitions) before the "Potential
-    pairs" count, so no candle is fetched for a refused pair. With an empty
-    listing and same-title groups to check, one WARNING says that every
-    series is filed by its ticker prefix, in the words the live run uses.
+    It looks for time-series pairs only (one question at two deadlines):
+    one grouping (_group_by_normalized_title) and one _extract_pairs call.
+    The backtest finds no same-title pairs.
 
     The corpus (the settled markets the fetch returns, normally streamed off
     disk) is walked TWICE: _index_eligible_keys counts it, prefilters it,
-    feeds the census and hashes each eligible record's two grouping keys;
-    _materialize_groupable then keeps only records whose key another shares
-    (any other would be a single-member group, which both groupings drop),
-    so the groups and pairs are exactly those of the whole eligible list.
+    feeds the census and hashes each eligible record's time-series grouping
+    key; _materialize_groupable then keeps only records whose key another
+    shares (any other would be a single-member group, which the grouping
+    drops), so every time-series group, its members, their order and every
+    pair are exactly those of the whole eligible list.
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
         live_client: Client passed through to fetch_all_settled_markets, and
-            the one the same-title competition labels are read with
-            (historical.load_event_competitions).
+            the one each pair market's event fee override and event facts are
+            read with (historical.load_event_fee_overrides,
+            historical.load_event_facts).
         start_date (date): Earliest settlement date to include.
         use_cache (bool): Whether to reuse the disk-cached assembled market list.
         max_horizon_days (int | None): Optional opt-in bet-horizon cap. Not
@@ -10914,17 +10336,11 @@ def _prepare_candidates(
             of ONE event may pair. None (the default) resolves this
             module's TIME_SERIES_SAME_EVENT_LADDERS (bound from config at
             import) at call time; patching config itself is a silent no-op —
-            see _extract_pairs' own entry. Handed verbatim to BOTH
-            _extract_pairs() calls and stored UNRESOLVED on the result, where
+            see _extract_pairs' own entry. Handed verbatim to the
+            _extract_pairs() call and stored UNRESOLVED on the result, where
             _entries_for_band() reads it for every _find_entry() call. That is
             load-bearing: the two must agree, or a pair this function proposes
             is replayed under the other rule's ordering.
-        series_categories (dict | None): Keyword-only. Kalshi's /series
-            listing the same-title label check files each series by.
-            backtest.py hands in the copy it reads with the production client
-            (the one the dashboard files trades by). None (the default) reads
-            the cached copy only (historical.load_series_categories(None)),
-            with no request.
         fee_multipliers (dict | None): Keyword-only. series ticker -> fee
             multiplier (historical.load_series_fee_multipliers); backtest.py
             hands in the copy it reads with the production client. None (the
@@ -10935,13 +10351,10 @@ def _prepare_candidates(
             pair market's scheduled close (_maturity_close). None (the
             default) resolves THIS MODULE's BACKTEST_SCHEDULED_CLOSE at call
             time, like same_event_ladders. On, the rules are learned from the
-            captures (market_details.load_close_rules); when any series has
-            one, the same-title close gate is applied after the scheduled
-            closes of the candidates' markets are read
-            (_extract_pairs(defer_close_gate=True), then
-            _close_gate_and_labels), and every pair market whose series' rule
-            gives a close carries it on its record (_SCHEDULED_CLOSE_KEY). Off,
-            nothing is read and every record's key is popped.
+            captures (market_details.load_close_rules), and every pair market
+            whose series' rule gives a close carries it on its record
+            (_SCHEDULED_CLOSE_KEY). Off, nothing is read and every record's
+            key is popped.
         stale_quote_max_age (Any): Keyword-only. The stale-quote limit in
             seconds (_resolve_stale_quote_max_age): None (the default) reads
             THIS MODULE's BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS at call time,
@@ -10957,8 +10370,8 @@ def _prepare_candidates(
             the entry passes attach.
 
     Returns:
-        _Candidates | None: The candidate pairs (in scan order: time-series,
-            then same-title), their candle series, this run's
+        _Candidates | None: The candidate pairs (time-series, in scan
+            order), their candle series, this run's
             OutcomeLabelCoverage, the corpus's provenance (None for a plain
             list corpus), and the start date / horizon / ladder flag every
             entry pass must reuse. None — the codebase's
@@ -11082,8 +10495,8 @@ def _prepare_candidates(
     eligible_count = key_index.eligible
     logging.info(
         "Groupable subset: materializing %d of %d eligible markets — the rest "
-        "share no grouping key with any other eligible market, so both "
-        "groupings would drop them as single-member groups",
+        "share no grouping key with any other eligible market, so the "
+        "grouping would drop them as single-member groups",
         len(groupable), eligible_count,
     )
     # Nothing below reads the corpus or the first pass's index: `groupable`
@@ -11102,8 +10515,8 @@ def _prepare_candidates(
     _log_rss("before grouping")
 
     # Everything from here to the end of pair extraction is held live at once:
-    # the groupable subset, two group maps over it, and two candidate-pair
-    # lists referencing those same dicts. The subset is ALREADY resident when
+    # the groupable subset, the group map over it, and the candidate-pair
+    # list referencing those same dicts. The subset is ALREADY resident when
     # this fires — the second pass has just materialized it — so this is a
     # budget line covering money already spent plus money about to be spent,
     # not a forecast issued ahead of the whole cost. It is keyed on the
@@ -11127,7 +10540,7 @@ def _prepare_candidates(
             len(groupable) * BACKTEST_RECORD_BYTES_ESTIMATE / 1e9,
         )
 
-    # Report the census of the two fields the grouping keys below are built
+    # Report the census of the two fields the grouping key below is built
     # from. It was COUNTED over every eligible record during pass 1 and is
     # only logged here, at the position it has always logged from. A cache
     # predating the 2026-08-14 yes_sub_title ingest fix carries subtitle=None
@@ -11143,111 +10556,66 @@ def _prepare_candidates(
     # nothing and the release of the subset below is unaffected.
     label_coverage = _report_outcome_label_coverage(census)
 
-    # Group the groupable subset into potential pairs using the same logic as
-    # the live scanner. Every member of every group of two or more is in the
-    # subset, in its original relative order, so these maps — keys, members,
-    # member order and insertion order — are exactly the maps the whole
-    # eligible list would have produced.
+    # Group the groupable subset into potential time-series pairs using the
+    # same key as the live scanner. Every member of every group of two or
+    # more is in the subset, in its original relative order, so this map —
+    # keys, members, member order and insertion order — is exactly the map
+    # the whole eligible list would have produced.
     ts_groups    = _group_by_normalized_title(groupable)
-    same_groups  = _group_by_exact_title(groupable)
-    # Both groupings' sizes, logged on EVERY run, zero included (M10). A
+    # The grouping's size, logged on EVERY run, zero included (M10). A
     # grouping with no group of two or more members reaches _extract_pairs as
-    # an empty dict, which cannot say which kind of grouping it was, and
-    # every per-candidate line there is silent at zero — so without this
-    # line an empty grouping and one whose every candidate was refused
-    # would read the same ("Potential pairs: 0 ..." and nothing else),
-    # absence of a warning being the only signal (DR-66). Linear in the
-    # number of groups; the groupable-subset line above counts the markets
-    # that share a key, this one what those keys actually grouped.
+    # an empty dict, and every per-candidate line there is silent at zero —
+    # so without this line an empty grouping and one whose every candidate
+    # was refused would read the same ("Potential pairs: 0 ..." and nothing
+    # else), absence of a warning being the only signal (DR-66). Linear in
+    # the number of groups; the groupable-subset line above counts the
+    # markets that share a key, this one what those keys actually grouped.
     logging.info(
-        "Groups of two or more markets: %d time-series (%d markets), "
-        "%d same-title (%d markets) — pairs form only inside a group",
+        "Groups of two or more markets: %d time-series (%d markets) — pairs "
+        "form only inside a group",
         len(ts_groups), sum(len(v) for v in ts_groups.values()),
-        len(same_groups), sum(len(v) for v in same_groups.values()),
     )
-    # The listing the same-title label check files each series by (DR-79).
-    # Cross-module: None reads the cached copy only, making no request
-    if series_categories is None:
-        series_categories = load_series_categories(None)
     # Each series' fee multiplier, carried on the result and filed onto each
     # pair market's record below (with its event's override), where _find_entry,
     # the Kelly gate, the live sizer and every sale and trim fee read it
     if fee_multipliers is None:
         fee_multipliers = load_series_fee_multipliers(None)
-    if not series_categories and same_groups:
-        # With no listing every series is filed by its ticker prefix, so
-        # nearly every pair of series is filed alike and only the competition
-        # check tells them apart. The same words as main._attach_series_labels'
-        # WARNING, so a reader learns it on either path
-        logging.warning(
-            "Same-title sport check: no /series listing this run, so every series is "
-            "filed by its ticker prefix and only the competition check tells two "
-            "series apart")
-    # The ladder flag is passed on unresolved; each call resolves it the same way
     # The scheduled-close switch; on, the rules learned per series
     scheduled_on = bool(BACKTEST_SCHEDULED_CLOSE if scheduled_close is None
                         else scheduled_close)
     close_rules = market_details.load_close_rules(hist_client) if scheduled_on else {}
-    # With any rule, the same-title close gate waits until the candidates'
-    # scheduled closes are known (below)
-    defer_gate = bool(close_rules)
+    # The ladder flag is passed on unresolved; the call resolves it at call
+    # time, as every later _find_entry call does
     ts_pairs     = _extract_pairs(ts_groups, same_event_ladders=same_event_ladders)
-    same_pairs   = _extract_pairs(same_groups, same_event_ladders=same_event_ladders,
-                                  series_categories=series_categories,
-                                  **({"defer_close_gate": True} if defer_gate else {}))
-    # Each pair market's scheduled close (Unix seconds, or None to keep the
-    # realized close), by ticker
-    scheduled_by_ticker: dict[str, int | None] = {}
-    st_timing: dict = {}
-    if defer_gate:
-        # Cross-module: the timing of the same-title candidates' markets
-        # (full records, so the later full load reads them from the cache)
-        st_tickers = list(dict.fromkeys(m["ticker"] for pair in same_pairs for m in pair[:2]))
-        st_timing = market_details.load_market_details(
-            hist_client, st_tickers, full=frozenset(st_tickers),
-            project=market_details.timing_epochs)
-        for pair in same_pairs:
-            for m in pair[:2]:
-                scheduled_by_ticker[m["ticker"]] = _write_scheduled_close(
-                    m, st_timing.get(m["ticker"]), close_rules)
-        # The close gate on the closes a live run would have read, then the
-        # label check, each on its usual line
-        same_pairs = _close_gate_and_labels(same_pairs, series_categories)
-    # The competition half of the check (DR-79). Cross-module: cached markets
-    # carry no competition, so it is read from Kalshi for these pairs' events
-    # only (one cached read-only GET per new event), then compared
-    competitions = load_event_competitions(
-        live_client, {m.get("event_ticker") for pair in same_pairs for m in pair[:2]})
-    same_pairs   = _refuse_other_competitions(same_pairs, competitions)
-    # Release the group maps AND the groupable subset together, before the
+    # Release the group map AND the groupable subset together, before the
     # candlestick pool spawns CANDLESTICK_FETCH_MAX_WORKERS threads rather than
-    # at function exit. Nothing below reads any of them — the pair lists carry
-    # the market dicts they need. Dropping the group maps alone frees no record
-    # dicts at all: `groupable` still references every one of them, so all
-    # three names have to go for the groupable records that landed in no
-    # candidate pair to become collectable. (The corpus itself was released
-    # right after the second pass, above.)
+    # at function exit. Nothing below reads either — the pair list carries the
+    # market dicts it needs. Dropping the group map alone frees no record
+    # dicts at all: `groupable` still references every one of them, so both
+    # names have to go for the groupable records that landed in no candidate
+    # pair to become collectable. (The corpus itself was released right after
+    # the second pass, above.)
     #
     # This lowers RESIDENCY across the candlestick fetch and every later
     # _find_entry sweep (_entries_for_band). It does NOT lower the run's peak
     # RSS, which is a high-water mark already reached by the time this
     # statement runs.
-    del ts_groups, same_groups, groupable
+    del ts_groups, groupable
     _log_rss("after pair extraction")
 
-    logging.info("Potential pairs: %d time-series, %d same-title", len(ts_pairs), len(same_pairs))
+    logging.info("Potential pairs: %d time-series", len(ts_pairs))
 
     # Collect only the tickers that actually appear in a potential pair to avoid
     # fetching candlesticks for thousands of unrelated markets
     needed_tickers: dict[str, dict] = {}
-    for mA, mB, _, _ in ts_pairs + same_pairs:
+    for mA, mB, _, _ in ts_pairs:
         needed_tickers[mA["ticker"]] = mA
         needed_tickers[mB["ticker"]] = mB
     # Each pair market's series' listed fee multiplier, written on its record
     # (only when not 1.0, so a market listing none is the record it always
     # was): every later fee on the market reads it there
     # (_charged_fee_multiplier), in this process and in a Sell worker's
-    pair_markets = [m for mA, mB, _, _ in ts_pairs + same_pairs for m in (mA, mB)]
+    pair_markets = [m for mA, mB, _, _ in ts_pairs for m in (mA, mB)]
     # Cross-module: each pair market's event's fee override (cached; one
     # read-only GET per new event), the events of reduced series first, since
     # an override there can raise the fee back; an event not read is unknown
@@ -11314,8 +10682,7 @@ def _prepare_candidates(
     # Each pair market's scheduled close on its record, or none (switch off,
     # no rule, no usable time): what _maturity_close reads from here on
     scheduled_markets = _apply_scheduled_closes(
-        needed_tickers, details, close_rules if scheduled_on else None,
-        scheduled_by_ticker, st_timing, ts_pairs,
+        needed_tickers, details, close_rules if scheduled_on else None, ts_pairs,
         TIME_SERIES_SAME_EVENT_LADDERS if same_event_ladders is None
         else same_event_ladders)
 
@@ -11325,15 +10692,15 @@ def _prepare_candidates(
     # GET per new event)
     facts = load_event_facts(live_client, {m.get("event_ticker") for m in pair_markets})
     extra_data_report = ExtraDataReport(
-        **_report_pair_facts(ts_pairs, same_pairs, details, facts),
+        # No same-title pairs: the backtest finds none
+        **_report_pair_facts(ts_pairs, [], details, facts),
         integrity_failures=integrity, anomaly_markets=anomaly_markets,
         anomaly_hours=anomaly_hours, pair_markets=len(needed_tickers),
         scheduled_close_markets=scheduled_markets)
 
-    # Combine both pair types in scan order — time-series first, then
-    # same-title — which is the order every entry pass walks and therefore the
-    # order of _prepare_entries' output.
-    all_pairs = [(p, "time_series") for p in ts_pairs] + [(p, "same_title") for p in same_pairs]
+    # Every pair, labelled with its type, in scan order — the order every
+    # entry pass walks and therefore the order of _prepare_entries' output.
+    all_pairs = [(p, "time_series") for p in ts_pairs]
 
     # The ladder flag is stored exactly as received (None included): every
     # entry pass hands _find_entry the same argument _extract_pairs was handed
@@ -11990,7 +11357,6 @@ def _prepare_entries(
     same_event_ladders: bool | None = None,
     *,
     depth_model: DepthModel | None = None,
-    series_categories: dict | None = None,
     fee_multipliers: dict | None = None,
     scheduled_close: bool | None = None,
     stale_quote_max_age: Any = None,
@@ -12009,9 +11375,9 @@ def _prepare_entries(
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
-        live_client: Client passed through to fetch_all_settled_markets
-            and to the same-title competition reads
-            (historical.load_event_competitions).
+        live_client: Client passed through to _prepare_candidates(), which
+            fetches the settled markets and each pair market's event fee
+            override and event facts with it.
         start_date (date): Earliest settlement date to include.
         use_cache (bool): Whether to reuse the disk-cached assembled market list.
         max_horizon_days (int | None): Optional opt-in bet-horizon cap mirroring
@@ -12025,18 +11391,14 @@ def _prepare_entries(
             module's TIME_SERIES_SAME_EVENT_LADDERS (bound from config at
             import) at call time; patching config itself is a silent no-op —
             see _extract_pairs' own entry. Handed
-            verbatim to _prepare_candidates(), which gives it to BOTH
-            _extract_pairs() calls and carries it, unresolved, to every
+            verbatim to _prepare_candidates(), which gives it to the
+            _extract_pairs() call and carries it, unresolved, to every
             _find_entry() call of the entry pass — load-bearing: the two must
             agree, or a pair this function proposes is replayed under the
             other rule's ordering.
         depth_model (DepthModel | None): Keyword-only. The depth model the
             entries' quotes carry, so their trades walk synthetic books; None
             (default) fills every trade at the top of the book.
-        series_categories (dict | None): Keyword-only. Kalshi's /series
-            listing, handed straight to _prepare_candidates() for the
-            same-title label check (DR-79); None (default) reads the cached
-            copy there.
         fee_multipliers (dict | None): Keyword-only. series ticker -> fee
             multiplier, handed straight to _prepare_candidates(); None
             (default) reads the cached copy there.
@@ -12054,7 +11416,7 @@ def _prepare_entries(
             entries and this run's outcome-label census.
 
             Element 0 is one record per pair that produced an entry, in scan
-            order (time-series pairs first, then same-title), each shaped
+            order (every one a time-series pair), each shaped
             {"pair_type": str, "canon": str, "group_key": object, "entry": dict}
             where "entry" is _find_entry()'s return dict (which already carries
             the possibly-swapped mA/mB). An empty list means no pair was ever
@@ -12087,7 +11449,7 @@ def _prepare_entries(
     # pre-check failed and nothing was fetched — so no census either.
     candidates = _prepare_candidates(
         hist_client, live_client, start_date, use_cache, max_horizon_days,
-        same_event_ladders=same_event_ladders, series_categories=series_categories,
+        same_event_ladders=same_event_ladders,
         fee_multipliers=fee_multipliers, scheduled_close=scheduled_close,
         stale_quote_max_age=stale_quote_max_age, max_volume_share=max_volume_share,
     )
@@ -13141,8 +12503,8 @@ def _simulate_at_discount(
                                        for pair_type in sorted(walk_types))])
 
     # Keep only the best same-title candidate per title group, as the live
-    # finders keep one pair per group; this ranks by expected monthly return
-    # (what Pass 2 orders on), the live finders by price gap. The key includes
+    # finder keeps one pair per group; this ranks by expected monthly return
+    # (what Pass 2 orders on), the live finder by price gap. The key includes
     # the event title, so one option label in two events stays two groups.
     # The winner can be dated after a group-mate that passed the gate earlier,
     # which the live bot could not have known. Time-series candidates skip
@@ -13163,14 +12525,6 @@ def _simulate_at_discount(
                   # Empty unless add_to_held is on (only then does a same-title
                   # pair keep a later Monday)
                   + [c for c in candidates if c["add_on_only"] and c["pair_id"] in winners])
-
-    # Cross-type dedup, mirroring main._dedup_pairs on the live path: the same
-    # two tickers can be discovered by BOTH groupings, and the live pipeline
-    # keeps only the same-title copy (simpler co-resolution model). Must run
-    # here rather than relying on Pass 2's ticker-conflict filter, which only
-    # stops both copies being open at once — not the time-series copy being
-    # entered whenever the same-title one is skipped for sizing reasons.
-    candidates = _drop_cross_type_duplicates(candidates)
 
     # Chronological order for the cash simulation; within one entry date, take
     # the best ENTRY-TIME expected return first (same_title preferred at ties,
@@ -14589,14 +13943,13 @@ def run_backtest(
     use_cache: bool = True,
     max_horizon_days: int | None = None,
     *,
-    series_categories: dict | None = None,
     fee_multipliers: dict | None = None,
     scheduled_close: bool | None = None,
     stale_quote_max_age: Any = None,
     max_volume_share: Any = None,
 ) -> tuple[list[BacktestTrade], pd.DataFrame]:
     """
-    Replay both pair strategies on all settled Kalshi markets from start_date.
+    Replay the time-series pair strategy on all settled Kalshi markets from start_date.
 
     Thin composition of the backtest's two halves, at the interval discount
     config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (config.py's k, the backtest's
@@ -14607,21 +13960,17 @@ def run_backtest(
     Algorithm (the step split between the two helpers is noted):
       1. Fetch all settled markets since start_date.                [prepare]
       2. Drop markets that provably can never enter (_can_ever_enter). [prepare]
-      3. Group into potential time-series and same-title pairs.     [prepare]
+      3. Group into potential time-series pairs.                    [prepare]
       4. Fetch hourly candlesticks for every ticker appearing in a
          potential pair, in parallel across CANDLESTICK_FETCH_MAX_WORKERS
          threads.                                                   [prepare]
       5. Find every entry checkpoint (the live run's weekly moment) where
          the pair was tradeable at the threshold.                   [prepare]
-      6. Keep each time-series pair's qualifying Mondays that pass the
-         Kelly gate, and each same-title pair's first; exclude (and count,
-         with one summary WARNING) any time-series candidate whose
+      6. Keep each pair's qualifying Mondays that pass the Kelly gate;
+         exclude (and count, with one summary WARNING) any candidate whose
          settlement was earlier-YES/later-NO — impossible for a
          cumulative-deadline pair, so a premise violation rather than a
-         payout; keep only the best same-title entry per title group (live
-         one-pair-per-group rule), then drop any time-series candidate whose
-         ticker pair was also found as a same-title candidate (live
-         main._dedup_pairs rule).                                  [simulate]
+         payout.                                                   [simulate]
       7. Walk the entries in date order with a running cash balance: each
          trade bets a share of that Monday's portfolio value (cash plus open
          trades at market) but spends at most the cash left, shrinking to fit;
@@ -14633,9 +13982,9 @@ def run_backtest(
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
-        live_client: Client passed through to fetch_all_settled_markets
-            and to the same-title competition reads
-            (historical.load_event_competitions).
+        live_client: Client handed through _prepare_entries() to
+            _prepare_candidates(), which fetches the settled markets and each
+            pair market's event fee override and event facts with it.
         start_date (date): Earliest settlement date to include.
         initial_balance (float): Simulated starting cash balance in dollars.
         use_cache (bool): Whether to reuse the disk-cached assembled market list.
@@ -14645,10 +13994,6 @@ def run_backtest(
             checkpoint, a pair can only enter if the later-closing leg
             closes within max_horizon_days of THAT checkpoint. None (default)
             applies no cap. Passed straight through to _find_entry().
-        series_categories (dict | None): Keyword-only. Kalshi's /series
-            listing for the same-title label check (DR-79), handed through
-            _prepare_entries() to _prepare_candidates(); None (default)
-            reads the cached copy there.
         fee_multipliers (dict | None): Keyword-only. series ticker -> fee
             multiplier, handed through _prepare_entries() to
             _prepare_candidates(); None (default) reads the cached copy
@@ -14709,10 +14054,9 @@ def run_backtest(
     # backtester.TIME_SERIES_SAME_EVENT_LADDERS, not the config attribute, which
     # this module never reads; the supported lever is
     # run_backtest_sweep(same_event_ladders=...), which needs no patching.
-    # The /series listing rides through for the same-title label check (DR-79)
     raw_entries, _ = _prepare_entries(
         hist_client, live_client, start_date, use_cache, max_horizon_days,
-        series_categories=series_categories, fee_multipliers=fee_multipliers,
+        fee_multipliers=fee_multipliers,
         scheduled_close=scheduled_close, stale_quote_max_age=stale_quote_max_age,
         max_volume_share=max_volume_share,
     )
@@ -15918,15 +15262,14 @@ def run_backtest_sweep(
     rebalance_sweep: bool = False,
     move_sweep: bool = False,
     maturity_sweep: bool = False,
-    series_categories: dict | None = None,
     fee_multipliers: dict | None = None,
     scheduled_close: bool | None = None,
     stale_quote_max_age: Any = None,
     max_volume_share: Any = None,
 ) -> BacktestSweep:
     """
-    Replay both pair strategies at one interval discount, or at a grid of them —
-    and, optionally, across a grid of time-series spread bands.
+    Replay the time-series pair strategy at one interval discount, or at a grid
+    of them — and, optionally, across a grid of time-series spread bands.
 
     The richer sibling of run_backtest(): same simulation, but it also returns
     the empirical-discount calibration and, by default, one full re-simulation
@@ -15944,7 +15287,7 @@ def run_backtest_sweep(
     The expensive half runs ONCE: _prepare_candidates() (fetch, prefilter,
     grouping, pair extraction, candlesticks) depends on neither the band nor
     k. Only the _find_entry pass is repeated per band (the band acts there and
-    nowhere else), and only _simulate_at_discount() — Kelly gate, dedups,
+    nowhere else), and only _simulate_at_discount() — Kelly gate,
     Pass 2, equity curve — per simulated scenario; it must be a full
     re-simulation rather than a re-score: k decides which candidates exist,
     and they then compete for the same simulated cash and ladders.
@@ -16011,9 +15354,9 @@ def run_backtest_sweep(
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
-        live_client: Client passed through to fetch_all_settled_markets
-            and to the same-title competition reads
-            (historical.load_event_competitions).
+        live_client: Client passed through to _prepare_candidates(), which
+            fetches the settled markets and each pair market's event fee
+            override and event facts with it.
         start_date (date): Earliest settlement date to include.
         initial_balance (float): Simulated starting cash balance in dollars.
         use_cache (bool): Whether to reuse the disk-cached assembled market list.
@@ -16108,11 +15451,6 @@ def run_backtest_sweep(
             (depth_model.load_depth_model()); None (default) fills every trade
             at the top of the book. Recorded on BacktestSweep.depth_model and
             named on one log line.
-        series_categories (dict | None): Keyword-only. Kalshi's /series
-            listing the same-title label check files each series by (DR-79),
-            handed straight to _prepare_candidates(); backtest.py passes the
-            copy the dashboard files trades by. None (default) reads the
-            cached copy there.
         fee_multipliers (dict | None): Keyword-only. series ticker -> fee
             multiplier (historical.load_series_fee_multipliers), handed
             straight to _prepare_candidates(); backtest.py passes the copy it
@@ -16362,9 +15700,9 @@ def run_backtest_sweep(
                         else scheduled_close)
     logging.info(
         "Scheduled close (backtest): %s (%s)",
-        "on — a market's days to maturity, a cross-event pair's order and gap, the "
-        "horizon and the same-title close gate read its scheduled close where its "
-        "series has a rule" if scheduled_on else
+        "on — a market's days to maturity, a cross-event pair's order and gap and "
+        "the horizon read its scheduled close where its series has a rule"
+        if scheduled_on else
         "off — every market's close is its realized close",
         "config.BACKTEST_SCHEDULED_CLOSE" if scheduled_close is None
         else "run-level override",
@@ -16399,11 +15737,10 @@ def run_backtest_sweep(
     # The band- and k-independent half — one fetch, one pairing, one candle
     # fetch, reused by every band and every point below. None means the
     # feasibility pre-check failed. The ladder flag rides through unresolved
-    # and is carried on the result to every entry pass (DR-73c), and the
-    # /series listing to the same-title label check (DR-79).
+    # and is carried on the result to every entry pass (DR-73c).
     candidates = _prepare_candidates(
         hist_client, live_client, start_date, use_cache, max_horizon_days,
-        same_event_ladders=same_event_ladders, series_categories=series_categories,
+        same_event_ladders=same_event_ladders,
         fee_multipliers=fee_multipliers, scheduled_close=scheduled_close,
         stale_quote_max_age=stale_quote_max_age, max_volume_share=max_volume_share,
     )

@@ -913,8 +913,8 @@ def write_dev_simulation(
     # ── Sheet 2: All Candidates ────────────────────────────
     ws_cands = wb.create_sheet("All Candidates")
     # nB is the traded NO-leg price of a time-series pair (reporting-only for
-    # same-title); "Price Diff" is the gap each finder actually tested — the
-    # later leg's premium pB − pA for time-series, pA − pB for same-title.
+    # same-title); "Price Diff" is the price gap each pair type is judged on —
+    # the later leg's premium pB − pA for time-series, pA − pB for same-title.
     cand_headers = [
         ("Pair Type", 14),
         ("Market A", 45), ("Ticker A", 18),
@@ -935,9 +935,9 @@ def write_dev_simulation(
 
     for pair in all_candidates:
         row_idx = ws_cands.max_row + 1
-        # The gap the finder tested: a time-series candidate needs the LATER
-        # contract's YES ask above the earlier's; a same-title candidate needs
-        # market_a (the pricier side) above market_b
+        # The gap each pair type is judged on: a time-series candidate needs
+        # the LATER contract's YES ask above the earlier's; a same-title pair
+        # has market_a (the pricier side) above market_b
         diff    = pair.pB - pair.pA if pair.pair_type == "time_series" else pair.pA - pair.pB
         row_data = [
             pair.pair_type,
