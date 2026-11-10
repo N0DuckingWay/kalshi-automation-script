@@ -1229,9 +1229,8 @@ def _scn_data(section_html: str) -> dict:
 
 
 def _scn_cap(section_html: str, ci: int | None = None) -> dict:
-    """One size cap's block (id="scn-cap-<ci>"): its cells, same-title row,
-    banner, cap-dependent matrices and titles — the primary cap's when ci is
-    None."""
+    """One size cap's block (id="scn-cap-<ci>"): its cells, banner,
+    cap-dependent matrices and titles — the primary cap's when ci is None."""
     blocks = _scn_blocks(section_html)
     if ci is None:
         ci = blocks["scn-data"]["primary"][2]
@@ -1322,12 +1321,9 @@ class _Grid:
                     scenarios.append(_scn_point(
                         band, k, "cross", [_scn_trade(-1.0)] * (20 + c),
                         [1000.0, 999.0 - c]))
-        same_title = _scn_point(None, cls.KS[1], "same_title",
-                                [_scn_trade(2.0)] * 7, [1000.0, 1002.0])
         return BacktestSweep(
             primary=primary, points=[primary], calibration=_scn_calibration(),
             label_coverage=_scn_coverage(), scenarios=scenarios,
-            same_title_point=same_title,
             calibrations_by_band={cls.BANDS[0]: _scn_calibration(),
                                   cls.BANDS[1]: _scn_calibration("8-15d", 9),
                                   cls.BANDS[2]: None},
@@ -1452,10 +1448,9 @@ class TestScenarioExplorerPayload:
         assert ladder["final_balance"] == pytest.approx(1006.0)
         assert cross["total_return"] == pytest.approx(-0.004)   # 1000 -> 996
         assert "h1_return" not in ladder and "equity" not in ladder
-        # The same-title row is its cap's own (one cap here: the run's own)
-        same_title = cap["same_title"]
-        assert same_title["trades"] == 7
-        assert same_title["total_return"] == pytest.approx(0.002)
+        # A cap's block holds its cells and their banner, matrices and titles:
+        # no row of any population outside the cells
+        assert set(cap) == {"cells", "banner", "matrices", "titles"}
 
     def test_calibration_is_the_selected_bands_own(self):
         data = _scn_data(_Grid.section())
@@ -1695,8 +1690,6 @@ class TestScenarioExplorerHeadlinePopulation:
         return BacktestSweep(
             primary=primary, points=[primary], calibration=None,
             label_coverage=_scn_coverage(), scenarios=scenarios,
-            same_title_point=_scn_point(None, 0.75, "same_title",
-                                        [_scn_trade(50.0)] * 3, [1000.0, 1500.0]),
             calibrations_by_band=dict.fromkeys(cls.BANDS),
             same_event_ladders=True, split_date=date(2026, 1, 6))
 
@@ -1781,14 +1774,14 @@ class TestScenarioExplorerHeadlinePopulation:
             "all": "All (time-series + same-title)",
             "ladder": "Ladders (same-event)",
             "cross": "Cross-event",
-            # Same-title reads the same under both Tier floors settings
-            "same_title": "Same-title (independent of band, k and the tier floors)",
         }
         # The script builds every KPI row from those labels, the headline
-        # population first, and no longer spells a bare 'All'
+        # population first, and no longer spells a bare 'All'; the four
+        # populations of a cell are its only rows
         js = dashboard._SCENARIO_EXPLORER_JS
         assert js.index("L.time_series") < js.index("L.ladder") < js.index("L.all")
         assert "kpiRow('All'" not in js
+        assert js.count("kpiRow(esc(L.") == 4 and "same_title" not in js
 
     def test_the_script_reads_the_headline_population(self):
         # The KPI table's headline row, its sub-row and the redrawn curve
@@ -2148,36 +2141,33 @@ class TestLiveRuleHeader:
     as run_backtest_sweep read it before its fetch, and where this page shows it
     (backtester._live_rule_view's verdict, in the filter bar's option texts),
     on a <p> of its own: _run_settings_html's exact "</p>" suffix is pinned.
-    When the saved k or caps are not the run's own, it says so and how the
-    filter bar shows them."""
+    When the saved k or per-trade cap is not the run's own, it says so and how
+    the filter bar shows them."""
 
     _P = '<p style="color:#616161; font-size:14px;">'
-    _CAP = "same-title trades capped at the size cap shown, like every pair (20% at this run's own cap)"
 
     @staticmethod
     def _sweep(*, live_tier_floors=True, live_spread_band=(0.0, 1.0),
-               primary_band=(0.0, 1.0), size_cap=0.2, same_title_size_cap=1.0,
+               primary_band=(0.0, 1.0), size_cap=0.2,
                calibrations_by_band=None, tier_off_calibrations_by_band=None,
                tier_off_scenarios=None, live_exclude_categories=None, live_exclude_tags=None,
                same_event_ladders=None, config_same_event_ladders=None,
-               live_sizing=(None, None, None)) -> BacktestSweep:
+               live_sizing=(None, None)) -> BacktestSweep:
         """A sweep at k 0.75 recording these live_* fields; live_sizing is the
-        saved defaults' (k, per-trade cap, same-title cap), unrecorded by default."""
+        saved defaults' (k, per-trade cap), unrecorded by default."""
         pt = dataclasses.replace(_scn_point(primary_band, 0.75), size_cap=size_cap)
-        live_k, live_cap, live_st = live_sizing
+        live_k, live_cap = live_sizing
         return BacktestSweep(
             primary=pt, points=[pt], calibration=None,
             calibrations_by_band=(calibrations_by_band if calibrations_by_band is not None
                                   else {primary_band: None}),
             tier_off_calibrations_by_band=tier_off_calibrations_by_band or {},
             tier_off_scenarios=tier_off_scenarios or [],
-            same_title_size_cap=same_title_size_cap,
             same_event_ladders=same_event_ladders,
             config_same_event_ladders=config_same_event_ladders,
             live_tier_floors=live_tier_floors, live_spread_band=live_spread_band,
             live_exclude_categories=live_exclude_categories, live_exclude_tags=live_exclude_tags,
             live_interval_discount=live_k, live_size_cap=live_cap,
-            live_same_title_size_cap=live_st,
         )
 
     @staticmethod
@@ -2249,20 +2239,20 @@ class TestLiveRuleHeader:
         rule = config.describe_time_series_rule(True, (0.0, 1.0))
         # The page as rendered IS the primary scenario: no bar needed
         assert self._text(self._sweep(), self._bar() if bar else None) == (
-            f"Live rule (saved live defaults): {rule}; {self._CAP} — this run's primary")
+            f"Live rule (saved live defaults): {rule} — this run's primary")
 
     def test_the_primary_is_matched_by_its_own_band(self):
         rule = config.describe_time_series_rule(True, (0.3, 0.6))
         sweep = self._sweep(live_spread_band=(0.3, 0.6), primary_band=(0.3, 0.6))
         assert self._text(sweep, self._bar(bands=[(0.3, 0.6)], primary=(0.3, 0.6))) == (
-            f"Live rule (saved live defaults): {rule}; {self._CAP} — this run's primary")
+            f"Live rule (saved live defaults): {rule} — this run's primary")
         # ... so a live band equal to the DEFAULT band is elsewhere on it
         rule = config.describe_time_series_rule(True, (0.0, 1.0))
         sweep = self._sweep(live_spread_band=(0.0, 1.0), primary_band=(0.3, 0.6),
                             calibrations_by_band={(0.0, 1.0): None, (0.3, 0.6): None})
         bar = self._bar(bands=[(0.0, 1.0), (0.3, 0.6)], primary=(0.3, 0.6))
         assert self._text(sweep, bar) == (
-            f"Live rule (saved live defaults): {rule}; {self._CAP} — choose Spread band "
+            f"Live rule (saved live defaults): {rule} — choose Spread band "
             "max(tier,0)-1 and Tier floors on in the filter bar")
 
     # ── Elsewhere on the grid, named as the bar names it ────────────────────
@@ -2273,7 +2263,7 @@ class TestLiveRuleHeader:
                             calibrations_by_band={(0.0, 1.0): None, (0.3, 0.6): None})
         bar = self._bar(bands=[(0.0, 1.0), (0.3, 0.6)])
         assert self._text(sweep, bar) == (
-            f"Live rule (saved live defaults): {rule}; {self._CAP} — choose Spread band "
+            f"Live rule (saved live defaults): {rule} — choose Spread band "
             "max(tier,0.3)-0.6 and Tier floors on in the filter bar")
         assert "max(tier,0.3)-0.6" in [e["option"] for e in bar["bands"]]
 
@@ -2287,7 +2277,7 @@ class TestLiveRuleHeader:
                             tier_off_scenarios=[object()])
         bar = self._bar(bands=[(0.0, 0.5), (0.0, 1.0)])
         assert self._text(sweep, bar) == (
-            f"Live rule (saved live defaults): {rule}; {self._CAP} — choose Tier floors off and "
+            f"Live rule (saved live defaults): {rule} — choose Tier floors off and "
             "Spread band 0-0.5 in the filter bar")
         # ... and at the primary band, its tier-off option carries the mark
         sweep = self._sweep(live_tier_floors=False, live_spread_band=(0.0, 1.0),
@@ -2361,97 +2351,72 @@ class TestLiveRuleHeader:
             assert self._text(sweep, bar).endswith(
                 "— not shown: this page's filter bar does not offer that scenario")
 
-    # ── The same-title cap at every cap the page offers ─────────────────────
+    # ── The run's own per-trade cap ─────────────────────────────────────────
 
-    @pytest.mark.parametrize("size_cap, st_cap, clause", [
-        (0.35, 1.0, "same-title trades capped at the size cap shown, like every pair "
-                    "(35% at this run's own cap)"),
-        (0.35, 0.10, "same-title trades capped at the lower of the size cap shown and 10% "
-                     "(10% at this run's own cap)"),
-        (1.0, 0.20, "same-title trades capped at the lower of the size cap shown and 20% "
-                    "(20% at this run's own cap)"),
-        (None, 1.0, "same-title cap not recorded"),
-        (0.2, None, "same-title cap not recorded"),
-    ])
-    def test_the_same_title_cap_clause(self, size_cap, st_cap, clause):
-        sweep = self._sweep(size_cap=size_cap, same_title_size_cap=st_cap)
-        assert f"; {clause} — this run's primary" in self._text(sweep, self._bar())
+    @pytest.mark.parametrize("size_cap", [0.35, 1.0, None])
+    def test_the_rule_is_followed_by_where_the_page_shows_it_at_any_cap(self, size_cap):
+        # The run's own per-trade cap, recorded or not, puts no clause between
+        # the rule and where the page shows it, as in the run's log line
+        rule = config.describe_time_series_rule(True, (0.0, 1.0))
+        assert self._text(self._sweep(size_cap=size_cap), self._bar()) == (
+            f"Live rule (saved live defaults): {rule} — this run's primary")
 
     # ── The saved defaults' own sizing ──────────────────────────────────────
 
-    # The run's own sizing, as _sweep records it: k 0.75, a 20% cap, no extra
-    # same-title cap
-    _RUN_SIZING = "k 0.75, per-trade cap 20% and same-title cap 100% (no extra cap)"
+    # The run's own sizing, as _sweep records it: k 0.75 and a 20% cap
+    _RUN_SIZING = "k 0.75 and per-trade cap 20%"
 
     def test_no_sizing_note_when_the_saved_sizing_is_the_runs(self):
-        for live_sizing in ((0.75, 0.2, 1.0), (None, None, None), (0.8, None, 1.0)):
+        for live_sizing in ((0.75, 0.2), (None, None), (0.8, None)):
             text = self._text(self._sweep(live_sizing=live_sizing),
                               self._bar(ks=(0.75, 0.8)))
             assert text.endswith("— this run's primary"), (live_sizing, text)
 
     def test_a_bar_offering_the_saved_sizing_names_its_options(self):
-        sweep = self._sweep(live_sizing=(0.8, 0.1, 1.0))
+        sweep = self._sweep(live_sizing=(0.8, 0.1))
         bar = self._bar(ks=(0.75, 0.8), caps=(0.2, 0.1))
         assert self._text(sweep, bar).endswith(
-            "— this run's primary; the live defaults size at k 0.8, per-trade cap 10% and "
-            f"same-title cap 100% (no extra cap), where this run's primary sized at "
-            f"{self._RUN_SIZING}; choose {dashboard._k_option(0.8)} and Size cap 10% in the "
-            "filter bar to see it")
+            "— this run's primary; the live defaults size at k 0.8 and per-trade cap 10%, "
+            f"where this run's primary sized at {self._RUN_SIZING}; choose "
+            f"{dashboard._k_option(0.8)} and Size cap 10% in the filter bar to see it")
 
     def test_an_offered_primary_option_is_named_as_the_bar_shows_it(self):
         # The saved k is the run's own, the cap is not: the k option is the primary's
-        sweep = self._sweep(live_sizing=(0.75, 0.1, 1.0))
+        sweep = self._sweep(live_sizing=(0.75, 0.1))
         text = self._text(sweep, self._bar(ks=(0.75, 0.8), caps=(0.2, 0.1)))
         assert text.endswith(f"; choose {dashboard._k_option(0.75)} (primary) and Size cap "
                              "10% in the filter bar to see it")
 
-    @pytest.mark.parametrize("ks, caps, live_st, clause", [
-        ((0.75,), (0.2, 0.1), 1.0,
-         "this page's filter bar does not offer k = 0.80"),
-        ((0.75, 0.8), (0.2,), 1.0,
-         "this page's filter bar does not offer size cap 10%"),
-        ((0.75,), (0.2,), 1.0,
-         "this page's filter bar does not offer k = 0.80 or size cap 10%"),
-        ((0.75, 0.8), (0.2, 0.1), 0.2,
-         "the same-title cap is not a filter-bar choice"),
-        ((0.75,), (0.2, 0.1), 0.2,
-         "this page's filter bar does not offer k = 0.80, and the same-title cap is not "
-         "a filter-bar choice"),
+    @pytest.mark.parametrize("ks, caps, clause", [
+        ((0.75,), (0.2, 0.1), "this page's filter bar does not offer k = 0.80"),
+        ((0.75, 0.8), (0.2,), "this page's filter bar does not offer size cap 10%"),
+        ((0.75,), (0.2,), "this page's filter bar does not offer k = 0.80 or size cap 10%"),
     ])
-    def test_what_the_bar_cannot_show_is_named(self, ks, caps, live_st, clause):
+    def test_what_the_bar_cannot_show_is_named(self, ks, caps, clause):
         assert dashboard._k_option(0.8) == "k = 0.80"
-        sweep = self._sweep(live_sizing=(0.8, 0.1, live_st))
+        sweep = self._sweep(live_sizing=(0.8, 0.1))
         text = self._text(sweep, self._bar(ks=ks, caps=caps))
         assert text.endswith(f"where this run's primary sized at {self._RUN_SIZING}; "
                              f"{clause}"), text
 
-    def test_only_the_same_title_cap_differing_is_named(self):
-        # k and the per-trade cap are the run's own: the bar shows those already
-        sweep = self._sweep(live_sizing=(0.75, 0.2, 0.2))
-        assert self._text(sweep, self._bar()).endswith(
-            "; the live defaults size at k 0.75, per-trade cap 20% and same-title cap 20%, "
-            f"where this run's primary sized at {self._RUN_SIZING}; the same-title cap is "
-            "not a filter-bar choice")
-
     def test_without_a_bar_the_saved_sizing_is_not_shown(self):
-        sweep = self._sweep(live_sizing=(0.8, 0.1, 1.0))
+        sweep = self._sweep(live_sizing=(0.8, 0.1))
         assert self._text(sweep, None).endswith(
             f"where this run's primary sized at {self._RUN_SIZING}; this page's filter bar "
             "could not be built, so it does not show that sizing")
 
     # The note as _live_sizing_note words a seed-like saved sizing against _sweep's run
-    _NOTE = ("; the live defaults size at k 0.8, per-trade cap 10% and same-title cap "
-             "100% (no extra cap), where this run's primary sized at k 0.75, per-trade cap "
-             "20% and same-title cap 100% (no extra cap)")
+    _NOTE = ("; the live defaults size at k 0.8 and per-trade cap 10%, where this run's "
+             "primary sized at k 0.75 and per-trade cap 20%")
 
     def test_the_note_follows_every_verdict(self):
         # Not simulated, and a grid cell elsewhere: the note closes the line either way
         assert self._NOTE.endswith(self._RUN_SIZING)
-        sweep = self._sweep(live_spread_band=(0.3, 0.6), live_sizing=(0.8, 0.1, 1.0),
+        sweep = self._sweep(live_spread_band=(0.3, 0.6), live_sizing=(0.8, 0.1),
                             calibrations_by_band={(0.0, 1.0): None})
         assert self._text(sweep, self._bar()).endswith(
             f"— not simulated by this run{self._NOTE}")
-        sweep = self._sweep(live_spread_band=(0.3, 0.6), live_sizing=(0.8, 0.1, 1.0),
+        sweep = self._sweep(live_spread_band=(0.3, 0.6), live_sizing=(0.8, 0.1),
                             calibrations_by_band={(0.0, 1.0): None, (0.3, 0.6): None})
         bar = self._bar(bands=[(0.0, 1.0), (0.3, 0.6)], ks=(0.75, 0.8), caps=(0.2, 0.1))
         assert self._text(sweep, bar).endswith(
@@ -2462,16 +2427,16 @@ class TestLiveRuleHeader:
         # A bar that offers the saved k and cap still cannot show a rule the run never
         # simulated, or one at a band the bar does not offer: no "choose ..." clause
         bar = self._bar(ks=(0.75, 0.8), caps=(0.2, 0.1))
-        not_simulated = self._sweep(live_spread_band=(0.3, 0.6), live_sizing=(0.8, 0.1, 1.0),
+        not_simulated = self._sweep(live_spread_band=(0.3, 0.6), live_sizing=(0.8, 0.1),
                                     calibrations_by_band={(0.0, 1.0): None})
         assert self._text(not_simulated, bar).endswith(
             f"— not simulated by this run{self._NOTE}")
-        not_offered = self._sweep(live_spread_band=(0.3, 0.6), live_sizing=(0.8, 0.1, 1.0),
+        not_offered = self._sweep(live_spread_band=(0.3, 0.6), live_sizing=(0.8, 0.1),
                                   calibrations_by_band={(0.0, 1.0): None, (0.3, 0.6): None})
         assert self._text(not_offered, bar).endswith(
             "— not shown: this page's filter bar does not offer that scenario"
             f"{self._NOTE}")
-        not_built = self._sweep(live_spread_band=(0.3, 0.6), live_sizing=(0.8, 0.1, 1.0),
+        not_built = self._sweep(live_spread_band=(0.3, 0.6), live_sizing=(0.8, 0.1),
                                 calibrations_by_band={(0.0, 1.0): None, (0.3, 0.6): None})
         assert self._text(not_built, None).endswith(
             f"— not shown: this page's filter bar could not be built{self._NOTE}")
@@ -2482,7 +2447,7 @@ class TestLiveRuleHeader:
         # bar, but its tier-off view there is the "missing" template
         band = (0.0, 0.5)
         sweep = self._sweep(live_tier_floors=False, live_spread_band=band,
-                            live_sizing=(0.8, 0.1, 1.0),
+                            live_sizing=(0.8, 0.1),
                             calibrations_by_band={(0.0, 1.0): None, band: None},
                             tier_off_calibrations_by_band={(0.0, 1.0): None, band: None},
                             tier_off_scenarios=[object()])
@@ -2564,7 +2529,7 @@ class TestLiveRuleHeader:
         words = backtester._live_filter_text(categories, tags)
         rule = config.describe_time_series_rule(True, (0.0, 1.0))
         assert text == (f"Live rule (saved live defaults): {rule}; category/tag filter "
-                        f"({html.escape(words, quote=False)}); {self._CAP} — {tail}")
+                        f"({html.escape(words, quote=False)}) — {tail}")
         assert "never their union" not in text and "one of them at a time" not in text
 
     _ECON = ("Economics · Fed",)
@@ -3014,8 +2979,7 @@ class TestLiveRuleHeader:
         pt = dataclasses.replace(_scn_point((0.0, 1.0), 0.75), size_cap=0.2)
         sweep = BacktestSweep(primary=pt, points=[pt], calibration=None,
                               label_coverage=_scn_coverage(),
-                              live_tier_floors=True, live_spread_band=(0.0, 1.0),
-                              same_title_size_cap=1.0)
+                              live_tier_floors=True, live_spread_band=(0.0, 1.0))
         page = TestRunSettingsHeader._page(monkeypatch, tmp_path, sweep=sweep)
         run_settings = dashboard._run_settings_html(sweep)
         # The primary needs no bar, so the line is the same whatever the page built
@@ -3034,8 +2998,7 @@ class TestLiveRuleHeader:
         sweep = BacktestSweep(primary=points[0], points=[points[0]], calibration=None,
                               label_coverage=_scn_coverage(), scenarios=points,
                               calibrations_by_band={(0.0, 1.0): None, band: None},
-                              live_tier_floors=True, live_spread_band=band,
-                              same_title_size_cap=1.0)
+                              live_tier_floors=True, live_spread_band=band)
         page = TestRunSettingsHeader._page(monkeypatch, tmp_path, sweep=sweep)
         assert ("— choose Spread band max(tier,0.3)-0.6 and Tier floors on in the filter "
                 "bar</p>") in page
@@ -3714,8 +3677,6 @@ class TestScenarioExplorerPageSize:
         sweep = BacktestSweep(
             primary=scenarios[0], points=[scenarios[0]], calibration=None,
             label_coverage=_scn_coverage(), scenarios=scenarios,
-            same_title_point=SweepPoint(k=ks[0], trades=trades[:10],
-                                        equity_df=shared_equity, population="same_title"),
             calibrations_by_band={b: _scn_calibration() for b in bands},
             same_event_ladders=True, split_date=date(2023, 5, 1),
             tier_off_scenarios=off, tier_off_calibrations_by_band=off_cals,
@@ -4519,9 +4480,9 @@ class TestScenarioExplorerTierFloors:
         # the script reads its tier-on ones there
         assert off["cells"][1] is None and off["cells"][2] is None
         assert data["calibration_by_band_off"][1:] == [None, None]
-        # ... and the off block carries no same-title row: no tier floor
-        # reaches a same-title pair, so the cap's own row is read
-        assert "same_title" not in off and cap["same_title"]["trades"] == 7
+        # ... and the off block carries what the cap's own block does: its
+        # cells, banner, matrices and titles
+        assert set(off) == set(cap) == {"cells", "banner", "matrices", "titles"}
         row = off["cells"][0]
         for name, first in (("all", 40), ("time_series", 30), ("ladder", 50), ("cross", 60)):
             assert [cell[pop[name]]["trades"] for cell in row] == [first, first + 1], name
@@ -7647,8 +7608,8 @@ def _kc_trades(n: int, count: int = 3) -> list[BacktestTrade]:
 class _FakeCapSweep:
     """
     A backtester.CapSweep stand-in carrying exactly what the dashboard reads
-    of one: bands, ks, caps, primary_cap, checks, simulated / reused, cell(),
-    same_title() and entry_events().
+    of one: bands, ks, caps, primary_cap, checks, simulated / reused, cell()
+    and entry_events().
 
     By default 2 bands x 2 ks x 3 caps — 5%, 20% (the run's own) and 1.0 (no
     cap). As CapSweep shares one simulation between every cap at or above a
@@ -7675,9 +7636,6 @@ class _FakeCapSweep:
             raise RuntimeError("the cap simulation failed")
         return {cap: {"all": self.points[(band, k, cap)]}
                 for cap in self.caps if (band, k, cap) in self.points}
-
-    def same_title(self):
-        return {}
 
     def entry_events(self):
         return {(t.event_ticker, t.category) for p in self.points.values() for t in p.trades}
@@ -8264,8 +8222,7 @@ class TestSaveLiveDefaultsButton:
     _save_target tests are not."""
 
     @staticmethod
-    def _page(monkeypatch, tmp_path, sweep=None, series=_FLT_SERIES, *,
-              same_title_size_cap: float | None = 0.5) -> str:
+    def _page(monkeypatch, tmp_path, sweep=None, series=_FLT_SERIES) -> str:
         """
         Render a whole page of the flt fixture, or of another sweep.
 
@@ -8277,20 +8234,16 @@ class TestSaveLiveDefaultsButton:
                 _flt_sweep().
             series (dict | None): The series listing the page files trades
                 by; None files them by ticker prefix.
-            same_title_size_cap (float | None): Keyword-only. The run's
-                same-title cap set on the sweep; None means not recorded.
 
         Returns:
             str: The page's HTML.
         """
-        sweep = dataclasses.replace(sweep or _flt_sweep(),
-                                    same_title_size_cap=same_title_size_cap)
-        return TestFilterPage()._page(monkeypatch, tmp_path, sweep, series)
+        return TestFilterPage()._page(monkeypatch, tmp_path, sweep or _flt_sweep(), series)
 
     @staticmethod
     def _kc(monkeypatch, tmp_path, sweep=None) -> str:
         """
-        Render a whole page of the k and size-cap fixture, same-title cap 0.5.
+        Render a whole page of the k and size-cap fixture, or of another sweep.
 
         Args:
             monkeypatch (pytest.MonkeyPatch): The test's monkeypatch.
@@ -8301,8 +8254,7 @@ class TestSaveLiveDefaultsButton:
         Returns:
             str: The page's HTML.
         """
-        sweep = dataclasses.replace(sweep or _kc_sweep(), same_title_size_cap=0.5)
-        return _kc_page(monkeypatch, tmp_path, sweep)
+        return _kc_page(monkeypatch, tmp_path, sweep or _kc_sweep())
 
     @staticmethod
     def _query(data: dict, opened: dict) -> dict[str, str]:
@@ -8366,10 +8318,11 @@ class TestSaveLiveDefaultsButton:
         Check that a query names scenario [bi, ki, ci] exactly, and nothing else.
 
         Each number must read back as the base block's own value, and the
-        query must carry the run's same-title cap and the source note, the
-        categories excluded on screen (one exclude_category each, in the
-        menu's order), the tags ticked (one exclude_tag each, "Category ·
-        Tag", in the menu's order), and no other field. The rebalancing and selling fields may also be present (pages
+        query must carry the source note, the categories excluded on screen
+        (one exclude_category each, in the menu's order), the tags ticked
+        (one exclude_tag each, "Category · Tag", in the menu's order), and
+        no other field: no same-title cap among them, so the defaults server
+        keeps the saved one. The rebalancing and selling fields may also be present (pages
         with those views send them); the caller checks their values. The
         "Rebalance until" days go only beside the Rebalance fields, and as 0
         (no limit) whenever Rebalance is off.
@@ -8388,21 +8341,20 @@ class TestSaveLiveDefaultsButton:
 
         Raises:
             AssertionError: If a field differs, the exclusions differ, a
-                retired field (category, tag) is sent, or an unknown field is
-                sent.
+                retired field (category, tag) or a same-title cap is sent, or
+                an unknown field is sent.
         """
         expected = self._expected(data, bi, ki, ci, tier)
         assert query["tier_floors"] == expected.pop("tier_floors")
         for name, value in expected.items():
             assert float(query[name]) == value, name
-        assert float(query["same_title_size_cap"]) == data["save"]["same_title_size_cap"]
+        assert "same_title_size_cap" not in query
         assert query["source"] == data["save"]["source"]
         assert query.get("exclude_category", []) == list(excluded)
         assert query.get("exclude_tag", []) == list(excluded_tags)
         assert "category" not in query and "tag" not in query
         known = {"tier_floors", "spread_min", "spread_max", "k", "size_cap",
-                 "same_title_size_cap", "source", "exclude_category", "exclude_tag",
-                 "rebalance",
+                 "source", "exclude_category", "exclude_tag", "rebalance",
                  "min_price_move", "rebalance_min_days_to_maturity", "sell_at",
                  "sell_min_days"}
         assert set(query) <= known
@@ -8432,7 +8384,9 @@ class TestSaveLiveDefaultsButton:
         assert [b["value"] for b in data["bands"]] == [[0.0, 1.0], [0.3, 0.6], [0.3, 1.0]]
         save = data["save"]
         assert save["url"] == _SAVE_URL
-        assert save["same_title_size_cap"] == 0.5
+        # The page sends no same-title cap: the defaults server keeps the saved one
+        assert "same_title_size_cap" not in save
+        assert "same_title_size_cap" not in dashboard._FILTER_JS
         assert re.fullmatch(config.LIVE_DEFAULTS_SOURCE_PATTERN, save["source"], re.ASCII)
         assert save["source"].startswith(f"backtest dashboard for {_FLT_START.isoformat()} to ")
         # Every word about the button is Python's: the script writes none
@@ -8864,7 +8818,6 @@ class TestSaveLiveDefaultsButton:
         pb, pk, pc = data["primary"]
         assert data["bands"][pb]["value"] is None and data["caps"][pc]["value"] is None
         assert data["ks"][pk]["value"] == 0.75
-        assert data["save"]["same_title_size_cap"] is None
         snap = _run_script(tmp_path, page, [
             ["wait"], ["click", "flt-save"], ["snap", "s"]], strict=True)["s"]
         assert not snap["selects"]["flt-band"]["disabled"]
@@ -8883,7 +8836,6 @@ class TestSaveLiveDefaultsButton:
         pb, pk, pc = data["primary"]
         assert data["bands"][pb]["value"] is None
         assert data["ks"][pk]["value"] == 0.75 and data["caps"][pc]["value"] == 0.2
-        assert data["save"]["same_title_size_cap"] == 0.5
         tag = str(data["subcats"].index([data["categories"].index("Sports"), "Basketball"]))
         snaps = _run_script(tmp_path, page, [
             ["wait"], ["click", "flt-save"], ["snap", "ready"],
@@ -8914,7 +8866,6 @@ class TestSaveLiveDefaultsButton:
         pb, pk, pc = data["primary"]
         assert data["bands"][pb]["value"] == [0.0, 1.0]
         assert data["ks"][pk]["value"] == 0.75 and data["caps"][pc]["value"] is None
-        assert data["save"]["same_title_size_cap"] == 0.5
         tag = str(data["subcats"].index([data["categories"].index("Sports"), "Basketball"]))
         snaps = _run_script(tmp_path, page, [
             ["wait"], ["click", "flt-save"], ["snap", "ready"],
@@ -8948,7 +8899,7 @@ class TestSaveLiveDefaultsButton:
         today = date(2026, 9, 28)
         sweep = _flt_sweep()
         target = dashboard._save_target(sweep, _FLT_START, today)
-        assert target == {"url": _SAVE_URL, "same_title_size_cap": None,
+        assert target == {"url": _SAVE_URL,
                           "source": "backtest dashboard for 2026-01-05 to 2026-09-28",
                           "live_rebalances": False, "live_rebalance_until": None,
                           "live_sells": False,
@@ -9000,7 +8951,7 @@ class TestSaveLiveDefaultsButton:
             " (same-event ladders on, config.py off: its pairs are not the live bot's)")
         # No sweep: nothing recorded
         bare = dashboard._save_target(None, datetime(2026, 1, 5, 12, tzinfo=UTC), today)
-        assert bare["same_title_size_cap"] is None
+        assert set(bare) == set(target)
         assert bare["source"] == "backtest dashboard for 2026-01-05 to 2026-09-28"
 
     def test_a_note_the_server_would_refuse_is_left_out(self, monkeypatch, tmp_path):
@@ -9015,17 +8966,6 @@ class TestSaveLiveDefaultsButton:
             ["wait"], ["click", "flt-save"], ["snap", "s"]], strict=True)["s"]
         [opened] = snap["opened"]
         assert "source" not in self._query(data, opened)
-
-    def test_an_unrecorded_same_title_cap_is_left_out(self, monkeypatch, tmp_path):
-        # The server then keeps the saved same-title cap, or the seed's when
-        # none is saved
-        page = self._page(monkeypatch, tmp_path, same_title_size_cap=None)
-        data = TestFilterPage._data(page)
-        assert data["save"]["same_title_size_cap"] is None
-        snap = _run_script(tmp_path, page, [
-            ["wait"], ["click", "flt-save"], ["snap", "s"]], strict=True)["s"]
-        [opened] = snap["opened"]
-        assert "same_title_size_cap" not in self._query(data, opened)
 
     def test_a_filter_that_cannot_be_built_leaves_no_button(self, monkeypatch, tmp_path):
         def broken(*_a, **_k):
@@ -9055,10 +8995,8 @@ class TestSaveLiveDefaultsButton:
         scenarios = [dataclasses.replace(p, size_cap=0.2) for p in base.scenarios]
         primary = next(p for p in scenarios if p.population == "all"
                        and (p.spread_band, p.k) == (base.primary.spread_band, base.primary.k))
-        sweep = dataclasses.replace(
-            base, primary=primary, points=[primary], scenarios=scenarios,
-            same_title_point=dataclasses.replace(base.same_title_point, size_cap=0.2),
-            same_title_size_cap=0.5)
+        sweep = dataclasses.replace(base, primary=primary, points=[primary],
+                                    scenarios=scenarios)
         page = TestScenarioExplorerScript._page(monkeypatch, tmp_path, sweep)
         data = TestFilterPage._data(page)
         pb = data["primary"][0]
@@ -9081,7 +9019,8 @@ class TestSaveLiveDefaultsButton:
         # The clicked address, handed to the server's own application as a
         # browser would send it: it answers with the confirmation page, and its
         # parser reads exactly the scenario on screen — tier floors off, k
-        # 0.60, a 20% cap, no category or tag (any), the run's 0.5 same-title cap
+        # 0.60, a 20% cap, no category or tag (any) — with the saved same-title
+        # cap, or the seed's with none saved, since the page sends none
         page = self._kc(monkeypatch, tmp_path, _kc_sweep_tiers())
         data = TestFilterPage._data(page)
         snaps = _run_script(tmp_path, page, [
@@ -9095,20 +9034,22 @@ class TestSaveLiveDefaultsButton:
         assert (current is not None) is saved
         app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
         pb, pk, pc = data["primary"]
-        # The page names no Rebalance choice, so the server keeps the saved
-        # one and its minimum, or the seed's with none saved
+        # The page names no Rebalance choice and no same-title cap, so the
+        # server keeps the saved ones and the minimum, or the seed's with none
+        # saved
         kept = current if current is not None else config.LIVE_DEFAULTS_SEED
         rebalance = {"rebalance": kept.rebalance, "min_price_move": kept.min_price_move}
         cases = (
             ("primary", config.LiveSettings(
                 tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][pk]["value"],
-                size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5, **rebalance)),
+                size_cap=data["caps"][pc]["value"],
+                same_title_size_cap=kept.same_title_size_cap, **rebalance)),
             ("chosen", config.LiveSettings(
                 tier_floors=False, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][0]["value"],
-                size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5,
-                **rebalance)),
+                size_cap=data["caps"][pc]["value"],
+                same_title_size_cap=kept.same_title_size_cap, **rebalance)),
         )
         for name, expected in cases:
             [opened] = snaps[name]["opened"]
@@ -9210,11 +9151,13 @@ class TestSaveLiveDefaultsButton:
                                                            _SAVE_HOST))
             assert response.status == 200, response.body
             settings, source = defaults_server._proposal(defaults_server._params(raw), current)
-            # The page has no Sell view, so the server keeps the saved selling
+            # The page has no Sell view and sends no same-title cap, so the
+            # server keeps the saved selling and the saved same-title cap
             expected = config.LiveSettings(
                 tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][pk]["value"],
-                size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5,
+                size_cap=data["caps"][pc]["value"],
+                same_title_size_cap=current.same_title_size_cap,
                 rebalance=yes, min_price_move=move, rebalance_min_days_to_maturity=days,
                 sell_at=current.sell_at, sell_min_days=current.sell_min_days)
             assert settings == expected, name
@@ -9256,8 +9199,9 @@ class TestSaveLiveDefaultsButton:
         assert (current is not None) is (saved != "nothing")
         app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
         pb, pk, pc = data["primary"]
-        # The page names no Rebalance choice, so the server keeps the saved
-        # one and its minimum, or the seed's with none saved
+        # The page names no Rebalance choice and no same-title cap, so the
+        # server keeps the saved ones and the minimum, or the seed's with none
+        # saved
         kept = current if current is not None else config.LIVE_DEFAULTS_SEED
         rebalance = {"rebalance": kept.rebalance, "min_price_move": kept.min_price_move}
         levels, days = data["sell_levels"], data["sell_days"]
@@ -9280,7 +9224,8 @@ class TestSaveLiveDefaultsButton:
             expected = config.LiveSettings(
                 tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][pk]["value"],
-                size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5,
+                size_cap=data["caps"][pc]["value"],
+                same_title_size_cap=kept.same_title_size_cap,
                 **rebalance, sell_at=level, sell_min_days=minimum)
             assert settings == expected, name
             for field in config.LIVE_TOGGLE_FIELDS:
@@ -9507,10 +9452,9 @@ class TestScenarioExplorerScript:
             sweep=sweep))
 
     def _rows(self, ts: str, ladder: str, cross: str, all_: str) -> list[tuple[str, str]]:
-        # Same-title's row is the same under both Tier floors settings
+        # The KPI table's four rows, one per population of the cell shown
         return [(self.TS, ts), ("Ladders (same-event)", ladder), ("Cross-event", cross),
-                ("All (time-series + same-title)", all_),
-                ("Same-title (independent of band, k and the tier floors)", "7")]
+                ("All (time-series + same-title)", all_)]
 
     @staticmethod
     def _blocks(page: str) -> tuple[dict, dict, dict]:
@@ -10889,16 +10833,11 @@ class _ExplorerCapSweep(_FakeCapSweep):
     """
     _FakeCapSweep with the band sweep's checks, as a production CapSweep has
     them whenever the band sweep ran: every scenario carries the "all" and
-    "time_series" populations (the primary band's also "ladder"), and the
-    same-title population has a point per cap. `points` maps (band, k, cap)
-    -> {population: SweepPoint}; `same_title` maps cap -> SweepPoint.
+    "time_series" populations (the primary band's also "ladder"). `points`
+    maps (band, k, cap) -> {population: SweepPoint}.
     """
 
     checks = True
-
-    def __init__(self, points: dict, *, same_title: dict | None = None, **kwargs):
-        super().__init__(points, **kwargs)
-        self._same_title = same_title or {}
 
     def cell(self, band, k):
         self.reads.append((band, k))
@@ -10906,9 +10845,6 @@ class _ExplorerCapSweep(_FakeCapSweep):
             raise RuntimeError("the cap simulation failed")
         return {cap: dict(self.points[(band, k, cap)]) for cap in self.caps
                 if (band, k, cap) in self.points}
-
-    def same_title(self):
-        return dict(self._same_title)
 
     def entry_events(self):
         return {(t.event_ticker, t.category) for pops in self.points.values()
@@ -10925,8 +10861,7 @@ def _ex_sweep(*, raise_on=None) -> BacktestSweep:
     with 20% but not its curve (booked on a 1,100 balance), so a row cached
     on the trades alone would be the 20% row. Band 0.3-0.6 traded nothing at
     k 0.60 (a flat curve: Sharpe 0.0, which the heatmap must not show) and
-    the same winning list at every cap at k 0.75. Same-title: one trade at
-    5%, two at 20% and no cap.
+    the same winning list at every cap at k 0.75.
     """
     def resized(t, n):
         return _kc_resized(t, n)
@@ -10968,23 +10903,15 @@ def _ex_sweep(*, raise_on=None) -> BacktestSweep:
         for cap in _EX_CAPS:
             points[(_KC_B1, k, cap)] = pops(_KC_B1, k, cap, empty if k == 0.6 else other)
 
-    def same_title(count):
-        # The first Basketball trade, then the Oil & Gas one, as same-title pairs
-        return [dataclasses.replace(t, pair_type="same_title") for t in _flt_trades()[:count]]
-
-    st_lists = {0.05: same_title(1), 0.2: same_title(2), 1.0: same_title(2)}
-    st = {cap: SweepPoint(k=0.75, trades=listed, equity_df=curve(listed),
-                          population="same_title", size_cap=cap)
-          for cap, listed in st_lists.items()}
     eager = [p for (_, _, cap), by_pop in points.items() if cap == 0.2 for p in by_pop.values()]
     primary = points[(_KC_B0, 0.75, 0.2)]["all"]
     cal = _flt_calibration([("KXNHLHART-27", "Other"), ("KXOTHER-1", "Other")])
     return BacktestSweep(
         primary=primary, points=[points[(_KC_B0, k, 0.2)]["all"] for k in (0.6, 0.75)],
         calibration=cal, label_coverage=_scn_coverage(), scenarios=eager,
-        same_title_point=st[0.2], calibrations_by_band={_KC_B0: cal, _KC_B1: None},
+        calibrations_by_band={_KC_B0: cal, _KC_B1: None},
         same_event_ladders=True, split_date=date(2026, 1, 13),
-        cap_sweep=_ExplorerCapSweep(points, same_title=st, raise_on=raise_on, caps=_EX_CAPS))
+        cap_sweep=_ExplorerCapSweep(points, raise_on=raise_on, caps=_EX_CAPS))
 
 
 def _ex_sweep_tiers() -> BacktestSweep:
@@ -11143,7 +11070,7 @@ class TestExplorerCapAndMetrics:
         cell_khat, cell_delta = data["matrices"]["empirical_k"][0][1], delta[0][1]
         assert cell_khat > khat_spec["zmid"] and cell_delta > spec["zmid"]
 
-    def test_the_banner_and_same_title_row_are_each_cap_s_own(self, monkeypatch, tmp_path):
+    def test_the_banner_is_each_cap_s_own(self, monkeypatch, tmp_path):
         section = _ex_section(_kc_page(monkeypatch, tmp_path, _ex_sweep()))
         blocks = _scn_blocks(section)
         caps = [blocks[f"scn-cap-{ci}"] for ci in range(3)]
@@ -11158,7 +11085,8 @@ class TestExplorerCapAndMetrics:
         assert "(10 scenario points" in caps[0]["banner"]
         # The page renders the primary cap's banner
         assert f'<div id="scn-banner">{caps[1]["banner"]}</div>' in section
-        assert [cap["same_title"]["trades"] for cap in caps] == [1, 2, 2]
+        # ... and every cap's block holds its cells and their figures alone
+        assert all(set(cap) == {"cells", "banner", "matrices", "titles"} for cap in caps)
 
     def test_without_the_band_sweep_the_explorer_is_its_placeholder(
             self, monkeypatch, tmp_path):
@@ -11248,38 +11176,6 @@ class TestExplorerCapAndMetrics:
         for piece in ('id="flt-bar"', "Portfolio Performance", "Benchmark Comparison"):
             assert piece in page
         assert html.escape(dashboard._BAR_REACH_NO_EXPLORER) in page
-
-    def test_a_same_title_simulation_failure_costs_only_the_same_title_rows(
-            self, monkeypatch, tmp_path, caplog):
-        # The size-cap sweep's same-title population cannot be simulated,
-        # while every cell can: the bar and the explorer keep their cap axis,
-        # and the explorer's same-title row is the run's own, at its own cap
-        sweep = _ex_sweep()
-
-        def broken():
-            raise RuntimeError("same-title cap simulation failed")
-        sweep.cap_sweep.same_title = broken
-        with caplog.at_level(logging.WARNING):
-            page = _kc_page(monkeypatch, tmp_path, sweep)
-        warned = [r for r in caplog.records if r.levelno == logging.WARNING
-                  and "same-title" in r.getMessage()]
-        assert [r.getMessage() for r in warned] == [
-            "The same-title population could not be simulated at every size cap; the "
-            "Scenario Explorer shows it at the run's own cap only"]
-        assert warned[0].exc_info is not None
-        assert not any("size-cap sweep could not be simulated" in r.getMessage()
-                       for r in caplog.records)
-        assert [c["label"] for c in TestFilterPage._data(page)["caps"]] == [
-            "5%", "20%", "off (full Kelly)"]
-        assert sweep.cap_sweep.reads == [(_KC_B0, 0.75), (_KC_B0, 0.6), (_KC_B1, 0.6),
-                                         (_KC_B1, 0.75)]
-        section = _ex_section(page)
-        blocks = _scn_blocks(section)
-        assert [blocks[f"scn-cap-{ci}"]["same_title"] for ci in (0, 2)] == [None, None]
-        assert blocks["scn-cap-1"]["same_title"]["trades"] == len(
-            sweep.same_title_point.trades)
-        assert html.escape(dashboard._BAR_REACH_NO_EXPLORER_TIERS[(True, True)]) in page
-        assert 'id="scn-own-cap"' not in page
 
     def test_a_late_cell_is_shown_over_the_page_s_span_as_the_bar_shows_it(
             self, monkeypatch):
@@ -14916,10 +14812,11 @@ class TestRebalanceScript:
                                                            _SAVE_HOST))
             assert response.status == 200, response.body
             settings, source = defaults_server._proposal(defaults_server._params(raw), current)
+            # No same-title cap is sent: the server keeps the saved one
             expected = config.LiveSettings(
                 tier_floors=True, spread_band=tuple(data["bands"][0]["value"]),
                 interval_discount=data["ks"][1]["value"], size_cap=data["caps"][ci]["value"],
-                same_title_size_cap=0.5, rebalance=yes,
+                same_title_size_cap=current.same_title_size_cap, rebalance=yes,
                 sell_at=None if sell_view else 0.9, sell_min_days=None if sell_view else 5)
             assert settings == expected, name
             for field in config.LIVE_TOGGLE_FIELDS:
@@ -14948,16 +14845,20 @@ class TestRebalanceScript:
         current = config.read_saved_live_defaults()
         app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
         pb, pk, pc = data["primary"]
+        # No same-title cap is sent: the server keeps the saved one, or the
+        # seed's with none saved
+        same_title = (current if current is not None
+                      else config.LIVE_DEFAULTS_SEED).same_title_size_cap
         cases = (
             ("primary", config.LiveSettings(
                 tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][pk]["value"],
-                size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5,
+                size_cap=data["caps"][pc]["value"], same_title_size_cap=same_title,
                 rebalance=False)),
             ("chosen", config.LiveSettings(
                 tier_floors=False, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][0]["value"],
-                size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5,
+                size_cap=data["caps"][pc]["value"], same_title_size_cap=same_title,
                 rebalance=True)),
         )
         for name, expected in cases:
@@ -15962,7 +15863,7 @@ class TestRebalanceEndToEnd:
         assert off_primary.tier_floors is False
         axes = {"caps": caps, "primary_cap": 0.20, "bands": (band,), "ks": (k,),
                 "primary_k": k, "start_date": start, "initial_balance": 10_000.0}
-        lazy = {**axes, "split_date": None, "checks": False, "st_entries": []}
+        lazy = {**axes, "split_date": None, "checks": False}
         days = {(band, k, "all"): end}
         run = BacktestSweep(
             primary=primary, points=[primary], calibration=None, scenarios=[primary],
@@ -16168,7 +16069,7 @@ class TestUntilEndToEnd:
         primary, off_primary = fresh(0.20), fresh(0.20, off=True)
         axes = {"caps": caps, "primary_cap": 0.20, "bands": (band,), "ks": (k,),
                 "primary_k": k, "start_date": start, "initial_balance": 10_000.0}
-        lazy = {**axes, "split_date": None, "checks": False, "st_entries": []}
+        lazy = {**axes, "split_date": None, "checks": False}
         days = {(band, k, "all"): end}
         run = BacktestSweep(
             primary=primary, points=[primary], calibration=None, scenarios=[primary],
@@ -16415,7 +16316,7 @@ class TestLiveRebalanceRule:
     def test_the_header_names_the_choices_that_show_the_rebalancing(self):
         run = TestLiveRuleHeader
         rule = config.describe_time_series_rule(True, (0.0, 1.0))
-        head = f"Live rule (saved live defaults): {rule}; {run._CAP} — this run's primary"
+        head = f"Live rule (saved live defaults): {rule} — this run's primary"
         sweep = self._both(run._sweep())
         shown = {**run._bar(), **self._view([[[7]]], [[[None]]])}
         # The rule is the page's primary and the bar has the view: with no saved
@@ -16465,7 +16366,7 @@ class TestLiveRebalanceRule:
     def test_the_header_names_the_rebalance_until_choice(self, days):
         run = TestLiveRuleHeader
         rule = config.describe_time_series_rule(True, (0.0, 1.0))
-        head = f"Live rule (saved live defaults): {rule}; {run._CAP} — this run's primary"
+        head = f"Live rule (saved live defaults): {rule} — this run's primary"
         sweep = self._both(run._sweep(), live_rebalance_min_days_to_maturity=days)
         until = None if days is None else self._UNTIL[[1, 7].index(days)]
         named = "maturity" if until is None else until["label"]
@@ -16547,7 +16448,7 @@ class TestLiveRebalanceRule:
         # Sell clause offers the selling alone, and the rebalance clause says why
         run = TestLiveRuleHeader
         rule = config.describe_time_series_rule(True, (0.0, 1.0))
-        head = f"Live rule (saved live defaults): {rule}; {run._CAP} — this run's primary"
+        head = f"Live rule (saved live defaults): {rule} — this run's primary"
         together = " — this page cannot show rebalancing together with selling"
         sweep = self._both(run._sweep(), live_sell_at=0.85, live_sell_min_days=3)
         view = self._view([[[7]]], [[[None]]])
@@ -17150,10 +17051,11 @@ class TestSellGrid:
 
     def test_a_worker_sells_by_the_parent_s_day_count(self, monkeypatch, tmp_path):
         # Each task carries the parent's TAKE_PROFIT_HOLD_DAYS beside its
-        # same-title cap and schedule; a worker process, which imports
-        # backtester afresh, installs all three before it simulates
-        for name in ("SAME_TITLE_SIZE_CAP", "SCHEDULED_RUN"):
-            monkeypatch.setattr(backtester, name, getattr(backtester, name))
+        # schedule and confirmed fee multipliers; a worker process, which
+        # imports backtester afresh, installs all three before it simulates
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN", backtester.SCHEDULED_RUN)
+        monkeypatch.setattr(config, "CONFIRMED_FEE_MULTIPLIERS",
+                            config.CONFIRMED_FEE_MULTIPLIERS)
         monkeypatch.setattr(backtester, "TAKE_PROFIT_HOLD_DAYS", 2)
         walked, chunker, _grid = _sl_build(_kc_sweep_sell(), tmp_path / "f")
         tasks = dashboard._sell_tasks(walked, chunker, start_date=_FLT_START,
@@ -17168,7 +17070,7 @@ class TestSellGrid:
 
     def test_a_task_carries_exactly_the_three_installed_bindings(self, tmp_path):
         """
-        A task carries the parent's same-title cap, schedule and hold days, and nothing for a wait.
+        A task carries the parent's schedule, hold days and confirmed fee multipliers, and nothing for a wait.
 
         A Sell run neither adds to held pairs nor trims, so no run of the
         Sell build reads backtester.REBALANCE_MIN_DAYS_SINCE_TRADE and a
@@ -17181,7 +17083,9 @@ class TestSellGrid:
                                       folder=tmp_path / "g")
         assert tasks
         fields = {f.name for f in dataclasses.fields(dashboard._SellTask)}
-        assert {"same_title_size_cap", "scheduled_run", "hold_days", "install"} <= fields
+        assert {"scheduled_run", "hold_days", "confirmed_fee_multipliers", "install"} <= fields
+        # ... and no same-title cap: the backtest sizes every pair by the per-trade cap alone
+        assert not {name for name in fields if "same_title" in name}
         assert not {name for name in fields if "rebalance" in name}
         # A cell a task covers is (k index, cap index): no Rebalance level
         assert all(len(cell) == 2 for task in tasks for cell in task.cells)
@@ -17416,7 +17320,7 @@ class TestLiveSellRule:
     def test_the_header_names_the_options_that_show_the_rule(self):
         run = TestLiveRuleHeader
         rule = config.describe_time_series_rule(True, (0.0, 1.0))
-        head = f"Live rule (saved live defaults): {rule}; {run._CAP} — this run's primary"
+        head = f"Live rule (saved live defaults): {rule} — this run's primary"
         sweep = dataclasses.replace(run._sweep(), live_sell_at=0.85, live_sell_min_days=3)
         shown = {**run._bar(), **self._view()}
         # The rule is the page's primary and the bar has the view at that level
@@ -17437,7 +17341,7 @@ class TestLiveSellRule:
     def test_a_page_that_cannot_show_the_level_says_so(self):
         run = TestLiveRuleHeader
         rule = config.describe_time_series_rule(True, (0.0, 1.0))
-        head = f"Live rule (saved live defaults): {rule}; {run._CAP} — this run's primary"
+        head = f"Live rule (saved live defaults): {rule} — this run's primary"
         cannot = " — this page cannot show that Sell level and minimum of days"
         sweep = dataclasses.replace(run._sweep(), live_sell_at=0.85, live_sell_min_days=3)
         other_level = [{"label": "sell at 90% of potential profit", "value": 0.9}]
@@ -18151,8 +18055,7 @@ class TestSellScript:
 
     def test_the_save_button_follows_the_level_and_minimum_on_screen(self, monkeypatch,
                                                                        tmp_path):
-        page = _sl_page(monkeypatch, tmp_path,
-                        dataclasses.replace(_kc_sweep_sell(), same_title_size_cap=0.5))
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
         data = TestFilterPage._data(page)
         src = f"{data['sidecar_dir']}/chunk-7.js"
         save = TestSaveLiveDefaultsButton()
@@ -19694,24 +19597,20 @@ class TestRiskFreeReachesEveryRatio:
             ts = data["populations"].index("time_series")
             pb, pk, _ = data["primary"]
             rows[name] = (cap["cells"][pb][pk][ts], cap["matrices"]["sharpe"][pb][pk],
-                          cap["cells"][1][0][ts], cap["same_title"])
+                          cap["cells"][1][0][ts])
         point = sweep.cap_sweep.points[(_KC_B0, 0.75, 0.2)]["time_series"]
         expected = dashboard._point_kpis(point, risk_free=rates)
         # ... which is the point's own trades' open capital, by hand
         assert expected["sharpe"] == pytest.approx(dashboard._sharpe(
             point.equity_df["daily_return"],
             rf=_hand_hurdle(point.equity_df, point.trades, rates)))
-        row, sharpe, flat, same_title = rows["rf"]
+        row, sharpe, flat = rows["rf"]
         assert row["sharpe"] == pytest.approx(expected["sharpe"])
         assert row["sortino"] == pytest.approx(expected["sortino"])
         assert sharpe == pytest.approx(expected["sharpe"])
         assert row["sharpe"] != pytest.approx(rows["zero"][0]["sharpe"])
         assert row["sortino"] != pytest.approx(rows["zero"][0]["sortino"])
-        # The same-title row takes the rates too ...
-        assert same_title["sharpe"] == pytest.approx(
-            dashboard._point_kpis(sweep.cap_sweep.same_title()[0.2], risk_free=rates)["sharpe"])
-        assert same_title["sharpe"] != pytest.approx(rows["zero"][3]["sharpe"])
-        # ... and a cell that traded nothing still reads 0.0 (_varies)
+        # A cell that traded nothing still reads 0.0 (_varies)
         assert flat["trades"] == 0 and flat["sharpe"] == 0.0 and flat["sortino"] == 0.0
 
     @staticmethod
@@ -19738,21 +19637,16 @@ class TestRiskFreeReachesEveryRatio:
             data, cap = _scn_data(section), _scn_cap(section)
             ts = data["populations"].index("time_series")
             pb, pk, _ = data["primary"]
-            cells[name] = (cap["cells"][pb][pk][ts], cap["same_title"])
+            cells[name] = cap["cells"][pb][pk][ts]
         point = next(p for p in sweep.scenarios if p.population == "time_series"
                      and p.spread_band == _KC_B0 and p.k == 0.75)
         daily = point.equity_df["daily_return"]
         hurdle = _hand_hurdle(point.equity_df, point.trades, rates)
-        row, same_title = cells["rf"]
+        row = cells["rf"]
         assert row["sharpe"] == pytest.approx(dashboard._sharpe(daily, rf=hurdle))
         assert row["sortino"] == pytest.approx(dashboard._sortino(daily, rf=hurdle))
-        assert row["sharpe"] != pytest.approx(cells["zero"][0]["sharpe"])
-        assert row["sortino"] != pytest.approx(cells["zero"][0]["sortino"])
-        # The same-title row, the run's own point, takes them too
-        st = sweep.same_title_point
-        assert same_title["sharpe"] == pytest.approx(dashboard._sharpe(
-            st.equity_df["daily_return"], rf=_hand_hurdle(st.equity_df, st.trades, rates)))
-        assert same_title["sharpe"] != pytest.approx(cells["zero"][1]["sharpe"])
+        assert row["sharpe"] != pytest.approx(cells["zero"]["sharpe"])
+        assert row["sortino"] != pytest.approx(cells["zero"]["sortino"])
 
     def test_the_static_interval_discount_through_the_page(self, monkeypatch, tmp_path):
         # The filter cannot be built, so the Interval Discount section renders
@@ -20549,7 +20443,7 @@ def _mix_sweep(trades: list[BacktestTrade], observations: tuple = (),
     return BacktestSweep(primary=primary, points=[primary], calibration=cal,
                          label_coverage=_scn_coverage(), scenarios=[primary],
                          calibrations_by_band={(0.0, 1.0): cal}, same_event_ladders=True,
-                         config_same_event_ladders=True, same_title_size_cap=0.5)
+                         config_same_event_ladders=True)
 
 
 def _mix_page(monkeypatch, tmp_path, trades: list[BacktestTrade], *, risk_free=None,
@@ -23019,8 +22913,7 @@ class TestExtraDataHeader:
 
     @staticmethod
     def _report(**changes) -> backtester.ExtraDataReport:
-        base = dict(strikes_differ=0, strikes_checked=0, sources_differ=0, sources_checked=0,
-                    rules_differ=0, rules_checked=0, option_ladders=0, ladders_checked=0,
+        base = dict(rules_differ=0, rules_checked=0, option_ladders=0, ladders_checked=0,
                     integrity_failures=tuple((name, 0) for name in ("candle_range",
                                                                     "trade_prices")),
                     anomaly_markets=2, anomaly_hours=5, pair_markets=40,

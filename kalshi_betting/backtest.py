@@ -1889,7 +1889,7 @@ def main() -> None:
         depth_model=depth_model,
         # Each series' fee multiplier (carried only)
         fee_multipliers=fee_multipliers,
-    )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep, and the lazy sell and Rebalance families (sell_sweep, rebalance_sweep) unless --no-sell-sweep / --no-rebalance-sweep
+    )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep, and the lazy sell and Rebalance families (sell_sweep, rebalance_sweep) unless --no-sell-sweep / --no-rebalance-sweep
     # What the dashboard is handed, saved before the page is built, so
     # --dashboard-only can rebuild the page (or finish a build that stopped)
     # without running the backtest again. period_end is the window's last day,

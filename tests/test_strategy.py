@@ -4320,13 +4320,13 @@ class TestTimeSeriesKellyParity:
                                 and sub.func.id == "_kelly_trim" for sub in ast.walk(func))}
         assert trim_callers == {"_simulate_at_discount", "planned_trims"}
         # ... handed the checkpoint's own date and value and the run's own k
-        # and caps, and decided before the valuation the day's purchases are
+        # and cap, and decided before the valuation the day's purchases are
         # sized on (the one checkpoint_value assignment)
         walk = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
                     and node.name == "_simulate_at_discount")
         [decided, counted, capped] = _calls_to(walk, "_kelly_trim")
         assert [ast.unparse(arg) for arg in decided.args] == [
-            "position", "d", "value", "effective_k", "cap", "st_cap"] and not decided.keywords
+            "position", "d", "value", "effective_k", "cap"] and not decided.keywords
         # The second call only counts the trims the stale-quote check held
         # back, and the third those the volume cap cut or held back: the same
         # arguments with that one check skipped, read for nothing but the count
@@ -4904,14 +4904,17 @@ class TestTimeSeriesKellyParity:
         assert [ast.unparse(n.value) for n in fills] == ["leg_prices(spec.pair)"]
 
     def test_ast_each_simulation_hands_the_live_code_its_own_settings(self):
-        # One LiveSettings per simulation, built from its own k, caps, band
-        # and tier setting, and handed to the live code as `settings`
+        # One LiveSettings per simulation, built from its own k, cap, band
+        # and tier setting, and handed to the live code as `settings`. The
+        # backtest simulates time-series pairs only, so it hands no
+        # same-title cap: the field keeps its default, which no time-series
+        # pair reads
         func = _def_named(inspect.getsource(backtester), "_simulate_at_discount")
         [built] = _calls_to(func, "LiveSettings")
         assert {k.arg: ast.unparse(k.value) for k in built.keywords} == {
             "tier_floors": "tier_floors is not False", "spread_band": "(band_lo, band_hi)",
             "interval_discount": "effective_k", "size_cap": "cap",
-            "same_title_size_cap": "st_cap", "exclude_categories": "None", "exclude_tags": "None",
+            "exclude_categories": "None", "exclude_tags": "None",
             "rebalance": "bool(add_to_held or trim_to_kelly)"}
         assert _bound_from(func, built) == ["settings"]
         # The cap a simulation shares from reads the live bound on the search

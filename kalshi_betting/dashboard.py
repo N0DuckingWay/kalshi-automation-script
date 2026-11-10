@@ -211,13 +211,12 @@ Purpose:
     (only on a page that carries the choices, beside those two as
     rebalance_min_days_to_maturity: the choice's days, or 0, no days limit,
     at maturity and with Rebalance no), Sell level and Min. days to
-    maturity (only on a page that simulated selling), with this run's
-    same-title cap when the run recorded one — never for the Scenario
-    Explorer's own selects. The address names each category ticked in the
-    Exclude categories menu as a category live runs exclude, and so each
-    kept category every one of whose tags is ticked in the Exclude tags
-    menu (with its letter-case twins, each ticked or with every tag ticked
-    too), and each other "Category · Tag" ticked as a tag live runs exclude
+    maturity (only on a page that simulated selling) — never for the
+    Scenario Explorer's own selects. The address names each category
+    ticked in the Exclude categories menu as a category live runs exclude,
+    and so each kept category every one of whose tags is ticked in the
+    Exclude tags menu (with its letter-case twins, each ticked or with every
+    tag ticked too), and each other "Category · Tag" ticked as a tag live runs exclude
     in that category (letter-case twins included, as the page ticks them),
     so every other category and tag trades live, one the backtest never saw
     included, and a save replaces the saved excluded categories and tags.
@@ -278,9 +277,10 @@ Dependencies:
     a backtester.SameMove for a minimum price movement that repeats another
     run, and whose maturity_grid a backtester.SameMaturity for a "Rebalance
     until" choice that does) by their attributes; imports backtester itself to
-    read, and in a worker process install, its SAME_TITLE_SIZE_CAP,
-    SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS (_run_sell_task; the last also
-    names the Sell select's rule, _sell_select_title), to read its
+    read, and in a worker process install, its SCHEDULED_RUN and
+    TAKE_PROFIT_HOLD_DAYS (_run_sell_task, which installs config's
+    CONFIRMED_FEE_MULTIPLIERS beside them; TAKE_PROFIT_HOLD_DAYS also names
+    the Sell select's rule, _sell_select_title), to read its
     REBALANCE_MIN_DAYS_SINCE_TRADE (named in the Rebalance select's hover
     text, _rebalance_select_title), and to word a minimum price movement and
     a "Rebalance until" choice as a run's label does (_move_label,
@@ -454,9 +454,7 @@ Notes:
     (_ExplorerVisitor — one that fails costs only the
     explorer's cap axis: it is rebuilt from the sweep's own eager points,
     tier-floors-off family included, and a notice replaces it only if even
-    that fails). The walk also reads
-    the same-title population once, at every cap, for the visitors that show
-    or count it. Only one cell's
+    that fails). Only one cell's
     points are ever alive, so a cap grid's points are never held in memory
     together; the chunks are held as separate packed strings until each is
     written (the page's first into the page, every other as a file in the
@@ -3790,15 +3788,12 @@ _HEADLINE_POPULATION = "time_series"
 
 # Every population's label on the page, spelled once so the KPI rows, the
 # banner, the heatmap title and the curve title can never name one
-# population two ways. Same-title is simulated once, and no band, k or
-# deadline-gap tier floor reaches a same-title pair, so its row reads the
-# same under both Tier floors settings — and its label says so.
+# population two ways.
 _POPULATION_LABELS = {
     "time_series": "Time-series (ladders + cross-event; same-title excluded)",
     "all": "All (time-series + same-title)",
     "ladder": "Ladders (same-event)",
     "cross": "Cross-event",
-    "same_title": "Same-title (independent of band, k and the tier floors)",
 }
 
 # The scenario explorer's heatmap hovers, one per kind of figure. A percent
@@ -4055,9 +4050,9 @@ def _point_kpis(point: SweepPoint, *, risk_free: RiskFreeRates | None = None) ->
     Compute one standalone SweepPoint's KPI-table row.
 
     Every field is derived from the point's OWN trades and OWN equity curve,
-    never sliced out of a joint run: a band sweep's "ladder" and "cross"
-    points and the same-title point are each their own simulation from the
-    initial balance, and only a simulation that ran alone has a return, a
+    never sliced out of a joint run: a band sweep's "time_series", "ladder"
+    and "cross" points are each their own simulation from the initial
+    balance, and only a simulation that ran alone has a return, a
     drawdown or a Sharpe of its own — slicing the joint "all" run's trades by
     population would give a P&L sum with no curve behind it.
 
@@ -4193,7 +4188,7 @@ def _robustness_extras(point: SweepPoint) -> dict:
 # block (id="scn-data": the axes and their labels, the calibration per band,
 # the heatmap metrics and their size-cap-independent matrices) and, when a
 # size cap is chosen, that cap's block (id="scn-cap-<i>": every cell's
-# figures, the same-title row, the banner, the cap's matrices and the heatmap
+# figures, the banner, the cap's matrices and the heatmap
 # titles), all packed by _packed_json_script and unpacked here by unpack(el)
 # — the primary cap's as the page loads, any other only when chosen — and,
 # on a page with a tier-floors-off view, when that setting is chosen at a cap
@@ -4369,10 +4364,8 @@ _SCENARIO_EXPLORER_JS = r"""
   // The KPI table, the band's calibration table and the curve, for the band,
   // k, cap and setting ON SCREEN. The headline (time-series) population
   // first — the one the heatmap and banner read — then its two parts, then
-  // All and Same-title, each row named by its own label so no two
-  // populations can be mistaken. A cell the run never simulated at this cap
-  // reads "—". Same-title is read from the cap's block under both settings:
-  // no tier floor reaches a same-title pair.
+  // All, each row named by its own label so no two populations can be
+  // mistaken. A cell the run never simulated at this cap reads "—".
   function renderTables() {
     var cell = cellAt(SHOWN[0], SHOWN[1]);
     var L = D.labels;
@@ -4380,8 +4373,7 @@ _SCENARIO_EXPLORER_JS = r"""
     byId('scn-kpi-body').innerHTML =
       kpiRow(esc(L.time_series), ts) + extrasRow(ts)
       + kpiRow(esc(L.ladder), cell[P.ladder]) + kpiRow(esc(L.cross), cell[P.cross])
-      + kpiRow(esc(L.all), cell[P.all]) + extrasRow(cell[P.all])
-      + kpiRow(esc(L.same_title), capData().same_title);
+      + kpiRow(esc(L.all), cell[P.all]) + extrasRow(cell[P.all]);
     byId('scn-cal-body').innerHTML = calRows(calAt(SHOWN[0]));
     // The headline population's curve, like the heatmap, on the explorer's
     // own date axis (D.dates). An update, not a restyle: both axes are
@@ -4997,11 +4989,10 @@ def _live_sizing_bar_clause(sweep: BacktestSweep, bar: dict | None,
     Say how this page's filter bar shows the saved defaults' sizing, or what it cannot show.
 
     Added to the live-rule line only after backtester._live_sizing_note, i.e.
-    when the saved defaults' k or caps differ from this run's primary, and
-    only where the line says this page shows the live rule: choosing a k and
-    a cap in the bar then shows that rule at them. The bar offers k and a
-    per-trade size cap; the same-title cap every row sized under is the run's
-    own (BacktestSweep.same_title_size_cap), never a bar choice.
+    when the saved defaults' k or per-trade cap differs from this run's
+    primary, and only where the line says this page shows the live rule:
+    choosing a k and a cap in the bar's k and Size cap selects then shows
+    that rule at them.
 
     Args:
         sweep (BacktestSweep): The run's sweep, its live_* sizing recorded.
@@ -5018,9 +5009,8 @@ def _live_sizing_bar_clause(sweep: BacktestSweep, bar: dict | None,
     Returns:
         str: "" when shown is None; "; choose <k option> and Size cap <cap
             option> in the filter bar to see it" when the bar offers both
-            values, holds a scenario of the live rule there and the two
-            same-title caps agree; otherwise a "; ..." clause naming what the
-            bar cannot show.
+            values and holds a scenario of the live rule there; otherwise a
+            "; ..." clause naming what the bar cannot show.
 
     Raises:
         Nothing. It only reads the sweep and the bar's entries.
@@ -5060,8 +5050,7 @@ def _live_sizing_bar_clause(sweep: BacktestSweep, bar: dict | None,
 
     k_found = offered(bar.get("ks"), k, pk)
     cap_found = offered(bar.get("caps"), cap, pc)
-    same_title_agrees = sweep.live_same_title_size_cap == sweep.same_title_size_cap
-    if k_found is not None and cap_found is not None and same_title_agrees:
+    if k_found is not None and cap_found is not None:
         # The bar's scenario at that band, k and cap: a chunk id, or null where
         # the run simulated none (a tier-floors-off cell at a cap the page could
         # not simulate it at)
@@ -5072,14 +5061,11 @@ def _live_sizing_bar_clause(sweep: BacktestSweep, bar: dict | None,
                     f"{cap_found[1]} but holds no scenario of the live rule there")
         return (f"; choose {k_found[1]} and Size cap {cap_found[1]} in the filter bar "
                 "to see it")
+    # One of the two at least is not offered: name each one missing
     missing = [text for found, text in ((k_found, _k_option(k)),
                                         (cap_found, f"size cap {_cap_option(cap)}"))
                if found is None]
-    parts = ([f"this page's filter bar does not offer {' or '.join(missing)}"]
-             if missing else [])
-    if not same_title_agrees:
-        parts.append("the same-title cap is not a filter-bar choice")
-    return "; " + ", and ".join(parts)
+    return f"; this page's filter bar does not offer {' or '.join(missing)}"
 
 
 def _sell_choice_in_bar(sweep: BacktestSweep, bar: dict | None, band_index: int | None,
@@ -5277,7 +5263,7 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     categories it keeps no pair of, and the tags it leaves out of each
     category it keeps only in part, or why the page cannot
     (_live_filter_ticks, _tick_phrase). When the saved defaults
-    size at a k or caps other than this run's primary, it says so
+    size at a k or per-trade cap other than this run's primary, it says so
     (backtester._live_sizing_note) and, where the page shows the rule, how
     its filter bar shows it at that sizing (_live_sizing_bar_clause). When
     the saved defaults rebalance held pairs or sell, which no primary does,
@@ -5298,8 +5284,8 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
             option texts the line names; None when the page has no filter bar.
 
     Returns:
-        str: One <p>, its text escaped: the rule, any live filter, the same-title cap
-            and where (or whether) the page shows the rule, plus any ladder-departure,
+        str: One <p>, its text escaped: the rule, any live filter and where (or
+            whether) the page shows the rule, plus any ladder-departure,
             sizing, rebalancing and selling notes; "Live rule: not
             recorded" when sweep is None, and backtester._LIVE_RULE_NONE's words when
             the run recorded no live rule.
@@ -5316,15 +5302,6 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     filtered = excluded is not None or tags is not None
     if filtered:
         rule += f"; category/tag filter ({_live_filter_text(excluded, tags)})"
-    run_cap, st_cap = sweep.primary.size_cap, sweep.same_title_size_cap
-    if run_cap is None or st_cap is None:
-        cap_clause = "same-title cap not recorded"
-    else:
-        own = f"{_cap_percent(min(run_cap, st_cap))}% at this run's own cap"
-        cap_clause = ("same-title trades capped at the size cap shown, like every pair "
-                      f"({own})" if st_cap >= 1.0 else
-                      "same-title trades capped at the lower of the size cap shown and "
-                      f"{_cap_percent(st_cap)}% ({own})")
 
     # What to tick in the bar's two menus to show a live filter
     # (ticks); when the bar cannot show it, why not (slices)
@@ -5401,7 +5378,7 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
         seen = "the selling alone" if rebalance_note else "it"
         sell_note += (f" — choose {choice} in the filter bar to see {seen}" if choice is not None
                       else " — this page cannot show that Sell level and minimum of days")
-    text = (f"Live rule ({_LIVE_RULE_LABEL}): {rule}; {cap_clause} — {tail}{sizing}"
+    text = (f"Live rule ({_LIVE_RULE_LABEL}): {rule} — {tail}{sizing}"
             f"{rebalance_note}{sell_note}")
     return f"{style}{html.escape(text, quote=False)}</p>"
 
@@ -5935,8 +5912,7 @@ def _section_scenario_explorer(
          each labelled from _POPULATION_LABELS (Time-series, with a sub-row of
          its H1/H2 and top-event figures; Ladders; Cross-event; All —
          time-series + same-title, the run's actual result — with its own
-         sub-row; Same-title, which is independent of band and k but not of
-         the cap), the selected band's own calibration table, and the
+         sub-row), the selected band's own calibration table, and the
          time-series equity curve (rendered once for the primary scenario via
          _fig_html(div_id="scn-equity") and redrawn in place by a
          Plotly.update that autoranges both axes and titles it for the Tier
@@ -5992,12 +5968,11 @@ def _section_scenario_explorer(
     k-hat matrices and the status line's words; each of those null
     without one), one block per size cap (id "scn-cap-<i>": every cell's
     per-population figures — the headline one with its curve as change
-    points on the explorer's axis (_equity_axis) — the same-title row, the
-    banner, the cap's seven matrices and the nine heatmap titles) and one
-    tier-floors-off block per size cap the grid has off cells at (id
-    "scn-off-cap-<i>": a binding band's row of off cells, null for every
-    other band, and that grid's banner, seven matrices and nine titles; no
-    same-title row, which no tier floor reaches). Only the base block and
+    points on the explorer's axis (_equity_axis) — the banner, the cap's
+    seven matrices and the nine heatmap titles) and one tier-floors-off
+    block per size cap the grid has off cells at (id "scn-off-cap-<i>": a
+    binding band's row of off cells, null for every other band, and that
+    grid's banner, seven matrices and nine titles). Only the base block and
     the primary cap's are unpacked as the page loads; another cap's when it
     is chosen, and an off block when the tier floors are chosen off at its
     cap. The run's primary band and ladder setting are not
@@ -7592,11 +7567,10 @@ _SAVE_TITLE = ("Open a confirmation page, in a new tab, that compares the filter
                "scenario on screen — its spread band, tier floors, k, size cap, its "
                "Rebalance choice and Min. price movement (when this page simulated "
                "rebalancing) and its Sell level and Min. days to maturity (when this page "
-               "simulated selling), with this run's same-title cap when the run recorded "
-               "one; not the Scenario Explorer's own selects — with the live trading "
-               "defaults. It names the categories ticked in the Exclude categories "
-               "menu, and each category every one of whose tags is ticked in the "
-               "Exclude tags menu, as the categories live runs exclude, and each other "
+               "simulated selling); not the Scenario Explorer's own selects — with the "
+               "live trading defaults. It names the categories ticked in the Exclude "
+               "categories menu, and each category every one of whose tags is ticked in "
+               "the Exclude tags menu, as the categories live runs exclude, and each other "
                "Category · Tag ticked there as a tag live runs exclude in that category "
                "(every other category and tag trades, one this backtest never saw "
                "included), so saving it replaces the excluded categories and tags saved "
@@ -7857,19 +7831,18 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date) -> 
     digits only), and left out should it ever not match.
 
     Args:
-        sweep (BacktestSweep | None): The run's sweep: its same-title cap and
-            its same-event ladder setting beside the configured one; None for
-            a page built without one.
+        sweep (BacktestSweep | None): The run's sweep, read for its
+            same-event ladder setting beside config.py's, and for what it
+            recorded of the saved live defaults: whether they rebalance
+            (and their "Rebalance until" days limit), whether they sell, and
+            the categories and tags they exclude. None for a page built
+            without one.
         start_date (date): The backtest's first day (the Period line's).
         today (date): The Period line's last day (UTC).
 
     Returns:
         dict: "url" (the confirmation page's address, on
             config.DEFAULTS_SERVER_HOST and DEFAULTS_SERVER_PORT);
-            "same_title_size_cap" (the extra same-title cap the run sized
-            under, or None when not recorded, so the address leaves it out
-            and the server keeps the saved same-title cap, or the seed's
-            when none is saved);
             "source" (the note the saved file keeps: "backtest dashboard for
             <start> to <today>", plus a note when the run's same-event ladder
             setting differed from config.py's, so its pairs are not the live
@@ -7919,7 +7892,6 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date) -> 
     rebalances = getattr(sweep, "live_rebalance", None) is True
     return {
         "url": f"http://{DEFAULTS_SERVER_HOST}:{DEFAULTS_SERVER_PORT}/confirm",
-        "same_title_size_cap": None if sweep is None else sweep.same_title_size_cap,
         "source": source,
         "live_rebalances": rebalances,
         # A days limit counts only with rebalancing on, as the live settings hold it
@@ -7963,16 +7935,6 @@ _TRADE_FIELDS = (tuple(f.name for f in dataclasses.fields(BacktestTrade) if f.co
 # The walk logs its progress about this many times over a size-cap sweep's
 # grid, whose cells are simulated as they are read.
 _WALK_PROGRESS_LINES = 20
-
-
-def _no_same_title() -> dict:
-    """
-    The same-title population of a grid with none: no point at any cap.
-
-    Returns:
-        dict: {}.
-    """
-    return {}
 
 
 def _no_off_cell(band: tuple[float, float] | None, k: float | None) -> dict:
@@ -8021,8 +7983,6 @@ class _GridSource:
             simulate (a size-cap sweep) and so may raise.
         calibrations (dict): Band -> that band's IntervalCalibration (or
             None). The primary band's falls back to sweep.calibration.
-        same_title: Callable () -> {cap: SweepPoint} — the band- and
-            k-independent same-title population; {} when there is none.
         events (frozenset): (event ticker, fallback category) of every trade
             any cell can show, so the bar can list every category and tag
             before a cell is simulated.
@@ -8135,7 +8095,6 @@ class _GridSource:
     primary: tuple[int, int, int]
     cell: Callable[[tuple[float, float] | None, float | None], dict]
     calibrations: dict
-    same_title: Callable[[], dict] = _no_same_title
     events: frozenset = frozenset()
     checks: bool = False
     cap_sweep: object | None = None
@@ -8718,7 +8677,6 @@ def _eager_source(sweep: BacktestSweep) -> _GridSource:
     for (band, k, population), point in eager.items():
         by_cell.setdefault((band, k), {})[population] = point
     cap = sweep.primary.size_cap
-    same_title = sweep.same_title_point
 
     def cell(band, k) -> dict:
         """
@@ -8734,21 +8692,11 @@ def _eager_source(sweep: BacktestSweep) -> _GridSource:
         pops = by_cell.get((band, k))
         return {cap: dict(pops)} if pops else {}
 
-    def same_title_points() -> dict:
-        """
-        The same-title point at the run's own cap.
-
-        Returns:
-            dict: {cap: point}, or {} without one.
-        """
-        return {} if same_title is None else {cap: same_title}
-
     return _GridSource(
         bands=bands, ks=ks, caps=(cap,),
         primary=(bands.index(sweep.primary.spread_band), ks.index(sweep.primary.k), 0),
         cell=cell, calibrations=_band_calibrations(sweep, bands),
-        same_title=same_title_points, events=_trade_events(eager.values()),
-        checks=bool(sweep.scenarios))
+        events=_trade_events(eager.values()), checks=bool(sweep.scenarios))
 
 
 def _grid_source(
@@ -8836,7 +8784,7 @@ def _grid_source(
                              caps.index(capped.primary_cap)),
                     # Simulates the cell's caps as they are read (backtester's
                     # lazy CapSweep): a cap grid is never held in memory whole
-                    cell=capped.cell, same_title=capped.same_title,
+                    cell=capped.cell,
                     calibrations=_band_calibrations(sweep, bands),
                     # Every entry's event, as the simulation files its trades —
                     # the categories and tags exist before any cell is simulated
@@ -8959,8 +8907,7 @@ def _cap_option(cap: float | None) -> str:
 
     Returns:
         str: "20%", "off (full Kelly)" for 1.0 (Kelly's f* never exceeds 1,
-            so a 100% cap is no per-trade cap; same-title pairs keep
-            BacktestSweep.same_title_size_cap), or "not recorded".
+            so a 100% cap is no per-trade cap), or "not recorded".
     """
     if cap is None:
         return "not recorded"
@@ -9068,42 +9015,6 @@ def _cut_to_axis(by_cap: dict, axis_end: pd.Timestamp | None) -> dict:
 
     return {cap: {population: cut(point) for population, point in pops.items()}
             for cap, pops in by_cap.items()}
-
-
-def _same_title_points(source: _GridSource) -> dict:
-    """
-    Read a grid's same-title population at every cap, never raising.
-
-    A size-cap sweep simulates the population at every cap here
-    (CapSweep.same_title). If that raises, the failure costs the same-title
-    rows at the other caps only — ONE WARNING (with the traceback) — and the
-    run's own same-title point at the run's own cap stands in, read from the
-    eager grid (source.fallback, whose same_title is a lookup), so the
-    scenario explorer still shows it. The cells
-    already walked, and the filter bar's cap axis, are untouched: unlike a
-    cell, this population feeds only the explorer's same-title row.
-
-    Args:
-        source (_GridSource): The grid being walked.
-
-    Returns:
-        dict: {cap: SweepPoint}; the run's own point alone after a failure,
-            or {} when the grid has no eager fallback (or it has no
-            same-title point).
-    """
-    try:
-        return source.same_title()
-    except Exception as exc:
-        error = exc
-    try:
-        # The eager grid's lookup: nothing is simulated here
-        own = source.fallback().same_title() if source.fallback is not None else {}
-    except Exception:
-        own = {}
-    logging.warning("The same-title population could not be simulated at every size cap; "
-                    "the Scenario Explorer shows %s", "it at the run's own cap only" if own
-                    else "no same-title row", exc_info=error)
-    return own
 
 
 def _walk_cells(source: _GridSource, visitors: list, axis_end: pd.Timestamp | None
@@ -9466,7 +9377,7 @@ def _walk_maturity_cells(source: _GridSource, takers: list,
 def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | None
                ) -> tuple[Exception | None, _GridSource]:
     """
-    Hand every scenario of a grid to each visitor: tier-on, tier-off, rebalancing, price movements, "Rebalance until", same-title.
+    Hand every scenario of a grid to each visitor: tier-on, tier-off, rebalancing, price movements, "Rebalance until".
 
     First the tier-on cells (_walk_cells: the primary cell and cap first, so
     the primary scenario's chunk is always chunk 0, one cell alive at a
@@ -9513,20 +9424,11 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
     and grids. A grid whose choices were not read to the end, for any
     reason, is returned without them, so no page shows a view of them that
     was never built.
-    Last, when some visitor shows it (one with a
-    same_title method), the band- and k-independent same-title population is
-    read once
-    (_same_title_points: source.same_title — a size-cap sweep simulates it
-    here too — or, if that raises, the run's own same-title point alone),
-    cut the same way, and handed to those visitors as {cap: point}. A
-    same-title failure costs only the same-title rows at the other caps,
-    never the cells already walked: it does not stop the walk.
 
     Args:
         source (_GridSource): The grid.
         visitors (list): Callables (band index, k index, cap index,
-            {population: SweepPoint}); one may also have a
-            same_title({cap: SweepPoint}) method, an off(band index,
+            {population: SweepPoint}); one may also have an off(band index,
             k index, cap index, {population: SweepPoint}) method taking the
             tier-floors-off cells, with a reset_off(grid) method dropping
             what off() built, a rebalance(band index, k index, cap index,
@@ -9640,15 +9542,6 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
             reset_maturity = getattr(visit, "reset_maturity", None)
             if reset_maturity is not None:
                 reset_maturity(source)
-    takers = [visit for visit in visitors if hasattr(visit, "same_title")]
-    if takers:
-        # Never raises: a failure falls back to the run's own point
-        by_cap = _same_title_points(source)
-        # Cut to the page's axis like any cell's point, then shown
-        cut = _cut_to_axis({cap: {"same_title": point} for cap, point in by_cap.items()},
-                           axis_end)
-        for visit in takers:
-            visit.same_title({cap: pops["same_title"] for cap, pops in cut.items()})
     return None, source
 
 
@@ -9668,13 +9561,10 @@ def _walk_grid(source: _GridSource, visitors: list,
     view's other caps, recovered inside the walk (_walk_once, off_fallback),
     with the tier-on cap axis kept. One walk reads, in order, the tier-on
     cells, the tier-floors-off ones, the Rebalance ones, each Rebalance
-    cell's minimum price movements, then its "Rebalance until" choices, and
-    the same-title population (_walk_once); a Rebalance, price-movement or
-    "Rebalance until" cell that raises costs its own view alone (and the
-    views read after it from its runs), inside the walk.
-    (The size-cap sweep's same-title
-    population costs less still: only the same-title rows at the other caps
-    — _same_title_points.) The fallback grid carries the same
+    cell's minimum price movements, then its "Rebalance until" choices
+    (_walk_once); a Rebalance, price-movement or "Rebalance until" cell that
+    raises costs its own view alone (and the views read after it from its
+    runs), inside the walk. The fallback grid carries the same
     tier-floors-off family, at the run's own cap (_grid_source attaches it
     to every banded shape), so the second walk keeps the Tier floors choice.
     The other layer is each visitor's own: it catches its own failure and
@@ -9863,7 +9753,7 @@ class _ExplorerData:
             "tier_phrases" and "off_missing" (the status line's words).
         blocks (tuple[str, ...]): Each size cap's packed "scn-cap-<i>" block,
             by cap index: "cells" ([band][k] -> one entry per population, or
-            null for a scenario never simulated), "same_title", "banner",
+            null for a scenario never simulated), "banner",
             "matrices" (the seven cap-dependent ones, [band][k]) and "titles"
             (one per metric).
         banner (str): The primary cap's banner (_explorer_banner).
@@ -10011,7 +9901,6 @@ class _ExplorerVisitor:
         # Whether the walk handed off() any cell at each cap: a cap with none
         # at a band the tiers bind at has no tier-floors-off view
         self.off_seen = [False] * nc
-        self.same_titles: list[str | None] = [None] * nc
         self.primary_curve: list = []
         self.failed = False
         self._data = None
@@ -10048,10 +9937,9 @@ class _ExplorerVisitor:
         """
         Drop every tier-floors-off figure kept so far (the walk re-reads the off cells).
 
-        The tier-on figures, the same-title rows and the primary curve are
-        kept: only what off() built goes, so the off cells can be walked
-        again from another source (the grid's off_fallback — its axes are
-        the same).
+        The tier-on figures and the primary curve are kept: only what off()
+        built goes, so the off cells can be walked again from another source
+        (the grid's off_fallback — its axes are the same).
 
         Args:
             source (_GridSource): The grid whose off cells are walked next.
@@ -10178,28 +10066,6 @@ class _ExplorerVisitor:
             logging.warning("The Scenario Explorer's figures could not be built from the "
                             "page's grid; it shows the run's own size cap only",
                             exc_info=True)
-            self.failed = True
-
-    def same_title(self, by_cap: dict) -> None:
-        """
-        Keep the same-title population's KPI row at every cap.
-
-        Args:
-            by_cap (dict): Cap -> the same-title SweepPoint at that cap (the
-                walk's; {} when the run has none, and the run's own cap
-                alone when it could not be simulated at every cap — a cap
-                without a point shows a null row, "—").
-        """
-        if self.failed or not self.source.checks:
-            return
-        try:
-            for ci, cap in enumerate(self.source.caps):
-                point = by_cap.get(cap)
-                self.same_titles[ci] = None if point is None else _strict_json(
-                    _point_kpis(point, risk_free=self.risk_free))
-        except Exception:
-            logging.warning("The Scenario Explorer's same-title figures could not be built; "
-                            "it shows the run's own size cap only", exc_info=True)
             self.failed = True
 
     def payload(self) -> _ExplorerData | None:
@@ -10404,7 +10270,6 @@ class _ExplorerVisitor:
             cells = "[" + ",".join("[" + ",".join(text or "null" for text in row) + "]"
                                    for row in on["cells"][ci]) + "]"
             raw = ('{"cells":' + cells
-                   + ',"same_title":' + (self.same_titles[ci] or "null")
                    + ',"banner":' + _strict_json(banner)
                    + ',"matrices":' + _strict_json(matrices)
                    + ',"titles":' + _strict_json(list(titles)) + "}")
@@ -11401,8 +11266,6 @@ class _SellTask:
             chunks the page already has, in the page or as files: a list with
             one of them is never written again.
         out_dir (Path): The build's folder of chunk files.
-        same_title_size_cap (float): backtester.SAME_TITLE_SIZE_CAP as the
-            parent reads it.
         scheduled_run: backtester.SCHEDULED_RUN as the parent reads it.
         hold_days (int): backtester.TAKE_PROFIT_HOLD_DAYS as the parent reads
             it: how many days in a row a position must stay at a level
@@ -11412,7 +11275,7 @@ class _SellTask:
             listed (config.confirmed_fee_multiplier), so a worker charges each leg's
             fee as the parent would.
         install (bool): Whether the task runs in a worker process of its own,
-            which then installs those four bindings first (a spawned process
+            which then installs those three bindings first (a spawned process
             imports backtester afresh, from config). False in the parent.
     """
     index: int
@@ -11431,7 +11294,6 @@ class _SellTask:
     risk_free: RiskFreeRates | None
     inline_keys: frozenset
     out_dir: Path
-    same_title_size_cap: float
     scheduled_run: object
     hold_days: int
     confirmed_fee_multipliers: frozenset = frozenset({1.0})
@@ -11686,8 +11548,8 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
     dropped before the next is read.
 
     Runs in a worker process (task.install True: the parent's
-    SAME_TITLE_SIZE_CAP, SCHEDULED_RUN, TAKE_PROFIT_HOLD_DAYS and
-    config.CONFIRMED_FEE_MULTIPLIERS are installed first) or in the parent itself.
+    SCHEDULED_RUN, TAKE_PROFIT_HOLD_DAYS and config.CONFIRMED_FEE_MULTIPLIERS
+    are installed first) or in the parent itself.
 
     Args:
         task (_SellTask): The task.
@@ -11701,9 +11563,8 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
             and leaves the task's cells uncovered.
     """
     if task.install:
-        # A spawned process imported backtester afresh: size, checkpoint and
-        # sell as the parent does
-        _backtester.SAME_TITLE_SIZE_CAP = task.same_title_size_cap
+        # A spawned process imported backtester afresh: checkpoint and sell as
+        # the parent does
         _backtester.SCHEDULED_RUN = task.scheduled_run
         _backtester.TAKE_PROFIT_HOLD_DAYS = task.hold_days
         # ... and charge each leg's fee at the multipliers the parent confirms
@@ -11808,8 +11669,7 @@ def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: da
               "series_categories": series_categories, "cat_index": dict(chunker.cat_index),
               "sub_index": dict(chunker.sub_index), "risk_free": risk_free,
               "inline_keys": frozenset(chunker.seen), "out_dir": folder,
-              # The four bindings a spawned worker installs (_run_sell_task)
-              "same_title_size_cap": _backtester.SAME_TITLE_SIZE_CAP,
+              # The three bindings a spawned worker installs (_run_sell_task)
               "scheduled_run": _backtester.SCHEDULED_RUN,
               "hold_days": _backtester.TAKE_PROFIT_HOLD_DAYS,
               "confirmed_fee_multipliers": _config.CONFIRMED_FEE_MULTIPLIERS}
@@ -11857,8 +11717,8 @@ def _run_sell_tasks(tasks: list[_SellTask], workers: int) -> dict[int, _SellResu
     With one worker (or one task) every task runs here, in order. Otherwise a
     pool of spawned processes runs them (spawn, not fork: safe on macOS, and
     a fresh import in each worker, which installs the parent's
-    SAME_TITLE_SIZE_CAP, SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS). A task
-    that raises costs its own cells only: one WARNING naming its band (the
+    SCHEDULED_RUN, TAKE_PROFIT_HOLD_DAYS and config.CONFIRMED_FEE_MULTIPLIERS).
+    A task that raises costs its own cells only: one WARNING naming its band (the
     first with its traceback), and the rest go on; a pool that cannot run at
     all fails every task the same way.
 
@@ -13181,10 +13041,10 @@ def _filter_payload(
             True (default).
         save (dict | None): Keyword-only. What the bar's save button sends
             besides the scenario on screen (_save_target): the confirmation
-            page's address, the run's same-title cap, the source note and
-            whether the saved defaults rebalance, whether they sell and
-            whether they filter by category or tag. None (default) ships
-            null, and the script then keeps the button disabled.
+            page's address, the source note and whether the saved defaults
+            rebalance, whether they sell and whether they filter by category
+            or tag. None (default) ships null, and the script then keeps the
+            button disabled.
         rebalance_state (str): Keyword-only. Why the page has no Rebalance
             view when it has none: "not simulated" (the run carried no such
             family: the note reads "(not simulated in this backtest)") or
@@ -14597,16 +14457,13 @@ _FILTER_JS = r"""
     if (shownId === null || shownId === undefined) { return null; }
     var band = D.bands[SHOWN[0]].value, k = D.ks[SHOWN[1]].value, cap = D.caps[SHOWN[2]].value;
     if (!band || !(k > 0) || !(cap > 0)) { return null; }
+    // No same-title cap is sent: the server keeps the saved one, or the
+    // seed's when none is saved
     var q =[['tier_floors', offAt(SHOWN[5]) ? 'off' : 'on'], ['spread_min', band[0]],
              ['spread_max', band[1]], ['k', k], ['size_cap', cap]];
-    // Left out when the run recorded none: the server then keeps the saved
-    // same-title cap, or the seed's when none is saved
-    if (typeof D.save.same_title_size_cap === 'number') {
-      q.push(['same_title_size_cap', D.save.same_title_size_cap]);
-    }
     // Sent only by a page that simulated rebalancing: otherwise the server
-    // keeps the saved values (or the seed's), as for an unrecorded same-title
-    // cap. The Rebalance choice goes as rebalance, and beside it, always, the
+    // keeps the saved values (or the seed's when none are saved). The
+    // Rebalance choice goes as rebalance, and beside it, always, the
     // minimum price movement shown as min_price_move — its dollars, or off
     // for any and whenever Rebalance is no (a shut select can still name
     // one), so the address never asks for a minimum without rebalancing,
@@ -16360,8 +16217,8 @@ def generate_dashboard(
     fragments into a full page with an embedded Plotly CDN script tag — plus
     the page-wide filter: the sticky bar under the header lines
     (_filter_bar_html, with its "Save as live defaults…" button, whose
-    confirmation-page address, run's same-title cap and source note are
-    _save_target's), one packed chunk per distinct scenario trade list
+    confirmation-page address and source note are _save_target's), one
+    packed chunk per distinct scenario trade list
     (tier-floors-off scenarios included, when the run carries that family),
     the first of them (the run's own scenario) written into the page after
     the sections and every other as a file in a new folder beside the page
@@ -16724,9 +16581,8 @@ def generate_dashboard(
                 # say its selects follow the bar's Tier floors choice
                 explorer_tiers=explorer_grid and explorer_data.tier_select,
                 # The save button's fixed part of the defaults server's
-                # confirmation-page address (the run's same-title cap, the
-                # source note), and what the saved live defaults do, for the
-                # notes beside the button
+                # confirmation-page address (the source note), and what the
+                # saved live defaults do, for the notes beside the button
                 save=_save_target(sweep, start_date, today),
                 # Why the Rebalance select stays shut, should it: a run that
                 # carried the family but shows no view of it could not use or
@@ -16871,8 +16727,8 @@ def generate_dashboard(
         # off the filter's base block, so it follows the filter bar like the
         # trade sections do (None when the filter could not be built)
         lambda: _section_khat(filter_data, k_used),
-        # Also takes the sweep whole — it reads .scenarios, .same_title_point
-        # and .calibrations_by_band, none of which _section_interval_discount
+        # Also takes the sweep whole — it reads .scenarios and
+        # .calibrations_by_band, neither of which _section_interval_discount
         # renders, and passing pieces could let the two sections (and the
         # header's run-settings line) drift onto different bands or settings —
         # and the walk's data for every band x k x size cap (or a notice when

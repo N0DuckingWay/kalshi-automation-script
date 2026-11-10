@@ -2131,7 +2131,7 @@ class TestCategoryFilter:
     def _trade(event_ticker: str) -> BacktestTrade:
         """A BacktestTrade carrying market A's event ticker and its infer_category label."""
         return BacktestTrade(
-            pair_type="same_title", ticker_a="A", ticker_b="B", title_a="Q", title_b="Q",
+            pair_type="time_series", ticker_a="A", ticker_b="B", title_a="Q", title_b="Q",
             category=infer_category(event_ticker), entry_date=date(2026, 1, 5),
             exit_date=date(2026, 1, 12), entry_pA=0.5, entry_pB=0.4, entry_nA=0.5,
             entry_nB=0.6, n=1, total_cost=0.9, fees=0.02, outcome_a="yes", outcome_b="yes",
