@@ -221,14 +221,15 @@ class _World:
         return plans
 
 
-def _trim_settings(*, k: float = 0.8, cap: float = 1.0, st_cap: float = 0.2,
+def _trim_settings(*, k: float = 0.8, cap: float = 1.0,
                    min_move: float | None = None, on: bool = True,
                    until: int | None = None) -> config.LiveSettings:
     """The run's settings with rebalancing on (or off), so the Kelly trim with it,
-    and its k, caps, minimum price move and "Rebalance until" days (None: maturity)."""
+    and its k, per-trade cap, minimum price move and "Rebalance until" days
+    (None: maturity)."""
     return dc_replace(config.live_settings(), rebalance=on, min_price_move=min_move,
                       rebalance_min_days_to_maturity=until,
-                      interval_discount=k, size_cap=cap, same_title_size_cap=st_cap)
+                      interval_discount=k, size_cap=cap)
 
 
 # ─── The same position, in the backtest and live ──────────────────────────────
@@ -1518,12 +1519,11 @@ class _TrimCase:
         return backtester._kelly_trim([self.trade], _D, self.value(value_cents), k, cap)
 
     def live(self, monkeypatch, value_cents: int, *, k: float = 0.8, cap: float = 1.0,
-             st_cap: float = 0.2, min_move: float | None = None, until: int | None = None,
+             min_move: float | None = None, until: int | None = None,
              **kwargs) -> list:
         """seller.plan_trims' plans for the pair at the same portfolio value."""
         return self.world.trims(
-            monkeypatch, _trim_settings(k=k, cap=cap, st_cap=st_cap, min_move=min_move,
-                                        until=until),
+            monkeypatch, _trim_settings(k=k, cap=cap, min_move=min_move, until=until),
             cash_cents=value_cents - self.positions_cents,
             positions_value_cents=self.positions_cents, **kwargs)
 
@@ -1672,10 +1672,10 @@ class _LoneTrimCase:
         return backtester._kelly_trim([self.trade], _D, self.value(value_cents), k, cap)
 
     def live(self, monkeypatch, value_cents: int, *, k: float = 0.8, cap: float = 1.0,
-             st_cap: float = 0.2, min_move: float | None = None) -> list:
+             min_move: float | None = None) -> list:
         """seller.plan_trims' plans for the lone leg at the same portfolio value."""
         return self.world.trims(
-            monkeypatch, _trim_settings(k=k, cap=cap, st_cap=st_cap, min_move=min_move),
+            monkeypatch, _trim_settings(k=k, cap=cap, min_move=min_move),
             cash_cents=value_cents - self.positions_cents,
             positions_value_cents=self.positions_cents)
 
@@ -3179,13 +3179,16 @@ class TestPlanTrims:
         # worded markets are no kind a trim reads, so the pair is never
         # trimmed, and no order book is read for it
         case = _TrimCase("same_title", sides=_NO_A_YES_B, a_now=a_now, b_now=b_now)
-        # Control: the backtest's trim, which reads the pair by its type, sells
-        # this very pair at this portfolio value under a 20% cap — the cap the
-        # live settings below put on a same-title pair (their same-title cap;
-        # the backtest has no same-title cap of its own, so the control hands
-        # it 20% as its per-trade cap). The pair is one a trim would act on:
-        # live leaves it alone for its identical wording alone
-        sold = case.backtest(10_000, cap=0.20)[0].sell
+        # The backtest's trim caps a pair of any type but time-series at 0
+        # (config.pair_size_cap), which sells nothing
+        assert case.backtest(10_000, cap=0.20)[0].sell == 0
+        # Control: the same trim, reading the pair by its type but capped as a
+        # time-series pair would be, sells this very pair at this portfolio
+        # value under a 20% cap. The pair is one a trim would act on: live
+        # leaves it alone for its identical wording alone
+        with pytest.MonkeyPatch.context() as patched:
+            patched.setattr(backtester, "pair_size_cap", lambda pair_type, size_cap: size_cap)
+            sold = case.backtest(10_000, cap=0.20)[0].sell
         assert (0 < sold < case.n) if backtest_sells == "part" else sold == case.n
         with caplog.at_level(logging.INFO):
             assert case.live(monkeypatch, 10_000) == []
@@ -4648,8 +4651,8 @@ class TestIsolation:
             "count", "value", "win_prob", "cap", "top_value", "net_sale"]
         assert not decided.keywords
         (cap,) = _calls_of("_trim_one", "pair_size_cap")
-        assert [ast.unparse(arg) for arg in cap.args] == [
-            "pair_type", "settings.size_cap", "settings.same_title_size_cap"]
+        assert [ast.unparse(arg) for arg in cap.args] == ["pair_type", "settings.size_cap"]
+        assert not cap.keywords
 
 
 def test_plans_are_frozen():

@@ -1333,7 +1333,6 @@ _LIVE_FLAGS = (
     ("spread_max", "--spread-max"),
     ("interval_discount", "--interval-discount"),
     ("size_cap", "--size-cap"),
-    ("same_title_size_cap", "--same-title-size-cap"),
     ("rebalance", "--rebalance/--no-rebalance"),
     ("min_price_move", "--min-price-move"),
     ("no_min_price_move", "--no-min-price-move"),
@@ -1349,8 +1348,8 @@ _LIVE_FLAGS = (
     ("no_exclude_tag", "--no-exclude-tag"),
 )
 
-# The cap flags, which take a whole percent where LiveSettings holds a fraction
-_LIVE_PERCENT_FLAGS = frozenset({"size_cap", "same_title_size_cap"})
+# The cap flag, which takes a whole percent where LiveSettings holds a fraction
+_LIVE_PERCENT_FLAGS = frozenset({"size_cap"})
 
 
 def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
@@ -1364,14 +1363,16 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
     saved value, and the result keeps the defaults' origin.
     --exclude-category and --exclude-tag each replace the whole saved list.
     --category, --any-category, --tag and --any-tag, which the exclude flags
-    replaced, are refused with the replacement named, in that order.
+    replaced, are refused with the replacement named, in that order, and then
+    --same-title-size-cap, whose setting is gone (the bot trades time-series
+    pairs only), whatever value it is given.
     --no-sell also clears the minimum of days, and --no-rebalance the minimum
     price move and the days to maturity, since none of them is allowed without
     its switch. A saved file an older version wrote (holding add_to_held_pairs,
-    trim_to_kelly, trim_min_rise, categories or tags) is refused too, with the
-    remedy: save it again through the defaults server, whose pages offer its
-    settings in their new form when they have one. Runs before logging is set up, so a refusal
-    logs nothing and sends no request.
+    trim_to_kelly, trim_min_rise, categories, tags or same_title_size_cap) is
+    refused too, with the remedy: save it again through the defaults server,
+    whose pages offer its settings in their new form when they have one. Runs
+    before logging is set up, so a refusal logs nothing and sends no request.
 
     Args:
         args (argparse.Namespace): The parsed flags; a missing attribute reads
@@ -1403,6 +1404,15 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
                      "(repeatable), or --no-exclude-tag to exclude none")
     if getattr(args, "retired_any_tag", None):
         parser.error("--any-tag no longer exists: use --no-exclude-tag (exclude no tag)")
+    # The same-title cap went with same-title pairs. A defaults server still
+    # running older code passes this flag on every run it starts, so the
+    # refusal names the remedy as well as the reason
+    if getattr(args, "retired_same_title_size_cap", None) is not None:
+        parser.error("--same-title-size-cap no longer exists: the bot trades time-series "
+                     "pairs only, so there is no same-title cap to set. A defaults server "
+                     "still running older code sends it with every run it starts: stop that "
+                     "server (Ctrl-C in the terminal running ./start_dashboard.sh or python3 "
+                     "-m kalshi_betting.defaults_server) and start ./start_dashboard.sh again")
     try:
         # The saved live defaults: the reference, and the base the flags lay over.
         # There is no fallback: with none saved, the run does not start
@@ -1434,8 +1444,6 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
         overrides["interval_discount"] = args.interval_discount
     if getattr(args, "size_cap", None) is not None:
         overrides["size_cap"] = args.size_cap / 100
-    if getattr(args, "same_title_size_cap", None) is not None:
-        overrides["same_title_size_cap"] = args.same_title_size_cap / 100
     # --no-rebalance clears the minimum price move and the days to maturity too;
     # --min-price-move and --rebalance-min-days-to-maturity then set one each
     # (LiveSettings refuses either with rebalancing off)
@@ -2376,35 +2384,33 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Time-series spread-band CEILING on pB - pA, 0-1 "
              "(default: the saved live defaults)",
     )
-    # Help ending for --interval-discount and both cap flags: with Rebalance yes,
-    # a higher k or a lower cap also sells held pairs
-    # (the third slot is the lone-leg clause; a same-title cap never reaches a lone leg,
-    # which is only ever the later market of a time-series pair)
-    lone_leg = ", or lone leg whose partner has paid out,"
+    # Help ending for --interval-discount and --size-cap: with Rebalance yes, a
+    # higher k or a lower cap also sells held time-series pairs and lone legs
+    # (a lone leg is the later market of a time-series pair)
     trim_sells = ("With Rebalance yes (saved, or given with --rebalance), a {} "
-                  "also sells: each exact held {}pair{} worth more than its new Kelly size is "
-                  "sold down to it before anything is bought, once its wait has passed")
+                  "also sells: each exact held time-series pair, or lone leg whose partner "
+                  "has paid out, worth more than its new Kelly size is sold down to it "
+                  "before anything is bought, once its wait has passed")
     live.add_argument(
         "--interval-discount", type=float, default=None, metavar="K",
         help="Time-series interval discount k, in (0, 1] "
              "(default: the saved live defaults). "
-             + trim_sells.format("higher k", "time-series ", lone_leg),
+             + trim_sells.format("higher k"),
     )
-    # The caps' grid step in percent (SIZE_CAP_STEP); argparse %-formats help, hence "%%"
+    # The cap's grid step in percent (SIZE_CAP_STEP); argparse %-formats help, hence "%%"
     cap_step = f"{SIZE_CAP_STEP * 100:g}"
     live.add_argument(
         "--size-cap", type=int, default=None, metavar="PCT",
-        help=f"Per-trade Kelly cap for every pair, in whole percent, in {cap_step}%% "
+        help=f"Per-trade Kelly cap for each time-series pair, in whole percent, in {cap_step}%% "
              "steps; 100 = no cap (default: the saved live defaults). "
-             + trim_sells.format("lower cap", "time-series ", lone_leg),
+             + trim_sells.format("lower cap"),
     )
-    live.add_argument(
-        "--same-title-size-cap", type=int, default=None, metavar="PCT",
-        help=f"Extra per-trade cap on same-title pairs, in whole percent, in {cap_step}%% "
-             "steps; 100 = no extra cap beyond --size-cap "
-             "(default: the saved live defaults). "
-             + trim_sells.format("lower cap", "same-title ", ""),
-    )
+    # The same-title cap's flag, gone with same-title pairs: hidden, and refused
+    # with the reason and the remedy (_resolve_live_settings). It takes any
+    # value, a missing one included, so that refusal is what prints, never a
+    # type error
+    parser.add_argument("--same-title-size-cap", nargs="?", const="", default=None,
+                        dest="retired_same_title_size_cap", help=argparse.SUPPRESS)
     live.add_argument(
         "--rebalance", action=argparse.BooleanOptionalAction, default=None,
         help="Rebalance the held pairs this run: before buying, sell part of each "

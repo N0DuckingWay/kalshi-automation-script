@@ -30,7 +30,7 @@ Notes:
     cash_need_cents is never below what shard funding asks for, so the cash set aside covers it in total.
     backtester and dashboard copy the Kelly formula, and backtester the ticker and ladder rules.
     Change every copy together.
-    k (the time-series model's discount) and the size caps come from the LiveSettings
+    k (the time-series model's discount) and the per-trade cap come from the LiveSettings
     each call is handed, or config.py's when none is.
     An add-on is a candidate that buys more of a pair the account already holds
     (CandidatePair.held, read through scanner.pair_held). Kelly sizes the whole
@@ -272,7 +272,7 @@ def _evaluate_size(
         levels (tuple): The pair's book levels; () means use the stored prices.
         n (int): Contract pairs to price; ignored when levels is empty.
         portfolio_value_cents (int): The value the Kelly share is taken of, in cents.
-        settings (LiveSettings): The run's settings (k and the size caps).
+        settings (LiveSettings): The run's settings (k and the per-trade cap).
         cash_cents (int | None): Keyword-only. The cash on hand in cents; None means it is all cash.
         refusal_out (dict | None): Keyword-only. When given, its "holds_kelly_share" key is
             set True if an add-on's held pair already holds its Kelly share at this price
@@ -337,9 +337,9 @@ def _evaluate_size(
         return None
 
     # The one cap definition, shared with the backtester and enrichment's bound
-    kelly_fraction_capped = min(
-        pair_size_cap(pair.pair_type, settings.size_cap, settings.same_title_size_cap),
-        kelly_fraction)
+    # (0 for a pair that is not time-series, which then has no budget)
+    kelly_fraction_capped = min(pair_size_cap(pair.pair_type, settings.size_cap),
+                                kelly_fraction)
     held = pair_held(pair)
     if held is not None:
         # An add-on: Kelly sizes the whole position, so this trade takes only
@@ -437,7 +437,7 @@ def _holds_kelly_share(
         pair (CandidatePair): The pair compute_trade could not size.
         levels (tuple): The pair's book levels; () means use the stored prices.
         portfolio_value_cents (int): The value the Kelly share is taken of, in cents.
-        settings (LiveSettings): The run's settings (k and the size caps).
+        settings (LiveSettings): The run's settings (k and the per-trade cap).
         cash_cents (int | None): Keyword-only. The cash on hand in cents, as compute_trade
             got it; None means it is all cash.
 

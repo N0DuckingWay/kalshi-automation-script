@@ -1193,8 +1193,8 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
         reads (_Reads): This planner call's reads.
         fills (FillTimes | None): When each market last traded; None only with no
             wait in days and no minimum price move.
-        settings (LiveSettings): The run's settings: k, both size caps and the
-            minimum price move.
+        settings (LiveSettings): The run's settings: k, the per-trade cap and
+            the minimum price move.
         min_days (int): Days a position must go without a trade (_rebalance_min_days).
         now_date (date): Today on the bot's own clock (_day).
         utc_date (date): Today in UTC, for the days left before maturity.
@@ -1427,7 +1427,7 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
         return total
 
     # Cross-module: the pair's size cap, as a new trade of its kind is capped
-    cap = pair_size_cap(pair_type, settings.size_cap, settings.same_title_size_cap)
+    cap = pair_size_cap(pair_type, settings.size_cap)
     # Cross-module: the backtest's trim rule
     decision = kelly_trim_count(count, value, win_prob, cap, top_value, net_sale)
     # Cross-module: the share Kelly lets the pair keep at its best bids, for the log line
@@ -1520,7 +1520,7 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
         held_labels (dict): Ticker -> ladder labels (scanner.resolve_held_ladders' labels_out).
         markets_by_ticker (dict): This run's whole market list by ticker, held markets included.
         settings (LiveSettings): rebalance (off: trim and read nothing), min_price_move,
-            rebalance_min_days_to_maturity, k and both size caps.
+            rebalance_min_days_to_maturity, k and the per-trade cap.
         now (datetime): The run's moment, timezone-aware.
         cash_cents (float): The account's cash on every shard, in cents.
         positions_value_cents (float | None): Kalshi's value of the open positions, in

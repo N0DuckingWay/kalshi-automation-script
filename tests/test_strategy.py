@@ -25,6 +25,7 @@ from kalshi_betting import (
     historical,
     main,
     scanner,
+    seller,
     strategy,
     trader,
 )
@@ -562,16 +563,16 @@ class TestComputeTradeTimeSeries:
         assert narrower.total_cost / narrower.x == pytest.approx(_TS_PA + _TS_NB)
 
 
-def _live(k: float = 0.75, cap: float = 0.20, st_cap: float = 1.0) -> LiveSettings:
-    """A LiveSettings at the given k and caps, tier floors on and no band."""
+def _live(k: float = 0.75, cap: float = 0.20) -> LiveSettings:
+    """A LiveSettings at the given k and per-trade cap, tier floors on and no band."""
     return LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=k,
-                        size_cap=cap, same_title_size_cap=st_cap)
+                        size_cap=cap)
 
 
 @pytest.mark.usefixtures("pre_toggle_defaults")
 class TestComputeTradeSettings:
-    """compute_trade reads k and both caps from ONE LiveSettings, hands it to
-    every internal helper, and resolves config.py's only when handed none.
+    """compute_trade reads k and the per-trade cap from ONE LiveSettings, hands
+    it to every internal helper, and resolves config.py's only when handed none.
     "The default" is pre_toggle_defaults' (k 0.75, a 20% cap)."""
 
     _ST = {"nA": 0.20, "pB": 0.30, "pair_type": "same_title"}
@@ -585,7 +586,6 @@ class TestComputeTradeSettings:
         return SAME_TITLE_CO_RESOLVE_PROB - (1 - SAME_TITLE_CO_RESOLVE_PROB) * (0.50 + fee) / net
 
     def test_the_reference_pairs(self):
-        assert self._st_f() == pytest.approx(0.8945, abs=1e-4)
         assert _ts_kelly_fraction(0.30, 0.85, 0.15) == pytest.approx(0.2163, abs=1e-4)
 
     def test_an_explicit_cap_binds_where_the_default_would(self):
@@ -635,26 +635,26 @@ class TestComputeTradeSettings:
         # _kelly_p reads the same k
         assert strategy._kelly_p(pair, _live(k=0.6)) == pytest.approx(at_06.kelly_p)
 
-    def test_the_same_title_cap_binds_same_title_only(self):
+    def test_a_pair_that_is_not_time_series_sizes_nothing(self):
+        # pair_size_cap caps any other type at 0, so even the same-title
+        # reference pair, whose f* on the co-resolution prior is about 0.89,
+        # has no budget and is refused, at every per-trade cap
+        assert self._st_f() == pytest.approx(0.8945, abs=1e-4)
         st, ts = make_pair(**self._ST), make_pair(**self._TS_WIDE)
-        s = _live(cap=1.0, st_cap=0.20)
-        assert compute_trade(st, 1_000_000, settings=s).kelly_fraction == pytest.approx(0.20)
-        # With no same-title cap the pair sizes at its full f*
-        uncapped = compute_trade(st, 1_000_000, settings=_live(cap=1.0))
-        assert uncapped.kelly_fraction == pytest.approx(self._st_f())
-        # The same-title cap never reaches a time-series pair
-        assert compute_trade(ts, 1_000_000, settings=s).kelly_fraction == pytest.approx(
-            _ts_kelly_fraction(0.30, 0.85, 0.15))
-        # The tighter of the two caps binds a same-title pair
-        tight = compute_trade(st, 1_000_000, settings=_live(cap=0.10, st_cap=0.20))
-        assert tight.kelly_fraction == pytest.approx(0.10)
+        for cap in (0.05, 0.10, 0.20, 0.35, 1.0):
+            s = _live(cap=cap)
+            assert compute_trade(st, 1_000_000, settings=s) is None, cap
+            # ... while the time-series pair sizes at min(cap, f*)
+            assert compute_trade(ts, 1_000_000, settings=s).kelly_fraction == pytest.approx(
+                min(cap, _ts_kelly_fraction(0.30, 0.85, 0.15))), cap
         # ... on the booked path too
         booked = make_booked_pair([(0.20, 0.30, 1_000_000.0)], pair_type="same_title")
-        assert compute_trade(booked, 1_000_000, settings=s).kelly_fraction == \
-            pytest.approx(0.20)
+        assert compute_trade(booked, 1_000_000, settings=_live(cap=1.0)) is None
+        # ... and with no settings handed, from config.py's
+        assert compute_trade(st, 1_000_000) is None
 
     def test_none_is_config_pys_settings_read_at_call_time(self, monkeypatch):
-        for kwargs in (self._ST, self._TS_WIDE, self._TS):
+        for kwargs in (self._TS_WIDE, self._TS):
             pair = make_pair(**kwargs)
             implicit = compute_trade(pair, 1_000_000)
             explicit = compute_trade(pair, 1_000_000, settings=live_settings())
@@ -662,17 +662,12 @@ class TestComputeTradeSettings:
                     implicit.total_cost_with_fees) == (
                 explicit.x, explicit.kelly_fraction, explicit.kelly_p,
                 explicit.total_cost_with_fees)
-        # Resolved at CALL time, from config.py's constants
+        # Resolved at CALL time, from config.py's constants: at k 0.5 the wide
+        # pair's f* (0.478) is over a 0.35 cap, which then binds it
         monkeypatch.setattr(config, "BUDGET_FRACTION", 0.35)
-        assert compute_trade(make_pair(**self._ST), 1_000_000).kelly_fraction == \
-            pytest.approx(0.35)
-        # A time-series pair reads it too: at k 0.5 its f* (0.478) is over 0.35
         monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.5)
         assert compute_trade(make_pair(**self._TS_WIDE), 1_000_000).kelly_fraction == \
             pytest.approx(0.35)
-        monkeypatch.setattr(config, "SAME_TITLE_SIZE_CAP", 0.10)
-        assert compute_trade(make_pair(**self._ST), 1_000_000).kelly_fraction == \
-            pytest.approx(0.10)
         monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.6)
         assert compute_trade(make_pair(**self._TS), 1_000_000).kelly_p == pytest.approx(0.82)
 
@@ -786,7 +781,7 @@ def _random_ts_case(rng: random.Random, *, crossed: str | None = None) -> tuple:
     settings = LiveSettings(
         tier_floors=rng.random() < 0.3, spread_band=rng.choice(((0.0, 1.0), (0.0, 0.5))),
         interval_discount=rng.choice((0.3, 0.5, 0.6, 0.7, 0.75, 0.8, 0.9, 0.95)),
-        size_cap=rng.choice((0.05, 0.1, 0.2, 0.5, 1.0)), same_title_size_cap=1.0)
+        size_cap=rng.choice((0.05, 0.1, 0.2, 0.5, 1.0)))
     value = rng.choice((20_000, 1_000_000, 100_000_000))
     cash = rng.choice((None, value, value // 3, 500))
     return pair, ob_a, ob_b, settings, value, cash
@@ -920,14 +915,6 @@ class TestForecastReadsTheMidSpread:
         [line] = [r.getMessage() for r in caplog.records
                   if r.getMessage().startswith("Trade computed")]
         assert f"| p={spec.kelly_p:.2f} (mid spread 0.350) kelly=" in line
-        # A same-title line has none
-        caplog.clear()
-        with caplog.at_level(logging.INFO):
-            assert compute_trade(make_pair(nA=0.20, pB=0.30, pair_type="same_title"),
-                                 1_000_000, settings=_live()) is not None
-        [line] = [r.getMessage() for r in caplog.records
-                  if r.getMessage().startswith("Trade computed")]
-        assert "| p=0.95 kelly=" in line and "mid spread" not in line
 
     def test_no_kelly_share_reaches_one_minus_k_on_uncrossed_books(self):
         # 10,000 random two-sided books, neither crossed, through enrichment
@@ -2223,21 +2210,6 @@ class TestMarginalFillPricing:
         assert spec is not None
         assert spec.pair is bare
 
-    def test_same_title_solves_on_its_own_leg_prices(self):
-        # Same-title legs are (nA, pB), so the solved prices must land there —
-        # writeback goes through leg_sides, never a hardcoded field name.
-        levels = [(0.44, 0.31, 30.0), (0.47, 0.34, 500.0)]
-        pair = make_booked_pair(levels, pair_type="same_title")
-        spec = compute_trade(pair, 100_000)
-        assert spec is not None
-        assert leg_prices(spec.pair) == pytest.approx(
-            prefix_fill_prices(pair.depth_levels, spec.x)
-        )
-        assert (spec.pair.nA, spec.pair.pB) == pytest.approx(leg_prices(spec.pair))
-        # pA/nB are reporting-only for this pair type and must be left alone
-        assert spec.pair.pA == pair.pA
-        assert spec.pair.nB == pair.nB
-
     def test_descent_terminates_on_a_steeply_worsening_book(self):
         # Every rung materially worse than the last, so the descent has to walk
         # rather than settle on its first guess. It must still return.
@@ -3133,7 +3105,6 @@ class TestTimeSeriesKellyParity:
             "TIME_SERIES_SPREAD_BAND",
             "TIME_SERIES_INTERVAL_PROB_DISCOUNT",
             "BUDGET_FRACTION",
-            "SAME_TITLE_SIZE_CAP",
             "TRADE_EXCLUDE_CATEGORIES",
             "TRADE_EXCLUDE_TAGS",
             "REBALANCE",
@@ -3142,6 +3113,12 @@ class TestTimeSeriesKellyParity:
             "SELL_AT",
             "SELL_MIN_DAYS",
         } | self._SAVED_FILE_INTERNALS
+        # Every toggle constant config.live_settings() builds the toggles from is
+        # forbidden, one per toggle, so a toggle added there cannot slip past
+        toggle_constants = {node.id for node in ast.walk(ast.parse(inspect.getsource(
+            config.live_settings))) if isinstance(node, ast.Name) and node.id.isupper()}
+        assert len(toggle_constants) == len(config.LIVE_TOGGLE_FIELDS), toggle_constants
+        assert toggle_constants <= forbidden, toggle_constants - forbidden
         resolver = "live_settings"
         # (module, exempted name) -> references found, so no exemption outlives its use
         exempt_uses = {(mod, name): 0 for mod, names in self._SAVED_FILE_EXEMPT.items()
@@ -3870,10 +3847,60 @@ class TestTimeSeriesKellyParity:
 
     def test_ast_every_sizer_caps_through_pair_size_cap(self):
         # config.pair_size_cap is the ONE definition of a pair's per-trade cap,
-        # so the live sizer, enrichment's bound and the backtester agree
+        # so the live sizer, enrichment's bound, the live trim, the change
+        # warning and the backtester (its sizing and its trim) agree
         assert _function_calls(strategy, "_evaluate_size", "pair_size_cap")
         assert _function_calls(config, "max_kelly_fraction", "pair_size_cap")
         assert _function_calls(backtester, "_simulate_at_discount", "pair_size_cap")
+        # ... each handing it the pair's type and the per-trade cap alone
+        # (the backtest's cap is its simulation's own)
+        for module, func, args in (
+                (strategy, "_evaluate_size", ["pair.pair_type", "settings.size_cap"]),
+                (config, "max_kelly_fraction", ["pair_type", "settings.size_cap"]),
+                (seller, "_trim_one", ["pair_type", "settings.size_cap"]),
+                (backtester, "_simulate_at_discount", ["pair_type", "cap"]),
+                (backtester, "_kelly_trim", ["first.pair_type", "cap"])):
+            calls = _call_nodes(module, func, "pair_size_cap")
+            assert len(calls) == 1, (module.__name__, func)
+            assert [ast.unparse(a) for a in calls[0].args] == args, (module.__name__, func)
+            assert not calls[0].keywords, (module.__name__, func)
+        # The warning a change of settings gets compares the cap a held
+        # time-series pair is trimmed to, before and after
+        calls = _call_nodes(config, "rebalance_change_warnings", "pair_size_cap")
+        assert sorted(ast.unparse(c) for c in calls) == [
+            "pair_size_cap('time_series', current.size_cap)",
+            "pair_size_cap('time_series', proposed.size_cap)"]
+        # Every module calls config's own definition, bound by name
+        for module in (strategy, seller, backtester):
+            assert module.pair_size_cap is config.pair_size_cap, module.__name__
+
+    @pytest.mark.parametrize("k", [0.6, 0.75, 0.8, 0.95])
+    def test_every_path_caps_a_time_series_pair_at_the_per_trade_cap(self, k):
+        # At every cell of the size-cap grid: the one definition gives a
+        # time-series pair the per-trade cap itself and any other type 0, the
+        # affordability bound is that cap under 1 - k, and the live sizer
+        # stakes min(cap, Kelly's own share) (the backtest and the live trim
+        # call the same definition with the same two arguments, pinned above)
+        grid = [round(config.SIZE_CAP_STEP * steps, 2)
+                for steps in range(1, round(1 / config.SIZE_CAP_STEP) + 1)]
+        assert len(grid) == 20 and grid[-1] == 1.0
+        pair = make_pair(pA=0.30, pB=0.85, nA=0.70, nB=0.15, pair_type="time_series")
+        uncapped = compute_trade(pair, 1_000_000, settings=_live(k=k, cap=1.0))
+        for cap in grid:
+            settings = _live(k=k, cap=cap)
+            assert config.pair_size_cap("time_series", settings.size_cap) == cap
+            for other in ("same_title", "unknown", ""):
+                assert config.pair_size_cap(other, settings.size_cap) == 0.0, (other, cap)
+                assert config.max_kelly_fraction(other, settings) == 0.0, (other, cap)
+            assert config.max_kelly_fraction("time_series", settings) == min(
+                cap, round(1.0 - k, 12))
+            spec = compute_trade(pair, 1_000_000, settings=settings)
+            if uncapped is None:
+                # No positive Kelly share at this k, whatever the cap
+                assert spec is None, (k, cap)
+                continue
+            assert spec.kelly_fraction == pytest.approx(min(cap, uncapped.kelly_fraction)), (
+                k, cap)
 
     def test_ast_add_ons_size_through_held_pair_fraction(self):
         # config.held_pair_fraction is the ONE definition of an add-on's size,
@@ -4920,10 +4947,7 @@ class TestTimeSeriesKellyParity:
 
     def test_ast_each_simulation_hands_the_live_code_its_own_settings(self):
         # One LiveSettings per simulation, built from its own k, cap, band
-        # and tier setting, and handed to the live code as `settings`. The
-        # backtest simulates time-series pairs only, so it hands no
-        # same-title cap: the field keeps its default, which no time-series
-        # pair reads
+        # and tier setting, and handed to the live code as `settings`
         func = _def_named(inspect.getsource(backtester), "_simulate_at_discount")
         [built] = _calls_to(func, "LiveSettings")
         assert {k.arg: ast.unparse(k.value) for k in built.keywords} == {
@@ -5455,31 +5479,6 @@ class TestKellyRiskIncludesFees:
         old_n = _fee_shrunk_n(fee_less_f, _TS_PA, _TS_NB, 10_000.0)
         assert 0 < spec.x <= old_n
 
-    def test_same_title_verdict_is_unchanged_on_the_reference_pair(self):
-        # q is the fixed 1 - SAME_TITLE_CO_RESOLVE_PROB = 0.05, so q*fee is
-        # small: the fraction barely moves and the accept/reject verdict is
-        # identical on both a profitable and an unprofitable same-title pair.
-        # NOT a universal — the name scopes it to this fixture on purpose.
-        # Measured over the same-title admissible region on a whole-cent grid,
-        # 12 of 4,465 price points DO flip (0.27%), always accept -> reject
-        # (e.g. nA 0.28 / pB 0.64: +0.0256 fee-less, -0.0048 fee-inclusive);
-        # test_a_flipping_same_title_pair_is_now_rejected pins one of them.
-        nA, pB = 0.20, 0.30
-        fee = fee_per_pair_approx(nA, pB)
-        net_spread = (1.0 - nA - pB) - fee
-        q = 1.0 - SAME_TITLE_CO_RESOLVE_PROB
-        fee_less = SAME_TITLE_CO_RESOLVE_PROB - q / (net_spread / (nA + pB))
-        fee_incl = SAME_TITLE_CO_RESOLVE_PROB - q / (net_spread / (nA + pB + fee))
-        assert (fee_less > 0) == (fee_incl > 0)
-        assert fee_incl == pytest.approx(fee_less, abs=0.01)
-        spec = compute_trade(make_pair(nA=nA, pB=pB, pair_type="same_title"), 1_000_000)
-        assert spec is not None
-        # Both readings are far above the cap, so the sizing is byte-identical
-        assert spec.kelly_fraction == pytest.approx(config.BUDGET_FRACTION)
-        # ...and a same-title pair with no spread is still rejected either way
-        assert compute_trade(make_pair(nA=0.60, pB=0.50, pair_type="same_title"),
-                             1_000_000) is None
-
     def test_a_flipping_same_title_pair_is_now_rejected(self):
         # "Effectively immune" is not "immune": a thin minority of same-title
         # price points inside the admissible region (pA - pB >= 0.05, legs
@@ -5498,14 +5497,13 @@ class TestKellyRiskIncludesFees:
     @pytest.mark.parametrize("kwargs", [
         {"pA": _TS_PA, "pB": _TS_PB, "nA": _TS_NA, "nB": _TS_NB,
          "pair_type": "time_series"},
-        {"nA": 0.20, "pB": 0.30, "pair_type": "same_title"},
     ])
     def test_accepted_specs_have_positive_ev_on_their_own_fields(self, kwargs):
-        # A spot-check on THESE fixtures, not a property of the gate. The gate
+        # A spot-check on THIS fixture, not a property of the gate. The gate
         # prices with fee_per_pair_approx, which UNDERESTIMATES the
         # ceiling-rounded fee_leg_exact that min_payoff and total_cost_with_fees
         # are built from — so the identity only holds at sizes where the two
-        # converge. Both fixtures size in the thousands, where the rounding is
+        # converge. The fixture sizes in the thousands, where the rounding is
         # negligible; test_small_n_can_still_be_ev_negative_on_exact_fees below
         # pins the residual at the other end so it is documented rather than
         # rediscovered.
@@ -6101,7 +6099,7 @@ class TestSelectPortfolioShrinksToCash:
         # One pair costs $0.98 and each leg's fee rounds up to a cent, so a
         # win pays exactly nothing — which float evaluates a hair above zero
         pair = make_booked_pair([(0.01, 0.97, 5_000)], pB=0.03)
-        spec = compute_trade(pair, 1_000_000, settings=_live(k=0.80, cap=0.10, st_cap=0.20))
+        spec = compute_trade(pair, 1_000_000, settings=_live(k=0.80, cap=0.10))
         assert spec.x == 748 and spec.interval_discount == 0.80
         assert 1 * (1.0 - 0.01 - 0.97) - 0.01 - 0.01 > 0
         assert strategy._spec_at_count(spec, 1) is None
@@ -6150,7 +6148,7 @@ class TestSelectPortfolioShrinksToCash:
         now = datetime.now(UTC)
         grids = {"cent": ("", None, 0.01),
                  "deci": ("deci_cent", [PriceRange(0.0, 1.0, 0.001)], 0.001)}
-        shrunk = checked = ts_checked = 0
+        shrunk = checked = ts_checked = refused = 0
         for trial in range(150):
             specs = []
             for i in range(rng.randrange(1, 7)):
@@ -6188,7 +6186,12 @@ class TestSelectPortfolioShrinksToCash:
                     **prices)
                 spec = compute_trade(pair, rng.choice([20_000, 200_000, 5_000_000]),
                                      settings=_live(k=0.6, cap=rng.choice([0.2, 1.0])))
-                if spec is not None:
+                if pair_type != "time_series":
+                    # Capped at 0 (pair_size_cap): the sizer refuses it, so no
+                    # portfolio holds one
+                    assert spec is None
+                    refused += 1
+                elif spec is not None:
                     specs.append(spec)
             cash = rng.choice([300, 2_000, 10_000, 60_000, 1_000_000])
             selected = select_portfolio(specs, cash)
@@ -6200,11 +6203,11 @@ class TestSelectPortfolioShrinksToCash:
             for s in selected:
                 # Per spec too, whichever shards its legs sit on
                 assert s.cash_need_cents >= sum(trader._required_cents_by_shard([s]).values())
-        # Non-vacuous: portfolios of both pair types were selected (a
-        # time-series pair's NO leg sits on market B, a same-title pair's on
-        # market A), and some specs were shrunk
-        assert (checked > 50 and shrunk > 5 and ts_checked > 50
-                and checked - ts_checked > 50), (checked, shrunk, ts_checked)
+        # Non-vacuous: time-series portfolios were selected (a time-series
+        # pair's NO leg sits on market B) and some specs were shrunk; every
+        # pair of another type drawn was refused before any portfolio
+        assert (checked > 50 and shrunk > 5 and ts_checked == checked
+                and refused > 50), (checked, shrunk, ts_checked, refused)
 
 
 class TestKellyOperandsShareOneSnapshot:
@@ -6561,8 +6564,7 @@ class TestComputeTradeChargesEachLegItsMultiplier:
         return pair
 
     @pytest.mark.parametrize("pair_type, mult_a, mult_b", [
-        ("time_series", None, 0.5), ("time_series", 0.5, None),
-        ("same_title", 0.5, None), ("same_title", None, 0.5)])
+        ("time_series", None, 0.5), ("time_series", 0.5, None)])
     def test_a_confirmed_half_halves_only_its_own_legs_fee(self, monkeypatch, caplog,
                                                           pair_type, mult_a, mult_b):
         monkeypatch.setattr(config, "CONFIRMED_FEE_MULTIPLIERS", frozenset({1.0, 0.5}))
@@ -6585,7 +6587,7 @@ class TestComputeTradeChargesEachLegItsMultiplier:
         assert (fee_a, fee_b)[halved] < fee_leg_exact(n, price, multiplier=1.0)
         assert f"| fee multipliers {want[0]:g}/{want[1]:g}" in caplog.text
 
-    @pytest.mark.parametrize("pair_type", ["time_series", "same_title"])
+    @pytest.mark.parametrize("pair_type", ["time_series"])
     def test_an_unconfirmed_half_is_charged_in_full(self, caplog, pair_type):
         full = compute_trade(self._pair(pair_type), 1_000_000, settings=_live())
         with caplog.at_level(logging.INFO):

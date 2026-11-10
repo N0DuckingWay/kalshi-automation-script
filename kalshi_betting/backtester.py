@@ -5910,12 +5910,10 @@ def _kelly_trim(position: list[BacktestTrade], day: date, portfolio_value: float
         return valued[1]
 
     # config.kelly_trim_count: the rule, capped as a new trade of this pair
-    # type is (config.pair_size_cap). The backtest has no same-title cap: the
-    # simulation's own cap goes in as the third argument too, which
-    # pair_size_cap never reads for a time-series pair, the only kind the
-    # backtest simulates
+    # type is (config.pair_size_cap, the one cap definition, which live trims
+    # read too)
     decision = kelly_trim_count(sum(trade.n for trade in position), portfolio_value,
-                                win_prob, pair_size_cap(first.pair_type, cap, cap),
+                                win_prob, pair_size_cap(first.pair_type, cap),
                                 top_value, net_sale)
     if not decision.sell:
         return decision, None
@@ -11973,8 +11971,6 @@ def _simulate_at_discount(
     # and tier setting the entries were found under, and whether it
     # rebalances held pairs (adds to them or trims them, as a live run with
     # rebalance on does both); validated here, before any entry is scored.
-    # The backtest has no same-title cap: LiveSettings' same_title_size_cap
-    # keeps its default, which no time-series pair reads
     settings = LiveSettings(
         tier_floors=tier_floors is not False, spread_band=(band_lo, band_hi),
         interval_discount=effective_k, size_cap=cap,
@@ -12117,11 +12113,8 @@ def _simulate_at_discount(
             continue
         # Any passing Monday may be the one traded
         peak_kelly = max(peak_kelly, *(kelly_f for _m, kelly_f, _ratio in passing))
-        # config.pair_size_cap: the one definition live sizing caps through.
-        # The backtest has no same-title cap: the simulation's own cap goes in
-        # as the third argument too, which pair_size_cap never reads for a
-        # time-series pair, the only kind simulated here
-        size_cap_for_pair = pair_size_cap(pair_type, cap, cap)
+        # config.pair_size_cap: the one definition live sizing caps through
+        size_cap_for_pair = pair_size_cap(pair_type, cap)
 
         # Checked once per pair: a time-series pair's markets are the same on
         # every Monday

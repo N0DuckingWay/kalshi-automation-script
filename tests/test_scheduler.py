@@ -805,11 +805,29 @@ class TestCheckLiveDefaults:
         assert error.startswith("The saved live defaults are out of date (")
         assert str(config.LIVE_DEFAULTS_FILE) in error
         assert "its pages offer them as rebalance yes, min price movement 10c" in error
+        # That version saved a same-title cap too, which nothing replaced
+        assert ("same_title_size_cap, which is no longer used (the bot trades time-series "
+                "pairs only)") in error
         assert error.endswith(
             "every scheduled run will exit 2 until they are saved again through the "
             f"defaults server (./start_dashboard.sh, run in {scheduler.PROJECT_ROOT}); do "
             "not delete the file")
         assert "fixed, or deleted" not in error
+
+    def test_a_file_holding_only_the_same_title_cap_logs_how_to_save_it_again(self, caplog):
+        # A file the version before this one saved, whose one retired setting
+        # is the same-title cap: every scheduled run will exit 2 until it is
+        # saved again, and the ERROR says so at start
+        from .test_config import _SAME_TITLE_CAP_ERA_BYTES, _SAME_TITLE_CAP_ERA_MESSAGE
+        config.LIVE_DEFAULTS_FILE.write_bytes(_SAME_TITLE_CAP_ERA_BYTES)
+        with caplog.at_level(logging.INFO):
+            scheduler._check_live_defaults()
+        (error,) = self._errors(caplog)
+        assert error == (
+            f"The saved live defaults are out of date ({config.LIVE_DEFAULTS_FILE}: "
+            f"{_SAME_TITLE_CAP_ERA_MESSAGE}): every scheduled run will exit 2 until they are "
+            "saved again through the defaults server (./start_dashboard.sh, run in "
+            f"{scheduler.PROJECT_ROOT}); do not delete the file")
 
     @pytest.mark.usefixtures("saved_live_defaults")
     def test_a_usable_file_logs_nothing(self, caplog):

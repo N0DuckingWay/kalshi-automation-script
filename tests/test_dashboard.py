@@ -8246,11 +8246,11 @@ class TestSaveLiveDefaultsButton:
         query must carry the source note, the categories excluded on screen
         (one exclude_category each, in the menu's order), the tags ticked
         (one exclude_tag each, "Category · Tag", in the menu's order), and
-        no other field: no same-title cap among them, so the defaults server
-        keeps the saved one. The rebalancing and selling fields may also be present (pages
-        with those views send them); the caller checks their values. The
-        "Rebalance until" days go only beside the Rebalance fields, and as 0
-        (no limit) whenever Rebalance is off.
+        no other field: no same-title cap among them, since the defaults
+        server refuses a link that names one. The rebalancing and selling
+        fields may also be present (pages with those views send them); the
+        caller checks their values. The "Rebalance until" days go only beside
+        the Rebalance fields, and as 0 (no limit) whenever Rebalance is off.
 
         Args:
             data (dict): The page's base block.
@@ -8266,7 +8266,7 @@ class TestSaveLiveDefaultsButton:
 
         Raises:
             AssertionError: If a field differs, the exclusions differ, a
-                retired field (category, tag) or a same-title cap is sent, or
+                retired field (category, tag, same_title_size_cap) is sent, or
                 an unknown field is sent.
         """
         expected = self._expected(data, bi, ki, ci, tier)
@@ -8309,7 +8309,8 @@ class TestSaveLiveDefaultsButton:
         assert [b["value"] for b in data["bands"]] == [[0.0, 1.0], [0.3, 0.6], [0.3, 1.0]]
         save = data["save"]
         assert save["url"] == _SAVE_URL
-        # The page sends no same-title cap: the defaults server keeps the saved one
+        # The page sends no same-title cap: the defaults server refuses a link
+        # that names one
         assert "same_title_size_cap" not in save
         assert "same_title_size_cap" not in dashboard._FILTER_JS
         assert re.fullmatch(config.LIVE_DEFAULTS_SOURCE_PATTERN, save["source"], re.ASCII)
@@ -8944,8 +8945,8 @@ class TestSaveLiveDefaultsButton:
         # The clicked address, handed to the server's own application as a
         # browser would send it: it answers with the confirmation page, and its
         # parser reads exactly the scenario on screen — tier floors off, k
-        # 0.60, a 20% cap, no category or tag (any) — with the saved same-title
-        # cap, or the seed's with none saved, since the page sends none
+        # 0.60, a 20% cap, no category or tag (any). It names no same-title
+        # cap, which the server would refuse
         page = self._kc(monkeypatch, tmp_path, _kc_sweep_tiers())
         data = TestFilterPage._data(page)
         snaps = _run_script(tmp_path, page, [
@@ -8959,22 +8960,19 @@ class TestSaveLiveDefaultsButton:
         assert (current is not None) is saved
         app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
         pb, pk, pc = data["primary"]
-        # The page names no Rebalance choice and no same-title cap, so the
-        # server keeps the saved ones and the minimum, or the seed's with none
-        # saved
+        # The page names no Rebalance choice, so the server keeps the saved one
+        # and its minimum, or the seed's with none saved
         kept = current if current is not None else config.LIVE_DEFAULTS_SEED
         rebalance = {"rebalance": kept.rebalance, "min_price_move": kept.min_price_move}
         cases = (
             ("primary", config.LiveSettings(
                 tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][pk]["value"],
-                size_cap=data["caps"][pc]["value"],
-                same_title_size_cap=kept.same_title_size_cap, **rebalance)),
+                size_cap=data["caps"][pc]["value"], **rebalance)),
             ("chosen", config.LiveSettings(
                 tier_floors=False, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][0]["value"],
-                size_cap=data["caps"][pc]["value"],
-                same_title_size_cap=kept.same_title_size_cap, **rebalance)),
+                size_cap=data["caps"][pc]["value"], **rebalance)),
         )
         for name, expected in cases:
             [opened] = snaps[name]["opened"]
@@ -9076,13 +9074,11 @@ class TestSaveLiveDefaultsButton:
                                                            _SAVE_HOST))
             assert response.status == 200, response.body
             settings, source = defaults_server._proposal(defaults_server._params(raw), current)
-            # The page has no Sell view and sends no same-title cap, so the
-            # server keeps the saved selling and the saved same-title cap
+            # The page has no Sell view, so the server keeps the saved selling
             expected = config.LiveSettings(
                 tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][pk]["value"],
                 size_cap=data["caps"][pc]["value"],
-                same_title_size_cap=current.same_title_size_cap,
                 rebalance=yes, min_price_move=move, rebalance_min_days_to_maturity=days,
                 sell_at=current.sell_at, sell_min_days=current.sell_min_days)
             assert settings == expected, name
@@ -9124,9 +9120,8 @@ class TestSaveLiveDefaultsButton:
         assert (current is not None) is (saved != "nothing")
         app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
         pb, pk, pc = data["primary"]
-        # The page names no Rebalance choice and no same-title cap, so the
-        # server keeps the saved ones and the minimum, or the seed's with none
-        # saved
+        # The page names no Rebalance choice, so the server keeps the saved one
+        # and its minimum, or the seed's with none saved
         kept = current if current is not None else config.LIVE_DEFAULTS_SEED
         rebalance = {"rebalance": kept.rebalance, "min_price_move": kept.min_price_move}
         levels, days = data["sell_levels"], data["sell_days"]
@@ -9150,7 +9145,6 @@ class TestSaveLiveDefaultsButton:
                 tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][pk]["value"],
                 size_cap=data["caps"][pc]["value"],
-                same_title_size_cap=kept.same_title_size_cap,
                 **rebalance, sell_at=level, sell_min_days=minimum)
             assert settings == expected, name
             for field in config.LIVE_TOGGLE_FIELDS:
@@ -14737,11 +14731,10 @@ class TestRebalanceScript:
                                                            _SAVE_HOST))
             assert response.status == 200, response.body
             settings, source = defaults_server._proposal(defaults_server._params(raw), current)
-            # No same-title cap is sent: the server keeps the saved one
             expected = config.LiveSettings(
                 tier_floors=True, spread_band=tuple(data["bands"][0]["value"]),
                 interval_discount=data["ks"][1]["value"], size_cap=data["caps"][ci]["value"],
-                same_title_size_cap=current.same_title_size_cap, rebalance=yes,
+                rebalance=yes,
                 sell_at=None if sell_view else 0.9, sell_min_days=None if sell_view else 5)
             assert settings == expected, name
             for field in config.LIVE_TOGGLE_FIELDS:
@@ -14770,21 +14763,15 @@ class TestRebalanceScript:
         current = config.read_saved_live_defaults()
         app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
         pb, pk, pc = data["primary"]
-        # No same-title cap is sent: the server keeps the saved one, or the
-        # seed's with none saved
-        same_title = (current if current is not None
-                      else config.LIVE_DEFAULTS_SEED).same_title_size_cap
         cases = (
             ("primary", config.LiveSettings(
                 tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][pk]["value"],
-                size_cap=data["caps"][pc]["value"], same_title_size_cap=same_title,
-                rebalance=False)),
+                size_cap=data["caps"][pc]["value"], rebalance=False)),
             ("chosen", config.LiveSettings(
                 tier_floors=False, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][0]["value"],
-                size_cap=data["caps"][pc]["value"], same_title_size_cap=same_title,
-                rebalance=True)),
+                size_cap=data["caps"][pc]["value"], rebalance=True)),
         )
         for name, expected in cases:
             [opened] = snaps[name]["opened"]

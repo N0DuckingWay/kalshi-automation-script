@@ -104,23 +104,14 @@ DEV_PEM_FILE = PROJECT_ROOT / "kalshi_demo_private_key.pem"
 
 # ── Trading parameters ────────────────────────────────────────────────────────
 
-# The largest share of the portfolio value (cash plus open positions) one trade
-# may stake, for every pair: a multiple of SIZE_CAP_STEP from 5% to 100%, where
-# 1.0 means no cap. The backtest sizes with it (backtester copies it at import);
-# a live run uses the saved live defaults' size_cap instead. At 1.0 this file's
-# k still holds a time-series pair to 1 - k = 20% (max_kelly_fraction), in the
-# backtest and under live_settings(), which also holds any other pair to
-# SAME_TITLE_SIZE_CAP: under live_settings() one pair still stakes at most 20%.
+# The largest share of the portfolio value (cash plus open positions) one
+# time-series trade may stake: a multiple of SIZE_CAP_STEP from 5% to 100%,
+# where 1.0 means no cap. The backtest sizes with it (backtester copies it at
+# import); a live run uses the saved live defaults' size_cap instead. At 1.0
+# this file's k still holds a time-series pair to 1 - k = 20%
+# (max_kelly_fraction), in the backtest and under live_settings(). Any other
+# pair type gets a cap of 0 (pair_size_cap), so it is never sized.
 BUDGET_FRACTION               = 1.0
-
-# An EXTRA per-trade cap on SAME-TITLE pairs, on the same grid: a same-title
-# pair is capped at min(BUDGET_FRACTION, this), a time-series pair never reads
-# it (pair_size_cap); 1.0 adds no cap. Under a BUDGET_FRACTION of 1.0 it bounds
-# a same-title pair, whose f* reaches about 0.89 on a wide divergence.
-# live_settings() reads it; a live run caps at the saved live defaults'
-# same_title_size_cap instead. The backtest, which simulates time-series pairs
-# only, has no same-title cap.
-SAME_TITLE_SIZE_CAP           = 0.20
 
 # Defensive ceiling on strategy.compute_trade's marginal-price descent. That
 # loop re-prices a pair at each candidate contract count and takes the SMALLER
@@ -580,11 +571,11 @@ KELLY_TRIM_MAX_BID_DROP = 0.20
 
 # ── Live trading toggles ──────────────────────────────────────────────────────
 #
-# Twelve live toggles (TIME_SERIES_TIER_FLOORS, TIME_SERIES_SPREAD_BAND,
+# Eleven live toggles (TIME_SERIES_TIER_FLOORS, TIME_SERIES_SPREAD_BAND,
 # TRADE_EXCLUDE_CATEGORIES, TRADE_EXCLUDE_TAGS, REBALANCE, MIN_PRICE_MOVE,
-# REBALANCE_MIN_DAYS_TO_MATURITY, SELL_AT and SELL_MIN_DAYS below; k,
-# BUDGET_FRACTION and SAME_TITLE_SIZE_CAP above). They are NOT the live
-# defaults: a live run starts only from the saved ones (LIVE_DEFAULTS_FILE, below) and
+# REBALANCE_MIN_DAYS_TO_MATURITY, SELL_AT and SELL_MIN_DAYS below; k and
+# BUDGET_FRACTION above). They are NOT the live defaults: a live run starts
+# only from the saved ones (LIVE_DEFAULTS_FILE, below) and
 # never falls back to these. k and BUDGET_FRACTION are also the backtest's k and
 # per-trade cap (backtester binds both by value, backtest binds k). All of them
 # are what live_settings() returns: the settings a live entry point
@@ -649,10 +640,10 @@ TRADE_EXCLUDE_TAGS: tuple[str, ...] | None = None
 TAG_SCOPE_SEPARATOR = " · "
 
 # Whether a live run rebalances the pairs the account holds: on, a production
-# run, before it buys, sells part of each exact held pair (two held markets
-# alone on one question, one held YES and the other NO, in equal counts), or of
-# each lone leg (the later market of a time-series pair, still held after the
-# earlier one paid out $0), worth
+# run, before it buys, sells part of each exact held time-series pair (two held
+# markets alone on one question, one held YES and the other NO, in equal
+# counts), or of each lone leg (the later market of a time-series pair, still
+# held after the earlier one paid out $0), worth
 # more than Kelly allows or more than its size cap (a Kelly trim:
 # main._run_prod, through seller.plan_trims), and may add to a pair it holds:
 # exactly the same two markets, buying the same side on each
@@ -748,12 +739,12 @@ SALE_PARTNER_REVENUE_TOLERANCE_DOLLARS = 0.005
 # not sold.
 SALE_PARTNER_MAX_AGE_DAYS = 2 * MAX_DEADLINE_GAP_DAYS
 
-# The size caps' grid: BUDGET_FRACTION, SAME_TITLE_SIZE_CAP, the saved live
-# defaults' two caps and main.py's --size-cap / --same-title-size-cap (in
-# percent) must each be a multiple of it
-# from 5% to 100%; LiveSettings normalises each onto a backtester.SIZE_CAP_SWEEP
-# cell (float-equal). Same value as SAME_TITLE_MIN_PRICE_DIFF, not the same
-# constant.
+# The size cap's grid: BUDGET_FRACTION, the saved live defaults' size cap and
+# main.py's --size-cap (in percent) must each be a multiple of it from 5% to
+# 100%; LiveSettings normalises the cap onto a backtester.SIZE_CAP_SWEEP cell
+# (float-equal). The same_title_size_cap an outdated saved file holds is
+# checked on it too, as the version that saved it did (_retired_proposal).
+# Same value as SAME_TITLE_MIN_PRICE_DIFF, not the same constant.
 SIZE_CAP_STEP = 0.05
 
 # The largest share of the portfolio value one pair may stake before
@@ -763,7 +754,7 @@ LIVE_EXPOSURE_WARN_FRACTION = 0.20
 
 # ── Saved live defaults ───────────────────────────────────────────────────────
 
-# The live defaults every live run starts from: one JSON record of the twelve
+# The live defaults every live run starts from: one JSON record of the eleven
 # live toggles (any of _OPTIONAL_TOGGLES may be left out, and then reads as off),
 # saved through defaults_server's confirmation page
 # (python3 -m kalshi_betting.defaults_server; its --seed proposes
@@ -771,12 +762,12 @@ LIVE_EXPOSURE_WARN_FRACTION = 0.20
 # page's Confirm and save (or Confirm and trade, which saves before it runs
 # the bot), and read_saved_live_defaults / live_defaults read it. A live
 # run refuses to start without it; it never falls back to the toggle constants
-# above. A file an older version saved, holding a setting this one replaced
-# (_RETIRED_TOGGLES), is refused too until it is saved again. main.py's flags
-# still override it for one run. Read at call time through this module's
-# global, so tests can point it elsewhere (tests/conftest.py). Operator state,
-# like scheduler_state.json: gitignored, in the checkout the scheduler runs
-# from.
+# above. A file an older version saved, holding a setting this one replaced or
+# no longer has (_RETIRED_TOGGLES), is refused too until it is saved again.
+# main.py's flags still override it for one run. Read at call time through this
+# module's global, so tests can point it elsewhere (tests/conftest.py). Operator
+# state, like scheduler_state.json: gitignored, in the checkout the scheduler
+# runs from.
 LIVE_DEFAULTS_FILE = PROJECT_ROOT / "live_defaults.json"
 
 # The format tag the saved file carries; a file with any other is refused.
@@ -3339,10 +3330,9 @@ class LiveSettings:
             0 <= floor < ceiling <= 1.
         interval_discount (float): k, in (0, 1]; at 0 every time-series pair
             would price as riskless (p = 1).
-        size_cap (float): The per-trade Kelly cap for every pair, on the
-            SIZE_CAP_STEP grid; 1.0 is no cap.
-        same_title_size_cap (float): The extra same-title cap, on the same
-            grid; default 1.0 (no extra cap).
+        size_cap (float): The per-trade Kelly cap for a time-series pair, on
+            the SIZE_CAP_STEP grid; 1.0 is no cap. Any other pair type is
+            capped at 0 (pair_size_cap).
         exclude_categories (tuple[str, ...] | None): Categories not to trade;
             None (default) excludes none. Every other category trades, one the
             backtest never saw included. Each is a category's name alone: one
@@ -3355,9 +3345,9 @@ class LiveSettings:
             category is excluded too is allowed (it excludes nothing more).
         rebalance (bool): Whether a production run rebalances the pairs the
             account holds: before it buys, it sells part of each exact held
-            pair, or lone leg (the later market of a time-series pair, still
-            held after the earlier one paid out $0), grown past its
-            Kelly size (a Kelly trim), and it may add to
+            time-series pair, or lone leg (the later market of a time-series
+            pair, still held after the earlier one paid out $0), grown past
+            its Kelly size (a Kelly trim), and it may add to
             a pair the account already holds (exactly the same two markets,
             the same side on each, or a lone held market whose partner has
             paid out), with Kelly sizing the whole position. A real bool.
@@ -3395,7 +3385,6 @@ class LiveSettings:
     spread_band: tuple[float, float]
     interval_discount: float
     size_cap: float
-    same_title_size_cap: float = 1.0
     exclude_categories: tuple[str, ...] | None = None
     exclude_tags: tuple[str, ...] | None = None
     rebalance: bool = False
@@ -3434,8 +3423,6 @@ class LiveSettings:
             raise ValueError(f"interval_discount (k) must be in (0, 1], got {k!r}")
         object.__setattr__(self, "interval_discount", float(k))
         object.__setattr__(self, "size_cap", _step_cap(self.size_cap, "size_cap"))
-        object.__setattr__(self, "same_title_size_cap",
-                           _step_cap(self.same_title_size_cap, "same_title_size_cap"))
         object.__setattr__(self, "exclude_categories",
                            _names(self.exclude_categories, "exclude_categories"))
         object.__setattr__(self, "exclude_tags", _names(self.exclude_tags, "exclude_tags"))
@@ -3484,13 +3471,13 @@ class LiveSettings:
             raise ValueError(f"origin must be a printable description, got {self.origin!r}")
 
 
-# The twelve toggles by field name: every LiveSettings field except origin
+# The eleven toggles by field name: every LiveSettings field except origin
 LIVE_TOGGLE_FIELDS = tuple(f.name for f in fields(LiveSettings) if f.compare)
 
 # Toggles a saved file may leave out. A missing one reads as its LiveSettings
 # default (all off, whatever config.py ships), since nobody confirmed a value
 # for it in that file. save_live_defaults leaves one out while it is at its
-# default, so code that does not know the toggle can still read the file.
+# default.
 _OPTIONAL_TOGGLES = ("rebalance", "min_price_move", "rebalance_min_days_to_maturity",
                      "sell_at", "sell_min_days")
 # Each of those toggles' LiveSettings default
@@ -3499,16 +3486,22 @@ _TOGGLE_DEFAULTS = {f.name: f.default for f in fields(LiveSettings)
 # Settings an older version saved: add_to_held_pairs, trim_to_kelly and
 # trim_min_rise, which rebalance and min_price_move replaced; categories (a
 # list of categories to trade), which exclude_categories (categories not to
-# trade) replaced; and tags (a list of tags to trade), which exclude_tags (tags
-# not to trade) replaced. A saved file holding any of them is refused
-# (LiveDefaultsOutdated) until it is saved again, and the writer never writes them.
+# trade) replaced; tags (a list of tags to trade), which exclude_tags (tags
+# not to trade) replaced; and same_title_size_cap (an extra per-trade cap on
+# same-title pairs), which nothing replaced, since the bot trades time-series
+# pairs only. A saved file holding any of them is refused (LiveDefaultsOutdated)
+# until it is saved again, and the writer never writes them.
 _RETIRED_TOGGLES = ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise", "categories",
-                    "tags")
-# Each retirement: the old settings, and what replaced them (as the messages name it)
+                    "tags", "same_title_size_cap")
+# Each retirement: the old settings, and what replaced them (as the messages
+# name it), or None when nothing did. The Rebalance one stays first
+# (_retired_proposal, _retired_message and defaults_server read it by place)
 _RETIREMENTS = (
     (("add_to_held_pairs", "trim_to_kelly", "trim_min_rise"), "rebalance and min_price_move"),
     (("categories",), "exclude_categories"),
     (("tags",), "exclude_tags"),
+    # Nothing replaced it: the bot no longer trades same-title pairs
+    (("same_title_size_cap",), None),
 )
 # The Rebalance settings: a saved file holding one of them beside an old
 # switch (add_to_held_pairs, trim_to_kelly, trim_min_rise) says two things at
@@ -3531,7 +3524,7 @@ _RETIRED_FILTER_COMPANIONS = {
 
 # The values `python3 -m kalshi_betting.defaults_server --seed` offers for a
 # first save of the live defaults: tier floors off, spread band 0-0.5, k 0.80,
-# a 10% per-trade cap, a 20% same-title cap, no category or tag excluded, rebalancing
+# a 10% per-trade cap, no category or tag excluded, rebalancing
 # on with no minimum price movement and no limit on how close to maturity (the
 # days to maturity read "maturity"), and no selling. One pair stakes at most
 # 10% of the portfolio value; an add-on to a held pair stakes no more than a
@@ -3543,8 +3536,7 @@ _RETIRED_FILTER_COMPANIONS = {
 # until they are confirmed and saved to LIVE_DEFAULTS_FILE.
 LIVE_DEFAULTS_SEED = LiveSettings(
     tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.80,
-    size_cap=0.10, same_title_size_cap=0.20, exclude_categories=None, exclude_tags=None,
-    rebalance=True)
+    size_cap=0.10, exclude_categories=None, exclude_tags=None, rebalance=True)
 
 
 class LiveDefaultsError(ValueError):
@@ -3568,25 +3560,30 @@ class LiveDefaultsMissing(LiveDefaultsError):
 
 class LiveDefaultsOutdated(LiveDefaultsError):
     """
-    The saved file holds settings this version replaced (_RETIRED_TOGGLES).
+    The saved file holds settings this version replaced or no longer has (_RETIRED_TOGGLES).
 
     An older version saved add_to_held_pairs, trim_to_kelly and
     trim_min_rise, where this one has rebalance and min_price_move;
     categories (categories to trade), where this one has exclude_categories
-    (categories not to trade); and tags (tags to trade), where this one has
-    exclude_tags (tags not to trade). A live run refuses such a file, as it
-    refuses any other, so it never trades settings nobody confirmed in their
-    new form. The defaults server offers the proposal on its confirmation
-    page, where one Confirm and save replaces the file.
+    (categories not to trade); tags (tags to trade), where this one has
+    exclude_tags (tags not to trade); and same_title_size_cap (an extra cap
+    on same-title pairs), which nothing replaced, since the bot trades
+    time-series pairs only. A live run refuses such a file, as it refuses any
+    other, so it never trades settings nobody confirmed in their new form.
+    The defaults server offers the proposal on its confirmation page, where
+    one Confirm and save replaces the file.
 
     Attributes:
         proposal (LiveSettings | None): What the file reads as now: rebalance
             on only when both old switches were on, min_price_move the old
             minimum then (otherwise none), no category excluded in place of
-            old categories, no tag excluded in place of old tags, every other
-            setting as saved. None when the old values break the older
-            version's own rules (_old_categories and _old_tags among them), or
-            when the rest of the file is refused too.
+            old categories, no tag excluded in place of old tags, no
+            same-title cap, every other setting as saved. None when the old
+            values break the older version's own rules (_old_categories,
+            _old_tags and the old same-title cap's grid among them), when the
+            file holds another retired setting but no same-title cap (every
+            older version saved one), or when the rest of the file is refused
+            too.
         retired (tuple[str, ...]): The retired settings the file holds, in
             _RETIRED_TOGGLES' order, so a page can say which change it
             predates.
@@ -3629,7 +3626,7 @@ class LiveDefaultsOutdated(LiveDefaultsError):
 
 class _RetiredSettings(ValueError):
     """
-    _saved_settings found settings this version replaced (_RETIRED_TOGGLES).
+    _saved_settings found settings this version replaced or no longer has (_RETIRED_TOGGLES).
 
     Internal: read_saved_live_defaults turns it into LiveDefaultsOutdated,
     naming the file. It is a ValueError, so a caller that only parses (the
@@ -3668,7 +3665,7 @@ class _RetiredSettings(ValueError):
 
 def live_settings() -> LiveSettings:
     """
-    Return config.py's own twelve toggle constants as LiveSettings, validated.
+    Return config.py's own eleven toggle constants as LiveSettings, validated.
 
     Read at call time, so a test that monkeypatches a constant here takes
     effect. It is NOT the live defaults: a live run starts only from the saved
@@ -3689,7 +3686,6 @@ def live_settings() -> LiveSettings:
         spread_band=TIME_SERIES_SPREAD_BAND,
         interval_discount=TIME_SERIES_INTERVAL_PROB_DISCOUNT,
         size_cap=BUDGET_FRACTION,
-        same_title_size_cap=SAME_TITLE_SIZE_CAP,
         exclude_categories=TRADE_EXCLUDE_CATEGORIES,
         exclude_tags=TRADE_EXCLUDE_TAGS,
         rebalance=REBALANCE,
@@ -3800,7 +3796,7 @@ def _settings_from_toggles(raw, origin: str) -> LiveSettings:
     """
     Turn a saved file's "settings" object into LiveSettings, or refuse it.
 
-    Checks what LiveSettings cannot see in JSON: exactly the twelve toggle
+    Checks what LiveSettings cannot see in JSON: exactly the eleven toggle
     names (a toggle in _OPTIONAL_TOGGLES may be left out, and then takes its
     LiveSettings default, off), a spread band of two real numbers
     (LiveSettings would read a JSON true as 1), no JSON true or false as a
@@ -3972,8 +3968,15 @@ def _retired_proposal(raw: dict, origin: str
     then WIDENS live trading to every category, and the old list is handed
     back so every page that offers the proposal says so. The tags one is the
     same, for tags (_old_tags): the proposal excludes no tag, and an old list
-    of tags to trade is handed back. Every other setting is as saved, and the
-    result must pass every check a saved file does (_settings_from_toggles).
+    of tags to trade is handed back. The same-title cap one: nothing replaced
+    same_title_size_cap, since the bot trades time-series pairs only, so the
+    proposal simply has no same-title cap. Every older version required that
+    cap and held it to its own rule (_step_cap: a number on the SIZE_CAP_STEP
+    grid in (0, 1], never a JSON true or false), so the file must hold one
+    beside any other retired setting, and it must pass that rule. Every other
+    setting is as saved, and the result must pass every check a saved file
+    does (_settings_from_toggles). Those checks come before the old cap's, so
+    when another setting is broken too, that setting is the one named.
 
     Args:
         raw (dict): The file's "settings" object, holding one or more of
@@ -3989,13 +3992,15 @@ def _retired_proposal(raw: dict, origin: str
 
     Raises:
         ValueError: The old values, or the rest of the settings, are refused;
-            or the object also holds the settings that replaced a retired one
-            (rebalance, min_price_move or rebalance_min_days_to_maturity beside
-            the Rebalance ones), or a key of the new category/tag filter that
-            no version saved beside a retired filter key
-            (_RETIRED_FILTER_COMPANIONS: exclude_categories or exclude_tags
-            beside categories, exclude_tags beside tags), so it says two
-            things at once.
+            the object holds another retired setting but no
+            same_title_size_cap, which every older version saved, so no
+            version saved it; or the object also holds the settings that
+            replaced a retired one (rebalance, min_price_move or
+            rebalance_min_days_to_maturity beside the Rebalance ones), or a
+            key of the new category/tag filter that no version saved beside a
+            retired filter key (_RETIRED_FILTER_COMPANIONS: exclude_categories
+            or exclude_tags beside categories, exclude_tags beside tags), so
+            it says two things at once.
     """
     toggles = {name: value for name, value in raw.items() if name not in _RETIRED_TOGGLES}
     # Two filters at once cannot be read as one: a retired filter key beside
@@ -4035,7 +4040,17 @@ def _retired_proposal(raw: dict, origin: str
         toggles["rebalance"] = rebalance
         if rebalance and rise is not None:
             toggles["min_price_move"] = rise
-    return _settings_from_toggles(toggles, origin), old_categories, old_tags
+    # Every other setting first, so a broken one there is the one named
+    proposal = _settings_from_toggles(toggles, origin)
+    # Then the old same-title cap. Every older version required one and held it
+    # to its own rule (a cap on the SIZE_CAP_STEP grid in (0, 1], never a JSON
+    # true or false), so a file without one, or with one that rule refuses, is
+    # not a file any older version saved, and it has no reading now either.
+    # The cap itself is left out of toggles above, so the proposal has none
+    if "same_title_size_cap" not in raw:
+        raise ValueError("it lacks same_title_size_cap, which every older version saved")
+    _step_cap(raw["same_title_size_cap"], "same_title_size_cap")
+    return proposal, old_categories, old_tags
 
 
 def _retired_message(retired: list[str], proposal: LiveSettings | None,
@@ -4045,7 +4060,8 @@ def _retired_message(retired: list[str], proposal: LiveSettings | None,
     """
     Say what an outdated saved file holds and how to save it again.
 
-    Each retirement the file holds is named with what replaced it.
+    Each retirement the file holds is named with what replaced it, or, for
+    one nothing replaced (the same-title cap), as no longer used.
 
     Args:
         retired (list[str]): The retired settings the file holds, in
@@ -4074,14 +4090,25 @@ def _retired_message(retired: list[str], proposal: LiveSettings | None,
             live defaults…" button)'. A file that listed tags to trade says
             "limited trading to the tags 'Basketball' (a 'Category · Tag'
             limited that category alone)" and "exclude each tag not to
-            trade", and one that listed both names both.
+            trade", and one that listed both names both. A file whose only
+            retired setting is the same-title cap says '"settings" holds
+            same_title_size_cap, which is no longer used (the bot trades
+            time-series pairs only): save the live defaults again (start
+            ./start_dashboard.sh; its pages offer them as saved, with no
+            same-title cap)'; beside another retirement, "no same-title cap"
+            joins the list of what its pages offer.
     """
     parts = []
     for old_names, replaced_by in _RETIREMENTS:
         held = [name for name in retired if name in old_names]
         if held:
             listed = held[0] if len(held) == 1 else ", ".join(held[:-1]) + " and " + held[-1]
-            parts.append(f"{listed}, which {replaced_by} replaced")
+            if replaced_by is None:
+                # Nothing replaced it: say it is gone, and why
+                parts.append(f"{listed}, which is no longer used (the bot trades "
+                             "time-series pairs only)")
+            else:
+                parts.append(f"{listed}, which {replaced_by} replaced")
     head = '"settings" holds ' + ", and ".join(parts)
     if proposal is None:
         return (f"{head}, and its other settings are refused too ({refused}): save the "
@@ -4095,6 +4122,8 @@ def _retired_message(retired: list[str], proposal: LiveSettings | None,
         offered.append("no category excluded")
     if "tags" in retired:
         offered.append("no tag excluded")
+    if "same_title_size_cap" in retired:
+        offered.append("no same-title cap")
     # What an old list to trade kept, and what to exclude in its place
     widened, kinds = [], []
     if old_categories is not None:
@@ -4117,8 +4146,12 @@ def _retired_message(retired: list[str], proposal: LiveSettings | None,
                 f"{' and '.join(kinds)} not to trade before saving (start "
                 "./start_dashboard.sh, or the backtest dashboard's \"Save as live "
                 "defaults…\" button)")
+    # The cap alone leaves every other setting as saved, which the list alone
+    # would not say
+    as_offered = ("saved, with no same-title cap" if offered == ["no same-title cap"]
+                  else ", ".join(offered))
     return (f"{head}: save the live defaults again (start ./start_dashboard.sh; its pages "
-            f"offer them as {', '.join(offered)})")
+            f"offer them as {as_offered})")
 
 
 def _saved_settings(record) -> LiveSettings:
@@ -4219,9 +4252,9 @@ def read_saved_live_defaults() -> LiveSettings | None:
     - "format": LIVE_DEFAULTS_FORMAT;
     - "saved_at": UTC, e.g. 2026-09-27T21:05:13Z;
     - "source": a note (live_defaults_source's rules);
-    - "settings": the twelve toggles by LiveSettings field name. tier_floors is
-      true/false, spread_band is [floor, ceiling], interval_discount, size_cap
-      and same_title_size_cap are numbers (the caps as fractions),
+    - "settings": the eleven toggles by LiveSettings field name. tier_floors is
+      true/false, spread_band is [floor, ceiling], interval_discount and
+      size_cap are numbers (the cap as a fraction),
       exclude_categories is null (none excluded) or a list of names,
       exclude_tags is null (none excluded) or a list of names, rebalance is
       true/false or left out, which reads as off, and min_price_move is
@@ -4237,9 +4270,10 @@ def read_saved_live_defaults() -> LiveSettings | None:
     A link to a regular file is read through. Settings that hold any of
     _RETIRED_TOGGLES (add_to_held_pairs, trim_to_kelly, trim_min_rise: what an
     older version saved in place of rebalance and min_price_move; categories,
-    which exclude_categories replaced; tags, which exclude_tags replaced) are
-    refused as LiveDefaultsOutdated,
-    which carries what they read as now.
+    which exclude_categories replaced; tags, which exclude_tags replaced;
+    same_title_size_cap, which nothing replaced, since the bot trades
+    time-series pairs only) are refused as LiveDefaultsOutdated, which
+    carries what they read as now.
 
     Returns:
         LiveSettings | None: The toggles, their origin naming the file and when
@@ -4388,13 +4422,13 @@ def save_live_defaults(settings: LiveSettings, *, source: str) -> LiveSettings:
     this process id, flushed, and renamed over the file, so a reader at the
     same moment sees the old file or the new one, never part of one. The
     directory is flushed too, so the rename survives a power cut. The file is
-    then read back from disk and must equal settings (the twelve toggles;
+    then read back from disk and must equal settings (the eleven toggles;
     origin is not compared). A toggle in _OPTIONAL_TOGGLES is written only
     when it is not at its default, so a file with all five off holds only the
-    seven other toggles, which code that does not know them can still read.
-    Only the twelve toggles' names are written, never one of
-    _RETIRED_TOGGLES, so a save replaces a file an older version saved with
-    one every live run reads.
+    six other toggles. Only the eleven toggles' names are written, never one
+    of _RETIRED_TOGGLES, so a save replaces a file an older version saved
+    with one every live run reads. No older version reads a file this one
+    writes: each of them requires same_title_size_cap.
 
     Args:
         settings (LiveSettings): The new defaults.
@@ -4415,9 +4449,8 @@ def save_live_defaults(settings: LiveSettings, *, source: str) -> LiveSettings:
     except ValueError as exc:
         raise LiveDefaultsError(f"{path}: not saved: {exc}") from exc
     values = {name: getattr(settings, name) for name in LIVE_TOGGLE_FIELDS}
-    # An optional toggle is written only when it differs from its default, so
-    # a file that keeps it at its default can still be read by code that does
-    # not know it
+    # An optional toggle is written only when it differs from its default; a
+    # read gives a missing one back as that default (_OPTIONAL_TOGGLES)
     for name in _OPTIONAL_TOGGLES:
         if values[name] == _TOGGLE_DEFAULTS[name]:
             del values[name]
@@ -4513,26 +4546,28 @@ def time_series_spread_refusal(
     return None
 
 
-def pair_size_cap(pair_type: str, size_cap: float, same_title_size_cap: float) -> float:
+def pair_size_cap(pair_type: str, size_cap: float) -> float:
     """
     Return the per-trade Kelly cap for a pair of this type.
 
-    The one definition, shared by strategy._evaluate_size, max_kelly_fraction
-    and backtester._simulate_at_discount, so no path caps a pair differently.
-    Anything but the exact string "time_series" reads as same-title
-    (scanner.leg_sides' rule).
+    The one definition, shared by strategy._evaluate_size (a new trade or an
+    add-on), max_kelly_fraction (enrichment's depth bound and the exposure
+    warning), rebalance_change_warnings, seller._trim_one (a live Kelly trim)
+    and the backtester (Pass 1's size_cap_for_pair and _kelly_trim), so no
+    path caps a pair differently. A time-series pair gets the per-trade cap;
+    any other type (anything but the exact string "time_series") gets a cap
+    of 0, which sizes nothing and sells nothing: strategy._evaluate_size then
+    has a budget of 0 and refuses the pair, and kelly_trim_count sells
+    nothing when the cap is not above 0.
 
     Args:
         pair_type (str): The pair's type.
-        size_cap (float): The cap for every pair, in (0, 1].
-        same_title_size_cap (float): The extra cap on same-title pairs, in (0, 1].
+        size_cap (float): The per-trade cap, in (0, 1].
 
     Returns:
-        float: size_cap for time-series, else min(size_cap, same_title_size_cap).
+        float: size_cap for a time-series pair, else 0.0.
     """
-    if pair_type == "time_series":
-        return size_cap
-    return min(size_cap, same_title_size_cap)
+    return size_cap if pair_type == "time_series" else 0.0
 
 
 def held_pair_fraction(fraction: float, held_stake: float, portfolio_value: float) -> float:
@@ -4561,7 +4596,8 @@ def held_pair_fraction(fraction: float, held_stake: float, portfolio_value: floa
 
     Args:
         fraction (float): The share of the portfolio value a new pair would
-            stake: min(f*, pair_size_cap(...)), in (0, 1].
+            stake: min(f*, pair_size_cap(...)), in [0, 1] (0 for a pair that
+            is not time-series).
         held_stake (float): What the held pair already stakes, in dollars: its
             worth plus the fees paid for it (live: HeldPair.stake_dollars, the
             worth at today's prices plus its held markets' fees, one market's
@@ -4593,8 +4629,8 @@ def max_kelly_fraction(pair_type: str, settings: LiveSettings) -> float:
     Enrichment bounds the depth it averages with this, so a lifted cap never
     averages depth no trade can use (#51); it bounds the sizer only because
     both read the run's one LiveSettings. The cap is pair_size_cap's, further
-    bounded by the pair type's ceiling on f* (anything but "time_series" is
-    same-title):
+    bounded by the pair type's ceiling on f*. pair_size_cap caps any type but
+    "time_series" at 0, so the bound of every other type is 0:
 
     time_series: f* = 1 - k*s/(1 - c), where s is the mid spread
         (time_series_mid_spread) and c = pA + nB + fee at the fills. A
@@ -4612,7 +4648,8 @@ def max_kelly_fraction(pair_type: str, settings: LiveSettings) -> float:
         places: 1.0 - 0.8 is 0.19999999999999996, which would shift
         max_contracts down by one on round-number books. At k = 1 it is 0,
         and no time-series trade can size.
-    same_title: f* = (p - c)/(1 - c) < p = SAME_TITLE_CO_RESOLVE_PROB.
+    any other type: 0. Its cap is 0 (pair_size_cap), below the
+        SAME_TITLE_CO_RESOLVE_PROB ceiling the code applies to it.
 
     It bounds an add-on to a held pair too (with settings.rebalance on):
     held_pair_fraction never gives an add-on more than a new pair would get,
@@ -4627,7 +4664,7 @@ def max_kelly_fraction(pair_type: str, settings: LiveSettings) -> float:
     Returns:
         float: The run's cap for this pair type, bounded by the ceiling above.
     """
-    cap = pair_size_cap(pair_type, settings.size_cap, settings.same_title_size_cap)
+    cap = pair_size_cap(pair_type, settings.size_cap)
     if pair_type == "time_series":
         return min(cap, round(1.0 - settings.interval_discount, 12))
     return min(cap, SAME_TITLE_CO_RESOLVE_PROB)
@@ -4947,7 +4984,9 @@ def kelly_trim_count(count: int, portfolio_value: float, win_prob: float, cap: f
             plus open positions.
         win_prob (float): The chance the pair pays (held_pair_win_prob), a
             number: a pair whose chance cannot be read is not passed here.
-        cap (float): The pair's size cap (pair_size_cap), in (0, 1].
+        cap (float): The pair's size cap (pair_size_cap), in [0, 1]: the
+            per-trade cap for a time-series pair, 0 for any other type, which
+            sells nothing.
         top_value (float): What selling one contract pair at the best bids
             returns, after the fee, in dollars.
         net_sale (Callable[[int], float | None]): pairs -> what selling that
@@ -5379,7 +5418,6 @@ _LIVE_SETTING_FIELDS = (
     ("spread band", "spread_band", _band_text),
     ("k", "interval_discount", repr),
     ("per-trade cap", "size_cap", lambda v: _cap_text(v, "no cap")),
-    ("same-title cap", "same_title_size_cap", lambda v: _cap_text(v, "no extra cap")),
     ("exclude categories", "exclude_categories", _names_text),
     ("exclude tags", "exclude_tags", _names_text),
     ("rebalance", "rebalance", lambda v: "yes" if v else "no"),
@@ -5490,8 +5528,7 @@ def describe_live_settings(settings: LiveSettings, reference: LiveSettings | Non
     main._log_live_settings logs it on every live run and main._run_prod hands
     it to the prod trade log's separator row, both against the run's reference
     toggles. A field departs when its RAW value differs, and every renderer is
-    exact where a short form would print two values alike. The same-title cap
-    reads "100% (no extra cap)" at 1.0: the per-trade cap still applies.
+    exact where a short form would print two values alike.
 
     Args:
         settings (LiveSettings): The run's toggles.
@@ -5500,7 +5537,7 @@ def describe_live_settings(settings: LiveSettings, reference: LiveSettings | Non
 
     Returns:
         str: e.g. "tier floors off | spread band 0-0.5 | k 0.8 | per-trade cap
-            100% (no cap) | same-title cap 20% | exclude categories none | exclude tags none |
+            100% (no cap) | exclude categories none | exclude tags none |
             rebalance yes | min price movement any | rebalance until maturity |
             sell at off | min days to maturity any",
             with " (default: X)" after each field that differs from reference's
@@ -5552,13 +5589,13 @@ def live_settings_changes(current: LiveSettings | None,
 
 def live_settings_argv(settings: LiveSettings) -> list[str]:
     """
-    Spell a run's settings as main.py's toggle flags, all twelve toggles.
+    Spell a run's settings as main.py's toggle flags, all eleven toggles.
 
     A program that starts main.py with these flags gets a run that trades
     exactly these settings, whatever the saved live defaults say:
     main._resolve_live_settings lays every flag over the saved defaults and
     gets back settings equal to these (tests/test_main.py checks the round
-    trip). Caps are written as whole percents, which LiveSettings' 5% grid
+    trip). The cap is written as a whole percent, which LiveSettings' 5% grid
     makes exact. The other numbers are written as their repr, which float()
     reads back exactly. Each excluded category or tag is written as
     --exclude-category=NAME or --exclude-tag=NAME, so a name that begins with
@@ -5577,16 +5614,15 @@ def live_settings_argv(settings: LiveSettings) -> list[str]:
     Returns:
         list[str]: The flags, in the order main.py lists them: the tier-floor
             switch, --spread-min, --spread-max, --interval-discount,
-            --size-cap, --same-title-size-cap, the rebalance switch, its
-            minimum and its days to maturity, the two sell flags, then the
-            excluded-category flags and the excluded-tag flags.
+            --size-cap, the rebalance switch, its minimum and its days to
+            maturity, the two sell flags, then the excluded-category flags
+            and the excluded-tag flags.
     """
     argv = ["--tier-floors" if settings.tier_floors else "--no-tier-floors",
             f"--spread-min={settings.spread_band[0]!r}",
             f"--spread-max={settings.spread_band[1]!r}",
             f"--interval-discount={settings.interval_discount!r}",
             f"--size-cap={round(settings.size_cap * 100)}",
-            f"--same-title-size-cap={round(settings.same_title_size_cap * 100)}",
             "--rebalance" if settings.rebalance else "--no-rebalance"]
     # The minimum price move is a multiple of 5c, so its whole cents are exact
     argv += ([f"--min-price-move={round(settings.min_price_move * 100)}"]
@@ -5620,9 +5656,10 @@ def live_rule_warnings(settings: LiveSettings) -> list[str]:
       ON THE FLOOR: the ceiling is within PRICE_EPSILON of the floor, so only
           spreads on it can trade — none on a floor within PRICE_EPSILON of
           0, where such a spread is not positive.
-      EXPOSURE: max_kelly_fraction of a pair type exceeds
+      EXPOSURE: max_kelly_fraction("time_series") exceeds
           LIVE_EXPOSURE_WARN_FRACTION: one pair's stake, or a held pair's
-          whole position, as a share of the portfolio value.
+          whole position, as a share of the portfolio value. Only a
+          time-series pair is checked: every other type's bound is 0.
       k = 1: max_kelly_fraction("time_series") is 0, so no time-series trade sizes.
 
     Rebalancing (rebalance) adds no sentence. Kelly sizes an add-on on the
@@ -5668,14 +5705,15 @@ def live_rule_warnings(settings: LiveSettings) -> list[str]:
                     f"the spread band's {_exact_number(ceiling)} ceiling sits on the "
                     f"{_exact_number(floor)} entry floor for {scope}, so only spreads "
                     "exactly on it can trade")
-    for pair_type, label in (("time_series", "time-series"), ("same_title", "same-title")):
-        bound = max_kelly_fraction(pair_type, settings)
-        if bound > LIVE_EXPOSURE_WARN_FRACTION + PRICE_EPSILON:
-            out.append(
-                f"one {label} pair may stake up to {_percent_text(bound)} of the portfolio "
-                f"value, above the {_percent_text(LIVE_EXPOSURE_WARN_FRACTION)} this check "
-                "accepts")
-    if max_kelly_fraction("time_series", settings) == 0:
+    # The most one time-series pair may stake (pair_size_cap caps every other
+    # type at 0, so none of them can stake anything)
+    bound = max_kelly_fraction("time_series", settings)
+    if bound > LIVE_EXPOSURE_WARN_FRACTION + PRICE_EPSILON:
+        out.append(
+            f"one time-series pair may stake up to {_percent_text(bound)} of the portfolio "
+            f"value, above the {_percent_text(LIVE_EXPOSURE_WARN_FRACTION)} this check "
+            "accepts")
+    if bound == 0:
         out.append(f"k = {settings.interval_discount!r}: time-series Kelly cannot be "
                    "positive, so no time-series trade can size")
     return out
@@ -5686,16 +5724,15 @@ def rebalance_change_warnings(current: LiveSettings,
     """
     Say when moving from one set of live settings to another also sells held pairs.
 
-    With rebalancing on, a run sells each exact held pair, or lone leg (the
-    later market of a time-series pair, still held after the earlier one paid
-    out $0), worth more than its Kelly size (the lower of its size cap and
-    Kelly's own share, which reads k for a time-series pair) down to that size,
-    before anything is bought, once its wait has passed (a Kelly trim). So with
-    the proposed settings rebalancing, a lower size cap (as pair_size_cap
-    applies it) or a higher k can sell pairs the current settings would keep,
-    and, through a time-series cap or k, lone legs too: a lone leg is never a
-    same-title position, so a same-title cap alone does not reach one and the
-    sentence then leaves lone legs out.
+    With rebalancing on, a run sells each exact held time-series pair, or
+    lone leg (the later market of a time-series pair, still held after the
+    earlier one paid out $0), worth more than its Kelly size (the lower of its
+    size cap and Kelly's own share, which reads k) down to that size, before
+    anything is bought, once its wait has passed (a Kelly trim). So with the
+    proposed settings rebalancing, a lower per-trade cap (as pair_size_cap
+    applies it to a time-series pair) or a higher k can sell pairs and lone
+    legs the current settings would keep. A held pair of any other type is
+    never trimmed (scanner.held_pair_kind gives it no kind).
     main._log_live_settings logs the sentence as a WARNING on a real-money
     run whose flags depart from the saved defaults; the defaults server's
     confirmation page shows it in red.
@@ -5711,30 +5748,25 @@ def rebalance_change_warnings(current: LiveSettings,
     if not proposed.rebalance:
         return []
     changes = []
-    # A lone leg is only ever the later market of a time-series pair, so only a
-    # time-series cap or k can move what one is trimmed to
-    reaches_lone_leg = False
-    for pair_type, label in (("time_series", "time-series"), ("same_title", "same-title")):
-        # The cap each pair type is trimmed to, as a new trade of it is capped
-        before = pair_size_cap(pair_type, current.size_cap, current.same_title_size_cap)
-        after = pair_size_cap(pair_type, proposed.size_cap, proposed.same_title_size_cap)
-        if after < before:
-            changes.append(f"the {label} size cap goes from {_cap_text(before, 'no cap')} to "
-                           f"{_cap_text(after, 'no cap')}")
-            reaches_lone_leg = reaches_lone_leg or pair_type == "time_series"
+    # The cap a held time-series pair (or lone leg, the later market of one) is
+    # trimmed to, as a new trade of it is capped
+    before = pair_size_cap("time_series", current.size_cap)
+    after = pair_size_cap("time_series", proposed.size_cap)
+    if after < before:
+        changes.append(f"the per-trade cap goes from {_cap_text(before, 'no cap')} to "
+                       f"{_cap_text(after, 'no cap')}")
     if proposed.interval_discount > current.interval_discount:
         changes.append(f"k goes from {_exact_number(current.interval_discount)} to "
                        f"{_exact_number(proposed.interval_discount)}, which lowers a "
                        "time-series pair's chance of paying")
-        reaches_lone_leg = True
     if not changes:
         return []
-    named = changes[0] if len(changes) == 1 else ", ".join(changes[:-1]) + " and " + changes[-1]
-    lone_leg = ", or lone leg whose partner has paid out," if reaches_lone_leg else ""
+    named = " and ".join(changes)
+    # Both changes reach a lone leg as well as a pair
     return [f"with Rebalance yes, these settings can sell more of the held pairs: {named}; "
-            f"each exact held pair{lone_leg} worth more than its "
-            "new Kelly size is sold down to it before anything is bought, once the wait since "
-            "its last trade has passed"]
+            "each exact held time-series pair, or lone leg whose partner has paid out, worth "
+            "more than its new Kelly size is sold down to it before anything is bought, once "
+            "the wait since its last trade has passed"]
 
 
 def order_api_version_error() -> str | None:

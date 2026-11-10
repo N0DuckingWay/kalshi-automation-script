@@ -101,17 +101,17 @@ KEY = b"k" * 32
 _REAL_POPEN = subprocess.Popen
 # A source note of the dashboard's shape
 DASHBOARD_NOTE = "backtest dashboard for 2025-09-24 to 2026-09-27"
-# The twelve rows of a comparison, in their order on the page
-LABELS = ["tier floors", "spread band", "k", "per-trade cap", "same-title cap",
+# The eleven rows of a comparison, in their order on the page
+LABELS = ["tier floors", "spread band", "k", "per-trade cap",
           "exclude categories", "exclude tags", "rebalance", "min price movement",
           "rebalance until", "sell at", "min days to maturity"]
 # A proposal's fields: the seed's values, spelled as the dashboard spells them
 _BASE = {"tier_floors": "off", "spread_min": "0", "spread_max": "0.5", "k": "0.8",
          "size_cap": "0.1"}
 # What _BASE proposes with nothing saved: the fields it leaves out take the
-# seed's values (20% same-title cap, rebalancing on with no minimum, no selling)
+# seed's values (rebalancing on with no minimum, no selling)
 _BASE_SETTINGS = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                              size_cap=0.1, same_title_size_cap=0.2, rebalance=True)
+                              size_cap=0.1, rebalance=True)
 # The ASCII digits as Arabic-Indic and as full-width digits (str.translate tables)
 _ARABIC_INDIC = str.maketrans("0123456789", "".join(chr(0x0660 + i) for i in range(10)))
 _FULL_WIDTH = str.maketrans("0123456789", "".join(chr(0xFF10 + i) for i in range(10)))
@@ -830,9 +830,8 @@ class TestConfirmPage:
 
     def test_with_a_file_saved_only_the_changed_rows_are_highlighted(self):
         saved = _save(LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.8,
-                                   size_cap=0.1, same_title_size_cap=0.5), source=DASHBOARD_NOTE)
-        response = _get(_app(), "/confirm?" + _query(same_title_size_cap="0.5",
-                                                   source=DASHBOARD_NOTE))
+                                   size_cap=0.1), source=DASHBOARD_NOTE)
+        response = _get(_app(), "/confirm?" + _query(source=DASHBOARD_NOTE))
         assert response.status == 200
         page = _parse(response.body)
         assert list(page.rows) == LABELS
@@ -840,7 +839,7 @@ class TestConfirmPage:
         assert changed == {"tier floors", "spread band"}
         assert all(css == "same" for label, css in page.rows.items() if label not in changed)
         assert response.body.count('<span class="tag">changed</span>') == 2
-        assert "2 of 12 settings change." in response.body
+        assert "2 of 11 settings change." in response.body
         assert "Overwrite the live trading defaults?" in response.body
         assert f"This writes <code>{config.LIVE_DEFAULTS_FILE.absolute()}</code>" \
             in response.body
@@ -854,8 +853,8 @@ class TestConfirmPage:
 
     def test_the_changed_value_is_bold(self):
         _save(LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.8,
-                           size_cap=0.1, same_title_size_cap=0.5))
-        body = _get(_app(), "/confirm?" + _query(same_title_size_cap="0.5")).body
+                           size_cap=0.1))
+        body = _get(_app(), "/confirm?" + _query()).body
         assert '<td><b>off</b></td>' in body
         assert '<td><b>0.8</b></td>' not in body
 
@@ -867,9 +866,8 @@ class TestConfirmPage:
         assert "none saved — live runs refuse to start until defaults are saved" in response.body
         assert set(page.rows.values()) == {"changed"}
         assert all(cells[1] == "—" for cells in page.cells.values())
-        assert "12 of 12 settings change." in response.body
+        assert "11 of 11 settings change." in response.body
         # The fields the link leaves out take the seed's values
-        assert page.cells["same-title cap"][2] == "20%"
         assert page.cells["rebalance"][2] == "yes"
         assert page.cells["min price movement"][2] == "any"
         assert page.cells["sell at"][2] == "off"
@@ -878,8 +876,7 @@ class TestConfirmPage:
     def test_the_exposure_warning_shows(self):
         response = _get(_app(), "/confirm?" + _query(k="0.4", size_cap="1"))
         warnings = config.live_rule_warnings(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5),
-                                                          interval_discount=0.4, size_cap=1.0,
-                                                          same_title_size_cap=0.2))
+                                                          interval_discount=0.4, size_cap=1.0))
         assert warnings
         for sentence in warnings:
             assert f'<p class="warn">Warning: {sentence}.</p>' in response.body
@@ -887,73 +884,48 @@ class TestConfirmPage:
     def test_no_warning_for_the_seed(self):
         assert 'class="warn"' not in _get(_app(), "/confirm?" + _query()).body
 
-    # Saved defaults that rebalance: k 0.8, 20% per-trade and same-title caps
+    # Saved defaults that rebalance: k 0.8, a 20% per-trade cap
     _REBALANCE_SAVED = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5),
-                                    interval_discount=0.8, size_cap=0.2, same_title_size_cap=0.2,
-                                    rebalance=True)
+                                    interval_discount=0.8, size_cap=0.2, rebalance=True)
 
-    @pytest.mark.parametrize("link, named, lone", [
-        ({"size_cap": "0.1", "same_title_size_cap": "0.2"},
-         "the time-series size cap goes from 20% to 10% and the same-title size cap goes "
-         "from 20% to 10%", True),
-        ({"k": "0.9", "size_cap": "0.2", "same_title_size_cap": "0.2"},
-         "k goes from 0.8 to 0.9, which lowers a time-series pair&#x27;s chance of paying",
-         True),
-        # A lone leg is never a same-title position: the warning leaves it out
-        ({"size_cap": "0.2", "same_title_size_cap": "0.1"},
-         "the same-title size cap goes from 20% to 10%", False),
-    ], ids=["per-trade cap", "k", "same-title cap"])
-    def test_with_rebalancing_on_a_lower_cap_or_a_higher_k_is_said_to_sell(
-        self, link, named, lone,
-    ):
+    @pytest.mark.parametrize("link, named", [
+        ({"size_cap": "0.1"}, "the per-trade cap goes from 20% to 10%"),
+        ({"k": "0.9", "size_cap": "0.2"},
+         "k goes from 0.8 to 0.9, which lowers a time-series pair&#x27;s chance of paying"),
+    ], ids=["per-trade cap", "k"])
+    def test_with_rebalancing_on_a_lower_cap_or_a_higher_k_is_said_to_sell(self, link, named):
         # These settings can sell more of the held pairs: the page warns in red
         _save(self._REBALANCE_SAVED)
         response = _get(_app(), "/confirm?" + _query(**link))
         assert response.status == 200
         [warning] = re.findall(r'<p class="warn">(.*?)</p>', response.body)
-        who = ("each exact held pair, or lone leg whose partner has paid out, worth"
-               if lone else "each exact held pair worth")
         assert warning == (
             "Warning: with Rebalance yes, these settings can sell more of the held pairs: "
-            f"{named}; {who} more than its new Kelly size is sold down to it before "
-            "anything is bought, once the wait since its last trade has passed.")
+            f"{named}; each exact held time-series pair, or lone leg whose partner has paid "
+            "out, worth more than its new Kelly size is sold down to it before anything is "
+            "bought, once the wait since its last trade has passed.")
 
     @pytest.mark.parametrize("saved, link", [
         # Rebalancing saved off, and the link leaves it off
+        (dataclasses.replace(_REBALANCE_SAVED, rebalance=False), {"size_cap": "0.1"}),
         (dataclasses.replace(_REBALANCE_SAVED, rebalance=False),
-         {"size_cap": "0.1", "same_title_size_cap": "0.2"}),
-        (dataclasses.replace(_REBALANCE_SAVED, rebalance=False),
-         {"k": "0.9", "size_cap": "0.2", "same_title_size_cap": "0.2"}),
-        (dataclasses.replace(_REBALANCE_SAVED, rebalance=False),
-         {"size_cap": "0.2", "same_title_size_cap": "0.1"}),
+         {"k": "0.9", "size_cap": "0.2"}),
         # Rebalancing turned off by the link itself
-        (_REBALANCE_SAVED, {"size_cap": "0.1", "same_title_size_cap": "0.2",
-                            "rebalance": "off"}),
+        (_REBALANCE_SAVED, {"size_cap": "0.1", "rebalance": "off"}),
         # A cap raised, and k lowered: nothing more is sold
-        (_REBALANCE_SAVED, {"size_cap": "0.3", "same_title_size_cap": "0.2"}),
-        (_REBALANCE_SAVED, {"k": "0.7", "size_cap": "0.2", "same_title_size_cap": "0.2"}),
-        # A lower same-title cap that is still above the per-trade cap
-        (dataclasses.replace(_REBALANCE_SAVED, same_title_size_cap=1.0),
-         {"size_cap": "0.2", "same_title_size_cap": "0.5"}),
-    ], ids=["off, cap", "off, k", "off, same-title cap", "link turns it off", "cap raised",
-            "k lowered", "same-title cap held below"])
+        (_REBALANCE_SAVED, {"size_cap": "0.3"}),
+        (_REBALANCE_SAVED, {"k": "0.7", "size_cap": "0.2"}),
+    ], ids=["off, cap", "off, k", "link turns it off", "cap raised", "k lowered"])
     def test_no_warning_when_no_more_is_sold(self, saved, link):
         _save(saved)
         response = _get(_app(), "/confirm?" + _query(**link))
         assert response.status == 200
         assert 'class="warn"' not in response.body
 
-    def test_a_missing_same_title_cap_keeps_the_saved_value(self):
-        _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                           size_cap=0.1, same_title_size_cap=0.5))
-        page = _parse(_get(_app(), "/confirm?" + _query()).body)
-        assert page.rows["same-title cap"] == "same"
-        assert page.cells["same-title cap"][1:3] == ["50%", "50%"]
-
     @pytest.mark.parametrize("given, saved_on", [("on", False), ("off", True)])
     def test_a_named_rebalance_is_proposed(self, given, saved_on):
         _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                           size_cap=0.1, same_title_size_cap=0.2, rebalance=saved_on))
+                           size_cap=0.1, rebalance=saved_on))
         page = _parse(_get(_app(), "/confirm?" + _query(rebalance=given)).body)
         assert page.rows["rebalance"] == "changed"
         assert page.cells["rebalance"][1:3] == ["yes" if saved_on else "no",
@@ -962,10 +934,10 @@ class TestConfirmPage:
     @pytest.mark.parametrize("saved", [
         {}, {"sell_at": 0.85}, {"sell_at": 0.85, "sell_min_days": 3}])
     def test_missing_sell_settings_keep_the_saved_values(self, saved):
-        # A link that names neither (an older dashboard page, a hand-made link)
-        # leaves selling exactly as saved, shown as no change
+        # A link that names neither (from a dashboard page without the Sell
+        # view, or made by hand) leaves selling exactly as saved, shown as no change
         _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                           size_cap=0.1, same_title_size_cap=0.2, **saved))
+                           size_cap=0.1, **saved))
         page = _parse(_get(_app(), "/confirm?" + _query()).body)
         assert page.rows["sell at"] == page.rows["min days to maturity"] == "same"
         assert page.cells["sell at"][1] == page.cells["sell at"][2]
@@ -1004,7 +976,7 @@ class TestConfirmPage:
 
     def test_a_named_sell_level_over_a_saved_one_is_a_change(self):
         _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                           size_cap=0.1, same_title_size_cap=0.2, sell_at=0.85, sell_min_days=3))
+                           size_cap=0.1, sell_at=0.85, sell_min_days=3))
         page = _parse(_get(_app(), "/confirm?" + _query(sell_at="0.9")).body)
         assert page.rows["sell at"] == "changed"
         assert page.cells["sell at"][1:3] == ["85% of potential profit", "90% of potential profit"]
@@ -1020,7 +992,7 @@ class TestConfirmPage:
     def test_turning_the_level_off_but_keeping_a_saved_minimum_is_refused_with_the_reason(self):
         # The minimum was left out, so it stays at the saved 3 with no level
         _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                           size_cap=0.1, same_title_size_cap=0.2, sell_at=0.85, sell_min_days=3))
+                           size_cap=0.1, sell_at=0.85, sell_min_days=3))
         response = _get(_app(), "/confirm?" + _query(sell_at="off"))
         assert response.status == 400
         assert "sell_min_days needs a sell level" in html.unescape(response.body)
@@ -1033,7 +1005,7 @@ class TestConfirmPage:
         # page without the Rebalance view, a hand-made link) keeps both as
         # saved, either way, shown as no change
         _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                           size_cap=0.1, same_title_size_cap=0.2, **saved))
+                           size_cap=0.1, **saved))
         page = _parse(_get(_app(), "/confirm?" + _query()).body)
         assert page.rows["rebalance"] == page.rows["min price movement"] == "same"
         assert page.cells["rebalance"][1] == page.cells["rebalance"][2] == (
@@ -1083,7 +1055,7 @@ class TestConfirmPage:
 
     def test_a_named_minimum_move_over_a_saved_one_is_a_change(self):
         _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                           size_cap=0.1, same_title_size_cap=0.2, rebalance=True,
+                           size_cap=0.1, rebalance=True,
                            min_price_move=0.25))
         page = _parse(_get(_app(), "/confirm?" + _query(min_price_move="0.1")).body)
         assert page.rows["min price movement"] == "changed"
@@ -1101,7 +1073,7 @@ class TestConfirmPage:
             self):
         # The minimum was left out, so it stays at the saved 25c with rebalancing off
         _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                           size_cap=0.1, same_title_size_cap=0.2, rebalance=True,
+                           size_cap=0.1, rebalance=True,
                            min_price_move=0.25))
         response = _get(_app(), "/confirm?" + _query(rebalance="off"))
         assert response.status == 400
@@ -1113,7 +1085,7 @@ class TestConfirmPage:
         # Named off by the link, or saved off and left out by it
         if saved_off:
             _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                               size_cap=0.1, same_title_size_cap=0.2))
+                               size_cap=0.1))
             given = {"min_price_move": "0.1"}
         else:
             given = {"rebalance": "off", "min_price_move": "0.1"}
@@ -1138,11 +1110,11 @@ class TestConfirmPage:
         {"rebalance": True, "rebalance_min_days_to_maturity": 7,
          "min_price_move": 0.25}])
     def test_a_missing_rebalance_until_keeps_the_saved_value(self, saved):
-        # A link that leaves it out (an older dashboard page, a hand-made link)
-        # keeps it as saved, shown as no change, exactly as the minimum price
-        # movement is kept
+        # A link that leaves it out (from a dashboard page without the
+        # "Rebalance until" choices, or made by hand) keeps it as saved, shown as
+        # no change, exactly as the minimum price movement is kept
         _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                           size_cap=0.1, same_title_size_cap=0.2, **saved))
+                           size_cap=0.1, **saved))
         page = _parse(_get(_app(), "/confirm?" + _query()).body)
         words = {None: "maturity", 1: "1 day before maturity", 7: "7 days before maturity"}
         expected = words[saved.get("rebalance_min_days_to_maturity")]
@@ -1177,7 +1149,7 @@ class TestConfirmPage:
 
     def test_a_named_rebalance_until_over_a_saved_one_is_the_only_change(self):
         _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                           size_cap=0.1, same_title_size_cap=0.2, rebalance=True,
+                           size_cap=0.1, rebalance=True,
                            rebalance_min_days_to_maturity=7))
         response = _get(_app(), "/confirm?" + _query(rebalance_min_days_to_maturity="1"))
         page = _parse(response.body)
@@ -1185,18 +1157,19 @@ class TestConfirmPage:
             "rebalance until"]
         assert page.cells["rebalance until"][1:3] == ["7 days before maturity",
                                                       "1 day before maturity"]
-        assert "1 of 12 settings change." in response.body
+        assert "1 of 11 settings change." in response.body
         # Naming 0 puts it back to "maturity"
         page = _parse(_get(_app(), "/confirm?" + _query(
             rebalance_min_days_to_maturity="0")).body)
         assert page.cells["rebalance until"][1:3] == ["7 days before maturity", "maturity"]
 
     def test_rebalance_off_without_the_field_clears_a_saved_limit(self):
-        # A page built before this field existed says rebalance=off and
-        # min_price_move=off and knows nothing of it: the limit goes with the
-        # switch, so the link is not refused for "needs rebalance on"
+        # A link that says rebalance=off and min_price_move=off and does not
+        # name the limit (a dashboard page without the "Rebalance until"
+        # choices sends one, and so may a link made by hand): the limit goes
+        # with the switch, so the link is not refused for "needs rebalance on"
         _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                           size_cap=0.1, same_title_size_cap=0.2, rebalance=True,
+                           size_cap=0.1, rebalance=True,
                            min_price_move=0.25, rebalance_min_days_to_maturity=7))
         query = _query(rebalance="off", min_price_move="off")
         proposed, _ = defaults_server._proposal(defaults_server._params(query),
@@ -1208,7 +1181,7 @@ class TestConfirmPage:
         assert [label for label, css in page.rows.items() if css == "changed"] == [
             "rebalance", "min price movement", "rebalance until"]
         assert page.cells["rebalance until"][1:3] == ["7 days before maturity", "maturity"]
-        assert "3 of 12 settings change." in response.body
+        assert "3 of 11 settings change." in response.body
 
     def test_rebalance_off_without_the_field_clears_it_with_nothing_saved(self):
         settings, _ = defaults_server._proposal(
@@ -1218,7 +1191,7 @@ class TestConfirmPage:
     def test_a_saved_limit_is_kept_when_the_link_leaves_out_both(self):
         # The switch is left out as well, so nothing says it goes off
         _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                           size_cap=0.1, same_title_size_cap=0.2, rebalance=True,
+                           size_cap=0.1, rebalance=True,
                            rebalance_min_days_to_maturity=7))
         proposed, _ = defaults_server._proposal(defaults_server._params(_query()),
                                                 config.read_saved_live_defaults())
@@ -1240,7 +1213,7 @@ class TestConfirmPage:
     def test_a_limit_with_rebalancing_saved_off_is_refused_with_the_reason(self):
         # The switch is left out, so it stays at the saved off
         _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                           size_cap=0.1, same_title_size_cap=0.2))
+                           size_cap=0.1))
         before = config.LIVE_DEFAULTS_FILE.read_bytes()
         response = _get(_app(), "/confirm?" + _query(rebalance_min_days_to_maturity="1"))
         assert response.status == 400
@@ -1273,9 +1246,9 @@ class TestConfirmPage:
 
     def test_a_missing_exclusion_proposes_none(self):
         _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                           size_cap=0.1, same_title_size_cap=0.2, exclude_categories=("Sports",),
+                           size_cap=0.1, exclude_categories=("Sports",),
                            exclude_tags=("Basketball",)))
-        page = _parse(_get(_app(), "/confirm?" + _query(same_title_size_cap="0.2")).body)
+        page = _parse(_get(_app(), "/confirm?" + _query()).body)
         assert page.rows["exclude categories"] == page.rows["exclude tags"] == "changed"
         assert page.cells["exclude categories"][1:3] == ["Sports", "none"]
         assert page.cells["exclude tags"][1:3] == ["Basketball", "none"]
@@ -1312,7 +1285,7 @@ class TestConfirmPage:
         assert page.buttons[1] == {"type": "button", "disabled": None}
         assert html.escape(defaults_server._NOTHING_TO_SAVE) in response.body
         assert "These are already the live defaults — nothing to save." in response.body
-        assert "0 of 12 settings change." in response.body
+        assert "0 of 11 settings change." in response.body
         # With nothing to save, the page does not say it writes
         assert "This writes" not in response.body
         assert str(config.LIVE_DEFAULTS_FILE.absolute()) in response.body
@@ -1370,7 +1343,7 @@ class TestTradePage:
 
     def test_it_shows_the_saved_defaults(self):
         saved = _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.4,
-                                   size_cap=1.0, same_title_size_cap=0.2), source=DASHBOARD_NOTE)
+                                   size_cap=1.0), source=DASHBOARD_NOTE)
         response = _get(_app(start_process=_Starter()), "/trade")
         assert response.status == 200
         page = _parse(response.body)
@@ -1700,7 +1673,11 @@ class TestConfirmRefusals:
         _query(k="nan"), _query(k="inf"), _query(k="0_8"), _query(k="1e-400"),
         _query(k="1e400"), _query(k="０.8"), _query(k=" 0.8"), _query(k="0"),
         _query(k="1.5"), _query(k="0x1"),
-        _query(size_cap="0.33"), _query(same_title_size_cap="0"),
+        _query(size_cap="0.33"),
+        # The field a link built before the same-title cap was removed carries,
+        # whatever its value
+        _query(same_title_size_cap="0.2"), _query(same_title_size_cap="0"),
+        _query(same_title_size_cap=""), _query(rebalance="on", same_title_size_cap="0.2"),
         # A field a link built before the category filter became a list of
         # categories to exclude carries, which exclude_category replaced
         _query(category="Sports"), _query(category="Sports", exclude_category="Politics"),
@@ -1782,13 +1759,22 @@ class TestConfirmRefusals:
 
     def test_the_seed_note_labels_the_seed_values_only(self):
         # The seed's values under its note are shown ...
-        assert _get(_app(), "/confirm?" + _query(
-            source=config.LIVE_DEFAULTS_SEED_SOURCE)).status == 200
-        # ... but a same-title cap that falls back to a saved 50% is not the
-        # seed's, so its note may not label it
-        _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                           size_cap=0.1, same_title_size_cap=0.5))
-        response = _get(_app(), "/confirm?" + _query(source=config.LIVE_DEFAULTS_SEED_SOURCE))
+        query = _query(source=config.LIVE_DEFAULTS_SEED_SOURCE)
+        assert _get(_app(), "/confirm?" + query).status == 200
+        # ... and still are over saved defaults whose minimum price movement,
+        # rebalance-until days and sell settings all differ from the seed's:
+        # under the seed's note, every field the link leaves out takes the
+        # seed's value, never the saved one
+        saved = _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5),
+                                   interval_discount=0.8, size_cap=0.1, rebalance=True,
+                                   min_price_move=0.25, rebalance_min_days_to_maturity=7,
+                                   sell_at=0.85, sell_min_days=3))
+        assert defaults_server._proposal(defaults_server._params(query), saved) == (
+            config.LIVE_DEFAULTS_SEED, config.LIVE_DEFAULTS_SEED_SOURCE)
+        assert _get(_app(), "/confirm?" + query).status == 200
+        # ... but a value the link names that is not the seed's may not carry its note
+        response = _get(_app(), "/confirm?" + _query(
+            k="0.75", source=config.LIVE_DEFAULTS_SEED_SOURCE))
         assert response.status == 400
         assert "may label only the seed values" in response.body
 
@@ -1840,6 +1826,78 @@ class TestConfirmRefusals:
         assert (f"this link was built before Rebalance (it names {field}): rebuild the "
                 "backtest dashboard, or open this server&#x27;s start page") in response.body
         assert "<form" not in response.body
+
+    # The refusal of a link that names the same-title cap and no older retired field
+    _SAME_TITLE_CAP_REFUSAL = (
+        "this link names same_title_size_cap, which is no longer used (the bot trades "
+        "time-series pairs only): rebuild the backtest dashboard, or open this "
+        "server&#x27;s start page")
+
+    @pytest.mark.parametrize("value", ["0.2", "0.05", "1", "0", "x", ""])
+    def test_a_link_naming_the_same_title_cap_says_how_to_get_a_new_one(self, value):
+        # A dashboard page built before the cap was removed sends it (when its
+        # run recorded one), as an old bookmark may: refused whatever its
+        # value, before any other field is read, saving nothing, over saved
+        # defaults or none
+        for saved in (False, True):
+            if saved:
+                _save(_BASE_SETTINGS)
+            before = config.LIVE_DEFAULTS_FILE.read_bytes() if saved else None
+            response = _get(_app(start_process=_Starter()),
+                            "/confirm?" + _query(same_title_size_cap=value, k="nan"))
+            assert response.status == 400, (value, saved)
+            assert self._SAME_TITLE_CAP_REFUSAL in response.body, (value, saved)
+            assert "<form" not in response.body and "<button" not in response.body
+            if saved:
+                assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
+            else:
+                assert config.read_saved_live_defaults() is None
+
+    @pytest.mark.parametrize("older, message", [
+        # A page built after Rebalance but before the category filter became a
+        # list to exclude sent category beside the cap: it is told about the
+        # category filter, exactly as a link naming category alone is
+        ({"category": "Sports"},
+         "this link names category, which exclude_category replaced (the category filter "
+         "is now a list of categories NOT to trade)"),
+        ({"tag": "Basketball"},
+         "this link names tag, which exclude_tag replaced (the tag filter is now a list "
+         "of tags NOT to trade)"),
+        ({"category": "Sports", "tag": "Basketball"},
+         "this link names category and tag, which exclude_category and exclude_tag "
+         "replaced (the category and tag filters are now lists of categories and tags NOT "
+         "to trade)"),
+        # A page built before Rebalance is told about Rebalance
+        ({"add_to_held_pairs": "on"}, "this link was built before Rebalance (it names "
+                                      "add_to_held_pairs)"),
+        ({"trim_to_kelly": "on", "trim_min_rise": "0.1", "category": "Sports"},
+         "this link was built before Rebalance (it names trim_to_kelly)"),
+    ], ids=["category", "tag", "category and tag", "rebalance", "rebalance and category"])
+    def test_a_link_naming_the_cap_beside_an_older_field_is_told_about_the_older_one(
+            self, older, message):
+        # The cap is the newest retirement, so the older field's message is the
+        # one that says what the link predates; the cap is not named in it
+        for query in (_query(same_title_size_cap="0.2", **older),
+                      _query(**older) + "&same_title_size_cap=0.2"):
+            response = _get(_app(), "/confirm?" + query)
+            assert response.status == 400, query
+            body = html.unescape(response.body)
+            assert (message + ": rebuild the backtest dashboard, or open this server's "
+                    "start page") in body, query
+            assert "same_title_size_cap" not in body, query
+            assert "<form" not in response.body
+        # ... and without the cap, the very same message
+        alone = _get(_app(), "/confirm?" + _query(**older))
+        assert alone.status == 400
+        assert message in html.unescape(alone.body)
+
+    def test_a_refusal_of_the_cap_is_logged_as_one_warning(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _get(_app(), "/confirm?" + _query(same_title_size_cap="0.2"))
+        [record] = caplog.records
+        assert record.levelno == logging.WARNING
+        assert record.getMessage() == (
+            "Refused (400 Bad Request): " + html.unescape(self._SAME_TITLE_CAP_REFUSAL))
 
     def test_an_invalid_proposal_is_refused_on_the_post_too(self):
         # A form carrying a proposal no page would render, signed as a page would sign it
@@ -2230,7 +2288,7 @@ class TestSeveralCategoriesAndTags:
         app = _app()
         form = _page_form(app, _filter_query(self._CATEGORIES, self._TAGS))
         _save(LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.8,
-                           size_cap=0.1, same_title_size_cap=0.5))
+                           size_cap=0.1))
         response = _post(app, form)
         assert response.status == 409
         page = _parse(response.body)
@@ -2260,8 +2318,10 @@ class TestRefusedFile:
         assert app._start_process.calls == []
 
 
-# A file the previous version's writer wrote, in its exact layout: adding to
-# held pairs on, the Kelly trim on with a 10c minimum price rise
+# A file a version from before Rebalance wrote, in its exact layout: adding to
+# held pairs on, the Kelly trim on with a 10c minimum price rise, and the old
+# category and tag keys and the same-title cap, which every file saved then
+# holds
 _OLD_VERSION_BYTES = (
     b'{\n'
     b'  "format": "live-defaults-v1",\n'
@@ -2280,9 +2340,10 @@ _OLD_VERSION_BYTES = (
     b'    "trim_min_rise": 0.1\n'
     b'  }\n'
     b'}\n')
-# What it reads as now: rebalance yes with the old 10c minimum, the rest as saved
+# What it reads as now: rebalance yes with the old 10c minimum, no category or
+# tag excluded, no same-title cap, the rest as saved
 _OLD_VERSION_READS_AS = LiveSettings(tier_floors=False, spread_band=(0.0, 0.8),
-                                     interval_discount=0.7, size_cap=0.15, same_title_size_cap=0.2,
+                                     interval_discount=0.7, size_cap=0.15,
                                      rebalance=True, min_price_move=0.10)
 # The notice the confirmation page shows above its table when it proposes them
 _OUTDATED_CONFIRM_NOTICE = (
@@ -2292,7 +2353,7 @@ _OUTDATED_CONFIRM_NOTICE = (
 
 def _old_version_file() -> defaults_server._Response:
     """
-    Write the previous version's file as the saved defaults, and open the link the index offers.
+    Write the file saved before Rebalance as the saved defaults, and open the index that links it.
 
     Returns:
         defaults_server._Response: The index page, which carries the link.
@@ -2303,7 +2364,7 @@ def _old_version_file() -> defaults_server._Response:
 
 def _outdated_link() -> str:
     """
-    The link every page offers for the previous version's file: its values in their new form.
+    The link every page offers for the file saved before Rebalance: its values in their new form.
 
     Returns:
         str: /confirm? and the query naming every field, with no source note.
@@ -2312,11 +2373,13 @@ def _outdated_link() -> str:
 
 
 class TestOutdatedFile:
-    """A file the previous version saved (add_to_held_pairs, trim_to_kelly and
-    trim_min_rise) is never traded: the confirmation page counts nothing as in
-    force and offers its values in their new form (rebalance yes, the old
-    minimum) for one Confirm and save, which replaces the file; every other
-    page shows a notice linking there; and every run stays refused, or keeps
+    """A file saved before Rebalance (add_to_held_pairs, trim_to_kelly and
+    trim_min_rise, beside the later changes' old keys: categories, tags and
+    the same-title cap) is never traded: the confirmation page counts nothing
+    as in force and offers its values in their new form (rebalance yes, the
+    old minimum, no same-title cap) for one Confirm and save, which replaces
+    the file; every other page shows a notice linking there, naming only
+    Rebalance, the earliest change; and every run stays refused, or keeps
     every blocker, until the save."""
 
     def test_the_index_shows_the_notice_and_the_link(self):
@@ -2326,10 +2389,33 @@ class TestOutdatedFile:
                 "refuses them until they are saved again.") in response.body
         assert _outdated_link() in _parse(response.body).links
         assert "read as Rebalance yes and Min. price movement 10c" in response.body
+        # Only the earliest change is named: the file's null category and tag
+        # keys, and its same-title cap, leave what it trades as it was
+        assert "same-title" not in response.body
+        assert "category filter" not in response.body and "tag filter" not in response.body
+
+    def test_only_the_earliest_change_is_named_while_the_file_can_be_read(self):
+        # Every later change's old key sits in the file, but the notice names
+        # Rebalance alone; with no reading in the new form it names all four
+        config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+        with pytest.raises(config.LiveDefaultsOutdated) as caught:
+            config.read_saved_live_defaults()
+        assert caught.value.retired == ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise",
+                                        "categories", "tags", "same_title_size_cap")
+        assert defaults_server._outdated_changes(caught.value) == (True, False, False, False)
+        assert defaults_server._outdated_when(caught.value) == "before Rebalance"
+        assert defaults_server._outdated_reading(caught.value) == (
+            "Rebalance yes and Min. price movement 10c")
+        unreadable = config.LiveDefaultsOutdated("m", None, caught.value.retired)
+        assert defaults_server._outdated_changes(unreadable) == (True, True, True, True)
+        assert defaults_server._outdated_when(unreadable) == (
+            "before Rebalance and before the category filter became a list of categories to "
+            "exclude and before the tag filter became a list of tags to exclude and before the "
+            "same-title cap was removed")
 
     def test_the_link_names_every_field_and_no_source_note(self):
         params = defaults_server._params(_outdated_link().split("?", 1)[1])
-        assert "source" not in params
+        assert "source" not in params and "same_title_size_cap" not in params
         assert [name for name in defaults_server._FIELDS
                 if name not in ("exclude_category", "exclude_tag", "source")] == list(params)
         assert params["rebalance"] == ["on"] and params["min_price_move"] == ["0.1"]
@@ -2357,7 +2443,7 @@ class TestOutdatedFile:
         assert page.cells["per-trade cap"][2] == "15%"
         assert page.cells["rebalance"][2] == "yes"
         assert page.cells["min price movement"][2] == "10c"
-        assert "12 of 12 settings change." in response.body
+        assert "11 of 11 settings change." in response.body
 
     def test_a_link_that_leaves_the_limit_out_keeps_the_old_file_s(self):
         # The old file's values in their new form carry no limit, so "maturity"
@@ -2390,7 +2476,8 @@ class TestOutdatedFile:
         assert config.read_saved_live_defaults() == _OLD_VERSION_READS_AS
         assert config.live_defaults() == _OLD_VERSION_READS_AS
         text = config.LIVE_DEFAULTS_FILE.read_text()
-        for retired in ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise"):
+        for retired in ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise",
+                        "same_title_size_cap"):
             assert retired not in text
         assert '"rebalance": true' in text and '"min_price_move": 0.1' in text
         # ... and every page reads it as the defaults in force
@@ -2592,8 +2679,8 @@ class TestOutdatedFile:
         assert _OUTDATED_CONFIRM_NOTICE not in response.body
 
     def test_a_lower_cap_over_the_old_file_still_warns_it_sells_more(self):
-        # The held pairs were bought and trimmed under the old file's caps, so
-        # a save at a lower cap is compared with them (nothing counts as in
+        # The held pairs were bought and trimmed under the old file's cap, so
+        # a save at a lower cap is compared with it (nothing counts as in
         # force, yet the red sell-more warning still shows); the link that
         # proposes exactly the old values shows none
         config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
@@ -2602,14 +2689,15 @@ class TestOutdatedFile:
                        min_price_move="0.1")
         body = html.unescape(_get(app, "/confirm?" + query).body)
         assert "these settings can sell more of the held pairs" in body
-        assert "the time-series size cap goes from 15% to 10%" in body
+        assert "the per-trade cap goes from 15% to 10%" in body
         assert 'class="warn"' not in _get(app, _outdated_link()).body
 
     def test_a_link_naming_some_fields_keeps_the_old_file_s_others(self):
         # A link that leaves fields out keeps them as the old file had them
-        # (its sell rule, same-title cap, Rebalance and minimum), never the
-        # seed's, exactly as it keeps a usable saved file's: here an old file
-        # that only added to held pairs, which reads as Rebalance no
+        # (its sell rule, Rebalance and minimum), never the seed's, exactly as
+        # it keeps a usable saved file's: here an old file that only added to
+        # held pairs, which reads as Rebalance no. Its same-title cap is gone
+        # whatever it was: the page has no row for one, and the save writes none
         old = (_OLD_VERSION_BYTES
                .replace(b'"same_title_size_cap": 0.2', b'"same_title_size_cap": 0.5')
                .replace(b'"trim_to_kelly": true,\n    "trim_min_rise": 0.1',
@@ -2624,14 +2712,15 @@ class TestOutdatedFile:
         response = _get(app, "/confirm?" + query)
         page = _parse(response.body)
         assert page.cells["rebalance"][2] == "no"
-        assert page.cells["same-title cap"][2] == "50%"
+        assert "same-title cap" not in page.rows
         assert page.cells["sell at"][2] != "off"
         posted = _post(app, _click(response.body, "confirm"))
         assert posted.status == 303
         saved = config.read_saved_live_defaults()
         assert saved == caught.value.proposal
-        assert (saved.same_title_size_cap, saved.rebalance, saved.min_price_move,
-                saved.sell_at, saved.sell_min_days) == (0.5, False, None, 0.85, 7)
+        assert (saved.rebalance, saved.min_price_move, saved.sell_at,
+                saved.sell_min_days) == (False, None, 0.85, 7)
+        assert "same_title_size_cap" not in config.LIVE_DEFAULTS_FILE.read_text()
 
     def test_an_old_file_whose_other_settings_are_refused_points_at_new_ones(self):
         # The old minimum is off the 5c grid: there is no proposal, so the
@@ -2758,9 +2847,9 @@ class TestOutdatedFile:
         saved = config.read_saved_live_defaults()
         assert saved == proposal
         assert (saved.tier_floors, saved.spread_band, saved.interval_discount,
-                saved.size_cap, saved.same_title_size_cap, saved.rebalance,
-                saved.min_price_move, saved.sell_at, saved.exclude_categories) == (
-            False, (0.0, 0.8), 0.7, 0.15, 0.2, True, 0.1, None, None)
+                saved.size_cap, saved.rebalance, saved.min_price_move, saved.sell_at,
+                saved.exclude_categories) == (
+            False, (0.0, 0.8), 0.7, 0.15, True, 0.1, None, None)
 
     def test_a_listed_file_s_link_keeps_its_sell_rule_and_tags(self):
         # The offered link carries every one of the file's other settings
@@ -2805,15 +2894,20 @@ class TestOutdatedFile:
         self._tags_file(b"null")
         with pytest.raises(config.LiveDefaultsOutdated) as caught:
             config.read_saved_live_defaults()
-        assert caught.value.retired == ("tags",) and caught.value.old_tags is None
+        # The file holds the same-title cap too, a later change than the tag
+        # filter's, so only the tag filter's change is named
+        assert caught.value.retired == ("tags", "same_title_size_cap")
+        assert caught.value.old_tags is None
         assert caught.value.proposal == replace(_OLD_VERSION_READS_AS,
                                                 exclude_categories=("Politics",))
+        assert defaults_server._outdated_changes(caught.value) == (False, False, True, False)
         app = _app()
         index = _get(app, "/")
         assert ("The saved live defaults were saved before the tag filter became a list "
                 "of tags to exclude, so every live run refuses them until they are saved "
                 "again.") in index.body
-        assert "read as no tag excluded" in index.body
+        assert "read as no tag excluded</a>" in index.body
+        assert "same-title" not in index.body
         assert "limited trading to these tags" not in html.unescape(index.body)
         link = "/confirm?" + defaults_server._settings_query(caught.value.proposal)
         confirm = _get(app, link)
@@ -2902,6 +2996,293 @@ class TestOutdatedFile:
         assert "traded only these categories" not in html.unescape(trade.body)
 
 
+# Settings that differ from tests/test_config.py's _SAME_TITLE_CAP_ERA_PROPOSAL
+# in every toggle, saved where a test needs other defaults in force
+_UNLIKE_THE_CAP_ERA = LiveSettings(
+    tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.2,
+    exclude_categories=("Sports",), exclude_tags=("Basketball",), rebalance=False,
+    sell_at=0.9, sell_min_days=5)
+
+
+class TestSameTitleCapFile:
+    """A file saved before the same-title cap was removed: it holds
+    same_title_size_cap and no older retired setting, the shape of every file
+    saved since the tag filter became a list of tags to exclude, and the shape
+    of the account's own saved defaults (tests/test_config.py's
+    _SAME_TITLE_CAP_ERA_BYTES). No run trades it. Every page names that one
+    change and offers its other settings as saved, with no same-title cap, for
+    one Confirm and save; the save writes no same-title cap, and the runs that
+    follow read the new file."""
+
+    # The notice /, /trade and /saved show for it, with its link
+    @staticmethod
+    def _notice(link: str) -> str:
+        """
+        The red notice the pages that cannot use the file show, as HTML.
+
+        Args:
+            link (str): The confirmation link it carries.
+
+        Returns:
+            str: The one paragraph.
+        """
+        return ('<p class="banner">The saved live defaults were saved before the same-title '
+                "cap was removed, so every live run refuses them until they are saved again. "
+                f'<a href="{html.escape(link)}">Review their values, read as no same-title '
+                "cap</a>: one Confirm and save there replaces the file.</p>")
+
+    # The banner the confirmation page shows above its table when it proposes them
+    _BANNER = ('<p class="banner">The saved live defaults were saved before the same-title cap '
+               "was removed. Below: their values, read as no same-title cap. Confirm and save "
+               "to replace the file.</p>")
+
+    @staticmethod
+    def _write(data: bytes | None = None) -> tuple[config.LiveDefaultsOutdated, str]:
+        """
+        Save the account-shaped file (or other bytes) as the live defaults, and read its refusal.
+
+        Args:
+            data (bytes | None): The file's bytes; None writes
+                _SAME_TITLE_CAP_ERA_BYTES.
+
+        Returns:
+            tuple[config.LiveDefaultsOutdated, str]: The refusal, and the
+                /confirm? link to its proposal ("" when it has none).
+        """
+        from .test_config import _SAME_TITLE_CAP_ERA_BYTES
+        config.LIVE_DEFAULTS_FILE.write_bytes(_SAME_TITLE_CAP_ERA_BYTES if data is None else data)
+        with pytest.raises(config.LiveDefaultsOutdated) as caught:
+            config.read_saved_live_defaults()
+        proposal = caught.value.proposal
+        link = "" if proposal is None else "/confirm?" + defaults_server._settings_query(proposal)
+        return caught.value, link
+
+    def test_its_one_change_is_named_and_read_as_no_same_title_cap(self):
+        from .test_config import _SAME_TITLE_CAP_ERA_PROPOSAL
+        outdated, _ = self._write()
+        assert outdated.retired == ("same_title_size_cap",)
+        assert outdated.proposal == _SAME_TITLE_CAP_ERA_PROPOSAL
+        assert defaults_server._outdated_changes(outdated) == (False, False, False, True)
+        assert defaults_server._outdated_when(outdated) == "before the same-title cap was removed"
+        # Never read as the Rebalance choice, though the file rebalances
+        assert defaults_server._outdated_reading(outdated) == "no same-title cap"
+        assert "Rebalance" not in defaults_server._outdated_reading(outdated)
+
+    @pytest.mark.parametrize("target, status", [("/", 200), ("/trade", 409), ("/saved", 409)])
+    def test_every_page_that_cannot_use_it_shows_the_notice_and_the_link(self, target, status):
+        outdated, link = self._write()
+        response = _get(_app(start_process=_Starter()), target)
+        assert response.status == status
+        assert self._notice(link) in response.body
+        assert link in _parse(response.body).links
+        # No other change is named, nor any widening of the filter
+        body = html.unescape(response.body)
+        assert "before Rebalance" not in body and "filter became" not in body
+        assert "read as Rebalance" not in body
+        assert "traded only these categories" not in body
+        assert "limited trading to these tags" not in body
+        assert "Fix or delete" not in body
+
+    def test_the_link_names_every_field_of_its_values_and_no_same_title_cap(self):
+        from .test_config import _SAME_TITLE_CAP_ERA_PROPOSAL
+        _, link = self._write()
+        params = defaults_server._params(link.split("?", 1)[1])
+        assert params == {
+            "tier_floors": ["off"], "spread_min": ["0.2"], "spread_max": ["0.8"], "k": ["0.85"],
+            "size_cap": ["0.1"], "rebalance": ["on"], "min_price_move": ["0.1"],
+            "rebalance_min_days_to_maturity": ["7"], "sell_at": ["off"], "sell_min_days": ["off"],
+            "exclude_tag": ["Climate and Weather · Ski Resorts", "Entertainment · General"]}
+        # It proposes exactly them, whatever is saved
+        for saved in (None, _UNLIKE_THE_CAP_ERA, config.LIVE_DEFAULTS_SEED):
+            assert defaults_server._proposal(params, saved) == (_SAME_TITLE_CAP_ERA_PROPOSAL, "")
+
+    def test_the_confirmation_page_shows_the_banner_and_eleven_rows(self):
+        from .test_config import _SAME_TITLE_CAP_ERA_PROPOSAL
+        _, link = self._write()
+        response = _get(_app(), link)
+        assert response.status == 200
+        assert self._BANNER in response.body
+        # The banner sits above the table
+        assert response.body.index(self._BANNER) < response.body.index("<table>")
+        assert "Save the live trading defaults again?" in response.body
+        assert ("Live defaults in force: none — the saved file was saved before the same-title "
+                "cap was removed, and live runs refuse it until it is saved again") in response.body
+        page = _parse(response.body)
+        assert list(page.rows) == LABELS and len(page.rows) == 11
+        assert "same-title cap" not in page.rows
+        # Nothing counts as in force: every row is a change from nothing
+        assert set(page.rows.values()) == {"changed"}
+        assert all(cells[1] == "—" for cells in page.cells.values())
+        assert [page.cells[label][2] for label in LABELS] == [
+            new for _, _, new, _ in config.live_settings_changes(None, _SAME_TITLE_CAP_ERA_PROPOSAL)]
+        assert page.cells["exclude tags"][2] == (
+            "Climate and Weather · Ski Resorts, Entertainment · General")
+        assert "11 of 11 settings change." in response.body
+        # These settings warn of nothing, and the save sells nothing more
+        assert config.live_rule_warnings(_SAME_TITLE_CAP_ERA_PROPOSAL) == []
+        assert 'class="warn"' not in response.body
+
+    def test_another_proposal_over_it_links_to_its_own_values(self):
+        # A dashboard page's Save proposes other values: the page says the save
+        # replaces the file with them, and links to the file's own
+        _, link = self._write()
+        response = _get(_app(), "/confirm?" + _query())
+        assert response.status == 200
+        assert ("The saved live defaults were saved before the same-title cap was removed, so "
+                "every live run refuses them. Confirm and save replaces the file with the "
+                f'settings below; <a href="{html.escape(link)}">their own values</a> read as no '
+                "same-title cap.</p>") in response.body
+        assert self._BANNER not in response.body
+
+    def test_a_start_logs_where_to_save_it_again(self, run_main):
+        _, link = self._write()
+        log = run_main["run"](["--no-browser"])
+        assert ("WARNING  The saved live defaults were saved before the same-title cap was "
+                "removed, and every live run refuses them until they are saved again: open "
+                f"http://127.0.0.1:{PORT}{link} to review their values (read as no same-title "
+                "cap) and save them; do not delete the file\n") in log
+
+    def test_its_fingerprint_is_its_own_and_its_pages_go_stale_once_it_is_replaced(self):
+        from .test_config import _SAME_TITLE_CAP_ERA_PROPOSAL
+        outdated, link = self._write()
+        fingerprint = defaults_server._fingerprint(None, outdated)
+        # Neither no file's, nor a file saved before Rebalance's, nor its own
+        # values' once they are saved
+        assert fingerprint != defaults_server._fingerprint(None)
+        older, _ = self._write(_OLD_VERSION_BYTES)
+        assert fingerprint != defaults_server._fingerprint(None, older)
+        assert fingerprint != defaults_server._fingerprint(_SAME_TITLE_CAP_ERA_PROPOSAL)
+        # A page built while it was there, posted after another page's save
+        # replaced it, is shown again against what is now saved, saving nothing
+        self._write()
+        app = _app()
+        first = _click(_get(app, link).body, "confirm")
+        second = _page_form(app, _query())
+        assert _post(app, second).status == 303
+        replaced = config.LIVE_DEFAULTS_FILE.read_bytes()
+        response = _post(app, first)
+        assert response.status == 409
+        assert html.escape(defaults_server._STALE_BANNER) in response.body
+        assert self._BANNER not in response.body
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == replaced
+
+    def test_a_cap_the_older_version_refused_points_at_new_ones(self, run_main):
+        # A cap off the 5% grid has no reading, so nothing is offered: the
+        # pages link to the seed values, and the start-up WARNING to the index
+        from .test_config import _SAME_TITLE_CAP_ERA_BYTES
+        outdated, link = self._write(_SAME_TITLE_CAP_ERA_BYTES.replace(
+            b'"same_title_size_cap": 0.2', b'"same_title_size_cap": 0.07'))
+        assert outdated.proposal is None and link == ""
+        assert defaults_server._outdated_changes(outdated) == (False, False, False, True)
+        assert defaults_server._outdated_when(outdated) == "before the same-title cap was removed"
+        trade = _get(_app(), "/trade")
+        assert trade.status == 409
+        body = html.unescape(trade.body)
+        assert ("The saved live defaults were saved before the same-title cap was removed, and "
+                "every live run refuses them:") in body
+        assert "its other settings are refused too" in body
+        assert "/confirm?" + defaults_server._seed_query() in _parse(trade.body).links
+        log = run_main["run"](["--no-browser"])
+        assert ("WARNING  The saved live defaults were saved before the same-title cap was "
+                "removed, and every live run refuses them (") in log
+        assert f"): open http://127.0.0.1:{PORT}/ and save new ones; a save replaces the file\n" \
+            in log
+
+    def test_the_account_s_file_is_saved_again_in_one_confirm_and_runs_read_it(self, capsys):
+        # End to end, from the file exactly as the account has it saved: every
+        # live run refuses it; the start page links to its values; that page
+        # shows them in eleven rows; one Confirm and save writes them with no
+        # same-title cap; and live runs then read the new file
+        from kalshi_betting import main
+
+        from .test_config import _SAME_TITLE_CAP_ERA_PROPOSAL
+        proposal = _SAME_TITLE_CAP_ERA_PROPOSAL
+        _, link = self._write()
+        parser = main._build_parser()
+        with pytest.raises(SystemExit) as exited:
+            main._resolve_live_settings(parser.parse_args(["--mode", "prod"]), parser)
+        assert exited.value.code == 2
+        assert "same_title_size_cap, which is no longer used" in capsys.readouterr().err
+        app = _app()
+        # The start page: the notice and the link
+        index = _get(app, "/")
+        assert index.status == 200
+        assert self._notice(link) in index.body
+        params = defaults_server._params(link.split("?", 1)[1])
+        assert "same_title_size_cap" not in params
+        assert defaults_server._proposal(params, None) == (proposal, "")
+        # The confirmation page the link opens
+        confirm = _get(app, link)
+        assert confirm.status == 200
+        assert self._BANNER in confirm.body
+        page = _parse(confirm.body)
+        assert list(page.rows) == LABELS and "same-title cap" not in page.rows
+        assert "11 of 11 settings change." in confirm.body
+        # Confirm and save, through the page's own form
+        posted = _post(app, _click(confirm.body, "confirm"))
+        assert posted.status == 303 and posted.location == "/saved"
+        stored = json.loads(config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8"))
+        assert "same_title_size_cap" not in stored["settings"]
+        saved = config.read_saved_live_defaults()
+        assert saved == proposal
+        for name in config.LIVE_TOGGLE_FIELDS:
+            assert getattr(saved, name) == getattr(proposal, name), name
+        # The tied tags keep their middle dot
+        assert saved.exclude_tags == ("Climate and Weather · Ski Resorts", "Entertainment · General")
+        # Every live run now reads it, and its "Live settings:" line names no same-title cap
+        settings, reference = main._resolve_live_settings(parser.parse_args(["--mode", "prod"]),
+                                                          parser)
+        assert settings == reference == proposal
+        line = config.describe_live_settings(settings)
+        assert "same-title" not in line and "same_title" not in line
+        assert "| exclude tags Climate and Weather · Ski Resorts, Entertainment · General |" in line
+        # ... and every page reads it as the defaults in force
+        assert _get(app, "/saved").status == 200 and _get(app, "/trade").status == 200
+        assert "same-title" not in _get(app, "/").body
+
+    def test_confirm_and_trade_saves_it_then_runs_exactly_it(self):
+        # Confirm and trade from the page the notice links to saves the same
+        # file, then starts one real-money run whose command names no
+        # same-title cap and, read by main.py's own parser, trades exactly
+        # these settings, whatever is saved by then
+        from kalshi_betting import main
+
+        from .test_config import _SAME_TITLE_CAP_ERA_PROPOSAL
+        proposal = _SAME_TITLE_CAP_ERA_PROPOSAL
+        _, link = self._write()
+        starter = _Starter()
+        app = _app(start_process=starter)
+        run_id = _run_id(_post(app, _page_form(app, link.split("?", 1)[1], "confirm-trade")))
+        # Saved first, exactly as Confirm and save writes it
+        assert "same_title_size_cap" not in config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8")
+        assert config.read_saved_live_defaults() == proposal
+        [(argv, kwargs)] = starter.calls
+        folder = _run_folder(run_id)
+        assert argv == [sys.executable, "-m", "kalshi_betting.main", "--mode", "prod",
+                        *config.live_settings_argv(proposal), "--result-file",
+                        str(folder / "result.json")]
+        assert not any(arg.startswith("--same-title") for arg in argv)
+        assert kwargs["start_new_session"] is True
+        [record] = starter.run_json
+        assert record["dry_run"] is False
+        assert record["settings"] == config.describe_live_settings(proposal)
+        assert "same-title" not in record["settings"]
+        # main.py's parser reads the command (after "-m kalshi_betting.main")
+        # as exactly the proposal, over saved defaults unlike it in every toggle
+        parser = main._build_parser()
+        args = parser.parse_args(argv[3:])
+        assert args.retired_same_title_size_cap is None
+        assert (args.mode, args.dry_run, args.result_file) == (
+            "prod", False, folder / "result.json")
+        assert all(getattr(_UNLIKE_THE_CAP_ERA, name) != getattr(proposal, name)
+                   for name in config.LIVE_TOGGLE_FIELDS)
+        config.save_live_defaults(_UNLIKE_THE_CAP_ERA, source="")
+        settings, _ = main._resolve_live_settings(args, parser)
+        assert settings == proposal
+        for name in config.LIVE_TOGGLE_FIELDS:
+            assert getattr(settings, name) == getattr(proposal, name), name
+
+
 class TestSave:
     """POST /confirm with Confirm and save writes exactly what its page showed, after every check."""
 
@@ -2934,14 +3315,13 @@ class TestSave:
 
     def test_it_overwrites_the_defaults_in_force(self):
         _save(LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
-                           size_cap=0.2, same_title_size_cap=1.0))
+                           size_cap=0.2))
         app = _app()
-        form = _page_form(app, _query(exclude_category="Sports", exclude_tag="Basketball",
-                                      same_title_size_cap="0.5"))
+        form = _page_form(app, _query(exclude_category="Sports", exclude_tag="Basketball"))
         assert _post(app, form).status == 303
         assert config.read_saved_live_defaults() == LiveSettings(
             tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8, size_cap=0.1,
-            same_title_size_cap=0.5, exclude_categories=("Sports",), exclude_tags=("Basketball",))
+            exclude_categories=("Sports",), exclude_tags=("Basketball",))
 
     def test_a_form_with_a_charset_is_accepted(self):
         app = _app()
@@ -3051,14 +3431,12 @@ class TestSave:
         lambda f: [(n, "0.4" if n == "k" else v) for n, v in f],
         lambda f: f + [("exclude_category", "Economics")],
         lambda f: [(n, v) for n, v in f if n != "exclude_tag"],
-        lambda f: [(n, v) for n, v in f if n != "same_title_size_cap"],
         lambda f: [(n, "1" if n == "rebalance_min_days_to_maturity" else v) for n, v in f],
         lambda f: [(n, v) for n, v in f if n != "rebalance_min_days_to_maturity"],
     ])
     def test_a_field_changed_after_signing_is_refused(self, tamper):
         app = _app()
         form = _page_form(app, _query(exclude_category="Sports", exclude_tag="Basketball",
-                                      same_title_size_cap="0.5",
                                       rebalance_min_days_to_maturity="7"))
         assert _post(app, tamper(form)).status == 403
         assert config.read_saved_live_defaults() is None
@@ -3073,7 +3451,7 @@ class TestSave:
         app = _app()
         form = _page_form(app, _query())
         other = _save(LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
-                                   size_cap=0.2, same_title_size_cap=1.0))
+                                   size_cap=0.2))
         before = config.LIVE_DEFAULTS_FILE.read_bytes()
         response = _post(app, form)
         assert response.status == 409
@@ -3087,12 +3465,11 @@ class TestSave:
         # The page shown again saves
         assert _post(app, again).status == 303
         assert config.read_saved_live_defaults() == LiveSettings(
-            tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8, size_cap=0.1,
-            same_title_size_cap=1.0)
+            tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8, size_cap=0.1)
 
     def test_a_failed_save_is_a_500_and_keeps_the_old_file(self, monkeypatch):
         _save(LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
-                           size_cap=0.2, same_title_size_cap=1.0))
+                           size_cap=0.2))
         before = config.LIVE_DEFAULTS_FILE.read_bytes()
         app = _app()
         form = _page_form(app, _query())
@@ -3145,7 +3522,7 @@ class TestSave:
 
     def test_the_save_is_logged_against_the_defaults_it_replaced(self, caplog):
         _save(LiveSettings(tier_floors=True, spread_band=(0.0, 0.5), interval_discount=0.8,
-                           size_cap=0.1, same_title_size_cap=0.2))
+                           size_cap=0.1))
         app = _app()
         form = _page_form(app, _query())
         with caplog.at_level(logging.INFO):
@@ -3188,7 +3565,7 @@ class TestSavedPage:
 
     def test_a_warning_is_shown_as_a_note_on_what_was_saved(self):
         saved = _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.4,
-                                   size_cap=1.0, same_title_size_cap=0.2))
+                                   size_cap=1.0))
         body = _get(_app(), "/saved").body
         sentences = config.live_rule_warnings(saved)
         assert sentences
@@ -3209,7 +3586,7 @@ class TestSeed:
         assert source == config.LIVE_DEFAULTS_SEED_SOURCE
         # It names every field, so what is saved does not change it
         saved = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
-                             size_cap=0.2, same_title_size_cap=1.0)
+                             size_cap=0.2)
         assert defaults_server._proposal(params, saved)[0] == config.LIVE_DEFAULTS_SEED
 
     def test_the_seed_query_spells_selling_off(self):
@@ -3223,11 +3600,14 @@ class TestSeed:
         assert params["rebalance"] == ["on"] and params["min_price_move"] == ["off"]
         assert config.LIVE_DEFAULTS_SEED.rebalance is True
         assert config.LIVE_DEFAULTS_SEED.min_price_move is None
-        # Every field the seed sets, in the server's field order, then its note
+        # Every field the seed sets, in the server's field order, then its note;
+        # no same-title cap, which the server refuses on a link
         assert list(params) == ["tier_floors", "spread_min", "spread_max", "k", "size_cap",
-                                "same_title_size_cap", "rebalance", "min_price_move",
+                                "rebalance", "min_price_move",
                                 "rebalance_min_days_to_maturity", "sell_at", "sell_min_days",
                                 "source"]
+        assert defaults_server._proposal(params, None) == (
+            config.LIVE_DEFAULTS_SEED, config.LIVE_DEFAULTS_SEED_SOURCE)
 
     def test_the_seed_query_spells_maturity_as_zero(self):
         # No limit on how close to maturity a held position is rebalanced
@@ -3247,7 +3627,7 @@ class TestSeed:
         page = _parse(response.body)
         assert [label for label, css in page.rows.items() if css == "changed"] == [row]
         assert page.cells[row][1:3] == cells
-        assert "1 of 12 settings change." in response.body
+        assert "1 of 11 settings change." in response.body
 
     def test_the_seed_page_proposes_the_seed_s_rebalance_until(self):
         # Over saved defaults that stop short of maturity, the seed link changes
@@ -3262,7 +3642,7 @@ class TestSeed:
             assert [label for label, css in page.rows.items() if css == "changed"] == [
                 "rebalance until"]
             assert page.cells["rebalance until"][1:3] == ["7 days before maturity", "maturity"]
-            assert "1 of 12 settings change." in response.body
+            assert "1 of 11 settings change." in response.body
             assert defaults_server._proposal(
                 defaults_server._params(query), config.read_saved_live_defaults()) == (
                 config.LIVE_DEFAULTS_SEED, config.LIVE_DEFAULTS_SEED_SOURCE)
@@ -3310,7 +3690,7 @@ class TestSeed:
         page = _parse(response.body)
         assert [label for label, css in page.rows.items() if css == "changed"] == [
             "sell at", "min days to maturity"]
-        assert "2 of 12 settings change." in response.body
+        assert "2 of 11 settings change." in response.body
 
     def test_a_seed_link_that_leaves_selling_out_still_proposes_the_seed(self):
         # A seed link from before selling existed (no sell fields), opened over
@@ -3355,16 +3735,16 @@ class TestHelpers:
 
     @pytest.mark.parametrize("settings, written", [
         (LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                      size_cap=0.1, same_title_size_cap=0.2, rebalance=True), "0"),
+                      size_cap=0.1, rebalance=True), "0"),
         (LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                      size_cap=0.1, same_title_size_cap=0.2, rebalance=True,
+                      size_cap=0.1, rebalance=True,
                       rebalance_min_days_to_maturity=1), "1"),
         (LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                      size_cap=0.1, same_title_size_cap=0.2, rebalance=True, min_price_move=0.1,
+                      size_cap=0.1, rebalance=True, min_price_move=0.1,
                       rebalance_min_days_to_maturity=7), "7"),
         # With rebalancing off there is no limit to write but "maturity"
         (LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                      size_cap=0.1, same_title_size_cap=0.2), "0"),
+                      size_cap=0.1), "0"),
     ])
     def test_the_settings_query_names_the_limit_and_reads_back(self, settings, written):
         query = defaults_server._settings_query(settings)
@@ -3376,18 +3756,29 @@ class TestHelpers:
         # It proposes exactly these settings, whatever is saved
         for saved in (None, LiveSettings(tier_floors=True, spread_band=(0.0, 1.0),
                                          interval_discount=0.75, size_cap=0.2,
-                                         same_title_size_cap=1.0, rebalance=True,
+                                         rebalance=True,
                                          rebalance_min_days_to_maturity=7)):
             assert defaults_server._proposal(params, saved) == (settings, "")
 
     def test_the_fields_hold_the_limit_once_and_in_the_queries_order(self):
         assert defaults_server._FIELDS.count("rebalance_min_days_to_maturity") == 1
         assert "rebalance_min_days_to_maturity" not in defaults_server._REPEATABLE
-        assert len(defaults_server._FIELDS) == 14
+        assert len(defaults_server._FIELDS) == 13
         names = list(defaults_server._params(defaults_server._settings_query(
             replace(config.LIVE_DEFAULTS_SEED, exclude_categories=("A",), exclude_tags=("B",)),
             source=config.LIVE_DEFAULTS_SEED_SOURCE)))
         assert names == list(defaults_server._FIELDS)
+
+    def test_the_same_title_cap_is_a_retired_field_and_no_proposal_field(self):
+        # A link may not set it (it is refused), and no page or run names it:
+        # the eleven toggles are LiveSettings' own, the cap no longer among them
+        assert "same_title_size_cap" not in defaults_server._FIELDS
+        assert defaults_server._RETIRED_FIELDS[-1] == "same_title_size_cap"
+        assert "same_title_size_cap" not in config.LIVE_TOGGLE_FIELDS
+        assert len(config.LIVE_TOGGLE_FIELDS) == 11
+        # The notice reads the Rebalance retirement from config's one list
+        assert defaults_server._REBALANCE_RETIREMENTS == config._RETIREMENTS[0][0] == (
+            "add_to_held_pairs", "trim_to_kelly", "trim_min_rise")
 
     def test_the_fingerprint_follows_the_defaults_and_when_they_were_saved(self):
         seed = config.LIVE_DEFAULTS_SEED
@@ -3875,7 +4266,7 @@ class TestActions:
     def test_the_trade_page_keeps_a_saved_rebalance_until(self):
         # /trade runs the saved defaults, flags and all
         saved = _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                                   size_cap=0.1, same_title_size_cap=0.2, rebalance=True,
+                                   size_cap=0.1, rebalance=True,
                                    rebalance_min_days_to_maturity=1))
         starter = _Starter()
         app = _app(start_process=starter)
@@ -3904,7 +4295,7 @@ class TestActions:
         saved = config.read_saved_live_defaults()
         # Nothing was saved before, so rebalancing is the seed's (on)
         assert saved == LiveSettings(tier_floors=False, spread_band=(0.0, 0.5),
-                                     interval_discount=0.75, size_cap=0.1, same_title_size_cap=0.2,
+                                     interval_discount=0.75, size_cap=0.1,
                                      exclude_categories=("Sports",), rebalance=True)
         folder = _run_folder(run_id)
         [(argv, kwargs)] = starter.calls
@@ -3955,7 +4346,7 @@ class TestActions:
 
     def test_the_trade_page_starts_the_saved_defaults(self):
         saved = _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                                   size_cap=0.15, same_title_size_cap=0.2), source=DASHBOARD_NOTE)
+                                   size_cap=0.15), source=DASHBOARD_NOTE)
         before = config.LIVE_DEFAULTS_FILE.read_bytes()
         starter = _Starter()
         app = _app(start_process=starter)
@@ -4178,7 +4569,7 @@ class TestBlockers:
         app = _app(start_process=starter)
         form = _trade_form(app)
         other = _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5),
-                                   interval_discount=0.75, size_cap=0.1, same_title_size_cap=0.2))
+                                   interval_discount=0.75, size_cap=0.1))
         response = _post(app, form, target="/trade")
         assert response.status == 409
         assert defaults_server._STALE_BANNER in response.body

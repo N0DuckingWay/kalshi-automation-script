@@ -4079,29 +4079,15 @@ class TestEnrichmentStoresOrientedDepthLevels:
         # market_a's entry is the YES leg (pA), market_b's the NO leg (nB)
         assert leg_prices(enriched) == pytest.approx((0.32, 0.42))
 
-    def test_same_title_levels_are_nA_then_pB(self):
-        pair = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
-        client = _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, qty=100)
-        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
-        [level] = enriched.depth_levels
-        assert level == pytest.approx((0.44, 0.31, 100.0))
-        # market_a's entry is the NO leg (nA), market_b's the YES leg (pB)
-        assert leg_prices(enriched) == pytest.approx((0.44, 0.31))
-
-    def test_levels_match_leg_prices_ordering_for_both_types(self):
+    def test_levels_match_leg_prices_ordering(self):
         # The orientation contract stated once: depth_levels[i][0] always
         # belongs to market_a and [1] to market_b, whichever side each buys.
         ts = _ts_candidate(gap_days=10, pA=0.30, pB=0.62, nB=0.50)
         [ts_e] = enrich_with_orderbook_prices(
             _ts_orderbook_client(pA_fill=0.32, nB_fill=0.42, pB_ref=0.62), [ts], _AMPLE_BALANCE_CENTS,
         )
-        st = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
-        [st_e] = enrich_with_orderbook_prices(
-            _st_orderbook_client(nA_fill=0.44, pB_fill=0.31), [st], _AMPLE_BALANCE_CENTS,
-        )
-        for enriched in (ts_e, st_e):
-            a, b, _ = enriched.depth_levels[0]
-            assert (a, b) == pytest.approx(leg_prices(enriched))
+        a, b, _ = ts_e.depth_levels[0]
+        assert (a, b) == pytest.approx(leg_prices(ts_e))
 
     def test_unenriched_pair_has_empty_levels(self):
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.62, nB=0.50)
@@ -4254,41 +4240,16 @@ class TestTimeSeriesEnrichmentSides:
 
 
 class TestSameTitleEnrichmentByteIdentity:
-    """Same-title behaviour must not change with the time-series inversion:
-    NO on A still consumes A's YES bids, YES on B still consumes B's NO bids,
-    and the fills still land in nA/pB with nB untouched. pA is refreshed from
-    A's NO bids (TS-34) — the reporting-only reference quote — but same-title
-    is deliberately NOT direction-guarded: its model is the fixed co-resolution
-    prior, so nothing sizes on pA and there is no clamp to protect."""
+    """A same-title pair is still read off its own side of each book: the
+    pre-submission check consumes A's YES bids for the NO on A and B's NO bids
+    for the YES on B, and books of the time-series shape give it no depth.
+    Enrichment never marks one tradeable: its affordability bound is 0, since
+    config.pair_size_cap caps every type but time-series at 0
+    (TestEnrichmentSpreadRule::test_the_bound_is_max_kelly_fraction_exactly)."""
 
     @staticmethod
     def _pair() -> CandidatePair:
         return _st_candidate(pA=0.55, pB=0.30, nA=0.45, nB=0.70)
-
-    def test_enrichment_writes_fills_to_nA_pB_and_refreshes_pA_leaving_nB(self):
-        pair = self._pair()
-        client = _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, qty=100, pA_ref=0.57)
-        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
-        assert enriched.tradeable is True
-        assert enriched.max_contracts == 100
-        assert enriched.nA == pytest.approx(0.44)
-        assert enriched.pB == pytest.approx(0.31)
-        # pA is same_title's reference quote — refreshed from A's NO bids in the
-        # same snapshot as the fills (scan-time was 0.55)
-        assert enriched.pA == pytest.approx(0.57)
-        # nB is reporting-only for this pair type — byte-identical to the input
-        assert enriched.nB == pair.nB
-        assert leg_prices(enriched) == (pytest.approx(0.44), pytest.approx(0.31))
-
-    def test_ceiling_is_flat_five_percent(self):
-        # 0.50 + 0.46 = 0.96 > 0.95 — the same-title ceiling, no deadline tiering
-        pair = self._pair()
-        client = _st_orderbook_client(nA_fill=0.50, pB_fill=0.46)
-        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
-        assert enriched.tradeable is False
-        client_ok = _st_orderbook_client(nA_fill=0.50, pB_fill=0.45)
-        [enriched_ok] = enrich_with_orderbook_prices(client_ok, [pair], _AMPLE_BALANCE_CENTS)
-        assert enriched_ok.tradeable is True
 
     def test_validate_pair_price_same_title(self):
         pair = self._pair()
@@ -4339,28 +4300,6 @@ class TestEnrichmentRefreshesReferenceQuote:
         assert enriched.pA == pytest.approx(0.30)
         assert enriched.nB == pytest.approx(0.50)
         assert enriched.nA == pair.nA
-
-    def test_enrichment_refreshes_the_same_title_reference_ask(self):
-        # Mirror: for a same-title pair the YES leg is on B, so the reference
-        # is A's YES ask (pA), read from A's NO bids
-        mA = _mock_market(ticker="A1", event_ticker="EVT-A", title="Q", yes_ask=0.55, no_ask=0.45)
-        mB = _mock_market(ticker="B1", event_ticker="EVT-B", title="Q", yes_ask=0.30, no_ask=0.70)
-        pair = CandidatePair(
-            market_a=mA, market_b=mB,
-            pA=0.55, pB=0.30, nA=0.45,
-            tradeable=True,
-            canonical_title="Q",
-            pair_type="same_title",
-            nB=0.70,
-        )
-        client = _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, pA_ref=0.60)
-        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
-        assert enriched.tradeable is True
-        assert enriched.pA == pytest.approx(0.60)
-        assert enriched.pA != pytest.approx(pair.pA)
-        assert enriched.nA == pytest.approx(0.44)
-        assert enriched.pB == pytest.approx(0.31)
-        assert enriched.nB == pair.nB
 
     @staticmethod
     def _inverted_pair_and_client():
@@ -4427,8 +4366,8 @@ class TestEnrichmentRefreshesReferenceQuote:
         assert enriched.tradeable is False
 
     def test_reference_ask_falls_back_to_scan_time_when_side_is_empty(self, caplog):
-        # The fallback is SAME-TITLE only: a time-series pair with no later YES
-        # ask fails closed, its scan-time pB left as it was (never None).
+        # A time-series pair with no later YES ask fails closed, its scan-time
+        # pB left as it was (never None).
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
         client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50)
         with caplog.at_level(logging.INFO):
@@ -4440,15 +4379,6 @@ class TestEnrichmentRefreshesReferenceQuote:
                  if "the later contract has no YES ask on its book" in r.getMessage()]
         assert len(drops) == 1
         assert drops[0].levelno == logging.WARNING
-
-        # A same-title pair with A's NO side empty keeps its scan-time pA: its
-        # model is the fixed prior, so pA is a reporting-only reference.
-        st = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
-        [st_e] = enrich_with_orderbook_prices(
-            _st_orderbook_client(nA_fill=0.44, pB_fill=0.31), [st], _AMPLE_BALANCE_CENTS,
-        )
-        assert st_e.tradeable is True
-        assert st_e.pA == st.pA
 
     @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_ceiling_tier_is_the_stated_gap_for_a_ladder(self, caplog):
@@ -4655,7 +4585,7 @@ class TestEnrichmentSpreadRule:
     def _lines(caplog, text):
         return [r for r in caplog.records if text in r.getMessage()]
 
-    def test_no_reference_fails_closed_for_time_series_only(self, caplog):
+    def test_no_reference_fails_closed(self, caplog):
         ts = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
         with caplog.at_level(logging.INFO):
             [ts_e] = enrich_with_orderbook_prices(
@@ -4664,12 +4594,6 @@ class TestEnrichmentSpreadRule:
         assert ts_e.tradeable is False
         [line] = self._lines(caplog, "no YES ask on its book (no resting NO bids)")
         assert line.levelno == logging.WARNING
-        # same-title still falls back to its scan-time reference
-        st = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
-        [st_e] = enrich_with_orderbook_prices(
-            _st_orderbook_client(nA_fill=0.44, pB_fill=0.31), [st], _AMPLE_BALANCE_CENTS,
-            settings=_live())
-        assert st_e.tradeable is True and st_e.pA == st.pA
 
     def test_a_crossed_later_book_is_dropped(self, caplog):
         # LATE: YES bid 0.60, YES ask 0.55 — crossed; the 0.25 spread clears
@@ -4904,14 +4828,8 @@ class TestEnrichmentSpreadRule:
         [line] = self._lines(caplog, "No affordable contract pairs")
         assert ("the budget affords 0; the per-trade bound is 0 (k = 1.00: time-series "
                 "Kelly cannot be positive); skipping") in line.getMessage()
-        # control: a same-title pair under the same settings is not bounded at 0
-        st = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
-        [st_e] = enrich_with_orderbook_prices(
-            _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, pA_ref=0.60), [st],
-            _AMPLE_BALANCE_CENTS, settings=_live(interval_discount=1.0, size_cap=1.0))
-        assert st_e.tradeable is True
 
-    def test_the_bound_is_max_kelly_fraction_exactly(self):
+    def test_the_bound_is_max_kelly_fraction_exactly(self, caplog):
         # $10,000 at a best level of 0.80: 0.20 affords 2500 pairs, the unrounded
         # 1 - 0.8 (0.19999999999999996) only 2499
         ts = _ts_candidate(gap_days=10, pA=0.30, pB=0.62, nB=0.50)
@@ -4919,13 +4837,19 @@ class TestEnrichmentSpreadRule:
             _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50, qty=5000, pB_ref=0.62), [ts],
             1_000_000, settings=_live(interval_discount=0.8, size_cap=1.0))
         assert ts_e.max_contracts == 2500
-        # Same-title at no cap: the 0.95 co-resolution prior, over 0.75
+        # A same-title pair's bound is 0 at any cap (config.pair_size_cap caps
+        # every type but time-series at 0), so its budget affords nothing and
+        # enrichment refuses it, however deep its books
         st = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
-        [st_e] = enrich_with_orderbook_prices(
-            _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, qty=20000, pA_ref=0.60), [st],
-            1_000_000, settings=_live(size_cap=1.0))
-        assert st_e.max_contracts == int(10_000 * 0.95 / 0.75)
-        # _live()'s 20% cap bounds it at 0.20 too
+        with caplog.at_level(logging.INFO):
+            [st_e] = enrich_with_orderbook_prices(
+                _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, qty=20000, pA_ref=0.60), [st],
+                1_000_000, settings=_live(size_cap=1.0))
+        assert config.max_kelly_fraction("same_title", _live(size_cap=1.0)) == 0.0
+        assert st_e.tradeable is False and st_e.max_contracts == 0
+        [line] = self._lines(caplog, "No affordable contract pairs")
+        assert "the budget affords 0; skipping" in line.getMessage()
+        # _live()'s 20% cap bounds the time-series pair at 0.20 too
         [ts_t] = enrich_with_orderbook_prices(
             _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50, qty=5000, pB_ref=0.62), [ts],
             1_000_000, settings=_live())
@@ -5084,8 +5008,11 @@ def _old_enrich_with_orderbook_prices(
             # — the sub-one-contract hole that overloaded sentinel used to have.
             # Both figures are named because they are different faults with
             # different fixes (add funds vs. the book is too thin), and the
-            # binding one is whichever is smaller. A bound of 0 gets its own wording: only
-            # a time-series 1 - k rounding to 0 (k = 1) makes one (no cap can be 0).
+            # binding one is whichever is smaller. A time-series pair's bound of 0
+            # gets its own wording: only 1 - k rounding to 0 (k = 1) makes one,
+            # since its per-trade cap is never 0. Any other pair type always has a
+            # bound of 0 (config.pair_size_cap caps it at 0), so one that gets this
+            # far is always dropped here, with the plain wording.
             why = ""
             if bound == 0 and pair.pair_type == "time_series":
                 why = (
@@ -5419,16 +5346,11 @@ def _enrichment_cases() -> dict:
             {"EARLY": {"yes_dollars": [], "no_dollars": _bids((0.70, 100), (0.47, 2000))},
              "LATE": {"yes_dollars": _bids((0.55, 2100)), "no_dollars": _bids((0.44, 1000))}},
             1_000_000, tiers_off, None, {}, None),
-        "st-tradeable": ([st], _st_books(0.44, 0.31, pA_ref=0.60), big, _live(), None, {},
-                         None),
-        "st-no-reference-kept": ([st], _st_books(0.44, 0.31), big, _live(), None, {}, None),
         "st-no-qualifying": ([_st_candidate(pA=0.60, pB=0.40, nA=0.60)],
                              _st_books(0.60, 0.40, pA_ref=0.60), big, _live(), None, {},
                              scanner.ENRICH_NO_QUALIFYING),
         "st-no-cash": ([st], _st_books(0.44, 0.31, pA_ref=0.60), big, _live(), 0, {},
                        scanner.ENRICH_UNAFFORDABLE),
-        "st-unprofitable": ([st], _st_books(0.44, 0.31, pA_ref=0.60), big, _live(), None,
-                            fee, scanner.ENRICH_UNPROFITABLE),
         # EARLY's book serves both time-series pairs, fetched once
         "shared-book": (
             [ts, _late2(ts), st],
@@ -5681,14 +5603,6 @@ class TestEnrichmentWritesTheMidSpread:
         assert enriched.pA == pytest.approx(0.328)
         assert enriched.nB == pytest.approx(0.498)
         assert enriched.mid_spread == time_series_mid_spread(*_MID_TOPS)
-
-    def test_a_same_title_pair_carries_none(self):
-        st = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
-        [enriched] = enrich_with_orderbook_prices(
-            _books_client(_st_books(0.44, 0.31, pA_ref=0.60)), [st], _AMPLE_BALANCE_CENTS,
-            settings=_live())
-        assert enriched.tradeable is True
-        assert enriched.mid_spread is None
 
     @pytest.mark.parametrize("books, cash, code", [
         # 0.45 + 0.48 sits over the 0.85 price-sum ceiling: nothing qualifies

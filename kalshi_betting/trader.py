@@ -3965,8 +3965,9 @@ def sell_positions(client: Any, plans: list, *, dry_run: bool) -> list[SaleResul
     Sell the held contracts each plan names, one plan at a time, in order.
 
     A plan is a take-profit sale of a whole position, or a Kelly trim, which
-    sells an exact held pair, or a lone leg whose partner has paid out, down
-    to its Kelly size. main._run_prod calls this before it buys anything.
+    sells an exact held time-series pair, or a lone leg whose partner has
+    paid out, down to its Kelly size. main._run_prod calls this before it
+    buys anything.
     Each held market gets at most one order (a partner that has paid out
     gets none), sent once, never retried; nothing is sent for a position
     whose markets no longer hold what the plan was made on, or while the V2
