@@ -13,6 +13,7 @@ import dataclasses
 import enum
 import importlib
 import importlib.util
+import inspect
 import json
 import logging
 import math
@@ -72,14 +73,13 @@ from .conftest import apply_pre_toggle_defaults
 
 
 def _settings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20,
-              same_title_size_cap=1.0, exclude_categories=None, exclude_tags=None, rebalance=False,
+              exclude_categories=None, exclude_tags=None, rebalance=False,
               min_price_move=None, rebalance_min_days_to_maturity=None, sell_at=None,
               sell_min_days=None):
     """A LiveSettings with every toggle named, defaulting to the pre-toggle
     values conftest's apply_pre_toggle_defaults pins (no rebalancing, no selling)."""
     return LiveSettings(tier_floors=tier_floors, spread_band=spread_band,
                         interval_discount=interval_discount, size_cap=size_cap,
-                        same_title_size_cap=same_title_size_cap,
                         exclude_categories=exclude_categories, exclude_tags=exclude_tags,
                         rebalance=rebalance, min_price_move=min_price_move,
                         rebalance_min_days_to_maturity=rebalance_min_days_to_maturity,
@@ -843,17 +843,15 @@ class TestMaxAffordablePairs:
             assert max_affordable_pairs(bankroll, price_sum, fraction,
                                         cash_cents=bankroll) == old
 
-    @pytest.mark.parametrize("k, cap, st_cap", [
-        (0.75, 0.20, 1.0), (0.40, 1.0, 1.0), (0.80, 1.0, 1.0), (0.60, 0.35, 1.0),
-        (0.80, 1.0, 0.20), (0.40, 0.35, 0.05),
+    @pytest.mark.parametrize("k, cap", [
+        (0.75, 0.20), (0.40, 1.0), (0.80, 1.0), (0.60, 0.35), (0.40, 0.35),
     ])
-    def test_scanner_cap_bounds_the_sizer(self, k, cap, st_cap):
+    def test_scanner_cap_bounds_the_sizer(self, k, cap):
         # Enrichment bounds its average at max_kelly_fraction over the MINIMUM
         # (best-level) price sum, so its count can never be smaller than the
         # sizer's: checked against compute_trade with the SAME settings.
         settings = config.LiveSettings(
-            tier_floors=True, spread_band=(0.0, 1.0), interval_discount=k, size_cap=cap,
-            same_title_size_cap=st_cap)
+            tier_floors=True, spread_band=(0.0, 1.0), interval_discount=k, size_cap=cap)
         balance = 1_000_000
         now = datetime.now(UTC)
 
@@ -874,10 +872,8 @@ class TestMaxAffordablePairs:
         ts = [pair("time_series", pA, pB, 1 - pA, nB)
               for pA, pB, nB in [(0.10, 0.70, 0.30), (0.05, 0.85, 0.15), (0.20, 0.50, 0.50),
                                  (0.30, 0.60, 0.40), (0.12, 0.33, 0.70)]]
-        st = [pair("same_title", pA, pB, nA, 0.70)
-              for pA, pB, nA in [(0.70, 0.30, 0.20), (0.60, 0.31, 0.44), (0.55, 0.30, 0.45)]]
-        sized = {"time_series": 0, "same_title": 0}
-        for p in ts + st:
+        sized = {"time_series": 0}
+        for p in ts:
             spec = compute_trade(p, balance, settings=settings)
             if spec is None:
                 continue
@@ -893,8 +889,8 @@ class TestMaxAffordablePairs:
                     assert capped.x <= max_affordable_pairs(
                         balance, sum(leg_prices(p)), bound, cash_cents=cash)
                     assert capped.total_cost_with_fees <= cash / 100 + 1e-9
-        # Non-vacuous for both types at every setting
-        assert sized["time_series"] > 0 and sized["same_title"] > 0, sized
+        # Non-vacuous at every setting
+        assert sized["time_series"] > 0, sized
 
 
 class TestKellyBudget:
@@ -1332,7 +1328,6 @@ class TestLiveSettings:
         monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.1, 0.6))
         monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.6)
         monkeypatch.setattr(config, "BUDGET_FRACTION", 0.35)
-        monkeypatch.setattr(config, "SAME_TITLE_SIZE_CAP", 0.25)
         monkeypatch.setattr(config, "TRADE_EXCLUDE_CATEGORIES", ("Economics",))
         monkeypatch.setattr(config, "TRADE_EXCLUDE_TAGS", ["Oil & Gas"])
         monkeypatch.setattr(config, "REBALANCE", True)
@@ -1340,7 +1335,7 @@ class TestLiveSettings:
         monkeypatch.setattr(config, "REBALANCE_MIN_DAYS_TO_MATURITY", 7)
         monkeypatch.setattr(config, "SELL_AT", 0.85)
         monkeypatch.setattr(config, "SELL_MIN_DAYS", 3)
-        expected = _settings(True, (0.1, 0.6), 0.6, 0.35, 0.25,
+        expected = _settings(True, (0.1, 0.6), 0.6, 0.35,
                              ("Economics",), ("Oil & Gas",),
                              rebalance=True, min_price_move=0.10,
                              rebalance_min_days_to_maturity=7,
@@ -1359,11 +1354,6 @@ class TestLiveSettings:
         with pytest.raises(ValueError, match="size_cap"):
             live_settings()
 
-    def test_live_settings_refuses_an_invalid_same_title_cap(self, monkeypatch):
-        monkeypatch.setattr(config, "SAME_TITLE_SIZE_CAP", 0.37)
-        with pytest.raises(ValueError, match="same_title_size_cap"):
-            live_settings()
-
     def test_the_shipped_values_resolve(self):
         s = live_settings()
         assert s == LiveSettings(
@@ -1371,7 +1361,6 @@ class TestLiveSettings:
             spread_band=config.TIME_SERIES_SPREAD_BAND,
             interval_discount=config.TIME_SERIES_INTERVAL_PROB_DISCOUNT,
             size_cap=config.BUDGET_FRACTION,
-            same_title_size_cap=config.SAME_TITLE_SIZE_CAP,
             exclude_categories=config.TRADE_EXCLUDE_CATEGORIES,
             exclude_tags=config.TRADE_EXCLUDE_TAGS,
             rebalance=config.REBALANCE,
@@ -1415,21 +1404,18 @@ class TestLiveSettings:
         with pytest.raises(ValueError, match="rebalance_min_days_to_maturity needs rebalance on"):
             live_settings()
 
-    @pytest.mark.parametrize("cap", [0, 0.37, 1.01, float("nan"), True, "0.2", None, 1e-7])
-    def test_same_title_cap_off_the_grid_or_out_of_range_is_refused(self, cap):
-        # The same grid and validator as size_cap, reported under its own name
-        with pytest.raises(ValueError, match="same_title_size_cap"):
-            _settings(same_title_size_cap=cap)
-
-    def test_same_title_cap_is_normalised_and_defaults_to_no_cap(self):
-        assert _settings(same_title_size_cap=0.05 * 7).same_title_size_cap == 0.35
-        assert type(_settings(same_title_size_cap=1).same_title_size_cap) is float
-        # Naming only the first four fields adds no same-title cap
-        assert LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
-                            size_cap=0.2).same_title_size_cap == 1.0
-        # ... and replace re-validates it like every other field
-        with pytest.raises(ValueError, match="same_title_size_cap"):
-            dataclasses.replace(_settings(), same_title_size_cap=0.37)
+    def test_there_is_no_same_title_cap(self):
+        # The bot trades time-series pairs only: LiveSettings holds no
+        # same-title cap and config.py no constant for one, so nothing can
+        # set one, by construction or by replace
+        assert "same_title_size_cap" not in {f.name for f in dataclasses.fields(LiveSettings)}
+        assert not hasattr(config, "SAME_TITLE_SIZE_CAP")
+        assert not hasattr(live_settings(), "same_title_size_cap")
+        with pytest.raises(TypeError, match="same_title_size_cap"):
+            LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                         size_cap=0.2, same_title_size_cap=0.2)
+        with pytest.raises(TypeError, match="same_title_size_cap"):
+            dataclasses.replace(_settings(), same_title_size_cap=0.2)
 
     @pytest.mark.parametrize("field", ["exclude_categories", "exclude_tags"])
     @pytest.mark.parametrize("bad", [
@@ -1460,20 +1446,21 @@ class TestLiveSettings:
 
     def test_a_construction_without_the_filters_filters_nothing(self):
         s = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
-                         size_cap=0.2, same_title_size_cap=1.0)
+                         size_cap=0.2)
         assert s.exclude_categories is None and s.exclude_tags is None
         assert s.rebalance is False and s.min_price_move is None
         assert s.rebalance_min_days_to_maturity is None
         assert s.sell_at is None and s.sell_min_days is None
-        # Defaulted and last of the toggles: the first five fields keep their
-        # positions, so a positional construction of up to seven still builds;
+        # Defaulted and last of the toggles, after the four required ones;
         # origin, not a toggle, comes after them
+        assert list(config.LIVE_TOGGLE_FIELDS)[:4] == [
+            "tier_floors", "spread_band", "interval_discount", "size_cap"]
         assert list(config.LIVE_TOGGLE_FIELDS)[-7:] == [
             "exclude_categories", "exclude_tags", "rebalance", "min_price_move",
             "rebalance_min_days_to_maturity", "sell_at", "sell_min_days"]
         assert [f.name for f in dataclasses.fields(LiveSettings)][-1] == "origin"
         assert LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
-                            size_cap=0.2, same_title_size_cap=1.0, exclude_categories=("Sports",),
+                            size_cap=0.2, exclude_categories=("Sports",),
                             exclude_tags=("Hockey",)).exclude_tags == ("Hockey",)
 
     @pytest.mark.parametrize("name, value", [("TRADE_EXCLUDE_CATEGORIES", "Sports"),
@@ -1927,31 +1914,30 @@ class TestMaxKellyFraction:
     """max_kelly_fraction, enrichment's affordability bound. Compared with ==:
     1 - 0.8 is 0.19999999999999996, and the bound must be exactly 0.20."""
 
-    def test_today_both_types_are_the_cap(self):
+    def test_a_time_series_pair_is_the_cap_and_any_other_type_zero(self):
         s = _settings()
         assert max_kelly_fraction("time_series", s) == 0.20
-        assert max_kelly_fraction("same_title", s) == 0.20
+        # pair_size_cap caps any other type at 0
+        assert max_kelly_fraction("same_title", s) == 0.0
 
     def test_no_cap_time_series_is_one_minus_k_rounded(self):
         s = _settings(interval_discount=0.8, size_cap=1.0)
         assert 1.0 - 0.8 != 0.2
         assert max_kelly_fraction("time_series", s) == 0.2
 
-    def test_no_cap_same_title_is_the_co_resolution_prior(self):
-        s = _settings(size_cap=1.0)
-        assert max_kelly_fraction("same_title", s) == 0.95
-        assert max_kelly_fraction("same_title", s) == config.SAME_TITLE_CO_RESOLVE_PROB
-
     def test_k_of_one_bounds_time_series_at_zero(self):
         s = _settings(interval_discount=1.0, size_cap=1.0)
         assert max_kelly_fraction("time_series", s) == 0
-        # same-title never reads k
-        assert max_kelly_fraction("same_title", s) == 0.95
+        # Any other type is 0 at every k
+        assert max_kelly_fraction("same_title", s) == 0.0
 
-    @pytest.mark.parametrize("pair_type", [None, "bogus", "Time_Series", MagicMock().pair_type])
-    def test_anything_but_time_series_reads_as_same_title(self, pair_type):
-        s = _settings(interval_discount=0.8, size_cap=1.0)
-        assert max_kelly_fraction(pair_type, s) == 0.95
+    @pytest.mark.parametrize("pair_type", [None, "bogus", "", "unknown", "same_title",
+                                           "Time_Series", MagicMock().pair_type])
+    def test_anything_but_time_series_is_bounded_at_zero(self, pair_type):
+        for k in (0.6, 0.8, 1.0):
+            for cap in (0.05, 0.2, 1.0):
+                s = _settings(interval_discount=k, size_cap=cap)
+                assert max_kelly_fraction(pair_type, s) == 0.0, (pair_type, k, cap)
 
     def test_the_round_is_what_keeps_the_count(self):
         s = _settings(interval_discount=0.8, size_cap=1.0)
@@ -1959,41 +1945,50 @@ class TestMaxKellyFraction:
         # the unrounded bound loses a contract on this round-number book
         assert max_affordable_pairs(1_000_000, 0.8, 1.0 - 0.8) == 2499
 
-    def test_the_same_title_cap_bounds_same_title_only(self):
-        # No per-trade cap, a 20% same-title cap
-        s = _settings(interval_discount=0.8, size_cap=1.0, same_title_size_cap=0.2)
-        assert max_kelly_fraction("same_title", s) == 0.2
-        assert max_kelly_fraction("time_series", s) == 0.2   # 1 - k, not the cap
-        s = _settings(interval_discount=0.6, size_cap=1.0, same_title_size_cap=0.2)
-        assert max_kelly_fraction("time_series", s) == 0.4   # never the same-title cap
-        # The tighter of the two caps binds a same-title pair
-        s = _settings(size_cap=0.1, same_title_size_cap=0.2)
-        assert max_kelly_fraction("same_title", s) == 0.1
+    def test_only_the_per_trade_cap_and_k_bound_a_time_series_pair(self):
+        # No per-trade cap: 1 - k binds
+        s = _settings(interval_discount=0.8, size_cap=1.0)
+        assert max_kelly_fraction("time_series", s) == 0.2
+        s = _settings(interval_discount=0.6, size_cap=1.0)
+        assert max_kelly_fraction("time_series", s) == 0.4
+        # A per-trade cap under 1 - k binds instead
+        s = _settings(interval_discount=0.75, size_cap=0.1)
         assert max_kelly_fraction("time_series", s) == 0.1
+        assert max_kelly_fraction("same_title", s) == 0.0
 
 
 class TestPairSizeCap:
-    """config.pair_size_cap, the one definition of a pair's per-trade cap."""
+    """config.pair_size_cap, the one definition of a pair's per-trade cap: the
+    per-trade cap for a time-series pair, 0 for any other type."""
 
-    def test_time_series_reads_the_general_cap_alone(self):
-        assert pair_size_cap("time_series", 1.0, 0.2) == 1.0
-        assert pair_size_cap("time_series", 0.35, 0.05) == 0.35
+    # Every cap the size-cap grid holds, as LiveSettings normalises it
+    _GRID = [round(config.SIZE_CAP_STEP * steps, 2)
+             for steps in range(1, round(1 / config.SIZE_CAP_STEP) + 1)]
 
-    def test_same_title_takes_the_tighter_cap(self):
-        assert pair_size_cap("same_title", 1.0, 0.2) == 0.2
-        assert pair_size_cap("same_title", 0.1, 0.2) == 0.1
-        assert pair_size_cap("same_title", 0.2, 1.0) == 0.2
+    def test_it_takes_the_pair_type_and_the_per_trade_cap_alone(self):
+        assert list(inspect.signature(pair_size_cap).parameters) == ["pair_type", "size_cap"]
+        # A third argument (the same-title cap it no longer has) is refused
+        with pytest.raises(TypeError):
+            pair_size_cap("time_series", 0.2, 0.2)
 
-    @pytest.mark.parametrize("pair_type", [None, "bogus", "Time_Series", MagicMock().pair_type])
-    def test_anything_but_time_series_reads_as_same_title(self, pair_type):
-        # scanner.leg_sides' rule: an unknown type is never the directional bet
-        assert pair_size_cap(pair_type, 1.0, 0.2) == 0.2
+    def test_a_time_series_pair_gets_the_per_trade_cap_at_every_cell(self):
+        assert self._GRID[0] == 0.05 and self._GRID[-1] == 1.0 and len(self._GRID) == 20
+        for cap in self._GRID:
+            assert pair_size_cap("time_series", cap) == cap
+            # ... and the cap a run's settings hold, normalised onto the grid
+            assert pair_size_cap("time_series", _settings(size_cap=cap).size_cap) == cap
 
-    def test_the_shipped_caps_are_on_the_grid(self):
-        # Both must resolve through LiveSettings, which validates them
-        s = live_settings()
-        assert s.size_cap == config.BUDGET_FRACTION
-        assert s.same_title_size_cap == config.SAME_TITLE_SIZE_CAP
+    @pytest.mark.parametrize("pair_type", ["same_title", "unknown", "", None, "bogus",
+                                           "Time_Series", "time-series", MagicMock().pair_type])
+    def test_any_other_type_gets_a_cap_of_zero(self, pair_type):
+        # A cap of 0 sizes nothing and sells nothing, whatever the per-trade cap
+        for cap in self._GRID:
+            assert pair_size_cap(pair_type, cap) == 0.0, (pair_type, cap)
+
+    def test_the_shipped_cap_is_on_the_grid(self):
+        # It must resolve through LiveSettings, which validates it
+        assert live_settings().size_cap == config.BUDGET_FRACTION
+        assert config.BUDGET_FRACTION in self._GRID
 
 
 class TestHeldPairFraction:
@@ -3262,7 +3257,7 @@ class TestDescribeLiveSettings:
         s = _settings()
         assert config.describe_live_settings(s, s) == (
             "tier floors on | spread band none | k 0.75 | per-trade cap 20% | "
-            "same-title cap 100% (no extra cap) | exclude categories none | exclude tags none | "
+            "exclude categories none | exclude tags none | "
             "rebalance no | min price movement any | rebalance until maturity | "
             "sell at off | min days to maturity any")
         assert config.describe_live_settings(s) == config.describe_live_settings(s, s)
@@ -3282,7 +3277,6 @@ class TestDescribeLiveSettings:
         "spread_band": ((0.1, 1.0), "spread band 0.1-1 (config: none)"),
         "interval_discount": (0.6, "k 0.6 (config: 0.75)"),
         "size_cap": (0.35, "per-trade cap 35% (config: 20%)"),
-        "same_title_size_cap": (0.25, "same-title cap 25% (config: 100% (no extra cap))"),
         "exclude_categories": (("Economics",), "exclude categories Economics (config: none)"),
         "exclude_tags": (("Oil & Gas", "Energy"), "exclude tags Oil & Gas, Energy (config: none)"),
         "rebalance": (False, "rebalance no (config: yes)"),
@@ -3298,11 +3292,11 @@ class TestDescribeLiveSettings:
 
     def test_every_departing_field_is_marked_and_no_other(self):
         ref = _settings()
-        s = _settings(False, (0.0, 0.5), 0.8, 1.0, 0.2)
+        s = _settings(False, (0.0, 0.5), 0.8, 1.0)
         assert config.describe_live_settings(s, ref) == (
             "tier floors off (config: on) | spread band 0-0.5 (config: none) | "
             "k 0.8 (config: 0.75) | per-trade cap 100% (no cap) (config: 20%) | "
-            "same-title cap 20% (config: 100% (no extra cap)) | exclude categories none | exclude tags none | "
+            "exclude categories none | exclude tags none | "
             "rebalance no | min price movement any | rebalance until maturity | "
             "sell at off | min days to maturity any")
         for name in config.LIVE_TOGGLE_FIELDS:
@@ -3381,10 +3375,10 @@ class TestDescribeLiveSettings:
         assert "spread band 0.3000001-0.9 (config: 0.3-0.9)" in line
 
     def test_no_reference_marks_nothing(self):
-        line = config.describe_live_settings(_settings(False, (0.0, 0.5), 0.8, 1.0, 0.2))
+        line = config.describe_live_settings(_settings(False, (0.0, 0.5), 0.8, 1.0))
         assert "(config:" not in line
         assert line == ("tier floors off | spread band 0-0.5 | k 0.8 | "
-                        "per-trade cap 100% (no cap) | same-title cap 20% | "
+                        "per-trade cap 100% (no cap) | "
                         "exclude categories none | exclude tags none | rebalance no | "
                         "min price movement any | rebalance until maturity | "
                         "sell at off | min days to maturity any")
@@ -3423,12 +3417,12 @@ class TestDescribeLiveSettings:
     def test_a_saved_defaults_reference_marks_default(self):
         # A reference read from the saved file (any origin but config.py's)
         ref = dataclasses.replace(_settings(), origin=_SAVED_ORIGIN)
-        s = _settings(False, (0.0, 0.5), 0.8, 1.0, 0.2)
+        s = _settings(False, (0.0, 0.5), 0.8, 1.0)
         line = config.describe_live_settings(s, ref)
         assert line == (
             "tier floors off (default: on) | spread band 0-0.5 (default: none) | "
             "k 0.8 (default: 0.75) | per-trade cap 100% (no cap) (default: 20%) | "
-            "same-title cap 20% (default: 100% (no extra cap)) | exclude categories none | exclude tags none | "
+            "exclude categories none | exclude tags none | "
             "rebalance no | min price movement any | rebalance until maturity | "
             "sell at off | min days to maturity any")
         assert "(config:" not in line
@@ -3522,31 +3516,30 @@ class TestLiveRuleWarnings:
     def test_a_ceiling_well_above_both_tiers_is_silent(self):
         assert config.live_rule_warnings(_settings(spread_band=(0.2, 0.6))) == []
 
-    def test_a_lifted_cap_at_a_low_k_warns_for_both_types(self):
-        # --size-cap 60 --interval-discount 0.4: both types reach the cap
+    def test_a_lifted_cap_at_a_low_k_warns_for_a_time_series_pair(self):
+        # --size-cap 60 --interval-discount 0.4: a time-series pair reaches the cap
         out = config.live_rule_warnings(_settings(interval_discount=0.4, size_cap=0.6))
         assert out == [
             "one time-series pair may stake up to 60% of the portfolio value, above the "
             "20% this check accepts",
-            "one same-title pair may stake up to 60% of the portfolio value, above the "
-            "20% this check accepts",
         ]
 
-    def test_no_cap_with_a_same_title_cap_of_50_warns_for_both_types(self):
-        # --size-cap 100 --same-title-size-cap 50 at k 0.75: 25% and 50%
-        out = config.live_rule_warnings(_settings(size_cap=1.0, same_title_size_cap=0.5))
-        assert len(out) == 2
-        assert "one time-series pair may stake up to 25%" in out[0]
-        assert "one same-title pair may stake up to 50%" in out[1]
+    def test_no_cap_at_k_075_warns_once(self):
+        # --size-cap 100 at k 0.75: a time-series pair may stake 1 - k = 25%
+        (text,) = config.live_rule_warnings(_settings(size_cap=1.0))
+        assert "one time-series pair may stake up to 25%" in text
 
-    def test_a_same_title_cap_above_the_per_trade_cap_warns_nothing(self):
-        # --same-title-size-cap 50 alone: the 20% per-trade cap still binds
-        assert config.live_rule_warnings(_settings(same_title_size_cap=0.5)) == []
+    @pytest.mark.parametrize("cap", [0.05, 0.20, 0.35, 0.60, 1.0])
+    @pytest.mark.parametrize("k", [0.4, 0.75, 1.0])
+    def test_no_sentence_names_another_pair_type(self, cap, k):
+        # Any other type is capped at 0 (pair_size_cap), so only a time-series
+        # pair can stake anything to warn about
+        for text in config.live_rule_warnings(_settings(interval_discount=k, size_cap=cap)):
+            assert "same-title" not in text and "time-series" in text, text
 
     def test_a_bound_a_hair_over_the_threshold_prints_exactly(self):
         # 1 - 0.7996 = 0.2004: over 20%, and never printed as 20%
-        (text,) = config.live_rule_warnings(_settings(interval_discount=0.7996, size_cap=1.0,
-                                                     same_title_size_cap=0.2))
+        (text,) = config.live_rule_warnings(_settings(interval_discount=0.7996, size_cap=1.0))
         assert "up to 20.04% of the portfolio value" in text
 
     def test_k_of_one_names_the_dead_time_series_leg(self):
@@ -3567,8 +3560,8 @@ class TestLiveRuleWarnings:
 
     def test_the_threshold_is_the_constant(self, monkeypatch):
         monkeypatch.setattr(config, "LIVE_EXPOSURE_WARN_FRACTION", 0.10)
-        out = config.live_rule_warnings(_settings())
-        assert len(out) == 2 and all("above the 10%" in text for text in out)
+        (text,) = config.live_rule_warnings(_settings())
+        assert "one time-series pair may stake up to 20%" in text and "above the 10%" in text
 
 
 class TestRebalanceChangeWarnings:
@@ -3576,59 +3569,59 @@ class TestRebalanceChangeWarnings:
     higher k can sell more of the held pairs (through a Kelly trim). One
     sentence names every such change, and nothing else is warned about."""
 
-    # A per-trade and a same-title cap of 20%, k 0.8, rebalancing on
+    # A per-trade cap of 20%, k 0.8, rebalancing on
     _NOW = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                        size_cap=0.2, same_title_size_cap=0.2, rebalance=True)
+                        size_cap=0.2, rebalance=True)
 
     @staticmethod
-    def _sentence(named: str, lone: bool = True) -> list:
-        """The sentence for these changes; `lone` False when none can reach a lone leg."""
-        who = ("each exact held pair, or lone leg whose partner has paid out, worth"
-               if lone else "each exact held pair worth")
+    def _sentence(named: str) -> list:
+        """The sentence for these changes: each reaches a lone leg as well as a pair."""
         return [f"with Rebalance yes, these settings can sell more of the held pairs: "
-                f"{named}; {who} more than its new Kelly size is sold down to it before "
+                f"{named}; each exact held time-series pair, or lone leg whose partner has "
+                "paid out, worth more than its new Kelly size is sold down to it before "
                 "anything is bought, once the wait since its last trade has passed"]
 
     def test_each_change_that_sells_is_named(self):
         new = dataclasses.replace
+        # The cap is named as the "Live settings:" line names it
         assert config.rebalance_change_warnings(self._NOW, new(self._NOW, size_cap=0.1)) == (
-            self._sentence("the time-series size cap goes from 20% to 10% and the "
-                           "same-title size cap goes from 20% to 10%"))
-        assert config.rebalance_change_warnings(
-            self._NOW, new(self._NOW, same_title_size_cap=0.1)) == self._sentence(
-                "the same-title size cap goes from 20% to 10%", lone=False)
+            self._sentence("the per-trade cap goes from 20% to 10%"))
+        assert "per-trade cap 10%" in config.describe_live_settings(new(self._NOW, size_cap=0.1))
         assert config.rebalance_change_warnings(
             self._NOW, new(self._NOW, interval_discount=0.85)) == self._sentence(
                 "k goes from 0.8 to 0.85, which lowers a time-series pair's chance of paying")
-        # Three at once: a comma, then "and" before the last
+        # Both at once, joined by "and"
         assert config.rebalance_change_warnings(
             self._NOW, new(self._NOW, size_cap=0.1, interval_discount=0.9)) == self._sentence(
-                "the time-series size cap goes from 20% to 10%, the same-title size cap goes "
-                "from 20% to 10% and k goes from 0.8 to 0.9, which lowers a time-series "
-                "pair's chance of paying")
+                "the per-trade cap goes from 20% to 10% and k goes from 0.8 to 0.9, which "
+                "lowers a time-series pair's chance of paying")
         # No cap at all reads as such
-        uncapped = new(self._NOW, size_cap=1.0, same_title_size_cap=1.0)
+        uncapped = new(self._NOW, size_cap=1.0)
         assert config.rebalance_change_warnings(uncapped, new(uncapped, size_cap=0.5)) == (
-            self._sentence("the time-series size cap goes from 100% (no cap) to 50% and the "
-                           "same-title size cap goes from 100% (no cap) to 50%"))
+            self._sentence("the per-trade cap goes from 100% (no cap) to 50%"))
 
-    def test_a_lone_leg_is_named_only_when_a_time_series_setting_can_reach_it(self):
-        # A lone leg is the later market of a time-series pair: a same-title cap
-        # alone never reaches one, a time-series cap or k does, alone or with a
-        # same-title change
+    def test_every_sentence_names_lone_legs_and_no_other_pair_type(self):
+        # A lone leg is the later market of a time-series pair, trimmed to the
+        # per-trade cap and k like the pair, so both changes reach one; a held
+        # pair of any other type is never trimmed, so none is named
         new = dataclasses.replace
-        [same_title] = config.rebalance_change_warnings(
-            self._NOW, new(self._NOW, same_title_size_cap=0.1))
-        assert "lone leg" not in same_title
-        # Only the time-series cap falls: the same-title cap was already the lower
-        held = new(self._NOW, size_cap=0.3, same_title_size_cap=0.2)
-        assert config.rebalance_change_warnings(held, new(held, size_cap=0.25)) == (
-            self._sentence("the time-series size cap goes from 30% to 25%"))
-        [k_up] = config.rebalance_change_warnings(self._NOW, new(self._NOW, interval_discount=0.9))
-        assert "or lone leg whose partner has paid out, worth more than" in k_up
-        both = config.rebalance_change_warnings(
-            self._NOW, new(self._NOW, same_title_size_cap=0.1, interval_discount=0.9))
-        assert "or lone leg whose partner has paid out" in both[0]
+        for proposed in (new(self._NOW, size_cap=0.1), new(self._NOW, interval_discount=0.9),
+                         new(self._NOW, size_cap=0.05, interval_discount=0.95)):
+            [text] = config.rebalance_change_warnings(self._NOW, proposed)
+            assert ("each exact held time-series pair, or lone leg whose partner has paid "
+                    "out, worth more than") in text
+            assert "same-title" not in text
+
+    def test_the_cap_compared_is_the_one_a_time_series_pair_is_trimmed_to(self):
+        # Every pair of grid cells: a lower per-trade cap is named, any other is not
+        grid = [round(config.SIZE_CAP_STEP * steps, 2) for steps in range(1, 21)]
+        for before in grid:
+            for after in grid:
+                current = dataclasses.replace(self._NOW, size_cap=before)
+                proposed = dataclasses.replace(self._NOW, size_cap=after)
+                named = bool(config.rebalance_change_warnings(current, proposed))
+                assert named is (pair_size_cap("time_series", after)
+                                 < pair_size_cap("time_series", before)), (before, after)
 
     @pytest.mark.parametrize("change", [
         # Rebalancing off in the proposed settings: nothing is trimmed at all
@@ -3653,14 +3646,6 @@ class TestRebalanceChangeWarnings:
         proposed = dataclasses.replace(self._NOW, rebalance_min_days_to_maturity=after)
         assert config.rebalance_change_warnings(current, proposed) == []
 
-    def test_a_same_title_cap_held_below_by_the_per_trade_cap_moves_nothing(self):
-        # The same-title cap a pair is trimmed to is the lower of the two
-        before = dataclasses.replace(self._NOW, same_title_size_cap=1.0)
-        after = dataclasses.replace(before, same_title_size_cap=0.5)
-        assert config.pair_size_cap("same_title", 0.2, 1.0) == config.pair_size_cap(
-            "same_title", 0.2, 0.5)
-        assert config.rebalance_change_warnings(before, after) == []
-
     def test_turning_rebalancing_on_is_judged_by_the_settings_it_trims_by(self):
         # Saved off, proposed on with a lower cap: the first trims use the new
         # cap, so it is named
@@ -3671,25 +3656,25 @@ class TestRebalanceChangeWarnings:
 class TestShippedLiveToggles:
     """The live toggles config.py ships, read unpatched end to end: any
     positive time-series spread up to 0.5 is admitted, books price up to a
-    leg-price sum of 1.0 with no-edge levels cut, and one pair stakes at most
-    20% (time-series under 1 - k, same-title at its cap). Changing a toggle
-    means re-pinning this class."""
+    leg-price sum of 1.0 with no-edge levels cut, and one time-series pair
+    stakes at most 20% (1 - k; any other pair type is capped at 0). Changing
+    a toggle means re-pinning this class."""
 
     _SHIPPED = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                            size_cap=1.0, same_title_size_cap=0.2, exclude_categories=None, exclude_tags=None,
+                            size_cap=1.0, exclude_categories=None, exclude_tags=None,
                             rebalance=True)
     # The values conftest's apply_pre_toggle_defaults pins, for the controls
     _BEFORE = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
-                           size_cap=0.2, same_title_size_cap=1.0)
+                           size_cap=0.2)
 
     def test_the_shipped_settings(self):
         assert live_settings() == self._SHIPPED
         assert (config.TIME_SERIES_TIER_FLOORS, config.TIME_SERIES_SPREAD_BAND,
                 config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, config.BUDGET_FRACTION,
-                config.SAME_TITLE_SIZE_CAP, config.TRADE_EXCLUDE_CATEGORIES, config.TRADE_EXCLUDE_TAGS,
+                config.TRADE_EXCLUDE_CATEGORIES, config.TRADE_EXCLUDE_TAGS,
                 config.REBALANCE, config.MIN_PRICE_MOVE, config.REBALANCE_MIN_DAYS_TO_MATURITY,
                 config.SELL_AT, config.SELL_MIN_DAYS) == (
-            False, (0.0, 0.5), 0.80, 1.0, 0.20, None, None, True, None, None, None, None)
+            False, (0.0, 0.5), 0.80, 1.0, None, None, True, None, None, None, None)
         # ... and the seed proposes rebalancing too, with no minimum price move and
         # no limit on how close to maturity a position is rebalanced
         assert (config.LIVE_DEFAULTS_SEED.rebalance, config.LIVE_DEFAULTS_SEED.min_price_move,
@@ -3728,25 +3713,6 @@ class TestShippedLiveToggles:
         assert spec is not None and spec.x == 100
         # With the tiers on, the 0.85 ceiling excludes that level on its own
         assert scanner._pair_max_sum(pair, self._BEFORE) == pytest.approx(0.85)
-
-    def test_the_same_title_reference_pair_is_capped_at_20_percent(self):
-        # nA 0.20 + pB 0.30: f* ~0.8945, bound only by SAME_TITLE_SIZE_CAP
-        fee = fee_per_pair_approx(0.20, 0.30)
-        net = 0.50 - fee
-        f_star = config.SAME_TITLE_CO_RESOLVE_PROB - (
-            1 - config.SAME_TITLE_CO_RESOLVE_PROB) * (0.50 + fee) / net
-        assert f_star == pytest.approx(0.8945, abs=1e-4)
-        pair = MagicMock()
-        pair.pA, pair.pB, pair.nA, pair.nB = 0.70, 0.30, 0.20, 0.70
-        pair.pair_type, pair.tradeable, pair.max_contracts = "same_title", True, 0
-        pair.canonical_title = "same-title reference pair"
-        pair.market_a.close_time = pair.market_b.close_time = (
-            datetime.now(UTC) + timedelta(days=15))
-        spec = compute_trade(pair, 1_000_000)
-        assert spec is not None
-        assert spec.kelly_fraction == pytest.approx(0.20)
-        assert spec.total_cost_with_fees <= 10_000.0 * 0.20 + 1e-9
-        assert max_kelly_fraction("same_title", live_settings()) == 0.2
 
     def test_every_time_series_spec_stakes_under_20_percent(self):
         # No per-trade cap: 1 - k = 0.20 bounds it on every uncrossed book
@@ -3838,7 +3804,7 @@ class TestPreToggleDefaults:
 
     _TOGGLES = frozenset({
         "TIME_SERIES_TIER_FLOORS", "TIME_SERIES_SPREAD_BAND",
-        "TIME_SERIES_INTERVAL_PROB_DISCOUNT", "BUDGET_FRACTION", "SAME_TITLE_SIZE_CAP",
+        "TIME_SERIES_INTERVAL_PROB_DISCOUNT", "BUDGET_FRACTION",
         "TRADE_EXCLUDE_CATEGORIES", "TRADE_EXCLUDE_TAGS", "REBALANCE", "MIN_PRICE_MOVE",
         "REBALANCE_MIN_DAYS_TO_MATURITY", "SELL_AT", "SELL_MIN_DAYS"})
 
@@ -3864,7 +3830,7 @@ class TestPreToggleDefaults:
         apply_pre_toggle_defaults(monkeypatch)
         assert live_settings() == LiveSettings(
             tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20,
-            same_title_size_cap=1.0, exclude_categories=None, exclude_tags=None, rebalance=False,
+            exclude_categories=None, exclude_tags=None, rebalance=False,
             min_price_move=None, rebalance_min_days_to_maturity=None, sell_at=None,
             sell_min_days=None)
         for module, bound, toggle in binders:
@@ -4053,12 +4019,12 @@ class TestLiveSettingsOrigin:
         assert dataclasses.replace(s, size_cap=0.35).origin == _SAVED_ORIGIN
         assert dataclasses.replace(s, exclude_categories=("Sports",)).origin == _SAVED_ORIGIN
 
-    def test_the_toggle_fields_are_the_twelve(self):
+    def test_the_toggle_fields_are_the_eleven(self):
         assert config.LIVE_TOGGLE_FIELDS == (
             "tier_floors", "spread_band", "interval_discount", "size_cap",
-            "same_title_size_cap", "exclude_categories", "exclude_tags", "rebalance", "min_price_move",
+            "exclude_categories", "exclude_tags", "rebalance", "min_price_move",
             "rebalance_min_days_to_maturity", "sell_at", "sell_min_days")
-        assert len(config.LIVE_TOGGLE_FIELDS) == 12
+        assert len(config.LIVE_TOGGLE_FIELDS) == 11
         # The five a saved file may leave out, in field order, at the end
         assert config._OPTIONAL_TOGGLES == ("rebalance", "min_price_move",
                                             "rebalance_min_days_to_maturity", "sell_at",
@@ -4066,15 +4032,27 @@ class TestLiveSettingsOrigin:
         assert config._TOGGLE_DEFAULTS == {
             "rebalance": False, "min_price_move": None,
             "rebalance_min_days_to_maturity": None, "sell_at": None, "sell_min_days": None}
-        # The settings an older version saved in their place, refused when read
+        # The settings an older version saved in their place (or, for the
+        # same-title cap, beside them, which nothing replaced), refused when read
         assert config._RETIRED_TOGGLES == ("add_to_held_pairs", "trim_to_kelly",
-                                           "trim_min_rise", "categories", "tags")
+                                           "trim_min_rise", "categories", "tags",
+                                           "same_title_size_cap")
+        # Each retirement names what replaced it, or None; the Rebalance one first
+        assert config._RETIREMENTS == (
+            (("add_to_held_pairs", "trim_to_kelly", "trim_min_rise"),
+             "rebalance and min_price_move"),
+            (("categories",), "exclude_categories"),
+            (("tags",), "exclude_tags"),
+            (("same_title_size_cap",), None),
+        )
+        assert [name for names, _ in config._RETIREMENTS for name in names] == list(
+            config._RETIRED_TOGGLES)
         assert [f.name for f in dataclasses.fields(LiveSettings)] == [
             *config.LIVE_TOGGLE_FIELDS, "origin"]
 
     def test_every_toggle_count_the_package_states_is_the_number_of_toggles(self):
         # Wherever a module's comments, docstrings or messages count the toggles
-        # ("the twelve toggles", "twelve live toggles", "twelve toggle names"),
+        # ("the eleven toggles", "eleven live toggles", "eleven toggle names"),
         # the count is the number of toggle fields or the number a saved file
         # must hold. Comment lines are joined first, so a split count is found
         names = ("one two three four five six seven eight nine ten eleven twelve "
@@ -4120,7 +4098,7 @@ def _valid_record(**changes) -> dict:
     Build a saved-defaults record the reader accepts, then apply changes.
 
     Its toggles are LIVE_DEFAULTS_SEED's, saved at 2026-09-27T21:05:13Z with
-    no source note and the optional toggles left out (the seven-toggle
+    no source note and the optional toggles left out (the six-toggle
     shape), so it reads as _SEED_REBALANCE_OFF.
 
     Args:
@@ -4135,7 +4113,7 @@ def _valid_record(**changes) -> dict:
         "source": "",
         "settings": {
             "tier_floors": False, "spread_band": [0.0, 0.5], "interval_discount": 0.8,
-            "size_cap": 0.1, "same_title_size_cap": 0.2, "exclude_categories": None, "exclude_tags": None,
+            "size_cap": 0.1, "exclude_categories": None, "exclude_tags": None,
         },
     }
     for key, value in changes.items():
@@ -4165,18 +4143,38 @@ def _with_toggles(**changes) -> dict:
     return record
 
 
-# Marks a key _valid_record / _with_toggles should remove
+def _older_toggles(**changes) -> dict:
+    """
+    Build _with_toggles() as an older version saved it: with a same-title cap.
+
+    Every older version required same_title_size_cap (an extra per-trade cap
+    on same-title pairs, which this version no longer has), so every file one
+    of them saved holds one beside its other settings: here 20%, on the 5%
+    grid those versions required. A file this version saves holds none
+    (_valid_record), and a file holding another retired setting without the
+    cap has no reading (TestSameTitleCapRetirement).
+
+    Args:
+        **changes: Toggles to replace; a value of _DROP removes the toggle,
+            the cap included.
+
+    Returns:
+        dict: The record, ready for json.dumps.
+    """
+    return _with_toggles(**{"same_title_size_cap": 0.2, **changes})
+
+
+# Marks a key _valid_record, _with_toggles or _older_toggles should remove
 _DROP = object()
 
 # LIVE_DEFAULTS_SEED with rebalancing off (no selling either): what
-# _valid_record's seven-toggle file reads as, and what a save of it writes as
-# seven toggles
+# _valid_record's six-toggle file reads as, and what a save of it writes as
+# six toggles
 _SEED_REBALANCE_OFF = dataclasses.replace(config.LIVE_DEFAULTS_SEED, rebalance=False)
 
 # The exact bytes a save of _SEED_REBALANCE_OFF writes, with the seed's note, at
-# _FrozenDatetime's instant: the optional toggles are left out while off, so
-# code that does not know them can still read the file
-_SEVEN_TOGGLE_BYTES = (
+# _FrozenDatetime's instant: the optional toggles are left out while off
+_SIX_TOGGLE_BYTES = (
     b'{\n'
     b'  "format": "live-defaults-v1",\n'
     b'  "saved_at": "2026-09-27T21:05:13Z",\n'
@@ -4186,7 +4184,6 @@ _SEVEN_TOGGLE_BYTES = (
     b'    "spread_band": [0.0, 0.5],\n'
     b'    "interval_discount": 0.8,\n'
     b'    "size_cap": 0.1,\n'
-    b'    "same_title_size_cap": 0.2,\n'
     b'    "exclude_categories": null,\n'
     b'    "exclude_tags": null\n'
     b'  }\n'
@@ -4227,7 +4224,7 @@ class TestSavedLiveDefaults:
 
     _SETTINGS = LiveSettings(
         tier_floors=True, spread_band=(0.1, 0.6), interval_discount=0.6, size_cap=0.35,
-        same_title_size_cap=0.5, exclude_categories=("Sports",), exclude_tags=("Basketball",))
+        exclude_categories=("Sports",), exclude_tags=("Basketball",))
 
     def test_the_path_is_this_test_s_own(self, tmp_path):
         # conftest's per-test redirect, never the repo's own file
@@ -4247,8 +4244,7 @@ class TestSavedLiveDefaults:
         assert config.read_saved_live_defaults() is None
 
     def test_a_save_round_trips_every_toggle(self):
-        # A Category · Tag filter (the dashboard's "Sports · Basketball") and a
-        # same-title cap below the per-trade cap
+        # A Category · Tag filter (the dashboard's "Sports · Basketball")
         saved = config.save_live_defaults(self._SETTINGS, source="a note")
         assert saved == self._SETTINGS
         for name in config.LIVE_TOGGLE_FIELDS:
@@ -4257,21 +4253,22 @@ class TestSavedLiveDefaults:
         assert again == self._SETTINGS and again.origin == saved.origin
         text = config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8")
         assert '"exclude_categories": ["Sports"],' in text and '"exclude_tags": ["Basketball"]\n' in text
+        # No same-title cap is written: the file holds the eleven toggles' names only
+        assert "same_title_size_cap" not in text
 
     def test_the_written_text_is_pinned(self, monkeypatch):
-        # With rebalancing off, the key is left out, byte for byte, so code
-        # that does not know the toggle can read a file saved with it off
+        # With rebalancing off, the key is left out, byte for byte
         monkeypatch.setattr(config, "datetime", _FrozenDatetime)
         config.save_live_defaults(_SEED_REBALANCE_OFF, source=config.LIVE_DEFAULTS_SEED_SOURCE)
-        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SIX_TOGGLE_BYTES
 
     def test_an_on_save_writes_the_key_after_the_filters(self, monkeypatch):
         # The seed (rebalancing on, no minimum) writes the toggle, after the
-        # other seven
+        # other six
         monkeypatch.setattr(config, "datetime", _FrozenDatetime)
         config.save_live_defaults(config.LIVE_DEFAULTS_SEED,
                                   source=config.LIVE_DEFAULTS_SEED_SOURCE)
-        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES.replace(
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SIX_TOGGLE_BYTES.replace(
             b'    "exclude_tags": null\n',
             b'    "exclude_tags": null,\n    "rebalance": true\n')
         assert config.read_saved_live_defaults() == config.LIVE_DEFAULTS_SEED
@@ -4292,7 +4289,7 @@ class TestSavedLiveDefaults:
         # A level and a minimum, after rebalancing
         both = dataclasses.replace(config.LIVE_DEFAULTS_SEED, sell_at=0.85, sell_min_days=3)
         config.save_live_defaults(both, source=config.LIVE_DEFAULTS_SEED_SOURCE)
-        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES.replace(
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SIX_TOGGLE_BYTES.replace(
             b'    "exclude_tags": null\n',
             b'    "exclude_tags": null,\n    "rebalance": true,\n'
             b'    "sell_at": 0.85,\n    "sell_min_days": 3\n')
@@ -4300,7 +4297,7 @@ class TestSavedLiveDefaults:
         # A level alone leaves the minimum out; rebalancing off leaves its key out too
         level = dataclasses.replace(_SEED_REBALANCE_OFF, sell_at=0.5)
         config.save_live_defaults(level, source=config.LIVE_DEFAULTS_SEED_SOURCE)
-        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES.replace(
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SIX_TOGGLE_BYTES.replace(
             b'    "exclude_tags": null\n', b'    "exclude_tags": null,\n    "sell_at": 0.5\n')
         assert config.read_saved_live_defaults() == level
         # Every level of the grid round-trips as the same float
@@ -4320,12 +4317,12 @@ class TestSavedLiveDefaults:
     def test_rebalancing_off_writes_exactly_the_bytes_written_before_it_existed(
             self, monkeypatch):
         # Both rebalance settings at their defaults are left out of the file:
-        # with selling off too it is byte for byte the seven-toggle file
+        # with selling off too it is byte for byte the six-toggle file
         monkeypatch.setattr(config, "datetime", _FrozenDatetime)
         assert (_SEED_REBALANCE_OFF.rebalance, _SEED_REBALANCE_OFF.min_price_move) == (
             False, None)
         config.save_live_defaults(_SEED_REBALANCE_OFF, source=config.LIVE_DEFAULTS_SEED_SOURCE)
-        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SIX_TOGGLE_BYTES
         for settings in (_SEED_REBALANCE_OFF,
                          dataclasses.replace(_SEED_REBALANCE_OFF, sell_at=0.85,
                                              sell_min_days=3)):
@@ -4342,7 +4339,7 @@ class TestSavedLiveDefaults:
         everything = dataclasses.replace(config.LIVE_DEFAULTS_SEED, min_price_move=0.10,
                                          sell_at=0.85, sell_min_days=3)
         config.save_live_defaults(everything, source=config.LIVE_DEFAULTS_SEED_SOURCE)
-        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES.replace(
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SIX_TOGGLE_BYTES.replace(
             b'    "exclude_tags": null\n',
             b'    "exclude_tags": null,\n    "rebalance": true,\n    "min_price_move": 0.1,\n'
             b'    "sell_at": 0.85,\n    "sell_min_days": 3\n')
@@ -4361,7 +4358,7 @@ class TestSavedLiveDefaults:
             assert settings.rebalance_min_days_to_maturity is None
             config.save_live_defaults(settings, source=config.LIVE_DEFAULTS_SEED_SOURCE)
             assert b"rebalance_min_days_to_maturity" not in config.LIVE_DEFAULTS_FILE.read_bytes()
-        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES.replace(
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SIX_TOGGLE_BYTES.replace(
             b'    "exclude_tags": null\n',
             b'    "exclude_tags": null,\n    "rebalance": true\n')
         # A 0 given in is stored as None, so it is left out too
@@ -4376,7 +4373,7 @@ class TestSavedLiveDefaults:
             config.LIVE_DEFAULTS_SEED, min_price_move=0.10, rebalance_min_days_to_maturity=7,
             sell_at=0.85, sell_min_days=3)
         config.save_live_defaults(everything, source=config.LIVE_DEFAULTS_SEED_SOURCE)
-        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES.replace(
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SIX_TOGGLE_BYTES.replace(
             b'    "exclude_tags": null\n',
             b'    "exclude_tags": null,\n    "rebalance": true,\n    "min_price_move": 0.1,\n'
             b'    "rebalance_min_days_to_maturity": 7,\n'
@@ -4385,7 +4382,7 @@ class TestSavedLiveDefaults:
         # Alone, it follows rebalance directly
         one = dataclasses.replace(config.LIVE_DEFAULTS_SEED, rebalance_min_days_to_maturity=1)
         config.save_live_defaults(one, source=config.LIVE_DEFAULTS_SEED_SOURCE)
-        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES.replace(
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SIX_TOGGLE_BYTES.replace(
             b'    "exclude_tags": null\n',
             b'    "exclude_tags": null,\n    "rebalance": true,\n'
             b'    "rebalance_min_days_to_maturity": 1\n')
@@ -4413,7 +4410,7 @@ class TestSavedLiveDefaults:
                             sell_min_days=3),
     ])
     def test_the_writer_never_writes_a_retired_key(self, settings):
-        # Only the twelve toggles' names reach the file, so a save always
+        # Only the eleven toggles' names reach the file, so a save always
         # writes a file every live run reads
         config.save_live_defaults(settings, source="")
         record = json.loads(config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8"))
@@ -4431,11 +4428,11 @@ class TestSavedLiveDefaults:
             config._settings_from_bytes(_text(_with_toggles(min_price_move=0.10)))
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
 
-    def test_a_seven_toggle_file_reads_with_rebalancing_off(self):
+    def test_a_six_toggle_file_reads_with_rebalancing_off(self):
         # A file that leaves rebalance out reads as the same settings,
         # rebalancing off with no minimum (nobody confirmed a value for it),
         # whatever config.py or the seed ship
-        config.LIVE_DEFAULTS_FILE.write_bytes(_SEVEN_TOGGLE_BYTES)
+        config.LIVE_DEFAULTS_FILE.write_bytes(_SIX_TOGGLE_BYTES)
         saved = config.read_saved_live_defaults()
         assert saved == _SEED_REBALANCE_OFF and saved.rebalance is False
         assert saved.min_price_move is None
@@ -4788,9 +4785,9 @@ class TestSavedLiveDefaults:
         ("an extra toggle beside the later one",
          _text(_with_toggles(rebalance=True, sell_held_pairs=True))),
         # A setting an older version saved: refused until saved again
-        ("an older version's adding switch", _text(_with_toggles(add_to_held_pairs=True))),
+        ("an older version's adding switch", _text(_older_toggles(add_to_held_pairs=True))),
         ("an older version's trim settings",
-         _text(_with_toggles(trim_to_kelly=True, trim_min_rise=0.1))),
+         _text(_older_toggles(trim_to_kelly=True, trim_min_rise=0.1))),
         # Values
         # LiveSettings alone would read these two as the band (0.0, 1.0): only the
         # reader's own spread_band rule refuses them
@@ -4927,7 +4924,7 @@ class TestSavedLiveDefaults:
              "rebalance_min_days_to_maturity must be 0, 1 or 7, got 1.0"),
             (_text(_with_toggles(rebalance_min_days_to_maturity=7)),
              "rebalance_min_days_to_maturity needs rebalance on"),
-            (_text(_with_toggles(add_to_held_pairs=True)),
+            (_text(_older_toggles(add_to_held_pairs=True)),
              "which rebalance and min_price_move replaced"),
         ]:
             path.write_bytes(data)
@@ -5010,7 +5007,7 @@ class TestSavedLiveDefaults:
             exclude_categories=[" Sports "], exclude_tags=["Basketball"])))
         saved = config.read_saved_live_defaults()
         assert saved == LiveSettings(tier_floors=False, spread_band=(0.0, 1.0),
-                                     interval_discount=1.0, size_cap=1.0, same_title_size_cap=0.2,
+                                     interval_discount=1.0, size_cap=1.0,
                                      exclude_categories=("Sports",), exclude_tags=("Basketball",))
         assert saved.origin == "live_defaults.json, saved 2026-09-27T21:05:13Z"
 
@@ -5092,7 +5089,9 @@ class TestOutdatedSavedFile:
     trim_to_kelly, trim_min_rise) is refused as LiveDefaultsOutdated, so no run
     trades it, and carries what it reads as now (rebalance on only when both
     old switches were on, the old minimum then) for the defaults server to
-    offer. Each test writes to its own path (conftest's _isolate_live_defaults)."""
+    offer. Each file here holds a same-title cap too, as every file an older
+    version saved does (_older_toggles), so its message names that retirement
+    as well. Each test writes to its own path (conftest's _isolate_live_defaults)."""
 
     def test_the_old_file_is_refused_and_carries_its_new_form(self):
         # The previous writer's own bytes: both switches on, a 10c minimum
@@ -5100,20 +5099,23 @@ class TestOutdatedSavedFile:
         assert isinstance(err, config.LiveDefaultsError)
         assert not isinstance(err, config.LiveDefaultsMissing)
         # The previous writer's file holds categories and tags too (null: any
-        # category, any tag), which exclude_categories and exclude_tags replaced
+        # category, any tag), which exclude_categories and exclude_tags replaced,
+        # and a same-title cap, which nothing replaced: all four are named
         assert str(err) == (
             f'{config.LIVE_DEFAULTS_FILE}: "settings" holds add_to_held_pairs, trim_to_kelly '
             "and trim_min_rise, which rebalance and min_price_move replaced, and categories, "
-            "which exclude_categories replaced, and tags, which exclude_tags replaced: save "
-            "the live defaults again (start ./start_dashboard.sh; its pages offer them as "
-            "rebalance yes, min price movement 10c, no category excluded, no tag excluded)")
+            "which exclude_categories replaced, and tags, which exclude_tags replaced, and "
+            "same_title_size_cap, which is no longer used (the bot trades time-series pairs "
+            "only): save the live defaults again (start ./start_dashboard.sh; its pages offer "
+            "them as rebalance yes, min price movement 10c, no category excluded, no tag "
+            "excluded, no same-title cap)")
         assert err.retired == ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise",
-                               "categories", "tags")
-        # Every other setting as saved; the origin names the file as a read would
+                               "categories", "tags", "same_title_size_cap")
+        # Every other setting as saved, and no same-title cap; the origin names
+        # the file as a read would
         assert err.proposal == LiveSettings(tier_floors=False, spread_band=(0.0, 0.8),
                                             interval_discount=0.7, size_cap=0.15,
-                                            same_title_size_cap=0.2, rebalance=True,
-                                            min_price_move=0.10)
+                                            rebalance=True, min_price_move=0.10)
         assert err.proposal.origin == (
             "live_defaults.json, saved 2026-10-11T18:22:05Z from backtest dashboard for "
             "2025-10-11 to 2026-10-11")
@@ -5126,9 +5128,10 @@ class TestOutdatedSavedFile:
         assert err.value.proposal.rebalance is True
 
     def test_both_switches_on_with_no_minimum_proposes_no_minimum(self):
-        err = _outdated(_text(_with_toggles(add_to_held_pairs=True, trim_to_kelly=True)))
+        err = _outdated(_text(_older_toggles(add_to_held_pairs=True, trim_to_kelly=True)))
         assert err.proposal == config.LIVE_DEFAULTS_SEED
-        assert str(err).endswith("offer them as rebalance yes, min price movement any)")
+        assert str(err).endswith(
+            "offer them as rebalance yes, min price movement any, no same-title cap)")
 
     @pytest.mark.parametrize("old", [
         {"add_to_held_pairs": True},
@@ -5142,14 +5145,14 @@ class TestOutdatedSavedFile:
     def test_only_one_old_switch_on_proposes_rebalancing_off(self, old):
         # Rebalance does both together, so one old switch alone is not it, and
         # the old minimum goes with it
-        err = _outdated(_text(_with_toggles(**old)))
+        err = _outdated(_text(_older_toggles(**old)))
         assert err.proposal == _SEED_REBALANCE_OFF
         assert err.proposal.min_price_move is None
-        assert str(err).endswith("offer them as rebalance no)")
+        assert str(err).endswith("offer them as rebalance no, no same-title cap)")
 
     def test_the_other_settings_are_kept_as_saved(self):
         # Selling and the filter come through unchanged
-        err = _outdated(_text(_with_toggles(
+        err = _outdated(_text(_older_toggles(
             add_to_held_pairs=True, trim_to_kelly=True, trim_min_rise=0.25, sell_at=0.85,
             sell_min_days=3, exclude_categories=["Politics"], exclude_tags=["Sports · Basketball"])))
         assert err.proposal == dataclasses.replace(
@@ -5163,8 +5166,9 @@ class TestOutdatedSavedFile:
          "add_to_held_pairs and trim_to_kelly"),
     ])
     def test_the_message_names_only_the_old_settings_the_file_holds(self, old, held):
-        err = _outdated(_text(_with_toggles(**old)))
-        assert f'"settings" holds {held}, which rebalance and min_price_move replaced' in str(err)
+        err = _outdated(_text(_older_toggles(**old)))
+        assert (f'"settings" holds {held}, which rebalance and min_price_move replaced, and '
+                "same_title_size_cap, which is no longer used") in str(err)
 
     @pytest.mark.parametrize("label, old, reason", [
         ("a cap off the grid", {"add_to_held_pairs": True, "size_cap": 0.07},
@@ -5196,7 +5200,7 @@ class TestOutdatedSavedFile:
     def test_a_broken_setting_beside_an_old_one_leaves_no_proposal(self, label, old, reason):
         # Still refused as outdated, but with nothing to offer: the message says
         # why and names the other ways to save
-        err = _outdated(_text(_with_toggles(**old)))
+        err = _outdated(_text(_older_toggles(**old)))
         assert err.proposal is None, label
         message = str(err)
         assert "and its other settings are refused too (" in message, label
@@ -5239,10 +5243,11 @@ class TestCategoriesRetirement:
 
     @staticmethod
     def _current_era(**changes) -> bytes:
-        """A file the version before this one wrote: categories in place of
-        exclude_categories, with rebalance and selling saved."""
-        record = _with_toggles(rebalance=True, min_price_move=0.1, sell_at=0.9,
-                               sell_min_days=2, **changes)
+        """A file of the era before exclude_categories: categories in place of
+        exclude_categories, with rebalance and selling saved, and the
+        same-title cap every file of that era held (_older_toggles)."""
+        record = _older_toggles(rebalance=True, min_price_move=0.1, sell_at=0.9,
+                                sell_min_days=2, **changes)
         settings = record["settings"]
         settings["categories"] = settings.pop("exclude_categories")
         # That version's tags were tags to trade, under the old key
@@ -5251,17 +5256,19 @@ class TestCategoriesRetirement:
 
     def test_a_null_list_proposes_no_category_excluded_and_everything_else(self):
         # That version's file holds tags too (null: any tag), which exclude_tags
-        # replaced: both retirements at once
+        # replaced, and the same-title cap, which nothing replaced: all three
+        # retirements at once
         err = _outdated(self._current_era())
-        assert err.retired == ("categories", "tags")
+        assert err.retired == ("categories", "tags", "same_title_size_cap")
         assert err.proposal == dataclasses.replace(
             config.LIVE_DEFAULTS_SEED, min_price_move=0.1, sell_at=0.9, sell_min_days=2,
             exclude_categories=None)
         assert str(err) == (
             f'{config.LIVE_DEFAULTS_FILE}: "settings" holds categories, which '
-            "exclude_categories replaced, and tags, which exclude_tags replaced: save the "
-            "live defaults again (start ./start_dashboard.sh; its pages offer them as no "
-            "category excluded, no tag excluded)")
+            "exclude_categories replaced, and tags, which exclude_tags replaced, and "
+            "same_title_size_cap, which is no longer used (the bot trades time-series pairs "
+            "only): save the live defaults again (start ./start_dashboard.sh; its pages offer "
+            "them as no category excluded, no tag excluded, no same-title cap)")
         # live_defaults refuses it too: no run trades the proposal
         with pytest.raises(config.LiveDefaultsOutdated):
             config.live_defaults()
@@ -5286,12 +5293,13 @@ class TestCategoriesRetirement:
             exclude_categories=None)
         assert str(err) == (
             f'{config.LIVE_DEFAULTS_FILE}: "settings" holds categories, which '
-            "exclude_categories replaced, and tags, which exclude_tags replaced: these "
-            f"defaults traded only {', '.join(repr(name) for name in old)}, and this "
-            "version saves what NOT to trade instead. Saved again as offered (no category "
-            "excluded, no tag excluded), they trade everything: exclude each category not "
-            "to trade before saving (start ./start_dashboard.sh, or the backtest "
-            "dashboard's \"Save as live defaults…\" button)")
+            "exclude_categories replaced, and tags, which exclude_tags replaced, and "
+            "same_title_size_cap, which is no longer used (the bot trades time-series pairs "
+            f"only): these defaults traded only {', '.join(repr(name) for name in old)}, and "
+            "this version saves what NOT to trade instead. Saved again as offered (no "
+            "category excluded, no tag excluded, no same-title cap), they trade everything: "
+            "exclude each category not to trade before saving (start ./start_dashboard.sh, "
+            "or the backtest dashboard's \"Save as live defaults…\" button)")
 
     def test_a_null_list_has_no_old_categories(self):
         assert _outdated(self._current_era()).old_categories is None
@@ -5333,15 +5341,18 @@ class TestCategoriesRetirement:
         err = _outdated(_text(record))
         assert err.old_categories == ("Sports",)
         assert err.proposal.rebalance is True and err.proposal.exclude_categories is None
+        # That file holds a same-title cap too, which nothing replaced
         assert ('"settings" holds add_to_held_pairs, trim_to_kelly and trim_min_rise, '
                 "which rebalance and min_price_move replaced, and categories, which "
-                "exclude_categories replaced, and tags, which exclude_tags replaced: these "
-                "defaults traded only 'Sports'") in str(err)
+                "exclude_categories replaced, and tags, which exclude_tags replaced, and "
+                "same_title_size_cap, which is no longer used (the bot trades time-series "
+                "pairs only): these defaults traded only 'Sports'") in str(err)
         assert ("Saved again as offered (rebalance yes, min price movement 10c, no "
-                "category excluded, no tag excluded), they trade everything") in str(err)
+                "category excluded, no tag excluded, no same-title cap), they trade "
+                "everything") in str(err)
 
     def test_both_filters_together_are_refused_with_no_proposal(self):
-        record = _with_toggles()
+        record = _older_toggles()
         record["settings"]["categories"] = None
         err = _outdated(_text(record))
         assert err.proposal is None
@@ -5349,7 +5360,8 @@ class TestCategoriesRetirement:
                 "which no version saved beside categories)") in str(err)
 
     def test_the_rebalance_conflict_applies_only_to_the_rebalance_settings(self):
-        # A file of the version before this one holds rebalance beside categories:
+        # A file saved after Rebalance but before the category change holds
+        # rebalance beside categories:
         # not two things at once, since rebalance replaced nothing there
         err = _outdated(self._current_era())
         assert err.proposal is not None and err.proposal.rebalance is True
@@ -5369,16 +5381,17 @@ class TestTagsRetirement:
     exact reading (which tags it leaves out depends on every tag Kalshi
     lists), so its proposal excludes none too, and old_tags names the list,
     so every page that offers the proposal can say it widens live trading.
-    Every file the version before this one saved holds "tags", since it was
-    required."""
+    Every file the version with exclude_categories saved holds "tags", since
+    it was required."""
 
     @staticmethod
     def _current_era(**changes) -> bytes:
-        """A file the version before this one wrote: exclude_categories, and
-        tags (tags to trade) in place of exclude_tags, with rebalance and
-        selling saved."""
-        record = _with_toggles(rebalance=True, min_price_move=0.1, sell_at=0.9,
-                               sell_min_days=2, **changes)
+        """A file of the era before exclude_tags: exclude_categories, and tags
+        (tags to trade) in place of exclude_tags, with rebalance and selling
+        saved, and the same-title cap every file of that era held
+        (_older_toggles)."""
+        record = _older_toggles(rebalance=True, min_price_move=0.1, sell_at=0.9,
+                                sell_min_days=2, **changes)
         settings = record["settings"]
         settings["tags"] = settings.pop("exclude_tags")
         return _text(record)
@@ -5391,15 +5404,17 @@ class TestTagsRetirement:
 
     def test_a_null_list_proposes_no_tag_excluded_and_everything_else(self):
         err = _outdated(self._current_era(exclude_categories=["Politics"]))
-        assert err.retired == ("tags",)
+        assert err.retired == ("tags", "same_title_size_cap")
         assert err.proposal == dataclasses.replace(
             config.LIVE_DEFAULTS_SEED, min_price_move=0.1, sell_at=0.9, sell_min_days=2,
             exclude_categories=("Politics",), exclude_tags=None)
         assert err.old_tags is None and err.old_categories is None
         assert str(err) == (
             f'{config.LIVE_DEFAULTS_FILE}: "settings" holds tags, which exclude_tags '
-            "replaced: save the live defaults again (start ./start_dashboard.sh; its pages "
-            "offer them as no tag excluded)")
+            "replaced, and same_title_size_cap, which is no longer used (the bot trades "
+            "time-series pairs only): save the live defaults again (start "
+            "./start_dashboard.sh; its pages offer them as no tag excluded, no same-title "
+            "cap)")
         # live_defaults refuses it too: no run trades the proposal
         with pytest.raises(config.LiveDefaultsOutdated):
             config.live_defaults()
@@ -5414,11 +5429,12 @@ class TestTagsRetirement:
             exclude_tags=None)
         assert str(err) == (
             f'{config.LIVE_DEFAULTS_FILE}: "settings" holds tags, which exclude_tags '
-            "replaced: these defaults limited trading to the tags "
+            "replaced, and same_title_size_cap, which is no longer used (the bot trades "
+            "time-series pairs only): these defaults limited trading to the tags "
             f"{', '.join(repr(name) for name in old)} (a 'Category · Tag' limited that "
             "category alone), and this version saves what NOT to "
-            "trade instead. Saved again as offered (no tag excluded), they trade "
-            "everything: exclude each tag not to trade before saving (start "
+            "trade instead. Saved again as offered (no tag excluded, no same-title cap), "
+            "they trade everything: exclude each tag not to trade before saving (start "
             "./start_dashboard.sh, or the backtest dashboard's \"Save as live "
             "defaults…\" button)")
 
@@ -5470,7 +5486,7 @@ class TestTagsRetirement:
         assert "exclude each category and tag not to trade before saving" in str(err)
 
     def test_both_filters_together_are_refused_with_no_proposal(self):
-        record = _with_toggles()
+        record = _older_toggles()
         record["settings"]["tags"] = None
         err = _outdated(_text(record))
         assert err.proposal is None
@@ -5482,34 +5498,35 @@ class TestTagsRetirement:
         # No version saved categories (the oldest filter) beside exclude_tags,
         # as none saved tags beside exclude_tags: such a file says two things
         # at once and is offered nothing, whatever its categories says
-        record = _with_toggles(exclude_tags=["Sports · Basketball"])
+        record = _older_toggles(exclude_tags=["Sports · Basketball"])
         record["settings"]["categories"] = None if null else ["Sports"]
         del record["settings"]["exclude_categories"]
         err = _outdated(_text(record))
-        assert err.retired == ("categories",)
+        assert err.retired == ("categories", "same_title_size_cap")
         assert err.proposal is None and err.old_categories is None
         assert ("and its other settings are refused too (it also holds exclude_tags, "
                 "which no version saved beside categories)") in str(err)
 
     def test_every_filter_era_a_version_saved_still_has_its_proposal(self):
-        # categories beside tags (the oldest filter): both retirements
+        # categories beside tags (the oldest filter): both retirements, beside
+        # the Rebalance one and the same-title cap that file also holds
         record = json.loads(_OLD_VERSION_BYTES)
         record["settings"]["categories"] = ["Sports"]
         record["settings"]["tags"] = ["Basketball"]
         err = _outdated(_text(record))
         assert err.retired == ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise",
-                               "categories", "tags")
+                               "categories", "tags", "same_title_size_cap")
         assert err.proposal is not None
         assert err.old_categories == ("Sports",) and err.old_tags == ("Basketball",)
-        # exclude_categories beside tags (the version before this one)
+        # exclude_categories beside tags (a file saved before the tag change)
         err = _outdated(self._with_tags(b'["Basketball"]', exclude_categories=["Politics"]))
-        assert err.retired == ("tags",)
+        assert err.retired == ("tags", "same_title_size_cap")
         assert err.proposal.exclude_categories == ("Politics",)
         assert err.old_tags == ("Basketball",)
         # The Rebalance settings are not part of the filter: beside this
         # version's filter keys they still read as saved
-        err = _outdated(_text(_with_toggles(add_to_held_pairs=True, trim_to_kelly=True,
-                                            exclude_tags=["Sports · Basketball"])))
+        err = _outdated(_text(_older_toggles(add_to_held_pairs=True, trim_to_kelly=True,
+                                             exclude_tags=["Sports · Basketball"])))
         assert err.proposal.exclude_tags == ("Sports · Basketball",)
 
     def test_one_save_of_the_proposal_replaces_the_file(self):
@@ -5520,14 +5537,273 @@ class TestTagsRetirement:
         assert config.read_saved_live_defaults() == proposal
 
 
+# A file the version before this one wrote, in its exact layout and shaped like
+# the live defaults a real account had saved: tier floors off, band 0.2-0.8,
+# k 0.85, a 10% per-trade cap, a 20% same-title cap, no category excluded, two
+# tied tags excluded (json.dumps writes their middle dot as \u00b7), rebalancing
+# on with a 10c minimum price movement until 7 days before maturity, and no
+# selling (its keys left out). Its one retired setting is the same-title cap.
+# Other test files import it, and the two values below, from here (inside a
+# test, so this module loads only when one runs)
+_SAME_TITLE_CAP_ERA_BYTES = (
+    b'{\n'
+    b'  "format": "live-defaults-v1",\n'
+    b'  "saved_at": "2026-11-09T22:38:14Z",\n'
+    b'  "source": "backtest dashboard for 2024-01-01 to 2026-11-05",\n'
+    b'  "settings": {\n'
+    b'    "tier_floors": false,\n'
+    b'    "spread_band": [0.2, 0.8],\n'
+    b'    "interval_discount": 0.85,\n'
+    b'    "size_cap": 0.1,\n'
+    b'    "same_title_size_cap": 0.2,\n'
+    b'    "exclude_categories": null,\n'
+    b'    "exclude_tags": ["Climate and Weather \\u00b7 Ski Resorts", '
+    b'"Entertainment \\u00b7 General"],\n'
+    b'    "rebalance": true,\n'
+    b'    "min_price_move": 0.1,\n'
+    b'    "rebalance_min_days_to_maturity": 7\n'
+    b'  }\n'
+    b'}\n')
+
+# What _SAME_TITLE_CAP_ERA_BYTES reads as now: every setting as saved, no
+# same-title cap, no selling
+_SAME_TITLE_CAP_ERA_PROPOSAL = LiveSettings(
+    tier_floors=False, spread_band=(0.2, 0.8), interval_discount=0.85, size_cap=0.1,
+    exclude_categories=None,
+    exclude_tags=("Climate and Weather · Ski Resorts", "Entertainment · General"),
+    rebalance=True, min_price_move=0.1, rebalance_min_days_to_maturity=7)
+
+# The one line its refusal says after the file's path
+_SAME_TITLE_CAP_ERA_MESSAGE = (
+    '"settings" holds same_title_size_cap, which is no longer used (the bot trades '
+    "time-series pairs only): save the live defaults again (start ./start_dashboard.sh; "
+    "its pages offer them as saved, with no same-title cap)")
+
+
+class TestSameTitleCapRetirement:
+    """A saved file holding "same_title_size_cap" (an extra per-trade cap on
+    same-title pairs, which nothing replaced: the bot trades time-series pairs
+    only) is refused as LiveDefaultsOutdated, so no run trades it. Its proposal
+    is the file's other settings as saved, with no same-title cap, offered for
+    one Confirm and save, unless the cap breaks the older version's own rule
+    (a multiple of 5% from 5% to 100%, never true or false). Every file an
+    older version saved holds the cap, since every one required it, so a file
+    holding another retired setting without the cap has no proposal either."""
+
+    @staticmethod
+    def _record(**changes) -> dict:
+        """The file of _SAME_TITLE_CAP_ERA_BYTES as a record, its toggles changed
+        (a value of _DROP removes one)."""
+        record = json.loads(_SAME_TITLE_CAP_ERA_BYTES)
+        for key, value in changes.items():
+            if value is _DROP:
+                del record["settings"][key]
+            else:
+                record["settings"][key] = value
+        return record
+
+    def test_the_fixture_is_what_the_older_writer_wrote(self):
+        # Byte for byte the older version's layout (config._saved_text), the
+        # middle dot escaped as json.dumps writes it
+        record = json.loads(_SAME_TITLE_CAP_ERA_BYTES)
+        assert config._saved_text(record).encode("utf-8") == _SAME_TITLE_CAP_ERA_BYTES
+        assert b"\\u00b7" in _SAME_TITLE_CAP_ERA_BYTES
+        assert "sell_at" not in record["settings"] and "sell_min_days" not in record["settings"]
+
+    def test_a_file_holding_the_cap_is_refused_with_its_other_settings_offered(self):
+        err = _outdated(_SAME_TITLE_CAP_ERA_BYTES)
+        assert isinstance(err, config.LiveDefaultsError)
+        assert err.retired == ("same_title_size_cap",)
+        assert err.old_categories is None and err.old_tags is None
+        assert err.proposal == _SAME_TITLE_CAP_ERA_PROPOSAL
+        # Field by field, every setting the file holds but the cap, as saved
+        settings = json.loads(_SAME_TITLE_CAP_ERA_BYTES)["settings"]
+        for name, value in settings.items():
+            if name == "same_title_size_cap":
+                continue
+            assert getattr(err.proposal, name) == (
+                tuple(value) if isinstance(value, list) else value), name
+        # ... and the two sell settings it leaves out read as off
+        assert err.proposal.sell_at is None and err.proposal.sell_min_days is None
+        assert set(settings) - {"same_title_size_cap"} | {"sell_at", "sell_min_days"} == set(
+            config.LIVE_TOGGLE_FIELDS)
+        assert err.proposal.origin == (
+            "live_defaults.json, saved 2026-11-09T22:38:14Z from backtest dashboard for "
+            "2024-01-01 to 2026-11-05")
+        assert str(err) == f"{config.LIVE_DEFAULTS_FILE}: {_SAME_TITLE_CAP_ERA_MESSAGE}"
+
+    def test_no_run_trades_it(self):
+        # The read every live run makes refuses it, never the proposal
+        config.LIVE_DEFAULTS_FILE.write_bytes(_SAME_TITLE_CAP_ERA_BYTES)
+        with pytest.raises(config.LiveDefaultsOutdated) as err:
+            config.live_defaults()
+        assert err.value.proposal == _SAME_TITLE_CAP_ERA_PROPOSAL
+
+    def test_one_save_of_the_proposal_replaces_the_file(self):
+        # The defaults server's Confirm and save: the new file holds no
+        # same-title cap, and every run reads it back as the proposal
+        proposal = _outdated(_SAME_TITLE_CAP_ERA_BYTES).proposal
+        assert config.save_live_defaults(proposal, source="") == proposal
+        text = config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8")
+        assert "same_title_size_cap" not in text
+        assert config.read_saved_live_defaults() == proposal
+        assert config.live_defaults() == proposal
+
+    @pytest.mark.parametrize("settings", [
+        _SAME_TITLE_CAP_ERA_PROPOSAL, config.LIVE_DEFAULTS_SEED,
+        dataclasses.replace(config.LIVE_DEFAULTS_SEED, size_cap=1.0, sell_at=0.85),
+    ])
+    def test_the_writer_never_writes_the_cap(self, settings):
+        config.save_live_defaults(settings, source="")
+        stored = json.loads(config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8"))["settings"]
+        assert "same_title_size_cap" not in stored
+        assert config.read_saved_live_defaults() == settings
+
+    @pytest.mark.parametrize("label, changes, retired, offered", [
+        ("tags to trade, null",
+         {"exclude_tags": _DROP, "tags": None},
+         ("tags", "same_title_size_cap"),
+         "no tag excluded, no same-title cap"),
+        ("the Rebalance switches",
+         {"rebalance": _DROP, "min_price_move": _DROP,
+          "rebalance_min_days_to_maturity": _DROP,
+          "add_to_held_pairs": True, "trim_to_kelly": True, "trim_min_rise": 0.1},
+         ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise", "same_title_size_cap"),
+         "rebalance yes, min price movement 10c, no same-title cap"),
+        ("categories and tags to trade, null",
+         {"exclude_categories": _DROP, "exclude_tags": _DROP,
+          "categories": None, "tags": None},
+         ("categories", "tags", "same_title_size_cap"),
+         "no category excluded, no tag excluded, no same-title cap"),
+    ])
+    def test_beside_an_older_retirement_both_are_named_and_applied(
+            self, label, changes, retired, offered):
+        err = _outdated(_text(self._record(**changes)))
+        assert err.retired == retired, label
+        message = str(err)
+        # Each retirement is named, the cap last, as no longer used
+        assert message.split(": ", 1)[1].startswith('"settings" holds '), label
+        assert (", and same_title_size_cap, which is no longer used (the bot trades "
+                "time-series pairs only): save the live defaults again") in message, label
+        assert message.endswith(f"its pages offer them as {offered})"), (label, message)
+        # Both proposals applied: the older retirement's reading, no same-title
+        # cap, and everything else as saved
+        proposal = err.proposal
+        assert (proposal.tier_floors, proposal.spread_band, proposal.interval_discount,
+                proposal.size_cap) == (False, (0.2, 0.8), 0.85, 0.1), label
+        if "tags" in retired:
+            assert proposal.exclude_tags is None
+        if "categories" in retired:
+            assert proposal.exclude_categories is None
+        if "trim_to_kelly" in retired:
+            assert (proposal.rebalance, proposal.min_price_move,
+                    proposal.rebalance_min_days_to_maturity) == (True, 0.1, None)
+        assert not hasattr(proposal, "same_title_size_cap")
+
+    def test_beside_a_list_of_tags_to_trade_it_says_the_proposal_trades_everything(self):
+        err = _outdated(_text(self._record(exclude_tags=_DROP, tags=["Basketball"])))
+        assert err.retired == ("tags", "same_title_size_cap")
+        assert err.old_tags == ("Basketball",)
+        message = str(err)
+        assert ("holds tags, which exclude_tags replaced, and same_title_size_cap, which is "
+                "no longer used (the bot trades time-series pairs only): these defaults "
+                "limited trading to the tags 'Basketball'") in message
+        assert "Saved again as offered (no tag excluded, no same-title cap), they trade everything" \
+            in message
+
+    @pytest.mark.parametrize("cap", [0.07, 0, 0.0, 1.5, -0.05, 0.051, True, False, "x", "0.2",
+                                     None, [0.2]])
+    def test_an_old_cap_the_older_version_refused_leaves_no_proposal(self, cap):
+        # The older version took a cap on the 5% grid in (0, 1] and nothing
+        # else: a value it refused has no reading now either, so the file is
+        # still outdated but offers nothing
+        err = _outdated(_text(self._record(same_title_size_cap=cap)))
+        assert err.retired == ("same_title_size_cap",)
+        assert err.proposal is None
+        message = str(err)
+        assert ('"settings" holds same_title_size_cap, which is no longer used (the bot '
+                "trades time-series pairs only), and its other settings are refused too "
+                "(same_title_size_cap must be") in message, (cap, message)
+        assert "offer them" not in message
+        assert message.endswith("save new ones from its pages, from the seed values or the "
+                                "backtest dashboard)")
+
+    @pytest.mark.parametrize("cap", [0.05, 0.2, 0.95, 1, 1.0])
+    def test_an_old_cap_the_older_version_took_reads_as_no_cap(self, cap):
+        # Any cap on the grid, a whole 1 included: the proposal is the same
+        err = _outdated(_text(self._record(same_title_size_cap=cap)))
+        assert err.proposal == _SAME_TITLE_CAP_ERA_PROPOSAL
+
+    def test_a_broken_setting_beside_the_cap_leaves_no_proposal(self):
+        # The proposal must pass every check a saved file does
+        err = _outdated(_text(self._record(size_cap=0.07)))
+        assert err.retired == ("same_title_size_cap",) and err.proposal is None
+        assert "size_cap must be a multiple of 5%" in str(err)
+
+    @pytest.mark.parametrize("label, changes, held", [
+        ("tags to trade",
+         {"exclude_tags": _DROP, "tags": ["Basketball"]},
+         "tags, which exclude_tags replaced"),
+        ("the Rebalance switches",
+         {"rebalance": _DROP, "min_price_move": _DROP,
+          "rebalance_min_days_to_maturity": _DROP,
+          "add_to_held_pairs": True, "trim_to_kelly": True, "trim_min_rise": 0.1},
+         "add_to_held_pairs, trim_to_kelly and trim_min_rise, which rebalance and "
+         "min_price_move replaced"),
+        ("categories and tags to trade",
+         {"exclude_categories": _DROP, "exclude_tags": _DROP,
+          "categories": ["Sports"], "tags": None},
+         "categories, which exclude_categories replaced, and tags, which exclude_tags "
+         "replaced"),
+    ])
+    def test_an_older_retirement_without_the_cap_leaves_no_proposal(self, label, changes, held):
+        # Every older version required the cap, so none saved a file holding
+        # an older retired setting without one: it is still outdated, but it
+        # offers nothing, whatever it would read as with the cap
+        err = _outdated(_text(self._record(same_title_size_cap=_DROP, **changes)))
+        assert "same_title_size_cap" not in err.retired, label
+        assert err.proposal is None, label
+        assert err.old_categories is None and err.old_tags is None, label
+        assert str(err) == (
+            f'{config.LIVE_DEFAULTS_FILE}: "settings" holds {held}, and its other settings '
+            "are refused too (it lacks same_title_size_cap, which every older version "
+            "saved): save the live defaults again (start ./start_dashboard.sh and save new "
+            "ones from its pages, from the seed values or the backtest dashboard)"), label
+        # ... while the same file with the cap is offered
+        assert _outdated(_text(self._record(**changes))).proposal is not None, label
+
+    @pytest.mark.parametrize("label, changes", [
+        ("a cap the older version refused", {"same_title_size_cap": 0.07}),
+        ("no cap beside the Rebalance switches",
+         {"same_title_size_cap": _DROP, "rebalance": _DROP, "min_price_move": _DROP,
+          "rebalance_min_days_to_maturity": _DROP,
+          "add_to_held_pairs": True, "trim_to_kelly": True, "trim_min_rise": 0.1}),
+    ])
+    def test_another_broken_setting_is_named_before_the_cap(self, label, changes):
+        # The other settings are checked first, so a broken one there is what
+        # the message names, not the old cap
+        err = _outdated(_text(self._record(interval_discount=0, **changes)))
+        assert err.proposal is None, label
+        message = str(err)
+        assert ("and its other settings are refused too (interval_discount (k) must be in "
+                "(0, 1], got 0)") in message, (label, message)
+        assert "same_title_size_cap must be" not in message, label
+        assert "it lacks same_title_size_cap" not in message, label
+
+    def test_a_file_without_the_cap_is_not_outdated(self):
+        # The proposal's own shape, as the new writer saves it, reads as itself
+        record = self._record(same_title_size_cap=_DROP)
+        config.LIVE_DEFAULTS_FILE.write_bytes(_text(record))
+        assert config.read_saved_live_defaults() == _SAME_TITLE_CAP_ERA_PROPOSAL
+
+
 class TestLiveDefaultsSeed:
     """LIVE_DEFAULTS_SEED, the starting values offered for a first save."""
 
     def test_the_seed_values(self):
         seed = config.LIVE_DEFAULTS_SEED
         assert seed == LiveSettings(tier_floors=False, spread_band=(0.0, 0.5),
-                                    interval_discount=0.8, size_cap=0.10, same_title_size_cap=0.20,
-                                    rebalance=True)
+                                    interval_discount=0.8, size_cap=0.10, rebalance=True)
         assert seed.min_price_move is None
         assert seed.exclude_categories is None and seed.exclude_tags is None
         assert seed.origin == config.LIVE_DEFAULTS_FROM_CONFIG
@@ -5535,9 +5811,10 @@ class TestLiveDefaultsSeed:
     def test_the_seed_warns_nothing(self):
         assert config.live_rule_warnings(config.LIVE_DEFAULTS_SEED) == []
 
-    def test_one_pair_stakes_at_most_ten_percent_of_either_type(self):
+    def test_one_pair_stakes_at_most_ten_percent(self):
         assert max_kelly_fraction("time_series", config.LIVE_DEFAULTS_SEED) == 0.10
-        assert max_kelly_fraction("same_title", config.LIVE_DEFAULTS_SEED) == 0.10
+        # Any other pair type stakes nothing (pair_size_cap caps it at 0)
+        assert max_kelly_fraction("same_title", config.LIVE_DEFAULTS_SEED) == 0.0
 
     def test_the_seed_saves_and_reads_back(self):
         saved = config.save_live_defaults(config.LIVE_DEFAULTS_SEED,
@@ -5595,7 +5872,7 @@ class TestLiveSettingsChanges:
 
     def test_labels_and_values_match_describe_live_settings(self):
         current = _settings(exclude_categories=("Sports",), exclude_tags=("Basketball",))
-        proposed = _settings(False, (0.0, 0.5), 0.8, 1.0, 0.2)
+        proposed = _settings(False, (0.0, 0.5), 0.8, 1.0)
         rows = config.live_settings_changes(current, proposed)
         assert [f"{label} {new}" for label, _, new, _ in rows] == \
             config.describe_live_settings(proposed).split(" | ")
@@ -5606,7 +5883,6 @@ class TestLiveSettingsChanges:
             ("spread band", "none", "0-0.5", True),
             ("k", "0.75", "0.8", True),
             ("per-trade cap", "20%", "100% (no cap)", True),
-            ("same-title cap", "100% (no extra cap)", "20%", True),
             ("exclude categories", "Sports", "none", True),
             ("exclude tags", "Basketball", "none", True),
             ("rebalance", "no", "no", False),
@@ -5629,15 +5905,17 @@ class TestLiveSettingsChanges:
         # Case is part of the raw value, as on the "Live settings:" line
         rows = config.live_settings_changes(_settings(exclude_categories=("Sports",)),
                                             _settings(exclude_categories=("sports",)))
-        assert rows[5] == ("exclude categories", "Sports", "sports", True)
+        assert rows[4] == ("exclude categories", "Sports", "sports", True)
 
     def test_no_current_defaults_changes_every_row(self):
         rows = config.live_settings_changes(None, config.LIVE_DEFAULTS_SEED)
-        assert len(rows) == len(config.LIVE_TOGGLE_FIELDS) == 12
+        assert len(rows) == len(config.LIVE_TOGGLE_FIELDS) == 11
         assert all(old == "—" and changed for _, old, _, changed in rows)
         assert [new for _, _, new, _ in rows] == [
-            "off", "0-0.5", "0.8", "10%", "20%", "none", "none", "yes", "any", "maturity",
+            "off", "0-0.5", "0.8", "10%", "none", "none", "yes", "any", "maturity",
             "off", "any"]
+        # No row names a same-title cap
+        assert not any("same-title" in label for label, *_ in rows)
 
     def test_turning_selling_on_shows_as_the_two_sell_rows(self):
         on = dataclasses.replace(config.LIVE_DEFAULTS_SEED, sell_at=0.85, sell_min_days=3)
@@ -5684,7 +5962,7 @@ class TestLiveSettingsChanges:
             ("rebalance", "yes", "no", True),
             ("rebalance until", "7 days before maturity", "maturity", True)]
 
-    def test_a_seven_toggle_file_shows_turning_rebalancing_on_as_a_change(self):
+    def test_a_six_toggle_file_shows_turning_rebalancing_on_as_a_change(self):
         # A file that leaves the toggle out reads it as off; the seed proposes on
         rows = config.live_settings_changes(_SEED_REBALANCE_OFF, config.LIVE_DEFAULTS_SEED)
         assert [row for row in rows if row[3]] == [("rebalance", "no", "yes", True)]

@@ -349,7 +349,7 @@ class TestNoPairsMsg:
 @pytest.fixture
 def pinned_config_toggles(monkeypatch, _isolate_live_defaults):
     """
-    Pin the twelve live toggles and save them as this test's live defaults.
+    Pin the eleven live toggles and save them as this test's live defaults.
 
     Through conftest's apply_pre_toggle_defaults, the one definition of their
     values, then save_config_live_defaults into the test's own path (requested
@@ -496,7 +496,6 @@ class TestLiveSettingsFlags:
         (["--spread-max", "0.5"], "spread_band", (0.0, 0.5)),
         (["--interval-discount", "0.6"], "interval_discount", 0.6),
         (["--size-cap", "35"], "size_cap", 0.35),
-        (["--same-title-size-cap", "25"], "same_title_size_cap", 0.25),
         (["--exclude-category", "Economics"], "exclude_categories", ("Economics",)),
         (["--exclude-category", "Economics", "--exclude-category", " Sports "],
          "exclude_categories", ("Economics", "Sports")),
@@ -948,13 +947,10 @@ class TestLiveSettingsFlags:
     @pytest.mark.parametrize("argv, words, percent", [
         (["--size-cap", "37"],
          ["--size-cap", "size_cap", f"multiple of {config.SIZE_CAP_STEP:.0%}"], True),
+        # 0 is a value, not "not given": refused, never silently the saved one
         (["--size-cap", "0"], ["--size-cap", "size_cap", "(0, 1]"], True),
         (["--size-cap", "150"], ["--size-cap", "size_cap", "(0, 1]"], True),
-        (["--same-title-size-cap", "105"], ["--same-title-size-cap", "same_title_size_cap"],
-         True),
-        # 0 is a value, not "not given": refused, never silently the saved one
-        (["--same-title-size-cap", "0"],
-         ["--same-title-size-cap", "same_title_size_cap", "(0, 1]"], True),
+        (["--size-cap", "105"], ["--size-cap", "size_cap", "(0, 1]"], True),
         (["--interval-discount", "0"], ["--interval-discount", "interval_discount"], False),
         (["--interval-discount", "1.5"], ["--interval-discount", "interval_discount"], False),
         (["--spread-min", "0.6", "--spread-max", "0.5"], ["--spread-min", "--spread-max",
@@ -1209,13 +1205,83 @@ class TestLiveSettingsFlags:
         assert "--any-category" not in out
         assert "--tag" not in out.replace("--exclude-tag", "").replace("--no-exclude-tag", "")
         assert "--any-tag" not in out
+        # The same-title cap's flag too, in the usage line and the help alike
+        assert "--same-title-size-cap" not in out and "same-title" not in out
 
-    def test_two_cap_flags_share_one_unit_note(self, monkeypatch, capsys):
-        seen = _main_with(monkeypatch, ["--mode", "prod", "--size-cap", "37",
-                                        "--same-title-size-cap", "25"])
+    # What main.py prints for the same-title cap's flag, whatever its value
+    _NO_SAME_TITLE_CAP = (
+        "--same-title-size-cap no longer exists: the bot trades time-series pairs only, "
+        "so there is no same-title cap to set. A defaults server still running older "
+        "code sends it with every run it starts: stop that server (Ctrl-C in the "
+        "terminal running ./start_dashboard.sh or python3 -m "
+        "kalshi_betting.defaults_server) and start ./start_dashboard.sh again")
+
+    @pytest.mark.parametrize("mode", ["dev", "prod"])
+    @pytest.mark.parametrize("argv", [
+        ["--same-title-size-cap", "20"],
+        ["--same-title-size-cap=20"],
+        ["--same-title-size-cap=100"],
+        # A value no cap could be: the refusal, never a type error, is what prints
+        ["--same-title-size-cap", "x"],
+        ["--same-title-size-cap=-5"],
+        ["--same-title-size-cap="],
+        # No value at all
+        ["--same-title-size-cap"],
+        ["--same-title-size-cap", "--dry-run"],
+        # Beside valid flags, as an older defaults server sends it
+        ["--size-cap", "10", "--same-title-size-cap=20", "--rebalance"],
+    ])
+    def test_the_same_title_cap_flag_is_refused_with_the_reason_and_the_remedy(
+        self, monkeypatch, capsys, mode, argv,
+    ):
+        seen = _main_with(monkeypatch, ["--mode", mode, *argv])
         assert seen["code"] == 2
-        err = capsys.readouterr().err
-        assert f"--size-cap and --same-title-size-cap take {self._PERCENT}" in err, err
+        # Refused before logging, the client and either run mode: nothing is
+        # read from the account or sent
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "settings" not in seen
+        err = " ".join(capsys.readouterr().err.split())
+        assert self._NO_SAME_TITLE_CAP in err, err
+        # argparse's own words never print in its place
+        assert "unrecognized arguments" not in err and "invalid int value" not in err
+        assert "expected one argument" not in err
+
+    def test_the_same_title_cap_flag_is_refused_before_the_saved_defaults_are_read(
+        self, monkeypatch, capsys,
+    ):
+        # The flag is refused before the saved live defaults are read: a read
+        # here fails the test
+        def unread():
+            raise AssertionError("the saved live defaults were read")
+        monkeypatch.setattr(main, "live_defaults", unread)
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--same-title-size-cap=20"])
+        assert seen["code"] == 2
+        assert self._NO_SAME_TITLE_CAP in " ".join(capsys.readouterr().err.split())
+
+    def test_a_retired_filter_flag_is_named_before_the_same_title_cap_flag(
+        self, monkeypatch, capsys,
+    ):
+        # The filter flags are refused first, in their documented order
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--same-title-size-cap=20",
+                                        "--any-tag"])
+        assert seen["code"] == 2
+        err = " ".join(capsys.readouterr().err.split())
+        assert "--any-tag no longer exists" in err
+        assert "--same-title-size-cap no longer exists" not in err
+
+    def test_an_older_defaults_servers_run_command_is_refused(self, monkeypatch, capsys):
+        # The run command a defaults server running older code builds: every
+        # toggle flag, the same-title cap's among them, right after --size-cap.
+        # Every run it starts exits 2 with the remedy
+        settings = live_settings()
+        argv = config.live_settings_argv(settings)
+        cap = argv.index(f"--size-cap={round(settings.size_cap * 100)}")
+        older = [*argv[:cap + 1], "--same-title-size-cap=20", *argv[cap + 1:]]
+        seen = _main_with(monkeypatch, ["--mode", "prod", *older])
+        assert seen["code"] == 2 and "settings" not in seen
+        assert self._NO_SAME_TITLE_CAP in " ".join(capsys.readouterr().err.split())
+        # ... while the command this version builds runs
+        assert _main_with(monkeypatch, ["--mode", "prod", "--dry-run", *argv])["code"] == EXIT_OK
 
     def test_help_names_every_flag_and_the_grid(self, monkeypatch, capsys):
         # argparse %-formats help: a bare "%" would raise here, so "%%" is pinned
@@ -1226,18 +1292,20 @@ class TestLiveSettingsFlags:
         # argparse wraps help to the terminal: compare words, not line breaks
         out = " ".join(capsys.readouterr().out.split())
         for flag in ("--tier-floors", "--no-tier-floors", "--spread-min", "--spread-max",
-                     "--interval-discount", "--size-cap", "--same-title-size-cap",
+                     "--interval-discount", "--size-cap",
                      "--rebalance", "--no-rebalance", "--min-price-move",
                      "--no-min-price-move", "--rebalance-min-days-to-maturity",
                      "--no-rebalance-min-days-to-maturity",
                      "--sell-at", "--no-sell", "--sell-min-days", "--no-sell-min-days",
                      "--exclude-category", "--no-exclude-category", "--exclude-tag", "--no-exclude-tag"):
             assert flag in out, flag
-        # None of the flags the rebalance flags replaced is left
-        for gone in ("--add-to-held-pairs", "--trim-to-kelly", "--trim-min-rise"):
+        # None of the flags the rebalance flags replaced is left, nor the
+        # same-title cap's (hidden, and refused)
+        for gone in ("--add-to-held-pairs", "--trim-to-kelly", "--trim-min-rise",
+                     "--same-title-size-cap"):
             assert gone not in out, gone
         # Every value flag defaults to the saved live defaults, never a config.py constant
-        assert out.count("default: the saved live defaults") == 13
+        assert out.count("default: the saved live defaults") == 12
         assert out.count("whatever the saved live defaults say") == 6
         # The days to maturity name their three choices from the one grid, and say
         # what they need and what --no-rebalance does to them
@@ -1268,23 +1336,21 @@ class TestLiveSettingsFlags:
                 "kalshi_betting.defaults_server (live_defaults.json); a run refuses to "
                 "start without them. The weekly scheduler passes none of these flags, so "
                 "a scheduled run trades exactly the saved defaults.") in out
-        assert out.count(f"in {config.SIZE_CAP_STEP * 100:g}% steps") == 2
+        assert out.count(f"in {config.SIZE_CAP_STEP * 100:g}% steps") == 1
         assert "100 = no cap" in out
-        assert "100 = no extra cap beyond --size-cap" in out
-        # The two cap flags and k's flag warn that, with Rebalance yes, they can sell
-        assert out.count("a lower cap also sells: each exact held") == 2
+        assert "no extra cap" not in out and "same-title" not in out
+        # The cap flag and k's flag warn that, with Rebalance yes, they can sell
+        assert out.count("a lower cap also sells: each exact held") == 1
         assert out.count("a higher k also sells: each exact held") == 1
         assert out.count("worth more than its new Kelly size is sold down to it before "
-                         "anything is bought, once its wait has passed") == 3
-        # A lone leg is the later market of a time-series pair, so the flags that can
-        # reach one (k, and the per-trade cap) name it; the same-title cap does not
+                         "anything is bought, once its wait has passed") == 2
+        # A lone leg is the later market of a time-series pair, and both flags
+        # reach one, so both name it
         lone = "pair, or lone leg whose partner has paid out, worth more than its new Kelly"
         assert out.count(lone) == 2
         assert ("a higher k also sells: each exact held time-series " + lone) in out
         assert ("a lower cap also sells: each exact held time-series " + lone) in out
-        assert ("a lower cap also sells: each exact held same-title pair worth more than "
-                "its new Kelly") in out
-        assert out.count("With Rebalance yes (saved, or given with --rebalance), a ") == 3
+        assert out.count("With Rebalance yes (saved, or given with --rebalance), a ") == 2
         assert "Production runs only: a dev run holds nothing" in out
         # The constant itself is never named (its wait's constant is, above)
         assert not re.search(r"config\.REBALANCE\b", out)
@@ -1377,8 +1443,6 @@ class TestLogLiveSettings:
         "spread_band": (["--spread-max", "0.5"], "spread band 0-0.5 (default: none)"),
         "interval_discount": (["--interval-discount", "0.6"], "k 0.6 (default: 0.75)"),
         "size_cap": (["--size-cap", "35"], "per-trade cap 35% (default: 20%)"),
-        "same_title_size_cap": (["--same-title-size-cap", "15"],
-                                "same-title cap 15% (default: 100% (no extra cap))"),
         "exclude_categories": (["--exclude-category", "Economics"],
                                "exclude categories Economics (default: none)"),
         "exclude_tags": (["--exclude-tag", "Oil & Gas"],
@@ -1448,8 +1512,7 @@ class TestLogLiveSettings:
             f"Live settings: {text}"
             for text in config.live_rule_warnings(LiveSettings(
                 tier_floors=config.TIME_SERIES_TIER_FLOORS,
-                spread_band=config.TIME_SERIES_SPREAD_BAND, interval_discount=0.4, size_cap=0.6,
-                same_title_size_cap=config.SAME_TITLE_SIZE_CAP))
+                spread_band=config.TIME_SERIES_SPREAD_BAND, interval_discount=0.4, size_cap=0.6))
         ]
         assert any("one time-series pair may stake up to 60%" in w for w in warned)
 
@@ -1459,9 +1522,9 @@ class TestLogLiveSettings:
         def tripwire():
             raise AssertionError("_log_live_settings read settings of its own")
         s = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                         size_cap=1.0, same_title_size_cap=0.2)
+                         size_cap=1.0)
         r = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
-                         size_cap=0.2, same_title_size_cap=1.0, origin=self._ORIGIN)
+                         size_cap=0.2, origin=self._ORIGIN)
         for name in ("live_settings", "live_defaults"):
             monkeypatch.setattr(main, name, tripwire)
         for name in ("live_settings", "live_defaults", "read_saved_live_defaults"):
@@ -1480,9 +1543,9 @@ class TestLogLiveSettings:
         # A reference built from config.py's constants (origin "config.py"):
         # marked "(config: X)", and the WARNING names config.py
         s = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                         size_cap=1.0, same_title_size_cap=0.2)
+                         size_cap=1.0)
         r = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
-                         size_cap=0.2, same_title_size_cap=1.0)
+                         size_cap=0.2)
         with caplog.at_level(logging.INFO):
             main._log_live_settings(s, r, real_money=True)
         assert f"Live defaults: {config.LIVE_DEFAULTS_FROM_CONFIG}" in caplog.text
@@ -1497,9 +1560,9 @@ class TestLogLiveSettings:
 
     def test_the_saved_warning_is_worded_for_the_saved_defaults(self, caplog):
         s = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                         size_cap=1.0, same_title_size_cap=0.2)
+                         size_cap=1.0)
         r = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
-                         size_cap=0.2, same_title_size_cap=1.0, origin=self._ORIGIN)
+                         size_cap=0.2, origin=self._ORIGIN)
         with caplog.at_level(logging.INFO):
             main._log_live_settings(s, r, real_money=True)
         warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
@@ -1514,29 +1577,25 @@ class TestLogLiveSettings:
         return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
                 and "can sell more of the held pairs" in r.getMessage()]
 
-    @pytest.mark.parametrize("change, named, lone", [
-        ({"size_cap": 0.10}, "the time-series size cap goes from 20% to 10% and the "
-                             "same-title size cap goes from 20% to 10%", True),
-        # A lone leg is never a same-title position: the sentence leaves it out
-        ({"same_title_size_cap": 0.10}, "the same-title size cap goes from 20% to 10%", False),
+    @pytest.mark.parametrize("change, named", [
+        ({"size_cap": 0.10}, "the per-trade cap goes from 20% to 10%"),
         ({"interval_discount": 0.9}, "k goes from 0.8 to 0.9, which lowers a time-series "
-                                     "pair's chance of paying", True),
-    ], ids=["per-trade cap", "same-title cap", "k"])
+                                     "pair's chance of paying"),
+    ], ids=["per-trade cap", "k"])
     def test_with_rebalancing_on_a_lower_cap_or_a_higher_k_is_said_to_sell(
-        self, caplog, change, named, lone,
+        self, caplog, change, named,
     ):
-        # A real-money run whose flags lower a cap or raise k warns that it can sell
+        # A real-money run whose flags lower the cap or raise k warns that it can
+        # sell; both reach a held time-series pair and a lone leg alike
         saved = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                             size_cap=0.2, same_title_size_cap=0.2, rebalance=True,
-                             origin=self._ORIGIN)
+                             size_cap=0.2, rebalance=True, origin=self._ORIGIN)
         with caplog.at_level(logging.INFO):
             main._log_live_settings(dataclasses.replace(saved, **change), saved,
                                     real_money=True)
-        who = ("each exact held pair, or lone leg whose partner has paid out, worth"
-               if lone else "each exact held pair worth")
         assert self._trim_lines(caplog) == [
             "Live settings: with Rebalance yes, these settings can sell more of the held "
-            f"pairs: {named}; {who} more than its new Kelly size is sold down to it before "
+            f"pairs: {named}; each exact held time-series pair, or lone leg whose partner "
+            "has paid out, worth more than its new Kelly size is sold down to it before "
             "anything is bought, once the wait since its last trade has passed"]
         # ... after the WARNING that the flags override the saved defaults
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
@@ -1546,32 +1605,26 @@ class TestLogLiveSettings:
     @pytest.mark.parametrize("saved, run, real_money", [
         # Rebalancing off: a lower cap only makes purchases smaller
         (LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                      size_cap=0.2, same_title_size_cap=0.2),
+                      size_cap=0.2),
          LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                      size_cap=0.1, same_title_size_cap=0.2), True),
+                      size_cap=0.1), True),
         # A cap raised, and k lowered: nothing more is sold
         (LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                      size_cap=0.2, same_title_size_cap=0.2, rebalance=True),
+                      size_cap=0.2, rebalance=True),
          LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                      size_cap=0.3, same_title_size_cap=0.2, rebalance=True), True),
+                      size_cap=0.3, rebalance=True), True),
         (LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                      size_cap=0.2, same_title_size_cap=0.2, rebalance=True),
+                      size_cap=0.2, rebalance=True),
          LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.7,
-                      size_cap=0.2, same_title_size_cap=0.2, rebalance=True), True),
-        # A lower same-title cap the per-trade cap already holds below
-        (LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                      size_cap=0.2, same_title_size_cap=1.0, rebalance=True),
-         LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                      size_cap=0.2, same_title_size_cap=0.5, rebalance=True), True),
+                      size_cap=0.2, rebalance=True), True),
         # The seed, as saved and run
         (config.LIVE_DEFAULTS_SEED, config.LIVE_DEFAULTS_SEED, True),
         # A dry run sends no order
         (LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                      size_cap=0.2, same_title_size_cap=0.2, rebalance=True),
+                      size_cap=0.2, rebalance=True),
          LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                      size_cap=0.1, same_title_size_cap=0.2, rebalance=True), False),
-    ], ids=["rebalancing off", "cap raised", "k lowered", "same-title cap held below",
-            "seed", "dry run"])
+                      size_cap=0.1, rebalance=True), False),
+    ], ids=["rebalancing off", "cap raised", "k lowered", "seed", "dry run"])
     def test_nothing_is_said_when_no_more_is_sold(self, caplog, saved, run, real_money):
         with caplog.at_level(logging.INFO):
             main._log_live_settings(run, dataclasses.replace(saved, origin=self._ORIGIN),
@@ -1666,12 +1719,14 @@ class TestLiveDefaultsRequired:
         # A file holding the settings Rebalance replaced is never traded, not
         # even read as their new form or with every new flag given: the run
         # stops before logging or any client, saying how to save it again, and
-        # leaves it in place for the defaults server to offer
+        # leaves it in place for the defaults server to offer. Like every file
+        # an older version saved, it holds a same-title cap too, which every
+        # older version required
         record = json.loads(_saved_record())
         for name in ("rebalance", "min_price_move", "rebalance_min_days_to_maturity"):
             record["settings"].pop(name, None)
-        record["settings"].update(add_to_held_pairs=True, trim_to_kelly=True,
-                                  trim_min_rise=0.1)
+        record["settings"].update(same_title_size_cap=0.2, add_to_held_pairs=True,
+                                  trim_to_kelly=True, trim_min_rise=0.1)
         text = json.dumps(record)
         config.LIVE_DEFAULTS_FILE.write_text(text, encoding="utf-8")
         seen = _main_with(monkeypatch, ["--mode", mode, *flags])
@@ -1682,12 +1737,35 @@ class TestLiveDefaultsRequired:
         assert "the saved live defaults are out of date, and no run trades them" in err
         assert str(config.LIVE_DEFAULTS_FILE) in err
         assert ('"settings" holds add_to_held_pairs, trim_to_kelly and trim_min_rise, which '
-                "rebalance and min_price_move replaced: save the live defaults again (start "
-                "./start_dashboard.sh; its pages offer them as rebalance yes, min price "
-                "movement 10c)") in err
+                "rebalance and min_price_move replaced, and same_title_size_cap, which is no "
+                "longer used (the bot trades time-series pairs only): save the live defaults "
+                "again (start ./start_dashboard.sh; its pages offer them as rebalance yes, min "
+                "price movement 10c, no same-title cap)") in err
         assert "do not delete the file: a Confirm and save on those pages replaces it" in err
         assert "fix the file, or delete it" not in err
         assert config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8") == text
+
+    @pytest.mark.parametrize("mode", ["dev", "prod"])
+    @pytest.mark.parametrize("flags", [[], ["--size-cap", "10", "--rebalance"]])
+    def test_a_file_holding_the_same_title_cap_exits_2_naming_its_retirement(
+        self, monkeypatch, capsys, mode, flags,
+    ):
+        # A file shaped like a real account's saved defaults, whose one retired
+        # setting is the same-title cap: every live run stops before logging or
+        # any client, says the cap is no longer used and how to save the file
+        # again, and leaves it in place for the defaults server to offer
+        from .test_config import _SAME_TITLE_CAP_ERA_BYTES, _SAME_TITLE_CAP_ERA_MESSAGE
+        config.LIVE_DEFAULTS_FILE.write_bytes(_SAME_TITLE_CAP_ERA_BYTES)
+        seen = _main_with(monkeypatch, ["--mode", mode, *flags])
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "settings" not in seen
+        err = " ".join(capsys.readouterr().err.split())
+        assert ("the saved live defaults are out of date, and no run trades them: "
+                f"{config.LIVE_DEFAULTS_FILE}: {_SAME_TITLE_CAP_ERA_MESSAGE}; do not delete "
+                "the file: a Confirm and save on those pages replaces it") in err, err
+        assert "fix the file, or delete it" not in err
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SAME_TITLE_CAP_ERA_BYTES
 
     def test_an_invalid_config_constant_does_not_stop_a_run_with_a_saved_file(
         self, monkeypatch, saved_live_defaults,
@@ -4097,12 +4175,12 @@ class TestLiveSettingsReachEverySite:
     twice: with config.py's toggles as the reference, and with _SETTINGS saved as the
     live defaults and resolved as main() resolves them. _SETTINGS keeps both
     time-series pairs trading (at its k of 0.6 the TS pair's Kelly fraction sits
-    between the 0.25 same-title cap and the 0.35 per-trade cap, and the main
-    pair's own Kelly fraction is above 0.35, so that cap binds it) and turns
-    rebalancing on; both seller planners get the run's settings too."""
+    between 0.25 and the 0.35 per-trade cap, above config.py's pinned 20% cap,
+    and the main pair's own Kelly fraction is above 0.35, so that cap binds it)
+    and turns rebalancing on; both seller planners get the run's settings too."""
 
     _SETTINGS = LiveSettings(tier_floors=False, spread_band=(0.05, 0.9),
-                             interval_discount=0.6, size_cap=0.35, same_title_size_cap=0.25,
+                             interval_discount=0.6, size_cap=0.35,
                              exclude_categories=("sports", "WORLD"),
                              exclude_tags=("Hockey", "sports · soccer"),
                              rebalance=True,
@@ -4353,7 +4431,8 @@ class TestLiveSettingsReachEverySite:
         for key in (("strategy", "pair_size_cap"), ("config", "pair_size_cap")):
             for call in calls[key]:
                 assert arg(call, 1, "size_cap") == settings.size_cap, key
-                assert arg(call, 2, "same_title_size_cap") == settings.same_title_size_cap, key
+                # The pair type and the per-trade cap, and nothing else
+                assert len(call[0]) + len(call[1]) == 2, (key, call)
         # Enrichment's affordability bound is the run's: its 0.35 cap, below
         # the 0.4 (1 - k) every time-series stake stays under
         bounds = {arg(c, 2, "fraction") for c in calls[("scanner", "max_affordable_pairs")]}
@@ -4365,7 +4444,7 @@ class TestLiveSettingsReachEverySite:
         fractions = {arg(c, 2, "fraction") for c in calls[("strategy", "max_affordable_pairs")]}
         assert all(0 < f <= settings.size_cap for f in fractions), fractions
         assert settings.size_cap in fractions
-        assert any(settings.same_title_size_cap < f < settings.size_cap for f in fractions)
+        assert any(0.25 < f < settings.size_cap for f in fractions)
         sized = {arg(c, 0, "pair_type") for c in calls[("strategy", "pair_size_cap")]}
         assert sized == {"time_series"}
 
@@ -4381,7 +4460,7 @@ class TestLiveSettingsReachEverySite:
         ts, main_spec = by_ticker[_TICKER_TS_EARLY], by_ticker[_TICKER_MAIN_EARLY]
         assert ts.pair.pair_type == main_spec.pair.pair_type == "time_series"
         assert ts.kelly_p == pytest.approx(1 - 0.6 * 0.30)
-        assert settings.same_title_size_cap < ts.kelly_fraction < 0.35
+        assert 0.25 < ts.kelly_fraction < 0.35
         # The main pair's own Kelly fraction (at a 0.45 mid spread) is above
         # the run's 35% cap, so it stakes exactly that cap
         assert main_spec.kelly_p == pytest.approx(1 - 0.6 * 0.45)
@@ -4389,17 +4468,18 @@ class TestLiveSettingsReachEverySite:
 
         # pre_execution_check swallows exceptions — so none may have happened
         assert "Pre-execution check raised" not in caplog.text
-        # The run named its rule, its settings (all marked) and both lifted exposures
+        # The run named its rule, its settings (all eleven marked) and the
+        # lifted time-series exposure, and no other pair type's
         assert ("Time-series entry rule: "
                 + config.describe_time_series_rule(False, (0.05, 0.9))) in caplog.text
         echo = f"Live settings: {describe_live_settings(settings, reference)}"
-        assert echo in caplog.text and echo.count("(config:") == 12
+        assert echo in caplog.text and echo.count("(config:") == 11
         assert "This PRODUCTION run overrides" not in caplog.text
         assert "one time-series pair may stake up to 35%" in caplog.text
-        assert "one same-title pair may stake up to 25%" in caplog.text
+        assert "same-title pair may stake" not in caplog.text
         # The workbook's separator row carries the same marked line
         assert captured["run_note"] == f"settings: {describe_live_settings(settings, reference)}"
-        assert captured["run_note"].count("(config:") == 12
+        assert captured["run_note"].count("(config:") == 11
 
     def test_a_dev_run_handed_its_settings_reads_them_at_every_site(self, monkeypatch, caplog):
         settings, reference, calls, captured = self._run_under_the_tripwire(
@@ -4413,14 +4493,14 @@ class TestLiveSettingsReachEverySite:
         ts, main_spec = by_ticker[_TICKER_TS_EARLY], by_ticker[_TICKER_MAIN_EARLY]
         assert ts.pair.pair_type == main_spec.pair.pair_type == "time_series"
         assert ts.kelly_p == pytest.approx(1 - 0.6 * 0.30)
-        assert settings.same_title_size_cap < ts.kelly_fraction < 0.35
+        assert 0.25 < ts.kelly_fraction < 0.35
         assert main_spec.kelly_fraction == settings.size_cap
         # No trade stakes more than the run's per-trade cap
         assert all(r.spec.kelly_fraction <= settings.size_cap for r in results)
         assert ("Time-series entry rule: "
                 + config.describe_time_series_rule(False, (0.05, 0.9))) in caplog.text
         echo = f"Live settings: {describe_live_settings(settings, reference)}"
-        assert echo in caplog.text and echo.count("(config:") == 12
+        assert echo in caplog.text and echo.count("(config:") == 11
         # Dev never submits an order, so never the production WARNING
         assert "This PRODUCTION run overrides" not in caplog.text
 
@@ -4666,14 +4746,14 @@ class TestSavedLiveDefaults:
 
         monkeypatch.setattr(main, "append_to_prod_log", fake_append_to_prod_log)
         with caplog.at_level(logging.INFO):
-            out = _main_with(monkeypatch, ["--mode", "prod", "--dry-run",
-                                           "--same-title-size-cap", "20"],
+            out = _main_with(monkeypatch, ["--mode", "prod", "--dry-run", "--size-cap", "20"],
                              _run_prod=main._run_prod, build_client=lambda mode: client)
         assert out["code"] == EXIT_OK
         assert {r.status for r in captured["results"]} == {"simulated"}
         note = captured["run_note"]
         assert note.startswith("settings: ")
-        assert "same-title cap 20% (default: 25%)" in note
+        assert "per-trade cap 20% (default: 35%)" in note
+        assert note.count("(default:") == 1 and "same-title" not in note
         assert note.endswith(f" | defaults: {saved.origin}")
 
 
@@ -8802,7 +8882,7 @@ class TestLiveRebalanceTextsSayWhatARunDoes:
         order = [
             "(1) save the live defaults with rebalancing off",
             "/confirm?tier_floors=off&spread_min=0.0&spread_max=0.5&k=0.8&size_cap=0.1"
-            "&same_title_size_cap=0.2&rebalance=off`",
+            "&rebalance=off`",
             "(2) you run `python3 -m kalshi_betting.v2_probe",
             "--step yes-close` (about one cent",
             "(3) run `python3 -m kalshi_betting.main --mode prod --dry-run --rebalance "
@@ -8979,9 +9059,9 @@ class TestLiveRebalanceTextsSayWhatARunDoes:
                 f"{module} has no test {test}")
 
     def test_claude_md_names_the_planners_among_the_live_settings_sites(self):
-        # plan_trims reads the rebalance settings, k and both caps off the run's
-        # one LiveSettings, and plan_add_ons the rebalance settings, so the rule's
-        # list of where the toggles reach names both
+        # plan_trims reads the rebalance settings, k and the per-trade cap off the
+        # run's one LiveSettings, and plan_add_ons the rebalance settings, so the
+        # rule's list of where the toggles reach names both
         lines = claude_docs.notes_lines()
         [rule] = [line for line in lines
                   if line.startswith("- **Do not read a live toggle anywhere but through")]
@@ -11328,7 +11408,7 @@ class TestResultFile:
 
 def _other_toggles(target: LiveSettings) -> LiveSettings:
     """
-    Build live defaults that differ from target in every one of the twelve toggles.
+    Build live defaults that differ from target in every one of the eleven toggles.
 
     All but two cases: a target that rebalances with no minimum price move, or
     with no days to maturity, meets defaults that do not rebalance, and so hold
@@ -11348,7 +11428,6 @@ def _other_toggles(target: LiveSettings) -> LiveSettings:
         spread_band=band,
         interval_discount=0.55 if target.interval_discount != 0.55 else 0.65,
         size_cap=0.5 if target.size_cap != 0.5 else 0.6,
-        same_title_size_cap=0.25 if target.same_title_size_cap != 0.25 else 0.3,
         exclude_categories=None if target.exclude_categories is not None else ("Saved",),
         exclude_tags=None if target.exclude_tags is not None else ("Saved",),
         # The opposite rebalance switch; a 25c minimum when rebalancing here
@@ -11378,24 +11457,24 @@ _ARGV_TARGETS = {
     "seed": config.LIVE_DEFAULTS_SEED,
     "k-with-many-decimals-tier-floors-on": LiveSettings(
         tier_floors=True, spread_band=(0.15, 0.85), interval_discount=0.7123456789012345,
-        size_cap=0.05, same_title_size_cap=1.0, exclude_categories=("Economics",), exclude_tags=None,
+        size_cap=0.05, exclude_categories=("Economics",), exclude_tags=None,
         rebalance=True),
-    "tier-floors-off-caps-100-and-5": LiveSettings(
+    "tier-floors-off-no-cap": LiveSettings(
         tier_floors=False, spread_band=(0.0, 1.0), interval_discount=1.0,
-        size_cap=1.0, same_title_size_cap=0.05,
+        size_cap=1.0,
         exclude_categories=("Economics", "Sports", "Climate and Weather"), exclude_tags=("Soccer",)),
     "names-starting-with-a-dash": LiveSettings(
         tier_floors=True, spread_band=(0.1234567, 0.6543210987654321),
-        interval_discount=1 / 3, size_cap=0.35, same_title_size_cap=0.45,
+        interval_discount=1 / 3, size_cap=0.35,
         exclude_categories=("-Minus", "Politics"), exclude_tags=("-Dash", "Basketball", "Pro Football")),
     "several-tags-no-excluded-category": LiveSettings(
         tier_floors=False, spread_band=(0.05, 0.5), interval_discount=0.8,
-        size_cap=0.2, same_title_size_cap=0.2, exclude_categories=None,
+        size_cap=0.2, exclude_categories=None,
         exclude_tags=("Soccer", "Basketball", "--double dash")),
     # Tags tied to a category ("Category · Tag"), beside a plain one
     "tags-tied-to-a-category": LiveSettings(
         tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-        size_cap=0.1, same_title_size_cap=0.2,
+        size_cap=0.1,
         exclude_categories=("Economics", "Politics"),
         exclude_tags=("Sports · Basketball", "Sports · Pro Football",
               "climate and weather · Hurricanes", "Fed")),
@@ -11403,35 +11482,35 @@ _ARGV_TARGETS = {
     # a level alone (so --no-sell-min-days has to clear a saved minimum)
     "selling-at-85-with-a-minimum": LiveSettings(
         tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-        size_cap=0.1, same_title_size_cap=0.2, sell_at=0.85, sell_min_days=7),
+        size_cap=0.1, sell_at=0.85, sell_min_days=7),
     "selling-at-1-percent-of-profit": LiveSettings(
         tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
-        size_cap=0.2, same_title_size_cap=1.0, sell_at=0.01),
+        size_cap=0.2, sell_at=0.01),
     "selling-at-100-with-a-day": LiveSettings(
         tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-        size_cap=1.0, same_title_size_cap=0.2, rebalance=True,
+        size_cap=1.0, rebalance=True,
         sell_at=1.0, sell_min_days=1),
     # Rebalancing on with a minimum price move: the smallest step, a middle
     # step (15c), and a whole dollar beside selling
     "rebalancing-after-a-5c-move": LiveSettings(
         tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-        size_cap=0.1, same_title_size_cap=0.2, rebalance=True, min_price_move=0.05),
+        size_cap=0.1, rebalance=True, min_price_move=0.05),
     "rebalancing-after-a-15c-move": LiveSettings(
         tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
-        size_cap=0.2, same_title_size_cap=1.0, rebalance=True, min_price_move=0.15),
+        size_cap=0.2, rebalance=True, min_price_move=0.15),
     "selling-and-rebalancing-after-a-dollar": LiveSettings(
         tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-        size_cap=0.1, same_title_size_cap=0.2, rebalance=True, min_price_move=1.0,
+        size_cap=0.1, rebalance=True, min_price_move=1.0,
         sell_at=0.85, sell_min_days=7),
     # Rebalancing only while the later market is still 1 or 7 days from its close,
     # alone and beside a minimum price move and selling
     "rebalancing-until-1-day-before-maturity": LiveSettings(
         tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-        size_cap=0.1, same_title_size_cap=0.2, rebalance=True,
+        size_cap=0.1, rebalance=True,
         rebalance_min_days_to_maturity=1),
     "rebalancing-until-7-days-with-a-move-and-selling": LiveSettings(
         tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
-        size_cap=0.2, same_title_size_cap=1.0, rebalance=True, min_price_move=0.10,
+        size_cap=0.2, rebalance=True, min_price_move=0.10,
         rebalance_min_days_to_maturity=7, sell_at=0.85, sell_min_days=3),
 }
 
@@ -11459,7 +11538,9 @@ class TestLiveSettingsArgv:
         assert args.tier_floors is target.tier_floors
         assert args.spread_min is not None and args.spread_max is not None
         assert args.interval_discount is not None
-        assert args.size_cap is not None and args.same_title_size_cap is not None
+        assert args.size_cap is not None
+        # ... and never the same-title cap's retired flag
+        assert args.retired_same_title_size_cap is None
         assert (args.exclude_category is not None) or args.no_exclude_category
         assert (args.exclude_tag is not None) or args.no_exclude_tag
         # The rebalance settings are given either way: the switch on or off,
@@ -11492,14 +11573,21 @@ class TestLiveSettingsArgv:
     def test_the_seed_is_spelled_flag_by_flag(self):
         assert config.live_settings_argv(config.LIVE_DEFAULTS_SEED) == [
             "--no-tier-floors", "--spread-min=0.0", "--spread-max=0.5",
-            "--interval-discount=0.8", "--size-cap=10", "--same-title-size-cap=20",
+            "--interval-discount=0.8", "--size-cap=10",
             "--rebalance", "--no-min-price-move", "--no-rebalance-min-days-to-maturity",
             "--no-sell", "--no-sell-min-days", "--no-exclude-category", "--no-exclude-tag"]
 
+    @pytest.mark.parametrize("target", _ARGV_TARGETS.values(), ids=_ARGV_TARGETS.keys())
+    def test_no_flag_names_the_same_title_cap(self, target):
+        # main.py refuses that flag, so a run command holding it would never start
+        argv = config.live_settings_argv(target)
+        assert not any(flag.startswith("--same-title") for flag in argv), argv
+        assert len([flag for flag in argv if flag.startswith("--size-cap=")]) == 1
+
     def test_rebalancing_is_spelled_as_a_switch_and_whole_cents(self):
         argv = config.live_settings_argv(_ARGV_TARGETS["rebalancing-after-a-15c-move"])
-        assert argv[argv.index("--same-title-size-cap=100"):][:5] == [
-            "--same-title-size-cap=100", "--rebalance", "--min-price-move=15",
+        assert argv[argv.index("--size-cap=20"):][:5] == [
+            "--size-cap=20", "--rebalance", "--min-price-move=15",
             "--no-rebalance-min-days-to-maturity", "--no-sell"]
         # Every 5c step is spelled as exact whole cents and reads back the same
         # (0.55 * 100 is 55.00000000000001, so a plain product would not do)

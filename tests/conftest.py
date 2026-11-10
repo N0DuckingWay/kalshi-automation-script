@@ -320,13 +320,12 @@ def _isolate_event_title_accumulator(tmp_path, monkeypatch):
 
 def apply_pre_toggle_defaults(mp) -> None:
     """
-    Pin every binding of the twelve live toggles to fixed values.
+    Pin every binding of the eleven live toggles to fixed values.
 
-    Tier floors on, no spread band, k 0.75, a 20% per-trade cap, no extra
-    same-title cap, no category or tag filter, no rebalancing (no adding to
-    held pairs, no trimming) and no selling. A file saved from these values
-    holds only the other seven toggles, since the five optional ones are left
-    out while off. Patches
+    Tier floors on, no spread band, k 0.75, a 20% per-trade cap, no category
+    or tag filter, no rebalancing (no adding to held pairs, no trimming) and
+    no selling. A file saved from these values holds only the other six
+    toggles, since the five optional ones are left out while off. Patches
     config's constants, read at call time, AND the by-value copies backtester
     (k and the per-trade cap) and backtest (k) bind at import, or a test would
     price with one value and size with another; no other module binds one by
@@ -341,7 +340,6 @@ def apply_pre_toggle_defaults(mp) -> None:
     mp.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.0, 1.0))
     mp.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.75)
     mp.setattr(config, "BUDGET_FRACTION", 0.20)
-    mp.setattr(config, "SAME_TITLE_SIZE_CAP", 1.0)
     mp.setattr(config, "TRADE_EXCLUDE_CATEGORIES", None)
     mp.setattr(config, "TRADE_EXCLUDE_TAGS", None)
     mp.setattr(config, "REBALANCE", False)

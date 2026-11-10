@@ -12,14 +12,18 @@ Purpose:
     Claude reads only when a task needs it. These tests fail when the root
     grows past its cap, when a docs/claude/ file is missing from the root's
     index (or the index names one that does not exist), or when a notes
-    file would be loaded with every request after all.
+    file would be loaded with every request after all. One more test keeps
+    the notes and README.md from naming the same-title cap's command-line
+    flag, which main.py refuses (the bot trades time-series pairs only), so
+    no reader copies a command that exits 2; a dated decision record keeps
+    the wording its decision was taken with, and is skipped.
 
 Dependencies:
     tests/claude_docs.py, for where the notes live. Reads files only.
 
 Notes:
-    The checks read claude_docs.ROOT_NOTES and claude_docs.NOTES_DIR when
-    called, so a test can point them at a copy.
+    The checks read claude_docs.ROOT_NOTES, claude_docs.NOTES_DIR and
+    claude_docs.REPO_ROOT when called, so a test can point them at a copy.
 """
 
 import re
@@ -32,6 +36,24 @@ ROOT_CLAUDE_MD_MAX_BYTES = 40_000
 
 # The root's section that lists every docs/claude/ file
 INDEX_HEADING = "## Where the Detail Is"
+
+# The bold lead of a dated decision record: one that names a date and ends
+# "decision record.", such as "**The live defaults of 2026-09-27 — decision
+# record.**". An addendum's lead ("**Addendum to the 2026-09-27 decision
+# record — ...**") ends otherwise, so an addendum is checked like any other
+# paragraph
+DATED_RECORD_LEAD = re.compile(
+    r"\*\*[^*\n]*\b\d{4}-\d{2}-\d{2}\b[^*\n]* decision record\.\*\*")
+
+# Every dated decision record the notes hold, by its bold lead. Adding a
+# record means adding it here, so the records a test skips are always the
+# ones meant, never more or fewer
+DATED_RECORDS = ("**The live defaults of 2026-09-27 — decision record.**",)
+
+# The same-title cap's command-line flag. main.py refuses it (exit 2) since
+# the bot trades time-series pairs only, so no note may name it outside a
+# dated decision record
+RETIRED_SAME_TITLE_CAP_FLAG = "--same-title-size-cap"
 
 
 def _index_paths(root_text: str) -> list[str]:
@@ -65,6 +87,37 @@ def _imports(root_text: str) -> list[str]:
     text = re.sub(r"```.*?```", "", root_text, flags=re.DOTALL)
     text = re.sub(r"`[^`\n]*`", "", text)
     return re.findall(r"(?<![\w@])@[\w~.-]*[/.][\w~./-]*", text)
+
+
+def _dated_record_lines(lines: list[str]) -> dict[int, str]:
+    """
+    The lines of one notes file that belong to a dated decision record.
+
+    A record keeps the wording its decision was taken with, even where the
+    code has changed since, so a test of what the notes name skips it. A
+    record is the line that starts with its bold lead (DATED_RECORD_LEAD)
+    and every line after it — its numbered items and its closing sentence —
+    up to the next line that starts with a bold lead or a heading, or the
+    end of the file. Nothing else is a record: not the paragraph before it,
+    and not an addendum after it.
+
+    Args:
+        lines (list[str]): one file's lines, in order.
+
+    Returns:
+        dict[int, str]: each record line's 0-based index, mapped to the bold
+            lead of the record it belongs to.
+    """
+    records, lead = {}, None
+    for number, line in enumerate(lines):
+        found = DATED_RECORD_LEAD.match(line)
+        if found:
+            lead = found.group(0)
+        elif line.startswith(("**", "#")):
+            lead = None
+        if lead is not None:
+            records[number] = lead
+    return records
 
 
 class TestRootClaudeMd:
@@ -109,3 +162,46 @@ class TestRootClaudeMd:
         text = ("Use `@dataclass`. noreply@anthropic.com\n```\n@docs/x.md\n```\n"
                 "See @docs/claude/overview.md and @README.md.")
         assert _imports(text) == ["@docs/claude/overview.md", "@README.md."]
+
+
+class TestRetiredNames:
+    """Neither the notes nor README.md name the same-title cap's old
+    command-line flag (main.py refuses it), outside a dated decision record,
+    which keeps the wording its decision was taken with."""
+
+    def test_no_note_names_the_same_title_cap_flag_outside_a_dated_record(self):
+        # The record rule on a sample: a record runs from its bold lead to the
+        # next bold lead or heading, so its numbered items and closing sentence
+        # are skipped, and neither the paragraph before it nor an addendum after
+        # it is
+        record = "**The live defaults of 2026-09-27 — decision record.**"
+        sample = ["**A rule.** a", "", f"{record} b", "", "1. c", "   - d", "",
+                  "Closing sentence.", "",
+                  "**Addendum to the 2026-09-27 decision record — e.** f", "",
+                  f"{record} g", "# A heading", "h"]
+        assert _dated_record_lines(sample) == dict.fromkeys([*range(2, 9), 11], record)
+        # Every notes file and README.md, each read on its own, so a record never
+        # runs on into the next file
+        paths = [*claude_docs.notes_paths(), claude_docs.REPO_ROOT / "README.md"]
+        leads, named_in_a_record = set(), []
+        for path in paths:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            records = _dated_record_lines(lines)
+            leads.update(records.values())
+            for number, line in enumerate(lines):
+                if RETIRED_SAME_TITLE_CAP_FLAG not in line:
+                    continue
+                assert number in records, (
+                    f"{path.relative_to(claude_docs.REPO_ROOT)} line {number + 1} names "
+                    f"{RETIRED_SAME_TITLE_CAP_FLAG}, which main.py refuses (exit 2): drop it, "
+                    "or describe the old flag without its name")
+                named_in_a_record.append(f"{path.name}:{number + 1}")
+        # The skipped lines are exactly the dated records', never more or fewer ...
+        assert sorted(leads) == sorted(DATED_RECORDS), (
+            f"the notes' dated decision records are {sorted(leads)}, but DATED_RECORDS "
+            f"names {sorted(DATED_RECORDS)}")
+        # ... and the skip is used: the 2026-09-27 record keeps its one-run replay
+        # command, which named the flag when the record was taken
+        assert named_in_a_record, (
+            f"no dated decision record names {RETIRED_SAME_TITLE_CAP_FLAG} any more, but a "
+            "record keeps the wording its decision was taken with")

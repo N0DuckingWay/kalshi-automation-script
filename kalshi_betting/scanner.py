@@ -6450,8 +6450,11 @@ def _enrich_pair(
         # — the sub-one-contract hole that overloaded sentinel used to have.
         # Both figures are named because they are different faults with
         # different fixes (add funds vs. the book is too thin), and the
-        # binding one is whichever is smaller. A bound of 0 gets its own wording: only
-        # a time-series 1 - k rounding to 0 (k = 1) makes one (no cap can be 0).
+        # binding one is whichever is smaller. A time-series pair's bound of 0
+        # gets its own wording: only 1 - k rounding to 0 (k = 1) makes one,
+        # since its per-trade cap is never 0. Any other pair type always has a
+        # bound of 0 (config.pair_size_cap caps it at 0), so one that gets this
+        # far is always dropped here, with the plain wording.
         why = ""
         if bound == 0 and pair.pair_type == "time_series":
             why = (

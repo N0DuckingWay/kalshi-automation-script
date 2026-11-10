@@ -210,7 +210,7 @@ Notes:
     --no-cap-sweep returns cap_sweep=None, and the dashboard then offers the
     run's own cap only — a far smaller page, built far faster. Like the band
     and k sweeps it is backtest-only: live sizing reads
-    its caps from its run's config.LiveSettings, built from the saved live
+    its cap from its run's config.LiveSettings, built from the saved live
     defaults.
 
     The "Sell" family is ON by default too (sell_sweep=True): the result
@@ -1446,9 +1446,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-cap-sweep", action="store_true",
         help="Skip the per-trade size-cap sweep: the dashboard offers the "
              "run's own cap (config.BUDGET_FRACTION) only — a far smaller, "
-             "faster page. Backtest only — live sizing reads its caps from "
-             "the saved live defaults, or main.py's own --size-cap / "
-             "--same-title-size-cap for one live run",
+             "faster page. Backtest only — live sizing reads its cap from "
+             "the saved live defaults, or main.py's own --size-cap for one "
+             "live run",
     )
     parser.add_argument(
         "--no-sell-sweep", action="store_true",

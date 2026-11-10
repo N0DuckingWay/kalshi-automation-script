@@ -13972,11 +13972,11 @@ class TestCapSweepLogging:
         assert res.cap_sweep is None
 
     def test_the_cap_line_names_the_per_trade_cap_alone(self, monkeypatch, caplog):
-        # The backtest simulates time-series pairs only, so it has no
-        # same-title cap: a tight live same-title cap in config.py changes
-        # neither the line nor anything the run records
+        # The backtest simulates time-series pairs only, and there is no
+        # same-title cap anywhere: the line names the per-trade cap alone and
+        # the run records no other
         monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
-        monkeypatch.setattr(config, "SAME_TITLE_SIZE_CAP", 0.10)
+        assert not hasattr(config, "SAME_TITLE_SIZE_CAP")
         with caplog.at_level(logging.INFO):
             res = run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0)
         lines = [r.getMessage() for r in caplog.records
@@ -14093,7 +14093,7 @@ class TestLiveRuleLine:
         assert messages[-1].startswith(self._PREFIX)
         assert any(m.startswith("Size-cap sweep:") for m in messages[:-1])
 
-    # The thirteen fields a saved-defaults read records, all or none
+    # The twelve fields a saved-defaults read records, all or none
     _LIVE_FIELDS = ("live_tier_floors", "live_spread_band", "live_exclude_categories", "live_exclude_tags",
                     "live_origin", "live_interval_discount", "live_size_cap",
                     "live_rebalance", "live_min_price_move",
@@ -14156,7 +14156,7 @@ class TestLiveRuleLine:
         from kalshi_betting import config
         saved = config.save_live_defaults(
             config.LiveSettings(tier_floors=False, spread_band=(0.1, 0.8), interval_discount=0.6,
-                                size_cap=0.35, same_title_size_cap=0.25,
+                                size_cap=0.35,
                                 exclude_categories=("Economics",), exclude_tags=("Fed",),
                                 rebalance=True, min_price_move=0.10,
                                 rebalance_min_days_to_maturity=7, sell_at=0.85, sell_min_days=3),
@@ -14186,8 +14186,7 @@ class TestLiveRuleLine:
             "live_rebalance": True, "live_min_price_move": 0.10,
             "live_rebalance_min_days_to_maturity": 7,
             "live_sell_at": 0.85, "live_sell_min_days": 3}
-        # The saved same-title cap is a live setting the backtest has no use
-        # for: the sweep records no field for it
+        # There is no same-title cap to save or record
         assert not hasattr(res, "live_same_title_size_cap")
 
     def test_the_live_rule_fields_are_twelve_keys_or_none(self):
@@ -14422,12 +14421,8 @@ class TestLiveRuleLine:
 
     def test_no_sizing_note_when_the_saved_sizing_is_the_runs(self, monkeypatch, caplog):
         # _live saves config.py's own k and per-trade cap, which this run sized
-        # at too. The saved same-title cap is a live setting the backtest has
-        # no use for, so even a tight one adds no note
-        from kalshi_betting import config
-        monkeypatch.setattr(config, "SAME_TITLE_SIZE_CAP", 0.05)
+        # at too
         self._live(monkeypatch, True, (0.0, 1.0))
-        assert config.read_saved_live_defaults().same_title_size_cap == 0.05
         res = self._infeasible(monkeypatch, caplog)
         assert (res.live_interval_discount, res.live_size_cap) == (res.primary.k,
                                                                     res.primary.size_cap)
