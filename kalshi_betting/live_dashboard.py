@@ -898,9 +898,9 @@ def _notes(view: live_portfolio.LiveView) -> list[str]:
     The notes under the holdings: how positions are valued, the cash check, Kalshi's credits, Kalshi's own value, the ratios' yield.
 
     The credits note shows only when the credits Kalshi paid into the
-    account after the bot's first trade (interest and rewards) add up to
-    more than nothing. They count as profit, so the note says what they add
-    up to, interest apart.
+    account after the bot's first trade (interest and rewards) do not add
+    up to zero. They count as profit, so the note says what they add up to,
+    interest apart.
 
     Args:
         view (live_portfolio.LiveView): The view.

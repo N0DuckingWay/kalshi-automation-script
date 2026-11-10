@@ -104,8 +104,8 @@ from ._http import api_error_summary
 # The owner of every contract the bot's trade log does not account for
 OTHER_BETS = "Other bets"
 
-# Kalshi's type for a credit of interest on the account's money; its other
-# credits, such as those of type "incentive", are rewards
+# Kalshi's type for a credit of interest on the account's money; every other
+# type, such as "incentive" for a reward, counts as another credit
 INTEREST_CREDIT = "interest"
 
 _ZERO, _ONE = Decimal(0), Decimal(1)
@@ -623,9 +623,10 @@ def _read_once(client: Any) -> tuple[Account, frozenset[str], frozenset[tuple[da
             fee = _dec(row.get("fee_cents") or 0) / 100
             flows.append(CashFlow(_when(row.get("finalized_ts") or row["created_ts"]),
                                   amount - fee if deposit else -(amount + fee)))
+    # Only an applied credit is in the balance: pending, failed and unknown ones are left out
     credits = [_credit(row) for row in _pages(client, "/portfolio/credit_history", "credits",
                                               limit=config.LIVE_CREDITS_PAGE_SIZE)
-               if row.get("status") == "applied"]       # pending or failed: no money moved
+               if row.get("status") == "applied"]
     balance = _get(client, "/portfolio/balance")
     read_at = datetime.now(UTC)
     positions: dict[str, Decimal] = {}
@@ -2896,8 +2897,8 @@ def build_live_view(client: Any, *, risk_free: treasury.RiskFreeRates | None,
     fill, those whose payout must be rebuilt, every bot leg, then any held
     at the start that are still missing); rebuild the payouts and build the
     ledger; compare what it holds with Kalshi's positions (a warning per
-    market that differs); read the daily prices; then the history, each
-    period of config.LIVE_DASHBOARD_PERIODS, the purchases' returns, the
+    market that differs); read the daily prices; then the history, the
+    purchases' returns, each period of config.LIVE_DASHBOARD_PERIODS, the
     holdings now, the cash check and Kalshi's credits since the history's
     start. A bot purchase's group is its market A's Kalshi category
     (historical.series_labels, the backtest page's filing rule, with
@@ -2984,7 +2985,7 @@ def build_live_view(client: Any, *, risk_free: treasury.RiskFreeRates | None,
                  "from one moment"] if account.changing else [])
     warnings = (*account.warnings, *changing, *log_warnings, *match_warnings, *payout_warnings,
                 *ledger.warnings, *position_warnings, *mark_warnings)
-    # The credits the history's profit counts: those after its start
+    # The credits made after the history's start: the All period's profit counts them all
     credits = () if start is None else tuple(c for c in account.credits if c.time > start)
     return LiveView(account.read_at, account.cash, account.kalshi_positions_value,
                     tuple(holdings), group_order, history, periods, tuple(returns), cash_check,
