@@ -1624,8 +1624,13 @@ class BacktestTrade:
     (the later one).
 
     Attributes:
-        pair_type (str): Strategy variant used: "time_series", the only pair
-            type the backtest simulates.
+        pair_type (str): Always "time_series", the only pair type the
+            backtest simulates. No choice reads it any more; it is carried
+            because the helpers that give each leg its side, price and
+            payout take a pair type (scanner.leg_sides and leg_prices,
+            which the live bot also calls, and this module's
+            _settlement_receipt and _leg_prices_for, which follow them), and
+            the dashboard reads it from saved results.
         ticker_a (str): Kalshi ticker of market A — the earlier-closing
             contract, YES bought.
         ticker_b (str): Kalshi ticker of market B — the later-closing
@@ -8515,17 +8520,18 @@ def _find_entry(
         maturity_a, maturity_b = maturity_b, maturity_a
     if gap_days > MAX_DEADLINE_GAP_DAYS:
         return None
-    # Tier the required price gap by deadline distance (15% for gaps
-    # <= 15 days, 30% for 16-30 days) — the same tiering, computed off the
-    # same gap arithmetic, as scanner.find_time_series_pairs — and layer
-    # the backtest band's floor on top of it: config returns
-    # max(tier, band_lo), so the default floor of 0 leaves the live tier
-    # untouched — and, with tier_floors False (backtest-only), drops the
-    # tier and returns band_lo alone. This one threshold drives BOTH the
-    # gap test and the leg-price-sum ceiling below, which is what keeps
-    # the sum ceiling at 1 - floor when the band raises the floor (the
-    # live pairing of the two, applied to the raised floor rather than to
-    # the tier alone), and at 1 - floor when the tier is dropped too.
+    # The least price gap (pB - pA) a Monday must show at this deadline
+    # gap: config.min_price_diff_for_gap, the function the live spread rule
+    # reads too (config.live_time_series_floor, at the saved live defaults'
+    # band floor and tier setting), here at this pass's band floor
+    # (band_lo) and tier setting. With the tier floors on it is the larger
+    # of the deadline-gap tier (config's MIN_PRICE_DIFF_SHORT_GAP up to
+    # SHORT_DEADLINE_GAP_DAYS apart, MIN_PRICE_DIFF_LONG_GAP beyond) and the
+    # band's floor; with them off (backtest-only), the band's floor alone.
+    # So the gap required depends on the band and tier setting a run uses,
+    # not on the tiers alone. This one threshold drives BOTH the gap test
+    # and the leg-price-sum ceiling below (1 - threshold), as the live
+    # floor sets the live sum ceiling.
     threshold = min_price_diff_for_gap(gap_days, spread_min=band_lo,
                                        tier_floors=tier_floors)
 
