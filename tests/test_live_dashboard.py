@@ -1687,6 +1687,17 @@ class TestPageScript:
         assert [r["text"] for r in el["live-area-head"]["rows"]] == data["area_table"]["head"]
         assert _cells(snap, "live-area-rows") == [r["cells"] for r in data["area_table"]["rows"]]
 
+    def test_with_no_warnings_nothing_shows_above_the_figures(self, tmp_path):
+        # A run whose logged cash does not match is counted in the notes, not warned
+        # about, so a read with no other problem leaves the warnings list empty and hidden
+        data = payload(_view())
+        assert data["warnings"] == []
+        el = _run_live_script(tmp_path, [{"status": 200, "body": data}],
+                              [["settle"], ["snap", "shown"]])["shown"]["el"]
+        assert el["live-warnings"]["rows"] == []
+        assert el["live-warnings"]["hidden"] is True
+        assert el["live-stats"]["hidden"] is False
+
     def test_a_period_click(self, tmp_path):
         view = _view()
         view = dataclasses.replace(view, periods=(
