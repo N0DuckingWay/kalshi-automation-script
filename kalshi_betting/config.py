@@ -1034,6 +1034,11 @@ LIVE_PAGE_SIZE = 1000
 # Kalshi's largest page for the deposits and withdrawals listings.
 LIVE_TRANSFERS_PAGE_SIZE = 500
 
+# Kalshi's largest page for its credit history listing: the money Kalshi pays
+# into the account outside any trade, such as interest on the balance or a
+# reward. The live dashboard counts each credit as money the account earned.
+LIVE_CREDITS_PAGE_SIZE = 1000
+
 # How many markets one /markets or /historical/markets request looks up.
 LIVE_MARKET_TICKERS_PER_REQUEST = 100
 

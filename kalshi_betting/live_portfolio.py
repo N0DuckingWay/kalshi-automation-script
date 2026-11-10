@@ -6,14 +6,16 @@ Last edited by: Zachary Hoffman
 Purpose:
     Works out how the live account is doing, for the live dashboard's Live
     trading tab. Reads the account from Kalshi with read-only GETs (every
-    fill, settlement, deposit and withdrawal, then the balance and the
-    positions) and reads the bot's trade log, which lists the purchases the
-    bot made. Each of the bot's purchases is matched to the one Kalshi order
-    that made it; every other fill in the account counts as "Other bets"
-    (your own trades). Then every fill and payout is replayed, oldest first,
-    into a ledger of the contracts each owner bought, sold and was paid for,
-    with the cash each one moved. The bot's sale orders are Other bets fills,
-    read as sales by hand: a held pair's two sale orders, within
+    fill, settlement, deposit, withdrawal and credit, then the balance and
+    the positions) and reads the bot's trade log, which lists the purchases
+    the bot made. A credit is money Kalshi pays into the account outside any
+    trade, such as interest on the balance or a reward. Each of the bot's
+    purchases is matched to the one Kalshi order that made it; every other
+    fill in the account counts as "Other bets" (your own trades). Then every
+    fill and payout is replayed, oldest first, into a ledger of the
+    contracts each owner bought, sold and was paid for, with the cash each
+    one moved. The bot's sale orders are Other bets fills, read as sales by
+    hand: a held pair's two sale orders, within
     config.LIVE_MANUAL_PAIR_SECONDS of each other, close its purchase first.
 
     From the ledger it values the account over time: the cash, and each
@@ -21,12 +23,14 @@ Purpose:
     Kalshi's daily closes (midnight New York time), at each deposit or
     withdrawal, and now, by category
     (a bot purchase's category is its market A's Kalshi category; everything
-    else is Other bets). From those values it works out each period's
-    statistics (total return, profit, Sharpe and Sortino, each category's
-    return), each bot purchase's return, the holdings now, and whether the
-    cash each run logged before it traded matches the cash rebuilt from
-    Kalshi's records. build_live_view puts it all together for the page, and
-    append_snapshot writes one JSON line per read.
+    else is Other bets). Each credit is in the cash from the moment Kalshi
+    made it and counts as money the account earned, never as a deposit. From
+    those values it works out each period's statistics (total return,
+    profit, Sharpe and Sortino, each category's return), each bot purchase's
+    return, the holdings now, and whether the cash each run logged before it
+    traded matches the cash rebuilt from Kalshi's records. build_live_view
+    puts it all together for the page, and append_snapshot writes one JSON
+    line per read.
 
 Dependencies:
     config (the LIVE_* page sizes, matching windows, read retries, candle
@@ -99,6 +103,10 @@ from ._http import api_error_summary
 
 # The owner of every contract the bot's trade log does not account for
 OTHER_BETS = "Other bets"
+
+# Kalshi's type for a credit of interest on the account's money; every other
+# type, such as "incentive" for a reward, counts as another credit
+INTEREST_CREDIT = "interest"
 
 _ZERO, _ONE = Decimal(0), Decimal(1)
 
@@ -223,6 +231,29 @@ class CashFlow:
 
 
 @dataclass(frozen=True)
+class Credit:
+    """
+    One credit that reached the account: money Kalshi paid in outside any trade.
+
+    Kalshi lists these in its credit history, apart from fills, settlements,
+    deposits and withdrawals: interest on the account's money, and rewards
+    such as an incentive payout. The page counts each one as money the
+    account earned, in the cash from the moment Kalshi made it.
+
+    Attributes:
+        time (datetime): When Kalshi made it (UTC).
+        amount (Decimal): Dollars into the account.
+        kind (str): Kalshi's type for it: INTEREST_CREDIT, or another type
+            such as "incentive" for a reward.
+        reason (str): Kalshi's description, e.g. "Interest for October 2026".
+    """
+    time: datetime
+    amount: Decimal
+    kind: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class Market:
     """
     What the live dashboard needs to know about one market.
@@ -281,6 +312,8 @@ class Account:
             read, so the read may not be consistent.
         warnings (tuple[str, ...]): Anything odd in the replies that the read
             worked around, for the page to show (empty when nothing was).
+        credits (tuple[Credit, ...]): Kalshi's credits that reached the
+            account (interest and rewards), oldest first.
     """
     read_at: datetime
     cash: Decimal
@@ -292,6 +325,7 @@ class Account:
     flows: tuple[CashFlow, ...]
     changing: bool
     warnings: tuple[str, ...] = ()
+    credits: tuple[Credit, ...] = ()
 
 
 def _dec(value: Any) -> Decimal:
@@ -489,6 +523,27 @@ def _payout_key(row: dict) -> tuple[datetime, str]:
     return _when(row["settled_time"]), str(row["ticker"])
 
 
+def _credit(row: dict) -> Credit:
+    """
+    Read one credit record.
+
+    Kalshi gives the amount as dollar text (amount_dollars, e.g. "1.5600")
+    and the time it made the credit as ISO text (created_time).
+
+    Args:
+        row (dict): A record from /portfolio/credit_history.
+
+    Returns:
+        Credit: The credit.
+
+    Raises:
+        ValueError: If the amount or the time cannot be read.
+        KeyError: If the amount or the time is missing.
+    """
+    return Credit(_when(row["created_time"]), _dec(row["amount_dollars"]),
+                  str(row.get("type") or ""), str(row.get("reason") or ""))
+
+
 def _cash(balance: dict) -> tuple[Decimal, int, list[str]]:
     """
     Read the cash on every shard from a balance reply.
@@ -533,11 +588,11 @@ def _read_once(client: Any) -> tuple[Account, frozenset[str], frozenset[tuple[da
     Read the whole account once.
 
     Reads the records first (live fills, then archived ones; settlements;
-    deposits and withdrawals), then the balance and the positions, so the
-    balance is never older than the records. Live fills come first because
-    Kalshi moves a fill from its live listing to its archive, never back: a
-    fill that moves while the two are read is in the archive by the time
-    the archive is read. A fill in both is taken from the live listing.
+    deposits and withdrawals; credits), then the balance and the positions,
+    so the balance is never older than the records. Live fills come first
+    because Kalshi moves a fill from its live listing to its archive, never
+    back: a fill that moves while the two are read is in the archive by the
+    time the archive is read. A fill in both is taken from the live listing.
 
     Args:
         client (Any): A client from auth.build_client.
@@ -568,6 +623,10 @@ def _read_once(client: Any) -> tuple[Account, frozenset[str], frozenset[tuple[da
             fee = _dec(row.get("fee_cents") or 0) / 100
             flows.append(CashFlow(_when(row.get("finalized_ts") or row["created_ts"]),
                                   amount - fee if deposit else -(amount + fee)))
+    # Only an applied credit is in the balance: pending, failed and unknown ones are left out
+    credits = [_credit(row) for row in _pages(client, "/portfolio/credit_history", "credits",
+                                              limit=config.LIVE_CREDITS_PAGE_SIZE)
+               if row.get("status") == "applied"]
     balance = _get(client, "/portfolio/balance")
     read_at = datetime.now(UTC)
     positions: dict[str, Decimal] = {}
@@ -581,7 +640,8 @@ def _read_once(client: Any) -> tuple[Account, frozenset[str], frozenset[tuple[da
     ordered = tuple(sorted(fills.values(), key=lambda f: (f.time, f.fill_id)))
     account = Account(read_at, cash, shards, None if cents is None else Decimal(cents) / 100,
                       positions, ordered, payouts, tuple(sorted(flows, key=lambda f: f.time)),
-                      False, tuple(warnings))
+                      False, tuple(warnings),
+                      credits=tuple(sorted(credits, key=lambda c: c.time)))
     return account, frozenset(fills), frozenset((p.time, p.ticker) for p in payouts)
 
 
@@ -614,10 +674,10 @@ def read_account(client: Any) -> Account:
     second to include a fill), it waits config.LIVE_READ_RETRY_PAUSE_SECONDS
     and reads again, at most config.LIVE_READ_ATTEMPTS times in all.
 
-    Deposits and withdrawals are not checked again: one applied in the
-    moment between the read of their listings and the balance read would be
-    in the cash but not among the deposits, and the cash check would show
-    the difference.
+    Deposits, withdrawals and credits are not checked again: one applied in
+    the moment between the read of their listings and the balance read
+    would be in the cash but not among the records, and the cash check
+    would show the difference.
 
     Args:
         client (Any): A client from auth.build_client.
@@ -2090,8 +2150,10 @@ def _cash_reader(account: Account, ledger: Ledger) -> Callable[[datetime], Decim
     """
     Build the reader of the cash at any moment: the cash now, less every change after it.
 
-    The changes are the ledger's cash (fills and payouts) and the deposits
-    and withdrawals.
+    The changes are the ledger's cash (fills and payouts), the deposits and
+    withdrawals, and Kalshi's credits (interest and rewards). A record
+    missing from these would leave the cash rebuilt before it off by its
+    amount, which the cash check (check_logged_cash) shows.
 
     Args:
         account (Account): The account, from read_account.
@@ -2101,7 +2163,9 @@ def _cash_reader(account: Account, ledger: Ledger) -> Callable[[datetime], Decim
         Callable[[datetime], Decimal]: The cash at a moment, in dollars.
     """
     changes = sorted([(e.time, e.cash) for e in ledger.events]
-                     + [(f.time, f.amount) for f in account.flows], key=lambda change: change[0])
+                     + [(f.time, f.amount) for f in account.flows]
+                     + [(c.time, c.amount) for c in account.credits],
+                     key=lambda change: change[0])
     times = [when for when, _ in changes]
     after = [_ZERO] * (len(changes) + 1)          # after[i]: changes i, i+1, ... added up
     for i in range(len(changes) - 1, -1, -1):
@@ -2140,7 +2204,10 @@ def build_history(account: Account, ledger: Ledger, marks: Marks,
     or loss to the money already there. Each holding is valued at its
     market's YES value then (Marks.at), or at what it cost when its market
     has never been priced. A group's net cash and spending count only what
-    happened after `start`.
+    happened after `start`. Kalshi's credits (interest and rewards) are in
+    the cash from the moment each was made but are not flows: the total
+    return and the profit count them as money the account earned, and they
+    belong to no group.
 
     Args:
         account (Account): The account, from read_account.
@@ -2341,8 +2408,10 @@ class PeriodStats:
         last (datetime): Its last moment: the read.
         total_return (float | None): The return over the period with
             deposits and withdrawals taken out (each moment-to-moment return
-            chained); None for a period with no time in it.
-        pnl (float): The value's change, less deposits plus withdrawals.
+            chained); None for a period with no time in it. Kalshi's credits
+            count in it, as money the account earned.
+        pnl (float): The value's change, less deposits plus withdrawals;
+            Kalshi's credits count as profit.
         sharpe (float | None): dashboard._sharpe over its whole days' returns;
             None with fewer than config.LIVE_RATIO_MIN_WHOLE_DAYS whole days.
         sortino (float | None): dashboard._sortino, likewise.
@@ -2647,6 +2716,11 @@ class LiveView:
         warnings (tuple[str, ...]): Every warning of the read and of each step
             after it, for the page to show above its figures. A run whose
             logged cash does not match is not a warning: cash_check counts it.
+        credits (tuple[Credit, ...]): Kalshi's credits made after the
+            history's start (just before the bot's first fill), oldest first;
+            empty before the bot's first live trade. Each period's profit and
+            total return count the credits made inside it, and the page's
+            notes say what these add up to.
     """
     read_at: datetime
     cash: Decimal
@@ -2660,6 +2734,7 @@ class LiveView:
     risk_free: treasury.RiskFreeRates | None
     changing: bool
     warnings: tuple[str, ...]
+    credits: tuple[Credit, ...] = ()
 
     @property
     def holdings_value(self) -> Decimal:
@@ -2822,13 +2897,14 @@ def build_live_view(client: Any, *, risk_free: treasury.RiskFreeRates | None,
     fill, those whose payout must be rebuilt, every bot leg, then any held
     at the start that are still missing); rebuild the payouts and build the
     ledger; compare what it holds with Kalshi's positions (a warning per
-    market that differs); read the daily prices; then the history, each
-    period of config.LIVE_DASHBOARD_PERIODS, the purchases' returns, the
-    holdings now and the cash check. A bot purchase's group is its market
-    A's Kalshi category (historical.series_labels, the backtest page's
-    filing rule, with historical.infer_category for a series Kalshi's
-    listing lacks); everything else is OTHER_BETS. Before the bot's first
-    fill there is no history and no period.
+    market that differs); read the daily prices; then the history, the
+    purchases' returns, each period of config.LIVE_DASHBOARD_PERIODS, the
+    holdings now, the cash check and Kalshi's credits since the history's
+    start. A bot purchase's group is its market A's Kalshi category
+    (historical.series_labels, the backtest page's filing rule, with
+    historical.infer_category for a series Kalshi's listing lacks);
+    everything else is OTHER_BETS. Before the bot's first fill there is no
+    history, no period and no credit counted.
 
     Args:
         client (Any): A client from auth.build_client.
@@ -2909,9 +2985,11 @@ def build_live_view(client: Any, *, risk_free: treasury.RiskFreeRates | None,
                  "from one moment"] if account.changing else [])
     warnings = (*account.warnings, *changing, *log_warnings, *match_warnings, *payout_warnings,
                 *ledger.warnings, *position_warnings, *mark_warnings)
+    # The credits made after the history's start: the All period's profit counts them all
+    credits = () if start is None else tuple(c for c in account.credits if c.time > start)
     return LiveView(account.read_at, account.cash, account.kalshi_positions_value,
                     tuple(holdings), group_order, history, periods, tuple(returns), cash_check,
-                    risk_free, account.changing, tuple(warnings))
+                    risk_free, account.changing, tuple(warnings), credits)
 
 
 # ---- the log line ----------------------------------------------------------
