@@ -1,7 +1,8 @@
-"""Tests for live_portfolio.py: reading the account from Kalshi, reading the
-bot's trade log, matching the bot's purchases to Kalshi orders, the ledger of
-every contract bought, sold and paid out, and what is worked out from it: the
-daily prices, the account's value over time, each period's statistics, each
+"""Tests for live_portfolio.py: reading the account from Kalshi (its credits,
+the interest and rewards Kalshi pays in, included), reading the bot's trade
+log, matching the bot's purchases to Kalshi orders, the ledger of every
+contract bought, sold and paid out, and what is worked out from it: the daily
+prices, the account's value over time, each period's statistics, each
 purchase's return, the holdings now, the check of each run's logged cash, the
 whole view and its JSON log line.
 
@@ -50,6 +51,7 @@ from kalshi_betting.live_portfolio import (
     BotLeg,
     BotTrade,
     CashFlow,
+    Credit,
     Fill,
     History,
     Holding,
@@ -74,6 +76,7 @@ _KEYS = {
     "/portfolio/settlements": "settlements",
     "/portfolio/deposits": "deposits",
     "/portfolio/withdrawals": "withdrawals",
+    "/portfolio/credit_history": "credits",
     "/portfolio/positions": "market_positions",
     "/markets": "markets",
     "/historical/markets": "markets",
@@ -296,6 +299,41 @@ class TestReadAccount:
             (T0 + timedelta(seconds=60), D("99.75")),
         ]
 
+    def test_applied_credits_are_read_oldest_first(self, kalshi):
+        # Kalshi's credit history, newest first: interest and a reward that
+        # reached the account, and two credits that did not (no money moved)
+        kalshi.rows["/portfolio/credit_history"] = [
+            {"credit_id": "c4", "type": "interest", "status": "applied",
+             "amount_dollars": "1.5600", "reason": "Interest for October 2026",
+             "created_time": _iso(T0 + timedelta(days=9))},
+            {"credit_id": "c3", "type": "incentive", "status": "pending",
+             "amount_dollars": "5.0000", "reason": "A reward on its way",
+             "created_time": _iso(T0 + timedelta(days=8))},
+            {"credit_id": "c2", "type": "incentive", "status": "failed",
+             "amount_dollars": "3.0000", "reason": "A reward that failed",
+             "created_time": _iso(T0 + timedelta(days=7))},
+            {"credit_id": "c1", "type": "incentive", "status": "applied",
+             "amount_dollars": "20.0000", "reason": "UXR Survey", "created_time": _iso(T0)},
+        ]
+        account = live_portfolio.read_account(object())
+        assert account.credits == (
+            Credit(T0, D("20.0000"), "incentive", "UXR Survey"),
+            Credit(T0 + timedelta(days=9), D("1.5600"), "interest", "Interest for October 2026"))
+        assert ("/portfolio/credit_history",
+                {"cursor": None, "limit": config.LIVE_CREDITS_PAGE_SIZE}) in kalshi.calls
+
+    @pytest.mark.parametrize("row", [
+        {"status": "applied", "created_time": _iso(T0)},                     # no amount
+        {"status": "applied", "amount_dollars": "lots", "created_time": _iso(T0)},
+        {"status": "applied", "amount_dollars": "1.0000", "created_time": "yesterday"},
+    ])
+    def test_a_credit_that_cannot_be_read_stops_the_read(self, kalshi, row):
+        # A credit left out would leave the cash rebuilt before it off by its
+        # amount, so an unreadable one stops the read, as an unreadable fill does
+        kalshi.rows["/portfolio/credit_history"] = [row]
+        with pytest.raises((KeyError, ValueError)):
+            live_portfolio.read_account(object())
+
     def test_settlement_revenue_and_value_are_read_in_cents(self, kalshi):
         kalshi.rows["/portfolio/settlements"] = [
             {"ticker": "M1", "settled_time": _iso(T0), "market_result": "yes",
@@ -337,7 +375,8 @@ class TestReadAccount:
         # they are read is then in one of the two reads
         assert order == ["/portfolio/fills", "/historical/fills", "/portfolio/settlements",
                          "/portfolio/deposits", "/portfolio/withdrawals",
-                         "/portfolio/balance", "/portfolio/positions"]
+                         "/portfolio/credit_history", "/portfolio/balance",
+                         "/portfolio/positions"]
 
 
 class TestPages:
@@ -1893,11 +1932,12 @@ class TestReadMarks:
 
 # ---- the account over time -------------------------------------------------
 
-def _after(cash_at_start, ledger, *, flows=(), read_at=READ, shards=1) -> Account:
-    """The account whose cash before every ledger event and flow was `cash_at_start`."""
+def _after(cash_at_start, ledger, *, flows=(), credits=(), read_at=READ, shards=1) -> Account:
+    """The account whose cash before every ledger event, flow and credit was `cash_at_start`."""
     cash = (cash_at_start + sum((e.cash for e in ledger.events), D(0))
-            + sum((f.amount for f in flows), D(0)))
-    return Account(read_at, cash, shards, None, dict(ledger.held_now), (), (), tuple(flows), False)
+            + sum((f.amount for f in flows), D(0)) + sum((c.amount for c in credits), D(0)))
+    return Account(read_at, cash, shards, None, dict(ledger.held_now), (), (), tuple(flows), False,
+                   credits=tuple(credits))
 
 
 def _crypto(owner: str) -> str:
@@ -1913,11 +1953,18 @@ class TestHistory:
         flows = sorted((CashFlow(T0 + timedelta(hours=rng.randint(0, 60)),
                                  D(rng.randint(-5000, 5000)) / 100)
                         for _ in range(rng.randint(0, 4))), key=lambda f: f.time)
+        # Kalshi's credits, drawn from a generator of their own so the fills
+        # and flows above stay the same
+        credit_rng = random.Random(seed + 2000)
+        credits = sorted((Credit(T0 + timedelta(hours=credit_rng.randint(0, 60)),
+                                 D(credit_rng.randint(1, 3000)) / 100, "interest", "")
+                          for _ in range(credit_rng.randint(0, 3))), key=lambda c: c.time)
         ledger = live_portfolio.build_ledger(fills, payouts, owner_by_fill, legs)
         read_at = T0 + timedelta(days=3)
         start_cash = D("250.0000")
-        account = _after(start_cash, ledger, flows=flows, read_at=read_at)
-        changes = [(e.time, e.cash) for e in ledger.events] + [(f.time, f.amount) for f in flows]
+        account = _after(start_cash, ledger, flows=flows, credits=credits, read_at=read_at)
+        changes = ([(e.time, e.cash) for e in ledger.events] + [(f.time, f.amount) for f in flows]
+                   + [(c.time, c.amount) for c in credits])
         moments = sorted({when for when, _ in changes} | {START, read_at})
         for moment in moments:
             forward = start_cash + sum((amount for when, amount in changes if when <= moment),
@@ -2010,6 +2057,26 @@ class TestHistory:
                                  _utc(2026, 9, 30, 4), _utc(2026, 10, 1, 4), read_at)
         assert history.flows == (0.0, 0.0, 50.0, 0.0, 0.0, 0.0)
         assert history.cash == (100.0, 97.0, 147.0, 147.0, 147.0, 147.0)
+
+    def test_a_credit_is_cash_from_its_moment_and_counts_as_profit(self):
+        # $20.00 Kalshi paid in on Sep 29 at 10:00: in the cash from then on,
+        # with no moment of its own and no flow, so the profit and the total
+        # return count it as money the account earned (a deposit counts in neither)
+        ledger = _ledger([_fill("m", "M", T0, True, 10, "0.30")])
+        read_at = _utc(2026, 10, 1, 12)
+        credit = Credit(_utc(2026, 9, 29, 10), D("20.00"), "incentive", "UXR Survey")
+        account = _after(D(100), ledger, credits=[credit], read_at=read_at)
+        history = live_portfolio.build_history(account, ledger, Marks({}, {}, read_at), _crypto,
+                                               START)
+        assert history.times == (START, _utc(2026, 9, 29, 4), _utc(2026, 9, 30, 4),
+                                 _utc(2026, 10, 1, 4), read_at)
+        assert history.cash == (100.0, 97.0, 117.0, 117.0, 117.0)
+        assert history.flows == (0.0,) * 5
+        # The credit belongs to no group: only the $3.00 contracts have a value
+        assert history.value == {OTHER_BETS: (0.0, 3.0, 3.0, 3.0, 3.0)}
+        stats = live_portfolio.period_stats(history, [], None, "All", 0)
+        assert stats.pnl == pytest.approx(20.0)
+        assert stats.total_return == pytest.approx(0.20)
 
 
 # ---- statistics ------------------------------------------------------------
@@ -2355,6 +2422,23 @@ class TestCheckLoggedCash:
         logged = T0 + timedelta(minutes=1)
         assert check.misses == (() if matches else ((logged, D(banner), D("23.2275")),))
 
+    def test_a_credit_after_a_run_is_taken_out_of_the_cash_rebuilt_for_it(self):
+        # $20.00 Kalshi paid in a day after the run: the cash now has it, the
+        # cash the run logged did not. With the credit counted, the cash
+        # rebuilt before the run's fill is $23.2275 (logged as $23.22); left
+        # out, the rebuilt cash is $20.00 too high and the run is a miss
+        account, ledger = self._setup()
+        credit = Credit(T0 + timedelta(days=1), D("20.00"), "incentive", "UXR Survey")
+        account = dataclasses.replace(account, cash=account.cash + credit.amount,
+                                      credits=(credit,))
+        logged = T0 + timedelta(minutes=1)
+        run = RunStart(logged - timedelta(hours=6), logged, D("23.22"))
+        check = live_portfolio.check_logged_cash(account, ledger, [run], {logged: T0})
+        assert (check.matched, check.checked, check.misses) == (1, 1, ())
+        missed = dataclasses.replace(account, credits=())
+        assert live_portfolio.check_logged_cash(missed, ledger, [run], {logged: T0}).misses == (
+            (logged, D("23.22"), D("43.2275")),)
+
     def test_a_run_with_no_fills_is_checked_at_its_log_time(self):
         # After the fill: $20.2275 rebuilt at the log time
         assert self._check("20.22", first=None).matched == 1
@@ -2617,6 +2701,44 @@ class TestBuildLiveView:
         assert {t for p in fake.batches() for t in p["market_tickers"].split(",")} == {
             "A1", "B1", "X"}
         assert view.changing is False
+        assert view.credits == ()
+
+    def test_kalshis_credits_are_in_the_cash_and_counted_from_the_start(
+            self, whole_account, log_paths, pacific, monkeypatch):
+        # Interest paid the day before the bot's first fill, a $20.00 reward a
+        # day after it, and a reward still pending. The cash now is $110.9050:
+        # the $100.0050 before the bot's $9.10 pair, less the pair, plus the
+        # reward. With the reward taken out, the run's $100.00 matches the
+        # cash rebuilt before its pair; the view counts only the reward,
+        # since the interest came before the history's start
+        kalshi, fake = whole_account
+        self._account(kalshi, fake)
+        kalshi.rows["/portfolio/credit_history"] = [
+            {"type": "incentive", "status": "pending", "amount_dollars": "5.0000",
+             "reason": "A reward on its way", "created_time": _iso(T0 + timedelta(days=2))},
+            {"type": "incentive", "status": "applied", "amount_dollars": "20.0000",
+             "reason": "UXR Survey", "created_time": _iso(T0 + timedelta(days=1))},
+            {"type": "interest", "status": "applied", "amount_dollars": "0.7300",
+             "reason": "Interest for September 2026",
+             "created_time": _iso(T0 - timedelta(days=1))},
+        ]
+        kalshi.balance = {"balance_breakdown": [{"exchange_index": 0,
+                                                 "balance_dollars": "110.9050"}],
+                          "portfolio_value": 1225}
+        _write_run(monkeypatch, T0, [_trade_result("A1", "B1", "executed")], 100.00)
+        view = live_portfolio.build_live_view(
+            object(), risk_free=None, series_categories=self.CATEGORIES,
+            trade_logs=live_portfolio.trade_log_paths())
+        assert view.warnings == ()
+        assert (view.cash_check.matched, view.cash_check.checked) == (1, 1)
+        assert view.credits == (
+            Credit(T0 + timedelta(days=1), D("20.0000"), "incentive", "UXR Survey"),)
+        # The history starts from the cash before the pair, and the reward is
+        # no flow: it counts in the profit
+        assert view.history.cash[0] == pytest.approx(100.005)
+        assert sum(view.history.flows) == 0
+        assert view.periods[0].pnl == pytest.approx(view.history.total(-1)
+                                                    - view.history.total(0))
 
     @pytest.mark.parametrize("late", [False, True])
     def test_a_run_that_sells_then_buys(self, late, whole_account, log_paths, pacific,
