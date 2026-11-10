@@ -2489,17 +2489,6 @@ class TestCheckLoggedCash:
                                                  {self.SOLD_LOGGED: bot_time})
         assert (check.matched, check.checked, check.misses) == (1, 1, ())
 
-    def test_a_miss_is_one_sentence_with_the_rebuilt_cash_to_the_hundredth_of_a_cent(self):
-        logged = _utc(2026, 9, 28, 7, 11, 35)
-        check = live_portfolio.CashCheck(0, 2, D("1.004999999999"), (
-            (logged, D("101.00"), D("100.005000000000")),
-            (logged + timedelta(days=1), D("50.10"), D("49.123456789012"))))
-        assert live_portfolio._cash_miss_warnings(check) == [
-            "The run logged at 2026-09-28 07:11 UTC wrote $101.00 as its cash before trading; "
-            "Kalshi's records rebuild $100.0050 then",
-            "The run logged at 2026-09-29 07:11 UTC wrote $50.10 as its cash before trading; "
-            "Kalshi's records rebuild $49.1235 then"]
-
 
 # ---- the whole view, and its log line ----------------------------------------
 
@@ -2769,8 +2758,8 @@ class TestBuildLiveView:
         assert view.warnings == ("The account kept changing while it was read: the figures "
                                  "may not all be from one moment",)
 
-    def test_every_real_run_is_checked_and_a_miss_is_a_warning(self, whole_account, log_paths,
-                                                              pacific, monkeypatch):
+    def test_every_real_run_is_checked_and_a_miss_is_counted_not_warned(
+            self, whole_account, log_paths, pacific, monkeypatch):
         kalshi, fake = whole_account
         self._account(kalshi, fake)
         # A run two hours before the bot's first fill, whose pair failed and sent
@@ -2782,8 +2771,9 @@ class TestBuildLiveView:
             object(), risk_free=None, series_categories=self.CATEGORIES,
             trade_logs=live_portfolio.trade_log_paths())
         assert (view.cash_check.matched, view.cash_check.checked) == (1, 2)
-        assert view.warnings == ("The run logged at 2026-09-28 09:00 UTC wrote $101.00 as its "
-                                 "cash before trading; Kalshi's records rebuild $100.0050 then",)
+        assert view.cash_check.misses == ((T0, D("101.00"), D("100.005")),)
+        # The page's notes count the miss; no warning lists it at the top of the page
+        assert view.warnings == ()
 
     def test_kalshi_holding_something_else_is_a_warning(self, whole_account, log_paths, pacific,
                                                          monkeypatch):

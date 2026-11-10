@@ -1115,8 +1115,9 @@ LIVE_CASH_CHECK_BELOW_DOLLARS = "0.005"
 # page shows the largest gap beside the count. Text, for decimal.Decimal.
 LIVE_CASH_CHECK_ABOVE_PER_SHARD_DOLLARS = "0.01"
 
-# The rebuilt cash a mismatched run's warning shows is rounded to this: the
-# hundredth of a cent the account keeps its cash to. Text, for decimal.Decimal.
+# The largest gap the Live trading tab's cash-check note shows is rounded to
+# this: the hundredth of a cent the account keeps its cash to. Text, for
+# decimal.Decimal.
 LIVE_CASH_SHOWN_STEP_DOLLARS = "0.0001"
 
 # Where live_dashboard.py listens: the tab page and its account data on one

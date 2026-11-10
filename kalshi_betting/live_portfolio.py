@@ -2579,27 +2579,6 @@ def check_logged_cash(account: Account, ledger: Ledger, runs: list[RunStart],
     return CashCheck(matched, checked, worst, tuple(misses))
 
 
-def _cash_miss_warnings(check: CashCheck) -> list[str]:
-    """
-    One sentence per run whose logged cash does not match, for the page to show as it is.
-
-    The logged cash is shown as the trade log wrote it; the rebuilt cash is
-    rounded to config.LIVE_CASH_SHOWN_STEP_DOLLARS (the hundredth of a cent
-    the account keeps its cash to), since it can carry the ledger's finer
-    shares of a fee or a cost.
-
-    Args:
-        check (CashCheck): The check, from check_logged_cash.
-
-    Returns:
-        list[str]: The sentences, in the order of the runs.
-    """
-    step = Decimal(config.LIVE_CASH_SHOWN_STEP_DOLLARS)
-    return [f"The run logged at {logged:%Y-%m-%d %H:%M} UTC wrote ${banner} as its cash before "
-            f"trading; Kalshi's records rebuild ${rebuilt.quantize(step)} then"
-            for logged, banner, rebuilt in check.misses]
-
-
 # ---- what the page shows ---------------------------------------------------
 
 @dataclass(frozen=True)
@@ -2659,12 +2638,15 @@ class LiveView:
         periods (tuple[PeriodStats, ...] | None): One per
             config.LIVE_DASHBOARD_PERIODS; None before the first trade.
         trades (tuple[TradeReturn, ...]): Each bot purchase's return (trade_returns).
-        cash_check (CashCheck): The runs' logged cash against Kalshi's records.
+        cash_check (CashCheck): The runs' logged cash against Kalshi's
+            records. The page's notes give only how many runs match and the
+            largest gap; no run is listed.
         risk_free (treasury.RiskFreeRates | None): The T-bill yields the
             ratios used, or None (0%).
         changing (bool): True when the account kept changing while it was read.
         warnings (tuple[str, ...]): Every warning of the read and of each step
-            after it, for the page to show.
+            after it, for the page to show above its figures. A run whose
+            logged cash does not match is not a warning: cash_check counts it.
     """
     read_at: datetime
     cash: Decimal
@@ -2918,15 +2900,15 @@ def build_live_view(client: Any, *, risk_free: treasury.RiskFreeRates | None,
     for fill in bot_fills:
         run = run_of[owner_by_fill[fill.fill_id]]
         first_bot_fill.setdefault(run, fill.time)          # bot_fills are oldest first
-    # The bot's purchases' own fills are never read as a run's sale orders
+    # The bot's purchases' own fills are never read as a run's sale orders. A run
+    # that does not match is only counted (the page's notes), never a warning
     cash_check = check_logged_cash(account, ledger, runs, first_bot_fill,
                                    bot_fill_ids=frozenset(owner_by_fill))
-    cash_warnings = _cash_miss_warnings(cash_check)
 
     changing = (["The account kept changing while it was read: the figures may not all be "
                  "from one moment"] if account.changing else [])
     warnings = (*account.warnings, *changing, *log_warnings, *match_warnings, *payout_warnings,
-                *ledger.warnings, *position_warnings, *mark_warnings, *cash_warnings)
+                *ledger.warnings, *position_warnings, *mark_warnings)
     return LiveView(account.read_at, account.cash, account.kalshi_positions_value,
                     tuple(holdings), group_order, history, periods, tuple(returns), cash_check,
                     risk_free, account.changing, tuple(warnings))
