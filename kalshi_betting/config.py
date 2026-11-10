@@ -107,17 +107,19 @@ DEV_PEM_FILE = PROJECT_ROOT / "kalshi_demo_private_key.pem"
 # The largest share of the portfolio value (cash plus open positions) one trade
 # may stake, for every pair: a multiple of SIZE_CAP_STEP from 5% to 100%, where
 # 1.0 means no cap. The backtest sizes with it (backtester copies it at import);
-# a live run uses the saved live defaults' size_cap instead. At 1.0, with this
-# file's k and SAME_TITLE_SIZE_CAP, one pair still stakes at most 20%.
+# a live run uses the saved live defaults' size_cap instead. At 1.0 this file's
+# k still holds a time-series pair to 1 - k = 20% (max_kelly_fraction), in the
+# backtest and under live_settings(), which also holds any other pair to
+# SAME_TITLE_SIZE_CAP: under live_settings() one pair still stakes at most 20%.
 BUDGET_FRACTION               = 1.0
 
 # An EXTRA per-trade cap on SAME-TITLE pairs, on the same grid: a same-title
 # pair is capped at min(BUDGET_FRACTION, this), a time-series pair never reads
 # it (pair_size_cap); 1.0 adds no cap. Under a BUDGET_FRACTION of 1.0 it bounds
 # a same-title pair, whose f* reaches about 0.89 on a wide divergence.
-# backtester binds it by value and caps through pair_size_cap, and
 # live_settings() reads it; a live run caps at the saved live defaults'
-# same_title_size_cap instead.
+# same_title_size_cap instead. The backtest, which simulates time-series pairs
+# only, has no same-title cap.
 SAME_TITLE_SIZE_CAP           = 0.20
 
 # Defensive ceiling on strategy.compute_trade's marginal-price descent. That
@@ -583,8 +585,9 @@ KELLY_TRIM_MAX_BID_DROP = 0.20
 # REBALANCE_MIN_DAYS_TO_MATURITY, SELL_AT and SELL_MIN_DAYS below; k,
 # BUDGET_FRACTION and SAME_TITLE_SIZE_CAP above). They are NOT the live
 # defaults: a live run starts only from the saved ones (LIVE_DEFAULTS_FILE, below) and
-# never falls back to these. They are the backtest's k and caps (backtester and
-# backtest bind them by value), and what live_settings() returns: the settings a live entry point
+# never falls back to these. k and BUDGET_FRACTION are also the backtest's k and
+# per-trade cap (backtester binds both by value, backtest binds k). All of them
+# are what live_settings() returns: the settings a live entry point
 # falls back to when a caller hands it none, which only tests and direct
 # library calls do. No live module reads them but through LiveSettings (see
 # there). tests/test_config.py::TestShippedLiveToggles pins the values; see
@@ -973,11 +976,13 @@ BACKTEST_SWEEP_FILENAME = "backtest_sweep.pkl.gz"
 # A rebuild refuses a file with any other tag; change it whenever the line's
 # keys, the pickled inputs' keys or the fields of the classes pickled in them
 # (BacktestSweep and the lazy families it holds) change, so an older file is
-# refused rather than misread. v6: RebalanceSweep gained maturity_days (the
-# "Rebalance until" choices it covers) and BacktestSweep
-# live_rebalance_min_days_to_maturity (the saved live defaults' setting);
-# v5 files, from before, are refused.
-BACKTEST_SWEEP_FORMAT = "backtest-sweep-v6"
+# refused rather than misread. v7: the backtest simulates time-series pairs
+# only, so BacktestSweep lost same_title_point, same_title_size_cap and
+# live_same_title_size_cap, CapSweep lost st_entries and same_title_eager,
+# and ExtraDataReport lost its four same-title counts (strikes_differ,
+# strikes_checked, sources_differ, sources_checked); v6 files, from before,
+# are refused.
+BACKTEST_SWEEP_FORMAT = "backtest-sweep-v7"
 
 # The most bytes a rebuild reads for the saved sweep file's first line (the
 # JSON one): the real line is a few hundred bytes, so a file that runs past

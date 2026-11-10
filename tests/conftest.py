@@ -328,9 +328,9 @@ def apply_pre_toggle_defaults(mp) -> None:
     holds only the other seven toggles, since the five optional ones are left
     out while off. Patches
     config's constants, read at call time, AND the by-value copies backtester
-    and backtest bind at import, or a test would price with one value and size
-    with another; no other module binds one by value (pinned by
-    test_config.py's TestPreToggleDefaults).
+    (k and the per-trade cap) and backtest (k) bind at import, or a test would
+    price with one value and size with another; no other module binds one by
+    value (pinned by test_config.py's TestPreToggleDefaults).
 
     Args:
         mp (pytest.MonkeyPatch): The patcher; a class-scoped fixture passes its
@@ -351,7 +351,6 @@ def apply_pre_toggle_defaults(mp) -> None:
     mp.setattr(config, "SELL_MIN_DAYS", None)
     mp.setattr(backtester, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.75)
     mp.setattr(backtester, "BUDGET_FRACTION", 0.20)
-    mp.setattr(backtester, "SAME_TITLE_SIZE_CAP", 1.0)
     mp.setattr(backtest, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.75)
 
 

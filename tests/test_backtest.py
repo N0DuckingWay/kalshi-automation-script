@@ -2123,7 +2123,7 @@ class TestDashboardOnly:
     @pytest.mark.parametrize("damage", ["not gzip", "no header line", "header not json",
                                         "other format", "before tag exclusions",
                                         "before rebalance until", "before until choices",
-                                        "no fingerprint"])
+                                        "before the same-title removal", "no fingerprint"])
     def test_a_file_whose_header_cannot_be_read_exits_1(self, rebuild, monkeypatch, damage):
         path = rebuild["path"]
         if damage == "not gzip":
@@ -2148,6 +2148,12 @@ class TestDashboardOnly:
             # The format a run saved before RebalanceSweep gained
             # maturity_days and BacktestSweep the saved "Rebalance until"
             _rewrite_header(path, format="backtest-sweep-v5")
+        elif damage == "before the same-title removal":
+            # The format a run saved while the backtest still simulated
+            # same-title pairs: BacktestSweep held same_title_point and the
+            # two same-title caps, CapSweep its same-title entries and
+            # ExtraDataReport four same-title counts
+            _rewrite_header(path, format="backtest-sweep-v6")
         else:
             _rewrite_header(path, fingerprint_parts=None)
         with pytest.raises(SystemExit) as exc:
@@ -2157,12 +2163,13 @@ class TestDashboardOnly:
         assert exc.value.code.startswith(f"backtest: {path} cannot be used: ")
         assert exc.value.code.endswith("run the backtest again to save a new one")
         if damage in ("other format", "before tag exclusions", "before rebalance until",
-                      "before until choices"):
+                      "before until choices", "before the same-title removal"):
             old = {"other format": "v1", "before tag exclusions": "v3",
-                   "before rebalance until": "v4", "before until choices": "v5"}[damage]
+                   "before rebalance until": "v4", "before until choices": "v5",
+                   "before the same-title removal": "v6"}[damage]
             assert f"'backtest-sweep-{old}'" in exc.value.code
             assert repr(config.BACKTEST_SWEEP_FORMAT) in exc.value.code
-            assert config.BACKTEST_SWEEP_FORMAT == "backtest-sweep-v6"
+            assert config.BACKTEST_SWEEP_FORMAT == "backtest-sweep-v7"
         assert "dashboard" not in rebuild
 
     @pytest.mark.parametrize("damage", ["cut short", "not the inputs"])
@@ -2272,8 +2279,7 @@ def _families() -> dict:
     common = {"primary_cap": 0.2, "ks": (0.5,), "primary_k": 0.5,
               "start_date": date(2026, 1, 5), "initial_balance": 1000.0}
     band = ((0.0, 1.0),)
-    lazy = {"split_date": None, "checks": False, "entries_by_band": {}, "st_entries": [],
-            "eager": {}}
+    lazy = {"split_date": None, "checks": False, "entries_by_band": {}, "eager": {}}
     lists = {"off_bands": (), "entries_by_band": {}, "off_entries_by_band": {},
              "end_dates": {}, "off_end_dates": {}}
     return {

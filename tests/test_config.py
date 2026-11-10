@@ -3782,9 +3782,9 @@ class TestShippedLiveToggles:
     def test_a_default_backtest_departs_from_the_live_rule(self, monkeypatch, caplog,
                                                             saved_live_defaults):
         # The shipped toggles saved as the live defaults: the primary follows k
-        # and both caps but keeps band (0, 1) with the tiers on, so the live
-        # rule is a grid cell, and the last line says so (no sizing note: the
-        # saved k and caps are the run's own). The shipped defaults rebalance,
+        # and the per-trade cap but keeps band (0, 1) with the tiers on, so the
+        # live rule is a grid cell, and the last line says so (no sizing note:
+        # the saved k and per-trade cap are the run's own). The shipped defaults rebalance,
         # which no point of a backtest run does, so the line ends with that
         # note (backtester._live_rebalance_note, whose words its own tests pin).
         golden = _tb.TestPrepareEntriesGolden()
@@ -3798,7 +3798,6 @@ class TestShippedLiveToggles:
         primary = res.primary
         assert (primary.k, primary.size_cap, primary.spread_band, primary.tier_floors) == (
             0.8, 1.0, (0.0, 1.0), True)
-        assert res.same_title_size_cap == 0.2
         assert (res.live_tier_floors, res.live_spread_band) == (False, (0.0, 0.5))
         assert (res.live_rebalance, res.live_min_price_move) == (True, None)
         note = backtester._live_rebalance_note(res)
@@ -3857,8 +3856,8 @@ class TestPreToggleDefaults:
 
     def test_every_package_binder_reads_the_pre_flip_value(self, monkeypatch):
         binders = self._by_value_binders(pathlib.Path(config.__file__).parent)
-        # Not vacuous: the four known binders are among them
-        assert {("backtester", "BUDGET_FRACTION"), ("backtester", "SAME_TITLE_SIZE_CAP"),
+        # Not vacuous: the three known binders are among them
+        assert {("backtester", "BUDGET_FRACTION"),
                 ("backtester", "TIME_SERIES_INTERVAL_PROB_DISCOUNT"),
                 ("backtest", "TIME_SERIES_INTERVAL_PROB_DISCOUNT")} <= {
             (module, toggle) for module, _, toggle in binders}

@@ -1513,10 +1513,9 @@ class _TrimCase:
         """The portfolio value, in dollars, that plan_trims sizes on for `value_cents` in all."""
         return (value_cents - self.positions_cents) / 100 + self.positions_cents / 100
 
-    def backtest(self, value_cents: int, *, k: float = 0.8, cap: float = 1.0,
-                 st_cap: float = 0.2):
+    def backtest(self, value_cents: int, *, k: float = 0.8, cap: float = 1.0):
         """backtester._kelly_trim's (decision, sale) for the pair at one portfolio value."""
-        return backtester._kelly_trim([self.trade], _D, self.value(value_cents), k, cap, st_cap)
+        return backtester._kelly_trim([self.trade], _D, self.value(value_cents), k, cap)
 
     def live(self, monkeypatch, value_cents: int, *, k: float = 0.8, cap: float = 1.0,
              st_cap: float = 0.2, min_move: float | None = None, until: int | None = None,
@@ -1668,10 +1667,9 @@ class _LoneTrimCase:
         # so live sizes on the cash plus that $50: the whole amount
         return value_cents / 100
 
-    def backtest(self, value_cents: int, *, k: float = 0.8, cap: float = 1.0,
-                 st_cap: float = 0.2):
+    def backtest(self, value_cents: int, *, k: float = 0.8, cap: float = 1.0):
         """backtester._kelly_trim's (decision, sale) for the lone leg at one portfolio value."""
-        return backtester._kelly_trim([self.trade], _D, self.value(value_cents), k, cap, st_cap)
+        return backtester._kelly_trim([self.trade], _D, self.value(value_cents), k, cap)
 
     def live(self, monkeypatch, value_cents: int, *, k: float = 0.8, cap: float = 1.0,
              st_cap: float = 0.2, min_move: float | None = None) -> list:
@@ -3167,8 +3165,8 @@ class TestPlanTrims:
         assert case.world.calls["book"] == []
 
     @pytest.mark.parametrize("a_now, b_now, backtest_sells", [
-        # NO on A (best NO bid 0.50) and YES on B (best YES bid 0.40): past the
-        # 20% same-title cap of a $100 portfolio, so the backtest sells part of it
+        # NO on A (best NO bid 0.50) and YES on B (best YES bid 0.40): past a
+        # 20% cap of a $100 portfolio, so the backtest's trim sells part of it
         ((0.50, 0.52), (0.42, 0.60), "part"),
         # Converged: selling returns more than the pair is expected to pay, so
         # the backtest keeps none of it
@@ -3181,9 +3179,13 @@ class TestPlanTrims:
         # worded markets are no kind a trim reads, so the pair is never
         # trimmed, and no order book is read for it
         case = _TrimCase("same_title", sides=_NO_A_YES_B, a_now=a_now, b_now=b_now)
-        # Control: the backtest's trim, which holds the pair by its type, sells
-        # this very pair at this portfolio value
-        sold = case.backtest(10_000)[0].sell
+        # Control: the backtest's trim, which reads the pair by its type, sells
+        # this very pair at this portfolio value under a 20% cap — the cap the
+        # live settings below put on a same-title pair (their same-title cap;
+        # the backtest has no same-title cap of its own, so the control hands
+        # it 20% as its per-trade cap). The pair is one a trim would act on:
+        # live leaves it alone for its identical wording alone
+        sold = case.backtest(10_000, cap=0.20)[0].sell
         assert (0 < sold < case.n) if backtest_sells == "part" else sold == case.n
         with caplog.at_level(logging.INFO):
             assert case.live(monkeypatch, 10_000) == []
