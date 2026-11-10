@@ -294,7 +294,7 @@ Dependencies:
     and DEFAULTS_SERVER_PORT (the address the filter bar's save button and
     trade link open), LIVE_DEFAULTS_SOURCE_PATTERN (the note shapes that server
     accepts, which the button's note is checked against),
-    SAME_TITLE_CO_RESOLVE_PROB, CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR,
+    CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR,
     RISK_FREE_BILL_TERM and RISK_FREE_RATE_FIELD (named in the header),
     MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS
     and MAX_DEADLINE_GAP_DAYS (so the filter bar and the scenario explorer's
@@ -563,10 +563,9 @@ Notes:
     (_entry_mid_spread again), never the prices paid.
 
     The scenario explorer's heatmap, fragility banner and equity curve read
-    the "time_series" population — every time-series entry simulated alone,
-    same-title excluded — never the "all" one, so a same-title result (band-
-    and k-independent) cannot dilute the band x k comparison; "all" keeps its
-    own labelled KPI row.
+    the "time_series" population — every time-series entry simulated alone —
+    never the "all" one, which keeps its own labelled KPI row. The backtest
+    simulates time-series pairs only, so the two hold the same entries.
 """
 import base64
 import contextlib
@@ -654,7 +653,6 @@ from .config import (
     PROJECT_ROOT,
     RISK_FREE_BILL_TERM,
     RISK_FREE_RATE_FIELD,
-    SAME_TITLE_CO_RESOLVE_PROB,
     SHORT_DEADLINE_GAP_DAYS,
     TAG_SCOPE_SEPARATOR,
     TRADING_DAYS_PER_YEAR,
@@ -1067,8 +1065,9 @@ def _max_drawdown(equity: pd.Series) -> tuple[float, date | None]:
 
 
 # Trade-type lines of the performance chart, in display order: (label, colour).
+# The two kinds of time-series pair: two rungs of one event's deadline ladder,
+# and two events asking one question at two deadlines.
 _TRADE_TYPE_LINES = (
-    ("Same-title", "#8E24AA"),
     ("Time-series: ladder", "#FB8C00"),
     ("Time-series: cross-event", "#43A047"),
 )
@@ -1084,17 +1083,18 @@ def _trade_type_label(trade: BacktestTrade) -> str:
     """
     Name the trade-type line a trade belongs to.
 
+    Every trade the page is handed is a time-series pair (the backtest
+    simulates no other kind, and the saved results the page is rebuilt from
+    hold no other), so the line is chosen by whether its two markets are
+    rungs of one event's deadline ladder.
+
     Args:
         trade (BacktestTrade): A completed trade.
 
     Returns:
-        str: "Same-title" for any pair type other than time_series (the same
-            fail-safe reading scanner.leg_sides applies), otherwise
-            "Time-series: ladder" or "Time-series: cross-event" by
-            BacktestTrade.same_event_ladder.
+        str: "Time-series: ladder" when BacktestTrade.same_event_ladder is
+            set, otherwise "Time-series: cross-event".
     """
-    if trade.pair_type != "time_series":
-        return "Same-title"
     return "Time-series: ladder" if trade.same_event_ladder else "Time-series: cross-event"
 
 
@@ -1202,11 +1202,12 @@ def _spread_observations(trades: list[BacktestTrade]) -> list[tuple[float, int]]
     paid — the market-implied probability that the event first happens
     between the two deadlines, and the input the forecast reads. The outcome
     is 1 when the pair settled A = NO, B = YES (the in-between cell, where
-    both legs lose) and 0 otherwise. Same-title trades are left out — their
-    price gap is not the probability of anything.
+    both legs lose) and 0 otherwise. A trade of any other pair type has no
+    mid spread (_entry_mid_spread) and is left out; the page is handed
+    time-series trades only.
 
     Args:
-        trades (list[BacktestTrade]): Completed trades of either pair type.
+        trades (list[BacktestTrade]): Completed trades.
 
     Returns:
         list[tuple[float, int]]: (mid spread, in_between) per time-series
@@ -1284,25 +1285,29 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
                     k: float | None = None, *, spread: float | None = None,
                     multiplier_a: float = 1.0, multiplier_b: float = 1.0) -> float:
     """
-    Uncapped Kelly fraction f* = p - (1-p)/b for one pair trade.
+    Uncapped Kelly fraction f* = p - (1-p)/b for one time-series pair trade.
 
     Mirrors strategy._kelly_p_at and strategy.compute_trade so the dashboard
     scatter shows the same theoretical Kelly the live sizer would compute
     (before the per-pair cap, config.pair_size_cap) — including the
     fee-inclusive Kelly denominator b = net_spread / (price_a + price_b + fee),
     since the losing cell loses the fee too (DR-62). The legs are mapped
-    exactly like scanner.leg_prices: a same_title pair costs nA + pB (NO on A,
-    YES on B) and is priced on the SAME_TITLE_CO_RESOLVE_PROB prior; a
-    time_series pair costs pA + nB (YES on the earlier contract A, NO on the
-    later contract B) and is priced on config.time_series_profit_prob of its
-    mid spread (config.time_series_mid_spread: the later market's midpoint
-    minus the earlier one's, a midpoint being halfway between a market's YES
-    ask and its YES bid) — one minus the discounted market-implied probability
-    of the single loss cell (A=NO, B=YES; the event first happens between the
+    exactly as scanner.leg_prices maps a time-series pair: it costs pA + nB
+    (YES on the earlier contract A, NO on the later contract B) and is priced
+    on config.time_series_profit_prob of its mid spread
+    (config.time_series_mid_spread: the later market's midpoint minus the
+    earlier one's, a midpoint being halfway between a market's YES ask and its
+    YES bid) — one minus the discounted market-implied probability of the
+    single loss cell (A=NO, B=YES; the event first happens between the
     deadlines). The two win cells are event by A (A=YES, hence B=YES) and never
     by B (A=NO, B=NO); A=YES/B=NO is impossible for a cumulative-deadline pair,
-    a premise both pair-finders now screen for in the legs' wording
+    a premise both pair-finders screen for in the legs' wording
     (scanner.deadline_phrasing). Returns 0.0 when there is no edge.
+
+    A pair of any other type gets 0.0 too, no edge: the page shows
+    time-series trades only (the backtest simulates no other kind), and this
+    function has no forecast for another kind, so it never prices one on the
+    time-series forecast.
 
     The optional k must be whatever interval discount the plotted trades were
     actually SIZED at (backtester.SweepPoint.k). Leaving it None on a run that
@@ -1310,45 +1315,43 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
     trades sized at the override — a wrong chart, not merely a missing feature.
 
     Args:
-        pA (float): YES ask price of market A at entry (a leg price for time_series).
-        nA (float): NO ask price of market A at entry (a leg price for same_title;
-            gives market A's YES bid in the time_series mid spread).
-        pB (float): YES ask price of market B at entry (a leg price for same_title;
-            feeds the time_series mid spread).
-        nB (float): NO ask price of market B at entry (a leg price for time_series).
-        pair_type (str): "time_series" or "same_title" — selects the leg prices
-            and the probability model; anything else is treated as same_title,
-            matching scanner.leg_sides.
+        pA (float): YES ask price of market A at entry (the YES leg's price).
+        nA (float): NO ask price of market A at entry (gives market A's YES bid
+            in the mid spread).
+        pB (float): YES ask price of market B at entry (feeds the mid spread).
+        nB (float): NO ask price of market B at entry (the NO leg's price).
+        pair_type (str): The pair's type: "time_series" is priced, and any
+            other gets 0.0.
         k (float | None): Interval-discount override in [0, 1] handed straight to
             config.time_series_profit_prob. None (default) means "no override",
             which that helper resolves at call time to
             config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (config.py's k, which
             the backtest defaults to; live sizing reads the saved live
-            defaults' k). Ignored for same_title, which prices on a fixed prior.
-        spread (float | None): Keyword-only. The time_series mid spread to
-            forecast at; None (default) reads it from the four quotes given.
-            A caller whose four hold fills in place of quotes hands in the
-            entry quotes' own (_entry_mid_spread), as the live sizer prices
-            its legs at the fills and its forecast at the book's tops.
-            Ignored for same_title.
+            defaults' k).
+        spread (float | None): Keyword-only. The mid spread to forecast at;
+            None (default) reads it from the four quotes given. A caller
+            whose four hold fills in place of quotes hands in the entry
+            quotes' own (_entry_mid_spread), as the live sizer prices its legs
+            at the fills and its forecast at the book's tops.
         multiplier_a (float): Keyword-only. Market A's fee multiplier, the one
             the trade was priced at (BacktestTrade.fee_multiplier_a).
         multiplier_b (float): Keyword-only. Market B's.
 
     Returns:
-        float: Uncapped Kelly fraction, clamped to be >= 0.
+        float: Uncapped Kelly fraction, clamped to be >= 0; 0.0 for any pair
+            type other than "time_series".
     """
-    if pair_type == "time_series":
-        price_a, price_b = pA, nB
-        # The forecast's input (DR-78): these four quotes' mid spread, unless
-        # the caller hands in the entry quotes' own (its four may hold fills)
-        spread = time_series_mid_spread(pA, nA, pB, nB) if spread is None else spread
-        # Shared definition with strategy._kelly_p_at / backtester._simulate_at_discount
-        # so the dashboard can never show a Kelly the live sizer would not compute
-        p = time_series_profit_prob(spread, k=k)
-    else:
-        price_a, price_b = nA, pB
-        p = SAME_TITLE_CO_RESOLVE_PROB
+    if pair_type != "time_series":
+        # The page shows time-series trades only, and there is no forecast
+        # here for any other kind: no edge, never the time-series forecast
+        return 0.0
+    price_a, price_b = pA, nB
+    # The forecast's input (DR-78): these four quotes' mid spread, unless
+    # the caller hands in the entry quotes' own (its four may hold fills)
+    spread = time_series_mid_spread(pA, nA, pB, nB) if spread is None else spread
+    # Shared definition with strategy._kelly_p_at / backtester._simulate_at_discount
+    # so the dashboard can never show a Kelly the live sizer would not compute
+    p = time_series_profit_prob(spread, k=k)
     cost = price_a + price_b
     # Each leg at its own market's fee multiplier (market order, as price_a, price_b)
     fee_approx = fee_per_pair_approx(price_a, price_b, multiplier_a=multiplier_a,
@@ -1368,20 +1371,22 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
 
 def _entry_mid_spread(t: BacktestTrade) -> float | None:
     """
-    A time-series trade's mid spread at its entry quotes; None for same-title.
+    A time-series trade's mid spread at its entry quotes; None for any other trade.
 
     The forecast's input on the Monday the trade was entered: the later
     market's midpoint minus the earlier one's over entry_pA, entry_nA,
     entry_pB and entry_nB (config.time_series_mid_spread), the quotes the
     backtest's Kelly gate priced it at, whatever the trade then paid. The
     Kelly scatter (_kelly_points) forecasts each trade at it, and the spread
-    calibration (_spread_observations) scores it.
+    calibration (_spread_observations) scores it. Only a time-series pair has
+    a mid spread to forecast at; the page is handed no other kind.
 
     Args:
         t (BacktestTrade): A trade.
 
     Returns:
-        float | None: The mid spread in dollars; None for a same_title trade.
+        float | None: The mid spread in dollars; None when the trade's pair
+            type is not "time_series".
     """
     if t.pair_type != "time_series":
         return None
@@ -1726,13 +1731,12 @@ def _trade_category(
     File a trade under Kalshi's official category and its first tag.
 
     Looks up market A's series in historical.load_series_categories' map,
-    through _series_labels. Market A speaks for the pair: a same-title pair's
-    two legs ask one question, a same-event ladder's share one event, and a
-    cross-event time-series pair's legs ask one question at two deadlines —
-    usually within one series, and when not, the earlier leg (A) is the one
-    filed. Without a map, or for a series missing from it, it falls back to
-    BacktestTrade.category (the ticker-prefix label) so the breakdown still
-    renders.
+    through _series_labels. Market A speaks for the pair: a same-event
+    ladder's legs share one event, and a cross-event pair's legs ask one
+    question at two deadlines — usually within one series, and when not, the
+    earlier leg (A) is the one filed. Without a map, or for a series missing
+    from it, it falls back to BacktestTrade.category (the ticker-prefix
+    label) so the breakdown still renders.
 
     Args:
         trade (BacktestTrade): A completed trade.
@@ -2018,10 +2022,9 @@ def _decomposition_aggregates(df: pd.DataFrame) -> dict:
     Each group is added with _compensated_sum, the sum the page script repeats
     for a mix of categories and tags.
 
-    Entry price buckets read entry_pA, market A's YES ask at entry, for both
-    pair types. It is a quote, not what the trade paid: the leg a trade buys
-    on market A (the YES leg of a time_series trade, the NO leg of a
-    same_title one) paid its own fill price.
+    Entry price buckets read entry_pA, market A's YES ask at entry. It is a
+    quote, not what the trade paid: the YES leg a trade buys on market A paid
+    its own fill price.
 
     Args:
         df (pd.DataFrame): _decomposition_frame's output. Not modified.
@@ -2095,8 +2098,7 @@ def _section_decomposition(
     ))
     fig_sub.update_layout(title="P&L by Category · Tag ($)", xaxis_title="P&L ($)")
 
-    # Entry price bucket (see _decomposition_aggregates for what entry_pA means
-    # for each pair type)
+    # Entry price bucket (see _decomposition_aggregates for what entry_pA means)
     price_grp = agg["price"]
     fig_price = go.Figure(go.Bar(
         x=price_grp.index.astype(str), y=price_grp.values,
@@ -2136,9 +2138,9 @@ def _reliability(trades: list[BacktestTrade]) -> dict:
     Each time-series trade contributes one prediction — its entry mid spread,
     the market-implied probability that the event lands between the two
     deadlines — against whether the pair settled A = NO, B = YES
-    (_spread_observations). Same-title trades contribute nothing. The diagram
-    bins the predictions into 10 equal-width probability bins and keeps the
-    non-empty ones.
+    (_spread_observations). A trade of any other pair type contributes
+    nothing. The diagram bins the predictions into 10 equal-width probability
+    bins and keeps the non-empty ones.
 
     Args:
         trades (list[BacktestTrade]): Completed trades; may be empty.
@@ -2230,10 +2232,8 @@ def _section_calibration(trades: list[BacktestTrade]) -> str:
 
     Computes Brier score and log loss KPIs and renders a reliability diagram
     of the time-series entry mid spread (_entry_mid_spread) against the rate
-    the pairs settled A = NO, B = YES, per bin (_reliability). Same-title
-    trades are not shown;
-    a selection without a time-series trade shows "—" cards and an empty
-    diagram.
+    the pairs settled A = NO, B = YES, per bin (_reliability); a selection
+    without a time-series trade shows "—" cards and an empty diagram.
 
     Args:
         trades (list[BacktestTrade]): Completed backtest trades with entry prices
@@ -2444,8 +2444,7 @@ def _label_coverage_html(coverage: OutcomeLabelCoverage | None) -> str:
         f"{BACKTEST_OUTCOME_LABEL_WARN_FRACTION * 100.0:.2f}% floor</b> "
         f"({figures}). Most eligible markets carry no subtitle, so the "
         "time-series grouping key fell back to the bare normalized title — the "
-        "strike-blind grouping the live scanner no longer uses — and the "
-        "same-title key lost its outcome discriminator. The pairs behind the "
+        "strike-blind grouping the live scanner no longer uses. The pairs behind the "
         "k&#770; below, the per-k table and every other strategy-derived "
         "section of this page (the &#94;GSPC benchmark trace, having no pair "
         "population behind it, is unaffected) "
@@ -3777,21 +3776,18 @@ _EQUITY_DAILY_MAX_ROWS = 400
 _SCENARIO_POPULATIONS = ("all", "ladder", "cross", "time_series")
 
 # The population the heatmap, the fragility banner and the equity curve read:
-# every time-series entry (ladders + cross-event) simulated alone, same-title
-# excluded. The band and k act on time-series pairs only, and a same-title
-# pair prices on the fixed co-resolution prior, so an "all" cell carrying
-# same-title trades would dilute the very comparison the explorer exists for
-# — and the DR-73 calibration evidence the grid is read against was
-# time-series only (its "All" row was 330 = 299 ladder + 31 cross-event
-# entries). "all" keeps its own labelled KPI row.
+# every time-series entry (ladders + cross-event) simulated alone, the
+# entries the band and k act on. The backtest simulates time-series pairs
+# only, so the "all" population holds the same entries; it keeps its own
+# labelled KPI row.
 _HEADLINE_POPULATION = "time_series"
 
 # Every population's label on the page, spelled once so the KPI rows, the
 # banner, the heatmap title and the curve title can never name one
 # population two ways.
 _POPULATION_LABELS = {
-    "time_series": "Time-series (ladders + cross-event; same-title excluded)",
-    "all": "All (time-series + same-title)",
+    "time_series": "Time-series (ladders + cross-event)",
+    "all": "All trades",
     "ladder": "Ladders (same-event)",
     "cross": "Cross-event",
 }
@@ -5860,14 +5856,11 @@ def _section_scenario_explorer(
 
     The heatmap, the banner and the equity curve all read ONE population,
     _HEADLINE_POPULATION — "time_series", every time-series entry (ladders +
-    cross-event) simulated alone with same-title excluded — and say so on
-    the page. The band and k act on time-series pairs only; same-title pairs
-    price on the fixed co-resolution prior, so reading the "all" cells here
-    would let a band- and k-independent result dilute the comparison, and
-    the evidence the grid is read against (the DR-73 calibration corpus) was
-    time-series only. A cell with no time-series entry has no time-series
-    point and reads "—" everywhere below; nothing falls back to "all". In
-    order:
+    cross-event) simulated alone, the entries the band and k act on — and
+    say so on the page. The backtest simulates time-series pairs only, so a
+    run's "all" cells hold the same entries; they keep their own KPI row. A
+    cell with no time-series entry has no time-series point and reads "—"
+    everywhere below; nothing falls back to "all". In order:
 
       1. A fragility banner for the size cap shown (_explorer_banner): how
          many band x k cells were computed at that cap (and, when some have
@@ -5910,11 +5903,11 @@ def _section_scenario_explorer(
          unpacked its data, driving — through the small inline script
          _SCENARIO_EXPLORER_JS — a KPI table with one row per population,
          each labelled from _POPULATION_LABELS (Time-series, with a sub-row of
-         its H1/H2 and top-event figures; Ladders; Cross-event; All —
-         time-series + same-title, the run's actual result — with its own
-         sub-row), the selected band's own calibration table, and the
-         time-series equity curve (rendered once for the primary scenario via
-         _fig_html(div_id="scn-equity") and redrawn in place by a
+         its H1/H2 and top-event figures; Ladders; Cross-event; All trades —
+         the run's actual result — with its own sub-row), the selected band's
+         own calibration table, and the time-series equity curve (rendered
+         once for the primary scenario via _fig_html(div_id="scn-equity")
+         and redrawn in place by a
          Plotly.update that autoranges both axes and titles it for the Tier
          floors setting, so a zoom never carries into another view). The
          page-wide filter bar's script moves these selects to the scenario
@@ -6472,9 +6465,9 @@ def _section_diagnostics(trades: list[BacktestTrade]) -> str:
     slippages = [t.slippage for t in trades]
     fig_slip = go.Figure(go.Histogram(x=slippages, nbinsx=20,
                                       marker_color="#7986CB"))
-    # "Expected" is the win-scenario payoff: the co-resolution floor for a
-    # same-title trade, the profit of either win cell for a time-series one —
-    # so a time-series loss cell shows as large negative slippage, never positive
+    # "Expected" is the win-scenario payoff, the profit of either win cell of a
+    # time-series trade — so the loss cell shows as large negative slippage,
+    # never positive
     fig_slip.update_layout(title="Slippage Distribution (Actual − Win-Scenario Payoff, $)",
                             xaxis_title="Slippage ($)", yaxis_title="Count")
 
@@ -6521,25 +6514,26 @@ def _quotes_at_fills(t: BacktestTrade) -> tuple[float, float, float, float]:
     """
     A trade's four quotes, with the two legs it bought replaced by what it paid.
 
-    What the live sizer prices a trade's legs at: the leg prices are the
-    average the trade paid (backtester._paid_prices), while the other two
-    quotes stay as they were at entry. For a time_series trade that is (YES
-    fill on A, A's NO quote, B's YES quote, NO fill on B); for a same_title
-    trade (A's YES quote, NO fill on A, YES fill on B, B's NO quote). A trade
-    built without fills pays its quotes, so this returns them unchanged. The
-    time-series forecast reads the entry quotes' own mid spread
-    (_entry_mid_spread), never these mixed four.
+    What the live sizer prices a time-series trade's legs at: the YES leg on
+    A and the NO leg on B at the average the trade paid for each
+    (backtester._paid_prices), while the other two quotes, A's NO ask and
+    B's YES ask, stay as they were at entry. A trade built without fills
+    pays its quotes, so this returns them unchanged. The time-series
+    forecast reads the entry quotes' own mid spread (_entry_mid_spread),
+    never these mixed four. The page is handed time-series trades only, and
+    _kelly_fraction gives a pair of any other type no edge, whatever four it
+    is handed.
 
     Args:
         t (BacktestTrade): A trade.
 
     Returns:
-        tuple[float, float, float, float]: (pA, nA, pB, nB) for _kelly_fraction.
+        tuple[float, float, float, float]: (YES fill on A, A's NO quote, B's
+            YES quote, NO fill on B): the pA, nA, pB and nB _kelly_fraction
+            takes.
     """
     paid_a, paid_b = _paid_prices(t)
-    if t.pair_type == "time_series":
-        return paid_a, t.entry_nA, t.entry_pB, paid_b
-    return t.entry_pA, paid_a, paid_b, t.entry_nB
+    return paid_a, t.entry_nA, t.entry_pB, paid_b
 
 
 def _kelly_points(trades: list[BacktestTrade],
@@ -6565,11 +6559,10 @@ def _kelly_points(trades: list[BacktestTrade],
             the entry checkpoint with open trades at market, 0.0 when that
             value is not positive), each in trade order.
     """
-    # The four quotes with the legs at the prices paid (_quotes_at_fills) —
-    # _kelly_fraction picks the leg prices per pair type — the forecast at
-    # the entry quotes' mid spread (_entry_mid_spread), and the run's
-    # interval discount, so an --interval-discount run plots the Kelly its
-    # trades were actually sized at rather than the config one
+    # The four quotes with the legs at the prices paid (_quotes_at_fills),
+    # the forecast at the entry quotes' mid spread (_entry_mid_spread), and
+    # the run's interval discount, so an --interval-discount run plots the
+    # Kelly its trades were actually sized at rather than the config one
     kelly_fracs = [
         _kelly_fraction(*_quotes_at_fills(t), t.pair_type, k=k,
                         spread=_entry_mid_spread(t),
@@ -12825,7 +12818,8 @@ def _same_series(shipped, rebuilt, n: int) -> bool:
     return bool(np.array_equal(_sparse_as_floats(shipped, n), rebuilt))
 
 # The per-trade arrays of a mix that must hold a finite number for every trade
-# (the calibration pair "cp" / "ca" is null for a same-title trade by design)
+# (the calibration pair "cp" / "ca" is null for a trade with no mid spread, any
+# pair type but time-series, which the page is never handed)
 _MIX_FINITE_ARRAYS = ("pf", "pr", "st", "mo")
 
 

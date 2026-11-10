@@ -72,7 +72,6 @@ from kalshi_betting.backtester import (
     SweepPoint,
 )
 from kalshi_betting.config import (
-    SAME_TITLE_CO_RESOLVE_PROB,
     fee_leg_exact,
     fee_per_pair_approx,
     time_series_mid_spread,
@@ -115,7 +114,7 @@ def make_trade(title_a: str = "Will BTC exceed $80k?", profit: float | None = No
     (A=YES, hence B=YES). _section_risk calls _kelly_fraction on these entry
     prices live, threading the run's
     interval discount. deadline_gap_days is reporting-only on BacktestTrade and
-    defaults to None (the same-title / no-gap-recorded shape).
+    defaults to None (no gap recorded).
     """
     n = 5
     entry_pA, entry_pB, entry_nA, entry_nB = 0.30, 0.60, 0.70, 0.40
@@ -176,7 +175,7 @@ def make_equity(values: list[float], start: date = date(2026, 1, 5)) -> pd.DataF
 class TestKellyFraction:
     """dashboard._kelly_fraction maps the legs like scanner.leg_prices and
     prices time-series pairs through config.time_series_profit_prob of the
-    mid spread."""
+    mid spread; a pair of any other type has no edge."""
 
     @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_time_series_flow_through_fixture(self):
@@ -195,13 +194,23 @@ class TestKellyFraction:
     def test_time_series_wide_book_clamps_to_zero(self):
         assert _kelly_fraction(0.30, 0.70, 0.60, 0.50, "time_series") == 0.0
 
-    def test_same_title_prices_nA_pB_on_the_prior(self):
-        nA, pB = 0.20, 0.30
-        fee = fee_per_pair_approx(nA, pB)
-        net_spread = (1.0 - nA - pB) - fee
-        b = net_spread / (nA + pB + fee)
-        p = SAME_TITLE_CO_RESOLVE_PROB
-        assert _kelly_fraction(0.70, nA, pB, 0.65, "same_title") == pytest.approx(p - (1 - p) / b)
+    @pytest.mark.parametrize("pair_type", ["same_title", "unknown", ""])
+    def test_any_other_pair_type_has_no_edge(self, pair_type):
+        # The page shows time-series trades only, and _kelly_fraction has no
+        # forecast for any other kind: such a pair gets 0.0 at any quotes, k
+        # or spread, never the time-series forecast. The first quotes are the
+        # time-series fixture's (an edge on YES 0.30 on A and NO 0.40 on B, at
+        # its 0.30 mid spread or at a mid spread of 0, which a time-series
+        # pair prices as a sure win); the second are cheap on A's NO ask and
+        # B's YES ask (0.20 + 0.30)
+        assert _kelly_fraction(0.30, 0.70, 0.60, 0.40, "time_series", k=0.75) > 0
+        assert _kelly_fraction(0.30, 0.70, 0.60, 0.40, "time_series", spread=0.0) > 0
+        for quotes in ((0.30, 0.70, 0.60, 0.40), (0.70, 0.20, 0.30, 0.65)):
+            for k in (None, 0.0, 0.75, 1.0):
+                assert _kelly_fraction(*quotes, pair_type, k=k) == 0.0
+                assert _kelly_fraction(*quotes, pair_type, k=k, spread=0.0) == 0.0
+                assert _kelly_fraction(*quotes, pair_type, k=k, multiplier_a=0.0,
+                                       multiplier_b=0.0) == 0.0
 
     def test_risk_section_renders_time_series_trade(self):
         # End-to-end through _section_risk: the scatter is built from the
@@ -248,12 +257,6 @@ class TestKellyFractionIntervalDiscount:
         # sentinel is resolved at call time rather than bound at def time.
         assert _kelly_fraction(self._PA, self._NA, self._PB, self._NB,
                                "time_series", k=None) == 0.0
-
-    def test_same_title_ignores_k(self):
-        # same_title prices on the fixed co-resolution prior — no interval
-        # discount appears in its model at all.
-        base = _kelly_fraction(0.70, 0.20, 0.30, 0.65, "same_title")
-        assert _kelly_fraction(0.70, 0.20, 0.30, 0.65, "same_title", k=1.0) == base
 
     def test_risk_section_threads_k_into_the_scatter(self):
         # At k = 1 every time-series Kelly clamps to 0.0, so the scatter's x
@@ -1274,9 +1277,9 @@ class _Grid:
 
     PB7: each cell also carries a "time_series" point — the population the
     heatmap, banner and curve read — whose figures MIRROR its "all" point, as
-    on the DR-73 calibration corpus, which has no same-title pair (there
-    time_series == all). The tests below therefore read the same numbers they
-    always did; TestScenarioExplorerHeadlinePopulation proves, on a fixture
+    on every run, since the backtest simulates time-series pairs only (there
+    time_series == all). The tests below therefore read the same numbers
+    from either; TestScenarioExplorerHeadlinePopulation proves, on a fixture
     where the two differ, that the headline reads "time_series".
     """
 
@@ -1576,7 +1579,7 @@ class TestScenarioExplorerControls:
         heat, layout = _first_figure(section)
         data, cap = _scn_data(section), _scn_cap(section)
         # PB7: the title names the population the cells are; C4: and the cap
-        pop = "Time-series (ladders + cross-event; same-title excluded)"
+        pop = "Time-series (ladders + cross-event)"
         assert layout["title"]["text"] == cap["titles"][0] == (
             f"Mean per trade (equal stake) by spread band x k, cap not recorded — {pop}")
         # A scripted select replaced the native dropdown: one figure, no
@@ -1650,16 +1653,17 @@ def _nth_figure(section_html: str, n: int) -> tuple[list, dict]:
             dashboard_golden._decode_typed_arrays(args[2]))
 
 
-_TS_LABEL = "Time-series (ladders + cross-event; same-title excluded)"
+_TS_LABEL = "Time-series (ladders + cross-event)"
 
 
 class TestScenarioExplorerHeadlinePopulation:
     """PB7: the heatmap, the fragility banner and the equity curve read the
-    "time_series" population — every time-series entry simulated alone,
-    same-title excluded — never the "all" one, and say so. The fixture makes
-    the two DISAGREE on everything: every "all" cell is +50% (a same-title
-    windfall, band- and k-independent), every time-series cell loses, and the
-    last cell has no time-series point at all."""
+    "time_series" population — every time-series entry simulated alone —
+    never the "all" one, and say so. On a real run the two hold the same
+    entries (the backtest simulates time-series pairs only), so the fixture
+    makes them DISAGREE on everything to show which one is read: every "all"
+    cell is +50%, the same at every band and k, every time-series cell
+    loses, and the last cell has no time-series point at all."""
 
     BANDS = [(0.0, 1.0), (0.3, 0.6)]
     KS = [0.65, 0.75]
@@ -1711,7 +1715,7 @@ class TestScenarioExplorerHeadlinePopulation:
         assert layout["title"]["text"].endswith(f"— {_TS_LABEL}")
         assert all(title.endswith(f"— {_TS_LABEL}") for title in _scn_cap(section)["titles"])
 
-    def test_same_title_dilution_cannot_reach_the_banner(self):
+    def test_the_all_population_cannot_reach_the_banner(self):
         from scipy.stats import spearmanr
         section = _section_scenario_explorer(self.sweep())
         # Every time-series cell lost; every "all" cell won
@@ -1733,7 +1737,7 @@ class TestScenarioExplorerHeadlinePopulation:
         assert "The best of 4 correlated cells" not in section
 
     def test_a_grid_with_no_time_series_cell_says_so(self):
-        # Every cell carries an "all" point only (a same-title-only run): the
+        # Every cell carries an "all" point only (a hand-built grid): the
         # banner must not claim a "best of 0" and must not read the "all"
         # cells in their place.
         scenarios = [_scn_point(band, k, "all", [_scn_trade(50.0, "EVT-ST")],
@@ -1770,13 +1774,14 @@ class TestScenarioExplorerHeadlinePopulation:
     def test_every_population_is_labelled(self):
         data = _scn_data(_section_scenario_explorer(self.sweep()))  # the base block
         assert data["labels"] == {
-            "time_series": _TS_LABEL,
-            "all": "All (time-series + same-title)",
+            "time_series": "Time-series (ladders + cross-event)",
+            "all": "All trades",
             "ladder": "Ladders (same-event)",
             "cross": "Cross-event",
         }
+        assert _TS_LABEL == data["labels"]["time_series"]
         # The script builds every KPI row from those labels, the headline
-        # population first, and no longer spells a bare 'All'; the four
+        # population first, and spells no label of its own; the four
         # populations of a cell are its only rows
         js = dashboard._SCENARIO_EXPLORER_JS
         assert js.index("L.time_series") < js.index("L.ladder") < js.index("L.all")
@@ -1786,9 +1791,9 @@ class TestScenarioExplorerHeadlinePopulation:
     def test_the_script_reads_the_headline_population(self):
         # The KPI table's headline row, its sub-row and the redrawn curve
         # exist only in the inline script (TestScenarioExplorerScript runs
-        # it); on a corpus with no same-title pair "all" equals
-        # "time_series" cell for cell, so a script reading "all" would look
-        # right there. Pin the reads themselves.
+        # it); on a real run "all" equals "time_series" cell for cell (the
+        # backtest simulates time-series pairs only), so a script reading
+        # "all" would look right there. Pin the reads themselves.
         js = dashboard._SCENARIO_EXPLORER_JS
         assert "var ts = cell[P.time_series];" in js
         assert "kpiRow(esc(L.time_series), ts) + extrasRow(ts)" in js
@@ -3825,26 +3830,17 @@ class TestReturnByTradeType:
         assert ends["Time-series: ladder"] == pytest.approx((-12.0 - 4.0) / 10)
         assert ends["Time-series: cross-event"] == pytest.approx((30.0 + 5.0) / 10)
 
-    def test_type_lines_with_a_same_title_line_sum_to_the_total_return(self):
-        start = date(2026, 1, 5)
-        trades = [
-            _typed_trade("same_title", False, date(2026, 1, 6), date(2026, 1, 8), 30.0),
-            _typed_trade("time_series", True, date(2026, 1, 6), date(2026, 1, 9), -12.0),
-            _typed_trade("time_series", False, date(2026, 1, 7), date(2026, 1, 9), 5.0),
-            _typed_trade("same_title", False, date(2026, 1, 8), date(2026, 1, 9), -4.0),
-        ]
-        curve = backtester._build_equity_curve(trades, start, 1000.0)
-        lines = dashboard._return_by_trade_type(trades, curve, 1000.0)
-        assert [label for label, _, _ in lines] == [
-            "Same-title", "Time-series: ladder", "Time-series: cross-event"]
-        total = (curve["portfolio_value"] / 1000.0 - 1.0) * 100
-        summed = [sum(values) for values in zip(*(s for _, _, s in lines), strict=True)]
-        assert summed == pytest.approx(list(total), abs=1e-9)
-        # Each type ends at its own profit
-        ends = {label: s[-1] for label, _, s in lines}
-        assert ends["Same-title"] == pytest.approx((30.0 - 4.0) / 10)
-        assert ends["Time-series: ladder"] == pytest.approx(-1.2)
-        assert ends["Time-series: cross-event"] == pytest.approx(0.5)
+    def test_the_type_lines_are_the_two_kinds_of_time_series_pair(self):
+        # Every trade the page is handed is a time-series pair, so its lines
+        # are the two kinds of one, a ladder (two rungs of one event) and a
+        # cross-event pair, in that order; the base block's "mix" carries the
+        # same labels in the same order, the order the page's script adds a
+        # mix's lines up in
+        assert [label for label, _ in dashboard._TRADE_TYPE_LINES] == [
+            "Time-series: ladder", "Time-series: cross-event"]
+        axis = pd.DatetimeIndex(pd.to_datetime([date(2026, 1, 5)]))
+        assert dashboard._mix_base(axis, 1000.0, None)["types"] == [
+            "Time-series: ladder", "Time-series: cross-event"]
 
     def test_only_types_with_trades_get_a_line(self):
         start = date(2026, 1, 5)
@@ -3857,12 +3853,6 @@ class TestReturnByTradeType:
                 trades, curve, 1000.0)] == [label]
         assert dashboard._return_by_trade_type([], curve, 1000.0) == []
 
-    def test_a_lone_same_title_trade_gets_a_same_title_line(self):
-        trades = [_typed_trade("same_title", False, date(2026, 1, 6), date(2026, 1, 8), 3.0)]
-        curve = backtester._build_equity_curve(trades, date(2026, 1, 5), 1000.0)
-        assert [x for x, _, _ in dashboard._return_by_trade_type(trades, curve, 1000.0)] == [
-            "Same-title"]
-
     def test_the_first_chart_carries_the_total_and_the_type_lines(self):
         trades = [
             _typed_trade("time_series", True, date(2026, 1, 6), date(2026, 1, 8), 3.0),
@@ -3874,17 +3864,6 @@ class TestReturnByTradeType:
         assert [tr["name"] for tr in data] == [
             "Total return", "Time-series: ladder", "Time-series: cross-event"]
         assert layout["title"]["text"].startswith("Cumulative Return by Trade Type")
-
-    def test_the_first_chart_carries_a_same_title_line(self):
-        trades = [
-            _typed_trade("same_title", False, date(2026, 1, 6), date(2026, 1, 8), 3.0),
-            _typed_trade("time_series", False, date(2026, 1, 6), date(2026, 1, 8), -1.0),
-        ]
-        curve = backtester._build_equity_curve(trades, date(2026, 1, 5), 1000.0)
-        section = dashboard._section_performance(curve, trades, date(2026, 1, 5), 1000.0)
-        data, _ = _first_figure(section)
-        assert [tr["name"] for tr in data] == [
-            "Total return", "Same-title", "Time-series: cross-event"]
 
 
 class TestSectionDataHelpers:
@@ -3956,24 +3935,18 @@ class TestBestWorstTradeRows:
     def _cells(row: str) -> list[str]:
         return re.findall(r"<td[^>]*>(.*?)</td>", row, flags=re.S)
 
-    def test_a_same_title_row_pays_no_on_a_and_yes_on_b(self):
-        row = self._row(pair_type="same_title", entry_nA=0.32, entry_pB=0.35,
-                        outcome_a="yes", outcome_b="no")
-        cells = self._cells(row)
-        assert cells[2:4] == ["$0.35", "$0.32"]          # YES paid, NO paid
-        details, outcome = cells[4], cells[5]
-        assert details.index("<b>NO</b> on Game &lt;1&gt; — Western Illinois") < details.index(
-            "<b>YES</b> on")
-        assert "(closes Jan 13, 2026) at $0.32" in details
-        assert "(closes Jan 14, 2026) at $0.35" in details
-        assert "KXNCAAWBGAME-X-WIU" in details and "KXNCAAMBGAME-X-WIU" in details
-        assert "A: settled <b>YES</b> on Jan 14, 2026 (lost)" in outcome
-        assert "B: settled <b>NO</b> on Jan 15, 2026 (lost)" in outcome
-
     def test_a_time_series_row_pays_yes_on_a_and_no_on_b(self):
         cells = self._cells(self._row(pair_type="time_series", entry_pA=0.30,
                                       entry_nB=0.40, outcome_a="no", outcome_b="no"))
-        assert cells[2:4] == ["$0.30", "$0.40"]
+        assert cells[2:4] == ["$0.30", "$0.40"]          # YES paid, NO paid
+        # Each leg in market order: the side it bought, its question with its
+        # outcome label (escaped), its ticker, its close date and its price
+        details = cells[4]
+        assert details.index("<b>YES</b> on Game &lt;1&gt; — Western Illinois") < details.index(
+            "<b>NO</b> on Game &lt;1&gt; — Western Illinois")
+        assert "(closes Jan 13, 2026) at $0.30" in details
+        assert "(closes Jan 14, 2026) at $0.40" in details
+        assert details.index("KXNCAAWBGAME-X-WIU") < details.index("KXNCAAMBGAME-X-WIU")
         assert "A: settled <b>NO</b> on Jan 14, 2026 (lost)" in cells[5]
         assert "B: settled <b>NO</b> on Jan 15, 2026 (won)" in cells[5]
 
@@ -4007,16 +3980,6 @@ class TestFillsOnRowsAndScatter:
         assert "(closes Jan 14, 2026) at $0.43" in cells[4]
         assert "$0.30" not in row and "$0.40" not in row
 
-    def test_a_same_title_row_shows_the_fills_not_the_quotes(self):
-        row = TestBestWorstTradeRows._row(
-            pair_type="same_title", entry_nA=0.32, entry_pB=0.35,
-            fill_price_a=0.34, fill_price_b=0.37, outcome_a="yes", outcome_b="no",
-            book_walked=True)
-        cells = TestBestWorstTradeRows._cells(row)
-        assert cells[2:4] == ["$0.37", "$0.34"]          # YES on B, NO on A
-        assert "at $0.34" in cells[4] and "at $0.37" in cells[4]
-        assert "$0.32" not in row and "$0.35" not in row
-
     def test_a_trade_with_no_fills_still_shows_its_quotes(self):
         cells = TestBestWorstTradeRows._cells(dashboard._trade_row(make_trade(), "#FFF"))
         assert cells[2:4] == ["$0.30", "$0.40"]
@@ -4033,9 +3996,6 @@ class TestFillsOnRowsAndScatter:
         ts = self._with_fills(0.33, 0.43)
         # (YES fill on A, A's NO quote, B's YES quote stays the reference, NO fill on B)
         assert dashboard._quotes_at_fills(ts) == (0.33, 0.70, 0.60, 0.43)
-        st = dataclasses.replace(ts, pair_type="same_title")
-        # (A's YES quote, NO fill on A, YES fill on B, B's NO quote)
-        assert dashboard._quotes_at_fills(st) == (0.30, 0.33, 0.43, 0.40)
         assert dashboard._quotes_at_fills(make_trade()) == (0.30, 0.70, 0.60, 0.40)
 
     def test_the_scatter_prices_a_time_series_trade_at_its_fills(self):
@@ -4073,28 +4033,23 @@ class TestFillsOnRowsAndScatter:
         assert x[0] != pytest.approx(
             _kelly_fraction(*dashboard._quotes_at_fills(t), "time_series", k=k))
 
-    def test_a_same_title_trade_has_no_entry_mid_spread(self):
-        st = dataclasses.replace(make_trade(), pair_type="same_title")
-        assert dashboard._entry_mid_spread(st) is None
-        # ... and the spread keyword never reaches the same-title prior
-        assert (_kelly_fraction(0.70, 0.20, 0.30, 0.65, "same_title", spread=0.99)
-                == _kelly_fraction(0.70, 0.20, 0.30, 0.65, "same_title"))
+    @pytest.mark.parametrize("pair_type", ["same_title", "unknown"])
+    def test_a_trade_of_another_pair_type_has_no_mid_spread_and_no_edge(self, pair_type):
+        # Only a time-series trade has a mid spread to forecast at: a trade of
+        # any other type has none, so the calibration scores nothing for it,
+        # and the scatter gives it no edge at its fills
+        other = dataclasses.replace(self._with_fills(0.31, 0.41), pair_type=pair_type)
+        assert dashboard._entry_mid_spread(other) is None
+        assert dashboard._spread_observations([other]) == []
+        assert dashboard._kelly_points([other], 0.75)[0] == [0.0]
+        # The same trade as a time-series pair has an edge there
+        assert dashboard._kelly_points([self._with_fills(0.31, 0.41)], 0.75)[0][0] > 0
 
-    def test_the_scatter_prices_a_same_title_trade_at_its_fills(self):
-        t = dataclasses.replace(self._with_fills(0.62, 0.30), pair_type="same_title",
-                                entry_nA=0.60, entry_pB=0.28)
-        x, _ = dashboard._kelly_points([t], 0.75)
-        p = SAME_TITLE_CO_RESOLVE_PROB
-        fee = fee_per_pair_approx(0.62, 0.30)
-        b = (1.0 - 0.62 - 0.30 - fee) / (0.62 + 0.30 + fee)
-        assert x == [pytest.approx(max(0.0, p - (1.0 - p) / b))]
-
-    @pytest.mark.parametrize("pair_type", ["time_series", "same_title"])
-    def test_a_trade_with_no_fills_plots_its_quotes_exactly(self, pair_type):
-        t = dataclasses.replace(make_trade(), pair_type=pair_type)
+    def test_a_trade_with_no_fills_plots_its_quotes_exactly(self):
+        t = make_trade()
         x, _ = dashboard._kelly_points([t], 0.75)
         assert x == [_kelly_fraction(t.entry_pA, t.entry_nA, t.entry_pB, t.entry_nB,
-                                     pair_type, k=0.75)]
+                                     "time_series", k=0.75)]
 
     def test_a_walked_trade_at_the_quotes_plots_the_same_point(self):
         # Fills equal to the top-of-book quotes change nothing
@@ -5136,21 +5091,6 @@ class TestFilterViews:
         assert commodities["n"] == 1
         assert [label for label, _ in commodities["types"]] == ["Time-series: cross-event"]
 
-    def test_a_slice_with_same_title_trades_draws_their_line(self):
-        # The Basketball trades as same-title pairs: the Sports slice then
-        # holds same-title trades and the Hockey ladder, and draws a line for
-        # each of the two types
-        trades = [dataclasses.replace(t, pair_type="same_title")
-                  if t.event_ticker.startswith("KXNCAAMBGAME") else t for t in _flt_trades()]
-        curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
-        sweep = BacktestSweep(
-            primary=SweepPoint(k=0.75, trades=trades, equity_df=curve, spread_band=(0.0, 1.0)),
-            points=[], calibration=None)
-        _, _, base, chunks = _flt_payload(sweep)
-        view = _view(base, chunks, 0, 0, 0, _key(base, "Sports"))
-        assert view["n"] == 3
-        assert [label for label, _ in view["types"]] == ["Same-title", "Time-series: ladder"]
-
     def test_best_and_worst_rows_are_the_slices_own(self):
         _, _, base, chunks = _flt_payload()
         key = _key(base, "Sports", "Basketball")
@@ -5249,8 +5189,7 @@ def _mix_axes(series: dict) -> tuple[list[str], list[tuple[str, str]]]:
 
 
 def _mix_trades(seed: int, n: int = 36, *, quoted: bool = False, spread: int = 60,
-                series: dict = _MIX_SERIES, same_title_share: float = 0.0
-                ) -> list[BacktestTrade]:
+                series: dict = _MIX_SERIES) -> list[BacktestTrade]:
     """
     Seeded trades over a series map's tags (_MIX_SERIES' seven by default):
     time-series ladder and cross-event trades, entry quotes on and between
@@ -5259,10 +5198,7 @@ def _mix_trades(seed: int, n: int = 36, *, quoted: bool = False, spread: int = 6
     exactly on a rounding tie (12.5, 0.0). `quoted` gives three trades in
     four quotes that move while they are held (a run valued at market); the
     fourth stays at cost. Entries fall in the first `spread` days from
-    _MIX_START. `same_title_share` makes each trade a same-title one with
-    that chance, for the checks of a trade with no calibration pair and of
-    the "Same-title" type line; at 0, the default, no number is drawn for
-    it, so every trade is time-series.
+    _MIX_START.
     """
     rng = random.Random(seed)
     mark_rng = random.Random(seed + 1000)
@@ -5272,19 +5208,11 @@ def _mix_trades(seed: int, n: int = 36, *, quoted: bool = False, spread: int = 6
         ticker = rng.choice(names)
         entry = _MIX_START + timedelta(days=rng.randint(0, spread))
         held = rng.choice([0, 1, 3, 8, 21])
-        # Time-series with chance 1 - same_title_share, drawn only when that
-        # share is above 0
-        time_series = not same_title_share or rng.random() < 1.0 - same_title_share
         profit = rng.choice([round(rng.gauss(0.0, 20.0), 2), rng.gauss(0.0, 5.0), 12.5, -12.5, 0.0])
         pA = rng.choice([0.05, 0.2, 0.25, 0.4, 0.55, 0.8, 0.9])
-        if time_series:
-            pB = min(0.95, round(pA + rng.choice([0.1, 0.15, 0.3]), 2))
-            outcomes = rng.choice([("yes", "yes"), ("no", "no"), ("no", "yes")])
-        else:
-            # A same-title pair's two markets settle alike
-            pB = round(max(0.03, pA - 0.1), 2)
-            outcomes = rng.choice([("yes", "yes"), ("no", "no")])
-        base = _typed_trade("time_series" if time_series else "same_title", rng.random() < 0.5,
+        pB = min(0.95, round(pA + rng.choice([0.1, 0.15, 0.3]), 2))
+        outcomes = rng.choice([("yes", "yes"), ("no", "no"), ("no", "yes")])
+        base = _typed_trade("time_series", rng.random() < 0.5,
                             entry, entry + timedelta(days=held), profit)
         trades.append(dataclasses.replace(
             base, entry_pA=pA, entry_pB=pB,
@@ -5338,13 +5266,9 @@ class TestMixData:
     the same curve: "eq", "total", "types" and "dd") and its table row, and
     the constants and markup Python renders with."""
 
-    @pytest.mark.parametrize("same_title_share", [0.0, 0.4],
-                             ids=["time-series", "with-same-title"])
     @pytest.mark.parametrize("quoted", [False, True], ids=["at-cost", "at-market"])
-    def test_the_per_trade_arrays_are_the_trades_own_figures(self, quoted, same_title_share):
-        trades = _mix_trades(1, quoted=quoted, same_title_share=same_title_share)
-        # Only the fixture with a same-title share holds a same-title trade
-        assert any(t.pair_type == "same_title" for t in trades) is bool(same_title_share)
+    def test_the_per_trade_arrays_are_the_trades_own_figures(self, quoted):
+        trades = _mix_trades(1, quoted=quoted)
         lst, axis, _ = _mix_list(trades)
         days = [d.date() for d in axis]
         assert lst["pf"] == [t.profit for t in trades]
@@ -5360,11 +5284,12 @@ class TestMixData:
                      labels=dashboard._PRICE_BUCKET_LABELS)
         assert [dashboard._PRICE_BUCKET_LABELS[b] for b in lst["pb"]] == list(cut)
         assert {0, 1, 2, 3, 4} == set(lst["pb"])
-        # A time-series trade's calibration pair; a same-title trade has none
-        obs = iter(dashboard._spread_observations(trades))
-        for t, cp, ca in zip(trades, lst["cp"], lst["ca"], strict=True):
-            assert ((cp, ca) == next(obs)) if t.pair_type == "time_series" \
-                else (cp is None and ca is None)
+        # Each trade's calibration pair, its entry mid spread and whether it
+        # settled in between: every trade is a time-series one, so none is null
+        assert all(t.pair_type == "time_series" for t in trades)
+        assert list(zip(lst["cp"], lst["ca"], strict=True)) == dashboard._spread_observations(
+            trades)
+        assert None not in lst["cp"] and None not in lst["ca"]
         # Strict JSON, like everything a chunk holds
         json.loads(dashboard._strict_json(lst), parse_constant=_fail_on_constant)
 
@@ -9454,7 +9379,7 @@ class TestScenarioExplorerScript:
     def _rows(self, ts: str, ladder: str, cross: str, all_: str) -> list[tuple[str, str]]:
         # The KPI table's four rows, one per population of the cell shown
         return [(self.TS, ts), ("Ladders (same-event)", ladder), ("Cross-event", cross),
-                ("All (time-series + same-title)", all_)]
+                ("All trades", all_)]
 
     @staticmethod
     def _blocks(page: str) -> tuple[dict, dict, dict]:
@@ -18751,18 +18676,16 @@ class TestFilterPageSize:
         assert size <= budget, f"page was {size} bytes"
 
 
-def _cal_trade(pA: float, pB: float, outcome_a: str, outcome_b: str,
-               pair_type: str = "time_series", *, nA: float | None = None,
-               nB: float | None = None) -> BacktestTrade:
-    """make_trade with the entry quotes, settlement sides and pair type the
-    calibration section reads. The NO asks default to 1 minus their YES asks
-    (books with no width), so the mid spread the section scores is the
-    YES-ask gap the trade is written with."""
+def _cal_trade(pA: float, pB: float, outcome_a: str, outcome_b: str, *,
+               nA: float | None = None, nB: float | None = None) -> BacktestTrade:
+    """make_trade (a time-series trade) with the entry quotes and settlement
+    sides the calibration section reads. The NO asks default to 1 minus their
+    YES asks (books with no width), so the mid spread the section scores is
+    the YES-ask gap the trade is written with."""
     return dataclasses.replace(make_trade(), entry_pA=pA, entry_pB=pB,
                                entry_nA=1.0 - pA if nA is None else nA,
                                entry_nB=1.0 - pB if nB is None else nB,
-                               outcome_a=outcome_a, outcome_b=outcome_b,
-                               pair_type=pair_type)
+                               outcome_a=outcome_a, outcome_b=outcome_b)
 
 
 class TestSpreadCalibration:
@@ -18776,7 +18699,6 @@ class TestSpreadCalibration:
         _cal_trade(0.30, 0.65, "yes", "yes"),               # 0.35, event by A
         _cal_trade(0.20, 0.65, "no", "yes"),                # 0.45, in between
         _cal_trade(0.10, 0.35, "no", "no"),                 # 0.25, never
-        _cal_trade(0.70, 0.60, "no", "yes", "same_title"),  # left out
     ]
 
     def test_observations_are_the_spread_and_the_in_between_cell(self):
@@ -18803,9 +18725,6 @@ class TestSpreadCalibration:
         wide_a = _cal_trade(0.30, 0.65, "no", "no", nA=0.80, nB=0.35)
         assert dashboard._spread_observations([wide_a])[0][0] == pytest.approx(0.40)
 
-    def test_same_title_trades_contribute_nothing(self):
-        assert dashboard._spread_observations(self.TRADES[3:]) == []
-
     def test_scores_match_a_hand_computation(self):
         rel = dashboard._reliability(self.TRADES)
         pairs = [(0.35, 0), (0.45, 1), (0.25, 0)]
@@ -18819,12 +18738,12 @@ class TestSpreadCalibration:
         assert rel["counts"] == [1, 1, 1]
 
     def test_no_time_series_trade_reads_dash(self):
-        rel = dashboard._reliability(self.TRADES[3:])
+        rel = dashboard._reliability([])
         assert rel["brier"] is None and rel["log_loss"] is None
         assert rel["mean_pred"] == [] and rel["counts"] == []
         assert dashboard._calibration_title(None, None) == (
             "Calibration Curve (no time-series trades)")
-        section = dashboard._section_calibration(self.TRADES[3:])
+        section = dashboard._section_calibration([])
         assert 'id="kpi-brier"' in section and ">—</div>" in section
         assert "Calibration Curve (no time-series trades)" in section
 
@@ -20129,26 +20048,6 @@ class TestOpenTradesAtMarket:
             [0.45, 0.50, 0.60, 0.40, 0.48], [0.40, 0.42, float("nan"), 0.30, 0.35])
         return [ladder, cross, gap, plain]
 
-    @classmethod
-    def _trades_with_a_same_title_pair(cls) -> list[BacktestTrade]:
-        """
-        The trades of _trades, the third one a same-title pair (NO on A at
-        0.45, YES on B at 0.40) with a day of no usable quote (it keeps the
-        day before's ask).
-        """
-        base = make_trade()
-        ladder, cross, plain = cls._three_time_series_trades()
-        n = base.n
-        fees = fee_leg_exact(n, 0.45) + fee_leg_exact(n, 0.40)
-        same_title = _marked(
-            dataclasses.replace(
-                _typed_trade("same_title", False, date(2026, 1, 6), date(2026, 1, 11), 0.0),
-                ticker_a="ST-A", ticker_b="ST-B", entry_nA=0.45, entry_pB=0.40,
-                total_cost=n * 0.85, fees=fees, outcome_a="no", outcome_b="no",
-                actual_payoff=float(n), profit=n - n * 0.85 - fees),
-            [0.45, 0.50, 0.60, 0.40, 0.48], [0.40, 0.42, float("nan"), 0.30, 0.35])
-        return [ladder, cross, same_title, plain]
-
     @staticmethod
     def _cash(trades: list[BacktestTrade], day: date, initial: float) -> float:
         """The cash at a day's close, by hand: the start, less each entered
@@ -20280,48 +20179,6 @@ class TestOpenTradesAtMarket:
         assert by_label["Time-series: ladder"][-1] == pytest.approx(ladder.profit / 10)
         assert by_label["Time-series: cross-event"][-1] == pytest.approx(
             (cross.profit + gap.profit + plain.profit) / 10)
-        # The ladder's line moves on a day it is held: its fees on entry, then
-        # its earlier leg's fall from 0.30 to 0.10 on 01-07
-        assert by_label["Time-series: ladder"][row] == pytest.approx(
-            (-ladder.fees + 5 * (0.10 + 0.40) - 5 * (0.30 + 0.40)) / 10)
-
-    def test_the_curve_and_its_type_lines_value_an_open_same_title_pair_at_market(self):
-        trades = self._trades_with_a_same_title_pair()
-        ladder, cross, same_title, plain = trades
-        curve = self._curve(trades)
-        days = list(curve["date"])
-        want = [self._cash(trades, d, 1000.0)
-                + sum(self._held_value(t, d) for t in trades if t.entry_date <= d < t.exit_date)
-                for d in days]
-        assert list(curve["portfolio_value"]) == pytest.approx(want, abs=1e-9)
-        # The leading row is the untouched start (DR-03), the last the start
-        # plus every trade's profit, as at cost
-        assert curve["portfolio_value"].iloc[0] == 1000.0
-        assert curve["portfolio_value"].iloc[-1] == pytest.approx(
-            1000.0 + sum(t.profit for t in trades), abs=1e-9)
-        at_cost = self._curve([dataclasses.replace(t, marks=None) for t in trades])
-        assert at_cost["portfolio_value"].iloc[-1] == pytest.approx(
-            curve["portfolio_value"].iloc[-1], abs=1e-9)
-        # The same-title pair's YES leg has no usable ask on 01-08: it keeps
-        # 01-07's 0.42 (its last usable ask), not its 0.40 entry price
-        assert self._held_value(same_title, date(2026, 1, 8)) == pytest.approx(
-            same_title.n * (0.60 + 0.42))
-        row = days.index(date(2026, 1, 7))
-        assert curve["portfolio_value"].iloc[row] != pytest.approx(
-            at_cost["portfolio_value"].iloc[row], abs=1e-6)
-
-        lines = dashboard._return_by_trade_type(trades, curve, 1000.0)
-        assert [label for label, _, _ in lines] == [
-            "Same-title", "Time-series: ladder", "Time-series: cross-event"]
-        total = (curve["portfolio_value"] / 1000.0 - 1.0) * 100
-        summed = [sum(values) for values in zip(*(s for _, _, s in lines), strict=True)]
-        assert summed == pytest.approx(list(total), abs=1e-9)
-        by_label = {label: s for label, _, s in lines}
-        # Each type ends at its own profit
-        assert by_label["Time-series: ladder"][-1] == pytest.approx(ladder.profit / 10)
-        assert by_label["Time-series: cross-event"][-1] == pytest.approx(
-            (cross.profit + plain.profit) / 10)
-        assert by_label["Same-title"][-1] == pytest.approx(same_title.profit / 10)
         # The ladder's line moves on a day it is held: its fees on entry, then
         # its earlier leg's fall from 0.30 to 0.10 on 01-07
         assert by_label["Time-series: ladder"][row] == pytest.approx(
@@ -20916,9 +20773,8 @@ class TestMixedSelection:
     script works out itself from the tags' views. These tests hold a mix to
     what Python computes for the same trades, part by part, on several
     fixtures — trades valued at cost, trades with quotes valued at market,
-    pages with T-bill rates, pages whose every month holds trades, one with
-    same-title trades among its time-series ones, and one whose tags mostly
-    tie on P&L — and pin the menus' behaviour (tags, and
+    pages with T-bill rates, pages whose every month holds trades, and one
+    whose tags mostly tie on P&L — and pin the menus' behaviour (tags, and
     categories, that differ only in letter case move together), the save
     button staying shut while a category is left out or a tag ticked, the
     k-hat figures of a mix and how many mixes a list remembers. Skipped
@@ -20927,31 +20783,27 @@ class TestMixedSelection:
 
     # name -> (seed, quotes that move, T-bill rates on the page, starting
     # balance, the days entries are spread over, the page's last day or None
-    # for today, the share of same-title trades). With rates the balance is
-    # small and the yield steep (it changes inside the window), so the
-    # trades hold a share of the balance that the yield visibly moves each
-    # ratio by. The pages that run to today hold every trade in their first
-    # three months, so most of their months are flat and every Median
-    # Monthly Return reads +0.0%; the "every-month" pages end on a fixed day
-    # with trades in every month (five months on one, six on the other: an
-    # odd and an even count to take the median of), so that card is a real
-    # figure there, different from one mix to the next. The page with
-    # same-title trades draws their "Same-title" line in a mix, and none of
-    # them has a calibration pair, so a mix's Brier score, log loss and
-    # reliability diagram must leave them out, as Python's do. Each seed's mixes
+    # for today). With rates the balance is small and the yield steep (it
+    # changes inside the window), so the trades hold a share of the balance
+    # that the yield visibly moves each ratio by. The pages that run to today
+    # hold every trade in their first three months, so most of their months
+    # are flat and every Median Monthly Return reads +0.0%; the "every-month"
+    # pages end on a fixed day with trades in every month (five months on
+    # one, six on the other: an odd and an even count to take the median
+    # of), so that card is a real figure there, different from one mix to
+    # the next. Each seed's mixes
     # are ones the page and Python date alike: where a mix's drawdown climbs
     # back from its deepest value and later falls to exactly that value again,
     # the page's script and Python can name different days for it, as they
     # add the tags' curves in a different order
     FIXTURES = {
-        "at-cost": (21, False, False, _MIX_BALANCE, 60, None, 0.0),
-        "at-market": (22, True, False, _MIX_BALANCE, 60, None, 0.0),
-        "at-market-with-rates": (23, True, True, 400.0, 60, None, 0.0),
-        "at-cost-with-rates": (27, False, True, 150.0, 60, None, 0.0),
-        "at-cost-with-same-title": (21, False, False, _MIX_BALANCE, 60, None, 0.4),
-        "every-month-at-cost": (25, False, False, 150.0, 120, date(2026, 5, 31), 0.0),
+        "at-cost": (21, False, False, _MIX_BALANCE, 60, None),
+        "at-market": (22, True, False, _MIX_BALANCE, 60, None),
+        "at-market-with-rates": (23, True, True, 400.0, 60, None),
+        "at-cost-with-rates": (27, False, True, 150.0, 60, None),
+        "every-month-at-cost": (25, False, False, 150.0, 120, date(2026, 5, 31)),
         "every-month-at-market-with-rates": (
-            26, True, True, 400.0, 150, date(2026, 6, 30), 0.0),
+            26, True, True, 400.0, 150, date(2026, 6, 30)),
     }
     # The fixtures whose months all hold trades
     EVERY_MONTH = ("every-month-at-cost", "every-month-at-market-with-rates")
@@ -20983,9 +20835,9 @@ class TestMixedSelection:
     @pytest.mark.parametrize("fixture", sorted(FIXTURES))
     def test_a_mix_is_what_python_computes_for_the_same_trades(
             self, monkeypatch, tmp_path, fixture):
-        seed, quoted, kind, balance, spread, end, share = self.FIXTURES[fixture]
+        seed, quoted, kind, balance, spread, end = self.FIXTURES[fixture]
         rates = self._rates(kind)
-        trades = _mix_trades(seed, n=60, quoted=quoted, spread=spread, same_title_share=share)
+        trades = _mix_trades(seed, n=60, quoted=quoted, spread=spread)
         page = _mix_page(monkeypatch, tmp_path, trades, risk_free=rates, balance=balance,
                          end=end)
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
@@ -21012,15 +20864,13 @@ class TestMixedSelection:
                 data, cats, tags, ref["view"]["n"], n_all, mix=True)
             mixed += len(ref["view"]["types"]) > 1
             labels.update(label for label, _ in ref["view"]["types"])
-        # The fixture exercises what it claims to: several trade types in one
-        # mix, a ratio that the hurdle moves when rates are on the page, and
-        # — where every month holds trades — a Median Monthly Return that is
-        # a real figure, different from one mix to the next
+        # The fixture exercises what it claims to: both kinds of time-series
+        # pair, a ladder and a cross-event pair, in one mix, a ratio that the
+        # hurdle moves when rates are on the page, and — where every month
+        # holds trades — a Median Monthly Return that is a real figure,
+        # different from one mix to the next
         assert mixed
-        # Some mix of the page with same-title trades draws their line, so a
-        # mix held trades with no calibration pair, which its calibration
-        # figures left out as Python's do; no other page draws that line
-        assert ("Same-title" in labels) is bool(share)
+        assert labels == {"Time-series: ladder", "Time-series: cross-event"}
         if fixture in self.EVERY_MONTH:
             assert data["dates"][-1] == end.isoformat()
             assert len(medians - {"+0.0%", "-0.0%"}) >= 4, medians
@@ -21082,10 +20932,10 @@ class TestMixedSelection:
         # and the script works the four series it draws out of that. For
         # every tag of every parity fixture they are the very series
         # _view_payload computes for that tag
-        seed, quoted, kind, balance, spread, end, share = self.FIXTURES[fixture]
+        seed, quoted, kind, balance, spread, end = self.FIXTURES[fixture]
         views = self._each_tag_alone_is_pythons(
             monkeypatch, tmp_path,
-            _mix_trades(seed, n=60, quoted=quoted, spread=spread, same_title_share=share),
+            _mix_trades(seed, n=60, quoted=quoted, spread=spread),
             rates=self._rates(kind), balance=balance, end=end)
         # None of the four is shipped beside "m" on these pages
         assert not any(name in view for view in views.values()
@@ -22163,9 +22013,9 @@ class TestMixedSelection:
         # the live rule keeps over the categories kept, every figure
         # Python's own for them — drawn from Python's views where it has one
         # and, sent through the mix, the same
-        seed, quoted, kind, balance, spread, end, share = self.FIXTURES[fixture]
+        seed, quoted, kind, balance, spread, end = self.FIXTURES[fixture]
         rates = self._rates(kind)
-        trades = _mix_trades(seed, n=60, quoted=quoted, spread=spread, same_title_share=share)
+        trades = _mix_trades(seed, n=60, quoted=quoted, spread=spread)
         page = _mix_page(monkeypatch, tmp_path, trades, risk_free=rates, balance=balance,
                          end=end)
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)

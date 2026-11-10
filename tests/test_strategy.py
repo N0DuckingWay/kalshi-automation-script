@@ -2412,13 +2412,28 @@ class TestTimeSeriesKellyParity:
         # (no spread), not the ~0.1620 the live sizer computes at k 0.75 (pre_toggle_defaults)
         assert dashboard._kelly_fraction(_TS_PA, _TS_NA, _TS_PB, _TS_NB, "time_series") > 0.16
 
-    def test_dashboard_same_title_unchanged(self):
-        # Same-title still prices nA + pB on the fixed prior; nB is ignored
-        fee = fee_per_pair_approx(0.20, 0.30)
-        expected_b = ((1.0 - 0.20 - 0.30) - fee) / (0.50 + fee)
-        expected = SAME_TITLE_CO_RESOLVE_PROB - (1 - SAME_TITLE_CO_RESOLVE_PROB) / expected_b
-        assert dashboard._kelly_fraction(0.70, 0.20, 0.30, 0.65, "same_title") == pytest.approx(expected)
-        assert dashboard._kelly_fraction(0.70, 0.20, 0.30, 0.99, "same_title") == pytest.approx(expected)
+    def test_ast_the_backtest_and_the_dashboard_name_no_same_title_constant(self):
+        # The backtest simulates, and the dashboard shows and prices,
+        # time-series pairs only: neither module imports or reads the
+        # same-title pairs' fixed chance of settling alike, their minimum
+        # price gap or their size cap — by a bare name, as an attribute or
+        # as a string handed to getattr — nor binds one of its own
+        gone = {"SAME_TITLE_CO_RESOLVE_PROB", "SAME_TITLE_MIN_PRICE_DIFF",
+                "SAME_TITLE_SIZE_CAP"}
+        for module in (backtester, dashboard):
+            tree = ast.parse(inspect.getsource(module))
+            named = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name):
+                    named.add(node.id)
+                elif isinstance(node, ast.Attribute):
+                    named.add(node.attr)
+                elif isinstance(node, ast.alias):
+                    named.add(node.name)
+                elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    named.add(node.value)
+            assert not named & gone, (module.__name__, named & gone)
+            assert not [name for name in gone if hasattr(module, name)], module.__name__
 
     def test_discount_of_one_never_trades(self, monkeypatch):
         # k = 1 (market-implied): p = 1 - the mid spread → f* < 0 for every
