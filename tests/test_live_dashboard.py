@@ -53,8 +53,10 @@ from kalshi_betting.live_dashboard import (
     payload,
 )
 from kalshi_betting.live_portfolio import (
+    INTEREST_CREDIT,
     OTHER_BETS,
     CashCheck,
+    Credit,
     GroupReturn,
     History,
     Holding,
@@ -165,6 +167,8 @@ class TestCards:
         # The span, without parentheses inside the sentence's own
         assert cards["return"]["title"].endswith(
             "with deposits and withdrawals taken out, over Sep 28 – Oct 8, 2026, 10 days")
+        assert cards["pnl"]["title"].endswith(
+            "interest and rewards Kalshi paid in count as profit")
 
     def test_the_card_labels_explain_themselves(self):
         assert live_dashboard._CARD_HINTS["sharpe"] == (
@@ -468,6 +472,28 @@ class TestNotes:
             "The chart's times are New York time. It has a point at each daily close (midnight "
             "there, where Kalshi's days close) and now, joined by straight lines, so a trade made "
             "during a day shows as a slope up to that day's close.")
+
+    def test_the_credits_note_says_how_much_of_the_profit_kalshi_paid_in(self):
+        # Kalshi's credits count as profit, so the note under the cash check
+        # says what they add up to, interest apart from the rest
+        reward = Credit(START + timedelta(days=29), D("20.0000"), "incentive", "UXR Survey")
+        interest = Credit(START + timedelta(days=39), D("1.5600"), INTEREST_CREDIT,
+                          "Interest for October 2026")
+        notes = payload(_view(credits=(reward, interest)))["notes"]
+        assert notes[2] == ("Since the bot's first trade Kalshi has paid $21.56 into the "
+                            "account outside any trade: $1.56 of interest and $20.00 of other "
+                            "credits, such as rewards. Profit and total return count them.")
+        assert payload(_view(credits=(interest,)))["notes"][2] == (
+            "Since the bot's first trade Kalshi has paid $1.56 into the account outside any "
+            "trade: $1.56 of interest. Profit and total return count them.")
+        assert payload(_view(credits=(reward,)))["notes"][2].startswith(
+            "Since the bot's first trade Kalshi has paid $20.00 into the account outside any "
+            "trade: $20.00 of other credits, such as rewards.")
+        # No credit, or credits adding up to nothing: no note
+        nothing = dataclasses.replace(reward, amount=D(0))
+        for credits in ((), (nothing,)):
+            assert not any("Kalshi has paid" in note
+                           for note in payload(_view(credits=credits))["notes"])
 
     def test_unread_positions_value_and_no_run_checked(self):
         notes = payload(_view(kalshi_positions_value=None,
@@ -1686,6 +1712,17 @@ class TestPageScript:
         assert el["live-area-details"]["hidden"] is False
         assert [r["text"] for r in el["live-area-head"]["rows"]] == data["area_table"]["head"]
         assert _cells(snap, "live-area-rows") == [r["cells"] for r in data["area_table"]["rows"]]
+
+    def test_with_no_warnings_nothing_shows_above_the_figures(self, tmp_path):
+        # A run whose logged cash does not match is counted in the notes, not warned
+        # about, so a read with no other problem leaves the warnings list empty and hidden
+        data = payload(_view())
+        assert data["warnings"] == []
+        el = _run_live_script(tmp_path, [{"status": 200, "body": data}],
+                              [["settle"], ["snap", "shown"]])["shown"]["el"]
+        assert el["live-warnings"]["rows"] == []
+        assert el["live-warnings"]["hidden"] is True
+        assert el["live-stats"]["hidden"] is False
 
     def test_a_period_click(self, tmp_path):
         view = _view()

@@ -744,7 +744,7 @@ def _cards(stats: live_portfolio.PeriodStats) -> dict[str, dict[str, str]]:
                    f"taken out, over {span}, {length}"),
         "pnl": (_signed_money(stats.pnl),
                 "The account's value at the end less its value at the start, less deposits "
-                "and plus withdrawals"),
+                "and plus withdrawals; interest and rewards Kalshi paid in count as profit"),
         "sharpe": (_ratio(stats.sharpe),
                    "Mean daily return over its standard deviation, times √365, after taking "
                    f"out the {term} T-bill yield on the money held in positions; {ratio_note}"),
@@ -895,7 +895,12 @@ def _risk_free_note(rates: treasury.RiskFreeRates | None) -> str:
 
 def _notes(view: live_portfolio.LiveView) -> list[str]:
     """
-    The notes under the holdings: how positions are valued, the cash check, Kalshi's own value, the ratios' yield.
+    The notes under the holdings: how positions are valued, the cash check, Kalshi's credits, Kalshi's own value, the ratios' yield.
+
+    The credits note shows only when the credits Kalshi paid into the
+    account after the bot's first trade (interest and rewards) do not add
+    up to zero. They count as profit, so the note says what they add up to,
+    interest apart.
 
     Args:
         view (live_portfolio.LiveView): The view.
@@ -913,6 +918,16 @@ def _notes(view: live_portfolio.LiveView) -> list[str]:
                      f"{check.checked} runs' logged balances (largest gap ${worst}).")
     else:
         notes.append("No run's logged balance to check the rebuilt cash against yet.")
+    paid = sum((c.amount for c in view.credits), Decimal(0))
+    if paid:
+        interest = sum((c.amount for c in view.credits
+                        if c.kind == live_portfolio.INTEREST_CREDIT), Decimal(0))
+        parts = [f"{_money(interest)} of interest"] if interest else []
+        if paid - interest:
+            parts.append(f"{_money(paid - interest)} of other credits, such as rewards")
+        notes.append(f"Since the bot's first trade Kalshi has paid {_money(paid)} into the "
+                     f"account outside any trade: {' and '.join(parts)}. Profit and total "
+                     "return count them.")
     held = _money(view.holdings_value)
     if view.kalshi_positions_value is None:
         notes.append(f"Holdings at the midpoint: {held}. Kalshi's own value of the positions "
