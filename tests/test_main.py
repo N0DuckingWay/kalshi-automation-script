@@ -3339,6 +3339,64 @@ class TestRunProdDryRunLiveShapeReplay:
         assert client.rest_client.request.call_count == 0
 
 
+class TestCombosShardCoverageLog:
+    """While combo markets are not read (config.INCLUDE_MVE_MARKETS off), the
+    shard the exchange keeps for them yields nothing: _log_shard_coverage
+    names it on one INFO line and neither reports it as a gap nor claims it
+    was scanned. Read through scanner's binding, the one the fetch reads."""
+
+    _STATUSES = {
+        0: {"trading_active": True, "description": "Default"},
+        1: {"trading_active": True, "description": "Combos"},
+        2: {"trading_active": True, "description": "Crypto & Commodities"},
+    }
+
+    def test_the_unread_combo_shard_is_named_and_not_a_gap(self, caplog):
+        # Funds on it too: their cash still counts, and a collateral transfer
+        # can move it while the exchange allows transfers on that shard
+        with caplog.at_level(logging.INFO):
+            main._log_shard_coverage(self._STATUSES, {0, 2}, {0, 1})
+        assert ("Shard 1 (Combos) not read: it holds only combo markets, which "
+                "this bot does not read (config.INCLUDE_MVE_MARKETS is off)") in caplog.messages
+        assert "Full shard coverage: shards [0, 2] scanned" in caplog.messages
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_while_combos_are_read_an_empty_combo_shard_is_a_gap(self, monkeypatch, caplog):
+        monkeypatch.setattr(scanner_mod, "INCLUDE_MVE_MARKETS", True)
+        with caplog.at_level(logging.INFO):
+            main._log_shard_coverage(self._STATUSES, {0, 2}, {0, 1})
+        assert any(r.levelno == logging.CRITICAL and "shard 1" in r.getMessage()
+                   for r in caplog.records)
+        assert not any("not read" in m for m in caplog.messages)
+
+    def test_an_empty_ordinary_shard_is_still_reported(self, caplog):
+        with caplog.at_level(logging.INFO):
+            main._log_shard_coverage(self._STATUSES, {0}, {0})
+        assert any(r.levelno == logging.WARNING and "shard 2" in r.getMessage()
+                   for r in caplog.records)
+        assert not any("Full shard coverage" in m for m in caplog.messages)
+
+    def test_a_halt_that_includes_the_combo_shard_reads_as_a_halt(self, caplog):
+        statuses = {idx: {**st, "trading_active": False} for idx, st in self._STATUSES.items()}
+        with caplog.at_level(logging.INFO):
+            main._log_shard_coverage(statuses, set(), set())
+        assert ("Shard coverage NOT claimable: all 3 advertised shards are "
+                "trading-inactive — markets were ingested from 0 shard(s)") in caplog.messages
+        assert not any("not read" in m for m in caplog.messages)
+
+    def test_nothing_scanned_when_only_the_unread_combo_shard_is_active(self, caplog):
+        statuses = {
+            0: {"trading_active": False, "description": "Default"},
+            1: {"trading_active": True, "description": "Combos"},
+        }
+        with caplog.at_level(logging.INFO):
+            main._log_shard_coverage(statuses, set(), set())
+        assert ("Shard coverage NOT claimable: no advertised shard was scanned (1 "
+                "trading-inactive, 1 not read because it holds only combo markets) — "
+                "markets were ingested from 0 shard(s)") in caplog.messages
+        assert not any("Full shard coverage" in m for m in caplog.messages)
+
+
 class TestSeriesLabelsAreAttached:
     """DR-79's wiring in both run modes: every run reads Kalshi's /series
     listing once, right after the market fetch (production with its own

@@ -234,6 +234,7 @@ from .scanner import (
     market_fee_multiplier,
     pair_held,
     resolve_held_ladders,
+    unread_combo_shards,
 )
 from .seller import plan_add_ons, plan_sales, plan_trims
 from .strategy import compute_trade, select_portfolio
@@ -1307,6 +1308,11 @@ def _log_shard_coverage(shard_statuses, market_shards: set, balance_shards: set)
     does NOT, because scanner.fetch_shard_statuses normalises it to a real
     False first (TS-04b).
 
+    While config.INCLUDE_MVE_MARKETS is off the run reads no combo markets,
+    so the shard the exchange keeps for them yields none. That shard
+    (scanner.unread_combo_shards) gets one INFO line saying it was not read,
+    and is neither reported as a gap nor named among the scanned shards.
+
     Args:
         shard_statuses (dict | None): Return value of scanner.fetch_shard_statuses().
         market_shards (set): exchange_index values seen among ingested markets.
@@ -1318,17 +1324,30 @@ def _log_shard_coverage(shard_statuses, market_shards: set, balance_shards: set)
     if shard_statuses is None:
         logging.info("Per-shard exchange status unavailable — coverage not assessable.")
         return
+    # The combo shard yields nothing while combo markets are not read
+    # (config.INCLUDE_MVE_MARKETS off); that is the bot's choice, not a gap
+    unread = unread_combo_shards(shard_statuses, market_shards)
+    for idx in sorted(unread):
+        logging.info(
+            "Shard %d (%s) not read: it holds only combo markets, which this "
+            "bot does not read (config.INCLUDE_MVE_MARKETS is off)",
+            idx, shard_statuses[idx].get("description") or "",
+        )
     # Pure comparison of advertised vs. observed shards; this function only
     # decides how loudly to log what check_shard_coverage found.
-    critical, warnings = check_shard_coverage(shard_statuses, market_shards, balance_shards)
+    critical, warnings = check_shard_coverage(
+        shard_statuses, market_shards, balance_shards, unread_shards=unread)
     # Coverage may only be CLAIMED over shards that were scannable.
     # check_shard_coverage deliberately skips trading-inactive shards (their
     # ingest drop already warned), so an all-inactive exchange yields ([], [])
     # — which read as success (TS-01). Only a False is inactive (a real bool
     # by now: scanner.fetch_shard_statuses recovers a re-typed "false" into
     # one); None (flag unknown) is scannable, matching inactive_shard_indexes.
+    # A combo shard left unread is not scanned either, so it is not named as
+    # one in the "Full shard coverage" line below
     scannable = sorted(
-        idx for idx, st in shard_statuses.items() if st.get("trading_active") is not False
+        idx for idx, st in shard_statuses.items()
+        if st.get("trading_active") is not False and idx not in unread
     )
     for problem in critical:
         # Same severity channel as orphaned positions — this must never be missable.
@@ -1336,11 +1355,20 @@ def _log_shard_coverage(shard_statuses, market_shards: set, balance_shards: set)
     for problem in warnings:
         logging.warning("Shard coverage: %s", problem)
     if not scannable:
-        logging.warning(
-            "Shard coverage NOT claimable: all %d advertised shards are "
-            "trading-inactive — markets were ingested from %d shard(s)",
-            len(shard_statuses), len(market_shards),
-        )
+        if unread:
+            # Inactive but for a combo shard left unread: still nothing scanned
+            logging.warning(
+                "Shard coverage NOT claimable: no advertised shard was scanned "
+                "(%d trading-inactive, %d not read because it holds only combo "
+                "markets) — markets were ingested from %d shard(s)",
+                len(shard_statuses) - len(unread), len(unread), len(market_shards),
+            )
+        else:
+            logging.warning(
+                "Shard coverage NOT claimable: all %d advertised shards are "
+                "trading-inactive — markets were ingested from %d shard(s)",
+                len(shard_statuses), len(market_shards),
+            )
     elif not critical and not warnings:
         # Lists the shards actually scanned, not every advertised one — a
         # funded-but-halted shard is no longer folded into "full".

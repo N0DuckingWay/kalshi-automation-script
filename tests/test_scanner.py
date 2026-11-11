@@ -19,7 +19,6 @@ from urllib3.exceptions import ProtocolError
 from kalshi_betting import _http, config, scanner
 from kalshi_betting.config import (
     DEFAULT_EXCHANGE_INDEX,
-    INCLUDE_MVE_MARKETS,
     MAX_DEADLINE_GAP_DAYS,
     PRICE_EPSILON,
     SAME_TITLE_LEG_SIDES,
@@ -80,6 +79,7 @@ from kalshi_betting.scanner import (
     resolve_held_ladders,
     tick_size_for_price,
     time_series_group_key,
+    unread_combo_shards,
     validate_pair_price,
 )
 
@@ -7595,6 +7595,18 @@ def _raw_page(events: list, cursor: str | None = None) -> SimpleNamespace:
     return SimpleNamespace(status=200, data=json.dumps(payload).encode("utf-8"))
 
 
+@pytest.fixture
+def combo_markets_read(monkeypatch):
+    """Read combo (MVE) markets for one test.
+
+    config.INCLUDE_MVE_MARKETS is off, so the live fetch skips the combo
+    events listing; the tests of that listing's own handling (status filter,
+    bail-outs, cursor guards, shard tagging) turn it on through scanner's
+    binding, the one fetch_open_events_with_markets reads.
+    """
+    monkeypatch.setattr(scanner, "INCLUDE_MVE_MARKETS", True)
+
+
 def _raw_market(ticker: str, title: str, status: str = "active", **extra) -> dict:
     m = {
         "ticker": ticker, "event_ticker": f"EVT-{ticker}", "title": title,
@@ -7626,7 +7638,7 @@ class TestFetchOrderbookFailureIsOneLine:
 
 
 class TestFetchOpenEventsMveStatusFilter:
-    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    @pytest.mark.usefixtures("combo_markets_read")
     def test_mve_active_markets_kept_others_dropped(self):
         # The API status string for an open market is "active" (allowed values:
         # initialized/active/closed/settled/determined — there is no "open").
@@ -7733,7 +7745,7 @@ class TestFetchOpenEventsMveStatusFilter:
 
         assert get_held_tickers(client) == {"HELD-NO", "HELD-FRACTIONAL"}
 
-    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    @pytest.mark.usefixtures("combo_markets_read")
     def test_mve_pull_bails_after_consecutive_marketless_pages(self):
         # The MVE listing is effectively unbounded and currently returns zero
         # nested markets; without the MVE_MAX_EMPTY_PAGES bail-out the fetch
@@ -7761,7 +7773,7 @@ class TestFetchOpenEventsMveStatusFilter:
         calls = client.get_multivariate_events_without_preload_content.call_count
         assert calls == MVE_MAX_EMPTY_PAGES, f"expected bail-out at {MVE_MAX_EMPTY_PAGES} pages, made {calls} calls"
 
-    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    @pytest.mark.usefixtures("combo_markets_read")
     def test_mve_pull_bails_after_consecutive_pages_with_no_active_markets(self, caplog):
         # Regression (sandbox, live 2026-08): the bail-out counter used to
         # reset on RAW nested-market count regardless of status. The MVE
@@ -7800,7 +7812,7 @@ class TestFetchOpenEventsMveStatusFilter:
         assert calls == MVE_MAX_EMPTY_PAGES, f"expected bail-out at {MVE_MAX_EMPTY_PAGES} pages, made {calls} calls"
         assert "no active nested" in caplog.text
 
-    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    @pytest.mark.usefixtures("combo_markets_read")
     def test_mve_page_with_one_active_market_resets_bailout_counter(self):
         # Mixed case: a page containing one ACTIVE market among otherwise
         # inactive ones must reset the empty-page counter, so pagination
@@ -7980,7 +7992,7 @@ class TestFetchOpenEventsMveStatusFilter:
         assert "cursor did not advance" in caplog.text
         assert "Positions fetch" in caplog.text
 
-    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    @pytest.mark.usefixtures("combo_markets_read")
     def test_mve_stuck_cursor_stops_pagination(self, caplog):
         page1 = _raw_page(
             [{"title": "MVE E1", "markets": [_raw_market("MVE-1", "Q one")]}],
@@ -8065,7 +8077,7 @@ class TestCursorLoopBounds:
         assert "cursor did not advance" in caplog.text
         assert "Positions fetch" in caplog.text
 
-    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    @pytest.mark.usefixtures("combo_markets_read")
     def test_mve_cycling_cursor_stops_pagination(self, caplog):
         # Every page carries an ACTIVE nested market, so MVE_MAX_EMPTY_PAGES
         # never fires — the seen-cursor set is the only thing that can stop it.
@@ -8139,7 +8151,7 @@ class TestCursorLoopBounds:
         assert "reached SCANNER_MAX_PAGES (5)" in caplog.text
         assert "Positions fetch" in caplog.text
 
-    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    @pytest.mark.usefixtures("combo_markets_read")
     def test_mve_page_cap_stops_pagination(self, caplog, monkeypatch):
         # The cap is independent of MVE_MAX_EMPTY_PAGES (25): every page here
         # is productive, so the productivity bail-out can never fire.
@@ -11143,7 +11155,7 @@ class TestFetchOpenEventsShardTagging:
         assert "non-routable" not in caplog.text
         assert "trading-inactive" not in caplog.text
 
-    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    @pytest.mark.usefixtures("combo_markets_read")
     def test_mve_loop_also_keeps_and_tags_every_shard(self):
         mve_event = {"title": "2024 Election Winner", "markets": [
             _raw_market("MVE-SHARD0", "Trump", status="active", exchange_index=0),
@@ -11167,7 +11179,7 @@ class TestFetchOpenEventsShardTagging:
         assert {m.ticker for m in markets} == {"STD-SHARD0"}
         assert "Skipped 2 markets on trading-inactive exchange shards [1]" in caplog.text
 
-    @pytest.mark.skipif(not INCLUDE_MVE_MARKETS, reason="MVE scanning disabled in config")
+    @pytest.mark.usefixtures("combo_markets_read")
     def test_inactive_shard_drop_spans_both_loops_in_one_count(self, caplog):
         event = {"title": "Weather Event", "markets": [
             _raw_market("STD-SHARD1", "Snow tomorrow", exchange_index=1),
@@ -11691,6 +11703,103 @@ class TestTickSizeForPrice:
         with caplog.at_level(logging.WARNING):
             assert tick_size_for_price(m, 0.5) == Decimal("0.01")
         assert "KXTEST-1" in caplog.text
+
+
+class TestCombosNotReadByDefault:
+    """Combo (MVE) markets are not read by default, live or in the backtest.
+
+    config.INCLUDE_MVE_MARKETS is off: the live fetch skips the combo events
+    listing (most of a run's time, and none of those markets forms a pair),
+    and the shard the exchange keeps for combos is then left out of the
+    coverage check instead of being reported as empty every run."""
+
+    @staticmethod
+    def _status(description, trading_active=True):
+        return {
+            "trading_active": trading_active,
+            "exchange_active": True,
+            "intra_exchange_transfers_active": True,
+            "description": description,
+        }
+
+    def test_the_default_is_off_in_config_and_in_every_binding(self):
+        # scanner (the live fetch) and historical (the backtest's fetches)
+        # each bind the constant by value, so all three must read off
+        from kalshi_betting import historical
+        assert config.INCLUDE_MVE_MARKETS is False
+        assert scanner.INCLUDE_MVE_MARKETS is False
+        assert historical.INCLUDE_MVE_MARKETS is False
+
+    def test_a_default_fetch_never_reads_the_combo_listing(self, caplog):
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([
+            {"title": "Weather Event", "markets": [_raw_market("STD-1", "Rain tomorrow")]},
+        ]))
+        with caplog.at_level(logging.INFO):
+            markets = fetch_open_events_with_markets(client)
+        assert [m.ticker for m in markets] == ["STD-1"]
+        client.get_multivariate_events_without_preload_content.assert_not_called()
+        assert "Fetched 1 open markets (MVE included: False)" in caplog.messages
+
+    def test_the_empty_combo_shard_is_named_as_unread(self):
+        statuses = {0: self._status("Default"), 1: self._status("Combos"),
+                    2: self._status("Crypto & Commodities")}
+        assert unread_combo_shards(statuses, {0, 2}) == {1}
+
+    def test_the_description_is_matched_ignoring_case_and_spaces(self):
+        statuses = {0: self._status("Default"), 1: self._status("  combos ")}
+        assert unread_combo_shards(statuses, {0}) == {1}
+
+    def test_a_combo_shard_that_yielded_markets_was_read(self):
+        # Kalshi moved ordinary markets onto it: it was read, so it is checked
+        statuses = {0: self._status("Default"), 1: self._status("Combos")}
+        assert unread_combo_shards(statuses, {0, 1}) == set()
+
+    def test_no_other_shard_is_left_out(self):
+        # Any other description, a missing one, a label that is not text, or
+        # an unreadable status list leaves every shard checked
+        statuses = {0: self._status("Default"), 1: self._status("Combo markets"),
+                    2: self._status(""), 3: self._status(None),
+                    4: {"trading_active": True}}
+        assert unread_combo_shards(statuses, {0}) == set()
+        assert unread_combo_shards(None, set()) == set()
+        assert unread_combo_shards({}, set()) == set()
+
+    def test_a_halted_combo_shard_is_left_to_the_halt_handling(self):
+        # Trading-inactive: the check already skips it, and the run reports
+        # it as halted rather than as unread
+        statuses = {0: self._status("Default"), 1: self._status("Combos", trading_active=False)}
+        assert unread_combo_shards(statuses, {0}) == set()
+
+    def test_nothing_is_left_out_while_combos_are_read(self, monkeypatch):
+        monkeypatch.setattr(scanner, "INCLUDE_MVE_MARKETS", True)
+        statuses = {0: self._status("Default"), 1: self._status("Combos")}
+        assert unread_combo_shards(statuses, {0}) == set()
+
+    def test_an_unread_shard_is_never_a_coverage_gap(self):
+        # Funded or not: no pair the bot can form is on it, and its cash still
+        # counts and a collateral transfer can move it while the exchange
+        # allows transfers on that shard
+        statuses = {0: self._status("Default"), 1: self._status("Combos")}
+        assert check_shard_coverage(statuses, {0}, {0, 1}, unread_shards={1}) == ([], [])
+        assert check_shard_coverage(statuses, {0}, set(), unread_shards={1}) == ([], [])
+
+    def test_every_other_empty_shard_is_still_reported(self):
+        statuses = {0: self._status("Default"), 1: self._status("Combos"),
+                    2: self._status("Crypto & Commodities")}
+        critical, warnings = check_shard_coverage(statuses, {0}, {0, 2}, unread_shards={1})
+        assert len(critical) == 1 and "shard 2" in critical[0]
+        assert warnings == []
+        critical, warnings = check_shard_coverage(statuses, {0}, {0}, unread_shards={1})
+        assert critical == []
+        assert len(warnings) == 1 and "shard 2" in warnings[0]
+
+    def test_without_unread_shards_the_check_is_unchanged(self):
+        # The keyword's default leaves nothing out: an empty, funded combo
+        # shard is still the CRITICAL it always was
+        statuses = {0: self._status("Default"), 1: self._status("Combos")}
+        critical, warnings = check_shard_coverage(statuses, {0}, {0, 1})
+        assert len(critical) == 1 and "shard 1" in critical[0]
 
 
 class TestFetchShardStatusesEmptyBreakdown:
