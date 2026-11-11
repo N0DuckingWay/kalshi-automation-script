@@ -217,22 +217,6 @@ BACKTEST_DEFAULT_SPREAD_BAND  = (0.0, 1.0)
 SPREAD_BAND_SWEEP_FLOORS      = (0.0, 0.20, 0.25, 0.30, 0.35, 0.40)
 SPREAD_BAND_SWEEP_CEILINGS    = (0.50, 0.60, 0.70, 0.80, 0.90, 1.00)
 
-# Minimum YES ask price difference for same-title pairs. These are markets asking
-# the exact same question, so even a small divergence (5%) is anomalous and worth trading.
-SAME_TITLE_MIN_PRICE_DIFF     = 0.05
-
-# Prior probability that a same-title pair co-resolves (i.e. both YES or both NO).
-# Set at 95% — divergence is an anomaly, so we assume high correlation by default.
-# It holds only for a pair meeting all three pairing rules: its two event
-# tickers belong to two DIFFERENT series (the one-series rule, DR-02/DR-54),
-# its two markets close within an hour of each other (DR-74), and both
-# series are filed under one Kalshi category and first tag while both events
-# name the same competition, or neither names one (DR-79).
-# No code forms a same-title pair: the live finder and the backtest look for
-# time-series pairs only. Identical wording that fails any of the rules is
-# two different games or questions, for which this prior is simply false.
-SAME_TITLE_CO_RESOLVE_PROB    = 0.95
-
 # The held-pair close bound, in seconds: one hour. held_pair_kind (which
 # tells live trimming whether two held markets are a time-series pair held as
 # one) gives no kind to two held markets on two events that close within it
@@ -744,7 +728,6 @@ SALE_PARTNER_MAX_AGE_DAYS = 2 * MAX_DEADLINE_GAP_DAYS
 # 100%; LiveSettings normalises the cap onto a backtester.SIZE_CAP_SWEEP cell
 # (float-equal). The same_title_size_cap an outdated saved file holds is
 # checked on it too, as the version that saved it did (_retired_proposal).
-# Same value as SAME_TITLE_MIN_PRICE_DIFF, not the same constant.
 SIZE_CAP_STEP = 0.05
 
 # The largest share of the portfolio value one pair may stake before
@@ -1187,13 +1170,11 @@ LIVE_DASHBOARD_PLOTLY_SRI = "sha384-H7GB7Kme/VbPI/0S4LNq7OixFNVRgRGE8kyqTntBuiXl
 # left past them, by its own name in that gray).
 LIVE_DASHBOARD_MAX_CATEGORY_BANDS = 6
 
-# Which side each leg of a pair buys, as (side bought on market_a, side bought
-# on market_b). scanner.leg_sides() is the ONLY reader — never hardcode a side
-# elsewhere. Same-title: NO on the pricier contract (market_a), YES on the
-# cheaper (market_b). Time-series: YES on the earlier contract (market_a), NO on
-# the later (market_b). The trader always SUBMITS the NO leg first, whichever
-# market it sits on (see trader._ordered_legs).
-SAME_TITLE_LEG_SIDES  = ("no", "yes")
+# Which side each leg of a time-series pair buys, as (side bought on market_a,
+# side bought on market_b): YES on the earlier contract (market_a), NO on the
+# later (market_b). scanner.leg_sides() is the ONLY reader — never hardcode a
+# side elsewhere. The trader always SUBMITS the NO leg first, whichever market
+# it sits on: market_b for a time-series pair (see trader._ordered_legs).
 TIME_SERIES_LEG_SIDES = ("yes", "no")
 
 # The smallest portfolio value (cash plus open positions), in cents, a
@@ -1236,8 +1217,8 @@ INCLUDE_MVE_MARKETS           = True
 # DR-02/DR-54 one-series rule exists to refuse. event_series() used to return
 # the LITERAL prefix, which DID refuse two combos listed under ONE KXMVE*
 # prefix; what it could not see was a pair spanning TWO of them, which read as
-# two different series and was priced on the 0.95 SAME_TITLE_CO_RESOLVE_PROB
-# co-resolution prior (and, identically worded, as a time-series pair).
+# two different series and so was priced as a same-title pair, on a 95% chance
+# of the two settling alike (and, identically worded, as a time-series pair).
 #
 # Census of backtest_cache/event_titles.json (3,996,906 keys, 2,444 distinct
 # prefixes), measured 2026-09-16. That file was mostly "" entries for combo
@@ -1257,8 +1238,8 @@ INCLUDE_MVE_MARKETS           = True
 # under TWO literal KXMVE prefixes — every one of them KXMVECROSSCATEGORY x
 # KXMVECROSSCATEGORY0. Those wordings form 26,072 cross-prefix market pairs, of
 # which 17,829 co-resolved and 8,243 settled DIFFERENTLY: a 68.4%
-# co-resolution rate against the 0.95 prior a same-title pair is priced on
-# (SAME_TITLE_CO_RESOLVE_PROB).
+# co-resolution rate against the 95% chance a same-title pair was priced on as
+# settling alike.
 #
 # A FAMILY PREFIX rather than an enumerated allowlist, deliberately. Enumerating
 # the combo series would BE an allowlist, and the codebase's own prior belief
@@ -1433,8 +1414,8 @@ V2_FOK_KILL_HTTP_STATUS       = 409
 V2_FOK_KILL_ERROR_CODE        = "fill_or_kill_insufficient_resting_volume"
 
 # TOP-OF-GRID CEILING CLAMP, as a dollar string, on the V2 reduce-only rollback
-# bid that unwinds a filled NO leg (market_a for same-title, market_b for
-# time-series — see trader._ordered_legs). On the single-YES-book model a held
+# bid that unwinds a filled NO leg (market_b of a time-series pair, the later
+# contract — see trader._ordered_legs). On the single-YES-book model a held
 # NO position is a short YES, so closing it is a YES BUY (bid).
 #
 # This is NOT the price submitted. The submitted bid is the bounded-loss
@@ -2143,8 +2124,8 @@ BACKTEST_OUTCOME_LABEL_WARN_FRACTION = 0.50
 # one consumes _build_equity_curve output, and the single trading-day
 # consumer is the external ^GSPC row, which passes TRADING_DAYS_PER_YEAR
 # explicitly. Defaulting to the majority case is the same fail-safe-default
-# rule scanner.leg_sides() and scanner._shard_index() follow — a future
-# in-module caller inherits the correct base rather than the wrong one.
+# rule scanner._shard_index() follows — a future in-module caller inherits the
+# correct base rather than the wrong one.
 TRADING_DAYS_PER_YEAR: int  = 252
 CALENDAR_DAYS_PER_YEAR: int = 365
 
@@ -2859,11 +2840,11 @@ def fee_per_pair_approx(price_a: float, price_b: float, *,
     which sums the quadratic fee contribution of the two legs, each leg's
     contribution scaled by its own market's fee multiplier. It is
     side-agnostic: pass the per-contract cost of whatever side each leg buys —
-    (nA, pB) for a same-title pair, (pA, nB) for a time-series pair, i.e.
-    exactly scanner.leg_prices(pair) — and the multipliers in the same MARKET
-    order, scanner.leg_fee_multipliers(pair): multiplier_a is market A's,
-    whichever side is bought there. With both multipliers 1.0 the arithmetic
-    is exactly the formula above, operation for operation.
+    (pA, nB) for a time-series pair, i.e. exactly scanner.leg_prices(pair) —
+    and the multipliers in the same MARKET order,
+    scanner.leg_fee_multipliers(pair): multiplier_a is market A's, whichever
+    side is bought there. With both multipliers 1.0 the arithmetic is exactly
+    the formula above, operation for operation.
 
     Args:
         price_a (float): Cost in dollars of the side bought on the first leg.
@@ -4628,9 +4609,8 @@ def max_kelly_fraction(pair_type: str, settings: LiveSettings) -> float:
 
     Enrichment bounds the depth it averages with this, so a lifted cap never
     averages depth no trade can use (#51); it bounds the sizer only because
-    both read the run's one LiveSettings. The cap is pair_size_cap's, further
-    bounded by the pair type's ceiling on f*. pair_size_cap caps any type but
-    "time_series" at 0, so the bound of every other type is 0:
+    both read the run's one LiveSettings. For a time-series pair it is
+    pair_size_cap's cap, further bounded by the ceiling on f*:
 
     time_series: f* = 1 - k*s/(1 - c), where s is the mid spread
         (time_series_mid_spread) and c = pA + nB + fee at the fills. A
@@ -4648,8 +4628,9 @@ def max_kelly_fraction(pair_type: str, settings: LiveSettings) -> float:
         places: 1.0 - 0.8 is 0.19999999999999996, which would shift
         max_contracts down by one on round-number books. At k = 1 it is 0,
         and no time-series trade can size.
-    any other type: 0. Its cap is 0 (pair_size_cap), below the
-        SAME_TITLE_CO_RESOLVE_PROB ceiling the code applies to it.
+    any other type (anything but the exact string "time_series"): 0. The
+        bot trades time-series pairs only, so no other type is ever sized
+        (pair_size_cap caps one at 0 too).
 
     It bounds an add-on to a held pair too (with settings.rebalance on):
     held_pair_fraction never gives an add-on more than a new pair would get,
@@ -4662,12 +4643,14 @@ def max_kelly_fraction(pair_type: str, settings: LiveSettings) -> float:
         settings (LiveSettings): The run's toggles.
 
     Returns:
-        float: The run's cap for this pair type, bounded by the ceiling above.
+        float: For a time-series pair, the run's cap bounded by the ceiling
+            above; 0.0 for any other type.
     """
-    cap = pair_size_cap(pair_type, settings.size_cap)
-    if pair_type == "time_series":
-        return min(cap, round(1.0 - settings.interval_discount, 12))
-    return min(cap, SAME_TITLE_CO_RESOLVE_PROB)
+    if pair_type != "time_series":
+        # The bot trades time-series pairs only: no other type is ever sized
+        return 0.0
+    return min(pair_size_cap(pair_type, settings.size_cap),
+               round(1.0 - settings.interval_discount, 12))
 
 
 # ── Selling a held position early ─────────────────────────────────────────────
@@ -4830,9 +4813,15 @@ def held_pair_win_prob(pair_type: str, yes_ask_a: float, no_ask_a: float,
     The same model a new trade is sized with: a time-series pair (market A
     the earlier deadline, B the later) pays unless the event lands between
     its two deadlines, a chance of k times the mid spread
-    (time_series_mid_spread, time_series_profit_prob); a same-title pair has
-    the fixed SAME_TITLE_CO_RESOLVE_PROB. Anything but the exact string
-    "time_series" reads as same-title (scanner.leg_sides' rule).
+    (time_series_mid_spread, time_series_profit_prob). The bot trades
+    time-series pairs only, so any other pair type (anything but the exact
+    string "time_series") has no chance this can read, whatever its quotes.
+
+    Both callers keep a pair whose chance is None: a live Kelly trim
+    (seller._trim_one, which reaches this only with a pair
+    scanner.held_pair_kind reads as time-series) logs one "Not trimming" line
+    and plans no sale, and the backtest's (backtester._kelly_trim, on the
+    time-series trades the backtest holds) sells nothing.
 
     Args:
         pair_type (str): The pair's type.
@@ -4843,15 +4832,17 @@ def held_pair_win_prob(pair_type: str, yes_ask_a: float, no_ask_a: float,
         k (float): The share of the mid spread the model believes, in (0, 1].
 
     Returns:
-        float | None: The chance, in [0, 1]. None for a time-series pair
-            whose chance cannot be read, as a new trade of it would not be
-            sized: a quote or k is not a finite number, a market's book is
-            crossed (its YES ask sits below its own YES bid), or the mid
-            spread is not above zero (the model would read that as a sure
-            win; scanner.pair_mid_spread refuses it the same way).
+        float | None: The chance, in [0, 1]. None for any other pair type,
+            and for a time-series pair whose chance cannot be read, as a new
+            trade of it would not be sized: a quote or k is not a finite
+            number, a market's book is crossed (its YES ask sits below its
+            own YES bid), or the mid spread is not above zero (the model
+            would read that as a sure win; scanner.pair_mid_spread refuses it
+            the same way).
     """
     if pair_type != "time_series":
-        return SAME_TITLE_CO_RESOLVE_PROB
+        # The bot trades time-series pairs only: no chance to read
+        return None
     quotes = (yes_ask_a, no_ask_a, yes_ask_b, no_ask_b)
     # Tested first: a quote that is not a number would read as a mid spread
     # of zero, which the model takes as a sure win
@@ -5079,13 +5070,12 @@ def pair_price_move(price_then: float, price_now: float) -> float:
     Return how far a held pair's total price has moved since the last trade on it (now less then).
 
     A pair's total price is the price of the side held on each of its two
-    markets, added: YES on the earlier market plus NO on the later one for a
-    time-series pair, NO on the first plus YES on the second for a same-title
-    pair. (For a lone leg, one held market whose partner has paid out, it is
-    that one market's price.) Both prices must be the same kind of quote (two
-    asks, say), so the gap between a market's bid and ask never reads as a
-    move. This is the one place the sign is decided: a caller hands in the two
-    prices and never subtracts them itself.
+    markets, added: YES on the earlier market plus NO on the later one, for
+    a time-series pair. (For a lone leg, one held market whose partner has
+    paid out, it is that one market's price.) Both prices must be the same
+    kind of quote (two asks, say), so the gap between a market's bid and ask
+    never reads as a move. This is the one place the sign is decided: a
+    caller hands in the two prices and never subtracts them itself.
 
     Args:
         price_then (float): The pair's total price at the last trade on it

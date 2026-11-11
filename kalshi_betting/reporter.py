@@ -68,11 +68,12 @@ Notes:
     an existing shared trade_log.xlsx keeps
     its old header row untouched. Column COUNT and order are unchanged (18), so
     old and new rows line up; the per-row Notes prefix
-    ("[<pair_type>: <SIDE_A> A / <SIDE_B> B[ nB=0.xxxx] fees=$x.xx[ adds to N
-    held]] ") is what tells a reader which side each count bought, for a
-    time-series row the traded NO-leg price — the retained "nA (NO ask)"
-    column is reporting-only there — and, for a trade that adds to a pair the
-    account already held, how many contracts a side it held.
+    ("[<pair_type>: <SIDE_A> A / <SIDE_B> B nB=0.xxxx fees=$x.xx[ adds to N
+    held]] "; older same-title rows carry no nB) is what tells a reader which
+    side each count bought, for a time-series row the traded NO-leg price —
+    the retained "nA (NO ask)" column is reporting-only there — and, for a
+    trade that adds to a pair the account already held, how many contracts a
+    side it held.
 
     append_to_prod_log's keyword-only run_note goes on every call's separator
     banner, never in a column; main._run_prod passes the run's live toggles
@@ -147,8 +148,9 @@ _TRADE_COLUMNS = [
     ("pB (YES ask)",      13),
     ("nA (NO ask)",       13),
     # Side-neutral: x is the count on market A and y on market B whatever side
-    # each bought (NO/YES for same-title, YES/NO for time-series) — the row's
-    # Notes prefix names the sides. An existing workbook keeps its old headers.
+    # each bought (YES/NO for a time-series pair; an older row may record a
+    # same-title pair's NO/YES) — the row's Notes prefix names the sides. An
+    # existing workbook keeps its old headers.
     ("x — A leg",         12),
     ("y — B leg",         13),
     # Fee-INCLUSIVE, matching the cash the collateral planner actually
@@ -314,16 +316,18 @@ def _result_to_row(result: TradeResult, run_ts: datetime) -> list:
     floats and datetimes as "YYYY-MM-DD" strings. Columns are in MARKET order
     (A then B): x is market A's count and y is market B's, whatever side each
     bought. The Notes cell carries a prefix naming the pair type, the side
-    bought on each market (from scanner.leg_sides) and, for a time-series pair,
-    the traded NO-leg price nB, the fees, and, for a trade that adds to a
-    pair the account already held (scanner.pair_held), how many contracts a
-    side it held — "[time_series: YES A / NO B nB=0.4000 fees=$0.10] ",
-    "[same_title: NO A / YES B fees=$0.10] " or "[time_series: YES A / NO B
-    nB=0.4000 fees=$0.10 adds to 30 held] " — followed by result.error (if
-    any). That prefix is what disambiguates rows in a workbook whose header
-    row predates the side-neutral x/y headers, and it is the only place nB is
-    recorded (the "nA (NO ask)" column is reporting-only for a time-series
-    row). No column is added for an add-on: every other row is unchanged.
+    bought on each market (from scanner.leg_sides), the traded NO-leg price
+    nB, the fees, and, for a trade that adds to a pair the account already
+    held (scanner.pair_held), how many contracts a side it held —
+    "[time_series: YES A / NO B nB=0.4000 fees=$0.10] " or "[time_series:
+    YES A / NO B nB=0.4000 fees=$0.10 adds to 30 held] " — followed by
+    result.error (if any). That prefix is what disambiguates rows in a
+    workbook whose header row predates the side-neutral x/y headers, and it
+    is the only place nB is recorded (the "nA (NO ask)" column is
+    reporting-only for a time-series row). Older rows of the trade log may
+    carry a same-title prefix, "[same_title: NO A / YES B fees=$0.10] ",
+    which the Live trading tab (live_portfolio) still reads. No column is
+    added for an add-on: every other row is unchanged.
 
     Args:
         result (TradeResult): The trade result to serialize.
@@ -332,6 +336,11 @@ def _result_to_row(result: TradeResult, run_ts: datetime) -> list:
 
     Returns:
         list: Ordered list of 18 values, one per column in _TRADE_COLUMNS.
+
+    Raises:
+        ValueError: For a result whose pair type is not "time_series"
+            (scanner.leg_sides). select_portfolio refuses such a pair before
+            any order, so a run hands this none.
     """
     spec = result.spec
     pair = spec.pair
@@ -339,9 +348,8 @@ def _result_to_row(result: TradeResult, run_ts: datetime) -> list:
     mB   = display_title(pair.market_b)
     # Which side each market's leg bought — the only source of truth for sides
     side_a, side_b = leg_sides(pair.pair_type)
-    # nB is a traded leg price only for time-series pairs; for same-title it
-    # is reporting-only and would just be noise in the Notes cell
-    nb_note = f" nB={pair.nB:.4f}" if pair.pair_type == "time_series" else ""
+    # nB, the traded NO-leg price, recorded only here
+    nb_note = f" nB={pair.nB:.4f}"
     # fees=... makes a row self-describing: _append_locked writes headers only
     # when CREATING the file, so a pre-existing shared trade_log.xlsx keeps the
     # old "Total Cost ($)" header above a column whose values are now
@@ -912,9 +920,9 @@ def write_dev_simulation(
 
     # ── Sheet 2: All Candidates ────────────────────────────
     ws_cands = wb.create_sheet("All Candidates")
-    # nB is the traded NO-leg price of a time-series pair (reporting-only for
-    # same-title); "Price Diff" is the price gap each pair type is judged on —
-    # the later leg's premium pB − pA for time-series, pA − pB for same-title.
+    # nB is the traded NO-leg price of a time-series pair; "Price Diff" is the
+    # price gap the time-series finder judges a pair on — the later leg's
+    # premium pB − pA.
     cand_headers = [
         ("Pair Type", 14),
         ("Market A", 45), ("Ticker A", 18),
@@ -935,10 +943,9 @@ def write_dev_simulation(
 
     for pair in all_candidates:
         row_idx = ws_cands.max_row + 1
-        # The gap each pair type is judged on: a time-series candidate needs
-        # the LATER contract's YES ask above the earlier's; a same-title pair
-        # has market_a (the pricier side) above market_b
-        diff    = pair.pB - pair.pA if pair.pair_type == "time_series" else pair.pA - pair.pB
+        # The gap the time-series finder judges a pair on (it forms no other
+        # kind): the LATER contract's YES ask above the earlier's
+        diff    = pair.pB - pair.pA
         row_data = [
             pair.pair_type,
             display_title(pair.market_a), pair.market_a.ticker,
@@ -1016,7 +1023,9 @@ class TradeRecord:
             "rolled_back", "rollback_failed" or "manual_review"; see
             TradeResult), or "unknown" when it could not be read.
         error (str | None): The trader's one-line error, if any.
-        pair_type (str | None): "same_title" or "time_series".
+        pair_type (str | None): "time_series", the only type trade_record
+            describes; in the record report_trades keeps for a pair it could
+            not describe, whatever type that pair names (None if unreadable).
         title (str | None): The pair's title.
         a (LegRecord | None): Market A's leg; None only when it could not be described.
         b (LegRecord | None): Market B's leg; None only when it could not be described.
@@ -1257,8 +1266,9 @@ def trade_record(result: TradeResult) -> TradeRecord:
     Raises:
         Exception: Whatever reading the result raises when its spec, pair or
             figures cannot be read (an AttributeError, TypeError, ValueError
-            or KeyError in practice); report_trades catches it and keeps a
-            record of what could be read instead.
+            or KeyError in practice; a ValueError for a pair of any type but
+            time-series, from scanner.leg_sides); report_trades catches it
+            and keeps a record of what could be read instead.
     """
     spec = result.spec
     pair = spec.pair

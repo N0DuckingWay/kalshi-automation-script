@@ -37,7 +37,6 @@ from kalshi_betting.config import (
     MIN_PRICE_DIFF_SHORT_GAP,
     PRICE_EPSILON,
     PROJECT_ROOT,
-    SAME_TITLE_LEG_SIDES,
     SCHEDULED_RUN,
     SHORT_DEADLINE_GAP_DAYS,
     SPREAD_ABOVE_CEILING,
@@ -336,17 +335,13 @@ class TestTimeSeriesProfitProb:
 
 
 class TestLegSideTuples:
-    def test_same_title_buys_no_on_a_yes_on_b(self):
-        assert SAME_TITLE_LEG_SIDES == ("no", "yes")
-
     def test_time_series_buys_yes_on_earlier_no_on_later(self):
         assert TIME_SERIES_LEG_SIDES == ("yes", "no")
 
-    def test_each_pair_type_has_exactly_one_no_leg(self):
-        # The trader submits "the NO leg" first and unwinds it — every pair
-        # type must have exactly one, and one YES leg to hedge it
-        for sides in (SAME_TITLE_LEG_SIDES, TIME_SERIES_LEG_SIDES):
-            assert sorted(sides) == ["no", "yes"]
+    def test_the_time_series_sides_have_exactly_one_no_leg(self):
+        # The trader submits "the NO leg" first and unwinds it, so the sides
+        # must hold exactly one, and one YES leg to hedge it
+        assert sorted(TIME_SERIES_LEG_SIDES) == ["no", "yes"]
 
 
 class TestV2SelfTradePrevention:
@@ -1917,7 +1912,7 @@ class TestMaxKellyFraction:
     def test_a_time_series_pair_is_the_cap_and_any_other_type_zero(self):
         s = _settings()
         assert max_kelly_fraction("time_series", s) == 0.20
-        # pair_size_cap caps any other type at 0
+        # Any other type is never sized
         assert max_kelly_fraction("same_title", s) == 0.0
 
     def test_no_cap_time_series_is_one_minus_k_rounded(self):
@@ -1938,6 +1933,21 @@ class TestMaxKellyFraction:
             for cap in (0.05, 0.2, 1.0):
                 s = _settings(interval_discount=k, size_cap=cap)
                 assert max_kelly_fraction(pair_type, s) == 0.0, (pair_type, k, cap)
+
+    @pytest.mark.parametrize("pair_type", [None, "bogus", "", "same_title", "Time_Series",
+                                           MagicMock().pair_type],
+                             ids=["none", "bogus", "empty", "same_title", "capitalised", "mock"])
+    def test_another_type_is_zero_by_its_own_rule_whatever_its_cap(self, monkeypatch,
+                                                                    pair_type):
+        # max_kelly_fraction refuses any other type itself, before it reads a
+        # cap: a pair_size_cap that handed every type the per-trade cap would
+        # still leave such a pair at 0, while a time-series pair keeps its bound
+        monkeypatch.setattr(config, "pair_size_cap", lambda pair_type, size_cap: size_cap)
+        for k in (0.6, 0.8, 1.0):
+            for cap in (0.05, 0.2, 1.0):
+                s = _settings(interval_discount=k, size_cap=cap)
+                assert max_kelly_fraction(pair_type, s) == 0.0, (pair_type, k, cap)
+                assert max_kelly_fraction("time_series", s) == min(cap, round(1.0 - k, 12))
 
     def test_the_round_is_what_keeps_the_count(self):
         s = _settings(interval_discount=0.8, size_cap=1.0)
@@ -2294,12 +2304,24 @@ class TestHeldPairWinProb:
     pair and a new one are never judged by two models.
     """
 
-    def test_a_same_title_pair_has_the_fixed_chance(self):
-        assert config.held_pair_win_prob("same_title", 0.5, 0.5, 0.5, 0.5, 0.8) \
-            == config.SAME_TITLE_CO_RESOLVE_PROB
-        # Anything but the exact string "time_series" is same-title, whatever the quotes
-        assert config.held_pair_win_prob(None, float("nan"), 0, 0, 0, 0.8) \
-            == config.SAME_TITLE_CO_RESOLVE_PROB
+    @pytest.mark.parametrize("pair_type", ["same_title", None, "", "bogus", "Time_Series",
+                                           MagicMock().pair_type],
+                             ids=["same_title", "none", "empty", "bogus", "capitalised", "mock"])
+    def test_any_other_pair_type_has_no_chance_to_read(self, monkeypatch, pair_type):
+        # Control: a time-series pair on these quotes has a chance
+        quotes = (0.22, 0.80, 0.63, 0.40)
+        assert config.held_pair_win_prob("time_series", *quotes, 0.8) is not None
+        # Any other type has none, whatever the quotes and k (even ones that
+        # are not numbers), and the model is never read for it
+
+        def unread(*args, **kwargs):
+            raise AssertionError("the model was read for a pair that is not time-series")
+
+        monkeypatch.setattr(config, "time_series_mid_spread", unread)
+        monkeypatch.setattr(config, "time_series_profit_prob", unread)
+        for case in (quotes, (0.5, 0.5, 0.5, 0.5), (float("nan"), 0, 0, 0)):
+            for k in (0.8, float("nan")):
+                assert config.held_pair_win_prob(pair_type, *case, k) is None, (case, k)
 
     def test_a_time_series_pair_reads_the_mid_spread(self):
         quotes = (0.22, 0.80, 0.63, 0.40)

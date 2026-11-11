@@ -15,14 +15,16 @@ Purpose:
     ("price ON <date>"), whose probabilities do not nest and which the date
     stripping would otherwise collapse into one group. It then checks the
     live order book to replace best-ask prices with depth-weighted fill
-    prices and confirm the edge survives real liquidity. The pricing, side
-    and fee helpers also read a same-title pair (two identically worded
-    markets on two different series, bought NO on the pricier and YES on the
-    cheaper), a pair type no finder forms.
+    prices and confirm the edge survives real liquidity. The bot trades
+    time-series pairs only: pricing from the order book (_enrich_pair), the
+    last price check before an order (validate_pair_price) and the check of
+    what an add-on buys (HeldPair.matches) refuse any other pair type, with
+    one WARNING each, and the side helpers (leg_sides, leg_prices) raise
+    ValueError for one, which only a bug can hand them.
 
 Dependencies:
-    Imports constants, the leg-side tuples, fee helpers and the live toggles
-    (LiveSettings and the helpers that read it) from config.py, and the
+    Imports constants, the time-series leg sides, fee helpers and the live
+    toggles (LiveSettings and the helpers that read it) from config.py, and the
     retry/raw-fetch helpers and api_error_summary (describes a failed
     order-book read in one line) from _http.py. Exports the CandidatePair and
     ApiMarket dataclasses, the leg helpers leg_sides()/leg_prices()/
@@ -72,7 +74,9 @@ Dependencies:
     two identically worded markets never are); for main._run_prod,
     get_resting_orders (a run trims nothing while an order rests). For
     seller.plan_add_ons, get_fill_times too and listed_ask (a held market's
-    ask as this run's market list shows it).
+    ask as this run's market list shows it). pair_log_name names a pair in
+    the WARNING that refuses it for not being time-series, here and in
+    strategy.compute_trade and strategy.select_portfolio.
     Depends on the KalshiClient produced by auth.py.
 
 Notes:
@@ -179,8 +183,6 @@ from .config import (
     ORDERS_PAGE_SIZE,
     POSITION_PAGE_SIZE,
     PRICE_EPSILON,
-    SAME_TITLE_LEG_SIDES,
-    SAME_TITLE_MIN_PRICE_DIFF,
     SCANNER_MAX_PAGES,
     SCANNER_PROGRESS_LOG_EVERY_PAGES,
     SETTLEMENT_PAGE_SIZE,
@@ -885,17 +887,31 @@ class HeldPair:
         """
         Say whether a candidate buys what is held, each held market on its held side.
 
+        The bot trades time-series pairs only, and nothing forms any other
+        kind, so a candidate of another type is refused first, with one
+        WARNING naming the held tickers and the type, before its markets or
+        sides are read.
+
         Args:
             market_a (Any): The candidate's market A, once its legs are ordered.
             market_b (Any): The candidate's market B.
-            pair_type (str): Its type; leg_sides says which side each leg buys.
+            pair_type (str): Its type; anything but "time_series" is refused.
+                leg_sides says which side each leg buys.
 
         Returns:
-            bool: For an exact pair, True when the two tickers are this
-                pair's and each leg buys the side held on it. For a lone leg,
-                True when one of the two tickers is the held market and its
-                leg buys the side held there (the other market is new).
+            bool: False for any pair type but time-series. For an exact pair,
+                True when the two tickers are this pair's and each leg buys
+                the side held on it. For a lone leg, True when one of the two
+                tickers is the held market and its leg buys the side held
+                there (the other market is new).
         """
+        # A candidate of another type is a bug and adds to nothing
+        if pair_type != "time_series":
+            logging.warning(
+                "Not adding to the held position on %s: the candidate's type is %r, "
+                "not a time-series pair, and the bot trades time-series pairs only",
+                " / ".join(str(ticker) for ticker, _side in self.sides), pair_type)
+            return False
         side_a, side_b = leg_sides(pair_type)
         ticker_a = getattr(market_a, "ticker", None)
         ticker_b = getattr(market_b, "ticker", None)
@@ -915,8 +931,8 @@ def pair_held(pair: Any) -> "HeldPair | None":
     Return the held pair a candidate adds to, or None for an ordinary candidate.
 
     Read by type, never truthiness: a MagicMock pair's auto-attribute is
-    truthy (the rule _depth_levels and leg_sides follow), and must not make
-    an ordinary pair an add-on.
+    truthy (the rule _depth_levels follows), and must not make an ordinary
+    pair an add-on.
 
     Args:
         pair (Any): A CandidatePair, or anything standing in for one.
@@ -973,16 +989,11 @@ class CandidatePair:
     A candidate pair of correlated markets with a detectable price gap.
 
     Which side each leg buys, and therefore which two of the four quoted
-    prices are LEG prices, depends on pair_type — read them through
-    leg_sides() / leg_prices(), never by position:
+    prices are LEG prices, comes from pair_type — read them through
+    leg_sides() / leg_prices(), never by position. Both accept only a
+    time-series pair (the only kind find_time_series_pairs forms) and raise
+    ValueError for any other pair_type:
 
-      same_title:  NO on market_a (the pricier side by YES ask) at nA, YES on
-                   market_b (the cheaper side) at pB: two identically worded
-                   markets on two DIFFERENT event series. Both legs pay when
-                   the two identical questions co-resolve, so the trade is a
-                   near-arbitrage priced on the SAME_TITLE_CO_RESOLVE_PROB
-                   prior. No finder forms one: find_time_series_pairs forms
-                   time_series pairs only.
       time_series: YES on market_a (the EARLIER contract) at pA, NO on
                    market_b (the later one) at nB. "Earlier" means earlier by
                    close_time for a cross-event pair, and earlier by STATED
@@ -1002,28 +1013,23 @@ class CandidatePair:
                    config.time_series_profit_prob).
 
     Attributes:
-        market_a (Any): same_title: the market with the higher YES ask (the
-            expensive side). time_series: the earlier contract — by close_time
-            for a cross-event pair, by STATED deadline for a same-event
-            ladder (DR-73).
-        market_b (Any): same_title: the market with the lower YES ask (the
-            cheap side). time_series: the later contract, by the same
-            ordering.
+        market_a (Any): The earlier contract — by close_time for a
+            cross-event pair, by STATED deadline for a same-event ladder
+            (DR-73).
+        market_b (Any): The later contract, by the same ordering.
         pA (float): YES ask price of market A in dollars (cost to buy YES on A).
-            Range: [0, 1]. A leg price for time_series; reporting-only for
-            same_title.
+            Range: [0, 1]. A leg price: the YES leg's.
         pB (float): YES ask price of market B in dollars (what a YES contract
-            on market B costs). Range: [0, 1]. A leg price for same_title; for
-            time_series it is not a leg price: the spread rule tests it
-            against pA (in the finder, and again on the fresh book in
-            enrichment), and the forecast reads mid_spread rather than it,
-            though mid_spread reads the same quote at half weight (it is one
-            of the two quotes the later market's midpoint averages), a quote
-            neither leg buys from.
+            on market B costs). Range: [0, 1]. Not a leg price: the spread
+            rule tests it against pA (in the finder, and again on the fresh
+            book in enrichment), and the forecast reads mid_spread rather
+            than it, though mid_spread reads the same quote at half weight
+            (it is one of the two quotes the later market's midpoint
+            averages), a quote neither leg buys from.
         nA (float): NO ask price of market A in dollars (what a NO contract on
-            market A costs). Range: [0, 1]. A leg price for same_title; reporting-only for
-            time_series (still read so the prod log's "nA (NO ask)" column
-            stays meaningful). On the live path a time_series pair's nA stays
+            market A costs). Range: [0, 1]. Reporting-only (still read so the
+            prod log's "nA (NO ask)" column stays meaningful). On the live
+            path a time_series pair's nA stays
             the finder's scan-time quote: enrichment refreshes pB but not nA,
             so that column is not the earlier market's NO ask the forecast
             read off its book. Of a run's outputs, only the "Trade computed"
@@ -1031,23 +1037,20 @@ class CandidatePair:
             candidate's nA is that Monday's quote, the one its forecast reads.
         tradeable (bool): True when the two LEG prices sum to less than
             1 - fee_per_pair_approx(leg prices) — i.e. a win scenario pays more
-            than the pair costs — and, for time_series, pB > pA. Neither pair
-            type's flag is a settlement guarantee: same-title rests on the
-            co-resolution prior, time-series on the in-between probability
-            being overstated.
+            than the pair costs — and pB > pA. The flag is no settlement
+            guarantee: a time-series pair profits only when the in-between
+            probability is overstated.
         canonical_title (str): Grouping key used to identify the pair — the
-            normalized title+outcome key (scanner.time_series_group_key) for
-            time-series pairs, raw title for same-title pairs.
-        pair_type (str): Strategy variant: "time_series" for pairs differing only in deadline,
-            "same_title" for pairs with identical title/subtitle across different event tickers.
+            normalized title+outcome key (scanner.time_series_group_key).
+        pair_type (str): Strategy variant: "time_series" for pairs differing
+            only in deadline, the only type the bot trades. The side helpers
+            (leg_sides, leg_prices) raise ValueError for any other.
         max_contracts (int): How many contracts the pair's written leg prices
             are valid for — the affordability-bounded qualifying depth set by
             enrich_with_orderbook_prices(). 0 means NOT ENRICHED (uncapped);
             enrichment never writes 0, dropping such a pair instead.
         nB (float): NO ask price of market B in dollars (cost to buy NO on B).
-            Range: [0, 1]. A leg price for time_series; populated fail-soft
-            (0.0 when unparseable) for same_title, where it is reporting-only
-            and never priced.
+            Range: [0, 1]. A leg price: the NO leg's.
         stated_gap_days (int | None): For a same-event ladder (DR-73), the
             calendar-day gap between the two legs' STATED deadlines — the gap
             that ordered the legs, chose the price tier and was checked
@@ -1079,20 +1082,20 @@ class CandidatePair:
             writes it from the tops of the two order books it fetched, once it
             has priced the pair at its fills and found a YES ask on the later
             book; the backtest writes it from that Monday's candle quotes.
-            None before that, and always None for same_title. The finder
-            never sets it. Read it through pair_mid_spread(), by type: the
-            sizer refuses a time-series pair without a usable one.
+            None before that. The finder never sets it. Read it through
+            pair_mid_spread(), by type: the sizer refuses a time-series pair
+            without a usable one.
     """
-    market_a: Any           # same_title: pricier side by YES ask | time_series: EARLIER contract (close_time, or STATED deadline for a DR-73 ladder)
-    market_b: Any           # same_title: cheaper side by YES ask  | time_series: the later one, by the same ordering
+    market_a: Any           # EARLIER contract (close_time, or STATED deadline for a DR-73 ladder)
+    market_b: Any           # the later one, by the same ordering
     pA: float               # yes_ask_dollars of A (cost to buy YES on A) — a LEG price for time_series
-    pB: float               # yes_ask_dollars of B (cost of a YES contract on B) — a LEG price for same_title
-    nA: float               # no_ask_dollars of A  (cost of a NO contract on A)  — a LEG price for same_title
+    pB: float               # yes_ask_dollars of B (cost of a YES contract on B) — not a leg price
+    nA: float               # no_ask_dollars of A  (cost of a NO contract on A)  — reporting-only
     tradeable: bool         # True when a win scenario pays more than the leg prices + approx fees
-    canonical_title: str    # grouping key (normalized for time-series, raw for same-title)
-    pair_type: str          # "time_series" | "same_title"
+    canonical_title: str    # grouping key (scanner.time_series_group_key)
+    pair_type: str          # "time_series", the only type the side helpers accept
     max_contracts: int = 0  # qualifying contracts from order book (0 = not yet enriched)
-    nB: float = 0.0         # no_ask_dollars of B (cost to buy NO on B) — a LEG price for time_series; reporting-only for same_title
+    nB: float = 0.0         # no_ask_dollars of B (cost to buy NO on B) — a LEG price for time_series
     # Qualifying (price_a, price_b, qty) depth in MARKET order, ascending by
     # combined price; () = not enriched. Read via prefix_fill_prices().
     depth_levels: tuple[tuple[float, float, float], ...] = ()
@@ -1107,8 +1110,8 @@ class CandidatePair:
     # A time-series pair's later market's YES midpoint minus the earlier
     # one's (config.time_series_mid_spread), the forecast's input: written by
     # enrichment from the tops of both books, and by the backtest from that
-    # Monday's candle quotes; None until then and for same_title. Read via
-    # pair_mid_spread(), by type.
+    # Monday's candle quotes; None until then. Read via pair_mid_spread(), by
+    # type.
     mid_spread: float | None = None
 
 
@@ -1116,23 +1119,29 @@ def leg_sides(pair_type: str) -> tuple[str, str]:
     """
     Return which side each leg of a pair buys, as (side on market_a, side on market_b).
 
-    Time-series pairs buy YES on the earlier contract (market_a) and NO on the
-    later one (market_b); same-title pairs buy NO on the pricier contract
-    (market_a) and YES on the cheaper (market_b). Anything other than the exact
-    string "time_series" — including None or a test double's auto-attribute —
-    resolves to the same-title sides, so a pair whose type is unknown can never
-    be silently traded as the directional time-series bet.
+    A time-series pair buys YES on the earlier contract (market_a) and NO on
+    the later one (market_b), config.TIME_SERIES_LEG_SIDES. The bot trades
+    time-series pairs only, and every place a pair comes in refuses any other
+    type before this is read (enrichment, the price check before an order,
+    the add-on check, sizing and the portfolio pick live; held_pair_kind
+    for trims; the backtest's entry refusal; the saved-results format the
+    dashboard reads), so any other pair_type — None and a test double's
+    auto-attribute included — is a bug, and raises rather than being given
+    sides.
 
     Args:
-        pair_type (str): CandidatePair.pair_type — "time_series" or "same_title".
+        pair_type (str): CandidatePair.pair_type; only "time_series" is accepted.
 
     Returns:
-        tuple[str, str]: config.TIME_SERIES_LEG_SIDES for time-series pairs,
-            config.SAME_TITLE_LEG_SIDES otherwise. Each element is "yes" or "no".
+        tuple[str, str]: config.TIME_SERIES_LEG_SIDES, ("yes", "no").
+
+    Raises:
+        ValueError: For any pair_type but the exact string "time_series".
     """
-    if pair_type == "time_series":
-        return TIME_SERIES_LEG_SIDES
-    return SAME_TITLE_LEG_SIDES
+    if pair_type != "time_series":
+        # Reached only by a bug: every entry point refuses other types first
+        raise ValueError(f"not a time-series pair type: {pair_type!r}")
+    return TIME_SERIES_LEG_SIDES
 
 
 def leg_prices(pair: Any) -> tuple[float, float]:
@@ -1140,24 +1149,31 @@ def leg_prices(pair: Any) -> tuple[float, float]:
     Return the per-contract cost of the side actually bought on each leg.
 
     This is the only mapping from a pair's four quoted prices to the two prices
-    the pipeline sizes, fees and submits against: (nA, pB) for a same-title pair
-    (NO on market_a, YES on market_b) and (pA, nB) for a time-series pair (YES on
-    market_a, NO on market_b). Reads nB directly rather than defaulting it — a
-    real CandidatePair always carries it, and a mock that lacks it should fail
-    loudly instead of pricing a leg at a placeholder.
+    the pipeline sizes, fees and submits against: (pA, nB) for a time-series
+    pair (YES on market_a, NO on market_b, the sides leg_sides gives). Reads nB
+    directly rather than defaulting it — a real CandidatePair always carries
+    it, and a mock that lacks it should fail loudly instead of pricing a leg at
+    a placeholder.
 
     Args:
-        pair (Any): A CandidatePair (or an object exposing pair_type, pA, pB,
-            nA and nB). pair_type is read fail-safe: anything other than
-            "time_series" is treated as same-title (see leg_sides).
+        pair (Any): A CandidatePair (or an object exposing pair_type, pA and
+            nB). pair_type is read with a default of None, so a pair that
+            carries none raises ValueError like any other type but
+            time-series, never AttributeError.
 
     Returns:
         tuple[float, float]: (price of the leg on market_a, price of the leg on
             market_b), dollars in (0, 1).
+
+    Raises:
+        ValueError: For any pair_type but the exact string "time_series"
+            (see leg_sides).
     """
-    if getattr(pair, "pair_type", None) == "time_series":
-        return pair.pA, pair.nB
-    return pair.nA, pair.pB
+    pair_type = getattr(pair, "pair_type", None)
+    if pair_type != "time_series":
+        # Reached only by a bug: every entry point refuses other types first
+        raise ValueError(f"not a time-series pair type: {pair_type!r}")
+    return pair.pA, pair.nB
 
 
 def market_fee_multiplier(market: Any) -> float:
@@ -1206,15 +1222,20 @@ def _side_fee_multipliers(pair: Any) -> tuple[float, float]:
     Return the fee multipliers of the pair's YES leg and NO leg, in that (SIDE) order.
 
     Enrichment and validate_pair_price work in SIDE order, (yes_price,
-    no_price) levels, so each side is mapped here to the market it is bought
-    on (leg_sides): the YES leg is market_a for a time-series pair and
-    market_b for a same-title pair.
+    no_price) levels, so each side is mapped here to the market leg_sides
+    puts it on. leg_sides accepts only a time-series pair and gives its
+    legs, so the YES leg's multiplier is market_a's and the NO leg's is
+    market_b's.
 
     Args:
         pair (Any): A CandidatePair.
 
     Returns:
         tuple[float, float]: (YES leg's multiplier, NO leg's multiplier).
+
+    Raises:
+        ValueError: For any pair type but time-series (leg_sides); both
+            callers refuse such a pair before they get here.
     """
     mult_a, mult_b = leg_fee_multipliers(pair)
     side_a, _side_b = leg_sides(getattr(pair, "pair_type", None))
@@ -1260,9 +1281,9 @@ def pair_gap_days(pair: Any) -> int:
 
     The stated gap is read by TYPE, not truthiness: a genuine 0-day stated gap
     is falsy, and bool is deliberately not accepted (type(True) is bool, not
-    int), the same fail-safe-by-type rule leg_sides() and
-    strategy._depth_levels() follow — anything that is not exactly an int
-    (a MagicMock's auto-attribute, None, a float) falls back to close_time.
+    int), the same fail-safe-by-type rule strategy._depth_levels() follows —
+    anything that is not exactly an int (a MagicMock's auto-attribute, None,
+    a float) falls back to close_time.
 
     Args:
         pair (Any): A CandidatePair, or any object exposing market_a/market_b
@@ -1691,8 +1712,8 @@ def _field_phrasing(text: Any) -> str | None:
         text (Any): One of a market's wording fields (event title, market
             title, or outcome label). Anything that is not a non-empty str
             reads as absent rather than raising — the same fail-safe-by-type
-            rule leg_sides and strategy._depth_levels follow, and the case is
-            real: historical._market_to_dict stores subtitle as
+            rule strategy._depth_levels follows, and the case is real:
+            historical._market_to_dict stores subtitle as
             `m.get("subtitle") or m.get("yes_sub_title")`, which is None when
             both are absent.
 
@@ -2209,8 +2230,8 @@ def _span_deadline(span: Any) -> date | None:
 
     Args:
         span (Any): One deadline phrase. A non-str reads as absent rather than
-            raising — the same fail-safe-by-type rule leg_sides and
-            strategy._depth_levels follow.
+            raising — the same fail-safe-by-type rule strategy._depth_levels
+            follows.
 
     Returns:
         date | None: The last calendar day the deadline includes, or None when
@@ -2468,9 +2489,9 @@ def same_event_ladder(deadline_a: Any, deadline_b: Any) -> tuple | str | None:
     Args:
         deadline_a (Any): First rung's last included day, from stated_deadline().
             Anything that is not exactly a date reads as unreadable rather than
-            raising — the fail-safe-by-type rule leg_sides follows. datetime is
-            a date subclass and is deliberately excluded: mixing the two raises
-            TypeError on subtraction.
+            raising — the fail-safe-by-type rule strategy._depth_levels follows.
+            datetime is a date subclass and is deliberately excluded: mixing
+            the two raises TypeError on subtraction.
         deadline_b (Any): Second rung's, same shape.
 
     Returns:
@@ -2551,7 +2572,7 @@ def time_series_group_key(combined_title: str, subtitle: Any) -> str:
     (pinned by AST in tests/test_strategy.py; a two-link chain on the
     backtester side). Fail-safe on a non-string subtitle (a MagicMock's
     auto-attribute, None from an old cache record): treated as absent, never
-    raised on — the same rule leg_sides and strategy._depth_levels follow.
+    raised on — the same rule strategy._depth_levels follows.
 
     Args:
         combined_title (str): The pair_key() of the market — "<event_title> |
@@ -5748,9 +5769,9 @@ def _pair_ticker(pair: Any, attr: str) -> str:
     Read one of a pair's market tickers without assuming the market is there.
 
     Used only to name a market in a log line. _leg_ask_levels and
-    _reference_yes_ask are deliberately tolerant of a bare pair stub (the same
-    fail-safe rule leg_sides applies to an unknown pair_type), so a missing
-    market must degrade to a placeholder rather than raise inside the scan.
+    _reference_yes_ask are deliberately tolerant of a bare pair stub that
+    carries no market, so a missing market must degrade to a placeholder
+    rather than raise inside the scan.
 
     Args:
         pair (Any): A CandidatePair or any stub exposing market_a/market_b.
@@ -5760,6 +5781,30 @@ def _pair_ticker(pair: Any, attr: str) -> str:
         str: The market's ticker, or "<unknown>" when it cannot be read.
     """
     return getattr(getattr(pair, attr, None), "ticker", "<unknown>")
+
+
+def pair_log_name(pair: Any) -> str:
+    """
+    Name a pair in a log line: its title in quotes, or its two tickers when it has none.
+
+    The refusals of a pair that is not time-series (_enrich_pair,
+    validate_pair_price, strategy.compute_trade and strategy.select_portfolio)
+    name the pair with it. Each refusal meets a pair only through a bug, so it
+    must name even a malformed one without raising: a pair whose
+    canonical_title is not a non-empty string is named by its two tickers
+    (_pair_ticker, "<unknown>" for a market that cannot be read).
+
+    Args:
+        pair (Any): A CandidatePair, or anything standing in for one.
+
+    Returns:
+        str: The canonical title in single quotes, or "<market A's ticker> /
+            <market B's ticker>".
+    """
+    title = getattr(pair, "canonical_title", None)
+    if isinstance(title, str) and title:
+        return f"'{title}'"
+    return f"{_pair_ticker(pair, 'market_a')} / {_pair_ticker(pair, 'market_b')}"
 
 
 def _bids_to_ask_levels(bids_raw: list, ticker: str = "<unknown>") -> list[tuple[float, float]]:
@@ -5928,12 +5973,10 @@ def _leg_ask_levels(
     buy fills against the NO bids (YES ask = 1 - NO bid), both via
     _bids_to_ask_levels. Which market carries which leg comes from
     leg_sides(pair.pair_type), so this is the single place the book sides are
-    chosen for enrich_with_orderbook_prices and validate_pair_price:
-
-      same_title  (NO on A, YES on B): NO asks from A's YES bids, YES asks
-                                       from B's NO bids — today's behaviour.
-      time_series (YES on A, NO on B): NO asks from B's YES bids, YES asks
-                                       from A's NO bids.
+    chosen for enrich_with_orderbook_prices and validate_pair_price, and
+    neither hardcodes which market carries the NO leg. leg_sides accepts
+    only a time-series pair and gives its legs, YES on A and NO on B, so the
+    NO asks come from B's YES bids and the YES asks from A's NO bids.
 
     Args:
         pair (Any): CandidatePair (or anything exposing pair_type) whose legs
@@ -5947,9 +5990,14 @@ def _leg_ask_levels(
             [(ask_price, qty), ...] list as produced by _bids_to_ask_levels —
             exactly the two arguments _pair_orderbooks takes. Either may be
             empty when the relevant side has no resting bids.
+
+    Raises:
+        ValueError: For any pair type but time-series (leg_sides), before
+            either book is read; both callers refuse such a pair first.
     """
     # Map each market to the side bought there; the only source of truth for
-    # which market carries the NO leg is config's side tuples via leg_sides
+    # which market carries the NO leg is config.TIME_SERIES_LEG_SIDES, via
+    # leg_sides
     side_a, _side_b = leg_sides(getattr(pair, "pair_type", None))
     if side_a == "no":
         # NO on A consumes A's YES bids; YES on B consumes B's NO bids
@@ -5964,31 +6012,35 @@ def _reference_yes_ask(pair: Any, ob_a: dict, ob_b: dict) -> float | None:
     """
     Best YES ask on the market that does NOT carry the pair's YES leg.
 
-    Each pair type buys YES on one market and NO on the other, so exactly one
+    A pair buys YES on one market and NO on the other, so exactly one
     market's YES ask is a LEG price; the OTHER market's YES ask is the pair's
-    reference quote: pB for time_series, which the spread rule tests and the
-    mid spread reads, and pA for same_title, which is only reported. _leg_ask_levels
-    reads only one side of each book, which leaves the side that yields this
-    quote fetched but unused — so deriving it here costs no extra request.
+    reference quote: pB for a time-series pair, which the spread rule tests
+    and the mid spread reads. _leg_ask_levels reads only one side of each
+    book, which leaves the side that yields this quote fetched but unused —
+    so deriving it here costs no extra request.
 
     A YES ask is the complement of a resting NO bid, so the reference comes
     from the non-YES-leg market's NO bids via _bids_to_ask_levels.
 
     Args:
         pair (Any): CandidatePair (or anything exposing pair_type); only
-            pair_type is read, via leg_sides, so an unknown type resolves to
-            the same-title sides exactly as leg_sides specifies.
+            pair_type is read, via leg_sides, which accepts only
+            "time_series".
         ob_a (dict): market_a's parsed book from _fetch_orderbook —
             {"yes": [[price, qty], ...], "no": [...]} (bids, dollar strings).
         ob_b (dict): market_b's parsed book, same shape.
 
     Returns:
         float | None: The lowest YES ask on the non-YES-leg market, or None
-            when that side carries no usable resting bids: a same-title pair
-            keeps its scan-time value, a time-series pair is dropped.
+            when that side carries no usable resting bids, which drops the
+            time-series pair.
+
+    Raises:
+        ValueError: For any pair type but time-series (leg_sides), before
+            either book is read; both callers refuse such a pair first.
     """
     # leg_sides is the only source of truth for which market carries the YES
-    # leg: YES on A for time_series, YES on B for same_title
+    # leg: YES on A for a time-series pair
     side_a, _side_b = leg_sides(getattr(pair, "pair_type", None))
     ob_ref = ob_b if side_a == "yes" else ob_a
     ref_ticker = _pair_ticker(pair, "market_b" if side_a == "yes" else "market_a")
@@ -6248,11 +6300,11 @@ def _pair_max_sum(pair: Any, settings: LiveSettings) -> float:
     Return the maximum allowed yes_price + no_price sum for one pair's orderbook
     depth levels — the complement of the pair's minimum price-gap threshold.
 
-    The sum is over the two LEG prices (the YES leg's YES ask plus the NO leg's
-    NO ask, whichever markets those sit on). same_title pairs use the flat
-    SAME_TITLE_MIN_PRICE_DIFF threshold (sum <= 1 - SAME_TITLE_MIN_PRICE_DIFF).
-    time_series pairs use 1 - the run's entry floor
-    (config.live_time_series_floor), the leg-price-sum ceiling
+    It is read only for time-series pairs: its two callers, _enrich_pair and
+    validate_pair_price, refuse any other pair type before they read it. The
+    sum is over the two LEG prices (the YES leg's YES ask plus the NO leg's
+    NO ask, whichever markets those sit on), and the ceiling is 1 - the run's
+    entry floor (config.live_time_series_floor), the leg-price-sum ceiling
     backtester._find_entry applies. With the tier floors on that floor is
     max(tier, band floor); at no band, sum <= 1 - MIN_PRICE_DIFF_SHORT_GAP when the
     deadlines are <= SHORT_DEADLINE_GAP_DAYS apart, sum <= 1 -
@@ -6262,21 +6314,19 @@ def _pair_max_sum(pair: Any, settings: LiveSettings) -> float:
     its own 1 - threshold.
 
     Args:
-        pair (CandidatePair): The pair whose ceiling is needed.
+        pair (CandidatePair): The time-series pair whose ceiling is needed.
         settings (LiveSettings): The run's toggles.
 
     Returns:
         float: Maximum qualifying yes_price + no_price sum (dollars, 0-1).
     """
-    if pair.pair_type == "time_series":
-        # Tier the ceiling by the same deadline gap used at candidate
-        # detection — the STATED gap for a same-event ladder, close_time
-        # otherwise (DR-73). Re-deriving it from close_time here would
-        # re-tier a ladder the finder already tiered.
-        gap_days = pair_gap_days(pair)
-        # The floor config.time_series_spread_refusal applies, so the two agree
-        return 1.0 - live_time_series_floor(gap_days, settings)
-    return 1.0 - SAME_TITLE_MIN_PRICE_DIFF
+    # Tier the ceiling by the same deadline gap used at candidate
+    # detection — the STATED gap for a same-event ladder, close_time
+    # otherwise (DR-73). Re-deriving it from close_time here would
+    # re-tier a ladder the finder already tiered.
+    gap_days = pair_gap_days(pair)
+    # The floor config.time_series_spread_refusal applies, so the two agree
+    return 1.0 - live_time_series_floor(gap_days, settings)
 
 
 def _levels_with_edge_after_fee(qualifying: list, *, yes_multiplier: float = 1.0,
@@ -6330,9 +6380,11 @@ def _cash_binds(portfolio_value_cents: int, bound: float, cash_cents: int | None
 
 
 # Why _enrich_pair refused a pair. A refused time-series spread is named by
-# config's SPREAD_* code instead. UNAFFORDABLE: the budget cannot buy one
-# contract pair; THIN_BOOK: it can, but the book holds under one contract at
-# the gap.
+# config's SPREAD_* code instead. NOT_TIME_SERIES: the pair is of another
+# type, which the bot never trades, refused before its books are read;
+# UNAFFORDABLE: the budget cannot buy one contract pair; THIN_BOOK: it can,
+# but the book holds under one contract at the gap.
+ENRICH_NOT_TIME_SERIES = "not a time-series pair"
 ENRICH_NO_EDGE_AFTER_FEE = "no edge after fee"
 ENRICH_NO_QUALIFYING = "no qualifying levels"
 ENRICH_UNAFFORDABLE = "unaffordable"
@@ -6349,9 +6401,12 @@ def _enrich_pair(
     """
     Price one pair off its two order books, as live enrichment does.
 
-    Matches the two legs' asks level by level, keeps the levels under the
-    pair's price-sum ceiling that still have an edge after the fee, and prices
-    each leg at its average fill over the most contracts the largest Kelly
+    The bot trades time-series pairs only, and nothing forms any other kind,
+    so a pair of another type is refused first, before either book is read,
+    with one WARNING (ENRICH_NOT_TIME_SERIES). A time-series pair has its two
+    legs' asks matched level by level; the levels under the pair's price-sum
+    ceiling that still have an edge after the fee are kept, and each leg is
+    priced at its average fill over the most contracts the largest Kelly
     share could buy (never more than the cash). A time-series pair also needs
     a YES ask on the later book, neither book crossed (a crossed book's YES
     ask sits below its own YES bid), and a spread the run's spread rule
@@ -6369,7 +6424,8 @@ def _enrich_pair(
     enrich_with_orderbook_prices fetches the books and calls it once per pair.
 
     Args:
-        pair (CandidatePair): A tradeable pair.
+        pair (CandidatePair): A tradeable time-series pair; any other pair type
+            is refused.
         ob_a (dict): market_a's book, {"yes": YES bids, "no": NO bids}, in dollars.
         ob_b (dict): market_b's book, the same shape.
         portfolio_value_cents (int): Cash plus open positions' value, in cents.
@@ -6382,20 +6438,30 @@ def _enrich_pair(
 
     Returns:
         tuple[CandidatePair, str | None]: The re-priced pair, and why it was
-            refused (an ENRICH_* code, or config's SPREAD_* code for a refused
-            spread; the first check that failed). None when it is tradeable.
+            refused (an ENRICH_* code — ENRICH_NOT_TIME_SERIES for a pair of
+            another type, returned with only tradeable changed — or config's
+            SPREAD_* code for a refused spread; the first check that failed).
+            None when it is tradeable.
     """
+    # The bot trades time-series pairs only, and nothing forms any other kind:
+    # a pair of another type here is a bug, refused before its books are read
+    if pair.pair_type != "time_series":
+        log(logging.WARNING,
+            "Pair %s not priced from its order books: its type is %r, not a "
+            "time-series pair, and the bot trades time-series pairs only",
+            pair_log_name(pair), pair.pair_type)
+        return dc_replace(pair, tradeable=False), ENRICH_NOT_TIME_SERIES
+
     # Derive the ask levels each leg would consume — each buy fills against
     # the OPPOSITE-side bids of ITS OWN market, and which market carries the
-    # NO leg depends on the pair type (see _leg_ask_levels)
+    # NO leg comes from leg_sides (see _leg_ask_levels)
     no_levels, yes_levels = _leg_ask_levels(pair, ob_a, ob_b)
 
     # Merge-pair the NO and YES depth levels into (yes_price, no_price, qty) tuples
     paired     = _pair_orderbooks(no_levels, yes_levels)
 
-    # Keep only contract pairs where the combined fill price leaves the required
-    # gap: same_title requires >= SAME_TITLE_MIN_PRICE_DIFF; time_series requires
-    # the run's entry floor — see _pair_max_sum for the exact ceilings.
+    # Keep only contract pairs whose combined fill price leaves the run's
+    # entry floor — see _pair_max_sum for the exact ceiling.
     max_sum    = _pair_max_sum(pair, settings)
     qualifying = [
         (yp, np_, qty)
@@ -6450,13 +6516,11 @@ def _enrich_pair(
         # — the sub-one-contract hole that overloaded sentinel used to have.
         # Both figures are named because they are different faults with
         # different fixes (add funds vs. the book is too thin), and the
-        # binding one is whichever is smaller. A time-series pair's bound of 0
-        # gets its own wording: only 1 - k rounding to 0 (k = 1) makes one,
-        # since its per-trade cap is never 0. Any other pair type always has a
-        # bound of 0 (config.pair_size_cap caps it at 0), so one that gets this
-        # far is always dropped here, with the plain wording.
+        # binding one is whichever is smaller. A bound of 0 gets its own
+        # wording: only 1 - k rounding to 0 (k = 1) makes one, since a
+        # time-series pair's per-trade cap is never 0.
         why = ""
-        if bound == 0 and pair.pair_type == "time_series":
+        if bound == 0:
             why = (
                 f"; the per-trade bound is 0 (k = {settings.interval_discount:.2f}: "
                 "time-series Kelly cannot be positive)"
@@ -6483,83 +6547,79 @@ def _enrich_pair(
 
     # Why the pair is refused, the first check that fails (None: tradeable)
     refused = None
-    # Time-series only: same_title's model is the fixed co-resolution prior,
-    # so its pA is not a model input and there is no clamp to protect
-    is_time_series = leg_sides(pair.pair_type) == TIME_SERIES_LEG_SIDES
     direction_ok = True
-    if is_time_series:
-        # pair_gap_days: a same-event ladder is tiered on its STATED gap (DR-73)
-        gap = pair_gap_days(pair)
-        # The earlier market's best NO ask (1 - its best YES bid), from the
-        # YES-bid side of its book: one of the two sides neither leg buys
-        # from (the other, the later market's NO bids, gives ref_yes above).
-        # Read for its midpoint and the crossed-book check below. 1.0 (a bid
-        # of 0) when it has none, which can only lower its midpoint
-        a_no_asks = _bids_to_ask_levels(ob_a["yes"], _pair_ticker(pair, "market_a"))
-        no_ask_a = a_no_asks[0][0] if a_no_asks else 1.0
-        # The earlier market's best YES ask: the top of the YES leg's levels
-        yes_ask_a = yes_levels[0][0]
-        if ref_yes is None:
-            # Nothing prices the in-between mass now: with no YES ask on the
-            # later book there is no midpoint for it, so no mid spread for the
-            # forecast and no fresh quote for the spread rule. Fail CLOSED.
-            # backtester._find_entry does not mirror this (CLAUDE.md: "Known
-            # residual of the live spread rule").
-            direction_ok = False
-            refused = ENRICH_NO_REFERENCE
+    # pair_gap_days: a same-event ladder is tiered on its STATED gap (DR-73)
+    gap = pair_gap_days(pair)
+    # The earlier market's best NO ask (1 - its best YES bid), from the
+    # YES-bid side of its book: one of the two sides neither leg buys
+    # from (the other, the later market's NO bids, gives ref_yes above).
+    # Read for its midpoint and the crossed-book check below. 1.0 (a bid
+    # of 0) when it has none, which can only lower its midpoint
+    a_no_asks = _bids_to_ask_levels(ob_a["yes"], _pair_ticker(pair, "market_a"))
+    no_ask_a = a_no_asks[0][0] if a_no_asks else 1.0
+    # The earlier market's best YES ask: the top of the YES leg's levels
+    yes_ask_a = yes_levels[0][0]
+    if ref_yes is None:
+        # Nothing prices the in-between mass now: with no YES ask on the
+        # later book there is no midpoint for it, so no mid spread for the
+        # forecast and no fresh quote for the spread rule. Fail CLOSED.
+        # backtester._find_entry does not mirror this (CLAUDE.md: "Known
+        # residual of the live spread rule").
+        direction_ok = False
+        refused = ENRICH_NO_REFERENCE
+        log(logging.WARNING,
+            "Pair '%s' dropped: the later contract has no YES ask on its book "
+            "(no resting NO bids), so nothing prices its in-between mass now",
+            pair.canonical_title)
+    elif ref_yes + no_levels[0][0] < 1.0 - PRICE_EPSILON:
+        # no_levels[0][0] is the later market's best NO ask, 1 - its best
+        # YES bid; a YES ask below that bid is a crossed book. Its midpoint
+        # then sits below its YES bid, and Kelly could exceed 1 - k
+        # (config.max_kelly_fraction relies on this check)
+        direction_ok = False
+        refused = ENRICH_CROSSED
+        log(logging.WARNING,
+            "Pair '%s' dropped: the later contract's YES ask %.4f sits below "
+            "its own YES bid %.4f — a crossed book",
+            pair.canonical_title, ref_yes, 1.0 - no_levels[0][0])
+    elif yes_ask_a + no_ask_a < 1.0 - PRICE_EPSILON:
+        # The earlier market's YES ask below its own YES bid (1 - no_ask_a):
+        # a crossed book, whose midpoint sits above its YES ask, and Kelly
+        # could exceed 1 - k (config.max_kelly_fraction relies on this check)
+        direction_ok = False
+        refused = ENRICH_CROSSED
+        log(logging.WARNING,
+            "Pair '%s' dropped: the earlier contract's YES ask %.4f sits below "
+            "its own YES bid %.4f — a crossed book",
+            pair.canonical_title, yes_ask_a, 1.0 - no_ask_a)
+    else:
+        # Positivity and the floor are tested on the YES-ask gap at the
+        # YES leg's fill (the prefix average the order pays), the ceiling
+        # on the TOP of the book. Past the guards above, the price-sum
+        # ceiling implies the floor to within 2 * PRICE_EPSILON and the
+        # edge cut leaves a spread above the fee, so only the ceiling is
+        # live here; the other two stay as defence (TS-34).
+        basis = f"fresh reference ask {ref_yes:.4f}"
+        refusal = time_series_spread_refusal(ref_yes - avg_yes, gap, settings)
+        if refusal is None:
+            refusal = time_series_spread_refusal(
+                ref_yes - qualifying[0][0], gap, settings)
+        direction_ok = refusal is None
+        refused = refusal
+        if refusal == SPREAD_NOT_POSITIVE:
             log(logging.WARNING,
-                "Pair '%s' dropped: the later contract has no YES ask on its book "
-                "(no resting NO bids), so nothing prices its in-between mass now",
-                pair.canonical_title)
-        elif ref_yes + no_levels[0][0] < 1.0 - PRICE_EPSILON:
-            # no_levels[0][0] is the later market's best NO ask, 1 - its best
-            # YES bid; a YES ask below that bid is a crossed book. Its midpoint
-            # then sits below its YES bid, and Kelly could exceed 1 - k
-            # (config.max_kelly_fraction relies on this check)
-            direction_ok = False
-            refused = ENRICH_CROSSED
+                "Pair '%s' dropped: the later contract no longer prices above "
+                "the YES leg fill %.4f — %s", pair.canonical_title, avg_yes, basis)
+        elif refusal == SPREAD_BELOW_FLOOR:
             log(logging.WARNING,
-                "Pair '%s' dropped: the later contract's YES ask %.4f sits below "
-                "its own YES bid %.4f — a crossed book",
-                pair.canonical_title, ref_yes, 1.0 - no_levels[0][0])
-        elif yes_ask_a + no_ask_a < 1.0 - PRICE_EPSILON:
-            # The earlier market's YES ask below its own YES bid (1 - no_ask_a):
-            # a crossed book, whose midpoint sits above its YES ask, and Kelly
-            # could exceed 1 - k (config.max_kelly_fraction relies on this check)
-            direction_ok = False
-            refused = ENRICH_CROSSED
+                "Pair '%s' dropped: pB - pA %.4f at the YES leg fill is under the "
+                "%.2f entry floor — %s", pair.canonical_title, ref_yes - avg_yes,
+                live_time_series_floor(gap, settings), basis)
+        elif refusal == SPREAD_ABOVE_CEILING:
             log(logging.WARNING,
-                "Pair '%s' dropped: the earlier contract's YES ask %.4f sits below "
-                "its own YES bid %.4f — a crossed book",
-                pair.canonical_title, yes_ask_a, 1.0 - no_ask_a)
-        else:
-            # Positivity and the floor are tested on the YES-ask gap at the
-            # YES leg's fill (the prefix average the order pays), the ceiling
-            # on the TOP of the book. Past the guards above, the price-sum
-            # ceiling implies the floor to within 2 * PRICE_EPSILON and the
-            # edge cut leaves a spread above the fee, so only the ceiling is
-            # live here; the other two stay as defence (TS-34).
-            basis = f"fresh reference ask {ref_yes:.4f}"
-            refusal = time_series_spread_refusal(ref_yes - avg_yes, gap, settings)
-            if refusal is None:
-                refusal = time_series_spread_refusal(
-                    ref_yes - qualifying[0][0], gap, settings)
-            direction_ok = refusal is None
-            refused = refusal
-            if refusal == SPREAD_NOT_POSITIVE:
-                log(logging.WARNING,
-                    "Pair '%s' dropped: the later contract no longer prices above "
-                    "the YES leg fill %.4f — %s", pair.canonical_title, avg_yes, basis)
-            elif refusal == SPREAD_BELOW_FLOOR:
-                log(logging.WARNING,
-                    "Pair '%s' dropped: pB - pA %.4f at the YES leg fill is under the "
-                    "%.2f entry floor — %s", pair.canonical_title, ref_yes - avg_yes,
-                    live_time_series_floor(gap, settings), basis)
-            elif refusal == SPREAD_ABOVE_CEILING:
-                log(logging.WARNING,
-                    "Pair '%s' dropped: pB - pA %.4f at the top of the book exceeds "
-                    "the spread band's %g ceiling — %s", pair.canonical_title,
-                    ref_yes - qualifying[0][0], settings.spread_band[1], basis)
+                "Pair '%s' dropped: pB - pA %.4f at the top of the book exceeds "
+                "the spread band's %g ceiling — %s", pair.canonical_title,
+                ref_yes - qualifying[0][0], settings.spread_band[1], basis)
 
     # Re-validate tradeability at the depth-weighted prices (the pair may still be
     # unprofitable if all qualifying contracts are at the edge of the gap threshold).
@@ -6577,33 +6637,22 @@ def _enrich_pair(
 
     new_tradeable = profitable and direction_ok
 
-    # Replace the LEG prices and contract count with depth-accurate values,
-    # writing back to whichever fields are the leg prices for this pair type
-    # (nA/pB for same_title, pA/nB for time_series — the fields
-    # leg_prices() reads); strategy.py sizes the final Kelly trade on them
-    if leg_sides(pair.pair_type) == TIME_SERIES_LEG_SIDES:
-        leg_updates = {"pA": avg_yes, "nB": avg_no}
-        # pB is the later market's YES ask, not a leg price: written fresh
-        # from the book, the quote the spread rule above tested. Left alone
-        # when None, which has dropped the pair above.
-        if ref_yes is not None:
-            leg_updates["pB"] = ref_yes
-            # The mid spread at the tops of both books, the input the sizer's
-            # forecast reads (DR-78): the later market's YES ask and NO ask,
-            # and the earlier one's, read above (config.time_series_mid_spread,
-            # the one definition)
-            leg_updates["mid_spread"] = time_series_mid_spread(
-                yes_ask_a, no_ask_a, ref_yes, no_levels[0][0])
-    else:
-        leg_updates = {"nA": avg_no, "pB": avg_yes}
-        # Mirror: pA is same_title's reference quote. Nothing sizes on it
-        # (_kelly_p uses the fixed co-resolution prior here) and it is NOT
-        # guarded above, but it is the operand of the reported pA - pB
-        # "Price Diff", which otherwise subtracts a scan-time quote from a
-        # depth-weighted fill and can print a negative gap for a pair whose
-        # market A had the higher YES ask. Refreshed for coherence.
-        if ref_yes is not None:
-            leg_updates["pA"] = ref_yes
+    # Replace the LEG prices and contract count with depth-accurate values:
+    # pA (the YES leg, on the earlier market) and nB (the NO leg, on the
+    # later one), the fields leg_prices() reads; strategy.py sizes the final
+    # Kelly trade on them
+    leg_updates = {"pA": avg_yes, "nB": avg_no}
+    # pB is the later market's YES ask, not a leg price: written fresh
+    # from the book, the quote the spread rule above tested. Left alone
+    # when None, which has dropped the pair above.
+    if ref_yes is not None:
+        leg_updates["pB"] = ref_yes
+        # The mid spread at the tops of both books, the input the sizer's
+        # forecast reads (DR-78): the later market's YES ask and NO ask,
+        # and the earlier one's, read above (config.time_series_mid_spread,
+        # the one definition)
+        leg_updates["mid_spread"] = time_series_mid_spread(
+            yes_ask_a, no_ask_a, ref_yes, no_levels[0][0])
     return dc_replace(
         pair,
         tradeable=new_tradeable,
@@ -6635,8 +6684,10 @@ def enrich_with_orderbook_prices(
     market shows no YES ask, either market's YES ask sits below its own YES
     bid (a crossed book), or the spread rule refuses it. A time-series pair
     priced at its fills with a YES ask on the later book also carries its mid
-    spread (mid_spread), which the sizer's forecast reads. A pair that fails
-    a check is marked tradeable=False.
+    spread (mid_spread), which the sizer's forecast reads. _enrich_pair
+    refuses a pair of any other type, with one WARNING, before it reads the
+    books (the bot trades time-series pairs only). A pair that fails a check
+    is marked tradeable=False.
 
     Args:
         client (Any): Kalshi client used to fetch order books (each fetched once per call).
@@ -6704,14 +6755,18 @@ def validate_pair_price(client: Any, spec: Any, *, settings: LiveSettings | None
     Re-fetch both order books for a TradeSpec immediately before execution and
     confirm the gap threshold still holds at the required contract depth.
 
-    Returns True only if qualifying depth >= spec.x contracts remain at the
-    pair's price-sum ceiling (_pair_max_sum), over the levels that keep an
-    edge after the fee (_levels_with_edge_after_fee). A time-series pair also
-    fails CLOSED with no YES ask on the later book and is refused above the
-    band's ceiling on the fresh top of book; the price-sum ceiling implies the
-    floor on an uncrossed book. A False result means prices have moved since the
-    scan and the trade should be skipped. Every False return is logged here,
-    once, at WARNING, with its reason — callers must not log the drop again.
+    The bot trades time-series pairs only, and nothing forms any other kind,
+    so a pair of another type is refused first, before the settings are
+    resolved or either book is fetched. Otherwise it returns True only if
+    qualifying depth >= spec.x contracts remain at the pair's price-sum
+    ceiling (_pair_max_sum), over the levels that keep an edge after the fee
+    (_levels_with_edge_after_fee). The pair also fails CLOSED with no YES ask
+    on the later book and is refused above the band's ceiling on the fresh
+    top of book; the price-sum ceiling implies the floor on an uncrossed
+    book. A False result means prices have moved since the scan (or the pair
+    is not time-series) and the trade should be skipped. Every False return
+    is logged here, once, at WARNING, with its reason — callers must not log
+    the drop again.
 
     Args:
         client: Authenticated KalshiClient from auth.build_client().
@@ -6721,9 +6776,19 @@ def validate_pair_price(client: Any, spec: Any, *, settings: LiveSettings | None
             live run hands the run's settings).
 
     Returns:
-        bool: True if the pair still qualifies; False if prices moved or order
-            books are unavailable.
+        bool: True if the pair still qualifies; False if it is not a
+            time-series pair, prices moved or order books are unavailable.
     """
+    # The bot trades time-series pairs only, and nothing forms any other kind:
+    # a pair of another type at the last check before its orders is a bug,
+    # refused before either book is fetched
+    if spec.pair.pair_type != "time_series":
+        logging.warning(
+            "Pre-execution check failed for %s — its type is %r, not a time-series "
+            "pair, and the bot trades time-series pairs only; dropping",
+            pair_log_name(spec.pair), spec.pair.pair_type)
+        return False
+
     # The run's toggles, or config's when none are handed in
     settings = live_settings() if settings is None else settings
     pair   = spec.pair
@@ -6738,7 +6803,7 @@ def validate_pair_price(client: Any, spec: Any, *, settings: LiveSettings | None
         return False
 
     # Same side selection as enrichment: each leg consumes its own market's
-    # opposite-side bids, and the NO leg's market depends on the pair type
+    # opposite-side bids, and the NO leg's market comes from leg_sides
     no_levels, yes_levels = _leg_ask_levels(pair, ob_a, ob_b)
     paired     = _pair_orderbooks(no_levels, yes_levels)
     # The scan-time price-sum ceiling: the trade must still qualify now
@@ -6770,23 +6835,22 @@ def validate_pair_price(client: Any, spec: Any, *, settings: LiveSettings | None
             "keeps an edge after the fee; dropping", pair.canonical_title)
         return False
 
-    if leg_sides(pair.pair_type) == TIME_SERIES_LEG_SIDES:
-        ref_now = _reference_yes_ask(pair, ob_a, ob_b)
-        if ref_now is None:
-            # Fail CLOSED, as enrichment does: nothing prices the in-between mass
-            logging.warning(
-                "Pre-execution check failed for '%s' — the later contract has no YES "
-                "ask on its book now; dropping", pair.canonical_title)
-            return False
-        # The band's ceiling on the fresh top of book, as enrichment tests it
-        spread = ref_now - qualifying[0][0]
-        if (time_series_spread_refusal(spread, pair_gap_days(pair), settings)
-                == SPREAD_ABOVE_CEILING):
-            logging.warning(
-                "Pre-execution check failed for '%s' — pB - pA %.4f at the top of the "
-                "book now exceeds the spread band's %g ceiling; dropping",
-                pair.canonical_title, spread, settings.spread_band[1])
-            return False
+    ref_now = _reference_yes_ask(pair, ob_a, ob_b)
+    if ref_now is None:
+        # Fail CLOSED, as enrichment does: nothing prices the in-between mass
+        logging.warning(
+            "Pre-execution check failed for '%s' — the later contract has no YES "
+            "ask on its book now; dropping", pair.canonical_title)
+        return False
+    # The band's ceiling on the fresh top of book, as enrichment tests it
+    spread = ref_now - qualifying[0][0]
+    if (time_series_spread_refusal(spread, pair_gap_days(pair), settings)
+            == SPREAD_ABOVE_CEILING):
+        logging.warning(
+            "Pre-execution check failed for '%s' — pB - pA %.4f at the top of the "
+            "book now exceeds the spread band's %g ceiling; dropping",
+            pair.canonical_title, spread, settings.spread_band[1])
+        return False
 
     # Require enough depth for the full contract count at or under each leg's
     # limit price (TS-08): a fill-or-kill order buys nothing resting above its

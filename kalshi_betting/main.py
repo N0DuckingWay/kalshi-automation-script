@@ -835,18 +835,16 @@ def _print_portfolio(portfolio: list, label: str) -> None:
 
     Legs are rendered in MARKET order (A then B) with the side bought on each
     market next to its count — e.g. "5× YES(A) + 5× NO(B)" for a time-series
-    pair, "5× NO(A) + 5× YES(B)" for a same-title pair. The sides come from
-    scanner.leg_sides, never from the pair type by hand. Each line also names
-    both tickers: a time-series pair's canonical title now ends with the
-    outcome label (scanner.time_series_group_key) and the 55-character cut
-    applied below drops it, so two strikes of one daily family would otherwise
-    log an identical line (DR-17). "profit if won" is
-    spec.min_payoff: the guaranteed floor for a same-title pair, and the
-    profit in either winning settlement of a time-series pair (event by A, or
-    never by B) — the in-between settlement loses the whole stake. A trade
-    that adds to a pair the account already holds (scanner.pair_held) ends
-    " — adds to N held", N being the contracts held on each market; every
-    other line is unchanged.
+    pair. The sides come from scanner.leg_sides, never from the pair type by
+    hand. Each line also names both tickers: a time-series pair's canonical
+    title now ends with the outcome label (scanner.time_series_group_key) and
+    the 55-character cut applied below drops it, so two strikes of one daily
+    family would otherwise log an identical line (DR-17). "profit if won" is
+    spec.min_payoff: the profit in either winning settlement of a time-series
+    pair (event by A, or never by B) — the in-between settlement loses the
+    whole stake. A trade that adds to a pair the account already holds
+    (scanner.pair_held) ends " — adds to N held", N being the contracts held
+    on each market; every other line is unchanged.
 
     Args:
         portfolio (list): List of TradeSpec objects representing the trades
@@ -856,6 +854,10 @@ def _print_portfolio(portfolio: list, label: str) -> None:
 
     Returns:
         None
+
+    Raises:
+        ValueError: For a spec whose pair type is not "time_series"
+            (scanner.leg_sides); select_portfolio refuses such a spec first.
     """
     logging.info("%s %d trade(s):", label, len(portfolio))
     for spec in portfolio:
@@ -1139,6 +1141,11 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
 
     Returns:
         None
+
+    Raises:
+        ValueError: For a selected pair whose type is not "time_series"
+            (scanner.leg_sides); compute_trade refuses such a pair, so it
+            never has a spec.
     """
     rows = []
     for pair in candidate_pairs:
@@ -1185,7 +1192,7 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
             f"{priced.pA:.2%}",
             f"{priced.pB:.2%}",
             # The NO ask of market B — the traded NO-leg price of a time-series
-            # pair (depth-weighted after enrichment); reporting-only for same-title
+            # pair (depth-weighted after enrichment)
             f"{priced.nB:.2%}",
             "YES ✓" if pair.tradeable else "no",
             trade_str,

@@ -1,9 +1,9 @@
 """Tests for strategy.py Kelly sizing and portfolio selection.
 
-Time-series pairs buy YES on the earlier contract (market_a, at pA) and NO on
-the later one (market_b, at nB); same-title pairs buy NO on market_a (nA) and
-YES on market_b (pB). Every fixture therefore carries a REAL float nB — a
-MagicMock auto-attribute would TypeError inside compute_trade's arithmetic.
+Time-series pairs, the only kind the sizer takes, buy YES on the earlier
+contract (market_a, at pA) and NO on the later one (market_b, at nB). Every
+fixture therefore carries a REAL float nB — a MagicMock auto-attribute would
+TypeError inside compute_trade's arithmetic.
 """
 import ast
 import dataclasses
@@ -12,7 +12,9 @@ import inspect
 import json
 import logging
 import random
+import re
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -30,7 +32,6 @@ from kalshi_betting import (
     trader,
 )
 from kalshi_betting.config import (
-    SAME_TITLE_CO_RESOLVE_PROB,
     LiveSettings,
     fee_leg_exact,
     fee_per_pair_approx,
@@ -55,6 +56,19 @@ from kalshi_betting.strategy import TradeSpec, _kelly_p, compute_trade, select_p
 # buys), so an ample balance makes it never bind and these tests keep exercising
 # the depth path alone. Tests that mean to exercise the cap set their own.
 _AMPLE_BALANCE_CENTS = 100_000_000
+
+# Pair types that are not time-series, each refused where pairs come in: the
+# retired same-title type, a missing type, an empty one, an unknown one and a
+# test double's auto-attribute
+_OTHER_PAIR_TYPES = ["same_title", None, "", "bogus", MagicMock().pair_type]
+_OTHER_PAIR_TYPE_IDS = ["same_title", "none", "empty", "bogus", "mock"]
+
+
+def _must_not_run(name: str):
+    """A stand-in for `name` that fails the test if anything calls it."""
+    def fail(*args, **kwargs):
+        raise AssertionError(f"{name} ran after the refusal")
+    return fail
 
 
 # make_pair / make_booked_pair's default: read a time-series pair's mid spread
@@ -82,11 +96,11 @@ def make_pair(
     scanner.leg_prices reads it directly for time-series pairs.
 
     nA defaults to 1 - pA for time_series, so market A's quotes are a book with
-    no width, and to 0.20 for same_title (its NO leg). A time-series pair's
-    mid_spread, the input its forecast reads, defaults to
-    config.time_series_mid_spread over the four quotes, as enrichment writes it
-    from the tops of the books; pass a value (None included) to set it
-    instead. A same-title pair's is None.
+    no width, and to 0.20 for any other type (a pair the sizer refuses before
+    it reads a quote). A time-series pair's mid_spread, the input its
+    forecast reads, defaults to config.time_series_mid_spread over the four
+    quotes, as enrichment writes it from the tops of the books; pass a value
+    (None included) to set it instead. Any other type's is None.
     """
     if nA is None:
         nA = 1.0 - pA if pair_type == "time_series" else 0.20
@@ -128,12 +142,15 @@ def make_booked_pair(
     the wrong path entirely.
 
     levels are (price_a, price_b, qty) in MARKET order, ascending by combined
-    price — the shape enrichment writes. The scalar leg prices default to the
-    BEST level, and max_contracts to the full depth, which is what enrichment
-    would have written for a balance large enough not to bind. For a
-    time-series pair nA defaults to 1 - pA (market A's book with no width) and
-    mid_spread to config.time_series_mid_spread over the four scalar quotes,
-    the tops of the books, as enrichment writes it; pass either to set it.
+    price — the shape enrichment writes, here a time-series pair's: YES on
+    market A at pA and NO on market B at nB. The scalar leg prices default to
+    the BEST level, and max_contracts to the full depth, which is what
+    enrichment would have written for a balance large enough not to bind. nA
+    defaults to 1 - pA (market A's book with no width) and mid_spread to
+    config.time_series_mid_spread over the four scalar quotes, the tops of the
+    books, as enrichment writes it; pass either to set it. pair_type only
+    labels the pair, so a refusal test can hand the sizer these very books
+    under another type.
     """
     depth = tuple(levels)
     best_a, best_b, _ = depth[0]
@@ -143,16 +160,10 @@ def make_booked_pair(
                          exchange_index=0)
     mB = SimpleNamespace(ticker="B1", title="B", close_time=now + timedelta(days=30),
                          exchange_index=0)
-    if pair_type == "time_series":
-        pA_v, nB_v = (best_a if pA is None else pA), (best_b if nB is None else nB)
-        nA_v, pB_v = (1.0 - pA_v if nA is None else nA), pB
-        if mid_spread is _FROM_QUOTES:
-            mid_spread = config.time_series_mid_spread(pA_v, nA_v, pB_v, nB_v)
-    else:
-        nA_v, pB_v = best_a, best_b
-        pA_v, nB_v = (0.70 if pA is None else pA), (0.70 if nB is None else nB)
-        if mid_spread is _FROM_QUOTES:
-            mid_spread = None
+    pA_v, nB_v = (best_a if pA is None else pA), (best_b if nB is None else nB)
+    nA_v, pB_v = (1.0 - pA_v if nA is None else nA), pB
+    if mid_spread is _FROM_QUOTES:
+        mid_spread = config.time_series_mid_spread(pA_v, nA_v, pB_v, nB_v)
     return CandidatePair(
         market_a=mA, market_b=mB,
         pA=pA_v, pB=pB_v, nA=nA_v,
@@ -219,9 +230,9 @@ def _ts_kelly_fraction(pA: float, pB: float, nB: float, nA: float | None = None)
 
 @pytest.mark.usefixtures("pre_toggle_defaults")
 class TestKellyP:
-    """Probability-of-profit models: the discounted mid spread for time-series
-    (config.time_series_profit_prob) and the fixed co-resolution prior for
-    same-title, at k 0.75 (pre_toggle_defaults)."""
+    """The probability-of-profit model: the discounted mid spread for a
+    time-series pair (config.time_series_profit_prob), at k 0.75
+    (pre_toggle_defaults), and no forecast at all for any other pair type."""
 
     def test_time_series_discounted_gap_model(self):
         # Both books have no width (nA defaults to 1 - pA), so the mid spread
@@ -238,14 +249,22 @@ class TestKellyP:
         pair = make_pair(pA=0.30, pB=0.60, nB=0.40, pair_type="time_series")
         assert _kelly_p(pair, live_settings()) != pytest.approx(1.0 - 0.30 * (1.0 - 0.60))
 
-    def test_same_title_fixed_prior(self):
-        pair = make_pair(pA=0.80, pB=0.40, pair_type="same_title")
-        assert _kelly_p(pair, live_settings()) == SAME_TITLE_CO_RESOLVE_PROB
-
-    def test_same_title_ignores_prices(self):
-        pair_high = make_pair(pA=0.90, pB=0.80, pair_type="same_title")
-        pair_low = make_pair(pA=0.10, pB=0.05, pair_type="same_title")
-        assert _kelly_p(pair_high, live_settings()) == _kelly_p(pair_low, live_settings())
+    @pytest.mark.parametrize("pair_type", _OTHER_PAIR_TYPES, ids=_OTHER_PAIR_TYPE_IDS)
+    def test_any_other_pair_type_has_no_forecast(self, monkeypatch, pair_type):
+        # Control: as time-series pairs, two pairs on different quotes (books
+        # with no width, so mid spreads of 0.30 and 0.10) have a forecast
+        pairs = [make_pair(pA=0.30, pB=0.60, nB=0.40), make_pair(pA=0.10, pB=0.20, nB=0.80)]
+        assert [_kelly_p(pair, live_settings()) for pair in pairs] == [
+            pytest.approx(1.0 - 0.75 * 0.30), pytest.approx(1.0 - 0.75 * 0.10)]
+        # As any other type each has none, at every k, and neither the mid
+        # spread nor the model is read for it
+        for name in ("pair_mid_spread", "time_series_profit_prob"):
+            monkeypatch.setattr(strategy, name, _must_not_run(name))
+        for pair in pairs:
+            pair.pair_type = pair_type
+            assert _kelly_p(pair, live_settings()) is None
+            for k in (0.4, 0.75, 1.0):
+                assert strategy._kelly_p_at(pair, k) is None, k
 
 
 @pytest.mark.usefixtures("pre_toggle_defaults")
@@ -261,6 +280,40 @@ class TestComputeTrade:
     def test_returns_none_when_not_tradeable(self):
         pair = make_pair(tradeable=False)
         assert compute_trade(pair, 100_000) is None
+
+    @pytest.mark.parametrize("quiet", [False, True], ids=["loud", "quiet"])
+    @pytest.mark.parametrize("pair_type", _OTHER_PAIR_TYPES, ids=_OTHER_PAIR_TYPE_IDS)
+    def test_a_pair_that_is_not_time_series_is_refused_first(self, caplog, monkeypatch,
+                                                              pair_type, quiet):
+        # A booked pair the sizer buys as a time-series pair (the control)
+        booked = make_booked_pair([(_TS_PA, _TS_NB, 100)], pB=_TS_PB)
+        assert compute_trade(booked, 1_000_000) is not None
+        # As any other type it is refused before anything else: before the
+        # settings are resolved (none are handed in) and before any size is
+        # priced or any add-on line logged
+        for name in ("live_settings", "pair_mid_spread", "_depth_levels", "_evaluate_size",
+                     "_solve_marginal_size", "_log_no_add_on"):
+            monkeypatch.setattr(strategy, name, _must_not_run(name))
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            assert compute_trade(dataclasses.replace(booked, pair_type=pair_type), 1_000_000,
+                                 quiet=quiet) is None
+        # One WARNING, quiet or not, naming the pair and its type: no
+        # "Trade computed" line
+        assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
+            (logging.WARNING,
+             f"Pair 'booked pair' not sized: its type is {pair_type!r}, not a time-series "
+             "pair, and the bot trades time-series pairs only")]
+
+    def test_a_refused_pair_with_no_title_is_named_by_its_tickers(self, caplog):
+        pair = dataclasses.replace(make_booked_pair([(_TS_PA, _TS_NB, 100)], pB=_TS_PB),
+                                   pair_type="same_title", canonical_title="")
+        with caplog.at_level(logging.WARNING):
+            assert compute_trade(pair, 1_000_000) is None
+        [record] = caplog.records
+        assert record.getMessage() == (
+            "Pair A1 / B1 not sized: its type is 'same_title', not a time-series pair, "
+            "and the bot trades time-series pairs only")
 
     def test_returns_none_when_no_spread(self):
         # pA + nB = 0.50 + 0.50 = 1.0 means zero gross spread: a contract pair
@@ -575,15 +628,8 @@ class TestComputeTradeSettings:
     it to every internal helper, and resolves config.py's only when handed none.
     "The default" is pre_toggle_defaults' (k 0.75, a 20% cap)."""
 
-    _ST = {"nA": 0.20, "pB": 0.30, "pair_type": "same_title"}
     _TS_WIDE = {"pA": 0.30, "pB": 0.85, "nA": 0.70, "nB": 0.15, "pair_type": "time_series"}
     _TS = {"pA": _TS_PA, "pB": _TS_PB, "nA": _TS_NA, "nB": _TS_NB, "pair_type": "time_series"}
-
-    @staticmethod
-    def _st_f() -> float:
-        fee = fee_per_pair_approx(0.20, 0.30)
-        net = 0.50 - fee
-        return SAME_TITLE_CO_RESOLVE_PROB - (1 - SAME_TITLE_CO_RESOLVE_PROB) * (0.50 + fee) / net
 
     def test_the_reference_pairs(self):
         assert _ts_kelly_fraction(0.30, 0.85, 0.15) == pytest.approx(0.2163, abs=1e-4)
@@ -635,23 +681,27 @@ class TestComputeTradeSettings:
         # _kelly_p reads the same k
         assert strategy._kelly_p(pair, _live(k=0.6)) == pytest.approx(at_06.kelly_p)
 
-    def test_a_pair_that_is_not_time_series_sizes_nothing(self):
-        # pair_size_cap caps any other type at 0, so even the same-title
-        # reference pair, whose f* on the co-resolution prior is about 0.89,
-        # has no budget and is refused, at every per-trade cap
-        assert self._st_f() == pytest.approx(0.8945, abs=1e-4)
-        st, ts = make_pair(**self._ST), make_pair(**self._TS_WIDE)
+    @pytest.mark.parametrize("pair_type", _OTHER_PAIR_TYPES, ids=_OTHER_PAIR_TYPE_IDS)
+    def test_a_pair_that_is_not_time_series_sizes_nothing(self, pair_type):
+        # compute_trade refuses any pair that is not time-series before it
+        # sizes it, so no per-trade cap sizes one: not even on the quotes and
+        # mid spread the time-series pair beside it sizes on at every cap
+        ts = make_pair(**self._TS_WIDE)
+        other = make_pair(**{**self._TS_WIDE, "pair_type": pair_type},
+                          mid_spread=ts.mid_spread)
         for cap in (0.05, 0.10, 0.20, 0.35, 1.0):
             s = _live(cap=cap)
-            assert compute_trade(st, 1_000_000, settings=s) is None, cap
+            assert compute_trade(other, 1_000_000, settings=s) is None, cap
             # ... while the time-series pair sizes at min(cap, f*)
             assert compute_trade(ts, 1_000_000, settings=s).kelly_fraction == pytest.approx(
                 min(cap, _ts_kelly_fraction(0.30, 0.85, 0.15))), cap
-        # ... on the booked path too
-        booked = make_booked_pair([(0.20, 0.30, 1_000_000.0)], pair_type="same_title")
-        assert compute_trade(booked, 1_000_000, settings=_live(cap=1.0)) is None
+        # ... on the booked path too: the same books size as a time-series pair
+        booked = make_booked_pair([(0.30, 0.15, 1_000_000.0)], pB=0.85)
+        assert compute_trade(booked, 1_000_000, settings=_live(cap=1.0)) is not None
+        assert compute_trade(dataclasses.replace(booked, pair_type=pair_type), 1_000_000,
+                             settings=_live(cap=1.0)) is None
         # ... and with no settings handed, from config.py's
-        assert compute_trade(st, 1_000_000) is None
+        assert compute_trade(other, 1_000_000) is None
 
     def test_none_is_config_pys_settings_read_at_call_time(self, monkeypatch):
         for kwargs in (self._TS_WIDE, self._TS):
@@ -1224,6 +1274,33 @@ class TestComputeTradeAddsToHeldPair:
         assert sizes == {4.0: 22, 8.0: 16, 12.0: 11}
         assert plain.x == 28 and plain.total_cost_with_fees <= 150.0
 
+    @pytest.mark.parametrize("pair_type", _OTHER_PAIR_TYPES, ids=_OTHER_PAIR_TYPE_IDS)
+    @pytest.mark.parametrize("path", ["bookless", "booked"])
+    def test_an_add_on_of_another_type_gets_one_warning_and_no_add_on_line(
+            self, caplog, path, pair_type):
+        # Worth $30 at today's prices, plus $0.90 of fees, against 10% of a
+        # $211 portfolio: as a time-series pair it already holds its Kelly
+        # share, and says so (the control)
+        held = _held_pair(value=30.0)
+        ts = self._bookless(held) if path == "bookless" else self._booked(held, qty=1000)
+        with caplog.at_level(logging.INFO):
+            assert self._size(ts) is None
+        assert "it already holds its Kelly share" in caplog.text
+        # As any other type it is refused first: one WARNING, and no add-on
+        # line giving it that reason (or any other)
+        if path == "bookless":
+            odd = self._bookless(held)
+            odd.pair_type = pair_type
+        else:
+            odd = dataclasses.replace(ts, pair_type=pair_type)
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            assert self._size(odd) is None
+        assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
+            (logging.WARNING,
+             f"Pair '{odd.canonical_title}' not sized: its type is {pair_type!r}, not a "
+             "time-series pair, and the bot trades time-series pairs only")]
+
     def test_an_ordinary_pair_it_refuses_logs_nothing_new(self, caplog):
         with caplog.at_level(logging.INFO):
             assert self._size(make_pair(tradeable=False)) is None
@@ -1728,15 +1805,63 @@ def _add_on_sizing_problems(source: str) -> list[str]:
     return problems
 
 
+def _returns_none(stmt: ast.AST) -> bool:
+    """
+    Say whether a statement is `return` or `return None`.
+
+    Args:
+        stmt (ast.AST): One statement.
+
+    Returns:
+        bool: True for a bare return or a return of the constant None.
+    """
+    return isinstance(stmt, ast.Return) and (
+        stmt.value is None or (isinstance(stmt.value, ast.Constant)
+                               and stmt.value.value is None))
+
+
+def _type_refusal(func: ast.FunctionDef) -> ast.Return | None:
+    """
+    Find compute_trade's refusal of a pair that is not time-series, as its first statement.
+
+    The first statement after the docstring must be
+    `if pair.pair_type != "time_series":` with no else, holding exactly one
+    logging.warning call and then a return of None.
+
+    Args:
+        func (ast.FunctionDef): compute_trade's node (or a changed copy's).
+
+    Returns:
+        ast.Return | None: That refusal's return; None when the first
+            statement is not that refusal.
+    """
+    body = func.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+        body = body[1:]
+    first = body[0] if body else None
+    if not (isinstance(first, ast.If) and not first.orelse and len(first.body) == 2
+            and ast.unparse(first.test) == "pair.pair_type != 'time_series'"):
+        return None
+    warning, ret = first.body
+    if not (isinstance(warning, ast.Expr) and isinstance(warning.value, ast.Call)
+            and ast.unparse(warning.value.func) == "logging.warning" and _returns_none(ret)):
+        return None
+    return ret
+
+
 def _refusal_line_problems(source: str) -> list[str]:
     """
-    Check that compute_trade names every refusal of an add-on, once.
+    Check that compute_trade refuses another pair type first, then names every refusal of an add-on, once.
 
-    Every `return None` in compute_trade must come right after a
+    Its first statement must be the refusal of a pair that is not
+    time-series (_type_refusal): one WARNING and a return of None, before the
+    settings are resolved, anything is priced or an add-on line is logged,
+    so an add-on of another type is never logged as holding its Kelly share.
+    Every other `return None` in compute_trade must come right after a
     _log_no_add_on call in the same block, and there must be as many such
-    calls as returns, so an add-on refused on any path says why in exactly
-    one line. The calls that ask _holds_kelly_share hand it the cash
-    compute_trade got.
+    calls as those returns, so an add-on refused on any other path says why
+    in exactly one line. The calls that ask _holds_kelly_share hand it the
+    cash compute_trade got.
 
     Args:
         source (str): Source text holding def compute_trade (strategy.py's own,
@@ -1747,6 +1872,10 @@ def _refusal_line_problems(source: str) -> list[str]:
     """
     func = _def_named(source, "compute_trade")
     problems = []
+    type_refusal = _type_refusal(func)
+    if type_refusal is None:
+        problems.append("the first statement is not the one-WARNING refusal of a pair "
+                        "that is not time-series")
     returns = 0
     for node in ast.walk(func):
         for field in ("body", "orelse", "finalbody"):
@@ -1754,9 +1883,7 @@ def _refusal_line_problems(source: str) -> list[str]:
             if not isinstance(block, list):
                 continue
             for i, stmt in enumerate(block):
-                if not (isinstance(stmt, ast.Return) and (
-                        stmt.value is None or (isinstance(stmt.value, ast.Constant)
-                                               and stmt.value.value is None))):
+                if not _returns_none(stmt) or stmt is type_refusal:
                     continue
                 returns += 1
                 before = block[i - 1] if i else None
@@ -2072,6 +2199,33 @@ def _key_homes(tree: ast.AST, key: str) -> list[tuple[str | None, int]]:
     return homes
 
 
+# The same-title constants config.py no longer defines: the fixed chance a
+# same-title pair was priced on as settling alike, its minimum price gap, its
+# size cap and the sides it was bought on
+_DELETED_SAME_TITLE_CONSTANTS = frozenset({
+    "SAME_TITLE_CO_RESOLVE_PROB", "SAME_TITLE_MIN_PRICE_DIFF", "SAME_TITLE_SIZE_CAP",
+    "SAME_TITLE_LEG_SIDES"})
+
+
+def _names_used(source: str) -> set[str]:
+    """Every name a module's source reads or binds: each bare name, each
+    attribute (config.X), each imported name and its alias (from .config
+    import X as Y), and each string constant whole (getattr(config, "X"))."""
+    named: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Name):
+            named.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            named.add(node.attr)
+        elif isinstance(node, ast.alias):
+            named.add(node.name)
+            if node.asname:
+                named.add(node.asname)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            named.add(node.value)
+    return named
+
+
 def _kelly_fraction_at(pair, price_a: float, price_b: float) -> float:
     """Uncapped Kelly fraction for a pair priced at (price_a, price_b).
 
@@ -2384,28 +2538,34 @@ class TestTimeSeriesKellyParity:
         # (no spread), not the ~0.1620 the live sizer computes at k 0.75 (pre_toggle_defaults)
         assert dashboard._kelly_fraction(_TS_PA, _TS_NA, _TS_PB, _TS_NB, "time_series") > 0.16
 
-    def test_ast_the_backtest_and_the_dashboard_name_no_same_title_constant(self):
-        # The backtest simulates, and the dashboard shows and prices,
-        # time-series pairs only: neither module imports or reads the
+    def test_ast_no_module_names_a_deleted_same_title_constant(self):
+        # The bot trades time-series pairs only: config defines none of the
         # same-title pairs' fixed chance of settling alike, their minimum
-        # price gap or their size cap — by a bare name, as an attribute or
-        # as a string handed to getattr — nor binds one of its own
-        gone = {"SAME_TITLE_CO_RESOLVE_PROB", "SAME_TITLE_MIN_PRICE_DIFF",
-                "SAME_TITLE_SIZE_CAP"}
-        for module in (backtester, dashboard):
-            tree = ast.parse(inspect.getsource(module))
-            named = set()
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Name):
-                    named.add(node.id)
-                elif isinstance(node, ast.Attribute):
-                    named.add(node.attr)
-                elif isinstance(node, ast.alias):
-                    named.add(node.name)
-                elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-                    named.add(node.value)
-            assert not named & gone, (module.__name__, named & gone)
+        # price gap, their size cap or their sides, and no module of the
+        # package imports, reads or binds one (by a bare name, as an
+        # attribute, as an imported name or its alias, or as a string handed
+        # to getattr), nor names one in a comment, docstring or message
+        gone = _DELETED_SAME_TITLE_CONSTANTS
+        for module in (config, strategy, scanner, seller, backtester, dashboard, main,
+                       trader, historical):
             assert not [name for name in gone if hasattr(module, name)], module.__name__
+        package = Path(inspect.getsourcefile(config)).parent
+        sources = {path.name: path.read_text() for path in sorted(package.glob("*.py"))}
+        # Non-vacuous: every module of the package is read, the live and the
+        # backtest ones alike
+        assert {"__init__.py", "config.py", "scanner.py", "strategy.py", "trader.py",
+                "seller.py", "main.py", "backtester.py", "dashboard.py"} <= set(sources)
+        for name, source in sources.items():
+            assert not _names_used(source) & gone, (name, _names_used(source) & gone)
+            assert not [constant for constant in gone
+                        if re.search(rf"\b{constant}\b", source)], name
+        # The check sees each way a module could name one
+        for line in ("from .config import SAME_TITLE_MIN_PRICE_DIFF as gap",
+                     "p = config.SAME_TITLE_CO_RESOLVE_PROB",
+                     "cap = getattr(config, 'SAME_TITLE_SIZE_CAP', 0.2)",
+                     "SAME_TITLE_CO_RESOLVE_PROB = 0.95",
+                     "from .config import SAME_TITLE_LEG_SIDES, TIME_SERIES_LEG_SIDES"):
+            assert _names_used(line) & gone, line
 
     def test_discount_of_one_never_trades(self, monkeypatch):
         # k = 1 (market-implied): p = 1 - the mid spread → f* < 0 for every
@@ -4044,6 +4204,22 @@ class TestTimeSeriesKellyParity:
         assert source.count(refusal) == 1
         cash = "settings, cash_cents=cash_cents),"
         assert source.count(cash) == 2
+        type_refusal = (
+            '    if pair.pair_type != "time_series":\n'
+            "        # Named by its title, or by its tickers when it has none, without raising\n"
+            "        logging.warning(\n"
+            '            "Pair %s not sized: its type is %r, not a time-series pair, and the bot "\n'
+            '            "trades time-series pairs only", pair_log_name(pair), pair.pair_type)\n'
+            "        return None\n")
+        assert source.count(type_refusal) == 1
+        resolve = "    settings = live_settings() if settings is None else settings\n"
+        assert source.count(resolve) == 1
+        not_tradeable = ("    if not pair.tradeable:\n"
+                         "        _log_no_add_on(pair, holds_kelly_share=False,\n"
+                         "                       portfolio_value_cents=portfolio_value_cents, "
+                         "level=info)\n"
+                         "        return None\n")
+        assert source.count(not_tradeable) == 1
         sizing = {
             "fed the cash": source.replace(share, share.replace(
                 "portfolio_value_cents / 100.0", "cash_cents / 100.0")),
@@ -4062,6 +4238,20 @@ class TestTimeSeriesKellyParity:
         refusals = {
             "a silent refusal": source.replace(refusal, "    if min_payoff <= 0:\n"),
             "the cash not handed on": source.replace(cash, "settings),", 1),
+            # An add-on of another type would then get an add-on line, or be
+            # sized, before it is refused
+            "no type refusal": source.replace(type_refusal, ""),
+            "a silent type refusal": source.replace(
+                type_refusal, '    if pair.pair_type != "time_series":\n        return None\n'),
+            "the type refusal on the add-on line": source.replace(
+                type_refusal, '    if pair.pair_type != "time_series":\n'
+                "        _log_no_add_on(pair, holds_kelly_share=False,\n"
+                "                       portfolio_value_cents=portfolio_value_cents)\n"
+                "        return None\n"),
+            "the type refusal after the settings": source.replace(type_refusal, "").replace(
+                resolve, resolve + type_refusal),
+            "the type refusal after the tradeable check": source.replace(
+                type_refusal, "").replace(not_tradeable, not_tradeable + type_refusal),
         }
         for name, mutant in refusals.items():
             assert mutant != source, name
@@ -5456,8 +5646,9 @@ class TestKellyRiskIncludesFees:
 
     def test_the_overstatement_is_q_times_the_fee_for_any_pair(self):
         # Not a property of the fixture: the two EV expressions differ by q*fee
-        # for every price pair, which is why same-title (q = 0.05) is immune
-        # and the time-series bet (q = k * its mid spread) is not.
+        # for every price pair and every chance of profit, so a bet that is
+        # rarely lost (q = 0.05 here) barely moves, while the time-series bet
+        # (q = k * its mid spread) can move far more.
         for price_a, price_b, p in ((0.30, 0.40, 0.775), (0.20, 0.30, 0.95),
                                     (0.16, 0.21, 0.385)):
             fee = fee_per_pair_approx(price_a, price_b)
@@ -5478,21 +5669,6 @@ class TestKellyRiskIncludesFees:
         assert spec.kelly_fraction < fee_less_f
         old_n = _fee_shrunk_n(fee_less_f, _TS_PA, _TS_NB, 10_000.0)
         assert 0 < spec.x <= old_n
-
-    def test_a_flipping_same_title_pair_is_now_rejected(self):
-        # "Effectively immune" is not "immune": a thin minority of same-title
-        # price points inside the admissible region (pA - pB >= 0.05, legs
-        # <= 0.95) do change verdict, and the flip is always accept -> reject.
-        # Pinned so the immunity claim is never read as a universal.
-        nA, pB = 0.28, 0.64
-        fee = fee_per_pair_approx(nA, pB)
-        net_spread = (1.0 - nA - pB) - fee
-        q = 1.0 - SAME_TITLE_CO_RESOLVE_PROB
-        fee_less = SAME_TITLE_CO_RESOLVE_PROB - q / (net_spread / (nA + pB))
-        fee_incl = SAME_TITLE_CO_RESOLVE_PROB - q / (net_spread / (nA + pB + fee))
-        assert fee_less > 0 > fee_incl
-        assert compute_trade(make_pair(nA=nA, pB=pB, pair_type="same_title"),
-                             1_000_000) is None
 
     @pytest.mark.parametrize("kwargs", [
         {"pA": _TS_PA, "pB": _TS_PB, "nA": _TS_NA, "nB": _TS_NB,
@@ -5604,12 +5780,17 @@ class TestSelectPortfolio:
         result = select_portfolio([a, b], 50_000)
         assert len(result) == 2
 
-    def test_prefers_same_title_over_time_series_at_equal_return(self):
-        # Near-arbitrage (same-title) outranks the directional bet (time-series)
-        ts = make_spec(monthly_profit_ratio=0.10, pair_type="time_series", total_cost=100.0)
-        st = make_spec(monthly_profit_ratio=0.10, pair_type="same_title", total_cost=100.0)
-        result = select_portfolio([ts, st], 100_000)
-        assert result[0] is st
+    def test_equal_returns_keep_the_order_they_came_in(self):
+        # The ranking is the monthly return alone, and Python's sort is stable
+        # under reverse=True: specs with equal returns come out in the order
+        # they were handed in, whichever order that is
+        tied = [make_spec(monthly_profit_ratio=0.10, total_cost=10.0) for _ in range(3)]
+        best = make_spec(monthly_profit_ratio=0.20, total_cost=10.0)
+        worst = make_spec(monthly_profit_ratio=0.05, total_cost=10.0)
+        for order in ([0, 1, 2], [2, 0, 1], [1, 2, 0]):
+            first, second, third = (tied[i] for i in order)
+            got = select_portfolio([first, worst, second, best, third], 100_000)
+            assert [id(s) for s in got] == [id(s) for s in (best, first, second, third, worst)]
 
     def test_partial_selection_when_second_trade_doesnt_fit(self):
         cheap = make_spec(monthly_profit_ratio=0.10, total_cost=100.0)
@@ -5657,7 +5838,8 @@ class TestSelectPortfolioLadders:
     """select_portfolio picks at most one time-series trade per ladder (one
     question at several deadlines): two markets share a ladder when they share
     an event or ask the same question once the dates are removed. Held
-    positions count, and so do specs picked earlier in the run."""
+    positions count, and so do specs picked earlier in the run. A spec that
+    is not time-series is refused before the ranking and claims nothing."""
 
     def test_two_time_series_specs_on_one_ladder_take_only_the_better(self, caplog):
         best = _ladder_spec(_R1, _R3, ratio=0.20)
@@ -5699,12 +5881,52 @@ class TestSelectPortfolioLadders:
         assert shared == frozenset({("event", "KXRAIN-2")})
         assert select_portfolio([first, second], 100_000) == [first]
 
-    def test_a_spec_of_unknown_type_is_never_blocked(self):
-        # Only the exact type "time_series" is refused; anything else is
-        # treated as a same-title pair
-        ts = _ladder_spec(_R1, _R3, ratio=0.20)
-        odd = _ladder_spec(_R2, _R4, pair_type=None, ratio=0.10)
-        assert select_portfolio([ts, odd], 100_000) == [ts, odd]
+    @pytest.mark.parametrize("pair_type", _OTHER_PAIR_TYPES, ids=_OTHER_PAIR_TYPE_IDS)
+    def test_a_spec_of_another_type_is_refused_and_claims_nothing(self, caplog, pair_type):
+        # Ranked first, on the very tickers and ladder of a time-series spec,
+        # and costing all the cash: had it claimed a ticker, a ladder or the
+        # cash, the time-series spec would be refused
+        odd = _ladder_spec(_R1, _R3, pair_type=pair_type, ratio=0.30, cost=1_000.0)
+        ts = _ladder_spec(_R1, _R3, ratio=0.10, cost=1_000.0)
+        with caplog.at_level(logging.INFO):
+            got = select_portfolio([ts, odd], 100_000)
+        assert [id(s) for s in got] == [id(ts)]
+        # One WARNING, naming the spec (by its tickers: its pair has no
+        # title) and its type; the ladder rule refused nothing
+        assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == [
+            f"Trade on STAR-1 / STAR-20 not picked for the portfolio: its type is "
+            f"{pair_type!r}, not a time-series pair, and the bot trades time-series pairs "
+            "only"]
+        assert "on the same ladder" not in caplog.text
+        # Alone, off every held ladder, it is still refused
+        assert select_portfolio([odd], 100_000) == []
+
+    @pytest.mark.parametrize("pair_type", _OTHER_PAIR_TYPES, ids=_OTHER_PAIR_TYPE_IDS)
+    def test_a_spec_of_another_type_behind_a_pick_on_its_ticker_is_still_refused(
+            self, caplog, pair_type):
+        # A time-series spec with the better return is picked first; a spec of
+        # another type ranked after it shares one of its tickers. The refusal
+        # comes before the ranking, so that spec still gets its one WARNING:
+        # it is refused for its type, not skipped in silence by the rule
+        # against reusing a ticker
+        ts = _ladder_spec(_R1, _R3, ratio=0.30)
+        odd = _ladder_spec(_R1, _OTHER_B, pair_type=pair_type, ratio=0.10)
+        with caplog.at_level(logging.INFO):
+            got = select_portfolio([odd, ts], 100_000)
+        assert [id(s) for s in got] == [id(ts)]
+        assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == [
+            f"Trade on STAR-1 / RAIN-2 not picked for the portfolio: its type is "
+            f"{pair_type!r}, not a time-series pair, and the bot trades time-series pairs "
+            "only"]
+        # Control: the same spec as a time-series pair is skipped by the
+        # ticker rule, with no line at all (not even the ladder rule's)
+        caplog.clear()
+        same = _ladder_spec(_R1, _OTHER_B, ratio=0.10)
+        with caplog.at_level(logging.INFO):
+            got = select_portfolio([same, ts], 100_000)
+        assert [id(s) for s in got] == [id(ts)]
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+        assert "on the same ladder" not in caplog.text
 
     def test_a_held_question_blocks_a_time_series_spec(self):
         # The same question listed in another event, one we hold a position in
@@ -5718,21 +5940,6 @@ class TestSelectPortfolioLadders:
         # control: holding a position on an unrelated ladder blocks nothing
         other = scanner.market_ladder_keys(_OTHER_A)
         assert select_portfolio([star], 100_000, held_ladders=other) == [star]
-
-    def test_a_same_title_spec_is_never_blocked(self):
-        st = _ladder_spec(_R1, _R3, pair_type="same_title", ratio=0.20)
-        held = scanner.pair_ladder_keys(st.pair)
-        assert select_portfolio([st], 100_000, held_ladders=held) == [st]
-
-    def test_a_same_title_spec_picked_first_blocks_a_later_time_series_spec(self):
-        st = _ladder_spec(_R1, _R3, pair_type="same_title", ratio=0.20)
-        ts = _ladder_spec(_R2, _R4, ratio=0.10)
-        assert select_portfolio([ts, st], 100_000) == [st]
-
-    def test_a_time_series_spec_picked_first_does_not_block_a_same_title_spec(self):
-        ts = _ladder_spec(_R1, _R3, ratio=0.20)
-        st = _ladder_spec(_R2, _R4, pair_type="same_title", ratio=0.10)
-        assert select_portfolio([st, ts], 100_000) == [ts, st]
 
     def test_a_spec_skipped_for_cash_leaves_its_ladder_free(self):
         # The better spec does not fit the balance, so it never takes the ladder
@@ -5773,12 +5980,24 @@ class TestSelectPortfolioAddOns:
             assert select_portfolio([add_on], 100_000, held_ladders=held) == [add_on]
         assert "on the same ladder" not in caplog.text
 
-    def test_a_same_title_pick_earlier_in_the_run_blocks_an_add_on(self, caplog):
-        st = _ladder_spec(_R2, _R4, pair_type="same_title", ratio=0.20)
+    @pytest.mark.parametrize("pair_type", _OTHER_PAIR_TYPES, ids=_OTHER_PAIR_TYPE_IDS)
+    def test_a_spec_of_another_type_ranked_first_never_blocks_an_add_on(self, caplog,
+                                                                        pair_type):
+        # Ranked first on the add-on's own ladder: refused before the
+        # ranking, it claims no ladder, so the add-on is taken
+        odd = _ladder_spec(_R2, _R4, pair_type=pair_type, ratio=0.20)
         add_on = _add_on_spec(_R1, _R3, ratio=0.10)
         held = scanner.pair_ladder_keys(add_on.pair)
+        assert scanner.pair_ladder_keys(odd.pair) & held
         with caplog.at_level(logging.INFO):
-            assert select_portfolio([add_on, st], 100_000, held_ladders=held) == [st]
+            assert select_portfolio([add_on, odd], 100_000, held_ladders=held) == [add_on]
+        assert "on the same ladder" not in caplog.text
+        # Control: a time-series spec picked first on that ladder (nothing
+        # held, so it is taken) does block the add-on
+        ts = _ladder_spec(_R2, _R4, ratio=0.20)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert select_portfolio([add_on, ts], 100_000) == [ts]
         assert self._LADDER_LINE + "1" in caplog.text
 
     def test_an_ordinary_spec_on_a_held_ladder_is_still_refused(self, caplog):
@@ -6055,12 +6274,13 @@ class TestSelectPortfolioShrinksToCash:
         # Every later spec needs a cent and the shrink leaves three, so only
         # the ticker and ladder rules can refuse the first two
         shrinks = _held_spec(make_booked_pair(_HOLE_LADDER), 700, ratio=0.30)
-        # A same-title spec (never refused by the ladder rule) on the shrunk
-        # spec's market_a ticker
+        # A time-series spec on the shrunk spec's market_a ticker, sharing no
+        # ladder with it, so only the ticker rule can refuse it
         same_ticker = _ladder_spec(
             SimpleNamespace(ticker="A1", event_ticker="KXZ-1", title="Z", subtitle=""),
-            _ladder_market("Z-2", "KXZ-2", "Z"), pair_type="same_title",
-            ratio=0.25, cost=0.01)
+            _ladder_market("Z-2", "KXZ-2", "Z"), ratio=0.25, cost=0.01)
+        assert not scanner.pair_ladder_keys(same_ticker.pair) & scanner.pair_ladder_keys(
+            shrinks.pair)
         # A time-series spec whose later market asks the shrunk spec's later
         # market's question ("B")
         on_its_ladder = _ladder_spec(
@@ -6134,12 +6354,9 @@ class TestSelectPortfolioShrinksToCash:
         # than taken at a size the model never judged
         spec = _held_spec(make_booked_pair(_HOLE_LADDER), 700, k=None)
         assert select_portfolio([spec], 11_420) == []
-        # A same-title spec needs no k (its p is the fixed prior): 91 pairs of
-        # NO 0.30 / YES 0.20 need 2,958 + 2,017 = 4,975 cents, 92 need 5,029
-        same_title = _held_spec(make_booked_pair([(0.30, 0.20, 1_000)],
-                                                 pair_type="same_title"), 1_000, k=None)
-        [got] = select_portfolio([same_title], 5_000)
-        assert got.x == 91 and got.cash_need_cents == 4_975
+        # Control: with its k the same spec is shrunk to 128 pairs
+        assert select_portfolio([dataclasses.replace(spec, interval_discount=0.40)],
+                                11_420)[0].x == 128
 
     def test_the_shard_funder_never_finds_the_portfolio_short(self):
         # Over random portfolios on random books, grids and shards: what the
@@ -6148,12 +6365,11 @@ class TestSelectPortfolioShrinksToCash:
         now = datetime.now(UTC)
         grids = {"cent": ("", None, 0.01),
                  "deci": ("deci_cent", [PriceRange(0.0, 1.0, 0.001)], 0.001)}
-        shrunk = checked = ts_checked = refused = 0
+        shrunk = checked = 0
         for trial in range(150):
             specs = []
             for i in range(rng.randrange(1, 7)):
                 structure, ranges, tick = grids[rng.choice(list(grids))]
-                pair_type = rng.choice(["time_series", "same_title"])
                 markets = []
                 for leg in "AB":
                     markets.append(SimpleNamespace(
@@ -6170,44 +6386,33 @@ class TestSelectPortfolioShrinksToCash:
                     a += rng.randrange(0, 3) * tick
                     b += rng.randrange(0, 3) * tick
                 best_a, best_b, _ = levels[0]
-                if pair_type == "time_series":
-                    prices = {"pA": best_a, "nB": best_b, "nA": round(1 - best_a, 4),
-                              "pB": round(min(0.99, 1 - best_b + rng.randrange(0, 20) * tick), 4)}
-                    # The forecast's input, at the tops of the books, as
-                    # enrichment writes it: without it the sizer refuses the pair
-                    prices["mid_spread"] = config.time_series_mid_spread(
-                        prices["pA"], prices["nA"], prices["pB"], prices["nB"])
-                else:
-                    prices = {"nA": best_a, "pB": best_b, "pA": 0.70, "nB": 0.70}
+                prices = {"pA": best_a, "nB": best_b, "nA": round(1 - best_a, 4),
+                          "pB": round(min(0.99, 1 - best_b + rng.randrange(0, 20) * tick), 4)}
+                # The forecast's input, at the tops of the books, as
+                # enrichment writes it: without it the sizer refuses the pair
+                prices["mid_spread"] = config.time_series_mid_spread(
+                    prices["pA"], prices["nA"], prices["pB"], prices["nB"])
                 pair = CandidatePair(
                     market_a=markets[0], market_b=markets[1], tradeable=True,
-                    canonical_title=f"pair {trial}-{i}", pair_type=pair_type,
+                    canonical_title=f"pair {trial}-{i}", pair_type="time_series",
                     max_contracts=int(sum(q for *_, q in levels)), depth_levels=tuple(levels),
                     **prices)
                 spec = compute_trade(pair, rng.choice([20_000, 200_000, 5_000_000]),
                                      settings=_live(k=0.6, cap=rng.choice([0.2, 1.0])))
-                if pair_type != "time_series":
-                    # Capped at 0 (pair_size_cap): the sizer refuses it, so no
-                    # portfolio holds one
-                    assert spec is None
-                    refused += 1
-                elif spec is not None:
+                if spec is not None:
                     specs.append(spec)
             cash = rng.choice([300, 2_000, 10_000, 60_000, 1_000_000])
             selected = select_portfolio(specs, cash)
             shrunk += sum(s not in specs for s in selected)
             checked += len(selected)
-            ts_checked += sum(s.pair.pair_type == "time_series" for s in selected)
             assert sum(s.cash_need_cents for s in selected) <= cash
             assert sum(trader._required_cents_by_shard(selected).values()) <= cash
             for s in selected:
                 # Per spec too, whichever shards its legs sit on
                 assert s.cash_need_cents >= sum(trader._required_cents_by_shard([s]).values())
-        # Non-vacuous: time-series portfolios were selected (a time-series
-        # pair's NO leg sits on market B) and some specs were shrunk; every
-        # pair of another type drawn was refused before any portfolio
-        assert (checked > 50 and shrunk > 5 and ts_checked == checked
-                and refused > 50), (checked, shrunk, ts_checked, refused)
+        # Non-vacuous: portfolios were selected (a time-series pair's NO leg
+        # sits on market B) and some specs were shrunk
+        assert checked > 50 and shrunk > 5, (checked, shrunk)
 
 
 class TestKellyOperandsShareOneSnapshot:
@@ -6546,7 +6751,6 @@ class TestComputeTradeChargesEachLegItsMultiplier:
     (scanner.leg_fee_multipliers), and only a confirmed one lowers it."""
 
     _TS_LEVELS = [(0.30, 0.38, 400.0), (0.31, 0.39, 400.0)]
-    _ST_LEVELS = [(0.30, 0.60, 500.0), (0.31, 0.61, 500.0)]
 
     @staticmethod
     def _fields(spec):
@@ -6554,23 +6758,20 @@ class TestComputeTradeChargesEachLegItsMultiplier:
         return {f.name: getattr(spec, f.name) for f in dataclasses.fields(spec)
                 if f.name not in ("pair", "fee_multipliers")}
 
-    def _pair(self, pair_type, mult_a=None, mult_b=None):
-        levels = self._TS_LEVELS if pair_type == "time_series" else self._ST_LEVELS
-        pair = make_booked_pair(levels, pair_type=pair_type, pB=0.62)
+    def _pair(self, mult_a=None, mult_b=None):
+        pair = make_booked_pair(self._TS_LEVELS, pB=0.62)
         if mult_a is not None:
             pair.market_a._fee_multiplier = mult_a
         if mult_b is not None:
             pair.market_b._fee_multiplier = mult_b
         return pair
 
-    @pytest.mark.parametrize("pair_type, mult_a, mult_b", [
-        ("time_series", None, 0.5), ("time_series", 0.5, None)])
+    @pytest.mark.parametrize("mult_a, mult_b", [(None, 0.5), (0.5, None)])
     def test_a_confirmed_half_halves_only_its_own_legs_fee(self, monkeypatch, caplog,
-                                                          pair_type, mult_a, mult_b):
+                                                          mult_a, mult_b):
         monkeypatch.setattr(config, "CONFIRMED_FEE_MULTIPLIERS", frozenset({1.0, 0.5}))
         with caplog.at_level(logging.INFO):
-            spec = compute_trade(self._pair(pair_type, mult_a, mult_b), 1_000_000,
-                                 settings=_live())
+            spec = compute_trade(self._pair(mult_a, mult_b), 1_000_000, settings=_live())
         assert spec is not None
         want = (mult_a or 1.0, mult_b or 1.0)
         assert spec.fee_multipliers == want
@@ -6587,12 +6788,10 @@ class TestComputeTradeChargesEachLegItsMultiplier:
         assert (fee_a, fee_b)[halved] < fee_leg_exact(n, price, multiplier=1.0)
         assert f"| fee multipliers {want[0]:g}/{want[1]:g}" in caplog.text
 
-    @pytest.mark.parametrize("pair_type", ["time_series"])
-    def test_an_unconfirmed_half_is_charged_in_full(self, caplog, pair_type):
-        full = compute_trade(self._pair(pair_type), 1_000_000, settings=_live())
+    def test_an_unconfirmed_half_is_charged_in_full(self, caplog):
+        full = compute_trade(self._pair(), 1_000_000, settings=_live())
         with caplog.at_level(logging.INFO):
-            listed = compute_trade(self._pair(pair_type, 0.5, 0.0), 1_000_000,
-                                   settings=_live())
+            listed = compute_trade(self._pair(0.5, 0.0), 1_000_000, settings=_live())
         assert full is not None and listed is not None
         assert listed.fee_multipliers == (1.0, 1.0)
         assert self._fields(listed) == self._fields(full)

@@ -5,7 +5,11 @@ The core check is parity with the backtest: one position built twice, as a
 backtest trade valued by backtester._hold_readings and as the live account
 judged by seller.plan_sales, must show equal profits at every check and the
 same verdict at 50%, at the highest 1% level the backtest sells at, and at
-the level just above it. Everything runs offline: the exchange reads
+the level just above it. A position held NO on market A and YES on market B
+(the sides a same-title pair was bought on, which the account may still
+hold) has no backtest half, since the backtest values time-series trades
+only: it is checked live alone against fixed numbers
+(TestPositionsHeldNoAYesB). Everything runs offline: the exchange reads
 (order books, candles, settlements, market lookups) are stubs on the seller
 module, and the client is a MagicMock that is never called.
 
@@ -243,9 +247,14 @@ class _Parity:
     For a lone case, market A has paid out before the run: the live account
     holds B alone, and A is one of its settlements, costing what the trade's
     A leg cost.
+
+    A position held NO on A and YES on B (the sides a same-title pair was
+    bought on) is given no pair type and gets no backtest trade (trade is
+    None): the backtest values time-series trades only, so such a case is
+    checked live alone (TestPositionsHeldNoAYesB).
     """
 
-    def __init__(self, pair_type: str, *, sides: tuple[str, str], candles_a: list,
+    def __init__(self, pair_type: str | None, *, sides: tuple[str, str], candles_a: list,
                  candles_b: list, price_a: float, price_b: float, n: int = 30,
                  lone: bool = False, a_settles: datetime | None = None,
                  a_result: str = "no", titles: tuple[str, str] | None = None) -> None:
@@ -267,7 +276,7 @@ class _Parity:
             {"ticker": _B, "settlement_ts": "2026-02-25T12:00:00+00:00", "result": "yes"},
             candles_b, _START)
         fee_a, fee_b = fee_leg_exact(n, price_a), fee_leg_exact(n, price_b)
-        self.trade = backtester.BacktestTrade(
+        self.trade = None if pair_type is None else backtester.BacktestTrade(
             pair_type=pair_type, ticker_a=_A, ticker_b=_B, title_a="", title_b="",
             category="Other", entry_date=date(2026, 1, 5), exit_date=date(2026, 2, 25),
             entry_pA=price_a, entry_pB=1 - price_b, entry_nA=1 - price_a, entry_nB=price_b,
@@ -303,6 +312,7 @@ class _Parity:
 
     def readings(self):
         """The backtest's sale and its profit at each check (None: not valued)."""
+        assert self.trade is not None, "a case held NO on A and YES on B has no backtest trade"
         return backtester._hold_readings([self.trade], _D, backtester._resolve_hold_days())
 
     def boundary(self, profits) -> float:
@@ -354,11 +364,21 @@ def _lone_case(a_settles: datetime, a_result: str, b_candles: list | None = None
                    a_result=a_result)
 
 
+def _same_title_pair() -> _Parity:
+    """NO on A and YES on B, 30 each, two identically worded markets: an exact
+    pair held on the sides a same-title pair was bought on (live alone, no
+    backtest trade)."""
+    a, b = _same_title_candles()
+    return _Parity(None, sides=_NO_A_YES_B, candles_a=a, candles_b=b, price_a=0.50,
+                   price_b=0.40, titles=("Who wins the game?", "Who wins the game?"))
+
+
 def _same_title_lone_case(a_settles: datetime, a_result: str, a_candles: list,
                           b_candles: list) -> _Parity:
     """B held YES alone, its partner A (held NO) paid out at a_settles: the
-    same-title sides, so the partner's NO cost, count and NO bid are read."""
-    return _Parity("same_title", sides=_NO_A_YES_B, candles_a=a_candles,
+    sides a same-title pair was bought on, so the partner's NO cost, count
+    and NO bid are read (live alone, no backtest trade)."""
+    return _Parity(None, sides=_NO_A_YES_B, candles_a=a_candles,
                    candles_b=b_candles, price_a=0.40, price_b=0.35, lone=True,
                    a_settles=a_settles, a_result=a_result,
                    titles=("Who wins the game?", "Who wins the game?"))
@@ -406,21 +426,75 @@ _PARITY_CASES = {
     "exact time-series pair (YES A / NO B)": lambda: _Parity(
         "time_series", sides=_YES_A_NO_B, candles_a=_time_series_candles()[0],
         candles_b=_time_series_candles()[1], price_a=0.30, price_b=0.40),
-    "exact same-title pair (NO A / YES B)": lambda: _Parity(
-        "same_title", sides=_NO_A_YES_B, candles_a=_same_title_candles()[0],
-        candles_b=_same_title_candles()[1], price_a=0.50, price_b=0.40,
-        titles=("Who wins the game?", "Who wins the game?")),
     "lone market with a $0 partner paid out before every check": lambda: _lone_case(
         datetime.fromtimestamp(_CK - 3 * _DAY, UTC), "no"),
     "lone market whose partner paid out between the checks": _paid_between_case,
     # Paid out at the very moment of the check a day before: paid there
     "lone market whose partner paid out exactly at a check": lambda: _paid_between_case(
         _CK - _DAY),
-    "lone YES market with a $0 NO partner paid out before every check":
-        _same_title_lone_paid_before,
-    "lone YES market whose NO partner paid out between the checks":
-        _same_title_lone_paid_between,
 }
+
+
+@dataclasses.dataclass(frozen=True)
+class _Fixed:
+    """
+    What seller.plan_sales gives one position held NO on A and YES on B.
+
+    Attributes:
+        profits (tuple): (realized, potential) profit at each check, now
+            first, in dollars.
+        cost (float): What the position cost, fees included, in dollars.
+        proceeds (float): What selling it on the held markets returns now,
+            after fees, in dollars.
+        paid (float): What a paid-out partner paid, in dollars (0 for an
+            exact pair).
+        top (float): The highest 1% sell level it sells at; the next level up
+            keeps it.
+        count (int): Contracts sold on each held market.
+    """
+    profits: tuple
+    cost: float
+    proceeds: float
+    paid: float
+    top: float
+    count: int = 30
+
+
+# Positions held on the sides a same-title pair was bought on: NO on A and YES
+# on B. Each: (builder, its fixed numbers whole, and those of what is left
+# after 10 of a lone market's 30 contracts are sold, None for an exact pair)
+_NO_A_YES_B_CASES = {
+    "exact same-title pair (NO A / YES B)": (
+        _same_title_pair,
+        _Fixed(profits=((0.60, 1.96),) * 3, cost=28.04, proceeds=28.64, paid=0.0, top=0.30),
+        None),
+    "lone YES market with a $0 NO partner paid out before every check": (
+        _same_title_lone_paid_before,
+        _Fixed(profits=((4.27, 6.51), (3.63, 6.51), (3.95, 6.51)), cost=23.49,
+               proceeds=27.76, paid=0.0, top=0.55),
+        _Fixed(profits=((2.84, 4.34), (2.42, 4.34), (2.63, 4.34)), cost=15.66,
+               proceeds=18.50, paid=0.0, top=0.55, count=20)),
+    "lone YES market whose NO partner paid out between the checks": (
+        _same_title_lone_paid_between,
+        _Fixed(profits=((7.06, 6.51), (7.06, 6.51), (4.15, 6.51)), cost=23.49,
+               proceeds=0.55, paid=30.0, top=0.63),
+        _Fixed(profits=((4.71, 4.34), (4.71, 4.34), (2.76, 4.34)), cost=15.66,
+               proceeds=0.37, paid=20.0, top=0.63, count=20)),
+}
+
+
+def _assert_fixed(plan: seller.SalePlan, fixed: _Fixed) -> None:
+    """Assert a take-profit plan carries a case's fixed numbers, each to within 1e-9."""
+    assert len(plan.profits) == len(fixed.profits) == backtester.TAKE_PROFIT_HOLD_DAYS
+    for (realized, potential), (want_realized, want_potential) in zip(
+            plan.profits, fixed.profits, strict=True):
+        assert realized == pytest.approx(want_realized, abs=1e-9)
+        assert potential == pytest.approx(want_potential, abs=1e-9)
+    assert plan.cost_dollars == pytest.approx(fixed.cost, abs=1e-9)
+    assert plan.count == fixed.count
+    paid = sum(leg.payout_dollars for leg in plan.legs if leg.market is None)
+    assert paid == pytest.approx(fixed.paid, abs=1e-9)
+    assert plan.proceeds_dollars == pytest.approx(fixed.proceeds, abs=1e-9)
 
 
 class TestParityWithTheBacktest:
@@ -459,7 +533,7 @@ class TestParityWithTheBacktest:
         if top < 1.0:
             assert not case.world.plan(monkeypatch, round(top + 0.01, 2))
 
-    @pytest.mark.parametrize("build", [_paid_between_case, _same_title_lone_paid_between])
+    @pytest.mark.parametrize("build", [_paid_between_case])
     def test_a_partners_fee_is_charged_at_its_own_multiplier_as_the_backtest_charges_it(
             self, monkeypatch, build):
         # Confirmed reduced multipliers: the paid-out partner A at 0.5 (its
@@ -602,6 +676,78 @@ class TestParityWithTheBacktest:
             assert case.world.calls["book"] == []
             assert case.world.calls["settlements"] == 0
             assert case.world.calls["candles"] == []
+
+
+class TestPositionsHeldNoAYesB:
+    """Positions held on the sides a same-title pair was bought on: NO on
+    market A and YES on market B, as an exact pair or as B alone once A has
+    paid out. The account may still hold some, and seller.plan_sales sells
+    one whole at a saved sell level as it sells any position. The backtest
+    values time-series trades only, so these have no backtest half: each is
+    checked live alone against fixed numbers (_NO_A_YES_B_CASES), the
+    profit at each check, the cost, the proceeds now, what a paid-out
+    partner paid and the highest 1% level that sells."""
+
+    @pytest.mark.parametrize("name", list(_NO_A_YES_B_CASES))
+    def test_it_is_valued_and_sold_at_its_fixed_numbers(self, monkeypatch, name):
+        build, fixed, _part = _NO_A_YES_B_CASES[name]
+        case = build()
+        assert case.trade is None
+        # A level every check reaches: the plan carries every check's profit
+        (plan,) = case.world.plan(monkeypatch, 0.01)
+        _assert_fixed(plan, fixed)
+        # Sold at 50% only when its highest selling level is that high, sold
+        # at that level and kept at the next 1% above it
+        assert 0.01 < fixed.top < 1.0
+        assert bool(case.world.plan(monkeypatch, 0.5)) == (fixed.top >= 0.5)
+        assert case.world.plan(monkeypatch, fixed.top)
+        assert not case.world.plan(monkeypatch, round(fixed.top + 0.01, 2))
+
+    @pytest.mark.parametrize("name", [name for name, (_b, _w, part) in _NO_A_YES_B_CASES.items()
+                                      if part is not None])
+    def test_a_lone_yes_market_partly_sold_values_at_its_fixed_numbers(self, monkeypatch,
+                                                                       name):
+        # 10 of the lone market's 30 contracts sold after its partner paid
+        # out: the partner still shows its 30 settled contracts and is taken
+        # at 20/30
+        build, _whole, part = _NO_A_YES_B_CASES[name]
+        case = build()
+        held = case.world.positions[_B]
+        case.world.positions[_B] = HeldPosition(
+            _B, held.count * 20 / 30, held.exposure_dollars * 20 / 30,
+            held.fees_dollars * 20 / 30)
+        (plan,) = case.world.plan(monkeypatch, 0.01)
+        _assert_fixed(plan, part)
+        assert case.world.plan(monkeypatch, part.top)
+        assert not case.world.plan(monkeypatch, round(part.top + 0.01, 2))
+
+    def test_a_no_partners_fee_is_charged_at_its_own_multiplier(self, monkeypatch):
+        # The lone YES market whose NO partner paid out between the checks,
+        # with confirmed reduced multipliers: the paid-out partner A at 0.5
+        # (its series', its event setting no override) and the held B at 0
+        monkeypatch.setattr(config, "CONFIRMED_FEE_MULTIPLIERS", frozenset({1.0, 0.5, 0.0}))
+        _build, full, _part = _NO_A_YES_B_CASES[
+            "lone YES market whose NO partner paid out between the checks"]
+        case = _same_title_lone_paid_between()
+        market_a = case.world.lookup[_A]
+        market_a._event_fee_override = None
+        case.world.markets[_B]._fee_multiplier = 0.0
+        (plan,) = case.world.plan(monkeypatch, 0.01,
+                                  fee_multipliers={series_ticker(_EV_A): 0.5})
+        (partner,) = [leg for leg in plan.legs if leg.market is None]
+        assert partner.partner_fee_multiplier == 0.5
+        realized = [profit for profit, _potential in plan.profits]
+        assert realized == pytest.approx([7.11, 7.11, 4.31], abs=1e-9)
+        # Not vacuous: the multipliers move the checks from the full-fee profits
+        assert realized != pytest.approx([profit for profit, _p in full.profits], abs=1e-9)
+        # The partner's event override not known: charged the full fee, never 0.5
+        market_a._event_fee_override = "unknown"
+        (plan,) = case.world.plan(monkeypatch, 0.01,
+                                  fee_multipliers={series_ticker(_EV_A): 0.5})
+        (partner,) = [leg for leg in plan.legs if leg.market is None]
+        assert partner.partner_fee_multiplier == 1.0
+        assert [profit for profit, _p in plan.profits] == pytest.approx(
+            [7.11, 7.11, 4.22], abs=1e-9)
 
 
 # ─── Walking the book now ─────────────────────────────────────────────────────
@@ -3164,32 +3310,40 @@ class TestPlanTrims:
                 "read") in caplog.text
         assert case.world.calls["book"] == []
 
-    @pytest.mark.parametrize("a_now, b_now, backtest_sells", [
-        # NO on A (best NO bid 0.50) and YES on B (best YES bid 0.40): past a
-        # 20% cap of a $100 portfolio, so the backtest's trim sells part of it
-        ((0.50, 0.52), (0.42, 0.60), "part"),
-        # Converged: selling returns more than the pair is expected to pay, so
-        # the backtest keeps none of it
-        ((0.03, 0.98), (0.03, 0.98), "all"),
-    ], ids=["past its size cap", "converged"])
-    def test_an_exact_held_same_title_pair_is_never_trimmed(self, monkeypatch, caplog, a_now,
-                                                            b_now, backtest_sells):
-        # One question listed on two series, held NO on A and YES on B, 30 each,
-        # both closing at one moment, last traded 7 days ago. Two identically
+    @pytest.mark.parametrize("a_now, b_now, n, positions_cents, value_cents, cap, twin_sells", [
+        # NO on A (best NO bid 0.50) and YES on B (best YES bid 0.40), 30 of
+        # each, worth $25.97 at those bids: past a 20% cap of a $100 portfolio
+        ((0.50, 0.52), (0.42, 0.60), 30, 5_000, 10_000, 0.20, "part"),
+        # NO on A (best NO bid 0.52) and YES on B (best YES bid 0.42), 10 of
+        # each, worth $9.05 at those bids: a 5% cap of a $15 portfolio holds
+        # less than one pair
+        ((0.48, 0.53), (0.44, 0.58), 10, 1_000, 1_500, 0.05, "all"),
+    ], ids=["past its size cap", "a size cap that holds less than one pair"])
+    def test_an_exact_held_same_title_pair_is_never_trimmed(
+            self, monkeypatch, caplog, a_now, b_now, n, positions_cents, value_cents, cap,
+            twin_sells):
+        # One question listed on two series, held NO on A and YES on B, both
+        # closing at one moment, last traded 7 days ago. Two identically
         # worded markets are no kind a trim reads, so the pair is never
         # trimmed, and no order book is read for it
-        case = _TrimCase("same_title", sides=_NO_A_YES_B, a_now=a_now, b_now=b_now)
-        # The backtest's trim caps a pair of any type but time-series at 0
-        # (config.pair_size_cap), which sells nothing
-        assert case.backtest(10_000, cap=0.20)[0].sell == 0
-        # Control: the same trim, reading the pair by its type but capped as a
-        # time-series pair would be, sells this very pair at this portfolio
-        # value under a 20% cap. The pair is one a trim would act on: live
-        # leaves it alone for its identical wording alone
-        with pytest.MonkeyPatch.context() as patched:
-            patched.setattr(backtester, "pair_size_cap", lambda pair_type, size_cap: size_cap)
-            sold = case.backtest(10_000, cap=0.20)[0].sell
-        assert (0 < sold < case.n) if backtest_sells == "part" else sold == case.n
+        case = _TrimCase("same_title", sides=_NO_A_YES_B, a_now=a_now, b_now=b_now, n=n,
+                         positions_cents=positions_cents)
+        # The backtest's trim keeps it too: a pair of any type but time-series
+        # has no chance of paying it can read (config.held_pair_win_prob)
+        assert case.backtest(value_cents, cap=cap)[0].sell == 0
+        # Control: the same position held as a time-series pair (two
+        # deadlines; the market held YES is the earlier, at the quotes and
+        # price of B here, and the market held NO the later, at A's), with the
+        # same counts and portfolio value. Live trims it under these very
+        # settings, part of it or all, so the position is one a trim acts on:
+        # live leaves the same-title pair alone for its identical wording alone
+        twin = _TrimCase(a_now=b_now, b_now=a_now, n=n, positions_cents=positions_cents,
+                         price_a=0.40, price_b=0.30)
+        (plan,) = twin.live(monkeypatch, value_cents, cap=cap)
+        assert (0 < plan.count < n) if twin_sells == "part" else plan.count == n
+        # ... while under those settings the same-title pair is not trimmed
+        assert case.live(monkeypatch, value_cents, cap=cap) == []
+        caplog.clear()
         with caplog.at_level(logging.INFO):
             assert case.live(monkeypatch, 10_000) == []
         assert (f"Not trimming NO {_A} / YES {_B}: its two markets cannot be shown to be a "

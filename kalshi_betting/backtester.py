@@ -4507,11 +4507,10 @@ def _settlement_receipt(n: int, outcome_a: str, outcome_b: str, pair_type: str) 
     unreachable from the pipeline — it exists so no caller can ever price the
     fourth cell by accident.
 
-    Any other pair_type is paid by the sides scanner.leg_sides gives it (NO
-    on market A and YES on market B, so A=NO with B=YES pays 2n). The
-    backtest simulates time-series pairs only (_simulate_at_discount refuses
-    every other record before scoring it), so no trade of another type
-    reaches here from a run.
+    Any other pair_type raises ValueError: scanner.leg_sides gives sides to
+    time-series pairs only. The backtest simulates time-series pairs only
+    (_simulate_at_discount refuses every other record before scoring it), so
+    no trade of another type reaches here from a run.
 
     Entry cost and taker fees are deliberately NOT deducted here — callers
     subtract them exactly once when computing profit and the equity curve.
@@ -4521,14 +4520,15 @@ def _settlement_receipt(n: int, outcome_a: str, outcome_b: str, pair_type: str) 
         outcome_a (str): Settlement result of market A — "yes" or "no".
         outcome_b (str): Settlement result of market B — "yes" or "no".
         pair_type (str): "time_series" — selects the sides via
-            scanner.leg_sides (see above for any other type).
+            scanner.leg_sides; any other type raises.
 
     Returns:
         float: Gross settlement receipt in dollars: n per leg that paid.
 
     Raises:
         ValueError: For a time_series pair whose earlier contract settled YES
-            while the later settled NO — a premise violation, never a payout.
+            while the later settled NO — a premise violation, never a payout —
+            and for any pair_type but "time_series" (scanner.leg_sides).
     """
     if pair_type == "time_series" and outcome_a == "yes" and outcome_b == "no":
         raise ValueError(
@@ -4555,26 +4555,33 @@ def _leg_prices_for(
     Dict-world mirror of scanner.leg_prices for the backtester, which carries a
     market's quotes as loose floats rather than a CandidatePair: (pA, nB) for
     a time-series pair (YES on the earlier market A, NO on the later market
-    B), and (nA, pB) for any other pair type (NO on market A, YES on market
-    B), the sides scanner.leg_sides gives it. These are the top-of-the-book
-    prices: _find_entry and Pass 1's Kelly gate read them, and a trade built
-    without fill prices paid them (_paid_prices).
+    B), the sides scanner.leg_sides gives it. Like scanner.leg_prices, it
+    raises for any other pair type: the backtest refuses every record that
+    is not time-series before it prices one, so only a bug reaches that.
+    These are the top-of-the-book prices: _find_entry and Pass 1's Kelly gate
+    read them, and a trade built without fill prices paid them
+    (_paid_prices).
 
     Args:
-        pair_type (str): "time_series"; anything but that exact string reads
-            (nA, pB), matching scanner.leg_sides.
+        pair_type (str): "time_series"; any other value raises.
         pA (float): YES ask of market A, dollars in [0.01, 0.99].
-        nA (float): NO ask of market A, dollars in [0.01, 0.99].
-        pB (float): YES ask of market B, dollars in [0.01, 0.99].
+        nA (float): NO ask of market A, dollars in [0.01, 0.99]. Read by no
+            time-series leg; taken so every caller hands the four quotes alike.
+        pB (float): YES ask of market B, dollars in [0.01, 0.99]. Likewise.
         nB (float): NO ask of market B, dollars in [0.01, 0.99].
 
     Returns:
         tuple[float, float]: (price_a, price_b) — the quote of the side bought
             on market A and on market B respectively.
+
+    Raises:
+        ValueError: For any pair_type but the exact string "time_series".
     """
-    if pair_type == "time_series":
-        return pA, nB
-    return nA, pB
+    if pair_type != "time_series":
+        # Reached only by a bug: the backtest refuses every other type before
+        # it prices a pair
+        raise ValueError(f"not a time-series pair type: {pair_type!r}")
+    return pA, nB
 
 
 def _paid_prices(trade: BacktestTrade) -> tuple[float, float]:
@@ -4590,6 +4597,10 @@ def _paid_prices(trade: BacktestTrade) -> tuple[float, float]:
 
     Returns:
         tuple[float, float]: (market A's leg, market B's leg), in dollars.
+
+    Raises:
+        ValueError: For a trade built without fill prices whose pair type is
+            not time-series (_leg_prices_for).
     """
     if trade.fill_price_a is not None and trade.fill_price_b is not None:
         return trade.fill_price_a, trade.fill_price_b
@@ -12851,8 +12862,7 @@ def _simulate_at_discount(
                     for key in (*ladders_a, *ladders_b)):
                 add_on_ladder_skips += 1
                 continue
-        elif c["pair_type"] == "time_series" and any(
-                key in open_ladders for key in (*ladders_a, *ladders_b)):
+        elif any(key in open_ladders for key in (*ladders_a, *ladders_b)):
             # At most one open time-series pair per ladder
             ladder_refusals += 1
             continue
@@ -12966,7 +12976,7 @@ def _simulate_at_discount(
             continue
 
         # Realized P&L from the settlement outcomes — n per leg whose market
-        # resolved to the side bought (sides depend on the pair type)
+        # resolved to the side bought (the time-series sides, from leg_sides)
         receipt      = _settlement_receipt(n, c["outcome_a"], c["outcome_b"], c["pair_type"])
         profit       = receipt - total_cost - fees
         profit_ratio = profit / invested if invested > 0 else 0.0

@@ -1086,7 +1086,8 @@ def _trade_type_label(trade: BacktestTrade) -> str:
     Every trade the page is handed is a time-series pair (the backtest
     simulates no other kind, and the saved results the page is rebuilt from
     hold no other), so the line is chosen by whether its two markets are
-    rungs of one event's deadline ladder.
+    rungs of one event's deadline ladder. A trade of any other pair type has
+    no line: it raises rather than being drawn on one.
 
     Args:
         trade (BacktestTrade): A completed trade.
@@ -1094,7 +1095,14 @@ def _trade_type_label(trade: BacktestTrade) -> str:
     Returns:
         str: "Time-series: ladder" when BacktestTrade.same_event_ladder is
             set, otherwise "Time-series: cross-event".
+
+    Raises:
+        ValueError: For a trade whose pair type is not "time_series".
     """
+    if trade.pair_type != "time_series":
+        # Reached only by a bug: a fresh run and the saved results both hold
+        # time-series trades only
+        raise ValueError(f"not a time-series pair type: {trade.pair_type!r}")
     return "Time-series: ladder" if trade.same_event_ladder else "Time-series: cross-event"
 
 
@@ -6330,6 +6338,11 @@ def _trade_row_head(t: BacktestTrade, color: str) -> str:
     Returns:
         str: An HTML fragment opening a <tr>: six cells, every
             Kalshi-controlled string escaped; _trade_row_tail closes it.
+
+    Raises:
+        ValueError: For a trade whose pair type is not "time_series"
+            (scanner.leg_sides gives sides to time-series pairs only); a fresh
+            run and the saved results both hold time-series trades only.
     """
     side_a, side_b = leg_sides(t.pair_type)
     price_a, price_b = _paid_prices(t)

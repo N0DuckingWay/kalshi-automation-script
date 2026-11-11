@@ -3842,6 +3842,29 @@ class TestReturnByTradeType:
         assert dashboard._mix_base(axis, 1000.0, None)["types"] == [
             "Time-series: ladder", "Time-series: cross-event"]
 
+    @pytest.mark.parametrize("pair_type", ["same_title", "unknown", ""])
+    def test_a_trade_of_another_pair_type_gets_no_line_and_no_row(self, pair_type):
+        # A fresh run and the saved results the page is rebuilt from hold
+        # time-series trades only (an older results file is refused), so a
+        # trade of another type is a bug: it raises rather than being drawn
+        # on the cross-event line or shown with the time-series sides in a
+        # trade table
+        for ladder, label in ((False, "Time-series: cross-event"),
+                              (True, "Time-series: ladder")):
+            t = _typed_trade("time_series", ladder, date(2026, 1, 6), date(2026, 1, 8), 3.0)
+            assert dashboard._trade_type_label(t) == label
+            assert dashboard._trade_row_head(t, "#FFF").startswith("<tr")
+            other = dataclasses.replace(t, pair_type=pair_type)
+            refused = re.escape(f"not a time-series pair type: {pair_type!r}")
+            with pytest.raises(ValueError, match=refused):
+                dashboard._trade_type_label(other)
+            with pytest.raises(ValueError, match=refused):
+                dashboard._trade_row_head(other, "#FFF")
+            with pytest.raises(ValueError, match=refused):
+                dashboard._return_by_trade_type(
+                    [t, other], backtester._build_equity_curve([t], date(2026, 1, 5), 1000.0),
+                    1000.0)
+
     def test_only_types_with_trades_get_a_line(self):
         start = date(2026, 1, 5)
         for ladder, label in ((True, "Time-series: ladder"),

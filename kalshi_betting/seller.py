@@ -1036,7 +1036,7 @@ def _log_summary(sold: int, considered: int, never: Counter) -> None:
 # ─── Trimming a held pair to its Kelly size ───────────────────────────────────
 
 # How a log line names a pair's kind
-_KIND_WORDS = {"time_series": "time-series", "same_title": "same-title"}
+_KIND_WORDS = {"time_series": "time-series"}
 
 
 def _cents_text(dollars: float) -> str:
@@ -1296,7 +1296,8 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
     pair_type, market_a, market_b = kind
     if partner is not None and (pair_type != "time_series" or market_b.ticker != lone_ticker):
         # The forecast for what is left is the later market's chance of paying once
-        # the earlier one has paid $0; no other lone leg has one
+        # the earlier one has paid $0; no other lone leg has one. held_pair_kind
+        # answers only "time_series", so the type test is defence only
         not_trimming("a lone leg is trimmed only as the later market of a time-series pair")
         return None, None
     # Cross-module: the side each leg holds
