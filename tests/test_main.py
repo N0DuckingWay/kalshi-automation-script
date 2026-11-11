@@ -3483,14 +3483,21 @@ class TestRunProdDryRunLiveShapeReplay:
         assert client.rest_client.request.call_count == 0
 
 
+# The smallest gap between two YES asks, in dollars (5 cents), that makes a
+# pair one a same-title search would have bought. _assert_same_title_pair
+# checks it, so the two tests that call it show the pair they hand the bot is
+# such a pair: their positive control.
+_SAME_TITLE_PRICE_GAP = 0.05
+
+
 def _assert_same_title_pair(dear, cheap) -> None:
     """
     Assert two markets are the pair a same-title search would buy.
 
     One wording (title, subtitle and event title) on two different series,
     closing within an hour of each other, their YES asks at least
-    SAME_TITLE_MIN_PRICE_DIFF apart, and a NO on the pricier plus a YES on
-    the other costing less than $1 after the fee.
+    _SAME_TITLE_PRICE_GAP (5 cents) apart, and a NO on the pricier plus a YES
+    on the other costing less than $1 after the fee.
 
     Args:
         dear: The market with the higher YES ask, bought NO.
@@ -3500,7 +3507,7 @@ def _assert_same_title_pair(dear, cheap) -> None:
     assert not scanner_mod._same_series(dear, cheap)
     assert not scanner_mod._closes_apart(dear, cheap)
     assert (float(dear.yes_ask_dollars) - float(cheap.yes_ask_dollars)
-            >= config.SAME_TITLE_MIN_PRICE_DIFF - config.PRICE_EPSILON)
+            >= _SAME_TITLE_PRICE_GAP - config.PRICE_EPSILON)
     no_ask, yes_ask = float(dear.no_ask_dollars), float(cheap.yes_ask_dollars)
     assert 1.0 - no_ask - yes_ask > config.fee_per_pair_approx(
         no_ask, yes_ask, multiplier_a=scanner_mod.market_fee_multiplier(dear),

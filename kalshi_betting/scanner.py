@@ -997,10 +997,10 @@ class CandidatePair:
       same_title:  NO on market_a (the pricier side by YES ask) at nA, YES on
                    market_b (the cheaper side) at pB: two identically worded
                    markets on two DIFFERENT event series. Both legs pay when
-                   the two identical questions co-resolve, so the trade is a
-                   near-arbitrage priced on the SAME_TITLE_CO_RESOLVE_PROB
-                   prior. No finder forms one: find_time_series_pairs forms
-                   time_series pairs only.
+                   the two identical questions co-resolve. No finder forms
+                   one (find_time_series_pairs forms time_series pairs only),
+                   and nothing sizes one (strategy._kelly_p_at has no
+                   forecast for it).
       time_series: YES on market_a (the EARLIER contract) at pA, NO on
                    market_b (the later one) at nB. "Earlier" means earlier by
                    close_time for a cross-event pair, and earlier by STATED

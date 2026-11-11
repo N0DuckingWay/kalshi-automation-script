@@ -51,7 +51,6 @@ from typing import NamedTuple
 
 from .config import (
     PRICE_EPSILON,
-    SAME_TITLE_CO_RESOLVE_PROB,
     SIZE_SOLVE_MAX_ITERATIONS,
     LiveSettings,
     count_text,
@@ -142,10 +141,10 @@ def _depth_levels(pair: CandidatePair) -> tuple:
 
 def _kelly_p(pair: CandidatePair, settings: LiveSettings) -> float | None:
     """
-    The pair's chance of profit under the run's k; None when a time-series pair has no mid spread.
+    The pair's chance of profit under the run's k; None when it has no forecast.
 
-    _kelly_p_at with the run's k (settings.interval_discount); see it for both
-    models.
+    _kelly_p_at with the run's k (settings.interval_discount); see it for the
+    model.
 
     Args:
         pair (CandidatePair): Supplies pair_type and, for time_series, mid_spread.
@@ -153,7 +152,8 @@ def _kelly_p(pair: CandidatePair, settings: LiveSettings) -> float | None:
 
     Returns:
         float | None: p, the "p" in compute_trade's Kelly formula; None for a
-            time-series pair without a usable mid spread.
+            pair that is not time-series, or a time-series pair without a
+            usable mid spread.
     """
     return _kelly_p_at(pair, settings.interval_discount)
 
@@ -177,19 +177,21 @@ def _kelly_p_at(pair: CandidatePair, k: float | None) -> float | None:
     caller must not size the pair, since the model's zero clamp would read it
     as riskless.
 
-    same_title: the fixed SAME_TITLE_CO_RESOLVE_PROB prior. It is only valid
-    for two markets that ask one question — same wording, different series,
-    closing within an hour of each other (DR-02, DR-74); no finder forms such
-    a pair.
+    Any other pair type (anything but the exact string "time_series") has no
+    forecast: None. The bot trades time-series pairs only, and no sizing step
+    hands it one: compute_trade refuses any other type before it sizes
+    anything, and select_portfolio before it shrinks a spec (_spec_at_count).
 
     Args:
         pair (CandidatePair): Supplies pair_type and, for time_series, mid_spread.
-        k (float | None): The run's time-series discount; None reads config's
-            value, so only same-title may pass None.
+        k (float | None): The run's time-series discount. None reads config.py's
+            TIME_SERIES_INTERVAL_PROB_DISCOUNT (time_series_profit_prob's
+            default); no caller passes None: each hands it the run's k or the
+            k a spec was sized at.
 
     Returns:
-        float | None: The chance of profit, in (0, 1]; None for a time-series
-            pair without a usable mid spread.
+        float | None: The chance of profit, in (0, 1]; None for a pair that is
+            not time-series, or a time-series pair without a usable mid spread.
     """
     if pair.pair_type == "time_series":
         # Read by type: None means nothing to forecast on
@@ -197,7 +199,8 @@ def _kelly_p_at(pair: CandidatePair, k: float | None) -> float | None:
         # Single shared definition of the time-series model — backtester and
         # dashboard call the same helper so the three sizers cannot drift
         return None if spread is None else time_series_profit_prob(spread, k=k)
-    return SAME_TITLE_CO_RESOLVE_PROB
+    # The bot trades time-series pairs only: nothing to forecast on
+    return None
 
 
 class _Sizing(NamedTuple):

@@ -3164,32 +3164,40 @@ class TestPlanTrims:
                 "read") in caplog.text
         assert case.world.calls["book"] == []
 
-    @pytest.mark.parametrize("a_now, b_now, backtest_sells", [
-        # NO on A (best NO bid 0.50) and YES on B (best YES bid 0.40): past a
-        # 20% cap of a $100 portfolio, so the backtest's trim sells part of it
-        ((0.50, 0.52), (0.42, 0.60), "part"),
-        # Converged: selling returns more than the pair is expected to pay, so
-        # the backtest keeps none of it
-        ((0.03, 0.98), (0.03, 0.98), "all"),
-    ], ids=["past its size cap", "converged"])
-    def test_an_exact_held_same_title_pair_is_never_trimmed(self, monkeypatch, caplog, a_now,
-                                                            b_now, backtest_sells):
-        # One question listed on two series, held NO on A and YES on B, 30 each,
-        # both closing at one moment, last traded 7 days ago. Two identically
+    @pytest.mark.parametrize("a_now, b_now, n, positions_cents, value_cents, cap, twin_sells", [
+        # NO on A (best NO bid 0.50) and YES on B (best YES bid 0.40), 30 of
+        # each, worth $25.97 at those bids: past a 20% cap of a $100 portfolio
+        ((0.50, 0.52), (0.42, 0.60), 30, 5_000, 10_000, 0.20, "part"),
+        # NO on A (best NO bid 0.52) and YES on B (best YES bid 0.42), 10 of
+        # each, worth $9.05 at those bids: a 5% cap of a $15 portfolio holds
+        # less than one pair
+        ((0.48, 0.53), (0.44, 0.58), 10, 1_000, 1_500, 0.05, "all"),
+    ], ids=["past its size cap", "a size cap that holds less than one pair"])
+    def test_an_exact_held_same_title_pair_is_never_trimmed(
+            self, monkeypatch, caplog, a_now, b_now, n, positions_cents, value_cents, cap,
+            twin_sells):
+        # One question listed on two series, held NO on A and YES on B, both
+        # closing at one moment, last traded 7 days ago. Two identically
         # worded markets are no kind a trim reads, so the pair is never
         # trimmed, and no order book is read for it
-        case = _TrimCase("same_title", sides=_NO_A_YES_B, a_now=a_now, b_now=b_now)
-        # The backtest's trim caps a pair of any type but time-series at 0
-        # (config.pair_size_cap), which sells nothing
-        assert case.backtest(10_000, cap=0.20)[0].sell == 0
-        # Control: the same trim, reading the pair by its type but capped as a
-        # time-series pair would be, sells this very pair at this portfolio
-        # value under a 20% cap. The pair is one a trim would act on: live
-        # leaves it alone for its identical wording alone
-        with pytest.MonkeyPatch.context() as patched:
-            patched.setattr(backtester, "pair_size_cap", lambda pair_type, size_cap: size_cap)
-            sold = case.backtest(10_000, cap=0.20)[0].sell
-        assert (0 < sold < case.n) if backtest_sells == "part" else sold == case.n
+        case = _TrimCase("same_title", sides=_NO_A_YES_B, a_now=a_now, b_now=b_now, n=n,
+                         positions_cents=positions_cents)
+        # The backtest's trim keeps it too: a pair of any type but time-series
+        # has no chance of paying it can read (config.held_pair_win_prob)
+        assert case.backtest(value_cents, cap=cap)[0].sell == 0
+        # Control: the same position held as a time-series pair (two
+        # deadlines; the market held YES is the earlier, at the quotes and
+        # price of B here, and the market held NO the later, at A's), with the
+        # same counts and portfolio value. Live trims it under these very
+        # settings, part of it or all, so the position is one a trim acts on:
+        # live leaves the same-title pair alone for its identical wording alone
+        twin = _TrimCase(a_now=b_now, b_now=a_now, n=n, positions_cents=positions_cents,
+                         price_a=0.40, price_b=0.30)
+        (plan,) = twin.live(monkeypatch, value_cents, cap=cap)
+        assert (0 < plan.count < n) if twin_sells == "part" else plan.count == n
+        # ... while under those settings the same-title pair is not trimmed
+        assert case.live(monkeypatch, value_cents, cap=cap) == []
+        caplog.clear()
         with caplog.at_level(logging.INFO):
             assert case.live(monkeypatch, 10_000) == []
         assert (f"Not trimming NO {_A} / YES {_B}: its two markets cannot be shown to be a "
