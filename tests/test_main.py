@@ -5364,7 +5364,7 @@ class TestRunProdAddsToHeldPairs:
         by_ticker = {m.ticker: m for m in searched}
         assert key <= set(by_ticker) and not key & seen["blocked"][0][0]
         _assert_same_title_pair(by_ticker["ST-A"], by_ticker["ST-B"])
-        assert add_on_pairs[key].matches(by_ticker["ST-A"], by_ticker["ST-B"], "same_title")
+        assert add_on_pairs[key].sides == (("ST-A", "no"), ("ST-B", "yes"))
 
     def test_a_failed_held_market_lookup_means_no_add_on(self, monkeypatch, caplog):
         # A held market that cannot be looked up could share the pair's

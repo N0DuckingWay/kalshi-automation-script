@@ -12851,8 +12851,7 @@ def _simulate_at_discount(
                     for key in (*ladders_a, *ladders_b)):
                 add_on_ladder_skips += 1
                 continue
-        elif c["pair_type"] == "time_series" and any(
-                key in open_ladders for key in (*ladders_a, *ladders_b)):
+        elif any(key in open_ladders for key in (*ladders_a, *ladders_b)):
             # At most one open time-series pair per ladder
             ladder_refusals += 1
             continue

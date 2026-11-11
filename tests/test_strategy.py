@@ -56,6 +56,19 @@ from kalshi_betting.strategy import TradeSpec, _kelly_p, compute_trade, select_p
 # the depth path alone. Tests that mean to exercise the cap set their own.
 _AMPLE_BALANCE_CENTS = 100_000_000
 
+# Pair types that are not time-series, each refused where pairs come in: the
+# retired same-title type, a missing type, an empty one, an unknown one and a
+# test double's auto-attribute
+_OTHER_PAIR_TYPES = ["same_title", None, "", "bogus", MagicMock().pair_type]
+_OTHER_PAIR_TYPE_IDS = ["same_title", "none", "empty", "bogus", "mock"]
+
+
+def _must_not_run(name: str):
+    """A stand-in for `name` that fails the test if anything calls it."""
+    def fail(*args, **kwargs):
+        raise AssertionError(f"{name} ran after the refusal")
+    return fail
+
 
 # make_pair / make_booked_pair's default: read a time-series pair's mid spread
 # off its four quotes, as enrichment writes it from the tops of its books
@@ -261,6 +274,40 @@ class TestComputeTrade:
     def test_returns_none_when_not_tradeable(self):
         pair = make_pair(tradeable=False)
         assert compute_trade(pair, 100_000) is None
+
+    @pytest.mark.parametrize("quiet", [False, True], ids=["loud", "quiet"])
+    @pytest.mark.parametrize("pair_type", _OTHER_PAIR_TYPES, ids=_OTHER_PAIR_TYPE_IDS)
+    def test_a_pair_that_is_not_time_series_is_refused_first(self, caplog, monkeypatch,
+                                                              pair_type, quiet):
+        # A booked pair the sizer buys as a time-series pair (the control)
+        booked = make_booked_pair([(_TS_PA, _TS_NB, 100)], pB=_TS_PB)
+        assert compute_trade(booked, 1_000_000) is not None
+        # As any other type it is refused before anything else: before the
+        # settings are resolved (none are handed in) and before any size is
+        # priced or any add-on line logged
+        for name in ("live_settings", "pair_mid_spread", "_depth_levels", "_evaluate_size",
+                     "_solve_marginal_size", "_log_no_add_on"):
+            monkeypatch.setattr(strategy, name, _must_not_run(name))
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            assert compute_trade(dataclasses.replace(booked, pair_type=pair_type), 1_000_000,
+                                 quiet=quiet) is None
+        # One WARNING, quiet or not, naming the pair and its type: no
+        # "Trade computed" line
+        assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
+            (logging.WARNING,
+             f"Pair 'booked pair' not sized: its type is {pair_type!r}, not a time-series "
+             "pair, and the bot trades time-series pairs only")]
+
+    def test_a_refused_pair_with_no_title_is_named_by_its_tickers(self, caplog):
+        pair = dataclasses.replace(make_booked_pair([(_TS_PA, _TS_NB, 100)], pB=_TS_PB),
+                                   pair_type="same_title", canonical_title="")
+        with caplog.at_level(logging.WARNING):
+            assert compute_trade(pair, 1_000_000) is None
+        [record] = caplog.records
+        assert record.getMessage() == (
+            "Pair A1 / B1 not sized: its type is 'same_title', not a time-series pair, "
+            "and the bot trades time-series pairs only")
 
     def test_returns_none_when_no_spread(self):
         # pA + nB = 0.50 + 0.50 = 1.0 means zero gross spread: a contract pair
@@ -636,9 +683,10 @@ class TestComputeTradeSettings:
         assert strategy._kelly_p(pair, _live(k=0.6)) == pytest.approx(at_06.kelly_p)
 
     def test_a_pair_that_is_not_time_series_sizes_nothing(self):
-        # pair_size_cap caps any other type at 0, so even the same-title
-        # reference pair, whose f* on the co-resolution prior is about 0.89,
-        # has no budget and is refused, at every per-trade cap
+        # compute_trade refuses any pair that is not time-series before it
+        # sizes it (and pair_size_cap would cap one at 0), so even the
+        # same-title reference pair, whose f* on the co-resolution prior is
+        # about 0.89, is refused, at every per-trade cap
         assert self._st_f() == pytest.approx(0.8945, abs=1e-4)
         st, ts = make_pair(**self._ST), make_pair(**self._TS_WIDE)
         for cap in (0.05, 0.10, 0.20, 0.35, 1.0):
@@ -1224,6 +1272,33 @@ class TestComputeTradeAddsToHeldPair:
         assert sizes == {4.0: 22, 8.0: 16, 12.0: 11}
         assert plain.x == 28 and plain.total_cost_with_fees <= 150.0
 
+    @pytest.mark.parametrize("pair_type", _OTHER_PAIR_TYPES, ids=_OTHER_PAIR_TYPE_IDS)
+    @pytest.mark.parametrize("path", ["bookless", "booked"])
+    def test_an_add_on_of_another_type_gets_one_warning_and_no_add_on_line(
+            self, caplog, path, pair_type):
+        # Worth $30 at today's prices, plus $0.90 of fees, against 10% of a
+        # $211 portfolio: as a time-series pair it already holds its Kelly
+        # share, and says so (the control)
+        held = _held_pair(value=30.0)
+        ts = self._bookless(held) if path == "bookless" else self._booked(held, qty=1000)
+        with caplog.at_level(logging.INFO):
+            assert self._size(ts) is None
+        assert "it already holds its Kelly share" in caplog.text
+        # As any other type it is refused first: one WARNING, and no add-on
+        # line giving it that reason (or any other)
+        if path == "bookless":
+            odd = self._bookless(held)
+            odd.pair_type = pair_type
+        else:
+            odd = dataclasses.replace(ts, pair_type=pair_type)
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            assert self._size(odd) is None
+        assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
+            (logging.WARNING,
+             f"Pair '{odd.canonical_title}' not sized: its type is {pair_type!r}, not a "
+             "time-series pair, and the bot trades time-series pairs only")]
+
     def test_an_ordinary_pair_it_refuses_logs_nothing_new(self, caplog):
         with caplog.at_level(logging.INFO):
             assert self._size(make_pair(tradeable=False)) is None
@@ -1728,15 +1803,63 @@ def _add_on_sizing_problems(source: str) -> list[str]:
     return problems
 
 
+def _returns_none(stmt: ast.AST) -> bool:
+    """
+    Say whether a statement is `return` or `return None`.
+
+    Args:
+        stmt (ast.AST): One statement.
+
+    Returns:
+        bool: True for a bare return or a return of the constant None.
+    """
+    return isinstance(stmt, ast.Return) and (
+        stmt.value is None or (isinstance(stmt.value, ast.Constant)
+                               and stmt.value.value is None))
+
+
+def _type_refusal(func: ast.FunctionDef) -> ast.Return | None:
+    """
+    Find compute_trade's refusal of a pair that is not time-series, as its first statement.
+
+    The first statement after the docstring must be
+    `if pair.pair_type != "time_series":` with no else, holding exactly one
+    logging.warning call and then a return of None.
+
+    Args:
+        func (ast.FunctionDef): compute_trade's node (or a changed copy's).
+
+    Returns:
+        ast.Return | None: That refusal's return; None when the first
+            statement is not that refusal.
+    """
+    body = func.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+        body = body[1:]
+    first = body[0] if body else None
+    if not (isinstance(first, ast.If) and not first.orelse and len(first.body) == 2
+            and ast.unparse(first.test) == "pair.pair_type != 'time_series'"):
+        return None
+    warning, ret = first.body
+    if not (isinstance(warning, ast.Expr) and isinstance(warning.value, ast.Call)
+            and ast.unparse(warning.value.func) == "logging.warning" and _returns_none(ret)):
+        return None
+    return ret
+
+
 def _refusal_line_problems(source: str) -> list[str]:
     """
-    Check that compute_trade names every refusal of an add-on, once.
+    Check that compute_trade refuses another pair type first, then names every refusal of an add-on, once.
 
-    Every `return None` in compute_trade must come right after a
+    Its first statement must be the refusal of a pair that is not
+    time-series (_type_refusal): one WARNING and a return of None, before the
+    settings are resolved, anything is priced or an add-on line is logged,
+    so an add-on of another type is never logged as holding its Kelly share.
+    Every other `return None` in compute_trade must come right after a
     _log_no_add_on call in the same block, and there must be as many such
-    calls as returns, so an add-on refused on any path says why in exactly
-    one line. The calls that ask _holds_kelly_share hand it the cash
-    compute_trade got.
+    calls as those returns, so an add-on refused on any other path says why
+    in exactly one line. The calls that ask _holds_kelly_share hand it the
+    cash compute_trade got.
 
     Args:
         source (str): Source text holding def compute_trade (strategy.py's own,
@@ -1747,6 +1870,10 @@ def _refusal_line_problems(source: str) -> list[str]:
     """
     func = _def_named(source, "compute_trade")
     problems = []
+    type_refusal = _type_refusal(func)
+    if type_refusal is None:
+        problems.append("the first statement is not the one-WARNING refusal of a pair "
+                        "that is not time-series")
     returns = 0
     for node in ast.walk(func):
         for field in ("body", "orelse", "finalbody"):
@@ -1754,9 +1881,7 @@ def _refusal_line_problems(source: str) -> list[str]:
             if not isinstance(block, list):
                 continue
             for i, stmt in enumerate(block):
-                if not (isinstance(stmt, ast.Return) and (
-                        stmt.value is None or (isinstance(stmt.value, ast.Constant)
-                                               and stmt.value.value is None))):
+                if not _returns_none(stmt) or stmt is type_refusal:
                     continue
                 returns += 1
                 before = block[i - 1] if i else None
@@ -4044,6 +4169,22 @@ class TestTimeSeriesKellyParity:
         assert source.count(refusal) == 1
         cash = "settings, cash_cents=cash_cents),"
         assert source.count(cash) == 2
+        type_refusal = (
+            '    if pair.pair_type != "time_series":\n'
+            "        # Named by its title, or by its tickers when it has none, without raising\n"
+            "        logging.warning(\n"
+            '            "Pair %s not sized: its type is %r, not a time-series pair, and the bot "\n'
+            '            "trades time-series pairs only", pair_log_name(pair), pair.pair_type)\n'
+            "        return None\n")
+        assert source.count(type_refusal) == 1
+        resolve = "    settings = live_settings() if settings is None else settings\n"
+        assert source.count(resolve) == 1
+        not_tradeable = ("    if not pair.tradeable:\n"
+                         "        _log_no_add_on(pair, holds_kelly_share=False,\n"
+                         "                       portfolio_value_cents=portfolio_value_cents, "
+                         "level=info)\n"
+                         "        return None\n")
+        assert source.count(not_tradeable) == 1
         sizing = {
             "fed the cash": source.replace(share, share.replace(
                 "portfolio_value_cents / 100.0", "cash_cents / 100.0")),
@@ -4062,6 +4203,20 @@ class TestTimeSeriesKellyParity:
         refusals = {
             "a silent refusal": source.replace(refusal, "    if min_payoff <= 0:\n"),
             "the cash not handed on": source.replace(cash, "settings),", 1),
+            # An add-on of another type would then get an add-on line, or be
+            # sized, before it is refused
+            "no type refusal": source.replace(type_refusal, ""),
+            "a silent type refusal": source.replace(
+                type_refusal, '    if pair.pair_type != "time_series":\n        return None\n'),
+            "the type refusal on the add-on line": source.replace(
+                type_refusal, '    if pair.pair_type != "time_series":\n'
+                "        _log_no_add_on(pair, holds_kelly_share=False,\n"
+                "                       portfolio_value_cents=portfolio_value_cents)\n"
+                "        return None\n"),
+            "the type refusal after the settings": source.replace(type_refusal, "").replace(
+                resolve, resolve + type_refusal),
+            "the type refusal after the tradeable check": source.replace(
+                type_refusal, "").replace(not_tradeable, not_tradeable + type_refusal),
         }
         for name, mutant in refusals.items():
             assert mutant != source, name
@@ -5604,12 +5759,17 @@ class TestSelectPortfolio:
         result = select_portfolio([a, b], 50_000)
         assert len(result) == 2
 
-    def test_prefers_same_title_over_time_series_at_equal_return(self):
-        # Near-arbitrage (same-title) outranks the directional bet (time-series)
-        ts = make_spec(monthly_profit_ratio=0.10, pair_type="time_series", total_cost=100.0)
-        st = make_spec(monthly_profit_ratio=0.10, pair_type="same_title", total_cost=100.0)
-        result = select_portfolio([ts, st], 100_000)
-        assert result[0] is st
+    def test_equal_returns_keep_the_order_they_came_in(self):
+        # The ranking is the monthly return alone, and Python's sort is stable
+        # under reverse=True: specs with equal returns come out in the order
+        # they were handed in, whichever order that is
+        tied = [make_spec(monthly_profit_ratio=0.10, total_cost=10.0) for _ in range(3)]
+        best = make_spec(monthly_profit_ratio=0.20, total_cost=10.0)
+        worst = make_spec(monthly_profit_ratio=0.05, total_cost=10.0)
+        for order in ([0, 1, 2], [2, 0, 1], [1, 2, 0]):
+            first, second, third = (tied[i] for i in order)
+            got = select_portfolio([first, worst, second, best, third], 100_000)
+            assert [id(s) for s in got] == [id(s) for s in (best, first, second, third, worst)]
 
     def test_partial_selection_when_second_trade_doesnt_fit(self):
         cheap = make_spec(monthly_profit_ratio=0.10, total_cost=100.0)
@@ -5657,7 +5817,8 @@ class TestSelectPortfolioLadders:
     """select_portfolio picks at most one time-series trade per ladder (one
     question at several deadlines): two markets share a ladder when they share
     an event or ask the same question once the dates are removed. Held
-    positions count, and so do specs picked earlier in the run."""
+    positions count, and so do specs picked earlier in the run. A spec that
+    is not time-series is refused before the ranking and claims nothing."""
 
     def test_two_time_series_specs_on_one_ladder_take_only_the_better(self, caplog):
         best = _ladder_spec(_R1, _R3, ratio=0.20)
@@ -5699,12 +5860,52 @@ class TestSelectPortfolioLadders:
         assert shared == frozenset({("event", "KXRAIN-2")})
         assert select_portfolio([first, second], 100_000) == [first]
 
-    def test_a_spec_of_unknown_type_is_never_blocked(self):
-        # Only the exact type "time_series" is refused; anything else is
-        # treated as a same-title pair
-        ts = _ladder_spec(_R1, _R3, ratio=0.20)
-        odd = _ladder_spec(_R2, _R4, pair_type=None, ratio=0.10)
-        assert select_portfolio([ts, odd], 100_000) == [ts, odd]
+    @pytest.mark.parametrize("pair_type", _OTHER_PAIR_TYPES, ids=_OTHER_PAIR_TYPE_IDS)
+    def test_a_spec_of_another_type_is_refused_and_claims_nothing(self, caplog, pair_type):
+        # Ranked first, on the very tickers and ladder of a time-series spec,
+        # and costing all the cash: had it claimed a ticker, a ladder or the
+        # cash, the time-series spec would be refused
+        odd = _ladder_spec(_R1, _R3, pair_type=pair_type, ratio=0.30, cost=1_000.0)
+        ts = _ladder_spec(_R1, _R3, ratio=0.10, cost=1_000.0)
+        with caplog.at_level(logging.INFO):
+            got = select_portfolio([ts, odd], 100_000)
+        assert [id(s) for s in got] == [id(ts)]
+        # One WARNING, naming the spec (by its tickers: its pair has no
+        # title) and its type; the ladder rule refused nothing
+        assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == [
+            f"Trade on STAR-1 / STAR-20 not picked for the portfolio: its type is "
+            f"{pair_type!r}, not a time-series pair, and the bot trades time-series pairs "
+            "only"]
+        assert "on the same ladder" not in caplog.text
+        # Alone, off every held ladder, it is still refused
+        assert select_portfolio([odd], 100_000) == []
+
+    @pytest.mark.parametrize("pair_type", _OTHER_PAIR_TYPES, ids=_OTHER_PAIR_TYPE_IDS)
+    def test_a_spec_of_another_type_behind_a_pick_on_its_ticker_is_still_refused(
+            self, caplog, pair_type):
+        # A time-series spec with the better return is picked first; a spec of
+        # another type ranked after it shares one of its tickers. The refusal
+        # comes before the ranking, so that spec still gets its one WARNING:
+        # it is refused for its type, not skipped in silence by the rule
+        # against reusing a ticker
+        ts = _ladder_spec(_R1, _R3, ratio=0.30)
+        odd = _ladder_spec(_R1, _OTHER_B, pair_type=pair_type, ratio=0.10)
+        with caplog.at_level(logging.INFO):
+            got = select_portfolio([odd, ts], 100_000)
+        assert [id(s) for s in got] == [id(ts)]
+        assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == [
+            f"Trade on STAR-1 / RAIN-2 not picked for the portfolio: its type is "
+            f"{pair_type!r}, not a time-series pair, and the bot trades time-series pairs "
+            "only"]
+        # Control: the same spec as a time-series pair is skipped by the
+        # ticker rule, with no line at all (not even the ladder rule's)
+        caplog.clear()
+        same = _ladder_spec(_R1, _OTHER_B, ratio=0.10)
+        with caplog.at_level(logging.INFO):
+            got = select_portfolio([same, ts], 100_000)
+        assert [id(s) for s in got] == [id(ts)]
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+        assert "on the same ladder" not in caplog.text
 
     def test_a_held_question_blocks_a_time_series_spec(self):
         # The same question listed in another event, one we hold a position in
@@ -5718,21 +5919,6 @@ class TestSelectPortfolioLadders:
         # control: holding a position on an unrelated ladder blocks nothing
         other = scanner.market_ladder_keys(_OTHER_A)
         assert select_portfolio([star], 100_000, held_ladders=other) == [star]
-
-    def test_a_same_title_spec_is_never_blocked(self):
-        st = _ladder_spec(_R1, _R3, pair_type="same_title", ratio=0.20)
-        held = scanner.pair_ladder_keys(st.pair)
-        assert select_portfolio([st], 100_000, held_ladders=held) == [st]
-
-    def test_a_same_title_spec_picked_first_blocks_a_later_time_series_spec(self):
-        st = _ladder_spec(_R1, _R3, pair_type="same_title", ratio=0.20)
-        ts = _ladder_spec(_R2, _R4, ratio=0.10)
-        assert select_portfolio([ts, st], 100_000) == [st]
-
-    def test_a_time_series_spec_picked_first_does_not_block_a_same_title_spec(self):
-        ts = _ladder_spec(_R1, _R3, ratio=0.20)
-        st = _ladder_spec(_R2, _R4, pair_type="same_title", ratio=0.10)
-        assert select_portfolio([st, ts], 100_000) == [ts, st]
 
     def test_a_spec_skipped_for_cash_leaves_its_ladder_free(self):
         # The better spec does not fit the balance, so it never takes the ladder
@@ -5773,12 +5959,24 @@ class TestSelectPortfolioAddOns:
             assert select_portfolio([add_on], 100_000, held_ladders=held) == [add_on]
         assert "on the same ladder" not in caplog.text
 
-    def test_a_same_title_pick_earlier_in_the_run_blocks_an_add_on(self, caplog):
-        st = _ladder_spec(_R2, _R4, pair_type="same_title", ratio=0.20)
+    @pytest.mark.parametrize("pair_type", _OTHER_PAIR_TYPES, ids=_OTHER_PAIR_TYPE_IDS)
+    def test_a_spec_of_another_type_ranked_first_never_blocks_an_add_on(self, caplog,
+                                                                        pair_type):
+        # Ranked first on the add-on's own ladder: refused before the
+        # ranking, it claims no ladder, so the add-on is taken
+        odd = _ladder_spec(_R2, _R4, pair_type=pair_type, ratio=0.20)
         add_on = _add_on_spec(_R1, _R3, ratio=0.10)
         held = scanner.pair_ladder_keys(add_on.pair)
+        assert scanner.pair_ladder_keys(odd.pair) & held
         with caplog.at_level(logging.INFO):
-            assert select_portfolio([add_on, st], 100_000, held_ladders=held) == [st]
+            assert select_portfolio([add_on, odd], 100_000, held_ladders=held) == [add_on]
+        assert "on the same ladder" not in caplog.text
+        # Control: a time-series spec picked first on that ladder (nothing
+        # held, so it is taken) does block the add-on
+        ts = _ladder_spec(_R2, _R4, ratio=0.20)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert select_portfolio([add_on, ts], 100_000) == [ts]
         assert self._LADDER_LINE + "1" in caplog.text
 
     def test_an_ordinary_spec_on_a_held_ladder_is_still_refused(self, caplog):
@@ -6055,12 +6253,13 @@ class TestSelectPortfolioShrinksToCash:
         # Every later spec needs a cent and the shrink leaves three, so only
         # the ticker and ladder rules can refuse the first two
         shrinks = _held_spec(make_booked_pair(_HOLE_LADDER), 700, ratio=0.30)
-        # A same-title spec (never refused by the ladder rule) on the shrunk
-        # spec's market_a ticker
+        # A time-series spec on the shrunk spec's market_a ticker, sharing no
+        # ladder with it, so only the ticker rule can refuse it
         same_ticker = _ladder_spec(
             SimpleNamespace(ticker="A1", event_ticker="KXZ-1", title="Z", subtitle=""),
-            _ladder_market("Z-2", "KXZ-2", "Z"), pair_type="same_title",
-            ratio=0.25, cost=0.01)
+            _ladder_market("Z-2", "KXZ-2", "Z"), ratio=0.25, cost=0.01)
+        assert not scanner.pair_ladder_keys(same_ticker.pair) & scanner.pair_ladder_keys(
+            shrinks.pair)
         # A time-series spec whose later market asks the shrunk spec's later
         # market's question ("B")
         on_its_ladder = _ladder_spec(
@@ -6134,12 +6333,9 @@ class TestSelectPortfolioShrinksToCash:
         # than taken at a size the model never judged
         spec = _held_spec(make_booked_pair(_HOLE_LADDER), 700, k=None)
         assert select_portfolio([spec], 11_420) == []
-        # A same-title spec needs no k (its p is the fixed prior): 91 pairs of
-        # NO 0.30 / YES 0.20 need 2,958 + 2,017 = 4,975 cents, 92 need 5,029
-        same_title = _held_spec(make_booked_pair([(0.30, 0.20, 1_000)],
-                                                 pair_type="same_title"), 1_000, k=None)
-        [got] = select_portfolio([same_title], 5_000)
-        assert got.x == 91 and got.cash_need_cents == 4_975
+        # Control: with its k the same spec is shrunk to 128 pairs
+        assert select_portfolio([dataclasses.replace(spec, interval_discount=0.40)],
+                                11_420)[0].x == 128
 
     def test_the_shard_funder_never_finds_the_portfolio_short(self):
         # Over random portfolios on random books, grids and shards: what the
@@ -6148,12 +6344,11 @@ class TestSelectPortfolioShrinksToCash:
         now = datetime.now(UTC)
         grids = {"cent": ("", None, 0.01),
                  "deci": ("deci_cent", [PriceRange(0.0, 1.0, 0.001)], 0.001)}
-        shrunk = checked = ts_checked = refused = 0
+        shrunk = checked = 0
         for trial in range(150):
             specs = []
             for i in range(rng.randrange(1, 7)):
                 structure, ranges, tick = grids[rng.choice(list(grids))]
-                pair_type = rng.choice(["time_series", "same_title"])
                 markets = []
                 for leg in "AB":
                     markets.append(SimpleNamespace(
@@ -6170,44 +6365,33 @@ class TestSelectPortfolioShrinksToCash:
                     a += rng.randrange(0, 3) * tick
                     b += rng.randrange(0, 3) * tick
                 best_a, best_b, _ = levels[0]
-                if pair_type == "time_series":
-                    prices = {"pA": best_a, "nB": best_b, "nA": round(1 - best_a, 4),
-                              "pB": round(min(0.99, 1 - best_b + rng.randrange(0, 20) * tick), 4)}
-                    # The forecast's input, at the tops of the books, as
-                    # enrichment writes it: without it the sizer refuses the pair
-                    prices["mid_spread"] = config.time_series_mid_spread(
-                        prices["pA"], prices["nA"], prices["pB"], prices["nB"])
-                else:
-                    prices = {"nA": best_a, "pB": best_b, "pA": 0.70, "nB": 0.70}
+                prices = {"pA": best_a, "nB": best_b, "nA": round(1 - best_a, 4),
+                          "pB": round(min(0.99, 1 - best_b + rng.randrange(0, 20) * tick), 4)}
+                # The forecast's input, at the tops of the books, as
+                # enrichment writes it: without it the sizer refuses the pair
+                prices["mid_spread"] = config.time_series_mid_spread(
+                    prices["pA"], prices["nA"], prices["pB"], prices["nB"])
                 pair = CandidatePair(
                     market_a=markets[0], market_b=markets[1], tradeable=True,
-                    canonical_title=f"pair {trial}-{i}", pair_type=pair_type,
+                    canonical_title=f"pair {trial}-{i}", pair_type="time_series",
                     max_contracts=int(sum(q for *_, q in levels)), depth_levels=tuple(levels),
                     **prices)
                 spec = compute_trade(pair, rng.choice([20_000, 200_000, 5_000_000]),
                                      settings=_live(k=0.6, cap=rng.choice([0.2, 1.0])))
-                if pair_type != "time_series":
-                    # Capped at 0 (pair_size_cap): the sizer refuses it, so no
-                    # portfolio holds one
-                    assert spec is None
-                    refused += 1
-                elif spec is not None:
+                if spec is not None:
                     specs.append(spec)
             cash = rng.choice([300, 2_000, 10_000, 60_000, 1_000_000])
             selected = select_portfolio(specs, cash)
             shrunk += sum(s not in specs for s in selected)
             checked += len(selected)
-            ts_checked += sum(s.pair.pair_type == "time_series" for s in selected)
             assert sum(s.cash_need_cents for s in selected) <= cash
             assert sum(trader._required_cents_by_shard(selected).values()) <= cash
             for s in selected:
                 # Per spec too, whichever shards its legs sit on
                 assert s.cash_need_cents >= sum(trader._required_cents_by_shard([s]).values())
-        # Non-vacuous: time-series portfolios were selected (a time-series
-        # pair's NO leg sits on market B) and some specs were shrunk; every
-        # pair of another type drawn was refused before any portfolio
-        assert (checked > 50 and shrunk > 5 and ts_checked == checked
-                and refused > 50), (checked, shrunk, ts_checked, refused)
+        # Non-vacuous: portfolios were selected (a time-series pair's NO leg
+        # sits on market B) and some specs were shrunk
+        assert checked > 50 and shrunk > 5, (checked, shrunk)
 
 
 class TestKellyOperandsShareOneSnapshot:
