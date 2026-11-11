@@ -5905,9 +5905,9 @@ def fetch_all_settled_markets(
     block repeats them (_assembled_cache_meta): the prefilter tag because a
     filtered result is a strict subset, and the _nomve marker because
     INCLUDE_MVE_MARKETS changes which markets are fetched at all (DR-57). Only
-    the False case is marked — every assembled cache already on disk was
-    built with MVE included, so the default (True) filename is unchanged and
-    no existing cache is orphaned. On use_cache=True, when the .jsonl.gz file
+    the False case (the default) is marked, so the caches built while combos
+    were read keep their unmarked names and the two kinds never share a
+    file. On use_cache=True, when the .jsonl.gz file
     exists it is validated by one full streaming walk (all or nothing: any
     decode error, truncation or meta mismatch is a WARNING and a miss), and
     then brought up to date (_up_to_date_corpus): served as it is, with ZERO
@@ -6016,13 +6016,13 @@ def fetch_all_settled_markets(
     # without it a run configured to EXCLUDE MVE is served an MVE-INCLUSIVE
     # assembly (~99.7% combo markets in practice) and reports results over a
     # universe its own config excludes, with nothing abnormal in the output.
-    # Only the False case is marked: every assembled cache currently on disk
-    # was built with MVE included, so leaving the True case unmarked keeps
-    # those filenames valid and avoids triggering a multi-hour refetch. The
-    # per-day slice stores need no such marker — their meta already carries
-    # include_mve (see _fetch_archive_phase / _fetch_live_phase), so a flip
-    # invalidates them on the existing gate; their PATHS are not flag-keyed,
-    # so each flip refetches and overwrites them.
+    # Only the False case (the default) is marked, so the caches built while
+    # combos were included keep their unmarked names and the two kinds never
+    # share a file. The per-day slice
+    # stores need no such marker — their meta already carries include_mve
+    # (see _fetch_archive_phase / _fetch_live_phase), so a change invalidates
+    # them on the existing gate; their PATHS are not flag-keyed, so each
+    # change refetches and overwrites them.
     mve_suffix = "" if INCLUDE_MVE_MARKETS else "_nomve"
     stem = f"settled_markets_{start_date.isoformat()}{suffix}{mve_suffix}"
     # The streamed format every run writes since SS-1, and the single JSON

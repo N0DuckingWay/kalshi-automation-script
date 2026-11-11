@@ -164,6 +164,7 @@ from typing import Any
 from ._http import api_call_with_retry, api_error_summary, fetch_json_page
 from .config import (
     BUY_SLIPPAGE_TICKS,
+    COMBO_SHARD_DESCRIPTION,
     DEFAULT_EXCHANGE_INDEX,
     DEFAULT_TICK_SIZE_DOLLARS,
     EXCHANGE_FLAG_DRIFT_REPR_MAX_CHARS,
@@ -4474,8 +4475,48 @@ def inactive_shard_indexes(shard_statuses: dict | None) -> set:
     }
 
 
+def unread_combo_shards(shard_statuses: dict | None, market_shards: set) -> set:
+    """
+    Name the shards this run left unread on purpose because they hold only combos.
+
+    While INCLUDE_MVE_MARKETS is off, the live fetch does not read combo
+    markets, so the shard the exchange keeps for them (its description is
+    COMBO_SHARD_DESCRIPTION, "Combos") yields no markets, and that is the
+    bot's own choice rather than a blind spot. main._log_shard_coverage hands
+    the result to check_shard_coverage, which leaves these shards out of its
+    check. A combo shard that did yield markets (Kalshi moved ordinary markets
+    onto it) was read, so it is checked as usual; a trading-inactive one is
+    left to the check's own handling of halted shards, so a halt is still
+    reported as one; with INCLUDE_MVE_MARKETS on, nothing is left out. A
+    shard is never left out on a guess: any other description, a missing
+    one, or a status list that could not be read leaves it checked.
+
+    Args:
+        shard_statuses (dict | None): Return value of fetch_shard_statuses().
+            None (breakdown unavailable) leaves nothing out.
+        market_shards (set): exchange_index values seen among this run's
+            ingested markets.
+
+    Returns:
+        set: exchange_index values of the combo shards that produced no
+            markets, empty while INCLUDE_MVE_MARKETS is on.
+    """
+    if INCLUDE_MVE_MARKETS:
+        return set()
+    wanted = COMBO_SHARD_DESCRIPTION.strip().casefold()
+    return {
+        idx for idx, st in (shard_statuses or {}).items()
+        # A trading-inactive shard is reported as one, combos or not
+        if st.get("trading_active") is not False
+        and idx not in market_shards
+        and isinstance(st.get("description"), str)
+        and st["description"].strip().casefold() == wanted
+    }
+
+
 def check_shard_coverage(
-    advertised: dict | None, market_shards: set, balance_shards: set
+    advertised: dict | None, market_shards: set, balance_shards: set,
+    *, unread_shards: set | frozenset = frozenset(),
 ) -> tuple:
     """
     Compare the shards /exchange/status advertises against what a run actually
@@ -4528,6 +4569,14 @@ def check_shard_coverage(
             the raw balance dict) does not count as fund presence here. This
             function only checks set membership; it has no concept of an
             amount.
+        unread_shards (set | frozenset): Keyword-only. Shards the run chose
+            not to read, from unread_combo_shards (the combo shard while
+            INCLUDE_MVE_MARKETS is off). Left out of the check like a
+            trading-inactive shard, whether or not they hold funds: no pair
+            the bot can form is on them, their cash still counts toward the
+            portfolio value, and a collateral transfer can move it while the
+            exchange allows transfers on that shard. Empty (the default)
+            leaves nothing out.
 
     Returns:
         tuple[list, list]: (critical, warnings) — human-readable problem
@@ -4540,6 +4589,10 @@ def check_shard_coverage(
     warnings: list = []
 
     for idx, status in advertised.items():
+        if idx in unread_shards:
+            # Not read by choice (combo markets); main._log_shard_coverage
+            # names it on its own INFO line
+            continue
         if status.get("trading_active") is False:
             # Deliberately dropped at ingest; fetch_open_events_with_markets
             # already warns about this — not this function's job to repeat it.
@@ -4594,10 +4647,12 @@ def fetch_open_events_with_markets(
     deserialize live responses (see ApiMarket docstring). Page size must be
     <= 200 (MARKET_PAGE_SIZE): the API returns HTTP 400 for larger limits.
 
-    When `INCLUDE_MVE_MARKETS` is True, also pulls the dedicated multivariate
-    events endpoint, since `get_events` excludes MVE events by API design.
-    When False, only the standard endpoint is hit and the previous binary-only
-    behaviour is preserved.
+    Combo (MVE) markets are left out by default: `get_events` excludes them by
+    API design, and the dedicated multivariate events endpoint is read only
+    when `INCLUDE_MVE_MARKETS` is True (it is off; config.py says why: that
+    listing is most of a run's time and none of its markets forms a pair).
+    The shard holding them then yields no markets, which
+    `unread_combo_shards` tells the shard coverage check.
 
     Both cursor loops are BOUNDED twice over (TS-05): each remembers every
     cursor it has requested, so a keyset that cycles (A, B, A, B, ...) rather

@@ -158,6 +158,18 @@ def _archive_first_day_near_the_fixtures(monkeypatch):
     monkeypatch.setattr(historical, "ARCHIVE_FIRST_CREATED_DATE", date(2026, 6, 1))
 
 
+@pytest.fixture
+def combo_markets_read(monkeypatch):
+    """Read combo (MVE) markets for one test.
+
+    config.INCLUDE_MVE_MARKETS is off, so the backtest skips the combo
+    event-title listing; the tests of that listing's own handling (its
+    fallback, bail-out, raw calls and page size) turn it on through
+    historical's binding, the one the lookup reads.
+    """
+    monkeypatch.setattr(historical, "INCLUDE_MVE_MARKETS", True)
+
+
 class TestEventTitlesCache:
     def test_resolves_from_bulk_events_endpoint(self, isolated_cache, monkeypatch):
         # Single page with both tickers, no MVE, no fallback needed
@@ -170,6 +182,7 @@ class TestEventTitlesCache:
         # The per-ticker fallback must NOT be called when bulk satisfies all misses
         assert fallback.call_count == 0
 
+    @pytest.mark.usefixtures("combo_markets_read")
     def test_falls_back_to_multivariate_endpoint(self, isolated_cache, monkeypatch):
         # First-tier (get_events) misses E2; it shows up in the MVE endpoint
         client = _make_client_with_event_pages(
@@ -227,6 +240,7 @@ class TestEventTitlesCache:
         assert "X-Big-Header" not in msgs[0]
         assert "HTTP response headers" not in msgs[0]
 
+    @pytest.mark.usefixtures("combo_markets_read")
     def test_mve_bulk_scan_bails_out_on_barren_pages(self, isolated_cache, monkeypatch):
         # The MVE listing is effectively unbounded — a ticker that never
         # appears must not page forever. Two bounds apply: the productivity
@@ -286,6 +300,7 @@ class TestEventTitlesCache:
                 == 3 * EVENT_TITLE_LISTING_MAX_BARREN_PAGES)
         assert fallback.call_count == 1
 
+    @pytest.mark.usefixtures("combo_markets_read")
     def test_bulk_listings_use_raw_variants_not_modeled_calls(self, isolated_cache,
                                                               monkeypatch):
         # Regression: the bulk event listings used the MODELED get_events /
@@ -493,6 +508,7 @@ class TestEventTitlesCache:
         assert historical._load_or_build_event_titles(client2, {"NEW-1"}) == {"NEW-1": ""}
         assert fallback2.call_count == 0
 
+    @pytest.mark.usefixtures("combo_markets_read")
     def test_listing_pages_request_market_page_size_limit(self, isolated_cache, monkeypatch):
         # BS-22: both bulk listing loops used to hardcode limit=200 rather than
         # importing the shared MARKET_PAGE_SIZE constant. Assert the kwargs
@@ -1577,8 +1593,8 @@ class TestShardedFetch:
             use_cache=False, prefilter=pred, prefilter_tag="testpred",
         )
         cache_dir = tmp_path / "cache"
-        assert (cache_dir / "settled_markets_2026-06-05_testpred.jsonl.gz").exists()
-        assert not (cache_dir / "settled_markets_2026-06-05.jsonl.gz").exists()
+        assert (cache_dir / "settled_markets_2026-06-05_testpred_nomve.jsonl.gz").exists()
+        assert not (cache_dir / "settled_markets_2026-06-05_nomve.jsonl.gz").exists()
         # SS-1: new runs never write the legacy single-document format.
         assert not list(cache_dir.glob("settled_markets_*.json"))
 
@@ -1612,11 +1628,12 @@ class TestShardedFetch:
 
     def test_mve_included_keeps_the_legacy_unmarked_cache_filename(self, tmp_path,
                                                                    monkeypatch):
-        # DR-57, backward-compatibility half: every assembled cache already on
-        # disk (there is a multi-GB one) was built with MVE included, so the
-        # default INCLUDE_MVE_MARKETS=True filename must stay byte-identical to
-        # the pre-DR-57 name. If this ever changes, every cached assembly is
-        # silently orphaned and the next run re-pays a multi-hour fetch.
+        # DR-57, backward-compatibility half: the assembled caches built while
+        # combos were read (there is a multi-GB one) were built with MVE
+        # included, so the INCLUDE_MVE_MARKETS=True filename must stay
+        # byte-identical to the pre-DR-57 name. If this ever changes, every
+        # such cache is silently orphaned and a run that turns combos back on
+        # re-pays a multi-hour fetch.
         # This one deliberately passes both BEFORE and AFTER the DR-57 fix — it
         # pins the unchanged half. The two that fail pre-fix (i.e. the DR-57
         # regression tests proper) are test_mve_flag_separates_assembled_cache_
@@ -5624,7 +5641,7 @@ class TestStreamedAssembledCache:
     def test_a_fetch_streams_into_the_cache_and_a_hit_streams_it_back(
             self, tmp_path, monkeypatch, caplog):
         out, archive, live_markets = self._fetch(tmp_path, monkeypatch)
-        path = tmp_path / "cache" / "settled_markets_2026-06-05.jsonl.gz"
+        path = tmp_path / "cache" / "settled_markets_2026-06-05_nomve.jsonl.gz"
         assert isinstance(out, historical.SettledCorpus)
         assert out.path == path
         first, second = list(out), list(out)
@@ -5681,25 +5698,25 @@ class TestStreamedAssembledCache:
         archive = _FakeArchive(archive_markets)
         _install_sharded_fakes(monkeypatch, tmp_path, archive, TestShardedFetch.CUTOFF)
         (tmp_path / "cache").mkdir(parents=True)
-        legacy_path = tmp_path / "cache" / "settled_markets_2026-06-05.json"
+        legacy_path = tmp_path / "cache" / "settled_markets_2026-06-05_nomve.json"
         legacy_path.write_text(json.dumps([{"ticker": "OLD1"}, {"ticker": "OLD2"}]))
         with caplog.at_level(logging.INFO):
             out, live = self._again(live_markets)
         assert isinstance(out, historical.SettledCorpus)
         assert "OLD1" not in {m["ticker"] for m in out}
         assert archive.calls > 0 and live.calls > 0
-        assert ("Legacy assembled cache settled_markets_2026-06-05.json cannot be "
+        assert ("Legacy assembled cache settled_markets_2026-06-05_nomve.json cannot be "
                 "brought up to date") in caplog.text
         assert "Loaded" not in caplog.text
         assert not legacy_path.exists()
         assert ("Removed the superseded legacy settled-market cache "
-                "settled_markets_2026-06-05.json") in caplog.text
+                "settled_markets_2026-06-05_nomve.json") in caplog.text
 
     def test_the_streamed_cache_wins_over_a_legacy_one_and_a_rebuild_retires_it(
             self, tmp_path, monkeypatch, caplog):
         out, archive, live_markets = self._fetch(tmp_path, monkeypatch)
         fresh = list(out)
-        legacy_path = tmp_path / "cache" / "settled_markets_2026-06-05.json"
+        legacy_path = tmp_path / "cache" / "settled_markets_2026-06-05_nomve.json"
         legacy_path.write_text(json.dumps([{"ticker": "STALE"}]))
 
         hit, _ = self._again(live_markets)
@@ -5718,7 +5735,7 @@ class TestStreamedAssembledCache:
         # so, since it can be a GB-scale file.
         assert not legacy_path.exists()
         assert ("Removed the superseded legacy settled-market cache "
-                "settled_markets_2026-06-05.json") in caplog.text
+                "settled_markets_2026-06-05_nomve.json") in caplog.text
 
     @pytest.mark.parametrize("loss", ["damaged", "vanished", "rename_reverted"])
     def test_a_superseded_legacy_cache_is_never_served_again(
@@ -5731,7 +5748,7 @@ class TestStreamedAssembledCache:
         # corpus must never be served.
         stale = [{"ticker": "STALE1"}, {"ticker": "STALE2"}]
         (tmp_path / "cache").mkdir(parents=True)
-        legacy_path = tmp_path / "cache" / "settled_markets_2026-06-05.json"
+        legacy_path = tmp_path / "cache" / "settled_markets_2026-06-05_nomve.json"
         legacy_path.write_text(json.dumps(stale))
         # The operator's rebuild (the BS-02 / subtitle-drift remedy).
         out, archive, live_markets = self._fetch(tmp_path, monkeypatch)
@@ -5762,7 +5779,7 @@ class TestStreamedAssembledCache:
         # the older assembly the streamed one superseded.
         out, archive, live_markets = self._fetch(tmp_path, monkeypatch)
         fresh = list(out)
-        legacy_path = tmp_path / "cache" / "settled_markets_2026-06-05.json"
+        legacy_path = tmp_path / "cache" / "settled_markets_2026-06-05_nomve.json"
         legacy_path.write_text(json.dumps([{"ticker": "STALE"}]))
         data = out.path.read_bytes()
         out.path.write_bytes(data[: len(data) // 2])
@@ -5781,7 +5798,7 @@ class TestStreamedAssembledCache:
         # a rebuild that fails leaves the operator's existing cache in place,
         # exactly as the old atomic overwrite did.
         (tmp_path / "cache").mkdir(parents=True)
-        legacy_path = tmp_path / "cache" / "settled_markets_2026-06-05.json"
+        legacy_path = tmp_path / "cache" / "settled_markets_2026-06-05_nomve.json"
         legacy_path.write_text(json.dumps([{"ticker": "KEEP"}]))
         archive_markets, live_markets = TestShardedFetch()._fixture_markets()
         _install_sharded_fakes(monkeypatch, tmp_path, _FakeArchive(archive_markets),
@@ -5798,7 +5815,7 @@ class TestStreamedAssembledCache:
                 MagicMock(), _FakeLive(live_markets), start_date=self.START,
                 use_cache=False)
         assert legacy_path.read_text() == '[{"ticker": "KEEP"}]'
-        assert not (tmp_path / "cache" / "settled_markets_2026-06-05.jsonl.gz").exists()
+        assert not (tmp_path / "cache" / "settled_markets_2026-06-05_nomve.jsonl.gz").exists()
 
     def test_retiring_the_legacy_cache(self, tmp_path, caplog):
         streamed = tmp_path / "settled_markets_2026-06-05.jsonl.gz"
@@ -6060,7 +6077,7 @@ class TestCorpusProvenance:
         meta = {**historical._assembled_cache_meta(self.PRE, None),
                 "assembled_at": (datetime.now(UTC) - timedelta(days=30)).isoformat()}
         _write_jsonl(out.path, meta, [])
-        legacy = tmp_path / "cache" / "settled_markets_2026-06-05.json"
+        legacy = tmp_path / "cache" / "settled_markets_2026-06-05_nomve.json"
         legacy.write_text(json.dumps([{"ticker": "LEG"}]))
         archive.calls = 0
         with caplog.at_level(logging.INFO):
@@ -6220,12 +6237,12 @@ class TestCacheExtension:
             from_cache=False, assembled_at=self.T2,
             archive_cutoff=datetime(2026, 6, 10, tzinfo=UTC), full_assembly_at=self.T1)
         text = caplog.text
-        assert "Extending assembled cache settled_markets_2026-06-05.jsonl.gz" in text
+        assert "Extending assembled cache settled_markets_2026-06-05_nomve.jsonl.gz" in text
         # Kept everything but the partial day's one record (L3), added L3-L6
         assert (f"kept {len(first_records) - 1} of its {len(first_records)} settled "
                 f"markets (dropped 1 settled on or after 2026-06-11") in text
         assert "added 4 settled markets of" in text
-        assert "Extended assembled cache settled_markets_2026-06-05.jsonl.gz" in text
+        assert "Extended assembled cache settled_markets_2026-06-05_nomve.jsonl.gz" in text
         assert "Loaded" not in text
         assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
@@ -6501,7 +6518,7 @@ class TestCacheExtension:
         warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
         assert len(warned) == 1
         assert warned[0].startswith("Could not read the archive cutoff to extend "
-                                    "assembled cache settled_markets_2026-06-05.jsonl.gz")
+                                    "assembled cache settled_markets_2026-06-05_nomve.jsonl.gz")
         assert "serving it as assembled at 2026-06-11 12:00 UTC" in warned[0]
         assert f"Loaded {len(records)} settled markets from cache" in caplog.text
 
@@ -6531,7 +6548,7 @@ class TestCacheExtension:
         assert first.path.read_bytes() == before      # nothing was published
         assert not list((tmp_path / "cache").glob("*.tmp"))
         assert any(r.levelname == "WARNING" and r.getMessage().startswith(
-            "Could not extend assembled cache settled_markets_2026-06-05.jsonl.gz")
+            "Could not extend assembled cache settled_markets_2026-06-05_nomve.jsonl.gz")
             for r in caplog.records)
 
 
@@ -6665,7 +6682,7 @@ class TestAssemblyCounts:
                 "assembled_at": now.isoformat(),
                 "archive_cutoff_ts": _day_lo("2026-06-10"),
                 "live_frontier_ts": _day_lo("2026-06-20")}
-        _write_jsonl(tmp_path / "cache" / f"settled_markets_{self.START}_t.jsonl.gz",
+        _write_jsonl(tmp_path / "cache" / f"settled_markets_{self.START}_t_nomve.jsonl.gz",
                      meta, [{"ticker": "OLD1", "settlement_ts": "2026-06-06T00:00:00Z"}])
         _forbid_network(monkeypatch)
         with caplog.at_level(logging.INFO):
