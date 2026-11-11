@@ -1277,7 +1277,7 @@ class TestLiveSettingsFlags:
                 "(rebalancing and selling: production runs only). The live "
                 "defaults are the ones saved through python3 -m "
                 "kalshi_betting.defaults_server (live_defaults.json); a run refuses to "
-                "start without them. The weekly scheduler passes none of these flags, so "
+                "start without them. The scheduler passes none of these flags, so "
                 "a scheduled run trades exactly the saved defaults.") in out
         assert out.count(f"in {config.SIZE_CAP_STEP * 100:g}% steps") == 2
         assert "100 = no cap" in out
@@ -2253,7 +2253,7 @@ class TestSetupLogging:
             handler_types = [type(h) for h in root.handlers]
             assert logging.StreamHandler in handler_types
             # RotatingFileHandler, not a plain FileHandler (BS-25) — a
-            # scheduler daemon runs this weekly forever, so the log must rotate
+            # scheduler daemon runs this twice a day forever, so the log must rotate
             assert logging.handlers.RotatingFileHandler in handler_types
             # Exactly one of each — basicConfig should not have added extras
             assert sum(1 for h in root.handlers if type(h) is logging.StreamHandler) == 1
@@ -3240,7 +3240,7 @@ class TestRunProdDryRunLiveShapeReplay:
         # TS-01: an exchange-wide halt (observed live 2026-09-03) makes ingest
         # drop every market. The run used to find no pairs, log the same "Full
         # shard coverage" line a healthy run logs, and exit 0 — so the
-        # scheduler counted the weekly slot as satisfied and the bot did not
+        # scheduler counted the slot as satisfied and the bot did not
         # trade again for a week. It must now say so and exit 30.
         client = _live_shape_client(
             monkeypatch,
@@ -9962,7 +9962,7 @@ class TestBlindRunReason:
     """VI-02: a run whose ingest produced nothing scanned nothing, and must
     report EXIT_NO_TRADEABLE_SHARDS rather than EXIT_OK. EXIT_OK claims
     "scanned everything, found no edge", which lets scheduler.run_job record
-    the weekly slot as satisfied by a run that never looked at a single order
+    the slot as satisfied by a run that never looked at a single order
     book — TS-01's bug surviving through a second door, because
     scanner.fetch_shard_statuses is fail-soft and returns None on ANY internal
     failure, which makes the all-shards-halted test unevaluable.
@@ -9978,7 +9978,7 @@ class TestBlindRunReason:
         # scanner._shard_index only defaults a MISSING/unparseable index to
         # DEFAULT_EXCHANGE_INDEX, so an explicit shard 9 stays 9, and 9 is not
         # in inactive_shards. Reading that run as healthy would carry it into
-        # pair discovery, Kelly sizing and — on a live Monday run — order
+        # pair discovery, Kelly sizing and — on a live scheduled run — order
         # submission with an explicit exchange_index during an exchange-wide
         # halt.
         stray = [SimpleNamespace(ticker="STRAY", exchange_index=9)]
@@ -11509,7 +11509,7 @@ class TestDevSimulationLoggedOnce:
 
 class TestLoggingRotation:
     """BS-25: kalshi_arb.log must rotate (5MB x 3 backups) instead of growing
-    unbounded — a scheduler daemon re-runs this process weekly forever.
+    unbounded — a scheduler daemon re-runs this process twice a day forever.
 
     Targets _setup_logging() directly rather than main(): logging.basicConfig()
     is a no-op once the root logger already has handlers (pytest installs its

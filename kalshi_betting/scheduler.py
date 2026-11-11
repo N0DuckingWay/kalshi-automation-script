@@ -4,14 +4,14 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    A long-running daemon that runs the production bot once a week, at
-    config.SCHEDULED_RUN's weekday and time (Monday 09:00) on the host's
-    clock. It polls `schedule` every 60 seconds, logs to its own
+    A long-running daemon that runs the production bot every day at
+    config.SCHEDULER_RUN_TIMES' times (07:00 and 21:00) on the host's clock.
+    It polls `schedule` every 60 seconds, logs to its own
     kalshi_scheduler.log, and records each run's slot in scheduler_state.json
     so a restart can catch up on a slot missed while it was down.
 
 Dependencies:
-    Imports PROJECT_ROOT, SCHEDULED_RUN, SCHEDULER_JOB_TIMEOUT_SECONDS,
+    Imports PROJECT_ROOT, SCHEDULER_RUN_TIMES, SCHEDULER_JOB_TIMEOUT_SECONDS,
     SCHEDULER_BLIND_RETRY_SECONDS / SCHEDULER_BLIND_MAX_RETRIES,
     SCHEDULER_STATE_FILENAME (the slot record's file name), and the
     EXIT_OK / EXIT_SKIPPED_LOW_BALANCE / EXIT_TRADES_NEED_ATTENTION /
@@ -34,13 +34,13 @@ Notes:
     saved: with none saved, or a saved file that is refused, every run exits 2
     (logged as "Job failed (exit 2)", and the slot is spent), and main() logs
     an ERROR saying so as soon as the daemon starts (_check_live_defaults). To
-    change the run day or time, edit config.SCHEDULED_RUN (the backtest enters
-    trades at the same moments).
+    change the run times, edit config.SCHEDULER_RUN_TIMES. The backtest does
+    not follow them: it enters trades once a week, at config.SCHEDULED_RUN.
 
     Host clock: `schedule` fires on the computer's local clock and must stay
-    that way, never `.at(time, tz)` (see _weekly_job). At startup
-    _host_clock_realises_run() checks that clock against SCHEDULED_RUN's zone
-    and logs CRITICAL on a mismatch; the daemon fires either way.
+    that way, never `.at(time, tz)` (see _daily_jobs). At startup
+    _host_clock_realises_run() checks that clock against SCHEDULER_RUN_TIMES'
+    zone and logs CRITICAL on a mismatch; the daemon fires either way.
 
     Log file: kalshi_scheduler.log, never kalshi_arb.log, which the spawned
     bot rotates (see _SCHEDULER_LOG_PATH).
@@ -55,7 +55,9 @@ Notes:
     _save_state() raises on purpose: a failed claim must stop the spawn. At
     startup _maybe_catch_up() (via _startup_catch_up, which never stops the
     daemon) re-runs a slot with no recorded attempt; with no state file yet,
-    the first start runs the bot.
+    the first start runs the bot. An ordinary fire whose slot is already
+    recorded spawns nothing (_slot_already_run), so a host that slept through
+    both run times trades once on waking, not twice.
 
     Lock refusals: exit code EXIT_RUN_IN_PROGRESS (50) means another live
     trading run on this machine held the live-run lock (run_lock), so the
@@ -100,10 +102,10 @@ from .config import (
     EXIT_TIME_SERIES_SKIPPED,
     EXIT_TRADES_NEED_ATTENTION,
     PROJECT_ROOT,
-    SCHEDULED_RUN,
     SCHEDULER_BLIND_MAX_RETRIES,
     SCHEDULER_BLIND_RETRY_SECONDS,
     SCHEDULER_JOB_TIMEOUT_SECONDS,
+    SCHEDULER_RUN_TIMES,
     SCHEDULER_STATE_FILENAME,
     LiveDefaultsOutdated,
     read_saved_live_defaults,
@@ -122,10 +124,10 @@ _STATE_SCHEMA_VERSION = 1
 # nothing in the tests needs it redirected.
 _SCHEDULER_LOG_PATH = PROJECT_ROOT / "kalshi_scheduler.log"
 
-# How many weekly runs _host_clock_realises_run() checks at daemon start: two
+# How many days of runs _host_clock_realises_run() checks at daemon start: two
 # years, so the check spans at least three clock changes, in both directions
 # (a host on other daylight-saving rules may disagree only after one).
-_HOST_CLOCK_CHECK_WEEKS = 104
+_HOST_CLOCK_CHECK_DAYS = 730
 
 
 def _state_file_path() -> Path:
@@ -168,163 +170,170 @@ def _decode(stream) -> str:
 
 def _host_clock_label() -> str:
     """
-    Describe when the daemon fires, for log lines: its weekday and time on the host's clock.
+    Describe when the daemon fires, for log lines: its daily times on the host's clock.
 
     Returns:
-        str: e.g. "Monday 09:00 on the host's clock".
+        str: e.g. "every day at 07:00 and 21:00 on the host's clock".
     """
-    return (f"{SCHEDULED_RUN.weekday_name().capitalize()} {SCHEDULED_RUN.at_time()} "
-            f"on the host's clock")
+    return f"every day at {SCHEDULER_RUN_TIMES.times_label()} on the host's clock"
 
 
-def _weekly_job() -> schedule.Job:
+def _daily_jobs() -> list[schedule.Job]:
     """
-    Build the weekly `schedule` job at SCHEDULED_RUN's weekday and time.
+    Build one daily `schedule` job per SCHEDULER_RUN_TIMES time.
 
-    main() registers it with `.do(_guarded_job, run_job)`. It fires by the
+    main() registers each with `.do(_guarded_job, run_job)`. They fire by the
     host's clock and must stay that way, never `.at(time, tz)`: that option
     goes through pytz, whose America/Los_Angeles table has no daylight-saving
     time after 2037. _host_clock_realises_run() checks the host's clock instead.
 
     Returns:
-        schedule.Job: `schedule.every().<weekday>.at("HH:MM")`, not yet
-            registered.
+        list[schedule.Job]: `schedule.every().day.at("HH:MM")` for each time,
+            earliest first, not yet registered.
     """
-    return getattr(schedule.every(), SCHEDULED_RUN.weekday_name()).at(SCHEDULED_RUN.at_time())
+    return [schedule.every().day.at(at_time) for at_time in SCHEDULER_RUN_TIMES.at_times()]
 
 
-def _cron_line(project_path: str, python_path: str) -> str:
+def _cron_lines(project_path: str, python_path: str) -> list[str]:
     """
-    Build the crontab line main() logs, running the bot at the daemon's weekly time.
+    Build the crontab lines main() logs, running the bot at the daemon's daily times.
 
-    cron also fires by the host's clock. Its day-of-week counts Sunday as 0,
-    SCHEDULED_RUN.weekday counts Monday as 0, hence the +1 mod 7.
+    cron also fires by the host's clock. Times that share a minute share a
+    line ("0 7,21 * * *"); each other minute gets a line of its own.
 
     Args:
         project_path (str): The repo root to cd into.
         python_path (str): The interpreter that runs kalshi_betting.main.
 
     Returns:
-        str: e.g. "0 9 * * 1 cd '<project>' && <python> -m kalshi_betting.main
-            --mode prod >> /tmp/kalshi_arb.log 2>&1".
+        list[str]: e.g. ["0 7,21 * * * cd '<project>' && <python> -m
+            kalshi_betting.main --mode prod >> /tmp/kalshi_arb.log 2>&1"],
+            ordered by minute.
     """
-    return (
-        f"{SCHEDULED_RUN.minute} {SCHEDULED_RUN.hour} * * {(SCHEDULED_RUN.weekday + 1) % 7} "
+    hours_by_minute: dict[int, list[int]] = {}
+    for hour, minute in SCHEDULER_RUN_TIMES.times:
+        hours_by_minute.setdefault(minute, []).append(hour)
+    return [
+        f"{minute} {','.join(str(hour) for hour in hours)} * * * "
         f"cd '{project_path}' && {python_path} -m kalshi_betting.main --mode prod "
         f">> /tmp/kalshi_arb.log 2>&1"
-    )
+        for minute, hours in sorted(hours_by_minute.items())
+    ]
 
 
 def _host_clock_realises_run(today: date | None = None) -> bool:
     """
-    Check that the host's clock fires the weekly run at SCHEDULED_RUN's UTC moments.
+    Check that the host's clock fires each run at the UTC moment SCHEDULER_RUN_TIMES names.
 
-    The daemon fires when the host's clock reads SCHEDULED_RUN's weekday and
-    time. That is SCHEDULED_RUN.instant(d) only if the host keeps
-    SCHEDULED_RUN's zone; otherwise the bot trades at moments the backtest
-    does not replay. Checks the next _HOST_CLOCK_CHECK_WEEKS run dates: logs
-    CRITICAL on the first mismatch, on run times a clock change skips, or if
-    the zone or a date cannot be checked; INFO when all match. Never raises,
-    so main()'s catch-up and weekly registration always run.
+    The daemon fires when the host's clock reads one of SCHEDULER_RUN_TIMES'
+    times. That is the moment the schedule names (DailyRuns.on(d), then
+    ScheduledRun.instant(d)) only if the host keeps the schedule's zone;
+    otherwise the bot trades at other hours than the ones set. Checks every
+    run in the next _HOST_CLOCK_CHECK_DAYS days: logs CRITICAL on the first
+    mismatch, on run times a clock change skips, or if the zone or a date
+    cannot be checked; INFO when all match. Never raises, so main()'s
+    catch-up and job registration always run.
 
     Args:
-        today (date | None): First date to check (included if it is a run
-            weekday). Defaults to date.today().
+        today (date | None): First date to check. Defaults to date.today().
 
     Returns:
-        bool: True when every checked run lands on SCHEDULED_RUN.instant(d).
+        bool: True when every checked run lands on its scheduled UTC moment.
     """
-    run = SCHEDULED_RUN
+    runs = SCHEDULER_RUN_TIMES
     try:
-        run.zone()
+        runs.zone()
     except Exception as exc:
         # Broad on purpose: this check must never stop the daemon.
         logging.critical(
-            "config.SCHEDULED_RUN's zone %r cannot be resolved (%s: %s), so the "
+            "config.SCHEDULER_RUN_TIMES' zone %r cannot be resolved (%s: %s), so the "
             "host's clock cannot be checked against it. The daemon still fires "
-            "every %s.",
-            run.timezone, type(exc).__name__, exc, _host_clock_label(),
+            "%s.",
+            runs.timezone, type(exc).__name__, exc, _host_clock_label(),
         )
         return False
     start = today if today is not None else date.today()
     skipped: list[str] = []
-    mismatch: tuple[date, datetime, datetime] | None = None
+    mismatch: tuple[date, str, datetime, datetime] | None = None
     try:
-        first = start + timedelta(days=(run.weekday - start.weekday()) % 7)
-        for week in range(_HOST_CLOCK_CHECK_WEEKS):
-            d = first + timedelta(weeks=week)
-            if run.clock_change(d) == "skipped":
-                # The zone skips this wall time, so a clock in that zone never
-                # reads it on d: a problem with the schedule, not the host.
-                skipped.append(d.isoformat())
-                continue
-            # A naive datetime converts to UTC by the host's own rules: the
-            # moment the daemon fires.
-            fired = datetime(d.year, d.month, d.day, run.hour, run.minute).astimezone(UTC)
-            scheduled = run.instant(d)
-            if fired != scheduled:
-                mismatch = (d, fired, scheduled)
+        for offset in range(_HOST_CLOCK_CHECK_DAYS):
+            d = start + timedelta(days=offset)
+            for run in runs.on(d):
+                if run.clock_change(d) == "skipped":
+                    # The zone skips this wall time, so a clock in that zone
+                    # never reads it on d: a problem with the schedule, not
+                    # the host.
+                    skipped.append(f"{d.isoformat()} {run.at_time()}")
+                    continue
+                # A naive datetime converts to UTC by the host's own rules:
+                # the moment the daemon fires.
+                fired = datetime(d.year, d.month, d.day, run.hour, run.minute).astimezone(UTC)
+                scheduled = run.instant(d)
+                if fired != scheduled:
+                    mismatch = (d, run.at_time(), fired, scheduled)
+                    break
+            if mismatch is not None:
                 break
     except Exception as exc:
         # Broad on purpose (an out-of-range date raises OverflowError, the
         # host's clock may raise OSError): never stop the daemon.
         logging.critical(
-            "The host's clock could not be checked against config.SCHEDULED_RUN "
-            "(%s) from %s (%s: %s). The daemon still fires every %s.",
-            run.label(), start.isoformat(), type(exc).__name__, exc, _host_clock_label(),
+            "The host's clock could not be checked against config.SCHEDULER_RUN_TIMES "
+            "(%s) from %s (%s: %s). The daemon still fires %s.",
+            runs.label(), start.isoformat(), type(exc).__name__, exc, _host_clock_label(),
         )
         return False
     if skipped:
         logging.critical(
-            "config.SCHEDULED_RUN (%s) names a wall time its zone skips at a clock "
-            "change on %s, so no host's clock fires those runs at their scheduled "
-            "instant. Move config.SCHEDULED_RUN off the clock change. The daemon "
-            "still fires every %s.",
-            run.label(), ", ".join(skipped), _host_clock_label(),
+            "config.SCHEDULER_RUN_TIMES (%s) names a wall time its zone skips at a "
+            "clock change (%s), so no host's clock fires those runs at their "
+            "scheduled instant. Move config.SCHEDULER_RUN_TIMES off the clock "
+            "change. The daemon still fires %s.",
+            runs.label(), ", ".join(skipped), _host_clock_label(),
         )
     if mismatch is not None:
-        d, fired, scheduled = mismatch
+        d, at_time, fired, scheduled = mismatch
         logging.critical(
-            "The host's clock does not keep config.SCHEDULED_RUN (%s): on "
-            "%s the daemon fires at %s UTC, not %s UTC, so the backtest, which "
-            "enters at config.SCHEDULED_RUN's instants, no longer replays this "
-            "host's runs. It still fires every %s; set the host's time zone "
-            "to %s, or change config.SCHEDULED_RUN.",
-            run.label(), d.isoformat(), f"{fired:%Y-%m-%d %H:%M}",
-            f"{scheduled:%Y-%m-%d %H:%M}", _host_clock_label(), run.timezone,
+            "The host's clock does not keep config.SCHEDULER_RUN_TIMES (%s): on "
+            "%s the %s run fires at %s UTC, not %s UTC, so the bot trades at "
+            "other hours than the ones set. It still fires %s; set the host's "
+            "time zone to %s, or change config.SCHEDULER_RUN_TIMES.",
+            runs.label(), d.isoformat(), at_time, f"{fired:%Y-%m-%d %H:%M}",
+            f"{scheduled:%Y-%m-%d %H:%M}", _host_clock_label(), runs.timezone,
         )
     if skipped or mismatch is not None:
         return False
     logging.info(
-        "The host's clock keeps config.SCHEDULED_RUN (%s) for the next %d weekly runs.",
-        run.label(), _HOST_CLOCK_CHECK_WEEKS,
+        "The host's clock keeps config.SCHEDULER_RUN_TIMES (%s) for the next %d days.",
+        runs.label(), _HOST_CLOCK_CHECK_DAYS,
     )
     return True
 
 
 def _most_recent_slot(now: datetime) -> datetime:
     """
-    Compute the latest weekly run time ("slot") at or before `now`, on the host's clock.
+    Compute the latest run time ("slot") at or before `now`, on the host's clock.
 
-    _maybe_catch_up() uses it to find the slot that should already have a
-    recorded run in scheduler_state.json.
+    run_job() records it in scheduler_state.json, and _maybe_catch_up() uses
+    it to find the slot that should already have a recorded run.
 
     Args:
         now (datetime): Naive local datetime to evaluate against.
 
     Returns:
         datetime: The most recent slot that should already have fired (naive,
-            local, seconds/microseconds zeroed). If `now` falls on the run
-            weekday before the run time, this is the PREVIOUS week's slot.
+            local, seconds/microseconds zeroed): today's latest run time at or
+            before `now`, or yesterday's last run time when `now` is before
+            today's first.
     """
-    candidate = now.replace(hour=SCHEDULED_RUN.hour, minute=SCHEDULED_RUN.minute,
-                            second=0, microsecond=0)
-    # Walk back to the most recent run weekday (Monday == 0 .. Sunday == 6).
-    candidate -= timedelta(days=(candidate.weekday() - SCHEDULED_RUN.weekday) % 7)
-    if candidate > now:
-        # Before this week's run time: its slot hasn't fired yet.
-        candidate -= timedelta(days=7)
-    return candidate
+    today = [now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+             for hour, minute in SCHEDULER_RUN_TIMES.times]
+    passed = [slot for slot in today if slot <= now]
+    if passed:
+        # The times are earliest first, so the last one passed is the latest
+        return passed[-1]
+    # Before today's first run time: yesterday's last slot
+    return today[-1] - timedelta(days=1)
 
 
 def _load_state() -> dict | None:
@@ -343,7 +352,7 @@ def _load_state() -> dict | None:
     (a hand-edited string, `null`) is read as 0, and a present-but-non-int
     `exit_code` is read as None. This closes a real crash: `_maybe_catch_up`
     compares `retries` with `<`, so a corrupt value there used to raise
-    `TypeError` out of the daemon at startup before the weekly job was ever
+    `TypeError` out of the daemon at startup before the run jobs were ever
     registered. A corrupt `exit_code` never raised — it only ever compared
     unequal to `EXIT_NO_TRADEABLE_SHARDS` via `==` — so typing it here is
     hygiene, not a crash fix; it is validated anyway so the dict always
@@ -385,7 +394,7 @@ def _load_state() -> dict | None:
         return None
     # DR-24: `retries` is compared with `<` in _maybe_catch_up; a hand-edited
     # string or null there used to raise TypeError out of main() before the
-    # weekly job was ever registered, killing the daemon at startup. A bad
+    # run jobs were ever registered, killing the daemon at startup. A bad
     # value degrades to "unknown" instead — bool is a subclass of int, so
     # True/False are accepted as-is. `exit_code` is compared with `==`,
     # which never raises on a type mismatch — its guard below is typing
@@ -426,7 +435,8 @@ def _save_state(
     the catch-up check) would read back and trust.
 
     Args:
-        last_slot (datetime): The Monday-09:00 slot this run is satisfying.
+        last_slot (datetime): The run slot (a SCHEDULER_RUN_TIMES time on
+            the host's clock) this run is satisfying.
         started_at (datetime): When this run began (claim time).
         finished_at (datetime | None): When this run ended, or None if the
             run has only been claimed (still in progress).
@@ -474,8 +484,8 @@ def _guarded_job(
     that escapes the job leaves `next_run` in the past. main()'s poll loop
     catches it ("Scheduler tick raised — daemon continues") and keeps the
     daemon alive, but the job is still overdue — so it is re-entered on the
-    very next 60 s poll tick, turning a weekly production trading run into a
-    once-a-minute one for as long as the fault persists. The same mechanism
+    very next 60 s poll tick, turning a twice-daily production trading run into
+    a once-a-minute one for as long as the fault persists. The same mechanism
     defeats the blind-retry one-shot contract: _blind_retry signals "run me
     once" by RETURNING schedule.CancelJob, and a retry that raises never
     returns, so it is never deregistered AND the SCHEDULER_BLIND_MAX_RETRIES
@@ -516,7 +526,7 @@ def _guarded_job(
         return job(*args, **kwargs)
     except Exception:
         # Deliberately says only what is true of BOTH registrations: the
-        # recurring weekly job is rescheduled for its next Monday, while a
+        # recurring daily job is rescheduled for its next day, while a
         # raising blind retry is deregistered by on_error=CancelJob and
         # its retry chain for this slot ends. Claiming "the next scheduled
         # fire is unaffected" would read, after a failing retry, as though
@@ -527,6 +537,40 @@ def _guarded_job(
             getattr(job, "__name__", job),
         )
         return on_error
+
+
+def _slot_already_run(slot: datetime) -> bool:
+    """
+    Say whether scheduler_state.json already records a run for `slot` (or a later one).
+
+    `schedule` fires every overdue job in one poll tick. When the host sleeps
+    (or the daemon is paused) through two run times, both daily jobs are
+    overdue on waking and fire one after the other, and both would take the
+    same slot (_most_recent_slot reads the wall clock). run_job() calls this
+    for an ordinary fire (retries == 0) so the second one does not trade
+    again: one scheduled run per slot. A blind-run retry never asks, since it
+    re-runs a slot on purpose. An unreadable state file reads as "not run".
+
+    Args:
+        slot (datetime): The slot the run would claim (naive, host clock).
+
+    Returns:
+        bool: True when the recorded last_slot is at or after `slot`; the
+            skip is logged at INFO.
+    """
+    state = _load_state()
+    if state is None:
+        return False
+    recorded = datetime.fromisoformat(state["last_slot"])
+    if recorded < slot:
+        return False
+    logging.info(
+        "Scheduler: the %s slot already has a recorded run (last slot %s), so this "
+        "fire is skipped — one scheduled run per slot (two run times passed while "
+        "the host slept or the daemon was paused).",
+        slot.isoformat(), recorded.isoformat(),
+    )
+    return True
 
 
 def run_job(retries: int = 0) -> None:
@@ -540,10 +584,13 @@ def run_job(retries: int = 0) -> None:
     killed after SCHEDULER_JOB_TIMEOUT_SECONDS so it cannot block the daemon
     past the next scheduled fire.
 
-    Claims its Monday-09:00 slot in scheduler_state.json before spawning the
+    Claims its slot (_most_recent_slot) in scheduler_state.json before spawning the
     subprocess, and finalizes that record on every exit path — success,
     nonzero exit, timeout, or OSError (BS-17). See this module's Notes for
-    why claiming happens up front.
+    why claiming happens up front. An ordinary fire (retries == 0) whose slot
+    already has a recorded run returns at once, spawning nothing
+    (_slot_already_run): both daily jobs fire on waking from a sleep that
+    spanned both run times, and only the first may trade.
 
     Logs the subprocess's stdout unconditionally (whether the run succeeded or
     failed). Its stderr is logged only on the catch-all failure branch (an
@@ -570,10 +617,10 @@ def run_job(retries: int = 0) -> None:
     is logged with a specific message and does not escape this function.
 
     EXIT_NO_TRADEABLE_SHARDS (TS-01, VI-02) is the one code that does NOT
-    satisfy the weekly slot: it means nothing was scanned at all — an
+    satisfy the slot: it means nothing was scanned at all — an
     exchange-wide halt, or an ingest that came back empty for a cause
-    /exchange/status could not name — and the bot trades only on the weekly
-    fire, so letting it stand would cost the week. Which of the two fired is
+    /exchange/status could not name — and the bot trades only at its
+    scheduled runs, so letting it stand would cost that run. Which of the two fired is
     named in kalshi_arb.log by the subprocess, not here: this daemon sees only
     the exit code, so its own messages must not claim one cause over the
     other. That branch registers a one-shot retry on the `schedule` library's
@@ -595,7 +642,7 @@ def run_job(retries: int = 0) -> None:
 
     Args:
         retries (int): How many blind-run retries have already been spent on
-            this Monday slot. 0 for the ordinary weekly fire and for a
+            this slot. 0 for the ordinary scheduled fire and for a
             catch-up of a never-attempted slot; greater than 0 only when
             _blind_retry or _maybe_catch_up is re-running a slot that a blind
             run left unsatisfied. Persisted into scheduler_state.json so the
@@ -604,9 +651,11 @@ def run_job(retries: int = 0) -> None:
     Returns:
         None
     """
-    logging.info("Scheduler: starting weekly arbitrage scan.")
     started_at = datetime.now()
     slot = _most_recent_slot(started_at)
+    if retries == 0 and _slot_already_run(slot):
+        return
+    logging.info("Scheduler: starting scheduled arbitrage scan.")
     # Claim the slot before spawning, so a crash/timeout/OSError mid-run
     # still leaves a recorded attempt for this slot — otherwise the startup
     # catch-up check would see no record at all and re-run it on every
@@ -661,20 +710,20 @@ def run_job(retries: int = 0) -> None:
         logging.error(
             "Job made NO time-series trade (exit %d): a held market could not "
             "be identified, so the run could not tell which ladders it already "
-            "holds. Same-title pairs were still searched. The weekly slot counts "
+            "holds. Same-title pairs were still searched. The slot counts "
             "as done — see the ERROR in kalshi_arb.log naming the market.",
             result.returncode,
         )
     elif result.returncode == EXIT_RUN_IN_PROGRESS:
         # Slot done: a real-money run was already trading on this machine, and
-        # a retry could stack a second same-title trade this week. The lock
+        # a retry could stack a second same-title trade. The lock
         # file's record names that run
         holder = run_lock.holder()
         age = holder.age_seconds()
         if age is not None and age <= SCHEDULER_JOB_TIMEOUT_SECONDS:
             logging.warning(
                 "Job did not trade (exit %d): another live trading run on this machine "
-                "was in progress (%s). The weekly slot counts as done — a real-money "
+                "was in progress (%s). The slot counts as done — a real-money "
                 "run was already trading, so it is not retried.",
                 result.returncode, holder.describe(),
             )
@@ -682,7 +731,7 @@ def run_job(retries: int = 0) -> None:
             logging.error(
                 "Job did not trade (exit %d): the run holding the live-run lock (%s) has "
                 "been running for over %d s, or its start is not recorded — it may be "
-                "hung or stopped. No trade was made for this weekly slot, and every "
+                "hung or stopped. No trade was made for this slot, and every "
                 "scheduled run will stop the same way until that run ends. Before "
                 "stopping it, check the account in the Kalshi UI: a run stopped "
                 "mid-trade can leave a leg unhedged.",
@@ -696,7 +745,7 @@ def run_job(retries: int = 0) -> None:
             logging.warning(
                 "Job scanned nothing (exit %d): every advertised exchange shard was "
                 "trading-inactive, or the market ingest came back empty — "
-                "kalshi_arb.log names which. The weekly slot is NOT satisfied — "
+                "kalshi_arb.log names which. The slot is NOT satisfied — "
                 "retrying in %d s (attempt %d of %d).",
                 result.returncode, SCHEDULER_BLIND_RETRY_SECONDS,
                 retries + 1, SCHEDULER_BLIND_MAX_RETRIES,
@@ -753,11 +802,11 @@ def _blind_retry(retries: int) -> type[schedule.CancelJob]:
 
 def _maybe_catch_up(now: datetime | None = None) -> None:
     """
-    Run a catch-up job now if the latest weekly slot has no recorded run, or
+    Run a catch-up job now if the latest run slot has no recorded run, or
     its last run was blind and the blind-retry cap is not yet used up.
 
     `schedule` fires only while this process polls, so a slot that passes
-    while the daemon is down would otherwise wait a week. main() calls this
+    while the daemon is down would otherwise be skipped. main() calls this
     once at startup, through _startup_catch_up(). A blind run (one that
     exited EXIT_NO_TRADEABLE_SHARDS) is re-run with `retries + 1`, sharing
     run_job's SCHEDULER_BLIND_MAX_RETRIES cap; a run that failed any other
@@ -787,8 +836,9 @@ def _maybe_catch_up(now: datetime | None = None) -> None:
     )
     if stale or blind:
         logging.warning(
-            "Most recent weekly slot (%s, %s) has no %s run — running catch-up now",
-            _host_clock_label(), slot.isoformat(),
+            "Most recent run slot (%s on the host's clock; runs are at %s) has no %s "
+            "run — running catch-up now",
+            slot.isoformat(), SCHEDULER_RUN_TIMES.times_label(),
             "recorded" if stale else "successful (blind-run)",
         )
         run_job(retries=0 if stale else state.get("retries", 0) + 1)
@@ -798,7 +848,7 @@ def _startup_catch_up() -> None:
     """
     Run _maybe_catch_up() and never let it take the daemon down.
 
-    main() calls this BEFORE registering the weekly job, so an exception
+    main() calls this BEFORE registering the run jobs, so an exception
     raised here used to propagate straight out of main() with nothing
     scheduled — a corrupt-but-present `retries` in scheduler_state.json (a
     raw string or null) reaching _maybe_catch_up's `retries < ...`
@@ -820,11 +870,11 @@ def _startup_catch_up() -> None:
 
 def _check_live_defaults() -> None:
     """
-    Log an ERROR at daemon start when the weekly run would refuse to start.
+    Log an ERROR at daemon start when the scheduled runs would refuse to start.
 
     A live run exits 2 when no live defaults are saved or the saved file is
     refused. The daemon says so as soon as it starts, naming the fix, rather
-    than only after the next Monday run has spent its slot: for a missing
+    than only after the next scheduled run has spent its slot: for a missing
     file, the checkout (PROJECT_ROOT) the defaults must be saved in, since the
     runs it spawns read the file there; for one an older version saved
     (LiveDefaultsOutdated), that it must be saved again through the defaults
@@ -838,7 +888,7 @@ def _check_live_defaults() -> None:
 
     Raises:
         Nothing: any exception from the read is logged as an ERROR instead,
-            so the daemon still registers its weekly job.
+            so the daemon still registers its run jobs.
     """
     try:
         # The one read the daemon makes of the saved defaults; main.py reads
@@ -910,16 +960,16 @@ def _setup_logging(log_path: pathlib.Path) -> None:
 
 def main() -> None:
     """
-    Entry point for the weekly scheduler daemon.
+    Entry point for the scheduler daemon.
 
     Sets up logging, checks the host's clock (_host_clock_realises_run), logs
     an ERROR when no usable live defaults are saved (_check_live_defaults:
     every run would exit 2 until they are), runs the startup catch-up
-    (_startup_catch_up), registers run_job() at SCHEDULED_RUN's weekday and
-    time through _guarded_job(), then polls every 60 seconds. The clock
-    check, the live-defaults check and the catch-up never raise, so the
-    weekly job is always registered. With no scheduler_state.json yet, the
-    catch-up runs the bot at once.
+    (_startup_catch_up), registers run_job() at each of SCHEDULER_RUN_TIMES'
+    times through _guarded_job(), then polls every 60 seconds. The clock
+    check, the live-defaults check and the catch-up never raise, so the run
+    jobs are always registered. With no scheduler_state.json yet, or none
+    recorded for the latest slot, the catch-up runs the bot at once.
     """
     # The daemon logs to its OWN file — see _SCHEDULER_LOG_PATH for why it
     # must not share kalshi_arb.log with the subprocess that rotates it.
@@ -931,34 +981,35 @@ def main() -> None:
     # would never be written. It never raises, so what follows always runs.
     _host_clock_realises_run()
 
-    # Say now, not after next Monday's run, when every run would exit 2 for
-    # want of saved live defaults (never raises, so the weekly job is still
+    # Say now, not after the next scheduled run, when every run would exit 2
+    # for want of saved live defaults (never raises, so the run jobs are still
     # registered below)
     _check_live_defaults()
 
     # Catch up on a missed run before registering future ones.
     # _startup_catch_up logs any raise (e.g. from a corrupt
-    # scheduler_state.json), so the weekly job below is always registered.
+    # scheduler_state.json), so the run jobs below are always registered.
     _startup_catch_up()
 
     # Through _guarded_job: `schedule` reschedules a job only after it
     # returns, so a raise escaping run_job() would leave it overdue and re-run
     # it on every poll tick.
-    _weekly_job().do(_guarded_job, run_job)
+    for job in _daily_jobs():
+        job.do(_guarded_job, run_job)
 
     python_path  = sys.executable
     project_path = str(PROJECT_ROOT)
 
     logging.info(
-        "Scheduler started. Runs every %s (config.SCHEDULED_RUN: %s).",
-        _host_clock_label(), SCHEDULED_RUN.label(),
+        "Scheduler started. Runs %s (config.SCHEDULER_RUN_TIMES: %s).",
+        _host_clock_label(), SCHEDULER_RUN_TIMES.label(),
     )
     logging.info(
-        "To run instead as a cron job, add this line with `crontab -e` (cron also "
-        "fires on the host's clock): %s",
-        _cron_line(project_path, python_path),
+        "To run instead as a cron job, add these lines with `crontab -e` (cron also "
+        "fires on the host's clock):\n%s",
+        "\n".join(_cron_lines(project_path, python_path)),
     )
-    logging.info("Waiting for the next %s...", _host_clock_label())
+    logging.info("Waiting for the next run (%s)...", _host_clock_label())
 
     # Poll for pending scheduled jobs every 60 seconds.
     # The schedule library tracks the next fire time internally.

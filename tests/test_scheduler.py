@@ -1,5 +1,5 @@
 """Tests for scheduler.py: exit-code logging, TimeoutExpired/OSError handling,
-missed-run catch-up, the weekly job (_weekly_job, _cron_line) and the startup
+missed-run catch-up, the daily run jobs (_daily_jobs, _cron_lines) and the startup
 host-clock check (_host_clock_realises_run). subprocess.run is mocked, and the
 autouse `_tmp_project_root` fixture sends run_job's scheduler_state.json
 writes to tmp_path instead of the repo root.
@@ -37,6 +37,7 @@ from kalshi_betting.config import (
     SCHEDULER_BLIND_MAX_RETRIES,
     SCHEDULER_BLIND_RETRY_SECONDS,
     SCHEDULER_JOB_TIMEOUT_SECONDS,
+    DailyRuns,
     ScheduledRun,
 )
 
@@ -234,7 +235,7 @@ class TestRunInProgress:
         assert f"exit {EXIT_RUN_IN_PROGRESS}" in message
         assert "another live trading run on this machine was in progress" in message
         assert f"process 4242 in {self._CHECKOUT}, since" in message
-        assert "The weekly slot counts as done" in message
+        assert "The slot counts as done" in message
         assert "not retried" in message
         assert "noise" not in message
         assert not any(r.levelno >= logging.ERROR for r in caplog.records)
@@ -262,7 +263,7 @@ class TestRunInProgress:
         assert f"exit {EXIT_RUN_IN_PROGRESS}" in message
         assert "process 4242" in message
         assert "may be hung or stopped" in message
-        assert "No trade was made for this weekly slot" in message
+        assert "No trade was made for this slot" in message
         assert "every scheduled run will stop the same way until that run ends" in message
         state = json.loads((tmp_path / "scheduler_state.json").read_text())
         assert state["exit_code"] == EXIT_RUN_IN_PROGRESS
@@ -410,52 +411,59 @@ class TestOSErrorHandling:
 
 
 class TestMostRecentSlot:
-    """_most_recent_slot: the latest SCHEDULED_RUN slot <= now, on the host's clock."""
-
-    def test_monday_before_0900_uses_previous_week(self):
-        # Monday 2026-08-31 is a real Monday.
-        now = datetime(2026, 8, 31, 8, 59)
-        slot = scheduler._most_recent_slot(now)
-        assert slot == datetime(2026, 8, 24, 9, 0)
-
-    def test_monday_after_0900_uses_today(self):
-        now = datetime(2026, 8, 31, 9, 1)
-        slot = scheduler._most_recent_slot(now)
-        assert slot == datetime(2026, 8, 31, 9, 0)
-
-    def test_monday_exactly_0900_uses_today(self):
-        now = datetime(2026, 8, 31, 9, 0)
-        slot = scheduler._most_recent_slot(now)
-        assert slot == datetime(2026, 8, 31, 9, 0)
-
-    def test_midweek_uses_that_weeks_monday(self):
-        # Wednesday 2026-09-02.
-        now = datetime(2026, 9, 2, 14, 30)
-        slot = scheduler._most_recent_slot(now)
-        assert slot == datetime(2026, 8, 31, 9, 0)
-
-    def test_sunday_uses_previous_monday(self):
-        # Sunday 2026-09-06.
-        now = datetime(2026, 9, 6, 12, 0)
-        slot = scheduler._most_recent_slot(now)
-        assert slot == datetime(2026, 8, 31, 9, 0)
+    """_most_recent_slot: the latest SCHEDULER_RUN_TIMES time <= now, on the host's clock."""
 
     @pytest.mark.parametrize(
         ("now", "expected"),
         [
-            # Thursday 2026-09-03 before 14:30: the previous Thursday.
-            (datetime(2026, 9, 3, 14, 29), datetime(2026, 8, 27, 14, 30)),
-            # Thursday 2026-09-03 exactly at and after 14:30: that day.
+            # Before 07:00: the previous evening's 21:00
+            (datetime(2026, 11, 10, 0, 0), datetime(2026, 11, 9, 21, 0)),
+            (datetime(2026, 11, 10, 6, 59), datetime(2026, 11, 9, 21, 0)),
+            # Exactly at and after 07:00: that morning's
+            (datetime(2026, 11, 10, 7, 0), datetime(2026, 11, 10, 7, 0)),
+            (datetime(2026, 11, 10, 20, 59, 59), datetime(2026, 11, 10, 7, 0)),
+            # Exactly at and after 21:00: that evening's
+            (datetime(2026, 11, 10, 21, 0), datetime(2026, 11, 10, 21, 0)),
+            (datetime(2026, 11, 10, 23, 59), datetime(2026, 11, 10, 21, 0)),
+            # Across a year's end
+            (datetime(2027, 1, 1, 3, 0), datetime(2026, 12, 31, 21, 0)),
+        ],
+    )
+    def test_the_shipped_times(self, now, expected):
+        assert scheduler._most_recent_slot(now) == expected
+
+    def test_seconds_are_zeroed(self):
+        now = datetime(2026, 11, 10, 7, 0, 30, 5)
+        assert scheduler._most_recent_slot(now) == datetime(2026, 11, 10, 7, 0)
+
+    @pytest.mark.parametrize(
+        ("now", "expected"),
+        [
+            (datetime(2026, 9, 3, 5, 14), datetime(2026, 9, 2, 23, 45)),
+            (datetime(2026, 9, 3, 5, 15), datetime(2026, 9, 3, 5, 15)),
+            (datetime(2026, 9, 3, 14, 29), datetime(2026, 9, 3, 5, 15)),
             (datetime(2026, 9, 3, 14, 30), datetime(2026, 9, 3, 14, 30)),
-            (datetime(2026, 9, 3, 23, 59), datetime(2026, 9, 3, 14, 30)),
-            # Monday 2026-08-31 and Wednesday 2026-09-02: the Thursday before.
-            (datetime(2026, 8, 31, 9, 0), datetime(2026, 8, 27, 14, 30)),
-            (datetime(2026, 9, 2, 23, 0), datetime(2026, 8, 27, 14, 30)),
+            (datetime(2026, 9, 3, 23, 44), datetime(2026, 9, 3, 14, 30)),
+            (datetime(2026, 9, 3, 23, 45), datetime(2026, 9, 3, 23, 45)),
         ],
     )
     def test_a_patched_schedule_moves_the_slot(self, monkeypatch, now, expected):
         monkeypatch.setattr(
-            scheduler, "SCHEDULED_RUN", ScheduledRun(3, 14, 30, "America/Los_Angeles"),
+            scheduler, "SCHEDULER_RUN_TIMES",
+            DailyRuns(((5, 15), (14, 30), (23, 45)), "America/Los_Angeles"),
+        )
+        assert scheduler._most_recent_slot(now) == expected
+
+    @pytest.mark.parametrize(
+        ("now", "expected"),
+        [
+            (datetime(2026, 9, 3, 14, 29), datetime(2026, 9, 2, 14, 30)),
+            (datetime(2026, 9, 3, 14, 30), datetime(2026, 9, 3, 14, 30)),
+        ],
+    )
+    def test_one_run_a_day(self, monkeypatch, now, expected):
+        monkeypatch.setattr(
+            scheduler, "SCHEDULER_RUN_TIMES", DailyRuns(((14, 30),), "America/Los_Angeles"),
         )
         assert scheduler._most_recent_slot(now) == expected
 
@@ -496,11 +504,12 @@ class TestCatchUp:
             scheduler._maybe_catch_up(now=now)
 
         [message] = [r.getMessage() for r in caplog.records if "no recorded run" in r.getMessage()]
-        assert "Monday 09:00 on the host's clock, 2026-08-31T09:00:00" in message
+        assert ("2026-09-02T07:00:00 on the host's clock; runs are at 07:00 and 21:00"
+                in message)
         assert "America/Los_Angeles" not in message
 
     def test_stale_slot_triggers_catch_up(self, tmp_path):
-        now = datetime(2026, 9, 2, 10, 0)  # midweek -> this week's Monday slot
+        now = datetime(2026, 9, 2, 10, 0)  # -> that morning's 07:00 slot
         current_slot = scheduler._most_recent_slot(now)
         stale_slot = current_slot - timedelta(days=7)
         _write_state(tmp_path, last_slot=stale_slot.isoformat())
@@ -709,7 +718,7 @@ class TestCatchUp:
 class TestStartupCatchUp:
     """DR-24: main() calls _startup_catch_up() instead of a bare
     _maybe_catch_up(), so an exception _load_state's own validation didn't
-    catch still can't exit the daemon before the weekly job is registered."""
+    catch still can't exit the daemon before the run jobs are registered."""
 
     def test_maybe_catch_up_raising_is_logged_and_swallowed(self, caplog):
         with patch(
@@ -723,7 +732,7 @@ class TestStartupCatchUp:
 
     def test_main_calls_the_guarded_wrapper(self):
         """DR-24: main() must call _startup_catch_up(), not _maybe_catch_up()
-        directly — a bare call can raise out of main() before the weekly job
+        directly — a bare call can raise out of main() before the run jobs
         is registered, exactly the failure this commit fixes. main() itself
         spawns a real prod run and is never invoked by this suite, so the
         call site is pinned on the source instead."""
@@ -745,7 +754,7 @@ class TestCheckLiveDefaults:
     """_check_live_defaults: at daemon start, one ERROR when every scheduled run
     would exit 2 for want of usable saved live defaults, naming the fix; nothing
     when a usable file is saved. It never raises, so main() still registers the
-    weekly job, and main() calls it before registering that job."""
+    run jobs, and main() calls it before registering them."""
 
     @staticmethod
     def _errors(caplog) -> list[str]:
@@ -828,10 +837,10 @@ class TestCheckLiveDefaults:
         (error,) = self._errors(caplog)
         assert "an unexpected failure" in error
 
-    def test_main_calls_it_before_registering_the_weekly_job(self):
+    def test_main_calls_it_before_registering_the_run_jobs(self):
         # main() spawns a real prod run and is never invoked by this suite, so
         # the order is pinned on the source: after the host-clock check, before
-        # the catch-up (which can spawn a run) and the weekly job's registration
+        # the catch-up (which can spawn a run) and the run jobs' registration
         tree = ast.parse(inspect.getsource(scheduler))
         main_fn = next(node for node in ast.walk(tree)
                        if isinstance(node, ast.FunctionDef) and node.name == "main")
@@ -856,7 +865,7 @@ class TestBlindRunRetry:
     came back empty for a cause /exchange/status could not name. The scheduler
     sees only the exit code, so its messages name both possibilities and point
     at kalshi_arb.log, where main._blind_run_reason logged which one fired. The
-    bot trades only on the weekly fire, so that slot must not count as
+    bot trades only at its scheduled runs, so that slot must not count as
     satisfied — it is retried hourly, a bounded number of times."""
 
     @patch("kalshi_betting.scheduler.subprocess.run")
@@ -905,7 +914,7 @@ class TestBlindRunRetry:
         assert result is schedule.CancelJob
 
     @patch("kalshi_betting.scheduler.subprocess.run")
-    def test_retry_is_one_shot_not_recurring(self, mock_run):
+    def test_retry_is_one_shot_not_recurring(self, mock_run, tmp_path):
         # schedule removes a job whose function returns CancelJob, so a blind
         # retry can never become a permanent hourly job.
         mock_run.return_value = _completed(EXIT_NO_TRADEABLE_SHARDS)
@@ -913,6 +922,8 @@ class TestBlindRunRetry:
         scheduler.run_job(retries=SCHEDULER_BLIND_MAX_RETRIES)  # registers nothing
         assert schedule.jobs == []
 
+        # A fresh slot: an ordinary fire in a slot already recorded spawns nothing
+        (tmp_path / "scheduler_state.json").unlink()
         scheduler.run_job()
         assert len(schedule.jobs) == 1
 
@@ -987,26 +998,47 @@ class TestBlindRunRetry:
         assert claimed[0]["finished_at"] is None
 
 
-def _register_weekly_job_as_main_does():
+def _register_jobs_as_main_does():
     """
-    Register the weekly job exactly as scheduler.main() does, due in the past.
+    Register the run jobs exactly as scheduler.main() does, the first one due in the past.
 
     main() itself spawns a real prod run and is never invoked by this suite, so
-    the registration it performs is reproduced here verbatim and its next_run
-    is pulled back one second so schedule.run_pending() fires it immediately.
+    the registration it performs is reproduced here verbatim and the first
+    job's next_run is pulled back one second so schedule.run_pending() fires
+    it immediately; the others keep their next fire, so only that one runs.
 
     Because this is a REPRODUCTION rather than a read of main(), the tests
     built on it prove the guard WORKS, not that main() is wired to it — that
     half is pinned on the source by
-    test_ast_weekly_job_is_registered_through_the_guard, and only that pin
+    test_ast_run_jobs_are_registered_through_the_guard, and only that pin
     fails if main() reverts to a bare `.do(run_job)`.
 
     Returns:
-        schedule.Job: The registered, already-overdue weekly job.
+        schedule.Job: The first registered job, already overdue.
     """
-    job = scheduler._weekly_job().do(scheduler._guarded_job, scheduler.run_job)
-    job.next_run = datetime.now() - timedelta(seconds=1)
-    return job
+    jobs = [job.do(scheduler._guarded_job, scheduler.run_job)
+            for job in scheduler._daily_jobs()]
+    jobs[0].next_run = datetime.now() - timedelta(seconds=1)
+    return jobs[0]
+
+
+def _main_registration_loop() -> tuple[ast.For, ast.Call]:
+    """
+    Find main()'s job registration: the one `.do(...)` call and the for loop around it.
+
+    Returns:
+        tuple[ast.For, ast.Call]: The loop and its `.do(...)` call, from one
+            parse of scheduler.py.
+    """
+    tree = ast.parse(inspect.getsource(scheduler))
+    main_fn = next(node for node in ast.walk(tree)
+                   if isinstance(node, ast.FunctionDef) and node.name == "main")
+    [call] = [sub for sub in ast.walk(main_fn)
+              if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+              and sub.func.attr == "do"]
+    [loop] = [node for node in ast.walk(main_fn)
+              if isinstance(node, ast.For) and any(sub is call for sub in ast.walk(node))]
+    return loop, call
 
 
 def _do_calls_in(func_name: str):
@@ -1037,7 +1069,7 @@ class TestGuardedJobRegistration:
     _schedule_next_run() only AFTER job_func() RETURNS, so any exception
     escaping a job leaves next_run in the past. main()'s poll loop catches it
     and keeps the daemon alive, but the job is still overdue — so it re-enters
-    on the very next 60 s poll tick, turning the weekly production trading run
+    on the very next 60 s poll tick, turning a scheduled production trading run
     into a once-a-minute one for as long as the fault persists. Every job is
     therefore registered through _guarded_job()."""
 
@@ -1051,13 +1083,13 @@ class TestGuardedJobRegistration:
             raise OSError("state write failed")
 
         monkeypatch.setattr(scheduler.pathlib.Path, "replace", _failing_replace)
-        job = _register_weekly_job_as_main_does()
+        job = _register_jobs_as_main_does()
 
         schedule.run_pending()  # must not raise
 
         assert job.next_run > datetime.now()
         assert not job.should_run, (
-            "an escaping exception must not leave the weekly job overdue — "
+            "an escaping exception must not leave the run job overdue — "
             "that is what re-fires a prod run every 60 s poll tick"
         )
         # The claim raised before the spawn, so no prod run was attempted.
@@ -1072,7 +1104,7 @@ class TestGuardedJobRegistration:
         mock_run.side_effect = UnicodeDecodeError(
             "utf-8", b"\xff", 0, 1, "invalid start byte",
         )
-        job = _register_weekly_job_as_main_does()
+        job = _register_jobs_as_main_does()
 
         with caplog.at_level(logging.ERROR):
             schedule.run_pending()  # must not raise
@@ -1136,7 +1168,7 @@ class TestGuardedJobRegistration:
         def boom():
             raise ValueError("nope")
 
-        # The weekly job passes no on_error: a recurring job must NOT be
+        # The run jobs pass no on_error: a recurring job must NOT be
         # cancelled by a failure, only rescheduled.
         assert scheduler._guarded_job(boom) is None
 
@@ -1158,20 +1190,24 @@ class TestGuardedJobRegistration:
         with pytest.raises(exc):
             scheduler._guarded_job(boom, on_error=schedule.CancelJob)
 
-    def test_ast_weekly_job_is_registered_through_the_guard(self):
-        """main() must register run_job through _guarded_job on _weekly_job()'s
-        job. main() is never invoked by this suite, so only this pin catches a
-        revert to `.do(run_job)` (a raising job would re-fire every 60-second
-        poll tick) or another job (which would move the live run)."""
-        calls = _do_calls_in("main")
-        assert len(calls) == 1, "main() should register exactly one job"
-        args = calls[0].args
+    def test_ast_run_jobs_are_registered_through_the_guard(self):
+        """main() must register run_job through _guarded_job on each of
+        _daily_jobs()'s jobs, in one `for` loop. main() is never invoked by
+        this suite, so only this pin catches a revert to `.do(run_job)` (a
+        raising job would re-fire every 60-second poll tick) or other jobs
+        (which would move the live runs)."""
+        loop, call = _main_registration_loop()
+        assert len(_do_calls_in("main")) == 1, "main() should register jobs in one place"
+        assert len(call.args) == 2 and not call.keywords, ast.unparse(call)
+        args = call.args
         assert isinstance(args[0], ast.Name) and args[0].id == "_guarded_job"
         assert isinstance(args[1], ast.Name) and args[1].id == "run_job"
-        receiver = calls[0].func.value
-        assert isinstance(receiver, ast.Call), ast.unparse(receiver)
-        assert isinstance(receiver.func, ast.Name) and receiver.func.id == "_weekly_job"
-        assert not receiver.args and not receiver.keywords
+        receiver = call.func.value
+        assert isinstance(receiver, ast.Name), ast.unparse(receiver)
+        assert isinstance(loop.target, ast.Name) and loop.target.id == receiver.id
+        assert isinstance(loop.iter, ast.Call), ast.unparse(loop.iter)
+        assert isinstance(loop.iter.func, ast.Name) and loop.iter.func.id == "_daily_jobs"
+        assert not loop.iter.args and not loop.iter.keywords
 
     def test_ast_blind_retry_is_registered_through_the_guard_with_canceljob(self):
         """DR-59: the blind retry must route through _guarded_job with
@@ -1187,6 +1223,113 @@ class TestGuardedJobRegistration:
         assert isinstance(on_error, ast.Attribute)
         assert on_error.attr == "CancelJob"
         assert isinstance(on_error.value, ast.Name) and on_error.value.id == "schedule"
+
+
+class TestOneRunPerSlot:
+    """An ordinary fire (retries == 0) whose slot already has a recorded run
+    spawns nothing (_slot_already_run). `schedule` fires every overdue job in
+    one tick, so a host that slept through both run times would otherwise
+    trade twice in a row on waking, both runs taking the same slot."""
+
+    @patch("kalshi_betting.scheduler.subprocess.run")
+    def test_both_jobs_overdue_after_a_sleep_trade_once(self, mock_run, caplog):
+        mock_run.return_value = _completed(EXIT_OK)
+        jobs = [job.do(scheduler._guarded_job, scheduler.run_job)
+                for job in scheduler._daily_jobs()]
+        for job in jobs:
+            job.next_run = datetime.now() - timedelta(hours=1)
+
+        with caplog.at_level(logging.INFO):
+            schedule.run_pending()
+
+        assert mock_run.call_count == 1
+        assert any("already has a recorded run" in r.getMessage() for r in caplog.records)
+        # Both jobs moved on to their next fire
+        assert all(job.next_run > datetime.now() for job in jobs)
+
+    @patch("kalshi_betting.scheduler.subprocess.run")
+    def test_a_recorded_slot_spawns_nothing_and_keeps_its_record(self, mock_run, tmp_path):
+        slot = scheduler._most_recent_slot(datetime.now())
+        _write_state(tmp_path, last_slot=slot.isoformat(), exit_code=EXIT_OK,
+                     started_at=slot.isoformat(), finished_at=slot.isoformat())
+        before = (tmp_path / "scheduler_state.json").read_text()
+
+        scheduler.run_job()
+
+        mock_run.assert_not_called()
+        assert (tmp_path / "scheduler_state.json").read_text() == before
+
+    @patch("kalshi_betting.scheduler.subprocess.run")
+    def test_an_earlier_recorded_slot_runs(self, mock_run, tmp_path):
+        mock_run.return_value = _completed(EXIT_OK)
+        slot = scheduler._most_recent_slot(datetime.now())
+        _write_state(tmp_path, last_slot=(slot - timedelta(hours=10)).isoformat())
+
+        scheduler.run_job()
+
+        mock_run.assert_called_once()
+        state = json.loads((tmp_path / "scheduler_state.json").read_text())
+        assert state["last_slot"] == slot.isoformat()
+
+    @patch("kalshi_betting.scheduler.subprocess.run")
+    def test_a_blind_retry_still_reruns_its_slot(self, mock_run, tmp_path):
+        mock_run.return_value = _completed(EXIT_OK)
+        slot = scheduler._most_recent_slot(datetime.now())
+        _write_state(tmp_path, last_slot=slot.isoformat(),
+                     exit_code=EXIT_NO_TRADEABLE_SHARDS, retries=0)
+
+        scheduler.run_job(retries=1)
+
+        mock_run.assert_called_once()
+
+    @patch("kalshi_betting.scheduler.subprocess.run")
+    def test_an_unreadable_state_file_runs(self, mock_run, tmp_path):
+        mock_run.return_value = _completed(EXIT_OK)
+        (tmp_path / "scheduler_state.json").write_text("{not json")
+
+        scheduler.run_job()
+
+        mock_run.assert_called_once()
+
+
+class TestMoveFromTheWeeklySchedule:
+    """The first daemon start after the move from one Monday 09:00 run a week
+    to 07:00 and 21:00 every day: scheduler_state.json still records a Monday
+    09:00 slot, and the catch-up compares it with the latest daily slot."""
+
+    _OLD = "2026-11-09T09:00:00"  # Monday 09:00, the last weekly slot
+
+    @pytest.mark.parametrize(
+        ("now", "catch_up"),
+        [
+            # Monday after 09:00 but before 21:00: the latest slot (07:00) is older
+            (datetime(2026, 11, 9, 10, 0), False),
+            (datetime(2026, 11, 9, 20, 59), False),
+            # From Monday 21:00 on, the latest slot is newer than the record
+            (datetime(2026, 11, 9, 21, 0), True),
+            (datetime(2026, 11, 10, 6, 0), True),
+            (datetime(2026, 11, 12, 15, 0), True),
+        ],
+    )
+    def test_the_old_record_against_the_latest_daily_slot(self, tmp_path, now, catch_up):
+        _write_state(tmp_path, last_slot=self._OLD, exit_code=EXIT_OK)
+
+        with patch("kalshi_betting.scheduler.run_job") as mock_run_job:
+            scheduler._maybe_catch_up(now=now)
+
+        if catch_up:
+            mock_run_job.assert_called_once_with(retries=0)
+        else:
+            mock_run_job.assert_not_called()
+
+    def test_an_old_blind_record_is_still_retried(self, tmp_path):
+        _write_state(tmp_path, last_slot=self._OLD,
+                     exit_code=EXIT_NO_TRADEABLE_SHARDS, retries=1)
+
+        with patch("kalshi_betting.scheduler.run_job") as mock_run_job:
+            scheduler._maybe_catch_up(now=datetime(2026, 11, 9, 12, 0))
+
+        mock_run_job.assert_called_once_with(retries=2)
 
 
 class TestSlotClaimAndFinalize:
@@ -1206,10 +1349,10 @@ class TestSlotClaimAndFinalize:
         assert state["exit_code"] == EXIT_OK
         assert state["started_at"] is not None
         assert state["finished_at"] is not None
-        # last_slot must be a real Monday 09:00, not a placeholder.
+        # last_slot must be a real run time, not a placeholder.
         parsed_slot = datetime.fromisoformat(state["last_slot"])
-        assert parsed_slot.weekday() == 0
-        assert (parsed_slot.hour, parsed_slot.minute) == (9, 0)
+        assert (parsed_slot.hour, parsed_slot.minute) in config.SCHEDULER_RUN_TIMES.times
+        assert (parsed_slot.second, parsed_slot.microsecond) == (0, 0)
 
     @patch("kalshi_betting.scheduler.subprocess.run")
     def test_nonzero_exit_still_finalizes_state(self, mock_run, tmp_path):
@@ -1328,41 +1471,48 @@ class TestSetupLogging:
         assert scheduler._SCHEDULER_LOG_PATH.name != "kalshi_arb.log"
 
 
-class TestWeeklyJobIsTheOldRegistration:
-    """On the shipped schedule, _weekly_job() builds the same job as the literal
-    `schedule.every().monday.at("09:00")`: Monday 09:00 on the host's clock,
-    with no time zone. It must never take one: schedule's zone option uses
-    pytz, whose Los Angeles table has no daylight time after 2037."""
+class TestDailyJobs:
+    """On the shipped schedule, _daily_jobs() builds the same jobs as the
+    literal `schedule.every().day.at("07:00")` and `.at("21:00")`: those
+    times on the host's clock, with no time zone. They must never take one:
+    schedule's zone option uses pytz, whose Los Angeles table has no daylight
+    time after 2037."""
 
-    def test_the_job_matches_the_literal_registration(self):
-        job = scheduler._weekly_job()
-        literal = schedule.every().monday.at("09:00")
-        for attr in ("at_time", "unit", "start_day", "interval", "at_time_zone"):
-            assert getattr(job, attr) == getattr(literal, attr), attr
-        assert job.at_time_zone is None
-        # Built, not registered: main() registers it with .do().
-        assert job.job_func is None
+    _LITERAL_TIMES = ("07:00", "21:00")
+
+    def test_the_jobs_match_the_literal_registrations(self):
+        jobs = scheduler._daily_jobs()
+        literals = [schedule.every().day.at(at_time) for at_time in self._LITERAL_TIMES]
+        assert len(jobs) == len(literals)
+        for job, literal in zip(jobs, literals, strict=True):
+            for attr in ("at_time", "unit", "start_day", "interval", "at_time_zone"):
+                assert getattr(job, attr) == getattr(literal, attr), attr
+            assert job.at_time_zone is None
+            # Built, not registered: main() registers each with .do().
+            assert job.job_func is None
         assert schedule.jobs == []
 
-    def test_the_first_fire_is_the_literal_registrations(self):
-        job = scheduler._weekly_job().do(lambda: None)
-        literal = schedule.every().monday.at("09:00").do(lambda: None)
-        assert job.next_run == literal.next_run
+    def test_the_first_fires_are_the_literal_registrations(self):
+        jobs = [job.do(lambda: None) for job in scheduler._daily_jobs()]
+        literals = [schedule.every().day.at(at_time).do(lambda: None)
+                    for at_time in self._LITERAL_TIMES]
+        assert [job.next_run for job in jobs] == [job.next_run for job in literals]
 
-    def test_a_patched_schedule_moves_the_job(self, monkeypatch):
+    def test_a_patched_schedule_moves_the_jobs(self, monkeypatch):
         monkeypatch.setattr(
-            scheduler, "SCHEDULED_RUN", ScheduledRun(3, 14, 30, "America/Los_Angeles"),
+            scheduler, "SCHEDULER_RUN_TIMES",
+            DailyRuns(((5, 15), (14, 30), (23, 45)), "America/Los_Angeles"),
         )
-        job = scheduler._weekly_job()
-        assert (job.unit, job.start_day, job.at_time.hour, job.at_time.minute) == (
-            "weeks", "thursday", 14, 30,
-        )
-        assert job.at_time_zone is None
+        jobs = scheduler._daily_jobs()
+        assert [(job.unit, job.interval, job.at_time.hour, job.at_time.minute)
+                for job in jobs] == [("days", 1, 5, 15), ("days", 1, 14, 30),
+                                     ("days", 1, 23, 45)]
+        assert all(job.at_time_zone is None for job in jobs)
 
 
 class TestOneRunSchedule:
-    """scheduler.py takes the run's weekday and time from config.SCHEDULED_RUN
-    alone: no "09:00" literal, no `.monday`, and no `.at()` call with a zone."""
+    """scheduler.py takes its run times from config.SCHEDULER_RUN_TIMES alone:
+    no "HH:MM" literal, no weekday, and no `.at()` call with a zone."""
 
     @staticmethod
     def _tree():
@@ -1372,13 +1522,17 @@ class TestOneRunSchedule:
     def test_ast_no_literal_run_time(self):
         assert not [
             n for n in ast.walk(self._tree())
-            if isinstance(n, ast.Constant) and n.value == "09:00"
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+            and len(n.value) == 5 and n.value[2] == ":"
+            and n.value[:2].isdigit() and n.value[3:].isdigit()
         ]
 
     def test_ast_no_literal_weekday(self):
+        weekdays = {"monday", "tuesday", "wednesday", "thursday", "friday",
+                    "saturday", "sunday"}
         assert not [
             n for n in ast.walk(self._tree())
-            if isinstance(n, ast.Attribute) and n.attr == "monday"
+            if isinstance(n, ast.Attribute) and n.attr in weekdays
         ]
 
     def test_ast_no_at_call_passes_a_zone(self):
@@ -1387,12 +1541,22 @@ class TestOneRunSchedule:
             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
             and n.func.attr == "at"
         ]
-        assert at_calls, "the weekly job's .at() call should be found"
+        assert at_calls, "the daily jobs' .at() call should be found"
         for call in at_calls:
             assert len(call.args) == 1 and not call.keywords, ast.unparse(call)
 
     def test_the_scheduler_reads_the_config_schedule(self):
-        assert scheduler.SCHEDULED_RUN is config.SCHEDULED_RUN
+        assert scheduler.SCHEDULER_RUN_TIMES is config.SCHEDULER_RUN_TIMES
+        # The backtest's weekly checkpoint is not the scheduler's to read
+        assert not hasattr(scheduler, "SCHEDULED_RUN")
+
+    def test_the_blind_retries_end_before_the_next_run(self):
+        # A retry chain started at a run time and still going at the next one
+        # would run that slot twice
+        minutes = [hour * 60 + minute for hour, minute in config.SCHEDULER_RUN_TIMES.times]
+        gaps = [later - earlier for earlier, later in zip(minutes, minutes[1:], strict=False)]
+        gaps.append(minutes[0] + 24 * 60 - minutes[-1])
+        assert SCHEDULER_BLIND_RETRY_SECONDS * SCHEDULER_BLIND_MAX_RETRIES < min(gaps) * 60
 
 
 @contextlib.contextmanager
@@ -1434,105 +1598,115 @@ def _criticals(caplog) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.levelno >= logging.CRITICAL]
 
 
-def _late_on(late: date) -> ScheduledRun:
+def _late_on(late: date, at_time: str) -> DailyRuns:
     """
-    Build the shipped schedule with instant() one minute late on `late` only,
-    so a host keeping the schedule's zone sees exactly one mismatch.
+    Build the shipped schedule with one run's instant() one minute late:
+    the `at_time` run on `late` only, so a host keeping the schedule's zone
+    sees exactly one mismatch.
 
     Args:
         late (date): The run date whose instant is moved.
+        at_time (str): The run time ("HH:MM") moved on that date.
 
     Returns:
-        ScheduledRun: Equal in every field to config.SCHEDULED_RUN.
+        DailyRuns: Equal in every field to config.SCHEDULER_RUN_TIMES.
     """
-    class _Late(ScheduledRun):
+    class _LateRun(ScheduledRun):
         def instant(self, d: date) -> datetime:
             moment = super().instant(d)
-            return moment + timedelta(minutes=1) if d == late else moment
+            late_here = d == late and self.at_time() == at_time
+            return moment + timedelta(minutes=1) if late_here else moment
 
-    return _Late(0, 9, 0, "America/Los_Angeles")
+    class _Late(DailyRuns):
+        def on(self, d: date) -> tuple[ScheduledRun, ...]:
+            return tuple(_LateRun(run.weekday, run.hour, run.minute, run.timezone)
+                         for run in super().on(d))
+
+    return _Late(((7, 0), (21, 0)), "America/Los_Angeles")
 
 
 class TestHostClockCheck:
-    """_host_clock_realises_run(): fires land at SCHEDULED_RUN.instant(d) only if
-    the host's clock keeps SCHEDULED_RUN's zone. A mismatch, bad zone or
-    unplaceable date is logged CRITICAL, never raised (main() runs it at startup)."""
+    """_host_clock_realises_run(): each run lands at its scheduled UTC moment
+    only if the host's clock keeps SCHEDULER_RUN_TIMES' zone. A mismatch, bad
+    zone or unplaceable date is logged CRITICAL, never raised (main() runs it
+    at startup)."""
 
     def test_a_host_in_the_schedules_zone_passes(self, caplog):
         with _host_zone("America/Los_Angeles"), caplog.at_level(logging.INFO):
             assert scheduler._host_clock_realises_run(date(2026, 9, 21)) is True
         assert _criticals(caplog) == []
         assert any(
-            "keeps config.SCHEDULED_RUN" in r.getMessage() for r in caplog.records
+            "keeps config.SCHEDULER_RUN_TIMES" in r.getMessage() for r in caplog.records
         )
 
-    def test_a_utc_host_is_flagged_on_the_first_run_date(self, caplog):
-        # The first run date checked is Monday 2026-09-28: 09:00 UTC on this host
+    def test_a_utc_host_is_flagged_on_the_first_run(self, caplog):
+        # The first run checked is 07:00 on 2026-09-23: 07:00 UTC on this host
         with _host_zone("UTC"), caplog.at_level(logging.INFO):
             assert scheduler._host_clock_realises_run(date(2026, 9, 23)) is False
         [message] = _criticals(caplog)
-        assert "on 2026-09-28" in message
-        assert "2026-09-28 09:00 UTC, not 2026-09-28 16:00 UTC" in message
-        assert "the backtest" in message and "no longer replays this host's runs" in message
+        assert "on 2026-09-23 the 07:00 run" in message
+        assert "2026-09-23 07:00 UTC, not 2026-09-23 14:00 UTC" in message
+        assert "set the host's time zone to America/Los_Angeles" in message
 
     def test_a_host_without_daylight_time_is_flagged_at_the_clock_change(self, caplog):
         # Phoenix has no daylight time: it first differs when Los Angeles falls back
         with _host_zone("America/Phoenix"), caplog.at_level(logging.INFO):
             assert scheduler._host_clock_realises_run(date(2026, 9, 21)) is False
         [message] = _criticals(caplog)
-        assert "on 2026-11-02" in message
+        assert "on 2026-11-01 the 07:00 run" in message
 
     def test_a_fixed_offset_host_is_flagged_at_the_spring_change(self, caplog):
-        # A UTC-8 host matches Los Angeles all winter: the first mismatch is 18 weeks out
+        # A UTC-8 host matches Los Angeles all winter: the first mismatch is in March
         with _host_zone("Etc/GMT+8"), caplog.at_level(logging.INFO):
             assert scheduler._host_clock_realises_run(date(2026, 11, 9)) is False
         [message] = _criticals(caplog)
-        assert "on 2027-03-15" in message
-        assert "2027-03-15 17:00 UTC, not 2027-03-15 16:00 UTC" in message
+        assert "on 2027-03-14 the 07:00 run" in message
+        assert "2027-03-14 15:00 UTC, not 2027-03-14 14:00 UTC" in message
 
     @pytest.mark.parametrize(
-        ("weeks_out", "passes"),
-        [(103, False), (104, True)],
-        ids=["last-checked-run", "first-run-after-the-horizon"],
+        ("days_out", "at_time", "passes"),
+        [(729, "07:00", False), (729, "21:00", False), (730, "07:00", True)],
+        ids=["last-day-morning", "last-day-evening", "first-day-after-the-horizon"],
     )
-    def test_the_check_covers_exactly_the_next_104_runs(
-        self, monkeypatch, caplog, weeks_out, passes,
+    def test_the_check_covers_exactly_the_next_730_days(
+        self, monkeypatch, caplog, days_out, at_time, passes,
     ):
-        # The 104th run date from 2026-09-21 is checked; the 105th is not
-        late = date(2026, 9, 21) + timedelta(weeks=weeks_out)
-        monkeypatch.setattr(scheduler, "SCHEDULED_RUN", _late_on(late))
+        # Both runs of the 730th day from 2026-09-21 are checked; the 731st day is not
+        late = date(2026, 9, 21) + timedelta(days=days_out)
+        monkeypatch.setattr(scheduler, "SCHEDULER_RUN_TIMES", _late_on(late, at_time))
         with _host_zone("America/Los_Angeles"), caplog.at_level(logging.INFO):
             assert scheduler._host_clock_realises_run(date(2026, 9, 21)) is passes
         if passes:
             assert _criticals(caplog) == []
-            assert any("next 104 weekly runs" in r.getMessage() for r in caplog.records)
+            assert any("next 730 days" in r.getMessage() for r in caplog.records)
         else:
             [message] = _criticals(caplog)
-            assert f"on {late.isoformat()}" in message
+            assert f"on {late.isoformat()} the {at_time} run" in message
 
     def test_a_skipped_wall_time_is_the_schedules_problem_not_the_hosts(
         self, monkeypatch, caplog,
     ):
-        # Sunday 02:30 is skipped each spring: the CRITICAL blames the schedule, not the host
+        # 02:30 is skipped each spring: the CRITICAL blames the schedule, not the host
         monkeypatch.setattr(
-            scheduler, "SCHEDULED_RUN", ScheduledRun(6, 2, 30, "America/Los_Angeles"),
+            scheduler, "SCHEDULER_RUN_TIMES",
+            DailyRuns(((2, 30), (21, 0)), "America/Los_Angeles"),
         )
         with _host_zone("America/Los_Angeles"), caplog.at_level(logging.INFO):
             assert scheduler._host_clock_realises_run(date(2026, 3, 1)) is False
         [message] = _criticals(caplog)
-        assert "2026-03-08, 2027-03-14" in message and "skips" in message
+        assert "2026-03-08 02:30, 2027-03-14 02:30" in message and "skips" in message
         assert "set the host's time zone" not in message
 
     def test_a_skipped_wall_time_does_not_hide_a_host_mismatch(self, monkeypatch, caplog):
-        # Sunday 2026-03-08 is skipped; 2026-03-15 then exposes the UTC host
+        # 02:30 on 2026-03-08 is skipped; 2026-03-09 then exposes the UTC host
         monkeypatch.setattr(
-            scheduler, "SCHEDULED_RUN", ScheduledRun(6, 2, 30, "America/Los_Angeles"),
+            scheduler, "SCHEDULER_RUN_TIMES", DailyRuns(((2, 30),), "America/Los_Angeles"),
         )
         with _host_zone("UTC"), caplog.at_level(logging.INFO):
-            assert scheduler._host_clock_realises_run(date(2026, 3, 2)) is False
+            assert scheduler._host_clock_realises_run(date(2026, 3, 8)) is False
         skipped, host = _criticals(caplog)
-        assert "2026-03-08" in skipped and "skips" in skipped
-        assert "on 2026-03-15" in host and "set the host's time zone" in host
+        assert "2026-03-08 02:30" in skipped and "skips" in skipped
+        assert "on 2026-03-09 the 02:30 run" in host and "set the host's time zone" in host
 
     @pytest.mark.parametrize(
         "zone",
@@ -1543,14 +1717,14 @@ class TestHostClockCheck:
         ],
     )
     def test_an_unresolvable_zone_is_critical_and_never_raises(self, monkeypatch, caplog, zone):
-        monkeypatch.setattr(scheduler, "SCHEDULED_RUN", ScheduledRun(0, 9, 0, zone))
+        monkeypatch.setattr(scheduler, "SCHEDULER_RUN_TIMES", DailyRuns(((7, 0),), zone))
         with caplog.at_level(logging.INFO):
             assert scheduler._host_clock_realises_run(date(2026, 9, 21)) is False
         [message] = _criticals(caplog)
         assert repr(zone) in message and "cannot be resolved" in message
 
     def test_the_end_of_the_calendar_is_critical_and_never_raises(self, caplog):
-        # 9999-12-27 is the last Monday datetime holds; the next cannot be placed
+        # 9999-12-31's 21:00 run is past datetime's range in UTC
         with _host_zone("America/Los_Angeles"), caplog.at_level(logging.INFO):
             assert scheduler._host_clock_realises_run(date(9999, 12, 27)) is False
         [message] = _criticals(caplog)
@@ -1571,41 +1745,45 @@ class TestHostClockCheck:
                 func = stmt.value.func
                 if isinstance(func, ast.Name):
                     lines[func.id] = stmt.lineno
-                elif isinstance(func, ast.Attribute) and func.attr == "do":
-                    lines["do"] = stmt.lineno
+            elif isinstance(stmt, ast.For):
+                lines["registration"] = stmt.lineno
+        loop, _ = _main_registration_loop()
+        assert lines["registration"] == loop.lineno
         assert (lines["_setup_logging"] < lines["_host_clock_realises_run"]
-                < lines["_startup_catch_up"] < lines["do"])
+                < lines["_startup_catch_up"] < lines["registration"])
 
 
-class TestCronLine:
-    """_cron_line(): the crontab line main() logs for operators who prefer cron,
-    at SCHEDULED_RUN's weekday and time on the host's clock. Cron's day 0 is
-    Sunday, datetime.weekday()'s is Monday: a wrong mapping moves the live run."""
+class TestCronLines:
+    """_cron_lines(): the crontab lines main() logs for operators who prefer
+    cron, at SCHEDULER_RUN_TIMES' times every day on the host's clock. Times
+    that share a minute share a line."""
 
-    def test_the_shipped_schedule_is_monday_0900(self):
-        assert scheduler._cron_line("/repo", "/py") == (
-            "0 9 * * 1 cd '/repo' && /py -m kalshi_betting.main --mode prod "
-            ">> /tmp/kalshi_arb.log 2>&1"
-        )
+    _TAIL = ("cd '/repo' && /py -m kalshi_betting.main --mode prod "
+             ">> /tmp/kalshi_arb.log 2>&1")
+
+    def test_the_shipped_schedule_is_0700_and_2100_daily(self):
+        assert scheduler._cron_lines("/repo", "/py") == [f"0 7,21 * * * {self._TAIL}"]
 
     @pytest.mark.parametrize(
-        ("run", "prefix"),
+        ("runs", "prefixes"),
         [
-            (ScheduledRun(6, 7, 5, "America/Los_Angeles"), "5 7 * * 0 "),
-            (ScheduledRun(3, 14, 30, "America/Los_Angeles"), "30 14 * * 4 "),
-            (ScheduledRun(5, 23, 59, "America/Los_Angeles"), "59 23 * * 6 "),
+            (DailyRuns(((9, 0),), "America/Los_Angeles"), ["0 9 * * * "]),
+            (DailyRuns(((5, 15), (14, 30), (23, 15)), "America/Los_Angeles"),
+             ["15 5,23 * * * ", "30 14 * * * "]),
         ],
-        ids=["sunday", "thursday", "saturday"],
+        ids=["one-time", "two-minutes"],
     )
-    def test_a_patched_schedule_moves_the_line(self, monkeypatch, run, prefix):
-        monkeypatch.setattr(scheduler, "SCHEDULED_RUN", run)
-        assert scheduler._cron_line("/repo", "/py").startswith(prefix)
+    def test_a_patched_schedule_moves_the_lines(self, monkeypatch, runs, prefixes):
+        monkeypatch.setattr(scheduler, "SCHEDULER_RUN_TIMES", runs)
+        assert scheduler._cron_lines("/repo", "/py") == [
+            f"{prefix}{self._TAIL}" for prefix in prefixes
+        ]
 
-    def test_ast_main_logs_the_helpers_line(self):
-        # main() is never invoked here: pin that it logs _cron_line()'s line
+    def test_ast_main_logs_the_helpers_lines(self):
+        # main() is never invoked here: pin that it logs _cron_lines()' lines
         tree = ast.parse(inspect.getsource(scheduler.main))
         assert [
             n for n in ast.walk(tree)
             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-            and n.func.id == "_cron_line"
+            and n.func.id == "_cron_lines"
         ]
