@@ -1388,7 +1388,9 @@ class TestOldCacheToleranceMissingTickAndSubtitleFields:
 
 class TestSettlementReceipt:
     """_settlement_receipt pays n per leg whose market resolved to the side
-    that leg bought (scanner.leg_sides), so the table depends on pair type."""
+    that leg bought (scanner.leg_sides): a time-series pair's three cells.
+    scanner.leg_sides gives sides to time-series pairs only, so any other
+    pair type raises."""
 
     def test_time_series_three_cell_table(self):
         # n YES on the earlier contract A + n NO on the later contract B.
@@ -1404,10 +1406,37 @@ class TestSettlementReceipt:
         with pytest.raises(ValueError, match="premise violated"):
             _settlement_receipt(10, "yes", "no", "time_series")
 
-    def test_unknown_pair_type_uses_same_title_sides(self):
-        # Mirrors scanner.leg_sides: anything but "time_series" is same-title,
-        # so an unknown label can never be paid as the directional bet.
-        assert _settlement_receipt(10, "no", "yes", "bogus") == 20
+    @pytest.mark.parametrize("pair_type", ["same_title", "bogus", "", None])
+    def test_any_other_pair_type_raises_in_every_cell(self, pair_type):
+        # As scanner.leg_sides: anything but "time_series" raises, so a trade
+        # of another type is paid in no cell, neither as the directional bet
+        # nor on both legs at once. The backtest refuses every record that is
+        # not time-series before it scores one, so no run reaches this
+        for outcome_a, outcome_b in (("yes", "yes"), ("no", "no"), ("no", "yes"),
+                                     ("yes", "no")):
+            with pytest.raises(ValueError, match="not a time-series pair type"):
+                _settlement_receipt(10, outcome_a, outcome_b, pair_type)
+
+
+class TestLegPricesFor:
+    """_leg_prices_for, the backtest's mirror of scanner.leg_prices over four
+    loose quotes: (pA, nB) for a time-series pair, and ValueError for any
+    other pair type, as scanner.leg_prices raises."""
+
+    def test_a_time_series_pair_is_priced_yes_on_a_and_no_on_b(self):
+        assert backtester._leg_prices_for("time_series", 0.30, 0.70, 0.60, 0.40) == (0.30, 0.40)
+        assert scanner.leg_prices(SimpleNamespace(
+            pair_type="time_series", pA=0.30, nA=0.70, pB=0.60, nB=0.40)) == (0.30, 0.40)
+
+    @pytest.mark.parametrize("pair_type", ["same_title", "bogus", "", None, "Time_Series"])
+    def test_any_other_pair_type_raises(self, pair_type):
+        # Never priced at the NO-on-A, YES-on-B quotes (nA, pB), on either path
+        refused = re.escape(f"not a time-series pair type: {pair_type!r}")
+        with pytest.raises(ValueError, match=refused):
+            backtester._leg_prices_for(pair_type, 0.30, 0.70, 0.60, 0.40)
+        with pytest.raises(ValueError, match=refused):
+            scanner.leg_prices(SimpleNamespace(
+                pair_type=pair_type, pA=0.30, nA=0.70, pB=0.60, nB=0.40))
 
 
 def _candle(ts: int, yes_ask: float, no_ask: float) -> dict:
@@ -19768,27 +19797,6 @@ class TestPositionSaleValueWalksTheLadder:
         assert backtester._position_sale_value([big], _LADDER_M2) is not None
         assert backtester._position_sale_value([first, big], _LADDER_M2) is None
 
-    def test_a_lone_leg_add_on_totals_by_ticker(self):
-        # X is held NO as market B of a time-series trade and as market A of a
-        # same-title one (an add-on to the lone leg): 160 NO contracts on X
-        # walk one ladder, though each trade's 80 fit its best level
-        levels = ((0.0, 100.0), (0.01, 1000.0))
-        model = _ladder_model(levels)
-        x = _sale_quotes("X", 0.38, 0.60, model)
-        first = _held_trade(80, _sale_quotes("Y", 0.40, 0.58, model), x)
-        add = _held_trade(80, x, _sale_quotes("W", 0.45, 0.53, model), "same_title")
-        on_x = _walk_average(0.60, 160, levels)
-        assert on_x < 0.60
-        (sale_1, sale_2), *_ = backtester._position_sale_value([first, add], _LADDER_M2)
-        assert sale_1[2] == (0.40, on_x) and sale_2[2] == (on_x, 0.45)
-        # Alone, each trade's X sells at the best bid
-        assert backtester._position_sale_value([first], _LADDER_M2)[0][0][2] == (0.40, 0.60)
-        assert backtester._position_sale_value([add], _LADDER_M2)[0][0][2] == (0.60, 0.45)
-        # Together past the ladder's 1,100 contracts: not sold, though each fits alone
-        big = dc_replace(add, n=1050)
-        assert backtester._position_sale_value([big], _LADDER_M2) is not None
-        assert backtester._position_sale_value([first, big], _LADDER_M2) is None
-
     def test_a_paid_out_market_counts_at_its_payout(self):
         # QB has paid out NO: worth $1 a contract, with no ladder to walk
         thin = _ladder_model(((0.0, 1.0),))
@@ -20595,17 +20603,6 @@ class TestTrimMinMove:
         # (02-10, "no"), its YES leg counts at its payout, nothing
         assert backtester._pair_price(held, date(2026, 2, 2)) == pytest.approx(0.77, abs=1e-12)
         assert backtester._pair_price(held, date(2026, 2, 16)) == pytest.approx(0.52, abs=1e-12)
-
-    def test_a_same_title_pair_s_price_is_the_ask_of_each_side_it_holds(self):
-        candles = self._TRIM._SUITE._candles()
-        (held,) = self._plain(self._records()).trades
-        same_title = dc_replace(held, pair_type="same_title")
-        for day in self._ASKS:
-            (a,) = [c for c in candles["SA"] if c["ts"] == _ck(day)]
-            (b,) = [c for c in candles["SB"] if c["ts"] == _ck(day)]
-            # A same-title pair holds NO on its first market and YES on its second
-            assert backtester._pair_price(same_title, day) == (
-                a["no_ask_close"] + b["yes_ask_close"])
 
     def test_no_minimum_is_the_default_and_the_run_without_the_keyword(self, caplog):
         default = inspect.signature(backtester._simulate_at_discount).parameters["min_move"]

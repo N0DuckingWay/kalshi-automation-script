@@ -37,7 +37,6 @@ from kalshi_betting.config import (
     MIN_PRICE_DIFF_SHORT_GAP,
     PRICE_EPSILON,
     PROJECT_ROOT,
-    SAME_TITLE_LEG_SIDES,
     SCHEDULED_RUN,
     SHORT_DEADLINE_GAP_DAYS,
     SPREAD_ABOVE_CEILING,
@@ -336,17 +335,13 @@ class TestTimeSeriesProfitProb:
 
 
 class TestLegSideTuples:
-    def test_same_title_buys_no_on_a_yes_on_b(self):
-        assert SAME_TITLE_LEG_SIDES == ("no", "yes")
-
     def test_time_series_buys_yes_on_earlier_no_on_later(self):
         assert TIME_SERIES_LEG_SIDES == ("yes", "no")
 
-    def test_each_pair_type_has_exactly_one_no_leg(self):
-        # The trader submits "the NO leg" first and unwinds it — every pair
-        # type must have exactly one, and one YES leg to hedge it
-        for sides in (SAME_TITLE_LEG_SIDES, TIME_SERIES_LEG_SIDES):
-            assert sorted(sides) == ["no", "yes"]
+    def test_the_time_series_sides_have_exactly_one_no_leg(self):
+        # The trader submits "the NO leg" first and unwinds it, so the sides
+        # must hold exactly one, and one YES leg to hedge it
+        assert sorted(TIME_SERIES_LEG_SIDES) == ["no", "yes"]
 
 
 class TestV2SelfTradePrevention:

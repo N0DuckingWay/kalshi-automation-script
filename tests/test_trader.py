@@ -4,12 +4,10 @@ and the write pacer. All Kalshi calls are mocked, so the tests run offline.
 
 Legs are named by the order they are sent: the NO leg goes first and is the
 one the rollback undoes, the YES leg second. make_spec builds a time-series
-pair (one question at two deadlines) unless a test asks for another type, so
+pair (one question at two deadlines), the only type the trader accepts, so
 the NO leg is market_b (TICK-B, the later deadline) and the YES leg market_a
-(TICK-A, the earlier one). A same-title pair (two identically worded markets)
-sends NO on market_a first; only the tests that name that pair type build one
-(make_same_title_spec, TestSameTitleWireIdentity and a few tests of both
-types).
+(TICK-A, the earlier one). A spec of another type is built only to check that
+nothing is read or sent for it (TestASpecOfAnotherPairTypeIsNeverSent).
 
 _execute_one reads BOTH legs' positions before sending anything (the NO
 leg's ticker first) and judges an exception by how a position changed
@@ -172,12 +170,11 @@ def make_spec(
 
     `pair_type` decides the leg order (see _ordered_legs). The default
     "time_series" makes market_b/TICK-B the NO leg, priced at `nB` ($0.40),
-    and market_a/TICK-A the YES leg, priced at `pA` ($0.35); "same_title"
-    makes TICK-A the NO leg at `nA` and TICK-B the YES leg at `pB` (see
-    make_same_title_spec). The two prices the default pair does not trade,
-    `nA` ($0.65) and `pB` ($0.60), differ from the two it does, so a leg
-    priced from the wrong field shows in its order body; on each market the
-    YES and NO prices add up to $1. All four prices are pinned as REAL
+    and market_a/TICK-A the YES leg, priced at `pA` ($0.35); any other type
+    is a spec _ordered_legs refuses. The two prices the default pair does not
+    trade, `nA` ($0.65) and `pB` ($0.60), differ from the two it does, so a
+    leg priced from the wrong field shows in its order body; on each market
+    the YES and NO prices add up to $1. All four prices are pinned as REAL
     floats: scanner.leg_prices reads `nB` directly, and a MagicMock
     auto-attribute there would TypeError in the price math.
 
@@ -221,31 +218,6 @@ def make_spec(
     spec.cost_with_fees_a = cost_a
     spec.cost_with_fees_b = cost_b
     return spec
-
-
-def make_same_title_spec(**overrides) -> MagicMock:
-    """
-    A same-title spec: NO on market_a/TICK-A at $0.40, then YES on
-    market_b/TICK-B at $0.35.
-
-    Same-title pairs are two identically worded markets listed separately;
-    the bot buys NO on the pricier one (market_a) and YES on the cheaper
-    (market_b). All four prices are given here rather than taken from
-    make_spec's defaults, so the same-title order bodies the tests pin keep
-    these inputs, and the two prices this pair does not trade (pA $0.60 and
-    nB $0.65) differ from the two it does, so a leg priced from the wrong
-    field shows.
-
-    Args:
-        **overrides: Any other make_spec argument (x, structure, ranges, a
-            shard, a price, ...); each replaces the value above.
-
-    Returns:
-        MagicMock: The spec, built by make_spec.
-    """
-    kwargs = {"pair_type": "same_title", "nA": 0.40, "pB": 0.35, "pA": 0.60, "nB": 0.65}
-    kwargs.update(overrides)
-    return make_spec(**kwargs)
 
 
 def _no_leg(spec) -> trader._Leg:
@@ -329,8 +301,7 @@ def positions_seq(*readings) -> MagicMock:
     consumed in that order:
         before_no, before_yes, [backstop], [after_no], [no lag re-read],
         [after_yes], [yes lag re-read]
-    (for make_spec's time-series default that is TICK-B, TICK-A, ...; for a
-    same-title spec it is TICK-A, TICK-B, ...).
+    (for make_spec's time-series default that is TICK-B, TICK-A, ...).
 
     The optional [backstop] slot is the V2 NO-mapping check's own single-shot
     read (see TestV2NoMappingBackstop); it hits the same client method, so it
@@ -1676,13 +1647,11 @@ class TestV2OrderBuilders:
         ]
 
     def test_every_v2_body_carries_the_documented_required_fields(self):
-        # Both pair types: a same-title spec and a time-series one
-        for spec in (make_same_title_spec(), TestTimeSeriesLegOrder._ts_spec()):
-            for body in self._all_v2_bodies(spec):
-                assert self._V2_REQUIRED_FIELDS <= body.keys()
-                assert body["side"] in self._V2_SIDES
-                assert body["time_in_force"] in self._V2_TIME_IN_FORCE
-                assert body["self_trade_prevention_type"] in self._V2_SELF_TRADE_PREVENTION
+        for body in self._all_v2_bodies(TestTimeSeriesLegOrder._ts_spec()):
+            assert self._V2_REQUIRED_FIELDS <= body.keys()
+            assert body["side"] in self._V2_SIDES
+            assert body["time_in_force"] in self._V2_TIME_IN_FORCE
+            assert body["self_trade_prevention_type"] in self._V2_SELF_TRADE_PREVENTION
 
     def test_reduce_only_only_with_immediate_or_cancel(self):
         # The docs, verbatim: "Orders with reduce_only set to true will be
@@ -1692,16 +1661,12 @@ class TestV2OrderBuilders:
             ("deci_cent", DECI_CENT_BANDS),
             ("center_deci_edge_centi_cent", CENTER_DECI_EDGE_CENTI_BANDS),
         ):
-            # Both pair types: a same-title spec and a time-series one
-            for spec in (
-                make_same_title_spec(structure=structure, ranges=bands),
-                TestTimeSeriesLegOrder._ts_spec(structure=structure, ranges=bands),
-            ):
-                for body in self._all_v2_bodies(spec):
-                    assert (
-                        not body["reduce_only"]
-                        or body["time_in_force"] == "immediate_or_cancel"
-                    )
+            spec = TestTimeSeriesLegOrder._ts_spec(structure=structure, ranges=bands)
+            for body in self._all_v2_bodies(spec):
+                assert (
+                    not body["reduce_only"]
+                    or body["time_in_force"] == "immediate_or_cancel"
+                )
 
     def test_self_trade_prevention_type_comes_from_config(self, monkeypatch):
         # The builders read the module binding of the config constant, so a
@@ -2796,28 +2761,21 @@ class TestV2MappingDisproofStopsTheRun:
     stopped none of them."""
 
     @staticmethod
-    def _specs(n: int, types=("same_title", "time_series")) -> list:
-        """n specs on distinct tickers, cycling through the given pair types."""
+    def _specs(n: int) -> list:
+        """n time-series specs on distinct tickers (TICK-A0/TICK-B0, ...)."""
         specs = []
         for i in range(n):
-            spec = make_spec(title=f"pair {i}", pair_type=types[i % len(types)])
+            spec = make_spec(title=f"pair {i}")
             spec.pair.market_a.ticker = f"TICK-A{i}"
             spec.pair.market_b.ticker = f"TICK-B{i}"
             specs.append(spec)
         return specs
 
-    @pytest.mark.parametrize(
-        "types",
-        [("same_title", "time_series"), ("time_series", "same_title")],
-        ids=["same-title-disproves", "time-series-disproves"],
-    )
-    def test_a_disproof_stops_every_later_pair_before_its_no_leg(
-        self, monkeypatch, caplog, types,
-    ):
+    def test_a_disproof_stops_every_later_pair_before_its_no_leg(self, monkeypatch, caplog):
         # Every NO fill moves the position the wrong way. The first pair's
-        # check disproves the mapping; the other eleven, of both pair types,
-        # send nothing and read nothing.
-        specs = self._specs(12, types)
+        # check disproves the mapping; the other eleven send nothing and read
+        # nothing.
+        specs = self._specs(12)
         # The first NO leg waits a moment for any other pair to start. One at
         # a time none can, so it waits the full 0.2 s; were pairs let run
         # together, others would start and send NO legs meanwhile.
@@ -3203,10 +3161,7 @@ class TestV2MappingDisproofStopsTheRun:
         results = execute_trades(MagicMock(), specs, dry_run=False)
         assert [r.status for r in results] == ["executed"] * 4
 
-    @pytest.mark.parametrize("pair_type", ["same_title", "time_series"])
-    def test_a_stopped_pair_reads_builds_and_sends_nothing(
-        self, monkeypatch, caplog, pair_type,
-    ):
+    def test_a_stopped_pair_reads_builds_and_sends_nothing(self, monkeypatch, caplog):
         monkeypatch.setattr(trader, "_V2_NO_MAPPING_DISPROVEN", True)
         post = MagicMock()
         monkeypatch.setattr(trader, "signed_request_json", post)
@@ -3215,7 +3170,7 @@ class TestV2MappingDisproofStopsTheRun:
         client = MagicMock()
         pacer = trader._ORDER_WRITE_PACER
         with caplog.at_level(logging.WARNING, logger="root"):
-            result = _execute_one(client, make_spec(pair_type=pair_type))
+            result = _execute_one(client, make_spec())
         assert result.status == "failed"
         assert result.error == (
             "NO leg not sent: V2 NO-leg mapping disproven earlier in this run;"
@@ -3330,28 +3285,26 @@ class TestV2MappingDisproofStopsTheRun:
 
 
 def make_add_on_spec(
-    x: int = 10, held: float = 30.0, pair_type: str = "time_series",
-    sides: tuple | None = None,
+    x: int = 10, held: float = 30.0, sides: tuple | None = None,
 ) -> MagicMock:
     """
     A spec that adds to a held pair, built on make_spec.
 
-    By default a time-series pair (NO on TICK-B, YES on TICK-A) of x contracts
-    a side, adding to a held pair of `held` contracts a side: NO held on
+    A time-series pair (NO on TICK-B, YES on TICK-A) of x contracts a side,
+    adding by default to a held pair of `held` contracts a side: NO held on
     TICK-B (reads -held) and YES held on TICK-A (reads +held), exactly the
     two legs the spec buys.
 
     Args:
         x (int): This pair's contracts a side.
         held (float): The contracts held on each market.
-        pair_type (str): The spec's pair type.
         sides (tuple | None): The held pair's (ticker, side) pairs; None holds
             exactly what the spec buys.
 
     Returns:
         MagicMock: The spec, its pair carrying a real scanner.HeldPair.
     """
-    spec = make_spec(x=x, pair_type=pair_type)
+    spec = make_spec(x=x)
     no_leg, yes_leg = _ordered_legs(spec)
     if sides is None:
         sides = ((no_leg.market.ticker, "no"), (yes_leg.market.ticker, "yes"))
@@ -3827,12 +3780,11 @@ class TestAddOnIsSentOnlyOntoItsPair:
         assert (f"Not sending 'test pair' (A=TICK-A B=TICK-B): it adds to a pair the account"
                 f" holds, but {reason}. Nothing was sent.") in warnings
 
-    @pytest.mark.parametrize("pair_type", ["time_series", "same_title"])
-    def test_an_exact_match_is_sent_as_usual(self, post, pacer, pair_type):
+    def test_an_exact_match_is_sent_as_usual(self, post, pacer):
         """Pins that an add-on whose held pair still matches exactly is sent
-        like any pair (NO leg first, holding a place for the YES leg), for
-        both pair types, so the check refuses only a real mismatch."""
-        spec = make_add_on_spec(pair_type=pair_type)
+        like any pair (NO leg first, holding a place for the YES leg), so the
+        check refuses only a real mismatch."""
+        spec = make_add_on_spec()
         no_leg, yes_leg = _ordered_legs(spec)
         post.side_effect = [v2_resp(10, 10), v2_resp(10, 10)]
         client = MagicMock(get_positions_without_preload_content=positions_seq(
@@ -4580,56 +4532,132 @@ class TestPreExecutionCheckSettings:
         assert all(s is resolved[0] for s in seen)
 
 
-class TestSameTitleWireIdentity:
-    """Every field (except the random client_order_id) of the three V2
-    bodies built for a same-title spec (make_same_title_spec: x=5, nA=0.40,
-    pB=0.35, shard 0), as literal values: NO on market_a, YES on market_b,
-    and a reduce-only immediate_or_cancel unwind."""
+class TestASpecOfAnotherPairTypeIsNeverSent:
+    """The trader takes time-series pairs only: _ordered_legs, the one place a
+    spec's legs are resolved, reads scanner.leg_sides and leg_prices first,
+    and both raise ValueError for any other pair type. select_portfolio
+    refuses such a spec before the trader is handed it, so only a bug can
+    bring one here; should one come, nothing is read or sent for it."""
 
-    def test_v2_bodies_are_unchanged(self):
-        spec = make_same_title_spec()
-        no_body = _build_no_order_v2(_no_leg(spec))
-        yes_body = _build_yes_order_v2(_yes_leg(spec))
-        rollback_body = _build_rollback_order_v2(_no_leg(spec))
-        for body in (no_body, yes_body, rollback_body):
-            uuid.UUID(body.pop("client_order_id"))
-        assert no_body == {
-            "ticker": "TICK-A", "side": "ask", "price": "0.5900", "count": "5.00",
-            "time_in_force": "fill_or_kill",
-            "self_trade_prevention_type": "taker_at_cross", "exchange_index": 0,
-            "reduce_only": False, "post_only": False,
-        }
-        assert yes_body == {
-            "ticker": "TICK-B", "side": "bid", "price": "0.3600", "count": "5.00",
-            "time_in_force": "fill_or_kill",
-            "self_trade_prevention_type": "taker_at_cross", "exchange_index": 0,
-            "reduce_only": False, "post_only": False,
-        }
-        assert rollback_body == {
-            "ticker": "TICK-A", "side": "bid", "price": "0.7200", "count": "5.00",
-            "time_in_force": "immediate_or_cancel",
-            "self_trade_prevention_type": "taker_at_cross", "exchange_index": 0,
-            "reduce_only": True, "post_only": False,
-        }
+    # Pair types that are not time-series: the retired same-title label, a
+    # missing type, an empty one, an unknown one and a test double's
+    # auto-attribute
+    _OTHER = ["same_title", None, "", "bogus", MagicMock().pair_type]
+    _OTHER_IDS = ["same_title", "none", "empty", "bogus", "mock"]
 
-    def test_same_title_baselines_read_market_a_then_market_b(
-        self, v2_mapping_confirmed, monkeypatch
+    @pytest.mark.parametrize("pair_type", _OTHER, ids=_OTHER_IDS)
+    def test_its_legs_are_never_resolved(self, pair_type):
+        # Not given the NO-on-A, YES-on-B legs or any other: no leg is built
+        with pytest.raises(ValueError, match="not a time-series pair type"):
+            _ordered_legs(make_spec(pair_type=pair_type))
+        # Control: the same spec as a time-series pair has its two legs
+        no_leg, yes_leg = _ordered_legs(make_spec())
+        assert (no_leg.market.ticker, yes_leg.market.ticker) == ("TICK-B", "TICK-A")
+
+    @pytest.mark.parametrize("pair_type", _OTHER, ids=_OTHER_IDS)
+    def test_the_live_path_reads_and_sends_nothing_for_it(
+        self, v2_mapping_confirmed, monkeypatch, caplog, pair_type,
     ):
-        # Nothing used to pin the ORDER of the two baseline reads; now that the
-        # NO leg can be either market, pin it for both pair types (the
-        # time-series mirror lives in TestTimeSeriesLegOrder).
-        monkeypatch.setattr(trader, "signed_request_json",
-                            MagicMock(side_effect=[v2_resp(5), v2_resp(5)]))
-        tickers: list[str] = []
+        # A time-series pair on TICK-A/TICK-B, then a pair of another type on
+        # TICK-C/TICK-D. The second stops in _ordered_legs before its position
+        # reads and its orders, and execute_trades records it as
+        # manual_review; the first trades as usual
+        other = make_spec(pair_type=pair_type, title="other pair")
+        other.pair.market_a.ticker, other.pair.market_b.ticker = "TICK-C", "TICK-D"
+        post = MagicMock(side_effect=[v2_resp(5), v2_resp(5)])
+        monkeypatch.setattr(trader, "signed_request_json", post)
+        pacer = MagicMock(wraps=trader._ORDER_WRITE_PACER)
+        monkeypatch.setattr(trader, "_ORDER_WRITE_PACER", pacer)
+        reads: list[str] = []
 
-        def record(**kwargs):
-            tickers.append(kwargs["ticker"])
+        def read(**kwargs):
+            reads.append(kwargs["ticker"])
             return positions_resp()
 
         client = MagicMock()
-        client.get_positions_without_preload_content = MagicMock(side_effect=record)
-        assert _execute_one(client, make_same_title_spec()).status == "executed"
-        assert tickers == ["TICK-A", "TICK-B"]
+        client.get_positions_without_preload_content = MagicMock(side_effect=read)
+        # Alone: nothing read, built, sent or held on the write pacer
+        with caplog.at_level(logging.INFO, logger="root"):
+            (alone,) = execute_trades(client, [other], dry_run=False)
+        assert alone.status == "manual_review"
+        assert "not a time-series pair type" in alone.error
+        assert reads == [] and post.call_count == 0
+        assert pacer.mock_calls == []
+        (critical,) = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
+        assert "'other pair' (A=TICK-C B=TICK-D)" in critical
+        assert "not a time-series pair type" in critical
+        # Beside a time-series pair: that pair reads and sends as usual, and
+        # nothing touches TICK-C or TICK-D
+        results = execute_trades(client, [make_spec(), other], dry_run=False)
+        assert [r.status for r in results] == ["executed", "manual_review"]
+        assert reads == ["TICK-B", "TICK-A"]
+        assert [c.kwargs["body"]["ticker"] for c in post.call_args_list] == ["TICK-B", "TICK-A"]
+
+    @pytest.mark.parametrize("pair_type", _OTHER, ids=_OTHER_IDS)
+    def test_a_dry_run_raises_for_it_and_reads_and_sends_nothing(
+        self, monkeypatch, caplog, pair_type,
+    ):
+        # A dry run resolves each spec's legs to log them, with no handler
+        # around that call, so a spec of another type raises ValueError out of
+        # execute_trades: alone, and after a time-series pair, whose dry-run
+        # line is logged first. Nothing is read, sent or held on the write
+        # pacer either way
+        other = make_spec(pair_type=pair_type, title="other pair")
+        other.pair.market_a.ticker, other.pair.market_b.ticker = "TICK-C", "TICK-D"
+        post = MagicMock()
+        monkeypatch.setattr(trader, "signed_request_json", post)
+        pacer = MagicMock(wraps=trader._ORDER_WRITE_PACER)
+        monkeypatch.setattr(trader, "_ORDER_WRITE_PACER", pacer)
+        client = MagicMock()
+        for specs in ([other], [make_spec(), other]):
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger="root"):
+                with pytest.raises(ValueError, match="not a time-series pair type"):
+                    execute_trades(client, specs, dry_run=True)
+            # One dry-run line for each time-series pair before it, none for it
+            dry = [r.getMessage() for r in caplog.records if "[DRY RUN]" in r.getMessage()]
+            assert len(dry) == len(specs) - 1
+            assert all("Buy 5x NO on Market B" in line for line in dry)
+        assert client.mock_calls == []
+        post.assert_not_called()
+        assert pacer.mock_calls == []
+
+    @pytest.mark.parametrize("ask_sign", [-1, +1], ids=["mapping-holds", "mapping-wrong"])
+    @pytest.mark.parametrize("pair_type", _OTHER, ids=_OTHER_IDS)
+    def test_handed_first_it_leaves_the_mapping_check_to_the_next_pair(
+        self, monkeypatch, pair_type, ask_sign,
+    ):
+        # A fresh process: the NO-leg side mapping is neither confirmed nor
+        # disproven, so execute_trades runs pairs one at a time until a NO
+        # fill settles it. A spec of another type handed FIRST neither settles
+        # the mapping nor stops it being checked: the time-series pair after
+        # it is the one whose NO fill is checked against the ledger, both when
+        # the mapping holds (an ask opens NO: ask_sign -1) and when it is
+        # wrong (+1), and nothing is read or sent on the refused spec's markets
+        monkeypatch.setattr(trader, "_V2_NO_MAPPING_CONFIRMED", False)
+        monkeypatch.setattr(trader, "_V2_NO_MAPPING_DISPROVEN", False)
+        other = make_spec(pair_type=pair_type, title="other pair")
+        other.pair.market_a.ticker, other.pair.market_b.ticker = "TICK-C", "TICK-D"
+        exchange = _SharedLedgerExchange(ask_sign=ask_sign)
+        monkeypatch.setattr(trader, "signed_request_json", exchange.post)
+        results = execute_trades(exchange.client(), [other, make_spec()], dry_run=False)
+        assert results[0].status == "manual_review"
+        assert "not a time-series pair type" in results[0].error
+        # Only the time-series pair read the account: its two baselines, then
+        # the mapping check after its NO fill
+        assert exchange.reads == ["TICK-B", "TICK-A", "TICK-B"]
+        sent = [(body["ticker"], body["side"]) for body in exchange.posts]
+        if ask_sign == -1:
+            assert results[1].status == "executed"
+            assert sent == [("TICK-B", "ask"), ("TICK-A", "bid")]
+            assert trader._V2_NO_MAPPING_CONFIRMED is True
+            assert trader._V2_NO_MAPPING_DISPROVEN is False
+        else:
+            assert results[1].status == "manual_review"
+            assert "mapping disproven" in results[1].error
+            assert sent == [("TICK-B", "ask")]
+            assert trader._V2_NO_MAPPING_DISPROVEN is True
+            assert trader._V2_NO_MAPPING_CONFIRMED is False
 
 
 class TestTimeSeriesWireIdentity:
@@ -4766,13 +4794,6 @@ class TestTimeSeriesLegOrder:
         assert yes_leg.market is spec.pair.market_a
         assert (yes_leg.side, yes_leg.price_dollars, yes_leg.count) == ("yes", 0.30, spec.x)
         assert yes_leg.label == "YES on Market A"
-
-    def test_ordered_legs_keeps_market_a_as_the_no_leg_for_same_title(self):
-        spec = make_same_title_spec()
-        no_leg, yes_leg = _ordered_legs(spec)
-        assert no_leg.market is spec.pair.market_a and no_leg.price_dollars == 0.40
-        assert yes_leg.market is spec.pair.market_b and yes_leg.price_dollars == 0.35
-        assert (no_leg.label, yes_leg.label) == ("NO on Market A", "YES on Market B")
 
     def test_legs_are_frozen(self):
         with pytest.raises(AttributeError):

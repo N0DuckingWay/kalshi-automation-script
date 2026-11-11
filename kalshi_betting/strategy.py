@@ -299,8 +299,8 @@ def _evaluate_size(
             return None
         price_a, price_b = fills
     else:
-        # The two prices the legs actually cost — which of the pair's four quotes
-        # they are depends on the pair type; leg_prices is the single source of truth
+        # The two prices the legs actually cost — which two of the pair's four
+        # quotes they are comes from leg_prices, the single source of truth
         price_a, price_b = leg_prices(pair)
 
     # 0 or 1 means a settled market and breaks the fee formula

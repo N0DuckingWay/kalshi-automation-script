@@ -1,9 +1,9 @@
 """Tests for strategy.py Kelly sizing and portfolio selection.
 
-Time-series pairs buy YES on the earlier contract (market_a, at pA) and NO on
-the later one (market_b, at nB); same-title pairs buy NO on market_a (nA) and
-YES on market_b (pB). Every fixture therefore carries a REAL float nB — a
-MagicMock auto-attribute would TypeError inside compute_trade's arithmetic.
+Time-series pairs, the only kind the sizer takes, buy YES on the earlier
+contract (market_a, at pA) and NO on the later one (market_b, at nB). Every
+fixture therefore carries a REAL float nB — a MagicMock auto-attribute would
+TypeError inside compute_trade's arithmetic.
 """
 import ast
 import dataclasses
@@ -96,11 +96,11 @@ def make_pair(
     scanner.leg_prices reads it directly for time-series pairs.
 
     nA defaults to 1 - pA for time_series, so market A's quotes are a book with
-    no width, and to 0.20 for same_title (its NO leg). A time-series pair's
-    mid_spread, the input its forecast reads, defaults to
-    config.time_series_mid_spread over the four quotes, as enrichment writes it
-    from the tops of the books; pass a value (None included) to set it
-    instead. A same-title pair's is None.
+    no width, and to 0.20 for any other type (a pair the sizer refuses before
+    it reads a quote). A time-series pair's mid_spread, the input its
+    forecast reads, defaults to config.time_series_mid_spread over the four
+    quotes, as enrichment writes it from the tops of the books; pass a value
+    (None included) to set it instead. Any other type's is None.
     """
     if nA is None:
         nA = 1.0 - pA if pair_type == "time_series" else 0.20
@@ -2200,10 +2200,11 @@ def _key_homes(tree: ast.AST, key: str) -> list[tuple[str | None, int]]:
 
 
 # The same-title constants config.py no longer defines: the fixed chance a
-# same-title pair was priced on as settling alike, its minimum price gap and
-# its size cap
+# same-title pair was priced on as settling alike, its minimum price gap, its
+# size cap and the sides it was bought on
 _DELETED_SAME_TITLE_CONSTANTS = frozenset({
-    "SAME_TITLE_CO_RESOLVE_PROB", "SAME_TITLE_MIN_PRICE_DIFF", "SAME_TITLE_SIZE_CAP"})
+    "SAME_TITLE_CO_RESOLVE_PROB", "SAME_TITLE_MIN_PRICE_DIFF", "SAME_TITLE_SIZE_CAP",
+    "SAME_TITLE_LEG_SIDES"})
 
 
 def _names_used(source: str) -> set[str]:
@@ -2540,10 +2541,10 @@ class TestTimeSeriesKellyParity:
     def test_ast_no_module_names_a_deleted_same_title_constant(self):
         # The bot trades time-series pairs only: config defines none of the
         # same-title pairs' fixed chance of settling alike, their minimum
-        # price gap or their size cap, and no module of the package imports,
-        # reads or binds one (by a bare name, as an attribute, as an imported
-        # name or its alias, or as a string handed to getattr), nor names one
-        # in a comment, docstring or message
+        # price gap, their size cap or their sides, and no module of the
+        # package imports, reads or binds one (by a bare name, as an
+        # attribute, as an imported name or its alias, or as a string handed
+        # to getattr), nor names one in a comment, docstring or message
         gone = _DELETED_SAME_TITLE_CONSTANTS
         for module in (config, strategy, scanner, seller, backtester, dashboard, main,
                        trader, historical):
@@ -2562,7 +2563,8 @@ class TestTimeSeriesKellyParity:
         for line in ("from .config import SAME_TITLE_MIN_PRICE_DIFF as gap",
                      "p = config.SAME_TITLE_CO_RESOLVE_PROB",
                      "cap = getattr(config, 'SAME_TITLE_SIZE_CAP', 0.2)",
-                     "SAME_TITLE_CO_RESOLVE_PROB = 0.95"):
+                     "SAME_TITLE_CO_RESOLVE_PROB = 0.95",
+                     "from .config import SAME_TITLE_LEG_SIDES, TIME_SERIES_LEG_SIDES"):
             assert _names_used(line) & gone, line
 
     def test_discount_of_one_never_trades(self, monkeypatch):

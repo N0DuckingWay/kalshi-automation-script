@@ -1170,13 +1170,11 @@ LIVE_DASHBOARD_PLOTLY_SRI = "sha384-H7GB7Kme/VbPI/0S4LNq7OixFNVRgRGE8kyqTntBuiXl
 # left past them, by its own name in that gray).
 LIVE_DASHBOARD_MAX_CATEGORY_BANDS = 6
 
-# Which side each leg of a pair buys, as (side bought on market_a, side bought
-# on market_b). scanner.leg_sides() is the ONLY reader — never hardcode a side
-# elsewhere. Same-title: NO on the pricier contract (market_a), YES on the
-# cheaper (market_b). Time-series: YES on the earlier contract (market_a), NO on
-# the later (market_b). The trader always SUBMITS the NO leg first, whichever
-# market it sits on (see trader._ordered_legs).
-SAME_TITLE_LEG_SIDES  = ("no", "yes")
+# Which side each leg of a time-series pair buys, as (side bought on market_a,
+# side bought on market_b): YES on the earlier contract (market_a), NO on the
+# later (market_b). scanner.leg_sides() is the ONLY reader — never hardcode a
+# side elsewhere. The trader always SUBMITS the NO leg first, whichever market
+# it sits on: market_b for a time-series pair (see trader._ordered_legs).
 TIME_SERIES_LEG_SIDES = ("yes", "no")
 
 # The smallest portfolio value (cash plus open positions), in cents, a
@@ -1416,8 +1414,8 @@ V2_FOK_KILL_HTTP_STATUS       = 409
 V2_FOK_KILL_ERROR_CODE        = "fill_or_kill_insufficient_resting_volume"
 
 # TOP-OF-GRID CEILING CLAMP, as a dollar string, on the V2 reduce-only rollback
-# bid that unwinds a filled NO leg (market_a for same-title, market_b for
-# time-series — see trader._ordered_legs). On the single-YES-book model a held
+# bid that unwinds a filled NO leg (market_b of a time-series pair, the later
+# contract — see trader._ordered_legs). On the single-YES-book model a held
 # NO position is a short YES, so closing it is a YES BUY (bid).
 #
 # This is NOT the price submitted. The submitted bid is the bounded-loss
@@ -2126,8 +2124,8 @@ BACKTEST_OUTCOME_LABEL_WARN_FRACTION = 0.50
 # one consumes _build_equity_curve output, and the single trading-day
 # consumer is the external ^GSPC row, which passes TRADING_DAYS_PER_YEAR
 # explicitly. Defaulting to the majority case is the same fail-safe-default
-# rule scanner.leg_sides() and scanner._shard_index() follow — a future
-# in-module caller inherits the correct base rather than the wrong one.
+# rule scanner._shard_index() follows — a future in-module caller inherits the
+# correct base rather than the wrong one.
 TRADING_DAYS_PER_YEAR: int  = 252
 CALENDAR_DAYS_PER_YEAR: int = 365
 
@@ -2842,11 +2840,11 @@ def fee_per_pair_approx(price_a: float, price_b: float, *,
     which sums the quadratic fee contribution of the two legs, each leg's
     contribution scaled by its own market's fee multiplier. It is
     side-agnostic: pass the per-contract cost of whatever side each leg buys —
-    (nA, pB) for a same-title pair, (pA, nB) for a time-series pair, i.e.
-    exactly scanner.leg_prices(pair) — and the multipliers in the same MARKET
-    order, scanner.leg_fee_multipliers(pair): multiplier_a is market A's,
-    whichever side is bought there. With both multipliers 1.0 the arithmetic
-    is exactly the formula above, operation for operation.
+    (pA, nB) for a time-series pair, i.e. exactly scanner.leg_prices(pair) —
+    and the multipliers in the same MARKET order,
+    scanner.leg_fee_multipliers(pair): multiplier_a is market A's, whichever
+    side is bought there. With both multipliers 1.0 the arithmetic is exactly
+    the formula above, operation for operation.
 
     Args:
         price_a (float): Cost in dollars of the side bought on the first leg.
@@ -5072,13 +5070,12 @@ def pair_price_move(price_then: float, price_now: float) -> float:
     Return how far a held pair's total price has moved since the last trade on it (now less then).
 
     A pair's total price is the price of the side held on each of its two
-    markets, added: YES on the earlier market plus NO on the later one for a
-    time-series pair, NO on the first plus YES on the second for a same-title
-    pair. (For a lone leg, one held market whose partner has paid out, it is
-    that one market's price.) Both prices must be the same kind of quote (two
-    asks, say), so the gap between a market's bid and ask never reads as a
-    move. This is the one place the sign is decided: a caller hands in the two
-    prices and never subtracts them itself.
+    markets, added: YES on the earlier market plus NO on the later one, for
+    a time-series pair. (For a lone leg, one held market whose partner has
+    paid out, it is that one market's price.) Both prices must be the same
+    kind of quote (two asks, say), so the gap between a market's bid and ask
+    never reads as a move. This is the one place the sign is decided: a
+    caller hands in the two prices and never subtracts them itself.
 
     Args:
         price_then (float): The pair's total price at the last trade on it

@@ -22,7 +22,6 @@ from kalshi_betting.config import (
     INCLUDE_MVE_MARKETS,
     MAX_DEADLINE_GAP_DAYS,
     PRICE_EPSILON,
-    SAME_TITLE_LEG_SIDES,
     SPREAD_ABOVE_CEILING,
     SPREAD_BELOW_FLOOR,
     SPREAD_NOT_POSITIVE,
@@ -1042,7 +1041,7 @@ class TestTimeSeriesGroupKey:
     def test_magicmock_subtitle_reads_as_absent(self):
         # Fail-safe by TYPE, not truthiness: a MagicMock stand-in answers any
         # attribute with a truthy child mock, and regex-substituting one would
-        # raise. Same rule leg_sides and strategy._depth_levels follow.
+        # raise. Same rule strategy._depth_levels follows.
         assert time_series_group_key("Will BTC exceed $80k", MagicMock()) == normalize_title(
             "Will BTC exceed $80k"
         )
@@ -1330,8 +1329,8 @@ class TestCumulativeDeadlineRule:
         (123, [], {}),
     ])
     def test_non_string_fields_read_as_absent_and_never_raise(self, args):
-        # Same fail-safe-by-type rule leg_sides and strategy._depth_levels
-        # follow. Real: historical._market_to_dict stores subtitle as
+        # Same fail-safe-by-type rule strategy._depth_levels follows. Real:
+        # historical._market_to_dict stores subtitle as
         # `subtitle or yes_sub_title`, which is None when both are absent.
         assert scanner.deadline_phrasing(*args) == scanner.DEADLINE_UNKNOWN
 
@@ -1991,7 +1990,7 @@ class TestStatedDeadline:
         assert set(head.split("|")) == readable
 
     def test_a_non_str_span_reads_as_absent(self):
-        # Same fail-safe-by-type rule leg_sides and _depth_levels follow: a
+        # Same fail-safe-by-type rule strategy._depth_levels follows: a
         # MagicMock auto-attribute must not raise out of the parser.
         assert scanner._span_deadline(MagicMock()) is None
         assert scanner._span_deadline(None) is None
@@ -2584,7 +2583,8 @@ class TestPairGapDays:
     @pytest.mark.parametrize("bad", [True, 19.0, "19", MagicMock()])
     def test_anything_that_is_not_an_int_falls_back(self, bad):
         # bool is an int SUBCLASS, so isinstance would read True as a one-day
-        # ladder — the same fail-safe-by-type rule leg_sides follows.
+        # ladder — the same fail-safe-by-type rule strategy._depth_levels
+        # follows.
         assert scanner.pair_gap_days(self._pair(bad, close_gap=9)) == 9
 
     @pytest.mark.usefixtures("pre_toggle_defaults")
@@ -3909,10 +3909,11 @@ class TestPrefixFillPrices:
 
 
 def _st_candidate(*, pA: float, pB: float, nA: float, nB: float = 0.70) -> CandidatePair:
-    """Build a same_title CandidatePair on tickers A1/B1.
+    """Build a CandidatePair of the same_title type on tickers A1/B1.
 
-    (nA, pB) are the leg prices (NO on A, YES on B); pA is the reference quote
-    and nB is reporting-only for this pair type.
+    Two identically worded markets on two series: a pair type the bot does
+    not trade, which the side helpers refuse and every entry point refuses
+    first.
     """
     mA = _mock_market(ticker="A1", event_ticker="EVT-A", title="Q", yes_ask=pA, no_ask=nA)
     mB = _mock_market(ticker="B1", event_ticker="EVT-B", title="Q", yes_ask=pB, no_ask=nB)
@@ -4190,23 +4191,38 @@ class TestTimeSeriesEnrichmentSides:
         assert no_levels == [(pytest.approx(0.42), 9.0)]
         assert yes_levels == [(pytest.approx(0.32), 5.0)]
 
-    def test_leg_ask_levels_same_title_reads_a_yes_bids_and_b_no_bids(self):
-        pair = SimpleNamespace(pair_type="same_title")
-        ob_a = {"yes": [["0.55", "7"]], "no": [["0.40", "5"]]}   # YES bid 0.55 → NO ask 0.45
-        ob_b = {"yes": [["0.20", "9"]], "no": [["0.69", "3"]]}   # NO bid 0.69 → YES ask 0.31
-        no_levels, yes_levels = _leg_ask_levels(pair, ob_a, ob_b)
-        assert no_levels == [(pytest.approx(0.45), 7.0)]
-        assert yes_levels == [(pytest.approx(0.31), 3.0)]
+    @pytest.mark.parametrize(
+        "pair", [*(SimpleNamespace(pair_type=t) for t in _OTHER_PAIR_TYPES), SimpleNamespace()],
+        ids=[*_OTHER_PAIR_TYPE_IDS, "no-type"])
+    def test_book_sides_raise_for_any_other_pair_type_before_a_book_is_read(self, pair):
+        # Which side of each book a leg buys from comes from leg_sides, which
+        # gives sides to time-series pairs only: a pair of any other type (or
+        # with no type) raises before either book is read, never priced off
+        # the NO-on-A, YES-on-B sides. Enrichment and validate_pair_price
+        # refuse such a pair before they get here
+        class Unreadable(dict):
+            """A book that fails the test if any side of it is read."""
 
-    def test_leg_ask_levels_unknown_pair_type_uses_same_title_sides(self):
-        # Fail-safe like leg_sides: None / a bogus type / a bare namespace with
-        # no pair_type all read the same-title sides
-        ob_a = {"yes": [["0.55", "7"]], "no": []}
-        ob_b = {"yes": [], "no": [["0.69", "3"]]}
-        for pair in (SimpleNamespace(), SimpleNamespace(pair_type=None), SimpleNamespace(pair_type="bogus")):
-            no_levels, yes_levels = _leg_ask_levels(pair, ob_a, ob_b)
-            assert no_levels == [(pytest.approx(0.45), 7.0)]
-            assert yes_levels == [(pytest.approx(0.31), 3.0)]
+            def __getitem__(self, side):
+                """
+                Fail on every side read.
+
+                Args:
+                    side (str): The side read ("yes" or "no").
+
+                Raises:
+                    AssertionError: Always.
+                """
+                raise AssertionError(f"the {side!r} side of a book was read")
+
+        book = Unreadable()
+        with pytest.raises(ValueError, match="not a time-series pair type"):
+            _leg_ask_levels(pair, book, book)
+        with pytest.raises(ValueError, match="not a time-series pair type"):
+            _reference_yes_ask(pair, book, book)
+        # Control: as a time-series pair the same books are read, and fail the test
+        with pytest.raises(AssertionError, match="side of a book was read"):
+            _leg_ask_levels(SimpleNamespace(pair_type="time_series"), book, book)
 
     def test_enrichment_writes_fills_to_pA_nB_and_refreshes_pB_leaving_nA(self):
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40)
@@ -4903,7 +4919,7 @@ def _old_enrich_with_orderbook_prices(
 
         # Derive the ask levels each leg would consume — each buy fills against
         # the OPPOSITE-side bids of ITS OWN market, and which market carries the
-        # NO leg depends on the pair type (see _leg_ask_levels)
+        # NO leg comes from leg_sides (see _leg_ask_levels)
         no_levels, yes_levels = _leg_ask_levels(pair, ob_a, ob_b)
 
         # Merge-pair the NO and YES depth levels into (yes_price, no_price, qty) tuples
@@ -6250,42 +6266,51 @@ class TestAddOnFor:
 
 class TestLegHelpers:
     """leg_sides / leg_prices / deadline_gap_days are the cross-module contract
-    for which side each leg buys and what it costs."""
+    for which side each leg buys and what it costs. The side helpers accept
+    time-series pairs only: every place a pair comes in refuses any other type
+    first, so one reaching them is a bug, and they raise rather than give it
+    sides or prices."""
 
     def test_leg_sides_time_series(self):
         assert leg_sides("time_series") == TIME_SERIES_LEG_SIDES == ("yes", "no")
 
-    def test_leg_sides_same_title(self):
-        assert leg_sides("same_title") == SAME_TITLE_LEG_SIDES == ("no", "yes")
+    @pytest.mark.parametrize(
+        "pair_type", [*_OTHER_PAIR_TYPES, "Time_Series", "time_series ", "time-series"],
+        ids=[*_OTHER_PAIR_TYPE_IDS, "capitalised", "trailing-space", "hyphen"])
+    def test_the_side_helpers_raise_for_any_other_pair_type(self, pair_type):
+        # Only the exact string "time_series" has sides: anything else, the
+        # retired same-title label and near misses of the real one included,
+        # raises, and is never given NO on market A and YES on market B nor
+        # priced at (nA, pB)
+        refused = re.escape(f"not a time-series pair type: {pair_type!r}")
+        with pytest.raises(ValueError, match=refused):
+            leg_sides(pair_type)
+        # A real pair of that type, its quotes those of a time-series pair
+        real = dc_replace(_ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40),
+                          pair_type=pair_type)
+        with pytest.raises(ValueError, match=refused):
+            leg_prices(real)
+        # ... and a bare stand-in with all four quotes
+        stub = SimpleNamespace(pair_type=pair_type, pA=0.30, pB=0.60, nA=0.70, nB=0.40)
+        with pytest.raises(ValueError, match=refused):
+            leg_prices(stub)
+        # Control: the same pair as a time-series pair is priced YES on A, NO on B
+        assert leg_prices(dc_replace(real, pair_type="time_series")) == (0.30, 0.40)
 
-    def test_leg_sides_fail_safe_to_same_title(self):
-        # None, a bogus string, and a MagicMock auto-attribute all resolve to
-        # the same-title sides — an unknown pair type must never be traded as
-        # the directional time-series bet
-        assert leg_sides(None) == SAME_TITLE_LEG_SIDES
-        assert leg_sides("bogus") == SAME_TITLE_LEG_SIDES
-        assert leg_sides(MagicMock().pair_type) == SAME_TITLE_LEG_SIDES
+    def test_a_pair_with_no_type_raises_value_error_not_attribute_error(self):
+        # pair_type is read with a default of None, so a pair that carries
+        # none is refused like any other type, never failed on the attribute
+        untyped = SimpleNamespace(pA=0.30, pB=0.60, nA=0.70, nB=0.40)
+        with pytest.raises(ValueError, match=re.escape("not a time-series pair type: None")):
+            leg_prices(untyped)
 
     def test_leg_prices_time_series_real_pair(self):
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40)
         assert leg_prices(pair) == (0.30, 0.40)
 
-    def test_leg_prices_same_title_real_pair(self):
-        mA = _mock_market(ticker="A1", event_ticker="EVT-A", title="Q", yes_ask=0.55, no_ask=0.45)
-        mB = _mock_market(ticker="B1", event_ticker="EVT-B", title="Q", yes_ask=0.30, no_ask=0.70)
-        pair = CandidatePair(
-            market_a=mA, market_b=mB, pA=0.55, pB=0.30, nA=0.45,
-            tradeable=True, canonical_title="Q", pair_type="same_title", nB=0.70,
-        )
-        assert leg_prices(pair) == (0.45, 0.30)
-
     def test_leg_prices_simple_namespace(self):
         ts = SimpleNamespace(pair_type="time_series", pA=0.30, pB=0.60, nA=0.70, nB=0.40)
-        st = SimpleNamespace(pair_type="same_title", pA=0.30, pB=0.60, nA=0.70, nB=0.40)
-        untyped = SimpleNamespace(pA=0.30, pB=0.60, nA=0.70, nB=0.40)
         assert leg_prices(ts) == (0.30, 0.40)
-        assert leg_prices(st) == (0.70, 0.60)
-        assert leg_prices(untyped) == (0.70, 0.60)
 
     def test_leg_prices_reads_nB_directly(self):
         # No getattr default: a time-series stub without nB must fail loudly
@@ -9221,9 +9246,8 @@ class TestHeldPairKind:
         mens, womens = self._wiu_markets(
             womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC))
         self._assert_same_title_shape(mens, womens)
-        # Held as such a pair is bought (NO on the pricier market, YES on the
-        # other), or the other way round
-        assert leg_sides("same_title") == ("no", "yes")
+        # Held as such a pair was bought (NO on the pricier market, YES on
+        # the other), or the other way round
         assert scanner.held_pair_kind(yes_market=womens, no_market=mens) is None
         assert scanner.held_pair_kind(yes_market=mens, no_market=womens) is None
 
@@ -9246,10 +9270,9 @@ class TestHeldPairKind:
         assert scanner._market_deadline_profile(weekly)[0] == scanner.DEADLINE_SNAPSHOT
 
     def test_a_same_title_pair_is_no_pair_whichever_side_is_held(self):
-        # Neither the sides such a pair buys (NO on the pricier, YES on the
-        # other) nor the other way round, whichever market today's prices
-        # make the pricier
-        assert leg_sides("same_title") == ("no", "yes")
+        # Neither the sides such a pair was bought on (NO on the pricier, YES
+        # on the other) nor the other way round, whichever market today's
+        # prices make the pricier
         for dear_is_mens in (True, False):
             mens, womens = self._wiu_markets(
                 womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC))
@@ -11529,12 +11552,18 @@ class TestLegFeeMultipliers:
         # Side order: YES on A, NO on B
         assert scanner._side_fee_multipliers(pair) == (1.0, 0.5)
 
-    def test_a_same_title_no_leg_on_a_gets_as_multiplier(self, half_confirmed):
+    def test_a_pair_of_another_type_has_market_multipliers_but_no_side_order(
+            self, half_confirmed):
+        # Each market's own multiplier is read whatever the pair's type
+        # (market order needs no sides), but side order needs leg_sides,
+        # which gives sides to time-series pairs only: a same-title pair
+        # raises rather than having its NO leg priced on market A
         pair = _st_candidate(pA=0.70, pB=0.60, nA=0.32)
         pair.market_a._fee_multiplier = 0.5
         assert scanner.leg_fee_multipliers(pair) == (0.5, 1.0)
-        # Side order: YES on B, NO on A
-        assert scanner._side_fee_multipliers(pair) == (1.0, 0.5)
+        with pytest.raises(ValueError,
+                           match=re.escape("not a time-series pair type: 'same_title'")):
+            scanner._side_fee_multipliers(pair)
 
     def test_an_unconfirmed_multiplier_reads_the_full_fee(self):
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.45)
