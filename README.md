@@ -252,8 +252,9 @@ main.py
   │                                   (exit 10)
   ├─ scanner.fetch_shard_statuses() — read GET /exchange/status per-shard trading/transfer flags (fail-soft)
   ├─ scanner.inactive_shard_indexes() — derive the trading-inactive shard set from the statuses above
-  ├─ scanner.fetch_open_events_with_markets() — fetch open events + their markets from EVERY exchange shard, tagged (attaches event titles for MVE grouping, and each event's competition for the same-title sport check; drops only markets on trading-inactive shards)
-  ├─ main._log_shard_coverage()    — audit advertised shards vs ingested markets/funds (reports, never aborts)
+  ├─ scanner.fetch_open_events_with_markets() — fetch open events + their markets from EVERY exchange shard, tagged; combo (MVE) markets are not read (config.INCLUDE_MVE_MARKETS off) (attaches event titles for grouping, and each event's competition for the same-title sport check; drops only markets on trading-inactive shards)
+  ├─ main._log_shard_coverage()    — audit advertised shards vs ingested markets/funds (reports, never aborts;
+  │                                   the empty "Combos" shard is named as not read, not as a gap)
   ├─ historical.load_series_categories() — read Kalshi's /series listing once per run (prod: the cached copy,
   │                                   refreshed once a week; dev: the cached copy only); a run stopped below $50, or one
   │                                   whose ingest scanned nothing (exit 30), reads none
@@ -761,9 +762,9 @@ falls back to `kalshi_private_key.pem` when it's absent.
                                     eligibility-filter tag when the backtester filters
                                     during assembly, so subsets never mix with full lists,
                                     and by a trailing `_nomve` when INCLUDE_MVE_MARKETS is
-                                    False, since that flag changes which markets are
-                                    fetched at all — the default True keeps the unmarked
-                                    name). Legacy `settled_markets_*.json` files of the
+                                    False, the default, since that flag changes which
+                                    markets are fetched at all — caches built with combo
+                                    markets keep the unmarked name). Legacy `settled_markets_*.json` files of the
                                     same name stem are still read (whole) when no
                                     .jsonl.gz exists at all, are never written any more,
                                     and are deleted once a rebuild of the same name stem
@@ -1813,9 +1814,9 @@ closing lines and the dashboard's header say whether the corpus was assembled,
 extended, reused from earlier the same day, or served as an earlier day's cache
 that could not be brought up to date. `--no-cache` still forces a full
 re-assembly. An extension costs every newly completed settled day once (an
-estimate: an hour or two of paging per full day of today's combo-heavy listings,
-with days fetched in parallel — the 7-day window's seven days took 1 h 47 min),
-plus today's partial day; each completed day is then stored and shared by every
+estimate, measured while combo markets were still read: an hour or two of
+paging per full day of combo-heavy listings, with days fetched in parallel —
+the 7-day window's seven days took 1 h 47 min), plus today's partial day; each completed day is then stored and shared by every
 window.
 
 `--interval-discount K` (`0 < K <= 1`) overrides the time-series interval
@@ -2426,7 +2427,7 @@ Rebuilds `eda_dashboard.html` (in the repo root, gitignored; the live dashboard'
 python3 -m kalshi_betting.scheduler
 ```
 
-Runs the production bot once a week in a blocking loop, at `config.SCHEDULED_RUN`'s weekday and time — Monday 09:00 — on the **host's clock**, each run spawned as a `python3 -m kalshi_betting.main --mode prod` subprocess and killed after `SCHEDULER_JOB_TIMEOUT_SECONDS` (14400s, four hours: reading up to `SCANNER_MAX_PAGES` (20,000) pages of combo markets takes about 2 hours 30 minutes at the slowest pace measured, and the kill stops a run wherever it is, even mid-order). The log also prints the equivalent `crontab` entry if you prefer cron (cron fires on the host's clock too).
+Runs the production bot once a week in a blocking loop, at `config.SCHEDULED_RUN`'s weekday and time — Monday 09:00 — on the **host's clock**, each run spawned as a `python3 -m kalshi_betting.main --mode prod` subprocess and killed after `SCHEDULER_JOB_TIMEOUT_SECONDS` (14400s, four hours: with combo markets read (`config.INCLUDE_MVE_MARKETS` on; it is off by default, and then a run reads its markets in about a minute), reading up to `SCANNER_MAX_PAGES` (20,000) pages of combo markets takes about 2 hours 30 minutes at the slowest pace measured, and the kill stops a run wherever it is, even mid-order). The log also prints the equivalent `crontab` entry if you prefer cron (cron fires on the host's clock too).
 
 **Run time and zone.** `config.SCHEDULED_RUN` also names the run's zone, America/Los_Angeles, where 09:00 is 16:00 UTC under daylight time and 17:00 UTC under standard time. The daemon still fires on the host's clock rather than converting: the `schedule` library's own zone support goes through `pytz`, whose America/Los_Angeles table has no daylight time after 2037, so from 2038 it would fire at 10:00 all summer. Instead, at startup the daemon checks that the host's clock places the next 104 weekly fires at the schedule's own UTC instants. **Keep the host's time zone set to America/Los_Angeles.** On a host whose clock keeps different UTC offsets over those two years (a UTC host, or a zone without the same daylight-saving rules), the daemon logs CRITICAL, naming the first mismatched date, and keeps firing at 09:00 on the host's clock; a zone with the same rules under another name (`US/Pacific`, `PST8PDT`) passes. The backtest enters every trade at the same instants, so on such a host it no longer replays the daemon's runs, and the CRITICAL says so. To move the run, edit `config.SCHEDULED_RUN` — its weekday, hour, minute and zone form one value, and the edit also moves every backtest entry and re-keys the backtest's assembled cache; the backtest refuses a schedule whose run time falls on another date in UTC or on a clock change. A time the zone skips at a clock change (02:30 on a spring-forward Sunday, say) cannot fire at one UTC instant on any host, and the startup check logs that CRITICAL against the schedule, not the host.
 

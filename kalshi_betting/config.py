@@ -1224,18 +1224,44 @@ CONTRACT_PAYOUT_DOLLARS       = 1.0
 # keeping group sizes tractable at current Kalshi market volumes.
 LARGE_GROUP_WARN_THRESHOLD    = 1000
 
-# Whether to include multivariate (multi-choice) markets in scanning and backtesting.
-# When True, markets are grouped by (event_title + market_title) so cross-event
-# option-label collisions (e.g. "Trump" in two unrelated events) cannot false-positive
-# into a same-title or time-series pair. When False, mve_filter="exclude" is passed
-# to all market-fetch APIs, the backtester's MVE event-title listing is skipped,
-# the assembled backtest cache filename gains a trailing "_nomve" marker (DR-57 —
-# the flag changes WHAT IS FETCHED, so a cache built under one setting must never
-# be served to a run under the other; only the False case is marked, so the
-# default True keeps the pre-DR-57 filename and no cached assembly is orphaned),
-# and the bot operates only on binary events. Event titles are still resolved for
-# binary events in both modes, so live and backtest grouping keys match.
-INCLUDE_MVE_MARKETS           = True
+# Whether live runs and the backtest read combo markets (Kalshi's multivariate,
+# "MVE", markets: parlays that bundle several other markets into one contract
+# paying $1 only if every pick hits). Off: neither reads them.
+#
+# Off because reading combos is most of a live run's time and no combo forms
+# a pair. Their listing runs to millions of markets and tens of minutes of
+# paging. Almost none passes the bot's first filter, a YES ask between 1c
+# and 99c: combos trade by request for quote, so most list $0.00 / $1.00.
+# Those that pass are parlays of sports games or races whose
+# wording names no deadline, which the cumulative-deadline rule refuses, so
+# none can be a time-series leg. A same-title pair needs the exact title on
+# both markets; a combo's title is its list of picks ("yes A,yes B,..."),
+# which no ordinary market's title was found to match, and two combos never
+# pair (DR-54/55, the one-series rule). The measurements are in
+# docs/claude/overview.md's MVE paragraph.
+#
+# When off: the live fetch (scanner.fetch_open_events_with_markets) skips the
+# combo events listing, and the shard coverage check leaves out a shard the
+# exchange labels COMBO_SHARD_DESCRIPTION (it holds only combos) when it
+# yields no markets; the backtest passes mve_filter="exclude" to every market
+# fetch, skips its combo event-title listing, and names its assembled cache
+# with a trailing "_nomve" (DR-57: the setting changes WHAT IS FETCHED, so a
+# cache built under one setting is never served to a run under the other).
+# Each per-day slice's meta records the setting too, so the first backtest
+# after a change fetches its data again. When on, combos are read and grouped
+# by event_title + market_title, so an option label shared by two unrelated
+# events (e.g. "Trump") cannot pair. Event titles are resolved for ordinary
+# events either way, so live and backtest grouping keys match.
+INCLUDE_MVE_MARKETS           = False
+
+# The description /exchange/status gives the exchange shard that holds only
+# combo markets (other shards read, for example, "Default" or "Crypto &
+# Commodities"). While INCLUDE_MVE_MARKETS is off, a trading-active shard
+# with this description that produced no markets is not a coverage gap: the
+# bot chose not to read it (scanner.unread_combo_shards). Compared ignoring
+# case and surrounding spaces. If Kalshi renames it, that shard is reported
+# as an empty shard again, as every other one is.
+COMBO_SHARD_DESCRIPTION       = "Combos"
 
 # Series-prefix FAMILY that scanner.event_series() collapses onto one series
 # (DR-55). Kalshi lists its multi-leg COMBO (parlay) markets under SEVERAL
@@ -1800,9 +1826,10 @@ SCHEDULED_RUN = ScheduledRun(weekday=0, hour=9, minute=0, timezone="America/Los_
 # block the weekly scheduler daemon forever. The kill is a hard stop wherever
 # the run has got to, even in the middle of sending orders, where it can leave
 # a bought leg without its partner, so the limit must cover a slow but healthy
-# run: reading up to SCANNER_MAX_PAGES (20,000) pages of the combo events
-# listing can take about 2 hours 30 minutes, and trading 30 pairs takes about
-# 15 minutes more when every position read fails
+# run: with INCLUDE_MVE_MARKETS on, reading up to SCANNER_MAX_PAGES (20,000)
+# pages of the combo events listing can take about 2 hours 30 minutes (with it
+# off, the default, a run reads its markets in about a minute), and trading 30
+# pairs takes about 15 minutes more when every position read fails
 # (V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS). The scheduler and the dashboard's
 # pages also call a run that has held the live-run lock for longer than this
 # possibly hung.
@@ -1934,10 +1961,10 @@ FILLS_EARLIEST_YEAR = 2021
 # stops says so in a WARNING or an error. Same bound-the-work-then-say-so idiom
 # as EVENT_TITLE_FALLBACK_MAX_LOOKUPS.
 #
-# The combo events listing (200 events a page, MARKET_PAGE_SIZE) is the one
-# walk long enough to reach this cap, and reading 20,000 of its pages can take
-# about 2 hours 30 minutes; docs/claude/known-gotchas/kalshi-api-and-shards.md
-# has the measurements. A run the scheduler starts is killed after
+# The combo events listing (200 events a page, MARKET_PAGE_SIZE), read only
+# while INCLUDE_MVE_MARKETS is on, is the one walk long enough to reach this
+# cap, and reading 20,000 of its pages can take about 2 hours 30 minutes;
+# docs/claude/known-gotchas/kalshi-api-and-shards.md has the measurements. A run the scheduler starts is killed after
 # SCHEDULER_JOB_TIMEOUT_SECONDS (4 hours), even in the middle of sending
 # orders, so that limit must stay well above this walk's time. A run started
 # from the dashboard or by hand has no time limit.
