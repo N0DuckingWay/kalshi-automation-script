@@ -1,5 +1,5 @@
 """Tests for config.py fee helpers, the time-series probability model, the
-leg-side tuples, the deadline-gap tier (with the backtest's spread band and
+leg-side tuple, the deadline-gap tier (with the backtest's spread band and
 tier-floors switch), the live toggles (LiveSettings and its helpers), the saved
 live defaults (their file's reader and writer, the seed, and the comparison of
 two sets of defaults), the weekly run schedule (ScheduledRun), the wait
@@ -172,8 +172,8 @@ class TestFeePairApprox:
         assert fee_per_pair_approx(0.3, 0.4) == pytest.approx(fee_per_pair_approx(0.4, 0.3))
 
     def test_side_agnostic_keyword_names(self):
-        # The parameters are leg-neutral (price_a/price_b): the same formula
-        # prices a same-title pair on (nA, pB) and a time-series pair on (pA, nB)
+        # The parameters are leg-neutral (price_a/price_b): a time-series pair
+        # is priced on (pA, nB), and the names do not say which leg is which
         assert fee_per_pair_approx(price_a=0.30, price_b=0.40) == pytest.approx(
             fee_per_pair_approx(0.30, 0.40)
         )
