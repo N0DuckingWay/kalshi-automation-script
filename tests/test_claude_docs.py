@@ -15,8 +15,12 @@ Purpose:
     file would be loaded with every request after all. One more test keeps
     the notes and README.md from naming the same-title cap's command-line
     flag, which main.py refuses (the bot trades time-series pairs only), so
-    no reader copies a command that exits 2; a dated decision record keeps
-    the wording its decision was taken with, and is skipped.
+    no reader copies a command that exits 2. Another keeps them from naming
+    deleted same-title code (the same-title finder and the SAME_TITLE_
+    constants of config.py), which a note describes in words instead, and
+    checks that no module of the package defines such a name again. A dated
+    decision record keeps the wording its decision was taken with, and is
+    skipped by both.
 
 Dependencies:
     tests/claude_docs.py, for where the notes live. Reads files only.
@@ -54,6 +58,18 @@ DATED_RECORDS = ("**The live defaults of 2026-09-27 — decision record.**",)
 # the bot trades time-series pairs only, so no note may name it outside a
 # dated decision record
 RETIRED_SAME_TITLE_CAP_FLAG = "--same-title-size-cap"
+
+# Deleted same-title code: the same-title finder and every SAME_TITLE_ constant
+# config.py defined (the 95% prior, the minimum price gap, the sides, the size
+# cap, and the close bound, renamed HELD_PAIR_CLOSE_GAP_SECONDS). The bot trades
+# time-series pairs only, so no note may name one outside a dated decision record
+REMOVED_SAME_TITLE_CODE = re.compile(
+    r"\b(?:find_same_title_pairs|SAME_TITLE_[A-Z0-9_]*[A-Z0-9])\b")
+
+# A definition of such a name in the package: a function, or a module-level
+# constant with or without a type
+PACKAGE_DEFINES_SAME_TITLE_CODE = re.compile(
+    r"^(?:def\s+find_same_title_pairs\b|SAME_TITLE_\w+\s*[:=])", re.MULTILINE)
 
 
 def _index_paths(root_text: str) -> list[str]:
@@ -166,8 +182,9 @@ class TestRootClaudeMd:
 
 class TestRetiredNames:
     """Neither the notes nor README.md name the same-title cap's old
-    command-line flag (main.py refuses it), outside a dated decision record,
-    which keeps the wording its decision was taken with."""
+    command-line flag (main.py refuses it) or deleted same-title code (the
+    same-title finder, the SAME_TITLE_ constants), outside a dated decision
+    record, which keeps the wording its decision was taken with."""
 
     def test_no_note_names_the_same_title_cap_flag_outside_a_dated_record(self):
         # The record rule on a sample: a record runs from its bold lead to the
@@ -204,4 +221,52 @@ class TestRetiredNames:
         # command, which named the flag when the record was taken
         assert named_in_a_record, (
             f"no dated decision record names {RETIRED_SAME_TITLE_CAP_FLAG} any more, but a "
+            "record keeps the wording its decision was taken with")
+
+    def test_no_note_names_deleted_same_title_code_outside_a_dated_record(self):
+        # The pattern finds the deleted names, however they are written around ...
+        for named in ("`scanner.find_same_title_pairs`", "find_same_title_pairs()",
+                      "config.SAME_TITLE_SIZE_CAP", "`SAME_TITLE_MAX_CLOSE_GAP_SECONDS`",
+                      "SAME_TITLE_CO_RESOLVE_PROB"):
+            assert REMOVED_SAME_TITLE_CODE.search(named), named
+        # ... and not the retired setting's key (old saved files hold it, so the
+        # notes keep naming it), a test class, plain words, a test fixture's name
+        # or a bare SAME_TITLE
+        for other in ("same_title_size_cap", "TestSameTitleCapRetirement",
+                      "same-title pairs", "_SS1_SAME_TITLE_ONLY_TITLES", "SAME_TITLE"):
+            assert not REMOVED_SAME_TITLE_CODE.search(other), other
+        # The premise, read from the files: no module of the package defines such
+        # a name, so the pattern forbids no live name. If one comes back, this
+        # list needs changing
+        modules = sorted((claude_docs.REPO_ROOT / "kalshi_betting").glob("*.py"))
+        assert modules, "no module of the package was found to read"
+        for module in modules:
+            defined = PACKAGE_DEFINES_SAME_TITLE_CODE.search(
+                module.read_text(encoding="utf-8"))
+            assert defined is None, (
+                f"{module.name} defines {defined.group(0)!r}, so it is live code again: "
+                "change REMOVED_SAME_TITLE_CODE, and the notes that describe it in words")
+        # Every notes file and README.md, each read on its own. Only a dated
+        # decision record's lines are skipped. A dated clause inside an ordinary
+        # paragraph or an addendum ("until 2026-11-09 ...") is not: it describes
+        # the deleted code in words, as a sentence-level date rule could not be
+        # told apart from the many dated measurements in ordinary paragraphs
+        paths = [*claude_docs.notes_paths(), claude_docs.REPO_ROOT / "README.md"]
+        named_in_a_record = []
+        for path in paths:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            records = _dated_record_lines(lines)
+            for number, line in enumerate(lines):
+                found = REMOVED_SAME_TITLE_CODE.search(line)
+                if found is None:
+                    continue
+                assert number in records, (
+                    f"{path.relative_to(claude_docs.REPO_ROOT)} line {number + 1} names "
+                    f"{found.group(0)}, deleted same-title code: describe it in words, e.g. "
+                    "'the same-title finder', 'the same-title cap constant'")
+                named_in_a_record.append(f"{path.name}:{number + 1}")
+        # The skip is used: the 2026-09-27 record names the same-title cap constant
+        # it set
+        assert named_in_a_record, (
+            "no dated decision record names deleted same-title code any more, but a "
             "record keeps the wording its decision was taken with")
