@@ -12001,6 +12001,117 @@ class TestValidatePairPriceReachableDepth:
         ]
 
 
+class TestValidatePairPriceLogsFreshPrices:
+    """
+    The pre-execution re-check logs one INFO line per trade with each leg's
+    scanned price beside the price the fresh book gives it now, both averaged
+    over the trade's own count, before it decides anything. That line is what
+    shows a price that moved between the scan and the orders without moving
+    far enough to drop the trade (which leaves no WARNING).
+    """
+
+    @staticmethod
+    def _pair(nA, pB):
+        # Same-title: NO on A1 (market_a), YES on B1 (market_b)
+        close = datetime(2026, 3, 1, tzinfo=UTC)
+        mA = SimpleNamespace(ticker="A1", title="A", subtitle="", event_ticker="EV-A",
+                             close_time=close, exchange_index=0,
+                             price_level_structure="", price_ranges=None)
+        mB = SimpleNamespace(ticker="B1", title="B", subtitle="", event_ticker="EV-B",
+                             close_time=close, exchange_index=0,
+                             price_level_structure="", price_ranges=None)
+        return CandidatePair(
+            market_a=mA, market_b=mB, pA=1.0 - nA, pB=pB, nA=nA, nB=1.0 - pB,
+            tradeable=True, canonical_title="fresh price pair",
+            pair_type="same_title",
+        )
+
+    def _run(self, monkeypatch, caplog, *, a_yes_bids, b_no_bids, x, nA=0.32, pB=0.30):
+        # A1's YES bids become the NO leg's asks (1 - bid), B1's NO bids the YES leg's
+        books = {"A1": {"yes": a_yes_bids, "no": []}, "B1": {"yes": [], "no": b_no_bids}}
+        monkeypatch.setattr(scanner, "_fetch_orderbook", lambda c, t: books[t])
+        spec = SimpleNamespace(pair=self._pair(nA=nA, pB=pB), x=x)
+        with caplog.at_level(logging.INFO):
+            ok = validate_pair_price(MagicMock(), spec)
+        lines = [r for r in caplog.records if "Pre-execution prices" in r.getMessage()]
+        return ok, lines
+
+    def test_unchanged_books_log_unchanged_word_for_word(self, monkeypatch, caplog):
+        ok, lines = self._run(monkeypatch, caplog, a_yes_bids=[["0.68", "300"]],
+                              b_no_bids=[["0.70", "600"]], x=300)
+        assert ok is True
+        assert [(r.levelno, r.getMessage()) for r in lines] == [(
+            logging.INFO,
+            "Pre-execution prices for 'fresh price pair', 300 contract(s) per leg: "
+            "NO on A1 scanned $0.3200, now $0.3200; YES on B1 scanned $0.3000, "
+            "now $0.3000 — unchanged",
+        )]
+
+    def test_a_dearer_book_that_still_passes_is_logged_as_moved(self, monkeypatch, caplog):
+        # The NO leg's ask rose 1c to 0.33, still within its order's limit
+        # (0.32 plus one tick), so the trade passes and only this line shows it
+        ok, lines = self._run(monkeypatch, caplog, a_yes_bids=[["0.67", "300"]],
+                              b_no_bids=[["0.70", "600"]], x=300)
+        assert ok is True
+        [line] = lines
+        assert "NO on A1 scanned $0.3200, now $0.3300;" in line.getMessage()
+        assert line.getMessage().endswith(
+            "— moved: one contract pair now costs $0.0100 more")
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_a_cheaper_book_is_logged_as_costing_less(self, monkeypatch, caplog):
+        # The YES leg's ask fell 1c to 0.29
+        ok, lines = self._run(monkeypatch, caplog, a_yes_bids=[["0.68", "300"]],
+                              b_no_bids=[["0.71", "600"]], x=300)
+        assert ok is True
+        [line] = lines
+        assert "YES on B1 scanned $0.3000, now $0.2900" in line.getMessage()
+        assert line.getMessage().endswith(
+            "— moved: one contract pair now costs $0.0100 less")
+
+    def test_prices_are_averaged_over_the_trades_own_count(self, monkeypatch, caplog):
+        # The NO leg was scanned at 0.34, its average over 600 contracts across
+        # two levels (0.32 and 0.36). The same book now reads the same average,
+        # so the line says unchanged, though the top of the book is 0.32. The
+        # trade is then dropped (only 300 contracts sit within its limit), and
+        # the price line still comes first.
+        ok, lines = self._run(monkeypatch, caplog,
+                              a_yes_bids=[["0.68", "300"], ["0.64", "300"]],
+                              b_no_bids=[["0.70", "600"]], x=600, nA=0.34)
+        assert ok is False
+        [line] = lines
+        assert "NO on A1 scanned $0.3400, now $0.3400;" in line.getMessage()
+        assert line.getMessage().endswith("— unchanged")
+        records = caplog.records
+        drop = next(r for r in records if r.levelno == logging.WARNING)
+        assert records.index(line) < records.index(drop)
+
+    def test_a_book_too_thin_for_the_count_gives_no_fresh_price(self, monkeypatch, caplog):
+        ok, lines = self._run(monkeypatch, caplog, a_yes_bids=[["0.68", "300"]],
+                              b_no_bids=[["0.70", "600"]], x=301)
+        assert ok is False
+        assert [r.getMessage() for r in lines] == [
+            "Pre-execution prices for 'fresh price pair', 301 contract(s) per leg: "
+            "NO on A1 scanned $0.3200; YES on B1 scanned $0.3000 — the thinner book "
+            "now holds only 300.0 of them, so there is no fresh price"
+        ]
+
+    def test_a_time_series_pair_names_each_leg_on_its_own_market(self, caplog):
+        # Time-series: YES on EARLY (market_a), NO on LATE (market_b). The NO
+        # leg's ask rose 1c to 0.51, within its limit, so the trade passes.
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
+        spec = SimpleNamespace(pair=pair, x=10)
+        client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.51, pB_ref=0.60)
+        with caplog.at_level(logging.INFO):
+            assert validate_pair_price(client, spec) is True
+        assert [r.getMessage() for r in caplog.records
+                if "Pre-execution prices" in r.getMessage()] == [
+            "Pre-execution prices for 'will btc exceed $80k by', 10 contract(s) per "
+            "leg: YES on EARLY scanned $0.3000, now $0.3000; NO on LATE scanned "
+            "$0.5000, now $0.5100 — moved: one contract pair now costs $0.0100 more"
+        ]
+
+
 class TestCloseTimeWarningOncePerRun:
     """
     TS-22: _filter_active_markets emits one summary WARNING naming how many

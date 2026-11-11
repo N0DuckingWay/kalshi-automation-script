@@ -1721,8 +1721,9 @@ def pre_execution_check(client: Any, portfolio: list, *,
     the run's band ceiling (scanner.validate_pair_price). This reduces the
     window between price observation and order submission, lowering the chance
     of submitting against a stale price. Each drop is logged once, with its
-    reason, by validate_pair_price (or by the exception handler here); this
-    function adds only a summary count.
+    reason, by validate_pair_price (or by the exception handler here), and
+    validate_pair_price also logs each spec's scanned and fresh leg prices;
+    this function adds only a summary count.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
