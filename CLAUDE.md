@@ -150,7 +150,7 @@ python3 -m kalshi_betting.backtest --dashboard-only
 # Rebuild the Data page from the cache
 python3 -m kalshi_betting.eda
 
-# Weekly scheduler daemon (prod every Monday 09:00 on the host's clock, config.SCHEDULED_RUN)
+# Scheduler daemon (prod every day at 07:00 and 21:00 on the host's clock, config.SCHEDULER_RUN_TIMES)
 python3 -m kalshi_betting.scheduler
 
 # The dashboard (Live trading, Backtest and Data tabs) and the defaults server, whose pages save

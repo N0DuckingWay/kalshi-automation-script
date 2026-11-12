@@ -118,7 +118,7 @@ BUDGET_FRACTION               = 1.0
 # of the count it started with and the one Kelly then allows, so the sequence is
 # strictly decreasing and terminates on its own — this cap only exists so a
 # future edit that breaks the decrease invariant surfaces as one WARNING and a
-# skipped pair rather than a hung weekly run. Convergence takes 1-3 passes in
+# skipped pair rather than a hung run. Convergence takes 1-3 passes in
 # practice; 64 strict decreases without settling means a pathological book, and
 # refusing to trade it is the safe answer.
 SIZE_SOLVE_MAX_ITERATIONS     = 64
@@ -1582,7 +1582,7 @@ TRANSFER_SETTLE_TIMEOUT_SECONDS = 30
 # loop while money is in flight.
 TRANSFER_POLL_INTERVAL_SECONDS = 2
 
-# ── Weekly scheduler ──────────────────────────────────────────────────────────
+# ── Scheduler and the backtest's entry checkpoint ─────────────────────────────
 
 # Weekday names, index 0 = Monday, spelled as the `schedule` library's methods.
 _WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
@@ -1591,13 +1591,13 @@ _WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "satur
 @dataclass(frozen=True)
 class ScheduledRun:
     """
-    When the weekly live run happens: a weekday, a wall-clock time and a time zone.
+    A weekly moment: a weekday, a wall-clock time and a time zone.
 
     Wall-clock means what a clock in that zone reads, so the UTC moment moves
-    with daylight-saving time. scheduler.py fires the live run at
-    config.SCHEDULED_RUN's weekday and time on the host's clock, and the
-    backtest opens simulated trades only at its UTC moments (its ENTRY
-    CHECKPOINTS). A spring clock change SKIPS the wall times in its jump and
+    with daylight-saving time. config.SCHEDULED_RUN is the backtest's: it
+    opens simulated trades only at its UTC moments (its ENTRY CHECKPOINTS).
+    DailyRuns.on() builds one for each live run the scheduler fires on a
+    date. A spring clock change SKIPS the wall times in its jump and
     an autumn one REPEATS them (clock_change()). The zone is looked up only
     in zone(), so importing config needs no tz database. Frozen, so it can
     key backtester._checkpoint_floor's cache.
@@ -1785,17 +1785,137 @@ class ScheduledRun:
         return problems
 
 
-# The weekly live run: Monday 09:00 Los Angeles time (16:00 UTC under daylight
-# time, 17:00 under standard time). scheduler.py fires it on the host's clock;
-# the backtest opens simulated trades only at these moments, so a change here
-# moves every backtest entry and renames its cached market list. scheduler.py
-# and backtester.py bind this at import: tests patch scheduler.SCHEDULED_RUN /
-# backtester.SCHEDULED_RUN, never config.*.
+# The backtest's weekly entry checkpoint: Monday 09:00 Los Angeles time (16:00
+# UTC under daylight time, 17:00 under standard time). The backtest opens
+# simulated trades only at these moments, so a change here moves every
+# backtest entry and renames its cached market list. Its zone is also the
+# bot's own clock (trade_day, which the live wait rules count days on) and the
+# zone of the live runs (SCHEDULER_RUN_TIMES). The live scheduler does not run
+# at this moment: it runs every day at SCHEDULER_RUN_TIMES. backtester.py and
+# seller.py bind this at import: tests patch backtester.SCHEDULED_RUN /
+# seller.SCHEDULED_RUN, never config.*.
 SCHEDULED_RUN = ScheduledRun(weekday=0, hour=9, minute=0, timezone="America/Los_Angeles")
+
+
+@dataclass(frozen=True)
+class DailyRuns:
+    """
+    When the scheduler starts a live run: every day, at each of a few wall-clock times in one zone.
+
+    scheduler.py fires a run at each time on the host's clock, and checks at
+    startup that the host keeps this zone. on(d) gives each run on a date as
+    a ScheduledRun, so a run's UTC moment and any clock change on its date
+    come from ScheduledRun.instant() and clock_change(), the one definition
+    of each. The zone is looked up only in zone().
+
+    Attributes:
+        times (tuple[tuple[int, int], ...]): (hour, minute) pairs on a
+            24-hour clock, earliest first and none twice, e.g.
+            ((7, 0), (21, 0)).
+        timezone (str): IANA zone name, e.g. "America/Los_Angeles".
+    """
+    times: tuple[tuple[int, int], ...]
+    timezone: str
+
+    def __post_init__(self) -> None:
+        """
+        Check the times and the zone name, so a bad schedule fails where it is built.
+
+        Raises:
+            ValueError: times is not a non-empty tuple of (hour, minute) int
+                pairs in range (a bool is refused), earliest first with none
+                twice, or timezone is not a non-empty str.
+        """
+        if type(self.times) is not tuple or not self.times:
+            raise ValueError(
+                f"DailyRuns.times must be a non-empty tuple of (hour, minute) pairs, "
+                f"got {self.times!r}")
+        for pair in self.times:
+            if (type(pair) is not tuple or len(pair) != 2
+                    or type(pair[0]) is not int or not 0 <= pair[0] <= 23
+                    or type(pair[1]) is not int or not 0 <= pair[1] <= 59):
+                raise ValueError(
+                    f"DailyRuns.times must hold (hour, minute) pairs, hour an int in "
+                    f"[0, 23] and minute an int in [0, 59], got {pair!r}")
+        if list(self.times) != sorted(set(self.times)):
+            raise ValueError(
+                f"DailyRuns.times must be earliest first with no time twice, got {self.times!r}")
+        if type(self.timezone) is not str or not self.timezone:
+            raise ValueError(f"DailyRuns.timezone must be an IANA zone name, got {self.timezone!r}")
+
+    def zone(self) -> ZoneInfo:
+        """
+        Look up the IANA time zone named by `timezone`.
+
+        Returns:
+            ZoneInfo: The zone.
+
+        Raises:
+            zoneinfo.ZoneInfoNotFoundError, ValueError, OSError: The name is
+                unknown, malformed (a path) or not a zone file ("America").
+        """
+        return ZoneInfo(self.timezone)
+
+    def at_times(self) -> tuple[str, ...]:
+        """
+        Format each run time as "HH:MM", the form `schedule`'s Job.at() takes.
+
+        Returns:
+            tuple[str, ...]: e.g. ("07:00", "21:00").
+        """
+        return tuple(f"{hour:02d}:{minute:02d}" for hour, minute in self.times)
+
+    def times_label(self) -> str:
+        """
+        Name the run times in words, for log lines.
+
+        Returns:
+            str: e.g. "07:00 and 21:00", or "07:00" for a single time.
+        """
+        names = self.at_times()
+        return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+
+    def label(self) -> str:
+        """
+        Describe the schedule with its zone, for log lines.
+
+        Returns:
+            str: e.g. "every day at 07:00 and 21:00 America/Los_Angeles".
+        """
+        return f"every day at {self.times_label()} {self.timezone}"
+
+    def on(self, d: date) -> tuple[ScheduledRun, ...]:
+        """
+        List the runs on date `d`, earliest first, each as a ScheduledRun.
+
+        Args:
+            d (date): A date in the zone.
+
+        Returns:
+            tuple[ScheduledRun, ...]: One per time, on d's weekday.
+        """
+        return tuple(ScheduledRun(weekday=d.weekday(), hour=hour, minute=minute,
+                                  timezone=self.timezone)
+                     for hour, minute in self.times)
+
+
+# When the scheduler starts a live run: every day at 07:00 and 21:00 Pacific
+# time (SCHEDULED_RUN's zone, the bot's own clock), on the host's clock
+# (scheduler.py). Both are clear of Kalshi's nightly maintenance window around
+# 00:30 Pacific, when every shard reports trading inactive and a run scans
+# nothing (a blind 21:00 run's hourly retries do reach into it). The shortest
+# gap between two runs (10 hours) is longer than a blind-run retry chain
+# started at a run time (SCHEDULER_BLIND_MAX_RETRIES hourly attempts), so such
+# a chain ends before the next run; one a startup catch-up starts at another
+# hour can still cross a run time. The backtest
+# does not follow these times: it enters trades once a week, at
+# SCHEDULED_RUN. scheduler.py binds this at import: tests patch
+# scheduler.SCHEDULER_RUN_TIMES, never config.*.
+SCHEDULER_RUN_TIMES = DailyRuns(times=((7, 0), (21, 0)), timezone=SCHEDULED_RUN.timezone)
 
 # Maximum seconds a run the scheduler starts may take before it is killed (4
 # hours), so a hung run (for example a network stall inside the SDK) cannot
-# block the weekly scheduler daemon forever. The kill is a hard stop wherever
+# block the scheduler daemon forever. The kill is a hard stop wherever
 # the run has got to, even in the middle of sending orders, where it can leave
 # a bought leg without its partner, so the limit must cover a slow but healthy
 # run: with INCLUDE_MVE_MARKETS on, reading up to SCANNER_MAX_PAGES (20,000)
@@ -1807,18 +1927,20 @@ SCHEDULED_RUN = ScheduledRun(weekday=0, hour=9, minute=0, timezone="America/Los_
 # possibly hung.
 SCHEDULER_JOB_TIMEOUT_SECONDS = 4 * 60 * 60
 
-# The scheduler's record of its claimed weekly slot (scheduler.py), under
+# The scheduler's record of its latest claimed run slot (scheduler.py), under
 # PROJECT_ROOT: the slot, when its run started and finished, its exit code and
 # the blind-run retries spent on it.
 SCHEDULER_STATE_FILENAME = "scheduler_state.json"
 
 # A run that exits EXIT_NO_TRADEABLE_SHARDS (exchange-wide halt) is retried
 # after this many seconds, at most SCHEDULER_BLIND_MAX_RETRIES times per
-# Monday slot, so a maintenance window overlapping the 09:00 fire no longer
-# silently costs the week (TS-01). Hourly x4 covers a four-hour outage while
-# keeping the scan close to the intended slot; a longer interval would trade
-# on stale morning pricing. Bounded on purpose: a multi-day outage stops
-# retrying after the cap and scheduler_state.json records the attempts.
+# slot, so a maintenance window overlapping a scheduled run does not silently
+# cost that run (TS-01). Hourly x4 covers a four-hour outage while keeping
+# the scan close to the intended slot, and a chain started at a run time
+# ends before the next one (the runs are at least 10 hours apart,
+# SCHEDULER_RUN_TIMES). Bounded on purpose:
+# a longer outage stops retrying after the cap and scheduler_state.json
+# records the attempts.
 SCHEDULER_BLIND_RETRY_SECONDS = 3600
 SCHEDULER_BLIND_MAX_RETRIES   = 4
 
@@ -1848,7 +1970,7 @@ EXIT_TRADES_NEED_ATTENTION    = 20
 # internal failure, which makes the all-halted test unevaluable exactly when
 # something has gone wrong (VI-02). Distinct from EXIT_OK's "scanned
 # everything, found no edge": scheduler.run_job maps this to a WARNING, never
-# counts the weekly slot as satisfied, and retries it.
+# counts the slot as satisfied, and retries it.
 EXIT_NO_TRADEABLE_SHARDS      = 30
 # No pair bought: a held market's ladder could not be identified, so the run
 # could not tell which ladders it already holds. It did scan the markets, so

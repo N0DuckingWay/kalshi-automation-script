@@ -1310,7 +1310,7 @@ def _blind_run_reason(markets: list, shard_statuses, inactive_shards: set) -> st
     market ingest yielded nothing to pair, and it must be reported with
     EXIT_NO_TRADEABLE_SHARDS rather than EXIT_OK: EXIT_OK claims "scanned
     everything, found no edge", which would let scheduler.run_job record the
-    weekly slot as satisfied by a run that never looked at a single book
+    scheduled slot as satisfied by a run that never looked at a single book
     (TS-01).
 
     Two independent causes, checked in that order because the first is the
@@ -1915,11 +1915,11 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
 
     # An ingest that produced nothing scanned nothing — an exchange-wide halt
     # dropping every market, or an empty ingest whose cause the status
-    # breakdown could not name. Either way that is not "no edge this week":
-    # return the dedicated code so scheduler.run_job never records the Monday
-    # slot as satisfied (TS-01, VI-02). Evaluated here, before the held-ticker
-    # and horizon filters below, so a filter that legitimately empties the list
-    # is never mistaken for a blind run.
+    # breakdown could not name. Either way that is not "no edge this run":
+    # return the dedicated code so scheduler.run_job never records the
+    # scheduled slot as satisfied (TS-01, VI-02). Evaluated here, before the
+    # held-ticker and horizon filters below, so a filter that legitimately
+    # empties the list is never mistaken for a blind run.
     blind_reason = _blind_run_reason(markets, shard_statuses, inactive_shards)
     if blind_reason:
         logging.warning("%s", blind_reason)
@@ -2401,7 +2401,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "Override one live default for THIS run only, in either mode "
         "(rebalancing and selling: production runs only). The live "
         "defaults are the ones saved through python3 -m kalshi_betting.defaults_server "
-        "(live_defaults.json); a run refuses to start without them. The weekly scheduler "
+        "(live_defaults.json); a run refuses to start without them. The scheduler "
         "passes none of these flags, so a scheduled run trades exactly the saved defaults.",
     )
     live.add_argument(
@@ -2579,7 +2579,7 @@ def _setup_logging(log_path: pathlib.Path) -> None:
     touch disk; the file is only created on the first emitted record.
 
     The file handler ROTATES (BS-25): a scheduler daemon runs this process
-    weekly forever, and a plain FileHandler would grow kalshi_arb.log without
+    twice a day forever, and a plain FileHandler would grow kalshi_arb.log without
     bound (see backtest.py's kalshi_backtest.log for the failure mode that
     motivated this). 5MB across 3 backups is logging infrastructure sized for
     this CLI's own verbosity, not a strategy constant, so it stays inline here

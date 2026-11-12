@@ -381,8 +381,8 @@ _V2_NO_MAPPING_CONFIRMED = False
 # the position by hand (flatten it, or bring it back to what the account held
 # there before the pair — _restore_remedy), so the bot must not keep opening
 # positions on the same mapping for the rest of the run. Only a new process
-# clears it; like the confirmation latch it is never persisted, so a
-# scheduled run the next week starts clear.
+# clears it; like the confirmation latch it is never persisted, so the
+# next scheduled run (07:00 or 21:00 Pacific) starts clear.
 # Each run the defaults server's Confirm and trade starts is a new process too,
 # so both disproof CRITICALs (the mapping check's and the ambiguous NO leg's)
 # name every way a real-money run starts: the scheduler daemon, main.py by

@@ -63,8 +63,8 @@ Dependencies:
     SPREAD_BAND_SWEEP_CEILINGS (both read only by _sweep_from_candidates;
     the size-cap grid SIZE_CAP_SWEEP is defined HERE instead, see Notes),
     MAX_DEADLINE_GAP_DAYS,
-    SCHEDULED_RUN and ScheduledRun (the weekly live run, whose UTC moments
-    are the entry checkpoints; tests patch backtester.SCHEDULED_RUN, never
+    SCHEDULED_RUN and ScheduledRun (the backtest's weekly moment, whose UTC
+    moments are the entry checkpoints; tests patch backtester.SCHEDULED_RUN, never
     config.*), SETTLED_PREFILTER_CACHE_TAG (the prefilter's version name),
     SHORT_DEADLINE_GAP_DAYS, TIME_SERIES_INTERVAL_PROB_DISCOUNT and
     TIME_SERIES_SAME_EVENT_LADDERS from config.py; fetch_all_settled_markets(),
@@ -314,8 +314,10 @@ Notes:
     pairs, so a backtest never simulates one without the other.
 
     An ENTRY CHECKPOINT is a moment at which the backtest may open a
-    simulated trade: the live bot's weekly run time (config.SCHEDULED_RUN,
-    Monday 09:00 America/Los_Angeles) on each run weekday. The backtest keeps
+    simulated trade: the weekly moment config.SCHEDULED_RUN names (Monday
+    09:00 America/Los_Angeles) on each run weekday. The live scheduler runs
+    at its own times (config.SCHEDULER_RUN_TIMES), which the backtest does
+    not follow. The backtest keeps
     UTC dates, so _prepare_candidates() refuses, before fetching, a schedule
     whose run does not fall once on its own UTC date (ScheduledRun.date_problems).
 
@@ -7640,7 +7642,7 @@ def _extract_pairs(
 
 def _checkpoint_datetime(d: date) -> datetime:
     """
-    The entry checkpoint on date `d`: SCHEDULED_RUN.instant(d), the UTC moment the live bot runs.
+    The entry checkpoint on date `d`: SCHEDULED_RUN.instant(d), the backtest's weekly UTC moment.
 
     _find_entry's checkpoints and the prefilter both come from SCHEDULED_RUN,
     so they cannot disagree. Tests patch backtester.SCHEDULED_RUN, never
@@ -13748,7 +13750,7 @@ def run_backtest(
       4. Fetch hourly candlesticks for every ticker appearing in a
          potential pair, in parallel across CANDLESTICK_FETCH_MAX_WORKERS
          threads.                                                   [prepare]
-      5. Find every entry checkpoint (the live run's weekly moment) where
+      5. Find every entry checkpoint (config.SCHEDULED_RUN's weekly moment) where
          the pair was tradeable at the threshold.                   [prepare]
       6. Keep each pair's qualifying Mondays that pass the Kelly gate;
          exclude (and count, with one summary WARNING) any candidate whose
@@ -15388,8 +15390,8 @@ def run_backtest_sweep(
         where = (f"{'/'.join(times)} UTC in this window" if times
                  else "no checkpoint in this window")
     logging.info(
-        "Entry checkpoint (backtest): %s (config.SCHEDULED_RUN, the live scheduler's "
-        "run time): %s",
+        "Entry checkpoint (backtest): %s (config.SCHEDULED_RUN, once a week; the live "
+        "scheduler runs at config.SCHEDULER_RUN_TIMES instead): %s",
         SCHEDULED_RUN.label(), where,
     )
     # And for the sell family: it is simulated when the dashboard reads it,

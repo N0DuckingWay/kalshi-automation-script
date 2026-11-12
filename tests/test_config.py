@@ -2,7 +2,8 @@
 leg-side tuple, the deadline-gap tier (with the backtest's spread band and
 tier-floors switch), the live toggles (LiveSettings and its helpers), the saved
 live defaults (their file's reader and writer, the seed, and the comparison of
-two sets of defaults), the weekly run schedule (ScheduledRun), the wait
+two sets of defaults), the backtest's weekly entry checkpoint (ScheduledRun),
+the live scheduler's daily run times (DailyRuns), the wait
 before a Kelly trim (rebalance_rested, rebalance_min_days, trade_day), the values
 config.py ships, conftest's apply_pre_toggle_defaults, the V2 order path's
 self-trade-prevention value, the startup check that refuses any order path but
@@ -38,12 +39,14 @@ from kalshi_betting.config import (
     PRICE_EPSILON,
     PROJECT_ROOT,
     SCHEDULED_RUN,
+    SCHEDULER_RUN_TIMES,
     SHORT_DEADLINE_GAP_DAYS,
     SPREAD_ABOVE_CEILING,
     SPREAD_BELOW_FLOOR,
     SPREAD_NOT_POSITIVE,
     TAKER_FEE_RATE,
     TIME_SERIES_LEG_SIDES,
+    DailyRuns,
     LiveSettings,
     ScheduledRun,
     fee_leg_exact,
@@ -3865,13 +3868,14 @@ class TestPreToggleDefaults:
 
 
 class TestScheduledRun:
-    """ScheduledRun, the weekly live run's schedule. The scheduler fires the
-    live run from it and the backtest enters every trade at instant(d), so
+    """ScheduledRun, a weekly moment: SCHEDULED_RUN is the backtest's entry
+    checkpoint (and DailyRuns.on() builds one per live run). The backtest
+    enters every trade at instant(d), so
     instant() must follow daylight-saving rules and date_problems() must flag
     every run date that is not one UTC moment on that same date."""
 
     def test_the_shipped_schedule_is_monday_0900_los_angeles(self):
-        # A change to the live run's time must fail a test, never pass silently
+        # A change to the backtest's entry time must fail a test, never pass silently
         assert SCHEDULED_RUN == ScheduledRun(0, 9, 0, "America/Los_Angeles")
 
     @pytest.mark.parametrize(
@@ -4006,6 +4010,92 @@ class TestScheduledRun:
         # No Monday is left before date.max: an empty list, never an overflow
         assert SCHEDULED_RUN.date_problems(date(9999, 12, 28), date.max) == []
         assert SCHEDULED_RUN.date_problems(date.max, date.max) == []
+
+
+class TestDailyRuns:
+    """DailyRuns, when the scheduler starts a live run: every day at each of a
+    few wall-clock times in one zone. on(d) hands each run on a date to
+    ScheduledRun, so a run's UTC moment and clock changes have one definition."""
+
+    def test_the_shipped_schedule_is_0700_and_2100_pacific(self):
+        # A change to the live run times must fail a test, never pass silently
+        assert SCHEDULER_RUN_TIMES == DailyRuns(((7, 0), (21, 0)), "America/Los_Angeles")
+        # The live runs keep the bot's own clock (the zone trade_day counts days in)
+        assert SCHEDULER_RUN_TIMES.timezone == SCHEDULED_RUN.timezone
+
+    @pytest.mark.parametrize(
+        "times",
+        [
+            (),
+            [(7, 0)],
+            ((7,),),
+            ((7, 0, 0),),
+            ((24, 0),),
+            ((-1, 0),),
+            ((7, 60),),
+            ((True, 0),),
+            (("7", 0),),
+            ((7, 0.0),),
+            ((21, 0), (7, 0)),
+            ((7, 0), (7, 0)),
+        ],
+        ids=["empty", "a-list", "no-minute", "three-fields", "hour-24", "hour-negative",
+             "minute-60", "a-bool", "a-string", "a-float", "out-of-order", "twice"],
+    )
+    def test_bad_times_are_refused(self, times):
+        with pytest.raises(ValueError, match="DailyRuns.times"):
+            DailyRuns(times, "America/Los_Angeles")
+
+    @pytest.mark.parametrize("zone", ["", None, 7])
+    def test_a_bad_zone_name_is_refused(self, zone):
+        with pytest.raises(ValueError, match="DailyRuns.timezone"):
+            DailyRuns(((7, 0),), zone)
+
+    def test_the_zone_is_resolved_only_on_use(self):
+        runs = DailyRuns(((7, 0),), "No/Such_Zone")  # constructing never looks it up
+        with pytest.raises(ZoneInfoNotFoundError):
+            runs.zone()
+
+    def test_frozen_and_compared_by_value(self):
+        runs = DailyRuns(((7, 0), (21, 0)), "America/Los_Angeles")
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            runs.times = ((8, 0),)
+        assert runs == SCHEDULER_RUN_TIMES
+        assert hash(runs) == hash(SCHEDULER_RUN_TIMES)
+        assert runs != DailyRuns(((7, 0), (21, 0)), "UTC")
+
+    def test_accessors(self):
+        assert SCHEDULER_RUN_TIMES.zone() == ZoneInfo("America/Los_Angeles")
+        assert SCHEDULER_RUN_TIMES.at_times() == ("07:00", "21:00")
+        assert SCHEDULER_RUN_TIMES.times_label() == "07:00 and 21:00"
+        assert SCHEDULER_RUN_TIMES.label() == "every day at 07:00 and 21:00 America/Los_Angeles"
+        one = DailyRuns(((9, 5),), "UTC")
+        assert one.times_label() == "09:05" and one.label() == "every day at 09:05 UTC"
+        three = DailyRuns(((0, 0), (12, 30), (23, 59)), "Etc/GMT+8")
+        assert three.times_label() == "00:00, 12:30 and 23:59"
+
+    def test_on_gives_each_run_of_the_day_as_a_scheduled_run(self):
+        # Tuesday 2026-11-10
+        assert SCHEDULER_RUN_TIMES.on(date(2026, 11, 10)) == (
+            ScheduledRun(1, 7, 0, "America/Los_Angeles"),
+            ScheduledRun(1, 21, 0, "America/Los_Angeles"),
+        )
+
+    def test_a_runs_utc_moment_follows_daylight_time(self):
+        # 07:00 Pacific is 14:00 UTC under daylight time and 15:00 under standard
+        # time; 21:00 Pacific falls on the next UTC date
+        summer = [run.instant(date(2026, 7, 1)) for run in SCHEDULER_RUN_TIMES.on(date(2026, 7, 1))]
+        winter = [run.instant(date(2026, 12, 1))
+                  for run in SCHEDULER_RUN_TIMES.on(date(2026, 12, 1))]
+        assert summer == [datetime(2026, 7, 1, 14, 0, tzinfo=UTC),
+                          datetime(2026, 7, 2, 4, 0, tzinfo=UTC)]
+        assert winter == [datetime(2026, 12, 1, 15, 0, tzinfo=UTC),
+                          datetime(2026, 12, 2, 5, 0, tzinfo=UTC)]
+
+    def test_no_shipped_run_is_skipped_or_repeated_by_a_clock_change(self):
+        # Pacific clocks change at 02:00, clear of both run times
+        for d in (date(2026, 3, 8), date(2026, 11, 1), date(2027, 3, 14), date(2027, 11, 7)):
+            assert [run.clock_change(d) for run in SCHEDULER_RUN_TIMES.on(d)] == [None, None]
 
 
 class TestLiveSettingsOrigin:
