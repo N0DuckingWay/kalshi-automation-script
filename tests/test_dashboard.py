@@ -3277,13 +3277,13 @@ class TestLiveRuleHeader:
 
 
 class TestEntryCheckpointHeader:
-    """The page header names the entry checkpoint (the live scheduler's run
-    time, BacktestSweep.entry_checkpoint) under the run-settings line, or
-    says it was not recorded."""
+    """The page header names the entry checkpoint (the backtest's weekly
+    moment, BacktestSweep.entry_checkpoint) under the run-settings line, says
+    the live runs are at other times, or says it was not recorded."""
 
     _LABEL = "Monday 09:00 America/Los_Angeles"
-    _RECORDED = (f"Entry checkpoint: {_LABEL} — the live scheduler's run "
-                 "time</p>")
+    _RECORDED = (f"Entry checkpoint: {_LABEL}, once a week (live runs are at "
+                 "other times)</p>")
     _NOT_RECORDED = "Entry checkpoint: not recorded</p>"
 
     def test_a_recorded_checkpoint_is_named_under_the_run_settings(
@@ -3319,8 +3319,7 @@ class TestEntryCheckpointHeader:
         sweep = BacktestSweep(primary=pt, points=[pt], calibration=None)
         page = TestRunSettingsHeader._page(monkeypatch, tmp_path, sweep=sweep)
         assert self._NOT_RECORDED in page
-        assert "the live scheduler&#x27;s run time" not in page
-        assert "the live scheduler's run time" not in page
+        assert "once a week" not in page
 
     @pytest.mark.parametrize("value", [None, "", MagicMock(), 7])
     def test_anything_but_a_label_reads_not_recorded(self, value):
@@ -3334,7 +3333,7 @@ class TestEntryCheckpointHeader:
         sweep = BacktestSweep(primary=pt, points=[pt], calibration=None,
                               entry_checkpoint="Monday 09:00 <Zone>")
         line = dashboard._entry_checkpoint_html(sweep)
-        assert "Entry checkpoint: Monday 09:00 &lt;Zone&gt; — the live" in line
+        assert "Entry checkpoint: Monday 09:00 &lt;Zone&gt;, once a week" in line
         assert "<Zone>" not in line
 
     def test_a_run_s_sweep_reaches_the_page(self, monkeypatch, tmp_path):
@@ -3343,8 +3342,8 @@ class TestEntryCheckpointHeader:
         sweep = backtester.run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1),
                                               1000.0, sweep=False)
         page = TestRunSettingsHeader._page(monkeypatch, tmp_path, sweep=sweep)
-        assert (f"Entry checkpoint: {backtester.SCHEDULED_RUN.label()} — the live "
-                "scheduler's run time</p>") in page
+        assert (f"Entry checkpoint: {backtester.SCHEDULED_RUN.label()}, once a week "
+                "(live runs are at other times)</p>") in page
 
 
 class TestFillsHeader:

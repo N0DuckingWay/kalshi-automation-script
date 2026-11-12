@@ -1259,11 +1259,11 @@ def _where_html(*, saving: bool, trading: bool = False) -> str:
     root = html.escape(str(config.PROJECT_ROOT.absolute()))
     if saving:
         text = (f"<p>This writes <code>{path}</code>; every live run of the code in "
-                f"<code>{root}</code> reads it (the weekly scheduler's too, when it runs "
+                f"<code>{root}</code> reads it (the scheduler's too, when it runs "
                 "from this checkout).</p>")
     else:
         text = (f"<p>Every live run of the code in <code>{root}</code> reads its defaults "
-                f"from <code>{path}</code> (the weekly scheduler's too, when it runs from "
+                f"from <code>{path}</code> (the scheduler's too, when it runs from "
                 "this checkout).</p>")
     if trading:
         lock = html.escape(str(config.LIVE_RUN_LOCK_FILE.absolute()))

@@ -2382,7 +2382,7 @@ _PIPELINE_MODULES = [
 class TestPipelineIsolation:
     """v2_probe submits real orders; the pipeline must never be able to reach
     it. A single import would put probe submissions one code path away from
-    the weekly scheduler."""
+    the scheduler."""
 
     @pytest.mark.parametrize("module", _PIPELINE_MODULES)
     def test_no_pipeline_module_imports_v2_probe(self, module):
