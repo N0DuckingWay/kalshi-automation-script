@@ -49,7 +49,7 @@ Every file here but `writing-for-people.md` was moved word for word from this fi
 | `known-gotchas/backtest-selling-and-rebalancing.md` | The Rebalance family and its selects, the backtest's take-profit rule, the Sell select's workers and chunk files, rebuilding from the saved sweep, the backtest Kelly trim and its wait, the live trim against it |
 | `known-gotchas/backtest-valuation.md` | The equity curve, open trades at market, the modeled order book, Sharpe and Sortino net of the T-bill |
 | `known-gotchas/backtest-data.md` | The settled-market fetch and its caches, memory, `min_settled_ts`, cache semantics, the UTC feasibility check, candles through today, hourly candles, the eligibility prefilter, event-title resolution |
-| `known-gotchas/backtest-entries.md` | The entry checkpoint (the scheduler's run instant), the pair-extraction window, the earliest Kelly-passing Monday (DR-75) |
+| `known-gotchas/backtest-entries.md` | The backtest's weekly entry checkpoint (Monday 09:00 Pacific, not the live run times), the pair-extraction window, the earliest Kelly-passing Monday (DR-75) |
 
 Where the code's comments, README.md or older plans point at a section of this file, the section now lives here: "What This Is" is `overview.md`, "Module Map" is `module-map/`, "Run Commands" is `run-commands.md`, "CI and Packaging" is `ci-and-packaging.md`, "Key Patterns" is `key-patterns/`, "Known Gotchas" is `known-gotchas/` and "What NOT To Do" is `what-not-to-do.md`, all under `docs/claude/`. A tag such as DR-74, TS-08 or BS-14 names a recorded finding: `grep -rln "DR-74" docs/claude` finds its file.
 
