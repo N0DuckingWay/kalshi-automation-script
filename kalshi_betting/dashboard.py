@@ -211,13 +211,12 @@ Purpose:
     (only on a page that carries the choices, beside those two as
     rebalance_min_days_to_maturity: the choice's days, or 0, no days limit,
     at maturity and with Rebalance no), Sell level and Min. days to
-    maturity (only on a page that simulated selling), with this run's
-    same-title cap when the run recorded one — never for the Scenario
-    Explorer's own selects. The address names each category ticked in the
-    Exclude categories menu as a category live runs exclude, and so each
-    kept category every one of whose tags is ticked in the Exclude tags
-    menu (with its letter-case twins, each ticked or with every tag ticked
-    too), and each other "Category · Tag" ticked as a tag live runs exclude
+    maturity (only on a page that simulated selling) — never for the
+    Scenario Explorer's own selects. The address names each category
+    ticked in the Exclude categories menu as a category live runs exclude,
+    and so each kept category every one of whose tags is ticked in the
+    Exclude tags menu (with its letter-case twins, each ticked or with every
+    tag ticked too), and each other "Category · Tag" ticked as a tag live runs exclude
     in that category (letter-case twins included, as the page ticks them),
     so every other category and tag trades live, one the backtest never saw
     included, and a save replaces the saved excluded categories and tags.
@@ -278,9 +277,10 @@ Dependencies:
     a backtester.SameMove for a minimum price movement that repeats another
     run, and whose maturity_grid a backtester.SameMaturity for a "Rebalance
     until" choice that does) by their attributes; imports backtester itself to
-    read, and in a worker process install, its SAME_TITLE_SIZE_CAP,
-    SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS (_run_sell_task; the last also
-    names the Sell select's rule, _sell_select_title), to read its
+    read, and in a worker process install, its SCHEDULED_RUN and
+    TAKE_PROFIT_HOLD_DAYS (_run_sell_task, which installs config's
+    CONFIRMED_FEE_MULTIPLIERS beside them; TAKE_PROFIT_HOLD_DAYS also names
+    the Sell select's rule, _sell_select_title), to read its
     REBALANCE_MIN_DAYS_SINCE_TRADE (named in the Rebalance select's hover
     text, _rebalance_select_title), and to word a minimum price movement and
     a "Rebalance until" choice as a run's label does (_move_label,
@@ -294,7 +294,7 @@ Dependencies:
     and DEFAULTS_SERVER_PORT (the address the filter bar's save button and
     trade link open), LIVE_DEFAULTS_SOURCE_PATTERN (the note shapes that server
     accepts, which the button's note is checked against),
-    SAME_TITLE_CO_RESOLVE_PROB, CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR,
+    CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR,
     RISK_FREE_BILL_TERM and RISK_FREE_RATE_FIELD (named in the header),
     MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS
     and MAX_DEADLINE_GAP_DAYS (so the filter bar and the scenario explorer's
@@ -454,9 +454,7 @@ Notes:
     (_ExplorerVisitor — one that fails costs only the
     explorer's cap axis: it is rebuilt from the sweep's own eager points,
     tier-floors-off family included, and a notice replaces it only if even
-    that fails). The walk also reads
-    the same-title population once, at every cap, for the visitors that show
-    or count it. Only one cell's
+    that fails). Only one cell's
     points are ever alive, so a cap grid's points are never held in memory
     together; the chunks are held as separate packed strings until each is
     written (the page's first into the page, every other as a file in the
@@ -565,10 +563,9 @@ Notes:
     (_entry_mid_spread again), never the prices paid.
 
     The scenario explorer's heatmap, fragility banner and equity curve read
-    the "time_series" population — every time-series entry simulated alone,
-    same-title excluded — never the "all" one, so a same-title result (band-
-    and k-independent) cannot dilute the band x k comparison; "all" keeps its
-    own labelled KPI row.
+    the "time_series" population — every time-series entry simulated alone —
+    never the "all" one, which keeps its own labelled KPI row. The backtest
+    simulates time-series pairs only, so the two hold the same entries.
 """
 import base64
 import contextlib
@@ -656,7 +653,6 @@ from .config import (
     PROJECT_ROOT,
     RISK_FREE_BILL_TERM,
     RISK_FREE_RATE_FIELD,
-    SAME_TITLE_CO_RESOLVE_PROB,
     SHORT_DEADLINE_GAP_DAYS,
     TAG_SCOPE_SEPARATOR,
     TRADING_DAYS_PER_YEAR,
@@ -1069,8 +1065,9 @@ def _max_drawdown(equity: pd.Series) -> tuple[float, date | None]:
 
 
 # Trade-type lines of the performance chart, in display order: (label, colour).
+# The two kinds of time-series pair: two rungs of one event's deadline ladder,
+# and two events asking one question at two deadlines.
 _TRADE_TYPE_LINES = (
-    ("Same-title", "#8E24AA"),
     ("Time-series: ladder", "#FB8C00"),
     ("Time-series: cross-event", "#43A047"),
 )
@@ -1086,17 +1083,26 @@ def _trade_type_label(trade: BacktestTrade) -> str:
     """
     Name the trade-type line a trade belongs to.
 
+    Every trade the page is handed is a time-series pair (the backtest
+    simulates no other kind, and the saved results the page is rebuilt from
+    hold no other), so the line is chosen by whether its two markets are
+    rungs of one event's deadline ladder. A trade of any other pair type has
+    no line: it raises rather than being drawn on one.
+
     Args:
         trade (BacktestTrade): A completed trade.
 
     Returns:
-        str: "Same-title" for any pair type other than time_series (the same
-            fail-safe reading scanner.leg_sides applies), otherwise
-            "Time-series: ladder" or "Time-series: cross-event" by
-            BacktestTrade.same_event_ladder.
+        str: "Time-series: ladder" when BacktestTrade.same_event_ladder is
+            set, otherwise "Time-series: cross-event".
+
+    Raises:
+        ValueError: For a trade whose pair type is not "time_series".
     """
     if trade.pair_type != "time_series":
-        return "Same-title"
+        # Reached only by a bug: a fresh run and the saved results both hold
+        # time-series trades only
+        raise ValueError(f"not a time-series pair type: {trade.pair_type!r}")
     return "Time-series: ladder" if trade.same_event_ladder else "Time-series: cross-event"
 
 
@@ -1204,11 +1210,12 @@ def _spread_observations(trades: list[BacktestTrade]) -> list[tuple[float, int]]
     paid — the market-implied probability that the event first happens
     between the two deadlines, and the input the forecast reads. The outcome
     is 1 when the pair settled A = NO, B = YES (the in-between cell, where
-    both legs lose) and 0 otherwise. Same-title trades are left out — their
-    price gap is not the probability of anything.
+    both legs lose) and 0 otherwise. A trade of any other pair type has no
+    mid spread (_entry_mid_spread) and is left out; the page is handed
+    time-series trades only.
 
     Args:
-        trades (list[BacktestTrade]): Completed trades of either pair type.
+        trades (list[BacktestTrade]): Completed trades.
 
     Returns:
         list[tuple[float, int]]: (mid spread, in_between) per time-series
@@ -1286,25 +1293,29 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
                     k: float | None = None, *, spread: float | None = None,
                     multiplier_a: float = 1.0, multiplier_b: float = 1.0) -> float:
     """
-    Uncapped Kelly fraction f* = p - (1-p)/b for one pair trade.
+    Uncapped Kelly fraction f* = p - (1-p)/b for one time-series pair trade.
 
     Mirrors strategy._kelly_p_at and strategy.compute_trade so the dashboard
     scatter shows the same theoretical Kelly the live sizer would compute
     (before the per-pair cap, config.pair_size_cap) — including the
     fee-inclusive Kelly denominator b = net_spread / (price_a + price_b + fee),
     since the losing cell loses the fee too (DR-62). The legs are mapped
-    exactly like scanner.leg_prices: a same_title pair costs nA + pB (NO on A,
-    YES on B) and is priced on the SAME_TITLE_CO_RESOLVE_PROB prior; a
-    time_series pair costs pA + nB (YES on the earlier contract A, NO on the
-    later contract B) and is priced on config.time_series_profit_prob of its
-    mid spread (config.time_series_mid_spread: the later market's midpoint
-    minus the earlier one's, a midpoint being halfway between a market's YES
-    ask and its YES bid) — one minus the discounted market-implied probability
-    of the single loss cell (A=NO, B=YES; the event first happens between the
+    exactly as scanner.leg_prices maps a time-series pair: it costs pA + nB
+    (YES on the earlier contract A, NO on the later contract B) and is priced
+    on config.time_series_profit_prob of its mid spread
+    (config.time_series_mid_spread: the later market's midpoint minus the
+    earlier one's, a midpoint being halfway between a market's YES ask and its
+    YES bid) — one minus the discounted market-implied probability of the
+    single loss cell (A=NO, B=YES; the event first happens between the
     deadlines). The two win cells are event by A (A=YES, hence B=YES) and never
     by B (A=NO, B=NO); A=YES/B=NO is impossible for a cumulative-deadline pair,
-    a premise both pair-finders now screen for in the legs' wording
+    a premise both pair-finders screen for in the legs' wording
     (scanner.deadline_phrasing). Returns 0.0 when there is no edge.
+
+    A pair of any other type gets 0.0 too, no edge: the page shows
+    time-series trades only (the backtest simulates no other kind), and this
+    function has no forecast for another kind, so it never prices one on the
+    time-series forecast.
 
     The optional k must be whatever interval discount the plotted trades were
     actually SIZED at (backtester.SweepPoint.k). Leaving it None on a run that
@@ -1312,45 +1323,43 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
     trades sized at the override — a wrong chart, not merely a missing feature.
 
     Args:
-        pA (float): YES ask price of market A at entry (a leg price for time_series).
-        nA (float): NO ask price of market A at entry (a leg price for same_title;
-            gives market A's YES bid in the time_series mid spread).
-        pB (float): YES ask price of market B at entry (a leg price for same_title;
-            feeds the time_series mid spread).
-        nB (float): NO ask price of market B at entry (a leg price for time_series).
-        pair_type (str): "time_series" or "same_title" — selects the leg prices
-            and the probability model; anything else is treated as same_title,
-            matching scanner.leg_sides.
+        pA (float): YES ask price of market A at entry (the YES leg's price).
+        nA (float): NO ask price of market A at entry (gives market A's YES bid
+            in the mid spread).
+        pB (float): YES ask price of market B at entry (feeds the mid spread).
+        nB (float): NO ask price of market B at entry (the NO leg's price).
+        pair_type (str): The pair's type: "time_series" is priced, and any
+            other gets 0.0.
         k (float | None): Interval-discount override in [0, 1] handed straight to
             config.time_series_profit_prob. None (default) means "no override",
             which that helper resolves at call time to
             config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (config.py's k, which
             the backtest defaults to; live sizing reads the saved live
-            defaults' k). Ignored for same_title, which prices on a fixed prior.
-        spread (float | None): Keyword-only. The time_series mid spread to
-            forecast at; None (default) reads it from the four quotes given.
-            A caller whose four hold fills in place of quotes hands in the
-            entry quotes' own (_entry_mid_spread), as the live sizer prices
-            its legs at the fills and its forecast at the book's tops.
-            Ignored for same_title.
+            defaults' k).
+        spread (float | None): Keyword-only. The mid spread to forecast at;
+            None (default) reads it from the four quotes given. A caller
+            whose four hold fills in place of quotes hands in the entry
+            quotes' own (_entry_mid_spread), as the live sizer prices its legs
+            at the fills and its forecast at the book's tops.
         multiplier_a (float): Keyword-only. Market A's fee multiplier, the one
             the trade was priced at (BacktestTrade.fee_multiplier_a).
         multiplier_b (float): Keyword-only. Market B's.
 
     Returns:
-        float: Uncapped Kelly fraction, clamped to be >= 0.
+        float: Uncapped Kelly fraction, clamped to be >= 0; 0.0 for any pair
+            type other than "time_series".
     """
-    if pair_type == "time_series":
-        price_a, price_b = pA, nB
-        # The forecast's input (DR-78): these four quotes' mid spread, unless
-        # the caller hands in the entry quotes' own (its four may hold fills)
-        spread = time_series_mid_spread(pA, nA, pB, nB) if spread is None else spread
-        # Shared definition with strategy._kelly_p_at / backtester._simulate_at_discount
-        # so the dashboard can never show a Kelly the live sizer would not compute
-        p = time_series_profit_prob(spread, k=k)
-    else:
-        price_a, price_b = nA, pB
-        p = SAME_TITLE_CO_RESOLVE_PROB
+    if pair_type != "time_series":
+        # The page shows time-series trades only, and there is no forecast
+        # here for any other kind: no edge, never the time-series forecast
+        return 0.0
+    price_a, price_b = pA, nB
+    # The forecast's input (DR-78): these four quotes' mid spread, unless
+    # the caller hands in the entry quotes' own (its four may hold fills)
+    spread = time_series_mid_spread(pA, nA, pB, nB) if spread is None else spread
+    # Shared definition with strategy._kelly_p_at / backtester._simulate_at_discount
+    # so the dashboard can never show a Kelly the live sizer would not compute
+    p = time_series_profit_prob(spread, k=k)
     cost = price_a + price_b
     # Each leg at its own market's fee multiplier (market order, as price_a, price_b)
     fee_approx = fee_per_pair_approx(price_a, price_b, multiplier_a=multiplier_a,
@@ -1370,20 +1379,22 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
 
 def _entry_mid_spread(t: BacktestTrade) -> float | None:
     """
-    A time-series trade's mid spread at its entry quotes; None for same-title.
+    A time-series trade's mid spread at its entry quotes; None for any other trade.
 
     The forecast's input on the Monday the trade was entered: the later
     market's midpoint minus the earlier one's over entry_pA, entry_nA,
     entry_pB and entry_nB (config.time_series_mid_spread), the quotes the
     backtest's Kelly gate priced it at, whatever the trade then paid. The
     Kelly scatter (_kelly_points) forecasts each trade at it, and the spread
-    calibration (_spread_observations) scores it.
+    calibration (_spread_observations) scores it. Only a time-series pair has
+    a mid spread to forecast at; the page is handed no other kind.
 
     Args:
         t (BacktestTrade): A trade.
 
     Returns:
-        float | None: The mid spread in dollars; None for a same_title trade.
+        float | None: The mid spread in dollars; None when the trade's pair
+            type is not "time_series".
     """
     if t.pair_type != "time_series":
         return None
@@ -1728,13 +1739,12 @@ def _trade_category(
     File a trade under Kalshi's official category and its first tag.
 
     Looks up market A's series in historical.load_series_categories' map,
-    through _series_labels. Market A speaks for the pair: a same-title pair's
-    two legs ask one question, a same-event ladder's share one event, and a
-    cross-event time-series pair's legs ask one question at two deadlines —
-    usually within one series, and when not, the earlier leg (A) is the one
-    filed. Without a map, or for a series missing from it, it falls back to
-    BacktestTrade.category (the ticker-prefix label) so the breakdown still
-    renders.
+    through _series_labels. Market A speaks for the pair: a same-event
+    ladder's legs share one event, and a cross-event pair's legs ask one
+    question at two deadlines — usually within one series, and when not, the
+    earlier leg (A) is the one filed. Without a map, or for a series missing
+    from it, it falls back to BacktestTrade.category (the ticker-prefix
+    label) so the breakdown still renders.
 
     Args:
         trade (BacktestTrade): A completed trade.
@@ -2020,10 +2030,9 @@ def _decomposition_aggregates(df: pd.DataFrame) -> dict:
     Each group is added with _compensated_sum, the sum the page script repeats
     for a mix of categories and tags.
 
-    Entry price buckets read entry_pA, market A's YES ask at entry, for both
-    pair types. It is a quote, not what the trade paid: the leg a trade buys
-    on market A (the YES leg of a time_series trade, the NO leg of a
-    same_title one) paid its own fill price.
+    Entry price buckets read entry_pA, market A's YES ask at entry. It is a
+    quote, not what the trade paid: the YES leg a trade buys on market A paid
+    its own fill price.
 
     Args:
         df (pd.DataFrame): _decomposition_frame's output. Not modified.
@@ -2097,8 +2106,7 @@ def _section_decomposition(
     ))
     fig_sub.update_layout(title="P&L by Category · Tag ($)", xaxis_title="P&L ($)")
 
-    # Entry price bucket (see _decomposition_aggregates for what entry_pA means
-    # for each pair type)
+    # Entry price bucket (see _decomposition_aggregates for what entry_pA means)
     price_grp = agg["price"]
     fig_price = go.Figure(go.Bar(
         x=price_grp.index.astype(str), y=price_grp.values,
@@ -2138,9 +2146,9 @@ def _reliability(trades: list[BacktestTrade]) -> dict:
     Each time-series trade contributes one prediction — its entry mid spread,
     the market-implied probability that the event lands between the two
     deadlines — against whether the pair settled A = NO, B = YES
-    (_spread_observations). Same-title trades contribute nothing. The diagram
-    bins the predictions into 10 equal-width probability bins and keeps the
-    non-empty ones.
+    (_spread_observations). A trade of any other pair type contributes
+    nothing. The diagram bins the predictions into 10 equal-width probability
+    bins and keeps the non-empty ones.
 
     Args:
         trades (list[BacktestTrade]): Completed trades; may be empty.
@@ -2232,10 +2240,8 @@ def _section_calibration(trades: list[BacktestTrade]) -> str:
 
     Computes Brier score and log loss KPIs and renders a reliability diagram
     of the time-series entry mid spread (_entry_mid_spread) against the rate
-    the pairs settled A = NO, B = YES, per bin (_reliability). Same-title
-    trades are not shown;
-    a selection without a time-series trade shows "—" cards and an empty
-    diagram.
+    the pairs settled A = NO, B = YES, per bin (_reliability); a selection
+    without a time-series trade shows "—" cards and an empty diagram.
 
     Args:
         trades (list[BacktestTrade]): Completed backtest trades with entry prices
@@ -2446,8 +2452,7 @@ def _label_coverage_html(coverage: OutcomeLabelCoverage | None) -> str:
         f"{BACKTEST_OUTCOME_LABEL_WARN_FRACTION * 100.0:.2f}% floor</b> "
         f"({figures}). Most eligible markets carry no subtitle, so the "
         "time-series grouping key fell back to the bare normalized title — the "
-        "strike-blind grouping the live scanner no longer uses — and the "
-        "same-title key lost its outcome discriminator. The pairs behind the "
+        "strike-blind grouping the live scanner no longer uses. The pairs behind the "
         "k&#770; below, the per-k table and every other strategy-derived "
         "section of this page (the &#94;GSPC benchmark trace, having no pair "
         "population behind it, is unaffected) "
@@ -3779,26 +3784,20 @@ _EQUITY_DAILY_MAX_ROWS = 400
 _SCENARIO_POPULATIONS = ("all", "ladder", "cross", "time_series")
 
 # The population the heatmap, the fragility banner and the equity curve read:
-# every time-series entry (ladders + cross-event) simulated alone, same-title
-# excluded. The band and k act on time-series pairs only, and a same-title
-# pair prices on the fixed co-resolution prior, so an "all" cell carrying
-# same-title trades would dilute the very comparison the explorer exists for
-# — and the DR-73 calibration evidence the grid is read against was
-# time-series only (its "All" row was 330 = 299 ladder + 31 cross-event
-# entries). "all" keeps its own labelled KPI row.
+# every time-series entry (ladders + cross-event) simulated alone, the
+# entries the band and k act on. The backtest simulates time-series pairs
+# only, so the "all" population holds the same entries; it keeps its own
+# labelled KPI row.
 _HEADLINE_POPULATION = "time_series"
 
 # Every population's label on the page, spelled once so the KPI rows, the
 # banner, the heatmap title and the curve title can never name one
-# population two ways. Same-title is simulated once, and no band, k or
-# deadline-gap tier floor reaches a same-title pair, so its row reads the
-# same under both Tier floors settings — and its label says so.
+# population two ways.
 _POPULATION_LABELS = {
-    "time_series": "Time-series (ladders + cross-event; same-title excluded)",
-    "all": "All (time-series + same-title)",
+    "time_series": "Time-series (ladders + cross-event)",
+    "all": "All trades",
     "ladder": "Ladders (same-event)",
     "cross": "Cross-event",
-    "same_title": "Same-title (independent of band, k and the tier floors)",
 }
 
 # The scenario explorer's heatmap hovers, one per kind of figure. A percent
@@ -4055,9 +4054,9 @@ def _point_kpis(point: SweepPoint, *, risk_free: RiskFreeRates | None = None) ->
     Compute one standalone SweepPoint's KPI-table row.
 
     Every field is derived from the point's OWN trades and OWN equity curve,
-    never sliced out of a joint run: a band sweep's "ladder" and "cross"
-    points and the same-title point are each their own simulation from the
-    initial balance, and only a simulation that ran alone has a return, a
+    never sliced out of a joint run: a band sweep's "time_series", "ladder"
+    and "cross" points are each their own simulation from the initial
+    balance, and only a simulation that ran alone has a return, a
     drawdown or a Sharpe of its own — slicing the joint "all" run's trades by
     population would give a P&L sum with no curve behind it.
 
@@ -4193,7 +4192,7 @@ def _robustness_extras(point: SweepPoint) -> dict:
 # block (id="scn-data": the axes and their labels, the calibration per band,
 # the heatmap metrics and their size-cap-independent matrices) and, when a
 # size cap is chosen, that cap's block (id="scn-cap-<i>": every cell's
-# figures, the same-title row, the banner, the cap's matrices and the heatmap
+# figures, the banner, the cap's matrices and the heatmap
 # titles), all packed by _packed_json_script and unpacked here by unpack(el)
 # — the primary cap's as the page loads, any other only when chosen — and,
 # on a page with a tier-floors-off view, when that setting is chosen at a cap
@@ -4369,10 +4368,8 @@ _SCENARIO_EXPLORER_JS = r"""
   // The KPI table, the band's calibration table and the curve, for the band,
   // k, cap and setting ON SCREEN. The headline (time-series) population
   // first — the one the heatmap and banner read — then its two parts, then
-  // All and Same-title, each row named by its own label so no two
-  // populations can be mistaken. A cell the run never simulated at this cap
-  // reads "—". Same-title is read from the cap's block under both settings:
-  // no tier floor reaches a same-title pair.
+  // All, each row named by its own label so no two populations can be
+  // mistaken. A cell the run never simulated at this cap reads "—".
   function renderTables() {
     var cell = cellAt(SHOWN[0], SHOWN[1]);
     var L = D.labels;
@@ -4380,8 +4377,7 @@ _SCENARIO_EXPLORER_JS = r"""
     byId('scn-kpi-body').innerHTML =
       kpiRow(esc(L.time_series), ts) + extrasRow(ts)
       + kpiRow(esc(L.ladder), cell[P.ladder]) + kpiRow(esc(L.cross), cell[P.cross])
-      + kpiRow(esc(L.all), cell[P.all]) + extrasRow(cell[P.all])
-      + kpiRow(esc(L.same_title), capData().same_title);
+      + kpiRow(esc(L.all), cell[P.all]) + extrasRow(cell[P.all]);
     byId('scn-cal-body').innerHTML = calRows(calAt(SHOWN[0]));
     // The headline population's curve, like the heatmap, on the explorer's
     // own date axis (D.dates). An update, not a restyle: both axes are
@@ -4997,11 +4993,10 @@ def _live_sizing_bar_clause(sweep: BacktestSweep, bar: dict | None,
     Say how this page's filter bar shows the saved defaults' sizing, or what it cannot show.
 
     Added to the live-rule line only after backtester._live_sizing_note, i.e.
-    when the saved defaults' k or caps differ from this run's primary, and
-    only where the line says this page shows the live rule: choosing a k and
-    a cap in the bar then shows that rule at them. The bar offers k and a
-    per-trade size cap; the same-title cap every row sized under is the run's
-    own (BacktestSweep.same_title_size_cap), never a bar choice.
+    when the saved defaults' k or per-trade cap differs from this run's
+    primary, and only where the line says this page shows the live rule:
+    choosing a k and a cap in the bar's k and Size cap selects then shows
+    that rule at them.
 
     Args:
         sweep (BacktestSweep): The run's sweep, its live_* sizing recorded.
@@ -5018,9 +5013,8 @@ def _live_sizing_bar_clause(sweep: BacktestSweep, bar: dict | None,
     Returns:
         str: "" when shown is None; "; choose <k option> and Size cap <cap
             option> in the filter bar to see it" when the bar offers both
-            values, holds a scenario of the live rule there and the two
-            same-title caps agree; otherwise a "; ..." clause naming what the
-            bar cannot show.
+            values and holds a scenario of the live rule there; otherwise a
+            "; ..." clause naming what the bar cannot show.
 
     Raises:
         Nothing. It only reads the sweep and the bar's entries.
@@ -5060,8 +5054,7 @@ def _live_sizing_bar_clause(sweep: BacktestSweep, bar: dict | None,
 
     k_found = offered(bar.get("ks"), k, pk)
     cap_found = offered(bar.get("caps"), cap, pc)
-    same_title_agrees = sweep.live_same_title_size_cap == sweep.same_title_size_cap
-    if k_found is not None and cap_found is not None and same_title_agrees:
+    if k_found is not None and cap_found is not None:
         # The bar's scenario at that band, k and cap: a chunk id, or null where
         # the run simulated none (a tier-floors-off cell at a cap the page could
         # not simulate it at)
@@ -5072,14 +5065,11 @@ def _live_sizing_bar_clause(sweep: BacktestSweep, bar: dict | None,
                     f"{cap_found[1]} but holds no scenario of the live rule there")
         return (f"; choose {k_found[1]} and Size cap {cap_found[1]} in the filter bar "
                 "to see it")
+    # One of the two at least is not offered: name each one missing
     missing = [text for found, text in ((k_found, _k_option(k)),
                                         (cap_found, f"size cap {_cap_option(cap)}"))
                if found is None]
-    parts = ([f"this page's filter bar does not offer {' or '.join(missing)}"]
-             if missing else [])
-    if not same_title_agrees:
-        parts.append("the same-title cap is not a filter-bar choice")
-    return "; " + ", and ".join(parts)
+    return f"; this page's filter bar does not offer {' or '.join(missing)}"
 
 
 def _sell_choice_in_bar(sweep: BacktestSweep, bar: dict | None, band_index: int | None,
@@ -5277,7 +5267,7 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     categories it keeps no pair of, and the tags it leaves out of each
     category it keeps only in part, or why the page cannot
     (_live_filter_ticks, _tick_phrase). When the saved defaults
-    size at a k or caps other than this run's primary, it says so
+    size at a k or per-trade cap other than this run's primary, it says so
     (backtester._live_sizing_note) and, where the page shows the rule, how
     its filter bar shows it at that sizing (_live_sizing_bar_clause). When
     the saved defaults rebalance held pairs or sell, which no primary does,
@@ -5298,8 +5288,8 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
             option texts the line names; None when the page has no filter bar.
 
     Returns:
-        str: One <p>, its text escaped: the rule, any live filter, the same-title cap
-            and where (or whether) the page shows the rule, plus any ladder-departure,
+        str: One <p>, its text escaped: the rule, any live filter and where (or
+            whether) the page shows the rule, plus any ladder-departure,
             sizing, rebalancing and selling notes; "Live rule: not
             recorded" when sweep is None, and backtester._LIVE_RULE_NONE's words when
             the run recorded no live rule.
@@ -5316,15 +5306,6 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     filtered = excluded is not None or tags is not None
     if filtered:
         rule += f"; category/tag filter ({_live_filter_text(excluded, tags)})"
-    run_cap, st_cap = sweep.primary.size_cap, sweep.same_title_size_cap
-    if run_cap is None or st_cap is None:
-        cap_clause = "same-title cap not recorded"
-    else:
-        own = f"{_cap_percent(min(run_cap, st_cap))}% at this run's own cap"
-        cap_clause = ("same-title trades capped at the size cap shown, like every pair "
-                      f"({own})" if st_cap >= 1.0 else
-                      "same-title trades capped at the lower of the size cap shown and "
-                      f"{_cap_percent(st_cap)}% ({own})")
 
     # What to tick in the bar's two menus to show a live filter
     # (ticks); when the bar cannot show it, why not (slices)
@@ -5401,7 +5382,7 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
         seen = "the selling alone" if rebalance_note else "it"
         sell_note += (f" — choose {choice} in the filter bar to see {seen}" if choice is not None
                       else " — this page cannot show that Sell level and minimum of days")
-    text = (f"Live rule ({_LIVE_RULE_LABEL}): {rule}; {cap_clause} — {tail}{sizing}"
+    text = (f"Live rule ({_LIVE_RULE_LABEL}): {rule} — {tail}{sizing}"
             f"{rebalance_note}{sell_note}")
     return f"{style}{html.escape(text, quote=False)}</p>"
 
@@ -5884,14 +5865,11 @@ def _section_scenario_explorer(
 
     The heatmap, the banner and the equity curve all read ONE population,
     _HEADLINE_POPULATION — "time_series", every time-series entry (ladders +
-    cross-event) simulated alone with same-title excluded — and say so on
-    the page. The band and k act on time-series pairs only; same-title pairs
-    price on the fixed co-resolution prior, so reading the "all" cells here
-    would let a band- and k-independent result dilute the comparison, and
-    the evidence the grid is read against (the DR-73 calibration corpus) was
-    time-series only. A cell with no time-series entry has no time-series
-    point and reads "—" everywhere below; nothing falls back to "all". In
-    order:
+    cross-event) simulated alone, the entries the band and k act on — and
+    say so on the page. The backtest simulates time-series pairs only, so a
+    run's "all" cells hold the same entries; they keep their own KPI row. A
+    cell with no time-series entry has no time-series point and reads "—"
+    everywhere below; nothing falls back to "all". In order:
 
       1. A fragility banner for the size cap shown (_explorer_banner): how
          many band x k cells were computed at that cap (and, when some have
@@ -5934,12 +5912,11 @@ def _section_scenario_explorer(
          unpacked its data, driving — through the small inline script
          _SCENARIO_EXPLORER_JS — a KPI table with one row per population,
          each labelled from _POPULATION_LABELS (Time-series, with a sub-row of
-         its H1/H2 and top-event figures; Ladders; Cross-event; All —
-         time-series + same-title, the run's actual result — with its own
-         sub-row; Same-title, which is independent of band and k but not of
-         the cap), the selected band's own calibration table, and the
-         time-series equity curve (rendered once for the primary scenario via
-         _fig_html(div_id="scn-equity") and redrawn in place by a
+         its H1/H2 and top-event figures; Ladders; Cross-event; All trades —
+         the run's actual result — with its own sub-row), the selected band's
+         own calibration table, and the time-series equity curve (rendered
+         once for the primary scenario via _fig_html(div_id="scn-equity")
+         and redrawn in place by a
          Plotly.update that autoranges both axes and titles it for the Tier
          floors setting, so a zoom never carries into another view). The
          page-wide filter bar's script moves these selects to the scenario
@@ -5993,12 +5970,11 @@ def _section_scenario_explorer(
     k-hat matrices and the status line's words; each of those null
     without one), one block per size cap (id "scn-cap-<i>": every cell's
     per-population figures — the headline one with its curve as change
-    points on the explorer's axis (_equity_axis) — the same-title row, the
-    banner, the cap's seven matrices and the nine heatmap titles) and one
-    tier-floors-off block per size cap the grid has off cells at (id
-    "scn-off-cap-<i>": a binding band's row of off cells, null for every
-    other band, and that grid's banner, seven matrices and nine titles; no
-    same-title row, which no tier floor reaches). Only the base block and
+    points on the explorer's axis (_equity_axis) — the banner, the cap's
+    seven matrices and the nine heatmap titles) and one tier-floors-off
+    block per size cap the grid has off cells at (id "scn-off-cap-<i>": a
+    binding band's row of off cells, null for every other band, and that
+    grid's banner, seven matrices and nine titles). Only the base block and
     the primary cap's are unpacked as the page loads; another cap's when it
     is chosen, and an off block when the tier floors are chosen off at its
     cap. The run's primary band and ladder setting are not
@@ -6363,6 +6339,11 @@ def _trade_row_head(t: BacktestTrade, color: str) -> str:
     Returns:
         str: An HTML fragment opening a <tr>: six cells, every
             Kalshi-controlled string escaped; _trade_row_tail closes it.
+
+    Raises:
+        ValueError: For a trade whose pair type is not "time_series"
+            (scanner.leg_sides gives sides to time-series pairs only); a fresh
+            run and the saved results both hold time-series trades only.
     """
     side_a, side_b = leg_sides(t.pair_type)
     price_a, price_b = _paid_prices(t)
@@ -6498,9 +6479,9 @@ def _section_diagnostics(trades: list[BacktestTrade]) -> str:
     slippages = [t.slippage for t in trades]
     fig_slip = go.Figure(go.Histogram(x=slippages, nbinsx=20,
                                       marker_color="#7986CB"))
-    # "Expected" is the win-scenario payoff: the co-resolution floor for a
-    # same-title trade, the profit of either win cell for a time-series one —
-    # so a time-series loss cell shows as large negative slippage, never positive
+    # "Expected" is the win-scenario payoff, the profit of either win cell of a
+    # time-series trade — so the loss cell shows as large negative slippage,
+    # never positive
     fig_slip.update_layout(title="Slippage Distribution (Actual − Win-Scenario Payoff, $)",
                             xaxis_title="Slippage ($)", yaxis_title="Count")
 
@@ -6547,25 +6528,26 @@ def _quotes_at_fills(t: BacktestTrade) -> tuple[float, float, float, float]:
     """
     A trade's four quotes, with the two legs it bought replaced by what it paid.
 
-    What the live sizer prices a trade's legs at: the leg prices are the
-    average the trade paid (backtester._paid_prices), while the other two
-    quotes stay as they were at entry. For a time_series trade that is (YES
-    fill on A, A's NO quote, B's YES quote, NO fill on B); for a same_title
-    trade (A's YES quote, NO fill on A, YES fill on B, B's NO quote). A trade
-    built without fills pays its quotes, so this returns them unchanged. The
-    time-series forecast reads the entry quotes' own mid spread
-    (_entry_mid_spread), never these mixed four.
+    What the live sizer prices a time-series trade's legs at: the YES leg on
+    A and the NO leg on B at the average the trade paid for each
+    (backtester._paid_prices), while the other two quotes, A's NO ask and
+    B's YES ask, stay as they were at entry. A trade built without fills
+    pays its quotes, so this returns them unchanged. The time-series
+    forecast reads the entry quotes' own mid spread (_entry_mid_spread),
+    never these mixed four. The page is handed time-series trades only, and
+    _kelly_fraction gives a pair of any other type no edge, whatever four it
+    is handed.
 
     Args:
         t (BacktestTrade): A trade.
 
     Returns:
-        tuple[float, float, float, float]: (pA, nA, pB, nB) for _kelly_fraction.
+        tuple[float, float, float, float]: (YES fill on A, A's NO quote, B's
+            YES quote, NO fill on B): the pA, nA, pB and nB _kelly_fraction
+            takes.
     """
     paid_a, paid_b = _paid_prices(t)
-    if t.pair_type == "time_series":
-        return paid_a, t.entry_nA, t.entry_pB, paid_b
-    return t.entry_pA, paid_a, paid_b, t.entry_nB
+    return paid_a, t.entry_nA, t.entry_pB, paid_b
 
 
 def _kelly_points(trades: list[BacktestTrade],
@@ -6591,11 +6573,10 @@ def _kelly_points(trades: list[BacktestTrade],
             the entry checkpoint with open trades at market, 0.0 when that
             value is not positive), each in trade order.
     """
-    # The four quotes with the legs at the prices paid (_quotes_at_fills) —
-    # _kelly_fraction picks the leg prices per pair type — the forecast at
-    # the entry quotes' mid spread (_entry_mid_spread), and the run's
-    # interval discount, so an --interval-discount run plots the Kelly its
-    # trades were actually sized at rather than the config one
+    # The four quotes with the legs at the prices paid (_quotes_at_fills),
+    # the forecast at the entry quotes' mid spread (_entry_mid_spread), and
+    # the run's interval discount, so an --interval-discount run plots the
+    # Kelly its trades were actually sized at rather than the config one
     kelly_fracs = [
         _kelly_fraction(*_quotes_at_fills(t), t.pair_type, k=k,
                         spread=_entry_mid_spread(t),
@@ -7593,11 +7574,10 @@ _SAVE_TITLE = ("Open a confirmation page, in a new tab, that compares the filter
                "scenario on screen — its spread band, tier floors, k, size cap, its "
                "Rebalance choice and Min. price movement (when this page simulated "
                "rebalancing) and its Sell level and Min. days to maturity (when this page "
-               "simulated selling), with this run's same-title cap when the run recorded "
-               "one; not the Scenario Explorer's own selects — with the live trading "
-               "defaults. It names the categories ticked in the Exclude categories "
-               "menu, and each category every one of whose tags is ticked in the "
-               "Exclude tags menu, as the categories live runs exclude, and each other "
+               "simulated selling); not the Scenario Explorer's own selects — with the "
+               "live trading defaults. It names the categories ticked in the Exclude "
+               "categories menu, and each category every one of whose tags is ticked in "
+               "the Exclude tags menu, as the categories live runs exclude, and each other "
                "Category · Tag ticked there as a tag live runs exclude in that category "
                "(every other category and tag trades, one this backtest never saw "
                "included), so saving it replaces the excluded categories and tags saved "
@@ -7858,19 +7838,18 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date) -> 
     digits only), and left out should it ever not match.
 
     Args:
-        sweep (BacktestSweep | None): The run's sweep: its same-title cap and
-            its same-event ladder setting beside the configured one; None for
-            a page built without one.
+        sweep (BacktestSweep | None): The run's sweep, read for its
+            same-event ladder setting beside config.py's, and for what it
+            recorded of the saved live defaults: whether they rebalance
+            (and their "Rebalance until" days limit), whether they sell, and
+            the categories and tags they exclude. None for a page built
+            without one.
         start_date (date): The backtest's first day (the Period line's).
         today (date): The Period line's last day (UTC).
 
     Returns:
         dict: "url" (the confirmation page's address, on
             config.DEFAULTS_SERVER_HOST and DEFAULTS_SERVER_PORT);
-            "same_title_size_cap" (the extra same-title cap the run sized
-            under, or None when not recorded, so the address leaves it out
-            and the server keeps the saved same-title cap, or the seed's
-            when none is saved);
             "source" (the note the saved file keeps: "backtest dashboard for
             <start> to <today>", plus a note when the run's same-event ladder
             setting differed from config.py's, so its pairs are not the live
@@ -7920,7 +7899,6 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date) -> 
     rebalances = getattr(sweep, "live_rebalance", None) is True
     return {
         "url": f"http://{DEFAULTS_SERVER_HOST}:{DEFAULTS_SERVER_PORT}/confirm",
-        "same_title_size_cap": None if sweep is None else sweep.same_title_size_cap,
         "source": source,
         "live_rebalances": rebalances,
         # A days limit counts only with rebalancing on, as the live settings hold it
@@ -7964,16 +7942,6 @@ _TRADE_FIELDS = (tuple(f.name for f in dataclasses.fields(BacktestTrade) if f.co
 # The walk logs its progress about this many times over a size-cap sweep's
 # grid, whose cells are simulated as they are read.
 _WALK_PROGRESS_LINES = 20
-
-
-def _no_same_title() -> dict:
-    """
-    The same-title population of a grid with none: no point at any cap.
-
-    Returns:
-        dict: {}.
-    """
-    return {}
 
 
 def _no_off_cell(band: tuple[float, float] | None, k: float | None) -> dict:
@@ -8022,8 +7990,6 @@ class _GridSource:
             simulate (a size-cap sweep) and so may raise.
         calibrations (dict): Band -> that band's IntervalCalibration (or
             None). The primary band's falls back to sweep.calibration.
-        same_title: Callable () -> {cap: SweepPoint} — the band- and
-            k-independent same-title population; {} when there is none.
         events (frozenset): (event ticker, fallback category) of every trade
             any cell can show, so the bar can list every category and tag
             before a cell is simulated.
@@ -8136,7 +8102,6 @@ class _GridSource:
     primary: tuple[int, int, int]
     cell: Callable[[tuple[float, float] | None, float | None], dict]
     calibrations: dict
-    same_title: Callable[[], dict] = _no_same_title
     events: frozenset = frozenset()
     checks: bool = False
     cap_sweep: object | None = None
@@ -8719,7 +8684,6 @@ def _eager_source(sweep: BacktestSweep) -> _GridSource:
     for (band, k, population), point in eager.items():
         by_cell.setdefault((band, k), {})[population] = point
     cap = sweep.primary.size_cap
-    same_title = sweep.same_title_point
 
     def cell(band, k) -> dict:
         """
@@ -8735,21 +8699,11 @@ def _eager_source(sweep: BacktestSweep) -> _GridSource:
         pops = by_cell.get((band, k))
         return {cap: dict(pops)} if pops else {}
 
-    def same_title_points() -> dict:
-        """
-        The same-title point at the run's own cap.
-
-        Returns:
-            dict: {cap: point}, or {} without one.
-        """
-        return {} if same_title is None else {cap: same_title}
-
     return _GridSource(
         bands=bands, ks=ks, caps=(cap,),
         primary=(bands.index(sweep.primary.spread_band), ks.index(sweep.primary.k), 0),
         cell=cell, calibrations=_band_calibrations(sweep, bands),
-        same_title=same_title_points, events=_trade_events(eager.values()),
-        checks=bool(sweep.scenarios))
+        events=_trade_events(eager.values()), checks=bool(sweep.scenarios))
 
 
 def _grid_source(
@@ -8837,7 +8791,7 @@ def _grid_source(
                              caps.index(capped.primary_cap)),
                     # Simulates the cell's caps as they are read (backtester's
                     # lazy CapSweep): a cap grid is never held in memory whole
-                    cell=capped.cell, same_title=capped.same_title,
+                    cell=capped.cell,
                     calibrations=_band_calibrations(sweep, bands),
                     # Every entry's event, as the simulation files its trades —
                     # the categories and tags exist before any cell is simulated
@@ -8960,8 +8914,7 @@ def _cap_option(cap: float | None) -> str:
 
     Returns:
         str: "20%", "off (full Kelly)" for 1.0 (Kelly's f* never exceeds 1,
-            so a 100% cap is no per-trade cap; same-title pairs keep
-            BacktestSweep.same_title_size_cap), or "not recorded".
+            so a 100% cap is no per-trade cap), or "not recorded".
     """
     if cap is None:
         return "not recorded"
@@ -9069,42 +9022,6 @@ def _cut_to_axis(by_cap: dict, axis_end: pd.Timestamp | None) -> dict:
 
     return {cap: {population: cut(point) for population, point in pops.items()}
             for cap, pops in by_cap.items()}
-
-
-def _same_title_points(source: _GridSource) -> dict:
-    """
-    Read a grid's same-title population at every cap, never raising.
-
-    A size-cap sweep simulates the population at every cap here
-    (CapSweep.same_title). If that raises, the failure costs the same-title
-    rows at the other caps only — ONE WARNING (with the traceback) — and the
-    run's own same-title point at the run's own cap stands in, read from the
-    eager grid (source.fallback, whose same_title is a lookup), so the
-    scenario explorer still shows it. The cells
-    already walked, and the filter bar's cap axis, are untouched: unlike a
-    cell, this population feeds only the explorer's same-title row.
-
-    Args:
-        source (_GridSource): The grid being walked.
-
-    Returns:
-        dict: {cap: SweepPoint}; the run's own point alone after a failure,
-            or {} when the grid has no eager fallback (or it has no
-            same-title point).
-    """
-    try:
-        return source.same_title()
-    except Exception as exc:
-        error = exc
-    try:
-        # The eager grid's lookup: nothing is simulated here
-        own = source.fallback().same_title() if source.fallback is not None else {}
-    except Exception:
-        own = {}
-    logging.warning("The same-title population could not be simulated at every size cap; "
-                    "the Scenario Explorer shows %s", "it at the run's own cap only" if own
-                    else "no same-title row", exc_info=error)
-    return own
 
 
 def _walk_cells(source: _GridSource, visitors: list, axis_end: pd.Timestamp | None
@@ -9467,7 +9384,7 @@ def _walk_maturity_cells(source: _GridSource, takers: list,
 def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | None
                ) -> tuple[Exception | None, _GridSource]:
     """
-    Hand every scenario of a grid to each visitor: tier-on, tier-off, rebalancing, price movements, "Rebalance until", same-title.
+    Hand every scenario of a grid to each visitor: tier-on, tier-off, rebalancing, price movements, "Rebalance until".
 
     First the tier-on cells (_walk_cells: the primary cell and cap first, so
     the primary scenario's chunk is always chunk 0, one cell alive at a
@@ -9514,20 +9431,11 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
     and grids. A grid whose choices were not read to the end, for any
     reason, is returned without them, so no page shows a view of them that
     was never built.
-    Last, when some visitor shows it (one with a
-    same_title method), the band- and k-independent same-title population is
-    read once
-    (_same_title_points: source.same_title — a size-cap sweep simulates it
-    here too — or, if that raises, the run's own same-title point alone),
-    cut the same way, and handed to those visitors as {cap: point}. A
-    same-title failure costs only the same-title rows at the other caps,
-    never the cells already walked: it does not stop the walk.
 
     Args:
         source (_GridSource): The grid.
         visitors (list): Callables (band index, k index, cap index,
-            {population: SweepPoint}); one may also have a
-            same_title({cap: SweepPoint}) method, an off(band index,
+            {population: SweepPoint}); one may also have an off(band index,
             k index, cap index, {population: SweepPoint}) method taking the
             tier-floors-off cells, with a reset_off(grid) method dropping
             what off() built, a rebalance(band index, k index, cap index,
@@ -9641,15 +9549,6 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
             reset_maturity = getattr(visit, "reset_maturity", None)
             if reset_maturity is not None:
                 reset_maturity(source)
-    takers = [visit for visit in visitors if hasattr(visit, "same_title")]
-    if takers:
-        # Never raises: a failure falls back to the run's own point
-        by_cap = _same_title_points(source)
-        # Cut to the page's axis like any cell's point, then shown
-        cut = _cut_to_axis({cap: {"same_title": point} for cap, point in by_cap.items()},
-                           axis_end)
-        for visit in takers:
-            visit.same_title({cap: pops["same_title"] for cap, pops in cut.items()})
     return None, source
 
 
@@ -9669,13 +9568,10 @@ def _walk_grid(source: _GridSource, visitors: list,
     view's other caps, recovered inside the walk (_walk_once, off_fallback),
     with the tier-on cap axis kept. One walk reads, in order, the tier-on
     cells, the tier-floors-off ones, the Rebalance ones, each Rebalance
-    cell's minimum price movements, then its "Rebalance until" choices, and
-    the same-title population (_walk_once); a Rebalance, price-movement or
-    "Rebalance until" cell that raises costs its own view alone (and the
-    views read after it from its runs), inside the walk.
-    (The size-cap sweep's same-title
-    population costs less still: only the same-title rows at the other caps
-    — _same_title_points.) The fallback grid carries the same
+    cell's minimum price movements, then its "Rebalance until" choices
+    (_walk_once); a Rebalance, price-movement or "Rebalance until" cell that
+    raises costs its own view alone (and the views read after it from its
+    runs), inside the walk. The fallback grid carries the same
     tier-floors-off family, at the run's own cap (_grid_source attaches it
     to every banded shape), so the second walk keeps the Tier floors choice.
     The other layer is each visitor's own: it catches its own failure and
@@ -9864,7 +9760,7 @@ class _ExplorerData:
             "tier_phrases" and "off_missing" (the status line's words).
         blocks (tuple[str, ...]): Each size cap's packed "scn-cap-<i>" block,
             by cap index: "cells" ([band][k] -> one entry per population, or
-            null for a scenario never simulated), "same_title", "banner",
+            null for a scenario never simulated), "banner",
             "matrices" (the seven cap-dependent ones, [band][k]) and "titles"
             (one per metric).
         banner (str): The primary cap's banner (_explorer_banner).
@@ -10012,7 +9908,6 @@ class _ExplorerVisitor:
         # Whether the walk handed off() any cell at each cap: a cap with none
         # at a band the tiers bind at has no tier-floors-off view
         self.off_seen = [False] * nc
-        self.same_titles: list[str | None] = [None] * nc
         self.primary_curve: list = []
         self.failed = False
         self._data = None
@@ -10049,10 +9944,9 @@ class _ExplorerVisitor:
         """
         Drop every tier-floors-off figure kept so far (the walk re-reads the off cells).
 
-        The tier-on figures, the same-title rows and the primary curve are
-        kept: only what off() built goes, so the off cells can be walked
-        again from another source (the grid's off_fallback — its axes are
-        the same).
+        The tier-on figures and the primary curve are kept: only what off()
+        built goes, so the off cells can be walked again from another source
+        (the grid's off_fallback — its axes are the same).
 
         Args:
             source (_GridSource): The grid whose off cells are walked next.
@@ -10179,28 +10073,6 @@ class _ExplorerVisitor:
             logging.warning("The Scenario Explorer's figures could not be built from the "
                             "page's grid; it shows the run's own size cap only",
                             exc_info=True)
-            self.failed = True
-
-    def same_title(self, by_cap: dict) -> None:
-        """
-        Keep the same-title population's KPI row at every cap.
-
-        Args:
-            by_cap (dict): Cap -> the same-title SweepPoint at that cap (the
-                walk's; {} when the run has none, and the run's own cap
-                alone when it could not be simulated at every cap — a cap
-                without a point shows a null row, "—").
-        """
-        if self.failed or not self.source.checks:
-            return
-        try:
-            for ci, cap in enumerate(self.source.caps):
-                point = by_cap.get(cap)
-                self.same_titles[ci] = None if point is None else _strict_json(
-                    _point_kpis(point, risk_free=self.risk_free))
-        except Exception:
-            logging.warning("The Scenario Explorer's same-title figures could not be built; "
-                            "it shows the run's own size cap only", exc_info=True)
             self.failed = True
 
     def payload(self) -> _ExplorerData | None:
@@ -10405,7 +10277,6 @@ class _ExplorerVisitor:
             cells = "[" + ",".join("[" + ",".join(text or "null" for text in row) + "]"
                                    for row in on["cells"][ci]) + "]"
             raw = ('{"cells":' + cells
-                   + ',"same_title":' + (self.same_titles[ci] or "null")
                    + ',"banner":' + _strict_json(banner)
                    + ',"matrices":' + _strict_json(matrices)
                    + ',"titles":' + _strict_json(list(titles)) + "}")
@@ -11402,8 +11273,6 @@ class _SellTask:
             chunks the page already has, in the page or as files: a list with
             one of them is never written again.
         out_dir (Path): The build's folder of chunk files.
-        same_title_size_cap (float): backtester.SAME_TITLE_SIZE_CAP as the
-            parent reads it.
         scheduled_run: backtester.SCHEDULED_RUN as the parent reads it.
         hold_days (int): backtester.TAKE_PROFIT_HOLD_DAYS as the parent reads
             it: how many days in a row a position must stay at a level
@@ -11413,7 +11282,7 @@ class _SellTask:
             listed (config.confirmed_fee_multiplier), so a worker charges each leg's
             fee as the parent would.
         install (bool): Whether the task runs in a worker process of its own,
-            which then installs those four bindings first (a spawned process
+            which then installs those three bindings first (a spawned process
             imports backtester afresh, from config). False in the parent.
     """
     index: int
@@ -11432,7 +11301,6 @@ class _SellTask:
     risk_free: RiskFreeRates | None
     inline_keys: frozenset
     out_dir: Path
-    same_title_size_cap: float
     scheduled_run: object
     hold_days: int
     confirmed_fee_multipliers: frozenset = frozenset({1.0})
@@ -11687,8 +11555,8 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
     dropped before the next is read.
 
     Runs in a worker process (task.install True: the parent's
-    SAME_TITLE_SIZE_CAP, SCHEDULED_RUN, TAKE_PROFIT_HOLD_DAYS and
-    config.CONFIRMED_FEE_MULTIPLIERS are installed first) or in the parent itself.
+    SCHEDULED_RUN, TAKE_PROFIT_HOLD_DAYS and config.CONFIRMED_FEE_MULTIPLIERS
+    are installed first) or in the parent itself.
 
     Args:
         task (_SellTask): The task.
@@ -11702,9 +11570,8 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
             and leaves the task's cells uncovered.
     """
     if task.install:
-        # A spawned process imported backtester afresh: size, checkpoint and
-        # sell as the parent does
-        _backtester.SAME_TITLE_SIZE_CAP = task.same_title_size_cap
+        # A spawned process imported backtester afresh: checkpoint and sell as
+        # the parent does
         _backtester.SCHEDULED_RUN = task.scheduled_run
         _backtester.TAKE_PROFIT_HOLD_DAYS = task.hold_days
         # ... and charge each leg's fee at the multipliers the parent confirms
@@ -11809,8 +11676,7 @@ def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: da
               "series_categories": series_categories, "cat_index": dict(chunker.cat_index),
               "sub_index": dict(chunker.sub_index), "risk_free": risk_free,
               "inline_keys": frozenset(chunker.seen), "out_dir": folder,
-              # The four bindings a spawned worker installs (_run_sell_task)
-              "same_title_size_cap": _backtester.SAME_TITLE_SIZE_CAP,
+              # The three bindings a spawned worker installs (_run_sell_task)
               "scheduled_run": _backtester.SCHEDULED_RUN,
               "hold_days": _backtester.TAKE_PROFIT_HOLD_DAYS,
               "confirmed_fee_multipliers": _config.CONFIRMED_FEE_MULTIPLIERS}
@@ -11858,8 +11724,8 @@ def _run_sell_tasks(tasks: list[_SellTask], workers: int) -> dict[int, _SellResu
     With one worker (or one task) every task runs here, in order. Otherwise a
     pool of spawned processes runs them (spawn, not fork: safe on macOS, and
     a fresh import in each worker, which installs the parent's
-    SAME_TITLE_SIZE_CAP, SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS). A task
-    that raises costs its own cells only: one WARNING naming its band (the
+    SCHEDULED_RUN, TAKE_PROFIT_HOLD_DAYS and config.CONFIRMED_FEE_MULTIPLIERS).
+    A task that raises costs its own cells only: one WARNING naming its band (the
     first with its traceback), and the rest go on; a pool that cannot run at
     all fails every task the same way.
 
@@ -12966,7 +12832,8 @@ def _same_series(shipped, rebuilt, n: int) -> bool:
     return bool(np.array_equal(_sparse_as_floats(shipped, n), rebuilt))
 
 # The per-trade arrays of a mix that must hold a finite number for every trade
-# (the calibration pair "cp" / "ca" is null for a same-title trade by design)
+# (the calibration pair "cp" / "ca" is null for a trade with no mid spread, any
+# pair type but time-series, which the page is never handed)
 _MIX_FINITE_ARRAYS = ("pf", "pr", "st", "mo")
 
 
@@ -13182,10 +13049,10 @@ def _filter_payload(
             True (default).
         save (dict | None): Keyword-only. What the bar's save button sends
             besides the scenario on screen (_save_target): the confirmation
-            page's address, the run's same-title cap, the source note and
-            whether the saved defaults rebalance, whether they sell and
-            whether they filter by category or tag. None (default) ships
-            null, and the script then keeps the button disabled.
+            page's address, the source note and whether the saved defaults
+            rebalance, whether they sell and whether they filter by category
+            or tag. None (default) ships null, and the script then keeps the
+            button disabled.
         rebalance_state (str): Keyword-only. Why the page has no Rebalance
             view when it has none: "not simulated" (the run carried no such
             family: the note reads "(not simulated in this backtest)") or
@@ -14600,14 +14467,9 @@ _FILTER_JS = r"""
     if (!band || !(k > 0) || !(cap > 0)) { return null; }
     var q =[['tier_floors', offAt(SHOWN[5]) ? 'off' : 'on'], ['spread_min', band[0]],
              ['spread_max', band[1]], ['k', k], ['size_cap', cap]];
-    // Left out when the run recorded none: the server then keeps the saved
-    // same-title cap, or the seed's when none is saved
-    if (typeof D.save.same_title_size_cap === 'number') {
-      q.push(['same_title_size_cap', D.save.same_title_size_cap]);
-    }
     // Sent only by a page that simulated rebalancing: otherwise the server
-    // keeps the saved values (or the seed's), as for an unrecorded same-title
-    // cap. The Rebalance choice goes as rebalance, and beside it, always, the
+    // keeps the saved values (or the seed's when none are saved). The
+    // Rebalance choice goes as rebalance, and beside it, always, the
     // minimum price movement shown as min_price_move — its dollars, or off
     // for any and whenever Rebalance is no (a shut select can still name
     // one), so the address never asks for a minimum without rebalancing,
@@ -16361,8 +16223,8 @@ def generate_dashboard(
     fragments into a full page with an embedded Plotly CDN script tag — plus
     the page-wide filter: the sticky bar under the header lines
     (_filter_bar_html, with its "Save as live defaults…" button, whose
-    confirmation-page address, run's same-title cap and source note are
-    _save_target's), one packed chunk per distinct scenario trade list
+    confirmation-page address and source note are _save_target's), one
+    packed chunk per distinct scenario trade list
     (tier-floors-off scenarios included, when the run carries that family),
     the first of them (the run's own scenario) written into the page after
     the sections and every other as a file in a new folder beside the page
@@ -16725,9 +16587,8 @@ def generate_dashboard(
                 # say its selects follow the bar's Tier floors choice
                 explorer_tiers=explorer_grid and explorer_data.tier_select,
                 # The save button's fixed part of the defaults server's
-                # confirmation-page address (the run's same-title cap, the
-                # source note), and what the saved live defaults do, for the
-                # notes beside the button
+                # confirmation-page address (the source note), and what the
+                # saved live defaults do, for the notes beside the button
                 save=_save_target(sweep, start_date, today),
                 # Why the Rebalance select stays shut, should it: a run that
                 # carried the family but shows no view of it could not use or
@@ -16872,8 +16733,8 @@ def generate_dashboard(
         # off the filter's base block, so it follows the filter bar like the
         # trade sections do (None when the filter could not be built)
         lambda: _section_khat(filter_data, k_used),
-        # Also takes the sweep whole — it reads .scenarios, .same_title_point
-        # and .calibrations_by_band, none of which _section_interval_discount
+        # Also takes the sweep whole — it reads .scenarios and
+        # .calibrations_by_band, neither of which _section_interval_discount
         # renders, and passing pieces could let the two sections (and the
         # header's run-settings line) drift onto different bands or settings —
         # and the walk's data for every band x k x size cap (or a notice when

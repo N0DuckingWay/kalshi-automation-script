@@ -26,10 +26,14 @@ Purpose:
     earlier market paid out $0 (the trim finds that market among the
     account's settlements as a take-profit sale finds a partner). The
     paid-out market then reads as its settlement price
-    (config.settled_bids), so the pair arithmetic runs unchanged. A position
-    is trimmed only after enough calendar days without a fill (a trade) on
-    its markets and, with LiveSettings.min_price_move set, once its price
-    has moved that far since, up or down. A trim sells only into bids within
+    (config.settled_bids), so the pair arithmetic runs unchanged. Only a
+    time-series pair is trimmed: a held same-title pair or same-title lone
+    leg (two identically worded markets) is no pair scanner.held_pair_kind
+    can read, so it is never trimmed (a saved sell level can still sell it
+    whole, since plan_sales never asks a position's kind). A position is
+    trimmed only after enough calendar days without a fill (a trade) on its
+    markets and, with LiveSettings.min_price_move set, once its price has
+    moved that far since, up or down. A trim sells only into bids within
     config.KELLY_TRIM_MAX_BID_DROP of the best bid, never into a gap in a
     book.
 
@@ -38,7 +42,7 @@ Purpose:
     the same number of calendar days after the last fill on the pair's
     markets and, with a minimum price move, until the pair's price has moved
     that far since, up or down. It sends nothing and sizes nothing: the
-    finders and the sizer do the rest. With
+    time-series finder and the sizer do the rest. With
     LiveSettings.rebalance_min_days_to_maturity set ("Rebalance until"),
     neither a trim nor an add-on is made once the position's later market
     closes fewer than that many days from today (UTC dates).
@@ -177,8 +181,9 @@ class SalePlan:
     Held contracts a run sells, with what the sale orders need.
 
     A take-profit sale (plan_sales) sells a whole position. A Kelly trim
-    (plan_trims) sells part of an exact held pair, or of a lone leg (the later
-    market of a time-series pair, held after its earlier market paid out $0);
+    (plan_trims) sells part of an exact held time-series pair, or of a lone
+    leg (the later market of a time-series pair, held after its earlier
+    market paid out $0);
     its count and money figures are those of the part sold, a lone leg's
     including that share of its paid-out partner.
 
@@ -461,6 +466,9 @@ class _Reads:
         self._settlements_read = False
         self._settlements_problem = ""
         self._labels: dict = {}
+        # Each looked-up event's title, by event ticker: the memo every
+        # market_for_labels call of this planner call shares, so two settled
+        # markets of one event cost one event request
         self._event_titles: dict = {}
 
     def candles(self, ticker: str, event_ticker: str) -> list | None:
@@ -1028,7 +1036,7 @@ def _log_summary(sold: int, considered: int, never: Counter) -> None:
 # ─── Trimming a held pair to its Kelly size ───────────────────────────────────
 
 # How a log line names a pair's kind
-_KIND_WORDS = {"time_series": "time-series", "same_title": "same-title"}
+_KIND_WORDS = {"time_series": "time-series"}
 
 
 def _cents_text(dollars: float) -> str:
@@ -1174,7 +1182,8 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
     out $0) is trimmed as the later market of a time-series pair, with the
     partner read at its settlement price (config.settled_bids). It stops at the
     first failing step with one "Not trimming" line: markets listed, the wait
-    since its last trade (_last_fill), the partner (_find_partner), its kind,
+    since its last trade (_last_fill), the partner (_find_partner), its kind
+    (only a time-series pair has one, so a held same-title pair stops there),
     readable books (their fetch value goes into `fetched`), the minimum price
     move, and a readable chance of paying. Only bids within
     KELLY_TRIM_MAX_BID_DROP of each best bid are sold into.
@@ -1184,8 +1193,8 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
         reads (_Reads): This planner call's reads.
         fills (FillTimes | None): When each market last traded; None only with no
             wait in days and no minimum price move.
-        settings (LiveSettings): The run's settings: k, both size caps and the
-            minimum price move.
+        settings (LiveSettings): The run's settings: k, the per-trade cap and
+            the minimum price move.
         min_days (int): Days a position must go without a trade (_rebalance_min_days).
         now_date (date): Today on the bot's own clock (_day).
         utc_date (date): Today in UTC, for the days left before maturity.
@@ -1277,16 +1286,18 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
             return None, None
         by_side[other] = partner_market
     # Cross-module: the pair's kind and which market is A (a lone leg's partner
-    # standing in for the market that paid out)
+    # standing in for the market that paid out). Only a time-series pair has
+    # one: two identically worded markets, a same-title pair, have none
     kind = held_pair_kind(by_side["yes"], by_side["no"])
     if kind is None:
-        not_trimming("its two markets cannot be shown to be a same-title or a time-series "
-                     "pair held this way round, so its chance of paying cannot be read")
+        not_trimming("its two markets cannot be shown to be a time-series pair held this "
+                     "way round, so its chance of paying cannot be read")
         return None, None
     pair_type, market_a, market_b = kind
     if partner is not None and (pair_type != "time_series" or market_b.ticker != lone_ticker):
         # The forecast for what is left is the later market's chance of paying once
-        # the earlier one has paid $0; no other lone leg has one
+        # the earlier one has paid $0; no other lone leg has one. held_pair_kind
+        # answers only "time_series", so the type test is defence only
         not_trimming("a lone leg is trimmed only as the later market of a time-series pair")
         return None, None
     # Cross-module: the side each leg holds
@@ -1417,7 +1428,7 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
         return total
 
     # Cross-module: the pair's size cap, as a new trade of its kind is capped
-    cap = pair_size_cap(pair_type, settings.size_cap, settings.same_title_size_cap)
+    cap = pair_size_cap(pair_type, settings.size_cap)
     # Cross-module: the backtest's trim rule
     decision = kelly_trim_count(count, value, win_prob, cap, top_value, net_sale)
     # Cross-module: the share Kelly lets the pair keep at its best bids, for the log line
@@ -1473,10 +1484,12 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
     Plan this run's Kelly trims: part sales of held positions grown past their Kelly share.
 
     A position is an exact held pair or a lone leg (one held market whose
-    partner has paid out), and each is judged by _trim_one. A lone leg is
-    trimmed only as the later market of a time-series pair whose earlier
-    market is found among the account's settlements, paid out $0 (the side
-    held there lost). Fails closed: nothing is trimmed, with one log line
+    partner has paid out), and each is judged by _trim_one. An exact pair is
+    trimmed only as a time-series pair: a held same-title pair (two
+    identically worded markets) never is. A lone leg is trimmed only as the
+    later market of a time-series pair whose earlier market is found among
+    the account's settlements, paid out $0 (the side held there lost). Fails
+    closed: nothing is trimmed, with one log line
     saying why, unless all of these hold:
 
       - Kalshi's value of the open positions is known and above zero (a trim
@@ -1488,6 +1501,9 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
       - The positions whose best bids were read would not, alone or together,
         fetch more at those bids than all open positions are valued at. If they
         would, that value is wrong and no trim stands, even one logged "-> sell".
+        A held same-title pair stops at its kind before its books are read, so
+        its bids never count in this test; they count only through the market
+        list's bids, in what the held markets would fetch (below).
 
     And no lone leg is trimmed, with one WARNING, when the account's
     settlements cannot all be read (any record left out may be its partner).
@@ -1505,7 +1521,7 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
         held_labels (dict): Ticker -> ladder labels (scanner.resolve_held_ladders' labels_out).
         markets_by_ticker (dict): This run's whole market list by ticker, held markets included.
         settings (LiveSettings): rebalance (off: trim and read nothing), min_price_move,
-            rebalance_min_days_to_maturity, k and both size caps.
+            rebalance_min_days_to_maturity, k and the per-trade cap.
         now (datetime): The run's moment, timezone-aware.
         cash_cents (float): The account's cash on every shard, in cents.
         positions_value_cents (float | None): Kalshi's value of the open positions, in
@@ -1694,10 +1710,10 @@ def _add_on_one(pair: HeldPair, reads: _Reads, fills: FillTimes, *,
       1. The wait: enough calendar days since its last trade (_last_fill, the
          Kelly trim's own reading: the last fill on both of an exact pair's
          markets; for a lone leg, on its own market and any market of its
-         ladder in this run's list, since the finders pair a lone leg only
-         with one of those, so a partner sold by hand restarts the wait).
-         With no fill listed, it last traded no later than the fills list's
-         oldest fill.
+         ladder in this run's list, since the time-series finder pairs a lone
+         leg only with one of those, so a partner sold by hand restarts the
+         wait). With no fill listed, it last traded no later than the fills
+         list's oldest fill.
       2. With a minimum price move set: a fill is listed, so its price when it
          last traded can be read.
       3. Its price now: the ask of the side held on each market, from this
@@ -1813,8 +1829,8 @@ def plan_add_ons(client: Any, add_on_pairs: dict, markets_by_ticker: dict, *,
     the last fill on any of its markets, by the bot or by hand
     (config.rebalance_rested, on the bot's own clock; for a lone leg, also on
     any market of its ladder in this run's list, the one kind of market the
-    finders pair it with, so a partner sold by hand is not bought back the
-    next day), and, with
+    time-series finder pairs it with, so a partner sold by hand is not
+    bought back the next day), and, with
     settings.min_price_move, a move of at least that many dollars, up or
     down, since that fill (config.pair_price_move, price_move_reached). An
     exact pair's price is the asks of the sides held on its two markets,

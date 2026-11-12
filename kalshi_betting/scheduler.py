@@ -706,18 +706,17 @@ def run_job(retries: int = 0) -> None:
             "check kalshi_arb.log and trade_log.xlsx.",
         )
     elif result.returncode == EXIT_TIME_SERIES_SKIPPED:
-        # Slot done: same-title still ran, and a retry would likely fail again
+        # Slot done: the run scanned the markets, and a retry would most likely
+        # fail the same lookup
         logging.error(
-            "Job made NO time-series trade (exit %d): a held market could not "
-            "be identified, so the run could not tell which ladders it already "
-            "holds. Same-title pairs were still searched. The slot counts "
-            "as done — see the ERROR in kalshi_arb.log naming the market.",
+            "Job bought NO pair (exit %d): a held market could not be identified, "
+            "so the run could not tell which ladders it already holds. The slot "
+            "counts as done — see the ERROR in kalshi_arb.log naming the market.",
             result.returncode,
         )
     elif result.returncode == EXIT_RUN_IN_PROGRESS:
-        # Slot done: a real-money run was already trading on this machine, and
-        # a retry could stack a second same-title trade. The lock
-        # file's record names that run
+        # Slot done, never retried: another real-money run held the live-run
+        # lock. The lock file's record names that run
         holder = run_lock.holder()
         age = holder.age_seconds()
         if age is not None and age <= SCHEDULER_JOB_TIMEOUT_SECONDS:

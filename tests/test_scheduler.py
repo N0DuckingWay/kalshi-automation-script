@@ -119,20 +119,25 @@ class TestRunJobExitCodeMapping:
 
     @patch("kalshi_betting.scheduler.subprocess.run")
     def test_time_series_skipped_logs_error(self, mock_run, caplog):
-        # A held market could not be identified, so the run made no
-        # time-series trade. It is an ERROR of its own, never a clean run or
-        # the catch-all failure, and it points at the line naming the market.
+        # A held market could not be identified, so the run bought no pair.
+        # It is an ERROR of its own, never a clean run or the catch-all
+        # failure, it says the slot counts as done, and it points at the line
+        # naming the market.
         mock_run.return_value = _completed(EXIT_TIME_SERIES_SKIPPED, stderr="noise")
 
         with caplog.at_level(logging.INFO):
             scheduler.run_job()
 
-        matches = [r for r in caplog.records if "NO time-series trade" in r.getMessage()]
+        matches = [r for r in caplog.records if "Job bought NO pair" in r.getMessage()]
         assert len(matches) == 1
         assert matches[0].levelno == logging.ERROR
         message = matches[0].getMessage()
-        assert f"exit {EXIT_TIME_SERIES_SKIPPED}" in message
-        assert "Same-title pairs were still searched" in message
+        assert message.startswith(f"Job bought NO pair (exit {EXIT_TIME_SERIES_SKIPPED}): "
+                                  "a held market could not be identified")
+        # It says once that no pair was bought
+        assert "no pair is bought" not in message
+        assert "The slot counts as done" in message
+        assert "same-title" not in message.lower()
         assert "kalshi_arb.log" in message
         assert "noise" not in message
         assert not any("Job completed successfully." in r.getMessage() for r in caplog.records)
@@ -618,8 +623,8 @@ class TestCatchUp:
         mock_run_job.assert_called_once_with(retries=0)
 
     def test_a_run_that_skipped_time_series_is_not_retried(self, tmp_path):
-        # It scanned and could trade same-title pairs, so the slot is done: a
-        # restart does not re-run it.
+        # It scanned the markets, so the slot is done: a restart does not
+        # re-run it.
         now = datetime(2026, 9, 2, 10, 0)
         current_slot = scheduler._most_recent_slot(now)
         _write_state(
@@ -809,11 +814,29 @@ class TestCheckLiveDefaults:
         assert error.startswith("The saved live defaults are out of date (")
         assert str(config.LIVE_DEFAULTS_FILE) in error
         assert "its pages offer them as rebalance yes, min price movement 10c" in error
+        # That version saved a same-title cap too, which nothing replaced
+        assert ("same_title_size_cap, which is no longer used (the bot trades time-series "
+                "pairs only)") in error
         assert error.endswith(
             "every scheduled run will exit 2 until they are saved again through the "
             f"defaults server (./start_dashboard.sh, run in {scheduler.PROJECT_ROOT}); do "
             "not delete the file")
         assert "fixed, or deleted" not in error
+
+    def test_a_file_holding_only_the_same_title_cap_logs_how_to_save_it_again(self, caplog):
+        # A file the version before this one saved, whose one retired setting
+        # is the same-title cap: every scheduled run will exit 2 until it is
+        # saved again, and the ERROR says so at start
+        from .test_config import _SAME_TITLE_CAP_ERA_BYTES, _SAME_TITLE_CAP_ERA_MESSAGE
+        config.LIVE_DEFAULTS_FILE.write_bytes(_SAME_TITLE_CAP_ERA_BYTES)
+        with caplog.at_level(logging.INFO):
+            scheduler._check_live_defaults()
+        (error,) = self._errors(caplog)
+        assert error == (
+            f"The saved live defaults are out of date ({config.LIVE_DEFAULTS_FILE}: "
+            f"{_SAME_TITLE_CAP_ERA_MESSAGE}): every scheduled run will exit 2 until they are "
+            "saved again through the defaults server (./start_dashboard.sh, run in "
+            f"{scheduler.PROJECT_ROOT}); do not delete the file")
 
     @pytest.mark.usefixtures("saved_live_defaults")
     def test_a_usable_file_logs_nothing(self, caplog):

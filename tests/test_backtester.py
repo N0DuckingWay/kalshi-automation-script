@@ -40,7 +40,6 @@ from kalshi_betting.backtester import (
     _extract_pairs,
     _fetch_candles_parallel,
     _find_entry,
-    _group_by_exact_title,
     _group_by_normalized_title,
     _interval_calibration,
     _log_interval_calibration,
@@ -59,7 +58,6 @@ from kalshi_betting.config import (
     MAX_DEADLINE_GAP_DAYS,
     MVE_SERIES_FAMILY_PREFIX,
     PRICE_EPSILON,
-    SAME_TITLE_CO_RESOLVE_PROB,
     SCHEDULED_RUN,
     SPREAD_BAND_SWEEP_CEILINGS,
     SPREAD_BAND_SWEEP_FLOORS,
@@ -117,52 +115,6 @@ class TestPairKey:
         assert _pair_key(m) == "Will BTC exceed $80k"
 
 
-class TestExactTitleGrouping:
-    def test_cross_event_same_option_label_separated(self):
-        # Same option title "Trump", different event_title — must NOT group together
-        mA = _md("A1", "ELECT", title="Trump", event_title="2024 Election Winner")
-        mB = _md("B1", "TIME",  title="Trump", event_title="2024 Time Person of the Year")
-        groups = _group_by_exact_title([mA, mB])
-        # Each lands in its own group, but only groups with >= 2 members survive,
-        # so the result should be empty.
-        assert groups == {}
-
-    def test_same_event_title_groups_together(self):
-        mA = _md("A1", "EVT-A", title="Republicans win majority",
-                 event_title="2026 Senate Control")
-        mB = _md("B1", "EVT-B", title="Republicans win majority",
-                 event_title="2026 Senate Control")
-        groups = _group_by_exact_title([mA, mB])
-        assert len(groups) == 1
-        key = next(iter(groups))
-        assert key[0] == "2026 Senate Control"
-        assert key[1] == "Republicans win majority"
-
-    def test_distinct_subtitles_separate_groups(self):
-        # The subtitle is the only intra-title discriminator: two DIFFERENT
-        # outcomes sharing one question title must never land in one group,
-        # or the backtester pairs them as the same contract. Cache records now
-        # populate subtitle from the API's yes_sub_title (2026-08 drift).
-        mA = _md("A1", "EVT-A", title="Who will the next Pope be?",
-                 subtitle="Pierbattista Pizzaballa", event_title="Papal Conclave")
-        mB = _md("B1", "EVT-B", title="Who will the next Pope be?",
-                 subtitle="Peter Turkson", event_title="Papal Conclave")
-        # Each lands alone, then the len>=2 filter drops both.
-        assert _group_by_exact_title([mA, mB]) == {}
-
-    def test_identical_subtitles_group_together(self):
-        mA = _md("A1", "EVT-A", title="Who will the next Pope be?",
-                 subtitle="Pierbattista Pizzaballa", event_title="Papal Conclave")
-        mB = _md("B1", "EVT-B", title="Who will the next Pope be?",
-                 subtitle="Pierbattista Pizzaballa", event_title="Papal Conclave")
-        groups = _group_by_exact_title([mA, mB])
-        assert len(groups) == 1
-        key = next(iter(groups))
-        assert key == ("Papal Conclave", "Who will the next Pope be?",
-                       "Pierbattista Pizzaballa")
-        assert len(groups[key]) == 2
-
-
 class TestNormalizedTitleGrouping:
     def test_same_event_different_deadlines_groups(self):
         # Same event_title and same dateless market title — these should group as
@@ -185,9 +137,8 @@ class TestNormalizedTitleGrouping:
         assert groups == {}
 
     def test_distinct_outcome_labels_separate_groups(self):
-        # DR-01: the subtitle is part of the time-series key too, not just the
-        # same-title one. Two strikes of a daily family share a title and
-        # differ only here.
+        # DR-01: the subtitle is part of the time-series key. Two strikes of
+        # a daily family share a title and differ only here.
         mA = _md("A1", "EVT-SEP14", title="Solana price on Sep 14, 2026?",
                  subtitle="$180 or above", event_title="Solana price on Sep 14, 2026?")
         mB = _md("B1", "EVT-SEP18", title="Solana price on Sep 18, 2026?",
@@ -291,71 +242,16 @@ class TestTimeSeriesOutcomeDiscriminator:
         assert len(cross) == 12
 
 
-class TestExtractPairsCanonHandling:
-    def test_three_tuple_key_uses_title_not_event(self):
-        # Build a same-title group with a 3-tuple key and verify canon is the
-        # market title (key[1]), not the event title (key[0]).
-        #
-        # RE-PINNED (DR-02/DR-54): the event tickers used to be EVT-A/EVT-B,
-        # which share the series prefix "EVT" — _extract_pairs now reads that
-        # as two instances of one recurring fixture and forms no pair, so the
-        # assertion below would have failed for a reason that has nothing to do
-        # with canon selection. Two DIFFERENT series restore the shape the
-        # same-title strategy was built for.
-        #
-        # RE-PINNED (DR-74): the same-title close gate refuses a pair whose
-        # close_time is missing (fail closed), so both records now carry one
-        # shared close — added HERE, not to the shared _md, whose other
-        # callers group or key records and never reach the gate.
-        mA = _md("A1", "EVA-1", title="Republicans win majority",
-                 event_title="2026 Senate Control")
-        mB = _md("B1", "EVB-1", title="Republicans win majority",
-                 event_title="2026 Senate Control")
-        for m in (mA, mB):
-            m["close_time"] = "2026-11-04T05:00:00Z"
-        groups = _group_by_exact_title([mA, mB])
-        pairs = _extract_pairs(groups)
-        assert len(pairs) == 1
-        _, _, canon, _ = pairs[0]
-        assert canon == "Republicans win majority"
-
-    def test_group_key_includes_event_title_for_dedup(self):
-        # Two unrelated events sharing an option label ("Trump") must produce
-        # DIFFERENT group_keys even though they share the same display canon —
-        # otherwise run_backtest's one-pair-per-group dedup collapses two
-        # legitimate, independent pairs into one.
-        #
-        # RE-PINNED (DR-74): each group's two records share a close_time, which
-        # the same-title close gate needs (a missing one fails closed). Added
-        # locally rather than to the shared _md.
-        mA1 = _md("E1-A", "EVT1A", title="Trump", event_title="Election Winner")
-        mA2 = _md("E1-B", "EVT1B", title="Trump", event_title="Election Winner")
-        mB1 = _md("E2-A", "EVT2A", title="Trump", event_title="Person of the Year")
-        mB2 = _md("E2-B", "EVT2B", title="Trump", event_title="Person of the Year")
-        for m in (mA1, mA2):
-            m["close_time"] = "2026-11-04T05:00:00Z"
-        for m in (mB1, mB2):
-            m["close_time"] = "2026-12-10T15:00:00Z"
-        groups = _group_by_exact_title([mA1, mA2, mB1, mB2])
-        pairs = _extract_pairs(groups)
-        assert len(pairs) == 2
-        canons = {canon for _, _, canon, _ in pairs}
-        assert canons == {"Trump"}
-        group_keys = {group_key for _, _, _, group_key in pairs}
-        assert len(group_keys) == 2, "distinct events must yield distinct group_keys"
-
-
 class TestOneEventSeriesIsTwoFixturesBacktest:
-    """DR-02 / DR-54 mirror: _extract_pairs refuses two events of ONE series.
+    """DR-02 / DR-54 mirror: _extract_pairs refuses two events of ONE series
+    worded identically.
 
-    The rule is the live scanner's, applied to cached records through
-    backtester._same_series_dicts / _identical_wording_dicts, which resolve the
-    series identity through the same scanner.event_series the live path uses —
-    including its collapse of every combo (KXMVE*) prefix onto one family. Both
-    branches of _extract_pairs carry it: the 3-tuple (same-title) branch on the
-    series alone, because the group key already guarantees identical wording,
-    and the string (time-series) branch on the conjunct, because there the
-    wording is only date-stripped-equal.
+    The rule is the live time-series finder's, applied to cached records
+    through backtester._same_series_dicts / _identical_wording_dicts, which
+    resolve the series identity through the same scanner.event_series the live
+    path uses — including its collapse of every combo (KXMVE*) prefix onto one
+    family. _extract_pairs tests the conjunct, because its groups' wording is
+    only date-stripped-equal.
     """
 
     @staticmethod
@@ -380,9 +276,6 @@ class TestOneEventSeriesIsTwoFixturesBacktest:
             cls._rec("KXNPBRFI-26SEP150500FUKORI-Y", "KXNPBRFI-26SEP150500FUKORI",
                      title, "2026-09-17T09:00:00Z", event_title=event_title),
         ]
-
-    def test_same_title_branch_rejects_two_game_days_of_one_fixture(self):
-        assert _extract_pairs(_group_by_exact_title(self._npb())) == []
 
     def test_time_series_branch_rejects_the_same_two_records(self):
         # Grouping still puts them together (their wording is identical, so it
@@ -411,16 +304,14 @@ class TestOneEventSeriesIsTwoFixturesBacktest:
                       "Parlay", "2026-09-15T20:00:00Z",
                       subtitle="All legs hit", event_title="Cross-category combo"),
         ]
-        assert _extract_pairs(_group_by_exact_title(recs)) == []
         assert _extract_pairs(_group_by_normalized_title(recs)) == []
 
     def test_two_combo_events_of_two_kxmve_series_are_rejected(self):
         # DR-55 mirror: the same wording listed under two DIFFERENT KXMVE*
         # series. Kalshi lists combos under several prefixes, so the literal
-        # prefix read these as two series and both _extract_pairs branches
-        # formed the pair. scanner.event_series collapses the whole KXMVE
-        # family onto one series, and _same_series_dicts inherits that because
-        # it resolves through the same helper the live path uses.
+        # prefix read these as two series. scanner.event_series collapses the
+        # whole KXMVE family onto one series, and _same_series_dicts inherits
+        # that because it resolves through the same helper the live path uses.
         recs = [
             self._rec("KXMVECROSSCATEGORY-SHARD1-S6471E4699E9-Y",
                       "KXMVECROSSCATEGORY-SHARD1-S6471E4699E9",
@@ -437,19 +328,11 @@ class TestOneEventSeriesIsTwoFixturesBacktest:
                 != recs[1]["event_ticker"].split("-")[0])
         assert backtester._identical_wording_dicts(recs[0], recs[1]) is True
         assert backtester._same_series_dicts(recs[0], recs[1]) is True
-        assert _extract_pairs(_group_by_exact_title(recs)) == []
         assert _extract_pairs(_group_by_normalized_title(recs)) == []
-
-    # Both Fed series filed alike, as Kalshi's /series listing files one
-    # question's two listings (DR-79): with no listing, KXFEDDEC falls back to
-    # infer_category's "Economics" and the others to "Other"
-    _FED_LISTING = {"KXFEDDEC": ("Economics", ("Fed",)),
-                    "KXMVPAWARD": ("Economics", ("Fed",)),
-                    "FEDCUTDEC": ("Economics", ("Fed",))}
 
     def test_a_non_mve_series_pair_is_untouched_by_the_family_collapse(self):
         # GUARD on the collapse's blast radius: only KXMVE* collapses, so two
-        # ordinary series still read as different and still pair.
+        # ordinary series still read as different.
         recs = [
             self._rec("KXFEDDEC-26-T25", "KXFEDDEC-26",
                       "Fed cuts rates in December?", "2026-12-10T19:00:00Z",
@@ -459,24 +342,6 @@ class TestOneEventSeriesIsTwoFixturesBacktest:
                       event_title="Fed December decision"),
         ]
         assert backtester._same_series_dicts(recs[0], recs[1]) is False
-        assert len(_extract_pairs(_group_by_exact_title(recs),
-                                  series_categories=self._FED_LISTING)) == 1
-
-    def test_two_different_series_asking_one_question_still_pair(self):
-        recs = [
-            self._rec("KXFEDDEC-26-T25", "KXFEDDEC-26",
-                      "Fed cuts rates in December?", "2026-12-10T19:00:00Z",
-                      event_title="Fed December decision"),
-            self._rec("FEDCUTDEC-26-T25", "FEDCUTDEC-26",
-                      "Fed cuts rates in December?", "2026-12-10T19:00:00Z",
-                      event_title="Fed December decision"),
-        ]
-        pairs = _extract_pairs(_group_by_exact_title(recs),
-                               series_categories=self._FED_LISTING)
-        assert len(pairs) == 1
-        assert {pairs[0][0]["ticker"], pairs[0][1]["ticker"]} == {
-            "KXFEDDEC-26-T25", "FEDCUTDEC-26-T25"
-        }
 
     def test_a_dated_pair_of_one_series_is_untouched(self):
         # The deadline lives IN the wording, so _identical_wording_dicts is
@@ -513,16 +378,15 @@ class TestOneEventSeriesIsTwoFixturesBacktest:
         assert _extract_pairs(_group_by_normalized_title(recs)) == []
 
     def test_an_unreadable_event_ticker_fails_closed(self):
-        # A record whose fixture identity cannot be read must NOT be replayed
-        # on the 95% co-resolution prior — the same direction the live helper
-        # fails in.
+        # A record whose fixture identity cannot be read reads as the same
+        # series, so the one-series conjunct refuses it — the same direction
+        # the live helper fails in.
         recs = [
             self._rec("A1", "", "Fed cuts rates in December?", "2026-12-10T19:00:00Z",
                       event_title="Fed December decision"),
             self._rec("B1", "FEDCUTDEC-26", "Fed cuts rates in December?",
                       "2026-12-10T19:00:00Z", event_title="Fed December decision"),
         ]
-        assert _extract_pairs(_group_by_exact_title(recs)) == []
         assert backtester._same_series_dicts(recs[0], recs[1]) is True
 
     def test_a_missing_event_ticker_key_also_fails_closed(self):
@@ -790,7 +654,7 @@ class TestPhrasingSkipCounts:
         assert self._refusal_lines(caplog) == []
 
 
-# M10: the lines _extract_pairs gained, by prefix — four refusals, plus the two
+# M10: the lines _extract_pairs gained, by prefix — two refusals, plus the two
 # things the time-series sweep sets aside before visiting anything. The DR-72
 # and DR-73 lines are read by the same prefix table so a test can check that
 # EVERY pair of a group's members is accounted for.
@@ -799,25 +663,6 @@ _TS_BEYOND = "Time-series candidate pairs the sweep never visits"
 _TS_SAME_EVENT = ("Time-series candidates skipped because both markets carry "
                   "the same event ticker")
 _TS_SERIES = "Time-series candidates skipped as two instances of one event series"
-_ST_SAME_EVENT = ("Same-title candidates skipped because both markets carry the "
-                  "same event ticker")
-_ST_SERIES = "Same-title candidates skipped as two instances of one event series"
-# DR-74: the same-title close gate's two lines — the close-gap refusal
-# (verbatim with find_same_title_pairs') and the backtest-only unreadable-close
-# one. Distinct prefixes ("candidates" vs "candidate pairs"), so neither can be
-# read as the other.
-_ST_CLOSE_GAP = "Same-title candidates refused because the two markets close more than"
-_ST_UNDATED = "Same-title candidate pairs refused because a market's close_time"
-# DR-79: the same-title sport check's three lines — the label refusal
-# (_extract_pairs, verbatim with find_same_title_pairs'), the competition
-# refusal (_refuse_other_competitions, verbatim with the live one) and the
-# backtest-only unknown-competition one.
-_ST_LABEL = ("Same-title candidates refused because the two series are filed under "
-             "different Kalshi categories or tags")
-_ST_COMPETITION = ("Same-title candidates refused because the two events name "
-                   "different competitions")
-_ST_UNKNOWN_COMPETITION = ("Same-title candidate pairs refused because an event's "
-                           "competition could not be read from Kalshi")
 _TS_WORDING = "Time-series candidates refused because"
 _LADDER_REFUSED = "Same-event ladder candidates refused because"
 _LADDER_GAP_CAP = "Same-event ladder candidates worded as two different cumulative"
@@ -834,8 +679,7 @@ def _logged_counts(caplog) -> dict[str, int]:
     group MEMBERS — read it on its own, never in a sum with the others.
     """
     out: dict[str, int] = defaultdict(int)
-    prefixes = (_TS_UNDATED, _TS_BEYOND, _TS_SAME_EVENT, _TS_SERIES, _ST_SAME_EVENT,
-                _ST_SERIES, _ST_CLOSE_GAP, _ST_UNDATED, _ST_LABEL, _TS_WORDING,
+    prefixes = (_TS_UNDATED, _TS_BEYOND, _TS_SAME_EVENT, _TS_SERIES, _TS_WORDING,
                 _LADDER_REFUSED, _LADDER_GAP_CAP, _LADDER_FORMED)
     for message in caplog.messages:
         for prefix in prefixes:
@@ -847,19 +691,12 @@ def _logged_counts(caplog) -> dict[str, int]:
 class TestOneSeriesAndSameEventCounts:
     """M10: every pair of a group's members is returned or counted.
 
-    The one-series rule (DR-02, DR-54, both branches) and the same-event skip
-    were bare `continue`s here, so the 2026-09-24 7-day run logged "Potential
-    pairs: 0 time-series, 0 same-title" over 184,178 groupable markets with
-    no cause for the same-title zero. Each now has a silent-at-zero INFO line,
-    and so do the two things the time-series sweep sets aside before visiting
-    anything (members with no readable close_time, pairs beyond its
-    close-date window); an EMPTY grouping, which reaches _extract_pairs as {},
-    is reported by _prepare_candidates' always-logged group-count line. DR-74
-    added two more same-title lines, counted after the series test: a pair
-    whose two markets close more than SAME_TITLE_MAX_CLOSE_GAP_SECONDS apart,
-    and (backtest-only) a pair whose close_time cannot be read or compared.
-    DR-79 added one more, counted after the close gate: a pair whose two
-    series are filed under different Kalshi categories or tags.
+    The one-series rule (DR-02, DR-54) and the same-event skip each have a
+    silent-at-zero INFO line, and so do the two things the time-series sweep
+    sets aside before visiting anything (members with no readable
+    close_time, pairs beyond its close-date window); an EMPTY grouping, which
+    reaches _extract_pairs as {}, is reported by _prepare_candidates'
+    always-logged group-count line.
     Counting must move no control flow: the pair lists are pinned by every
     other test in this module, and the partition test below proves that the
     counts and the returned pairs together account for each pair exactly
@@ -912,23 +749,17 @@ class TestOneSeriesAndSameEventCounts:
     def _group_sizes(groups):
         return sorted(len(members) for members in groups.values())
 
-    @pytest.mark.parametrize("grouping,same_event,series", [
-        (_group_by_exact_title, _ST_SAME_EVENT, _ST_SERIES),
-        (_group_by_normalized_title, _TS_SAME_EVENT, _TS_SERIES),
-    ])
-    def test_a_combo_heavy_zero_is_fully_explained(
-        self, caplog, grouping, same_event, series,
-    ):
+    def test_a_combo_heavy_zero_is_fully_explained(self, caplog):
         # regression — fails on the pre-M10 code, which returned [] here and
         # logged none of these lines, so the zero had no cause in the log.
-        groups = grouping(self._combo_heavy())
+        groups = _group_by_normalized_title(self._combo_heavy())
         # Not vacuous: three groups of 3, 2 and 3, so 3 + 1 + 3 = 7 candidates.
         assert self._group_sizes(groups) == [2, 3, 3]
         with caplog.at_level(logging.INFO):
             assert _extract_pairs(groups, same_event_ladders=False) == []
         counts = _logged_counts(caplog)
-        assert counts[same_event] == 1
-        assert counts[series] == 6
+        assert counts[_TS_SAME_EVENT] == 1
+        assert counts[_TS_SERIES] == 6
         # Every one of the seven candidates is on exactly one of the two lines.
         assert sum(counts.values()) == 7
 
@@ -948,29 +779,6 @@ class TestOneSeriesAndSameEventCounts:
         assert counts[_LADDER_REFUSED] == 1
         assert counts[_LADDER_FORMED] == 0
 
-    def test_the_same_title_lines_are_the_live_finders_verbatim(self, caplog):
-        # The backtest mirrors find_same_title_pairs' two lines word for word,
-        # so one grep reads either path. Same fixture through both: the live
-        # finder gets priced namespaces, the backtester the dicts.
-        recs = self._combo_heavy()
-        live = [SimpleNamespace(ticker=r["ticker"], event_ticker=r["event_ticker"],
-                                title=r["title"], subtitle=r["subtitle"],
-                                _event_title=r["event_title"], yes_ask_dollars="0.50",
-                                no_ask_dollars="0.50",
-                                close_time=_parse_iso_datetime(r["close_time"]))
-                for r in recs]
-        with caplog.at_level(logging.INFO):
-            scanner.find_same_title_pairs(live)
-        live_lines = [m for m in caplog.messages
-                      if m.startswith((_ST_SAME_EVENT, _ST_SERIES, _ST_CLOSE_GAP))]
-        caplog.clear()
-        with caplog.at_level(logging.INFO):
-            _extract_pairs(_group_by_exact_title(recs))
-        backtest_lines = [m for m in caplog.messages
-                          if m.startswith((_ST_SAME_EVENT, _ST_SERIES, _ST_CLOSE_GAP))]
-        assert len(live_lines) == 2
-        assert backtest_lines == live_lines
-
     def test_the_time_series_series_line_shares_the_live_prefix(self, caplog):
         # Only the parenthesis differs from find_time_series_pairs' line, as
         # it does for the DR-72 lines: the sweep is windowed, the live loop
@@ -984,13 +792,11 @@ class TestOneSeriesAndSameEventCounts:
             "window, before price filters): 6"
         )
 
-    @pytest.mark.parametrize("grouping", [_group_by_exact_title, _group_by_normalized_title])
-    def test_silent_at_zero(self, caplog, grouping):
-        # control — kills a mutant that drops any of the six `if count:`
+    def test_silent_at_zero(self, caplog):
+        # control — kills a mutant that drops any of the four `if count:`
         # guards. Two different series asking one cumulative question at two
-        # deadlines: nothing is refused by either rule on either branch — and
-        # the two records share a close, so the same-title close gate
-        # (DR-74) refuses nothing either.
+        # deadlines: neither rule refuses it, it has no undated member, and
+        # the sweep's window reaches it.
         recs = [
             self._rec("KXAA-1-T", "KXAA-1", "Will X happen by March 1, 2026?",
                       "2026-03-01T00:00:00Z"),
@@ -998,11 +804,9 @@ class TestOneSeriesAndSameEventCounts:
                       "2026-03-01T00:00:00Z"),
         ]
         with caplog.at_level(logging.INFO):
-            _extract_pairs(grouping(recs), same_event_ladders=False)
+            _extract_pairs(_group_by_normalized_title(recs), same_event_ladders=False)
         counts = _logged_counts(caplog)
-        for prefix in (_TS_UNDATED, _TS_BEYOND, _TS_SAME_EVENT, _TS_SERIES,
-                       _ST_SAME_EVENT, _ST_SERIES, _ST_CLOSE_GAP, _ST_UNDATED,
-                       _ST_LABEL):
+        for prefix in (_TS_UNDATED, _TS_BEYOND, _TS_SAME_EVENT, _TS_SERIES):
             assert prefix not in counts
 
     @pytest.mark.parametrize("ladders", [False, True])
@@ -1035,19 +839,23 @@ class TestOneSeriesAndSameEventCounts:
         # Not the live finder's gap-cap line: no rule was evaluated here.
         assert "more than 31 days apart" in line and "gap cap" not in line
 
-    def test_an_empty_grouping_is_reported_by_prepare_candidates(
-        self, monkeypatch, caplog,
+    @pytest.mark.parametrize("deadline_b, groups, pairs", [
+        ("March 20", 1, 1),       # one question at two deadlines: one group
+        (None, 0, 0),             # two questions, so no group at all
+    ])
+    def test_the_grouping_is_reported_by_prepare_candidates(
+        self, monkeypatch, caplog, deadline_b, groups, pairs,
     ):
         # regression — fails on the first cut of M10. A grouping with no
         # group of two or more reaches _extract_pairs as {}, where every line
-        # is silent, so "0 same-title" had no cause in the log. Here the two
-        # markets share only the time-series key (their titles differ), so
-        # the same-title grouping is empty.
+        # is silent, so a zero had no cause in the log. The grouping's size is
+        # logged on every run, an empty one included.
+        title_b = (f"Rain falls by {deadline_b}, 2026" if deadline_b
+                   else "Snow falls by March 20, 2026")
         corpus = [
             _ss1_record("RA", "RAINA-1", "Rain falls by March 1, 2026",
                         event_title="RAIN", close="2026-03-01"),
-            _ss1_record("RB", "RAINB-1", "Rain falls by March 20, 2026",
-                        event_title="RAIN", close="2026-03-20"),
+            _ss1_record("RB", "RAINB-1", title_b, event_title="RAIN", close="2026-03-20"),
         ]
         TestGroupableSubset._patch(monkeypatch, corpus)
         with caplog.at_level(logging.INFO):
@@ -1055,8 +863,8 @@ class TestOneSeriesAndSameEventCounts:
         messages = caplog.messages
         [groups_at] = [i for i, m in enumerate(messages) if m.startswith(_GROUPS)]
         assert messages[groups_at] == (
-            "Groups of two or more markets: 1 time-series (2 markets), "
-            "0 same-title (0 markets) — pairs form only inside a group"
+            f"Groups of two or more markets: {groups} time-series ({2 * groups} markets) "
+            "— pairs form only inside a group"
         )
         census_at = next(i for i, m in enumerate(messages)
                          if m.startswith("Deadline phrasing over"))
@@ -1064,7 +872,7 @@ class TestOneSeriesAndSameEventCounts:
                         if m.startswith("Potential pairs:"))
         # After the census, before any per-candidate line and the pair count.
         assert census_at < groups_at < pairs_at
-        assert messages[pairs_at] == "Potential pairs: 1 time-series, 0 same-title"
+        assert messages[pairs_at] == f"Potential pairs: {pairs} time-series"
 
     @staticmethod
     def _fuzz(seed: int) -> list[dict]:
@@ -1073,12 +881,11 @@ class TestOneSeriesAndSameEventCounts:
         snapshot and deadline-less wording, over a 60-day close spread so the
         sweep's window cuts some candidates.
 
-        Every other re-listed duplicate also copies its source's close_time
-        (DR-74), so some same-title candidates close at one instant and survive
-        the close gate while the rest are refused by it. That copy is keyed on
-        the record's index, not on a random draw, so the rng stream — and with
-        it every other field of every record — is the one the fuzz always
-        drew."""
+        Every other re-listed duplicate also copies its source's close_time,
+        so some identically worded candidates close at one instant. That copy
+        is keyed on the record's index, not on a random draw, so the rng
+        stream — and with it every other field of every record — is the one
+        the fuzz always drew."""
         rng = random.Random(seed)
         stems = ["Will X happen", "Will Y win", "Starship launches", "Q"]
         preps = ["by", "before", "on", "in", ""]
@@ -1126,21 +933,12 @@ class TestOneSeriesAndSameEventCounts:
         # what it returned plus what it counted.
         recs = self._fuzz(seed)
         # Some members with no readable close_time, which the sweep sets
-        # aside before visiting anything (one malformed, the rest absent). The
-        # same-title branch does NOT set them aside — its groups are not
-        # close-filtered — so they are what feeds its backtest-only
-        # unreadable-close count (DR-74; 1/3/5 such candidates for seeds
-        # 0/1/2).
+        # aside before visiting anything (one malformed, the rest absent).
         for k, rec in enumerate(recs):
             if k % 17 == 5:
                 rec["close_time"] = "not a date" if k == 5 else None
         margin = timedelta(days=MAX_DEADLINE_GAP_DAYS + 1)
         ts_groups = _group_by_normalized_title(recs)
-        st_groups = _group_by_exact_title(recs)
-        # A listing that files KXAA apart from every other series, which fall
-        # back to their ticker prefix and so file alike: some same-title
-        # candidates are refused on the label line (DR-79), the rest survive
-        listing = {"KXAA": ("Sports", ("Football",))}
 
         cross = same_event_in_window = ladder_population = 0
         undated = beyond = dated_pairs = 0
@@ -1162,25 +960,15 @@ class TestOneSeriesAndSameEventCounts:
             for m in dated:
                 buckets[m["event_ticker"]] += 1
             ladder_population += sum(n * (n - 1) // 2 for n in buckets.values())
-        st_candidates = sum(len(v) * (len(v) - 1) // 2 for v in st_groups.values())
 
         with caplog.at_level(logging.INFO):
             ts_pairs = _extract_pairs(ts_groups, same_event_ladders=ladders)
         ts = _logged_counts(caplog)
-        caplog.clear()
-        with caplog.at_level(logging.INFO):
-            st_pairs = _extract_pairs(st_groups, same_event_ladders=ladders,
-                                      series_categories=listing)
-        st = _logged_counts(caplog)
 
         ladder_pairs = ts[_LADDER_FORMED]
-        # Not vacuous: each rule fires, and something survives — including
-        # both same-title close-gate refusals (DR-74): the malformed/absent
-        # close_times set above supply the unreadable ones, and the fuzz's
-        # uncopied closes the ones more than an hour apart.
-        assert ts[_TS_SERIES] and st[_ST_SERIES] and st[_ST_SAME_EVENT]
-        assert st[_ST_UNDATED] and st[_ST_CLOSE_GAP] and st[_ST_LABEL]
-        assert len(ts_pairs) and len(st_pairs)
+        # Not vacuous: each rule fires, and something survives.
+        assert ts[_TS_SERIES]
+        assert len(ts_pairs)
         # What the sweep set aside before visiting anything, and the whole
         # partition of the dated members' pairs: beyond the window, or
         # visited (same-event or cross-event).
@@ -1196,532 +984,6 @@ class TestOneSeriesAndSameEventCounts:
         else:
             assert ts[_TS_SAME_EVENT] == same_event_in_window > 0
             assert ladder_pairs == 0
-        assert st_candidates == (
-            len(st_pairs) + st[_ST_SAME_EVENT] + st[_ST_SERIES]
-            + st[_ST_UNDATED] + st[_ST_CLOSE_GAP] + st[_ST_LABEL]
-        )
-
-
-class TestSameTitleCloseGapBacktest:
-    """DR-74 mirror: _extract_pairs' same-title branch refuses identical
-    wording on two DIFFERENT series unless both markets close within
-    SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other.
-
-    The verdict is scanner.closes_apart, the ONE definition the live finder
-    uses; the backtest only parses the cached close strings first
-    (_comparable_closes_dicts) and counts a pair it cannot date on a line of
-    its own, because the live finder never reaches such a market. The backtest
-    reads REALIZED closes. Mirror of test_scanner.py::TestSameTitleCloseGap.
-    """
-
-    _WIU_TITLE = "Western Illinois at Eastern Illinois Winner?"
-
-    @classmethod
-    def _wiu(cls, *, womens_close="2026-01-13T23:30:00Z"):
-        # The real pair's REALIZED closes sat 2 h 41 m apart (the clock times
-        # here are the fixture's own; the gap is the measured one).
-        def rec(ticker, event_ticker, close):
-            return {"ticker": ticker, "event_ticker": event_ticker,
-                    "event_title": "Western Illinois at Eastern Illinois",
-                    "title": cls._WIU_TITLE, "subtitle": "Western Illinois",
-                    "close_time": close}
-        return [
-            rec("KXNCAAMBGAME-26JAN13WIUEIU-WIU", "KXNCAAMBGAME-26JAN13WIUEIU",
-                "2026-01-14T02:11:00Z"),
-            rec("KXNCAAWBGAME-26JAN13WIUEIU-WIU", "KXNCAAWBGAME-26JAN13WIUEIU",
-                womens_close),
-        ]
-
-    def test_mens_and_womens_game_are_refused_and_counted_once(self, caplog):
-        recs = self._wiu()
-        gap = abs(_parse_iso_datetime(recs[0]["close_time"])
-                  - _parse_iso_datetime(recs[1]["close_time"]))
-        assert gap == timedelta(hours=2, minutes=41)
-        assert backtester._same_series_dicts(*recs) is False
-        groups = _group_by_exact_title(recs)
-        assert len(groups) == 1
-        with caplog.at_level(logging.INFO):
-            assert _extract_pairs(groups) == []
-        counts = _logged_counts(caplog)
-        assert counts[_ST_CLOSE_GAP] == 1
-        assert _ST_UNDATED not in counts
-        assert _ST_SERIES not in counts
-
-    def test_the_same_pair_at_one_close_instant_is_a_candidate(self):
-        # Positive control: only the women's close moves.
-        recs = self._wiu(womens_close="2026-01-14T02:11:00Z")
-        assert len(_extract_pairs(_group_by_exact_title(recs))) == 1
-
-    @pytest.mark.parametrize("gap_seconds,pairs", [
-        (0, 1), (3_600, 1), (3_601, 0),
-    ])
-    def test_the_bound_is_one_hour_inclusive(self, gap_seconds, pairs):
-        close = datetime(2026, 1, 14, 2, 11, tzinfo=UTC) - timedelta(seconds=gap_seconds)
-        recs = self._wiu(womens_close=close.isoformat())
-        assert len(_extract_pairs(_group_by_exact_title(recs))) == pairs
-
-    def test_the_gate_is_the_scanner_definition(self, monkeypatch, caplog):
-        # The backtest has no bound of its own: narrowing scanner's binding
-        # (the one closes_apart reads) narrows this gate too — and the bound
-        # its refusal line PRINTS, which must be the one the gate applied, not
-        # a second copy of the constant still reading 60 minutes.
-        monkeypatch.setattr(scanner, "SAME_TITLE_MAX_CLOSE_GAP_SECONDS", 60)
-        base = datetime(2026, 1, 14, 2, 11, tzinfo=UTC)
-        at_60 = self._wiu(womens_close=(base - timedelta(seconds=60)).isoformat())
-        at_61 = self._wiu(womens_close=(base - timedelta(seconds=61)).isoformat())
-        assert len(_extract_pairs(_group_by_exact_title(at_60))) == 1
-        with caplog.at_level(logging.INFO):
-            assert _extract_pairs(_group_by_exact_title(at_61)) == []
-        assert [m for m in caplog.messages if m.startswith(_ST_CLOSE_GAP)] == [
-            "Same-title candidates refused because the two markets close more "
-            "than 1 minute apart (two different games or instants, not one "
-            "question listed twice): 1"
-        ]
-
-    @pytest.mark.parametrize("womens_close", [
-        None,                     # absent
-        "",                       # blank
-        "not-a-timestamp",        # malformed
-        "2026-01-14T02:11:00",    # naive, beside an aware partner
-    ])
-    def test_an_unreadable_close_is_refused_on_its_own_line(self, caplog, womens_close):
-        # Fail CLOSED, and on the backtest-only line: the live finder never
-        # reaches such a market (_filter_active_markets drops a missing close
-        # before grouping), so counting it on the close-gap line would make
-        # that line stop being the live one's twin.
-        recs = self._wiu(womens_close=womens_close)
-        with caplog.at_level(logging.INFO):
-            assert _extract_pairs(_group_by_exact_title(recs)) == []
-        counts = _logged_counts(caplog)
-        assert counts[_ST_UNDATED] == 1
-        assert _ST_CLOSE_GAP not in counts
-        assert caplog.messages.count(
-            "Same-title candidate pairs refused because a market's close_time "
-            "cannot be read (fail closed; the live finder drops such markets "
-            "before grouping): 1"
-        ) == 1
-
-    def test_the_lines_are_silent_at_zero(self, caplog):
-        recs = self._wiu(womens_close="2026-01-14T02:11:00Z")
-        with caplog.at_level(logging.INFO):
-            assert len(_extract_pairs(_group_by_exact_title(recs))) == 1
-        counts = _logged_counts(caplog)
-        assert _ST_CLOSE_GAP not in counts and _ST_UNDATED not in counts
-
-    def test_the_close_gap_line_is_the_live_finders_verbatim(self, caplog):
-        # A SEPARATE fixture that reaches the gate: two non-combo series,
-        # identical wording, closes more than an hour apart (the combo-heavy
-        # fixture is refused by the series rule first and never gets here).
-        # One grep reads either path, so the two lines must match word for
-        # word — the count included.
-        recs = self._wiu() + [
-            {"ticker": "KXNCAAWBGAME-26FEB10WIUEIU-WIU",
-             "event_ticker": "KXNCAAWBGAME-26FEB10WIUEIU",
-             "event_title": "Western Illinois at Eastern Illinois",
-             "title": self._WIU_TITLE, "subtitle": "Western Illinois",
-             "close_time": "2026-02-10T23:30:00Z"},
-        ]
-        live = [SimpleNamespace(ticker=r["ticker"], event_ticker=r["event_ticker"],
-                                title=r["title"], subtitle=r["subtitle"],
-                                _event_title=r["event_title"],
-                                yes_ask_dollars=str(0.40 - 0.1 * i),
-                                no_ask_dollars=str(0.60 + 0.1 * i),
-                                close_time=_parse_iso_datetime(r["close_time"]))
-                for i, r in enumerate(recs)]
-        with caplog.at_level(logging.INFO):
-            assert scanner.find_same_title_pairs(live) == []
-        live_lines = [m for m in caplog.messages
-                      if m.startswith((_ST_SAME_EVENT, _ST_SERIES, _ST_CLOSE_GAP))]
-        caplog.clear()
-        with caplog.at_level(logging.INFO):
-            assert _extract_pairs(_group_by_exact_title(recs)) == []
-        backtest_lines = [m for m in caplog.messages
-                          if m.startswith((_ST_SAME_EVENT, _ST_SERIES, _ST_CLOSE_GAP))]
-        # Men's vs each women's listing: two close-gap refusals; the two
-        # women's listings of one series: one series refusal.
-        assert live_lines == [
-            "Same-title candidates skipped as two instances of one event series "
-            "(identical wording, different fixture): 1",
-            "Same-title candidates refused because the two markets close more "
-            "than 60 minutes apart (two different games or instants, not one "
-            "question listed twice): 2",
-        ]
-        assert backtest_lines == live_lines
-
-    @pytest.mark.parametrize("a,b,readable", [
-        ({}, {"close_time": "2026-01-14T02:11:00Z"}, False),
-        ({"close_time": None}, {"close_time": "2026-01-14T02:11:00Z"}, False),
-        ({"close_time": "not-a-timestamp"}, {"close_time": "2026-01-14T02:11:00Z"}, False),
-        ({"close_time": "2026-01-14T02:11:00"}, {"close_time": "2026-01-14T02:11:00Z"}, False),
-        ({"close_time": "2026-01-14T02:11:00Z"}, {"close_time": "2026-01-14T02:11:00"}, False),
-        ({"close_time": "2026-01-14T02:11:00"}, {"close_time": "2026-01-14T05:00:00"}, True),
-        ({"close_time": "2026-01-14T02:11:00Z"}, {"close_time": "2026-01-15T02:11:00+00:00"}, True),
-    ])
-    def test_comparable_closes_dicts(self, a, b, readable):
-        out = backtester._comparable_closes_dicts(a, b)
-        if not readable:
-            assert out is None
-            return
-        ca, cb = out
-        assert ca == _parse_iso_datetime(a["close_time"])
-        assert cb == _parse_iso_datetime(b["close_time"])
-
-
-class TestSameTitleSportCheckBacktest:
-    """DR-79 mirror: the backtest refuses identical wording from two sports or
-    two competitions as the live finder does.
-
-    The label half is in _extract_pairs' same-title branch, right after the
-    close gate, through scanner.labels_differ over historical.series_labels
-    (from the listing handed in); the competition half is
-    _refuse_other_competitions, through scanner.competitions_differ, over the
-    labels historical.load_event_competitions read for the pairs' events. A
-    pair whose event's label is unknown is refused on a backtest-only line.
-    Mirror of test_scanner.py::TestSameTitleSportCheck; the backtest reads
-    REALIZED closes, so the incident is placed at one close instant here,
-    where only this check can refuse it."""
-
-    # The listing as Kalshi's /series files these series (category, tags)
-    LISTING = {
-        "KXNCAAWVMATCH": ("Sports", ("Volleyball",)),
-        "KXNCAAFGAME": ("Sports", ("Football",)),
-        "KXNCAAMBGAME": ("Sports", ("Basketball",)),
-        "KXNCAAWBGAME": ("Sports", ("Basketball",)),
-        "KXBRENTW": ("Commodities", ("Oil & Gas",)),
-        "KXBRENTMON": ("Commodities", ("Oil & Gas",)),
-    }
-
-    @staticmethod
-    def _rec(ticker, event_ticker, title, subtitle, event_title, close):
-        return {"ticker": ticker, "event_ticker": event_ticker, "event_title": event_title,
-                "title": title, "subtitle": subtitle, "close_time": close}
-
-    @classmethod
-    def _incident(cls, close="2026-10-19T00:00:00Z"):
-        """The 2026-10-16 incident's four markets, all closing at one instant."""
-        out = []
-        for event in ("KXNCAAWVMATCH-26OCT161900UKOU", "KXNCAAFGAME-26OCT16UKOKLA"):
-            for team, code in (("Kentucky", "UK"), ("Oklahoma", "OU")):
-                out.append(cls._rec(f"{event}-{code}", event, f"{team} wins", team,
-                                    "Kentucky vs Oklahoma", close))
-        return out
-
-    @classmethod
-    def _basketball(cls):
-        """A men's and a women's game of one matchup at one close, both tagged Basketball."""
-        title = "Western Illinois at Eastern Illinois Winner?"
-        return [cls._rec(f"{event}-WIU", event, title, "Western Illinois",
-                         "Western Illinois at Eastern Illinois", "2026-01-28T01:30:00Z")
-                for event in ("KXNCAAMBGAME-26JAN27WIUEIU", "KXNCAAWBGAME-26JAN27WIUEIU")]
-
-    @classmethod
-    def _brent(cls):
-        """One question on a weekly and a monthly series, filed alike."""
-        title = "Brent crude oil price on Sep 25, 2026?"
-        return [cls._rec(f"{event}-T70", event, title, "$70 or above",
-                         "Brent crude oil price", "2026-09-25T21:00:00Z")
-                for event in ("KXBRENTW-26SEP25", "KXBRENTMON-26SEP")]
-
-    _COMPETITIONS = {
-        "KXNCAAWVMATCH-26OCT161900UKOU": "NCAA Volleyball (W)",
-        "KXNCAAFGAME-26OCT16UKOKLA": "NCAA Football",
-        "KXNCAAMBGAME-26JAN27WIUEIU": "College Basketball (M)",
-        "KXNCAAWBGAME-26JAN27WIUEIU": "College Basketball (W)",
-        "KXBRENTW-26SEP25": "",
-        "KXBRENTMON-26SEP": "",
-    }
-
-    @staticmethod
-    def _sport_lines(caplog) -> list[str]:
-        return [m for m in caplog.messages
-                if m.startswith((_ST_LABEL, _ST_COMPETITION, _ST_UNKNOWN_COMPETITION))]
-
-    def test_the_incident_at_one_close_is_refused_on_the_label_line(self, caplog):
-        groups = _group_by_exact_title(self._incident())
-        with caplog.at_level(logging.INFO):
-            assert _extract_pairs(groups, series_categories=self.LISTING) == []
-        # "Kentucky wins" and "Oklahoma wins", each counted once; every older
-        # check passed (no series, close-gap or unreadable-close line)
-        assert self._sport_lines(caplog) == [
-            "Same-title candidates refused because the two series are filed under "
-            "different Kalshi categories or tags (two different sports or subjects, "
-            "not one question listed twice): 2"]
-        counts = _logged_counts(caplog)
-        for prefix in (_ST_SAME_EVENT, _ST_SERIES, _ST_CLOSE_GAP, _ST_UNDATED):
-            assert prefix not in counts
-
-    def test_with_no_listing_the_incident_pairs_form(self):
-        # Control: with no listing every series falls back to its ticker
-        # prefix and files alike, so the refusal above is the label check
-        groups = _group_by_exact_title(self._incident())
-        assert len(_extract_pairs(groups)) == 2
-        assert len(_extract_pairs(groups, series_categories={})) == 2
-
-    def test_labels_are_compared_without_regard_to_letter_case(self):
-        listing = dict(self.LISTING, KXNCAAWVMATCH=("SPORTS", ("football",)))
-        groups = _group_by_exact_title(self._incident())
-        assert len(_extract_pairs(groups, series_categories=listing)) == 2
-
-    def test_mens_and_womens_basketball_are_refused_on_the_competition_line(self, caplog):
-        groups = _group_by_exact_title(self._basketball())
-        # One tag: the label half lets the pair through
-        pairs = _extract_pairs(groups, series_categories=self.LISTING)
-        assert len(pairs) == 1
-        with caplog.at_level(logging.INFO):
-            assert backtester._refuse_other_competitions(pairs, self._COMPETITIONS) == []
-        assert self._sport_lines(caplog) == [
-            "Same-title candidates refused because the two events name different "
-            "competitions (two leagues, genders or formats, not one question listed "
-            "twice): 1"]
-
-    def test_one_event_naming_a_competition_and_the_other_none_is_refused(self, caplog):
-        pairs = _extract_pairs(_group_by_exact_title(self._basketball()),
-                               series_categories=self.LISTING)
-        competitions = dict(self._COMPETITIONS, **{"KXNCAAWBGAME-26JAN27WIUEIU": ""})
-        with caplog.at_level(logging.INFO):
-            assert backtester._refuse_other_competitions(pairs, competitions) == []
-        assert self._sport_lines(caplog) == [_ST_COMPETITION + " (two leagues, genders or "
-                                             "formats, not one question listed twice): 1"]
-
-    def test_weekly_and_monthly_brent_are_kept(self, caplog):
-        with caplog.at_level(logging.INFO):
-            pairs = _extract_pairs(_group_by_exact_title(self._brent()),
-                                   series_categories=self.LISTING)
-            assert len(pairs) == 1
-            assert backtester._refuse_other_competitions(pairs, self._COMPETITIONS) == pairs
-        # Silent at zero
-        assert self._sport_lines(caplog) == []
-
-    @pytest.mark.parametrize("missing", ["KXBRENTW-26SEP25", "KXBRENTMON-26SEP"])
-    def test_an_unknown_competition_is_refused_on_the_backtest_only_line(self, caplog,
-                                                                          missing):
-        pairs = _extract_pairs(_group_by_exact_title(self._brent()),
-                               series_categories=self.LISTING)
-        competitions = {k: v for k, v in self._COMPETITIONS.items() if k != missing}
-        with caplog.at_level(logging.INFO):
-            assert backtester._refuse_other_competitions(pairs, competitions) == []
-        assert self._sport_lines(caplog) == [
-            "Same-title candidate pairs refused because an event's competition could "
-            "not be read from Kalshi (fail closed): 1"]
-
-    def test_the_kept_pairs_keep_their_order(self):
-        pairs = (_extract_pairs(_group_by_exact_title(self._brent()),
-                                series_categories=self.LISTING)
-                 + _extract_pairs(_group_by_exact_title(self._basketball()),
-                                  series_categories=self.LISTING))
-        same = dict.fromkeys(self._COMPETITIONS, "College Basketball (M)")
-        kept = backtester._refuse_other_competitions(pairs, same)
-        assert kept == pairs and kept[0] is pairs[0]
-
-    def test_the_lines_are_the_live_finders_verbatim(self, caplog):
-        # The incident (two label refusals) and the basketball pair (one
-        # competition refusal) through both paths: the live finder gets
-        # markets filed as main._attach_series_labels files them, the
-        # backtest the dicts, and the two print the same lines, counts included
-        recs = self._incident() + self._basketball() + self._brent()
-        live = []
-        for r in recs:
-            event = r["event_ticker"]
-            live.append(SimpleNamespace(
-                ticker=r["ticker"], event_ticker=event, title=r["title"],
-                subtitle=r["subtitle"], _event_title=r["event_title"],
-                yes_ask_dollars="0.50", no_ask_dollars="0.50",
-                close_time=_parse_iso_datetime(r["close_time"]),
-                _series_labels=historical.series_labels(
-                    event, historical.infer_category(event), self.LISTING),
-                _event_competition=self._COMPETITIONS[event]))
-        with caplog.at_level(logging.INFO):
-            scanner.find_same_title_pairs(live)
-        live_lines = self._sport_lines(caplog)
-        caplog.clear()
-        with caplog.at_level(logging.INFO):
-            pairs = _extract_pairs(_group_by_exact_title(recs), series_categories=self.LISTING)
-            backtester._refuse_other_competitions(pairs, self._COMPETITIONS)
-        backtest_lines = self._sport_lines(caplog)
-        assert live_lines == [
-            _ST_LABEL + " (two different sports or subjects, not one question listed "
-            "twice): 2",
-            _ST_COMPETITION + " (two leagues, genders or formats, not one question "
-            "listed twice): 1",
-        ]
-        assert backtest_lines == live_lines
-
-    def test_prepare_candidates_reads_the_labels_and_refuses_both_shapes(
-        self, monkeypatch, caplog,
-    ):
-        # Through the real _prepare_candidates: the listing handed in files
-        # the series, the competitions come from load_event_competitions (its
-        # reader stubbed to this fixture's labels), and only Brent is left
-        # to count and to fetch candles for
-        corpus = [
-            _ss1_record(r["ticker"], r["event_ticker"], r["title"], subtitle=r["subtitle"],
-                        event_title=r["event_title"])
-            for r in self._incident() + self._basketball() + self._brent()]
-        TestGroupableSubset._patch(monkeypatch, corpus)
-        asked: list = []
-
-        def read(client, event_ticker):
-            asked.append(event_ticker)
-            return self._COMPETITIONS[event_ticker]
-
-        monkeypatch.setattr(historical, "_fetch_event_competition", read)
-        fetched: list = []
-        monkeypatch.setattr(backtester, "fetch_candlesticks",
-                            lambda client, ticker, *a, **k: fetched.append(ticker) or [])
-        with caplog.at_level(logging.INFO):
-            candidates = backtester._prepare_candidates(
-                MagicMock(), MagicMock(), _SS1_START, True, None,
-                series_categories=self.LISTING)
-        assert [p[0][0]["event_ticker"] for p in candidates.all_pairs] == ["KXBRENTW-26SEP25"]
-        # Only the events of pairs the label half kept were asked for
-        assert sorted(asked) == sorted(["KXNCAAMBGAME-26JAN27WIUEIU",
-                                        "KXNCAAWBGAME-26JAN27WIUEIU",
-                                        "KXBRENTW-26SEP25", "KXBRENTMON-26SEP"])
-        assert sorted(fetched) == ["KXBRENTMON-26SEP-T70", "KXBRENTW-26SEP25-T70"]
-        messages = caplog.messages
-        label_at = next(i for i, m in enumerate(messages) if m.startswith(_ST_LABEL))
-        competition_at = next(i for i, m in enumerate(messages)
-                              if m.startswith(_ST_COMPETITION))
-        pairs_at = messages.index("Potential pairs: 0 time-series, 1 same-title")
-        assert label_at < competition_at < pairs_at
-
-    def test_prepare_candidates_reads_the_cached_listing_with_none(self, monkeypatch):
-        # None reads the cached copy only (no client), as a dev run does
-        historical._SERIES_CATEGORIES_CACHE.write_text(json.dumps({
-            "fetched_at": "2020-01-01T00:00:00+00:00",
-            "series": {k: [v[0], list(v[1])] for k, v in self.LISTING.items()}}))
-        corpus = [_ss1_record(r["ticker"], r["event_ticker"], r["title"],
-                              subtitle=r["subtitle"], event_title=r["event_title"])
-                  for r in self._incident()]
-        TestGroupableSubset._patch(monkeypatch, corpus)
-        seen: list = []
-        real_load = historical.load_series_categories
-
-        def spy(client, *a, **k):
-            seen.append(client)
-            return real_load(client, *a, **k)
-
-        monkeypatch.setattr(backtester, "load_series_categories", spy)
-        candidates = backtester._prepare_candidates(MagicMock(), MagicMock(), _SS1_START,
-                                                    True, None)
-        assert seen == [None]
-        assert candidates.all_pairs == []
-
-    def test_an_unknown_competition_in_prepare_candidates_refuses_the_pair(
-        self, monkeypatch, caplog,
-    ):
-        corpus = [_ss1_record(r["ticker"], r["event_ticker"], r["title"],
-                              subtitle=r["subtitle"], event_title=r["event_title"])
-                  for r in self._brent()]
-        TestGroupableSubset._patch(monkeypatch, corpus)
-
-        def offline(client, event_ticker):
-            raise RuntimeError("offline")
-
-        monkeypatch.setattr(historical, "_fetch_event_competition", offline)
-        with caplog.at_level(logging.INFO):
-            candidates = backtester._prepare_candidates(
-                MagicMock(), MagicMock(), _SS1_START, True, None,
-                series_categories=self.LISTING)
-        assert candidates.all_pairs == []
-        assert self._sport_lines(caplog) == [
-            "Same-title candidate pairs refused because an event's competition could "
-            "not be read from Kalshi (fail closed): 1"]
-
-    _NO_LISTING = "Same-title sport check: no /series listing"
-
-    @classmethod
-    def _no_listing_warnings(cls, caplog) -> list[str]:
-        return [r.getMessage() for r in caplog.records
-                if r.levelno == logging.WARNING and r.getMessage().startswith(cls._NO_LISTING)]
-
-    @pytest.mark.parametrize("listing", [{}, None])
-    def test_an_empty_listing_is_named_in_the_live_runs_words(self, monkeypatch, caplog,
-                                                             listing):
-        # {} (backtest.py's read failed with no cached copy) and None with no
-        # cached copy (a direct caller) both file every series by its ticker
-        # prefix, so the incident pairs form: one WARNING says so, in the
-        # words main._attach_series_labels uses for the same state live
-        from kalshi_betting import main as live_main
-
-        assert not historical._SERIES_CATEGORIES_CACHE.exists()
-        corpus = [_ss1_record(r["ticker"], r["event_ticker"], r["title"],
-                              subtitle=r["subtitle"], event_title=r["event_title"])
-                  for r in self._incident()]
-        TestGroupableSubset._patch(monkeypatch, corpus)
-        with caplog.at_level(logging.INFO):
-            candidates = backtester._prepare_candidates(
-                MagicMock(), MagicMock(), _SS1_START, True, None, series_categories=listing)
-        assert len(candidates.all_pairs) == 2
-        [backtest_line] = self._no_listing_warnings(caplog)
-        caplog.clear()
-        with caplog.at_level(logging.WARNING):
-            live_main._attach_series_labels([], {})
-        assert self._no_listing_warnings(caplog) == [backtest_line]
-
-    def test_a_listing_draws_no_such_warning(self, monkeypatch, caplog):
-        corpus = [_ss1_record(r["ticker"], r["event_ticker"], r["title"],
-                              subtitle=r["subtitle"], event_title=r["event_title"])
-                  for r in self._brent()]
-        TestGroupableSubset._patch(monkeypatch, corpus)
-        with caplog.at_level(logging.INFO):
-            backtester._prepare_candidates(MagicMock(), MagicMock(), _SS1_START, True, None,
-                                           series_categories=self.LISTING)
-        assert self._no_listing_warnings(caplog) == []
-
-    def test_no_same_title_group_draws_no_such_warning(self, monkeypatch, caplog):
-        # Nothing for the label check to file: an empty listing is not worth a word
-        corpus = [_ss1_record("KXBRENTW-26SEP25-T70", "KXBRENTW-26SEP25",
-                              "Brent crude oil price on Sep 25, 2026?",
-                              subtitle="$70 or above")]
-        TestGroupableSubset._patch(monkeypatch, corpus)
-        with caplog.at_level(logging.INFO):
-            backtester._prepare_candidates(MagicMock(), MagicMock(), _SS1_START, True, None,
-                                           series_categories={})
-        assert self._no_listing_warnings(caplog) == []
-
-
-class TestSeriesCategoriesReachPrepareCandidates:
-    """DR-79: the /series listing backtest.py reads is the one the same-title
-    label check files by, so every entry point hands it, unchanged, to
-    _prepare_candidates; None (a direct caller's default) arrives as None,
-    which _prepare_candidates turns into the cached copy."""
-
-    LISTING = {"KXA": ("Sports", ("Football",))}
-
-    @staticmethod
-    def _spy(monkeypatch):
-        seen: list = []
-
-        def fake(*args, **kwargs):
-            seen.append(kwargs.get("series_categories", "MISSING"))
-            return None
-
-        monkeypatch.setattr(backtester, "_prepare_candidates", fake)
-        return seen
-
-    @pytest.mark.parametrize("passed", [None, LISTING])
-    def test_run_backtest_sweep_hands_the_listing_over(self, monkeypatch, passed):
-        seen = self._spy(monkeypatch)
-        backtester.run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
-                                      sweep=False, series_categories=passed)
-        assert seen == [passed] and (passed is None or seen[0] is passed)
-
-    @pytest.mark.parametrize("passed", [None, LISTING])
-    def test_run_backtest_and_prepare_entries_hand_the_listing_over(self, monkeypatch,
-                                                                     passed):
-        seen = self._spy(monkeypatch)
-        run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
-                     start_date=date(2026, 1, 1), initial_balance=1000.0,
-                     series_categories=passed)
-        assert seen == [passed] and (passed is None or seen[0] is passed)
-
-    def test_the_listing_is_keyword_only_everywhere(self):
-        for func in (backtester._prepare_candidates, backtester._prepare_entries,
-                     run_backtest, run_backtest_sweep):
-            param = inspect.signature(func).parameters["series_categories"]
-            assert param.kind is inspect.Parameter.KEYWORD_ONLY, func.__name__
-            assert param.default is None, func.__name__
 
 
 class TestFeeMultipliersReachPrepareCandidates:
@@ -2110,32 +1372,6 @@ class TestOldCacheToleranceMissingTickAndSubtitleFields:
                                   "2026-01-01T00:00:00Z")
         assert _pair_key(m) == "Will BTC exceed $80k"
 
-    def test_group_by_exact_title_handles_missing_fields(self):
-        mA = self._old_style_dict("A1", "EVT-A", "Republicans win majority",
-                                   "2026-01-01T00:00:00Z", event_title="2026 Senate Control")
-        mB = self._old_style_dict("B1", "EVT-B", "Republicans win majority",
-                                   "2026-01-08T00:00:00Z", event_title="2026 Senate Control")
-        groups = _group_by_exact_title([mA, mB])
-        assert len(groups) == 1
-
-    def test_extract_pairs_same_title_handles_missing_fields(self):
-        # RE-PINNED (DR-02/DR-54): EVT-A/EVT-B share the series prefix "EVT",
-        # which _extract_pairs now refuses as two instances of one recurring
-        # fixture. The tickers name two DIFFERENT series so this test keeps
-        # pinning what it is for — that an old cache record missing the tick
-        # and subtitle keys still pairs.
-        #
-        # RE-PINNED (DR-74): the two records closed a week apart, which the
-        # same-title close gate now refuses as two different fixtures; they
-        # share one close so the pair again turns on the missing fields alone.
-        mA = self._old_style_dict("A1", "EVA-1", "Republicans win majority",
-                                   "2026-01-01T00:00:00Z", event_title="2026 Senate Control")
-        mB = self._old_style_dict("B1", "EVB-1", "Republicans win majority",
-                                   "2026-01-01T00:00:00Z", event_title="2026 Senate Control")
-        groups = _group_by_exact_title([mA, mB])
-        pairs = _extract_pairs(groups)
-        assert len(pairs) == 1
-
     def test_extract_pairs_time_series_handles_missing_fields(self):
         # Deadline gap kept within MAX_DEADLINE_GAP_DAYS + 1 margin so the
         # windowed sweep actually materializes a pair (not a windowing edge case).
@@ -2152,16 +1388,9 @@ class TestOldCacheToleranceMissingTickAndSubtitleFields:
 
 class TestSettlementReceipt:
     """_settlement_receipt pays n per leg whose market resolved to the side
-    that leg bought (scanner.leg_sides), so the table depends on pair type."""
-
-    def test_same_title_payoff_table(self):
-        # n NO contracts on A + n YES contracts on B; each winning contract
-        # pays exactly $1 — the receipt is independent of entry prices.
-        n = 10
-        assert _settlement_receipt(n, "yes", "yes", "same_title") == 10   # only B pays
-        assert _settlement_receipt(n, "no", "yes", "same_title") == 20    # both pay
-        assert _settlement_receipt(n, "no", "no", "same_title") == 10     # only A pays
-        assert _settlement_receipt(n, "yes", "no", "same_title") == 0     # loss scenario
+    that leg bought (scanner.leg_sides): a time-series pair's three cells.
+    scanner.leg_sides gives sides to time-series pairs only, so any other
+    pair type raises."""
 
     def test_time_series_three_cell_table(self):
         # n YES on the earlier contract A + n NO on the later contract B.
@@ -2177,10 +1406,37 @@ class TestSettlementReceipt:
         with pytest.raises(ValueError, match="premise violated"):
             _settlement_receipt(10, "yes", "no", "time_series")
 
-    def test_unknown_pair_type_uses_same_title_sides(self):
-        # Mirrors scanner.leg_sides: anything but "time_series" is same-title,
-        # so an unknown label can never be paid as the directional bet.
-        assert _settlement_receipt(10, "no", "yes", "bogus") == 20
+    @pytest.mark.parametrize("pair_type", ["same_title", "bogus", "", None])
+    def test_any_other_pair_type_raises_in_every_cell(self, pair_type):
+        # As scanner.leg_sides: anything but "time_series" raises, so a trade
+        # of another type is paid in no cell, neither as the directional bet
+        # nor on both legs at once. The backtest refuses every record that is
+        # not time-series before it scores one, so no run reaches this
+        for outcome_a, outcome_b in (("yes", "yes"), ("no", "no"), ("no", "yes"),
+                                     ("yes", "no")):
+            with pytest.raises(ValueError, match="not a time-series pair type"):
+                _settlement_receipt(10, outcome_a, outcome_b, pair_type)
+
+
+class TestLegPricesFor:
+    """_leg_prices_for, the backtest's mirror of scanner.leg_prices over four
+    loose quotes: (pA, nB) for a time-series pair, and ValueError for any
+    other pair type, as scanner.leg_prices raises."""
+
+    def test_a_time_series_pair_is_priced_yes_on_a_and_no_on_b(self):
+        assert backtester._leg_prices_for("time_series", 0.30, 0.70, 0.60, 0.40) == (0.30, 0.40)
+        assert scanner.leg_prices(SimpleNamespace(
+            pair_type="time_series", pA=0.30, nA=0.70, pB=0.60, nB=0.40)) == (0.30, 0.40)
+
+    @pytest.mark.parametrize("pair_type", ["same_title", "bogus", "", None, "Time_Series"])
+    def test_any_other_pair_type_raises(self, pair_type):
+        # Never priced at the NO-on-A, YES-on-B quotes (nA, pB), on either path
+        refused = re.escape(f"not a time-series pair type: {pair_type!r}")
+        with pytest.raises(ValueError, match=refused):
+            backtester._leg_prices_for(pair_type, 0.30, 0.70, 0.60, 0.40)
+        with pytest.raises(ValueError, match=refused):
+            scanner.leg_prices(SimpleNamespace(
+                pair_type=pair_type, pA=0.30, nA=0.70, pB=0.60, nB=0.40))
 
 
 def _candle(ts: int, yes_ask: float, no_ask: float) -> dict:
@@ -2309,17 +1565,24 @@ class TestFindEntryDirection:
                             "time_series", date(2026, 1, 1))
         assert entry is None
 
-    def test_same_title_canonicalizes_by_price(self):
-        # For same-title pairs, direction is price-only: A = expensive side.
+    @pytest.mark.parametrize("pair_type", ["same_title", "bogus", ""])
+    def test_any_other_pair_type_is_refused_before_the_data_is_read(self, pair_type):
+        # The backtest simulates time-series pairs only, and _entries_for_band
+        # hands _find_entry no other type: any other is a caller bug, refused
+        # as a bad band is — for quotes that enter as a time-series pair, and
+        # before a close_time that cannot be read ends the call quietly
         mA, mB = self._markets()
-        candles_a = [_candle(_MONDAY_TS, 0.55, 0.47)]
-        candles_b = [_candle(_MONDAY_TS, 0.70, 0.32)]
-        entry = _find_entry(candles_a, candles_b, mA, mB,
-                            "same_title", date(2026, 1, 1))
-        assert entry is not None
-        assert entry["mA"]["ticker"] == "LATE"  # the pricier side becomes A
-        # The canonical B's NO ask is carried too (reporting only for same_title)
-        assert entry["nB"] == pytest.approx(0.47)
+        candles_early = [_candle(_MONDAY_TS, 0.30, 0.70)]
+        candles_late = [_candle(_MONDAY_TS, 0.60, 0.40)]
+        assert _find_entry(candles_early, candles_late, mA, mB,
+                           "time_series", date(2026, 1, 1)) is not None
+        refused = re.escape(f"_find_entry takes time-series pairs only, got pair_type "
+                            f"{pair_type!r}")
+        with pytest.raises(ValueError, match=refused):
+            _find_entry(candles_early, candles_late, mA, mB, pair_type, date(2026, 1, 1))
+        with pytest.raises(ValueError, match=refused):
+            _find_entry([], [], {"ticker": "X"}, {"ticker": "Y"}, pair_type,
+                        date(2026, 1, 1))
 
 
 class TestLiveBacktestSpreadParity:
@@ -2432,16 +1695,6 @@ class TestFindEntryTieredThreshold:
         # gap never enters
         assert self._entry(35, pA=0.30, pB=0.70) is None
 
-    def test_same_title_ignores_deadline_gap(self):
-        # same_title keeps the flat 5% threshold: a 6% divergence on markets
-        # closing 20 days apart is still an entry (nA+pB = 0.94 <= 0.95)
-        mA, mB = self._markets(20)
-        candles_a = [_candle(_MONDAY_TS, 0.36, 0.64)]
-        candles_b = [_candle(_MONDAY_TS, 0.30, 0.70)]
-        entry = _find_entry(candles_a, candles_b, mA, mB,
-                            "same_title", date(2026, 1, 1))
-        assert entry is not None
-
     def test_gap_tier_uses_datetime_arithmetic_like_live_scanner(self):
         # The deadline gap must be measured the way scanner.find_time_series_pairs
         # measures it: timedelta.days on the tz-aware close_time DATETIMES, which
@@ -2543,31 +1796,64 @@ class TestFindEntryHorizon:
         assert entry is None
 
 
+# Time-series fixture shared by the end-to-end profit test and the sizing-parity
+# tests. SA (earlier deadline, February 1) and SB (later deadline, February 14)
+# are worded as two cumulative "by <date>" deadlines of one question, on two
+# events of different series. Both settle YES, the cell where only the YES leg
+# on SA pays. The quotes are the candle closes on the first Monday, in dollars:
+#   SA: YES ask 0.30, NO ask 0.72  (YES bid 1 - 0.72 = 0.28, YES mid 0.29)
+#   SB: YES ask 0.60, NO ask 0.42  (YES bid 1 - 0.42 = 0.58, YES mid 0.59)
+# The bot buys YES on SA at 0.30 and NO on SB at 0.42: legs 0.72 per pair, a
+# 0.28 edge before fees. The mid spread is 0.59 - 0.29 = 0.30, so with the
+# default discount k = 0.80 the chance of profit is 1 - 0.80 x 0.30 = 0.76.
+# The 13-day deadline gap is in the short tier (spread at least 0.15, legs at
+# most 0.85), and neither book is crossed (each YES ask is at least its YES bid).
+# Kelly at 1000 dollars: fee approx 0.0318 per pair, b = (0.28 - 0.0318) / (0.72
+# + 0.0318) = 0.330, f* = 0.76 - 0.24 / 0.330 = 0.0332, so the budget is 33.22
+# dollars. The raw count int(33.22 / 0.72) = 46 costs 33.12 dollars before its
+# two exact fees (about 1.5 dollars), which overshoots the budget, so the fee
+# loop shrinks it.
+_PARITY_PA, _PARITY_NA, _PARITY_PB, _PARITY_NB = 0.30, 0.72, 0.60, 0.42
+
+
+def _time_series_markets(result_a: str = "yes", result_b: str = "yes") -> list[dict]:
+    """Two markets of one deadline ladder: SA ("by February 1, 2026") and SB
+    ("by February 14, 2026"), on events of different series, each paying out
+    twelve hours after it closes."""
+    return [
+        {"ticker": "SA", "event_ticker": "EA", "event_title": "EV",
+         "title": "Will the launch happen by February 1, 2026?", "subtitle": "",
+         "result": result_a,
+         "close_time": "2026-02-01T00:00:00+00:00",
+         "settlement_ts": "2026-02-01T12:00:00+00:00"},
+        {"ticker": "SB", "event_ticker": "EB", "event_title": "EV",
+         "title": "Will the launch happen by February 14, 2026?", "subtitle": "",
+         "result": result_b,
+         "close_time": "2026-02-14T00:00:00+00:00",
+         "settlement_ts": "2026-02-14T12:00:00+00:00"},
+    ]
+
+
+def _parity_candles() -> dict[str, list[dict]]:
+    """The first-Monday candles of the time-series fixture, keyed by ticker."""
+    return {
+        "SA": [_candle(_MONDAY_TS, _PARITY_PA, _PARITY_NA)],
+        "SB": [_candle(_MONDAY_TS, _PARITY_PB, _PARITY_NB)],
+    }
+
+
 class TestRunBacktestPnL:
     def test_profit_not_double_counted_and_cash_sized(self, monkeypatch):
-        """End-to-end regression for the P&L double-subtraction and sizing bugs.
+        """End-to-end check of the profit count and the sizing.
 
-        One same-title pair, both markets resolve YES (co-resolution): the
-        realized profit must equal the guaranteed floor (receipt n, cost+fees
-        out), the equity curve must end at initial_balance + profit, and the
-        trade must be sized against the running balance.
+        One time-series pair, both markets settle YES (the cell where only the
+        YES leg on the earlier market pays): the realized profit must equal
+        the win-cell profit (receipt n dollars, cost and fees taken out once),
+        the equity curve must end at initial_balance + profit, and the trade
+        must be sized against the running balance.
         """
-        markets = [
-            {"ticker": "SA", "event_ticker": "EA", "event_title": "EV",
-             "title": "Q", "subtitle": "", "result": "yes",
-             "close_time": "2026-02-01T00:00:00+00:00",
-             "settlement_ts": "2026-02-01T12:00:00+00:00"},
-            {"ticker": "SB", "event_ticker": "EB", "event_title": "EV",
-             "title": "Q", "subtitle": "", "result": "yes",
-             "close_time": "2026-02-01T00:00:00+00:00",
-             "settlement_ts": "2026-02-01T12:00:00+00:00"},
-        ]
-        candles = {
-            # SA is the expensive side: pA=0.70, nA=0.32
-            "SA": [_candle(_MONDAY_TS, 0.70, 0.32)],
-            # SB is the cheap side: pB=0.55
-            "SB": [_candle(_MONDAY_TS, 0.55, 0.47)],
-        }
+        markets = _time_series_markets()
+        candles = _parity_candles()
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: markets)
         monkeypatch.setattr(backtester, "fetch_candlesticks",
@@ -2580,6 +1866,7 @@ class TestRunBacktestPnL:
 
         assert len(trades) == 1
         t = trades[0]
+        assert (t.pair_type, t.ticker_a, t.ticker_b) == ("time_series", "SA", "SB")
         # Sized against the balance at entry, not hardcoded
         assert t.balance_at_entry == pytest.approx(1000.0)
         assert t.total_cost + t.fees <= 1000.0
@@ -2587,11 +1874,12 @@ class TestRunBacktestPnL:
         # against — fees ride on top of the contract cost, so this only holds
         # because Pass 2 shrinks n (see TestKellyShrinkParity)
         assert t.total_cost + t.fees <= 1000.0 * t.kelly_fraction + 1e-9
-        # Both YES → only the YES leg pays: receipt is exactly n dollars
+        # Both YES -> only the YES leg on SA pays: receipt is exactly n dollars
         assert t.actual_payoff == pytest.approx(float(t.n))
         # Profit deducts cost and fees exactly once
         assert t.profit == pytest.approx(t.actual_payoff - t.total_cost - t.fees)
-        # Both-YES is the guaranteed-floor scenario: profit == expected_payoff
+        # Both YES is a win cell: profit == expected_payoff, the win-cell profit
+        # n x (1 - 0.30 - 0.42) less fees
         assert t.profit == pytest.approx(t.expected_payoff)
         assert t.profit > 0
         assert t.slippage == pytest.approx(0.0, abs=1e-9)
@@ -2600,26 +1888,16 @@ class TestRunBacktestPnL:
         assert final_value == pytest.approx(1000.0 + t.profit)
 
     def test_max_horizon_days_threads_through_and_excludes_trade(self, monkeypatch):
-        # Same fixture as test_profit_not_double_counted_and_cash_sized: both
-        # legs close 2026-02-01, only candle is at _MONDAY_TS (2026-01-05),
-        # 27 days before close. A 3-day horizon excludes every checkpoint in
-        # the scan window (Jan 5 - Jan 31), so run_backtest must report zero
-        # trades even though the same fixture produces exactly one trade with
+        # Same fixture as test_profit_not_double_counted_and_cash_sized: the
+        # later deadline closes 2026-02-14 and the only candle is at
+        # _MONDAY_TS (2026-01-05). The scan window ends the day before the
+        # earlier close (Jan 31), where the later close is 14 days away, and
+        # the first Monday it is 40 days away. A 3-day horizon excludes every
+        # checkpoint in the window, so run_backtest must report zero trades
+        # even though the same fixture produces exactly one trade with
         # max_horizon_days=None.
-        markets = [
-            {"ticker": "SA", "event_ticker": "EA", "event_title": "EV",
-             "title": "Q", "subtitle": "", "result": "yes",
-             "close_time": "2026-02-01T00:00:00+00:00",
-             "settlement_ts": "2026-02-01T12:00:00+00:00"},
-            {"ticker": "SB", "event_ticker": "EB", "event_title": "EV",
-             "title": "Q", "subtitle": "", "result": "yes",
-             "close_time": "2026-02-01T00:00:00+00:00",
-             "settlement_ts": "2026-02-01T12:00:00+00:00"},
-        ]
-        candles = {
-            "SA": [_candle(_MONDAY_TS, 0.70, 0.32)],
-            "SB": [_candle(_MONDAY_TS, 0.55, 0.47)],
-        }
+        markets = _time_series_markets()
+        candles = _parity_candles()
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: markets)
         monkeypatch.setattr(backtester, "fetch_candlesticks",
@@ -2634,58 +1912,42 @@ class TestRunBacktestPnL:
         assert trades == []
 
 
-# Same-title fixture shared by the sizing-parity and malformed-timestamp tests:
-# SA is the expensive side (pA=0.70, nA=0.32), SB the cheap one (pB=0.55), both
-# resolving YES on 2026-02-01. These are the numbers TestRunBacktestPnL uses, so
-# the parity assertions below are pinned to the same trade that test checks.
-_PARITY_PA, _PARITY_NA, _PARITY_PB = 0.70, 0.32, 0.55
-
-
-def _same_title_markets(close_time_b: str = "2026-02-01T00:00:00+00:00") -> list[dict]:
-    """Two markets in one exact-title group; close_time_b is overridable so a
-    malformed timestamp can be injected on exactly one leg."""
-    return [
-        {"ticker": "SA", "event_ticker": "EA", "event_title": "EV",
-         "title": "Q", "subtitle": "", "result": "yes",
-         "close_time": "2026-02-01T00:00:00+00:00",
-         "settlement_ts": "2026-02-01T12:00:00+00:00"},
-        {"ticker": "SB", "event_ticker": "EB", "event_title": "EV",
-         "title": "Q", "subtitle": "", "result": "yes",
-         "close_time": close_time_b,
-         "settlement_ts": "2026-02-01T12:00:00+00:00"},
-    ]
-
-
 class TestKellyShrinkParity:
     """Pass 2 must size a trade exactly like live strategy.compute_trade (BS-06).
 
     The Kelly budget covers the CONTRACTS only — the exact ceiling-rounded taker
-    fees are charged on top — so the raw n = int(budget / (nA + pB)) systematically
-    overshoots the cap. compute_trade shrinks n until the fee-inclusive cost fits
-    (CLAUDE.md forbids removing that loop); the backtest skipped the shrink
-    entirely and only rejected trades that didn't fit the whole CASH balance, so
-    every simulated trade was sized slightly above the Kelly fraction it reported.
+    fees are charged on top — so the raw n = int(budget / (pA + nB)) can
+    overshoot the budget once its fees are added, as it does at every balance
+    and cap below. compute_trade shrinks n until the fee-inclusive cost fits,
+    and the backtest must do the same: every simulated trade is sized within the
+    Kelly fraction it reports. One test has a size cap below Kelly's fraction,
+    so the cap, not Kelly, sets the budget on both paths.
 
     With a trade still open, Pass 2 sizes on the portfolio value (the cash plus
     that trade's cost) and the cash, as compute_trade sizes on the run's
     portfolio value and cash_cents; the last test pins the two counts equal.
+    The pair is the time-series fixture above (legs 0.30 and 0.42 dollars).
     """
 
     @staticmethod
     def _live_n(portfolio_value_cents: int, cash_cents: int | None = None) -> int:
         """The contract count live compute_trade picks for the same inputs:
         a portfolio value, and the cash on hand (None: the value is all cash)."""
-        def _market(ticker):
+        def _market(ticker, days):
             # compute_trade only reads .close_time (for days_to_close, which
             # doesn't affect n) and .ticker
             return SimpleNamespace(
-                ticker=ticker, close_time=datetime.now(UTC) + timedelta(days=27),
+                ticker=ticker, close_time=datetime.now(UTC) + timedelta(days=days),
             )
 
         pair = CandidatePair(
-            market_a=_market("SA"), market_b=_market("SB"),
-            pA=_PARITY_PA, pB=_PARITY_PB, nA=_PARITY_NA,
-            tradeable=True, canonical_title="Q", pair_type="same_title",
+            market_a=_market("SA", 27), market_b=_market("SB", 40),
+            pA=_PARITY_PA, pB=_PARITY_PB, nA=_PARITY_NA, nB=_PARITY_NB,
+            tradeable=True, canonical_title="Q", pair_type="time_series",
+            # The mid spread live enrichment writes from the two books' tops and
+            # the backtest reads from the same candle quotes: the later YES
+            # midpoint less the earlier one
+            mid_spread=time_series_mid_spread(_PARITY_PA, _PARITY_NA, _PARITY_PB, _PARITY_NB),
             # 0 = not depth-capped, which is the only state the backtest can
             # model (a backtest has candle closes, no orderbook)
             max_contracts=0,
@@ -2695,26 +1957,32 @@ class TestKellyShrinkParity:
         return spec.x
 
     @staticmethod
-    def _record(tickers: tuple[str, str], events: tuple[str, str], monday: date) -> dict:
-        """A prepared same-title record at the parity quotes, entering on one
-        Monday; both markets resolve YES on 2026-02-01, like the fixture's."""
+    def _record(tickers: tuple[str, str], events: tuple[str, str], monday: date,
+                subject: str = "launch") -> dict:
+        """A prepared time-series record at the parity quotes, entering on one
+        Monday; the earlier market closes 2026-02-01 and the later one
+        2026-02-14, both resolving YES, like the fixture's. The gap is the 13
+        days between the two closes. `subject` words the question, so two
+        records with different subjects and different events share no ladder
+        (a ladder is one event or one question)."""
         mA, mB = ({"ticker": ticker, "event_ticker": event, "event_title": "EV",
-                   "title": "Q", "subtitle": "", "result": "yes",
-                   "close_time": "2026-02-01T00:00:00+00:00",
-                   "settlement_ts": "2026-02-01T12:00:00+00:00"}
-                  for ticker, event in zip(tickers, events, strict=True))
-        return {"pair_type": "same_title", "canon": "Q", "group_key": ("EV", "Q", tickers[0]),
+                   "title": f"Will the {subject} happen by {deadline}?", "subtitle": "",
+                   "result": "yes", "close_time": close,
+                   "settlement_ts": close.replace("T00:00:00", "T12:00:00")}
+                  for ticker, event, deadline, close in zip(
+                      tickers, events, ("February 1, 2026", "February 14, 2026"),
+                      ("2026-02-01T00:00:00+00:00", "2026-02-14T00:00:00+00:00"),
+                      strict=True))
+        question = f"Will the {subject} happen by ?"
+        return {"pair_type": "time_series", "canon": question, "group_key": question,
                 "entry": {"entry_date": monday, "pA": _PARITY_PA, "pB": _PARITY_PB,
-                          "nA": _PARITY_NA, "nB": 0.47, "mA": mA, "mB": mB,
-                          "gap_days": None, "later": ()}}
+                          "nA": _PARITY_NA, "nB": _PARITY_NB, "mA": mA, "mB": mB,
+                          "gap_days": 13, "later": ()}}
 
     def test_backtest_n_matches_compute_trade_n(self, monkeypatch):
-        candles = {
-            "SA": [_candle(_MONDAY_TS, _PARITY_PA, _PARITY_NA)],
-            "SB": [_candle(_MONDAY_TS, _PARITY_PB, 0.47)],
-        }
+        candles = _parity_candles()
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
-                            lambda *a, **k: _same_title_markets())
+                            lambda *a, **k: _time_series_markets())
         monkeypatch.setattr(backtester, "fetch_candlesticks",
                             lambda _c, ticker, *a, **k: candles[ticker])
 
@@ -2725,48 +1993,104 @@ class TestKellyShrinkParity:
         assert len(trades) == 1
         t = trades[0]
 
-        # The load-bearing assertion: identical (nA, pB, kelly, balance) inputs
-        # must produce an identical contract count on both code paths.
+        # The load-bearing assertion: identical (pA, nB, mid spread, k, balance)
+        # inputs must produce an identical contract count on both code paths.
         assert t.n == self._live_n(100_000)
 
         # Guard against a vacuous pass: the shrink loop must actually have bitten
         # here, i.e. the un-shrunk n did NOT fit the Kelly budget once fees were
-        # added. (Pre-fix the backtest recorded exactly that raw n.)
+        # added.
         budget = 1000.0 * t.kelly_fraction
-        raw_n = int(budget / (_PARITY_NA + _PARITY_PB))
+        raw_n = int(budget / (_PARITY_PA + _PARITY_NB))
         assert raw_n > t.n
-        raw_cost = raw_n * (_PARITY_NA + _PARITY_PB)
-        raw_fees = fee_leg_exact(raw_n, _PARITY_NA) + fee_leg_exact(raw_n, _PARITY_PB)
+        raw_cost = raw_n * (_PARITY_PA + _PARITY_NB)
+        raw_fees = fee_leg_exact(raw_n, _PARITY_PA) + fee_leg_exact(raw_n, _PARITY_NB)
         assert raw_cost + raw_fees > budget
         # ...and the chosen n does fit, which is the invariant being restored
         assert t.total_cost + t.fees <= budget + 1e-9
 
     def test_shrunk_size_still_respects_the_budget_fraction(self, monkeypatch):
         # Second balance point, so the parity isn't an artifact of one number.
-        candles = {
-            "SA": [_candle(_MONDAY_TS, _PARITY_PA, _PARITY_NA)],
-            "SB": [_candle(_MONDAY_TS, _PARITY_PB, 0.47)],
-        }
+        # k and the size cap are set here, on config and on the backtest's
+        # own copies, so the figures below do not hang on config.py's values
+        for module in (config, backtester):
+            monkeypatch.setattr(module, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.80)
+            monkeypatch.setattr(module, "BUDGET_FRACTION", 1.0)
+        # At k 0.80 and no cap: p = 1 - 0.80 x 0.30 = 0.76, b = 0.2482 /
+        # 0.7518 = 0.3302 and f* = 0.76 - 0.24 / 0.3302 = 0.0332.
+        # By hand at $500: the budget is 0.0332 x $500 = $16.61. The raw
+        # int(16.61 / 0.72) = 23 pairs cost $16.56 plus exact fees of $0.34
+        # (0.07 x 23 x 0.30 x 0.70 = 0.3381, up to the cent) and $0.40
+        # (0.07 x 23 x 0.42 x 0.58 = 0.3922), $17.30, over the budget, so the
+        # fee loop shrinks to 22 pairs: $15.84 + $0.33 + $0.38 = $16.55.
+        candles = _parity_candles()
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
-                            lambda *a, **k: _same_title_markets())
+                            lambda *a, **k: _time_series_markets())
         monkeypatch.setattr(backtester, "fetch_candlesticks",
                             lambda _c, ticker, *a, **k: candles[ticker])
 
         trades, _ = run_backtest(
             hist_client=MagicMock(), live_client=MagicMock(),
-            start_date=date(2026, 1, 1), initial_balance=250.0,
+            start_date=date(2026, 1, 1), initial_balance=500.0,
         )
         assert len(trades) == 1
         t = trades[0]
-        assert t.n == self._live_n(25_000)
-        assert t.total_cost + t.fees <= 250.0 * t.kelly_fraction + 1e-9
+        assert t.n == self._live_n(50_000) == 22
+        budget = 500.0 * t.kelly_fraction
+        assert t.total_cost + t.fees <= budget + 1e-9
+        # Not vacuous: the un-shrunk count does not fit once its fees are added
+        raw_n = int(budget / (_PARITY_PA + _PARITY_NB))
+        assert raw_n == 23 > t.n
+        assert (raw_n * (_PARITY_PA + _PARITY_NB) + fee_leg_exact(raw_n, _PARITY_PA)
+                + fee_leg_exact(raw_n, _PARITY_NB)) > budget
+
+    def test_a_size_cap_below_kelly_sets_the_budget_on_both_paths(self, monkeypatch):
+        # Third point: a per-trade size cap below Kelly's fraction, so the cap
+        # sets the budget. At pre_toggle_defaults' k 0.75 (the test above runs
+        # at k 0.80, p 0.76) the chance of profit is p = 1 - 0.75 x 0.30 =
+        # 0.775, so f* = 0.775 - 0.225 / 0.330
+        # = 0.0936, above the smallest cap on the grid, 5%, set on both
+        # bindings (live sizing reads config's, the backtest its own copy).
+        # By hand at $1,000: the budget is 0.05 x $1,000 = $50.00. The raw
+        # int(50.00 / 0.72) = 69 pairs cost $49.68 plus exact fees of $1.02
+        # (0.07 x 69 x 0.21 = 1.0143, up to the cent) and $1.18 (0.07 x 69 x
+        # 0.2436 = 1.1766), $51.88, so the fee loop shrinks to 66 pairs:
+        # $47.52 + $0.98 + $1.13 = $49.63 (67 would cost $48.24 + $0.99 +
+        # $1.15 = $50.38).
+        apply_pre_toggle_defaults(monkeypatch)
+        monkeypatch.setattr(config, "BUDGET_FRACTION", 0.05)
+        monkeypatch.setattr(backtester, "BUDGET_FRACTION", 0.05)
+        candles = _parity_candles()
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: _time_series_markets())
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+
+        trades, _ = run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=date(2026, 1, 1), initial_balance=1000.0,
+        )
+        assert len(trades) == 1
+        t = trades[0]
+        # The cap, not Kelly, sized it
+        assert t.kelly_fraction == pytest.approx(0.05)
+        assert t.n == self._live_n(100_000) == 66
+        assert t.total_cost + t.fees == pytest.approx(49.63, abs=1e-9)
+        # The fee loop bit: the raw count does not fit the $50 budget with its fees
+        raw_n = int(50.0 / (_PARITY_PA + _PARITY_NB))
+        assert raw_n == 69 > t.n
+        assert (raw_n * (_PARITY_PA + _PARITY_NB) + fee_leg_exact(raw_n, _PARITY_PA)
+                + fee_leg_exact(raw_n, _PARITY_NB)) > 50.0
 
     def test_with_an_open_trade_n_matches_compute_trade_on_value_and_cash(self):
         # An opener entering on Monday 1 at the same quotes is still open on
-        # Monday 2 (it pays out on 02-01), so Monday 2's portfolio value is
+        # Monday 2 (it pays out on 02-14), so Monday 2's portfolio value is
         # the cash plus the opener's cost. The parity pair entering then must
         # get the count live compute_trade gives for that value and that cash.
-        opener = self._record(("OA", "OB"), ("EOA", "EOB"), date(2026, 1, 5))
+        # The two pairs share no event and no question wording, so the one-open-
+        # trade-per-ladder rule (DR-76) does not hold the second back.
+        opener = self._record(("OA", "OB"), ("EOA", "EOB"), date(2026, 1, 5),
+                              subject="opener")
         pair = self._record(("SA", "SB"), ("EA", "EB"), date(2026, 1, 12))
         point = backtester._simulate_at_discount([opener, pair], date(2026, 1, 1), 1000.0,
                                                  end_date=date(2026, 3, 1))
@@ -2784,24 +2108,18 @@ class TestKellyShrinkParity:
 class TestRunBacktestMalformedTimestamps:
     """A single market with an unparseable close_time must not kill a run.
 
-    The time-series extraction path drops such members while windowing by
-    close date (TestExtractPairsWindowedEquivalence). The same-title path is
-    naive and used to carry them straight into the candlestick fetch, where
-    the pre-pool window computation used a bare datetime.fromisoformat — on
-    the main thread, before any worker starts, so it aborted the whole
-    backtest (BS-07); _fetch_candles_parallel then learned to resolve such a
-    ticker to an empty series with a WARNING.
-
-    Since DR-74 the same-title branch refuses the pair itself, before any
-    candle is requested: the close gate cannot show that a market it cannot
-    date closes with its partner, so it fails closed and counts the pair on
-    its own backtest-only line. The pipeline therefore no longer reaches
-    BS-07's branch at all, and the second test below calls
-    _fetch_candles_parallel directly so that branch stays covered.
+    The time-series extraction sets such a member aside while windowing by
+    close date (TestExtractPairsWindowedEquivalence), and counts it, so no
+    candidate pair carries it and no candle is requested for it. The
+    candlestick fetch's own handling of such a ticker — an empty series with
+    a WARNING, on the main thread, before any worker starts (BS-07) — is
+    therefore reached only by a caller that hands one over directly, which
+    the second test below does so that branch stays covered.
     """
 
     def test_malformed_close_time_is_skipped_not_raised(self, monkeypatch, caplog):
-        markets = _same_title_markets(close_time_b="not-a-timestamp")
+        markets = _time_series_markets()
+        markets[1]["close_time"] = "not-a-timestamp"
         fetched = []
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: markets)
@@ -2814,20 +2132,15 @@ class TestRunBacktestMalformedTimestamps:
                 start_date=date(2026, 1, 1), initial_balance=1000.0,
             )
 
-        # No trade, no exception — and no candle request at all: the pair was
-        # refused before the fetch, so neither leg is a needed ticker.
+        # No trade, no exception — and no candle request at all: the market
+        # was set aside before any pair formed, so neither leg is a needed
+        # ticker.
         assert trades == []
         assert float(equity["portfolio_value"].iloc[-1]) == pytest.approx(1000.0)
         assert fetched == []
-        # Refused on the backtest-only unreadable-close line (DR-74), not on
-        # the close-gap line — the gap between them was never measurable.
-        assert caplog.messages.count(
-            "Same-title candidate pairs refused because a market's close_time "
-            "cannot be read (fail closed; the live finder drops such markets "
-            "before grouping): 1"
-        ) == 1
-        assert not any(m.startswith(_ST_CLOSE_GAP) for m in caplog.messages)
-        assert "Potential pairs: 0 time-series, 0 same-title" in caplog.messages
+        # Counted as one member set aside, on the sweep's own line
+        assert _logged_counts(caplog)[_TS_UNDATED] == 1
+        assert "Potential pairs: 0 time-series" in caplog.messages
 
     def test_the_candle_fetch_still_resolves_an_unparseable_close_to_nothing(
         self, monkeypatch, caplog,
@@ -2851,87 +2164,78 @@ class TestRunBacktestMalformedTimestamps:
         assert any("SB" in msg and "close_time" in msg for msg in warnings)
 
 
+_M2_TS = int(datetime(2026, 1, 12, 9, 0, tzinfo=UTC).timestamp())
+
+
 class TestActiveTickerRelease:
     """A ticker is blocked only while its position is OPEN (BS-24).
 
     Live, scanner.get_held_positions() reads positions with count_filter="position",
     so a ticker leaves the blocked set the moment its market settles. The
-    backtest used to add tickers to active_tickers and never remove them, so one
-    early trade blocked that ticker for the entire remaining simulation.
+    backtest must do the same: a ticker held by one trade blocks a second
+    trade only until the first pays out.
 
-    Fixture: TX/TY share an exact title and one close instant, 2026-02-02 (a
-    same-title pair, entering at the first Monday — the one close is what the
-    same-title close gate, DR-74, requires); TX/TZ share a normalized title
-    with an 18-day deadline gap (time-series pair, which can only enter at the
-    second Monday because TZ has no earlier candle). Both candidates therefore
-    contain TX, at different entry dates. TX settles before its close_time —
-    an early determination, which is what makes re-entry on a shared ticker
-    reachable at all (TY settles early too, on 2026-01-08).
+    Fixture: one question, "Team wins by <date>", asked at three deadlines on
+    three events of different series: TX (February 1), TY (February 10) and TZ
+    (February 20). Two of the three possible pairs enter, and both hold TX as
+    the earlier contract:
+      - TX/TY enters on the first Monday (2026-01-05): TZ has no candle yet.
+        The deadline gap is 9 days (short tier: price gap at least 0.15, legs
+        pA + nB at most 0.85). TX YES 0.30, TY YES 0.55 / NO 0.45: price gap
+        0.25, legs 0.30 + 0.45 = 0.75. The mid spread is 0.55 - 0.30 = 0.25
+        (every book is tight, NO ask = 1 - YES ask), so p = 1 - 0.80 x 0.25 =
+        0.80; fee about 0.032 per pair, b = (0.25 - 0.032) / (0.75 + 0.032) =
+        0.279, Kelly f* = 0.80 - 0.20 / 0.279 = 0.083, positive.
+      - TX/TZ enters on the second Monday (2026-01-12), the first with a TZ
+        candle. The gap is 19 days (long tier: price gap at least 0.30, legs at
+        most 0.70). TZ YES 0.75 / NO 0.25: price gap 0.45, legs 0.30 + 0.25 =
+        0.55. Mid spread 0.45, p = 1 - 0.80 x 0.45 = 0.64; fee about 0.028,
+        b = (0.45 - 0.028) / (0.55 + 0.028) = 0.73, Kelly f* = 0.64 - 0.36 /
+        0.73 = 0.147, positive.
+      - TY/TZ never enters: on the second Monday TY is quoted 0.65, only 0.10
+        under TZ's 0.75, below the short tier's 0.15.
+    TX and TY settle early (TY on 2026-01-08), which is what makes re-entry on
+    the shared ticker TX reachable at all.
 
-    Prices: TX yes 0.40 / no 0.60 throughout; TY yes 0.30 / no 0.70 at the
-    first Monday and 0.60 / 0.40 from the second; TZ yes 0.75 / no 0.25 from
-    the second Monday. Same-title TX/TY at the first Monday: TX is the pricier
-    side, gap 0.10 >= 0.05, legs nA+pB = 0.60+0.30 = 0.90 <= 0.95.
-    Time-series TX/TZ at the second Monday: TX is the earlier contract and TZ
-    (later) is priced 0.35 higher, clearing the 30% long-gap tier; legs
-    pA+nB = 0.40+0.25 = 0.65 <= 0.70, and under the interval discount
-    (p = 1 - 0.75*0.35) the Kelly fraction is ~0.180 — positive, so the pair
-    really is entered. TX/TY is never a time-series candidate: their titles
-    are identical, so they state one deadline ("by March 2026") twice and the
-    cumulative-deadline rule refuses them (DR-67). TY/TZ IS a candidate — TY
-    now closes with TX, 18 days before TZ, and the two are worded as two
-    different deadlines — which is why TY carries a second-Monday candle: at
-    0.60, TZ's 0.75 is only 0.15 above it, under the 30% long-gap tier, and at
-    the first Monday TZ has no candle at all. So TX/TZ is the only
-    time-series entry.
-
-    RE-DESIGNED (DR-74): TY used to close on 2026-01-20, 13 days before TX,
-    which the same-title close gate now refuses as two fixtures; aligning TY's
-    close alone was not enough, because it brought TY/TZ inside the 30-day
-    deadline-gap cap (it had been 31 days apart), where TY's first-Monday 0.30
-    would have entered it at the second Monday. Its second-Monday candle keeps
-    it out. No assertion changed.
+    Both entries hold TX, and they also share the question's ladder (DR-76:
+    two markets of one question are one ladder), so while the first trade is
+    open both the ticker rule and the ladder rule would refuse the second.
+    The ticker rule is checked first and refuses silently, while a ladder
+    refusal is counted on its own log line, so the first test can tell them
+    apart: with TX still open the second pair is refused and the ladder line is
+    absent, which fails if the ticker rule stops blocking. Once the first trade
+    has settled, both holds are released together, so the second test passes
+    only if the ticker (and the ladder) is freed; it cannot tell which of the
+    two releases is missing.
     """
-
-    _M2 = int(datetime(2026, 1, 12, 9, 0, tzinfo=UTC).timestamp())
 
     @staticmethod
     def _markets(tx_settlement: str) -> list[dict]:
+        def market(ticker, event, deadline, close, settle):
+            return {"ticker": ticker, "event_ticker": event, "event_title": "EV",
+                    "title": f"Team wins by {deadline}", "subtitle": "",
+                    "result": "yes", "open_time": "2026-01-01T00:00:00+00:00",
+                    "close_time": close, "settlement_ts": settle}
         return [
-            {"ticker": "TX", "event_ticker": "EX", "event_title": "EV",
-             "title": "Team wins by March 2026", "subtitle": "", "result": "yes",
-             "open_time": "2026-01-01T00:00:00+00:00",
-             "close_time": "2026-02-02T00:00:00+00:00",
-             "settlement_ts": tx_settlement},
-            {"ticker": "TY", "event_ticker": "EY", "event_title": "EV",
-             "title": "Team wins by March 2026", "subtitle": "", "result": "yes",
-             "open_time": "2026-01-01T00:00:00+00:00",
-             # TX's close instant: the same-title close gate (DR-74).
-             "close_time": "2026-02-02T00:00:00+00:00",
-             "settlement_ts": "2026-01-08T12:00:00+00:00"},
-            {"ticker": "TZ", "event_ticker": "EZ", "event_title": "EV",
-             "title": "Team wins by April 2026", "subtitle": "", "result": "yes",
-             "open_time": "2026-01-01T00:00:00+00:00",
-             "close_time": "2026-02-20T00:00:00+00:00",
-             "settlement_ts": "2026-02-20T12:00:00+00:00"},
+            market("TX", "EX", "February 1, 2026", "2026-02-01T00:00:00+00:00",
+                   tx_settlement),
+            market("TY", "EY", "February 10, 2026", "2026-02-10T00:00:00+00:00",
+                   "2026-01-08T12:00:00+00:00"),
+            market("TZ", "EZ", "February 20, 2026", "2026-02-20T00:00:00+00:00",
+                   "2026-02-20T12:00:00+00:00"),
         ]
 
-    @classmethod
-    def _candles(cls) -> dict[str, list[dict]]:
-        # Also used by TestFindEntryRecordsEveryQualifyingMonday: there the
-        # TX/TY same-title pair has A = TX on the first Monday and A = TY from
-        # the second, when TY becomes the pricier side.
+    @staticmethod
+    def _candles() -> dict[str, list[dict]]:
         return {
-            # TX: pricier than TY (same-title gap) yet cheaper than the
-            # later-closing TZ (time-series gap) — see the class docstring
-            "TX": [_candle(_MONDAY_TS, 0.40, 0.60)],
-            # TY: 0.30 at the first Monday (the same-title entry), then 0.60 —
-            # keeps TY/TZ (18 days apart, like TX/TZ) under the 30% tier at the
-            # second Monday; see the class docstring
-            "TY": [_candle(_MONDAY_TS, 0.30, 0.70), _candle(cls._M2, 0.60, 0.40)],
-            # TZ's first candle is the SECOND Monday, so the TX/TZ pair cannot
-            # enter until then
-            "TZ": [_candle(cls._M2, 0.75, 0.25)],
+            # TX: cheap earlier contract in both entries
+            "TX": [_candle(_MONDAY_TS, 0.30, 0.70)],
+            # TY: 0.55 at the first Monday (the TX/TY entry), then 0.65, which
+            # keeps TY/TZ under the short tier at the second Monday
+            "TY": [_candle(_MONDAY_TS, 0.55, 0.45), _candle(_M2_TS, 0.65, 0.35)],
+            # TZ's first candle is the SECOND Monday, so TX/TZ cannot enter
+            # until then
+            "TZ": [_candle(_M2_TS, 0.75, 0.25)],
         }
 
     def _run(self, monkeypatch, tx_settlement):
@@ -2951,7 +2255,7 @@ class TestActiveTickerRelease:
         trades = self._run(monkeypatch, "2026-01-08T12:00:00+00:00")
         assert len(trades) == 2
         first, second = trades
-        assert (first.pair_type, first.ticker_a, first.ticker_b) == ("same_title", "TX", "TY")
+        assert (first.pair_type, first.ticker_a, first.ticker_b) == ("time_series", "TX", "TY")
         assert first.entry_date == date(2026, 1, 5)
         assert first.exit_date == date(2026, 1, 8)
         # Same ticker, entered again after the first position closed
@@ -2959,13 +2263,22 @@ class TestActiveTickerRelease:
         assert second.entry_date == date(2026, 1, 12)
         assert second.entry_date > first.exit_date
 
-    def test_ticker_stays_blocked_while_its_trade_is_open(self, monkeypatch):
-        # Only change: TX settles 2026-02-02, i.e. AFTER the second pair's
+    def test_ticker_stays_blocked_while_its_trade_is_open(self, monkeypatch, caplog):
+        # Only change: TX settles 2026-02-01, i.e. AFTER the second pair's
         # entry date — the positions would overlap, so the second is skipped
-        trades = self._run(monkeypatch, "2026-02-02T12:00:00+00:00")
+        with caplog.at_level(logging.INFO):
+            trades = self._run(monkeypatch, "2026-02-01T12:00:00+00:00")
         assert len(trades) == 1
-        assert trades[0].pair_type == "same_title"
-        assert trades[0].exit_date == date(2026, 2, 2)
+        assert (trades[0].pair_type, trades[0].ticker_a, trades[0].ticker_b) == (
+            "time_series", "TX", "TY")
+        assert trades[0].exit_date == date(2026, 2, 1)
+        # Refused by the ticker rule itself: the ladder rule, which would also
+        # refuse it, never got to count it. The prefix is the shared
+        # _LADDER_LINE's, whose positive checks (TestOpenLadderExposure) fail if
+        # the bot's wording changes, so this check cannot go quietly stale
+        prefix = _LADDER_LINE.partition(" (")[0]
+        assert prefix.endswith("still held a trade on the same ladder")
+        assert not any(m.startswith(prefix) for m in caplog.messages)
 
 
 # Anchor Monday reused across the eligibility-prefilter tests below — matches
@@ -3746,16 +3059,15 @@ def _p5_candles(open_dt: datetime, close_dt: datetime,
 
 
 def _p5_corpus(seed: int) -> tuple[list[dict], dict[str, list[dict]]]:
-    """Same-title, cross-event time-series and same-event ladder families
-    whose legs open around a Monday checkpoint (both sides of the boundary,
-    and far enough either way to reach the next Monday), plus singletons,
-    with candles obeying the measured rule at prices every such pair clears
-    the gates at. The ladder rungs both close at one instant, so only their
-    STATED deadlines order and tier them (and only with ladders on). The two
-    legs of a same-title family close at one instant too — the later of their
-    two close draws — which the same-title close gate (DR-74) requires; the
-    draws themselves are unchanged, so every other record of the corpus is
-    the one it always was."""
+    """Short-lived and longer cross-event time-series families and same-event
+    ladder families whose legs open around a Monday checkpoint (both sides of
+    the boundary, and far enough either way to reach the next Monday), plus
+    singletons, with candles obeying the measured rule at prices every such
+    pair clears the gates at. The ladder rungs both close at one instant, so
+    only their STATED deadlines order and tier them (and only with ladders
+    on). Each short-lived family's two legs close a few days after they open,
+    each stating its own close date as its deadline, so many cannot reach a
+    second Monday and the tightened prefilter drops some of them."""
     rng = random.Random(seed)
     markets: list[dict] = []
     candles: dict[str, list[dict]] = {}
@@ -3779,20 +3091,21 @@ def _p5_corpus(seed: int) -> tuple[list[dict], dict[str, list[dict]]]:
                         "close_time": close, "settlement_ts": close})
         candles[ticker] = _p5_candles(open_dt, close_dt, yes, no)
 
-    for i in range(40):   # same-title: one question on two series
-        legs = []
-        for leg, yes, no in (("A", 0.70, 0.32), ("B", 0.55, 0.47)):
+    for i in range(40):   # short-lived time-series: one question, two series
+        drawn = []
+        for _leg in ("A", "B"):
             o = opening()
             close = (datetime(o.year, o.month, o.day, 12, tzinfo=UTC)
                      + timedelta(days=rng.choice((1, 2, 3, 6, 8, 9, 13))))
-            legs.append((leg, yes, no, o, close))
-        # RE-PINNED (DR-74): one close for both legs, the later of the two
-        # draws, so the pair passes the same-title close gate. The draws are
-        # made in the same order as before, and each leg's candles are built
-        # from the shared close.
-        shared_close = max(close for *_, close in legs)
-        for leg, yes, no, o, _close in legs:
-            add(f"S{i}{leg}", f"SER{leg}{i}-1", f"ST{i}", "Q", o, shared_close, yes, no)
+            drawn.append((o, close))
+        # The earlier-closing leg is market A, priced below B by the short
+        # tier's spread; each states its own close date as its deadline (two
+        # legs drawn to one date state one deadline, and form no pair)
+        early, late = sorted(drawn, key=lambda pair: pair[1])
+        for leg, (o, close), yes, no in (("A", early, 0.30, 0.72),
+                                         ("B", late, 0.60, 0.42)):
+            add(f"S{i}{leg}", f"SER{leg}{i}-1", f"ST{i}",
+                f"Snow falls by {close:%B} {close.day}, {close.year}", o, close, yes, no)
     for j in range(40):   # time-series: two cumulative deadlines, 14 days apart
         for leg, deadline, close, yes, no in (
             ("A", "January 20", datetime(2026, 1, 20, tzinfo=UTC), 0.30, 0.72),
@@ -3943,32 +3256,39 @@ class TestCheckpointPrefilterIsResultNeutral:
                        - datetime.fromisoformat(m["open_time"]).date() < timedelta(days=8))
 
     def test_a_group_whose_first_member_is_dropped_moves_later(self, monkeypatch):
-        # A same-title group on THREE series whose first member (in corpus
-        # order) opened an hour AFTER the only admissible checkpoint: the old
-        # date test keeps it, the checkpoint test drops it, and the other two
-        # members still pair. A two-member group sits between them in the
-        # corpus. Groups are keyed in first-appearance order, so the first
-        # group now first appears AFTER the second. The pair SET is the old
-        # one minus the dropped leg's pairs, each group's pairs keep their own
-        # order, and the two groups swap places in the candidate list. Nothing
-        # enters differently. The two groups' pairs are priced identically,
-        # so they tie exactly in _simulate_at_discount's sort, and the LISTING
-        # order of their simultaneous trades may follow the list. Cash does
-        # not bind here, so every trade and the equity curve are unchanged.
+        # A time-series group (one question at three deadlines) on THREE
+        # series whose first member (in corpus order) opened an hour AFTER
+        # the only admissible checkpoint: the old date test keeps it, the
+        # checkpoint test drops it, and the other two members still pair. A
+        # two-member group sits between them in the corpus. Groups are keyed
+        # in first-appearance order, so the first group now first appears
+        # AFTER the second. The pair SET is the old one minus the dropped
+        # leg's pairs, each group's pairs keep their own order, and the two
+        # groups swap places in the candidate list. Nothing enters
+        # differently. The two groups' pairs are priced identically, so they
+        # tie exactly in _simulate_at_discount's sort, and the LISTING order
+        # of their simultaneous trades may follow the list. Cash does not
+        # bind here, so every trade and the equity curve are unchanged.
         cp = backtester._checkpoint_datetime(_P5_MONDAYS[0])
         before, after = cp - timedelta(days=2), cp + timedelta(hours=1)
-        close = cp + timedelta(days=4)          # before the next Monday
         markets: list[dict] = []
         candles: dict[str, list[dict]] = {}
-        for ticker, series, group, opened, yes, no in (
-            ("X1", "SXA", "GX", after, 0.70, 0.32),
-            ("Y1", "SYA", "GY", before, 0.70, 0.32),
-            ("Y2", "SYB", "GY", before, 0.55, 0.47),
-            ("X2", "SXB", "GX", before, 0.70, 0.32),
-            ("X3", "SXC", "GX", before, 0.55, 0.47),
+        # Each market states its own deadline (the day after its close) and
+        # closes before the next Monday; the later ones are priced higher, so
+        # each group's earlier-to-later pairs clear the short tier's spread
+        for ticker, series, question, opened, days, yes, no in (
+            ("X1", "SXA", "Hail", after, 3, 0.30, 0.72),
+            ("Y1", "SYA", "Sleet", before, 3, 0.30, 0.72),
+            ("Y2", "SYB", "Sleet", before, 4, 0.60, 0.42),
+            ("X2", "SXB", "Hail", before, 4, 0.30, 0.72),
+            ("X3", "SXC", "Hail", before, 5, 0.60, 0.42),
         ):
+            close = datetime(cp.year, cp.month, cp.day, 12, tzinfo=UTC) + timedelta(days=days)
+            deadline = close + timedelta(days=1)
             markets.append({"ticker": ticker, "event_ticker": f"{series}-1",
-                            "event_title": group, "title": "Q", "subtitle": "",
+                            "event_title": "", "subtitle": "",
+                            "title": (f"{question} falls by {deadline:%B} {deadline.day}, "
+                                      f"{deadline.year}"),
                             "result": "yes", "open_time": opened.isoformat(),
                             "close_time": close.isoformat(),
                             "settlement_ts": close.isoformat()})
@@ -4651,7 +3971,7 @@ class TestPrepareEntriesThreadsTheLadderFlag:
     def test_both_callees_receive_the_same_sentinel(self, monkeypatch, passed):
         seen: dict = {"extract": [], "entry": []}
 
-        def _fake_extract(groups, *, same_event_ladders=None, series_categories=None):
+        def _fake_extract(groups, *, same_event_ladders=None):
             seen["extract"].append(same_event_ladders)
             return []
 
@@ -4670,9 +3990,8 @@ class TestPrepareEntriesThreadsTheLadderFlag:
         monkeypatch.setattr(backtester, "_find_entry", _fake_entry)
         backtester._prepare_entries(MagicMock(), MagicMock(), date(2026, 1, 1),
                                     True, None, same_event_ladders=passed)
-        # Both groupings go through _extract_pairs; the 3-tuple call takes the
-        # flag too, where it is inert.
-        assert seen["extract"] == [passed, passed]
+        # The one grouping goes through _extract_pairs, once
+        assert seen["extract"] == [passed]
 
     def test_find_entry_receives_it_too(self, monkeypatch):
         seen: list = []
@@ -4834,40 +4153,39 @@ class TestFindEntrySameEventLadders:
 
 class TestRunBacktestEndToEndWithPrefilter:
     """The eligibility prefilter must not change results — only skip work.
-    A hourly-ladder flood sharing the same exact-title group as a genuinely
-    tradeable pair must be dropped before grouping/extraction/candlestick
-    fetching, leaving the recorded trade identical to the pre-filter
-    baseline in TestRunBacktestPnL.test_profit_not_double_counted_and_cash_sized.
+    A flood of two-hour markets asking the same question as a tradeable
+    time-series pair must be dropped before grouping, pair extraction and the
+    candle fetch, leaving the recorded trade identical to the one the pair
+    makes alone, the trade
+    TestRunBacktestPnL.test_profit_not_double_counted_and_cash_sized checks.
     """
 
     def test_hourly_noise_is_filtered_without_changing_the_trade(self, monkeypatch):
-        valid_markets = [
-            {"ticker": "SA", "event_ticker": "EA", "event_title": "EV",
-             "title": "Q", "subtitle": "", "result": "yes",
-             "close_time": "2026-02-01T00:00:00+00:00",
-             "settlement_ts": "2026-02-01T12:00:00+00:00"},
-            {"ticker": "SB", "event_ticker": "EB", "event_title": "EV",
-             "title": "Q", "subtitle": "", "result": "yes",
-             "close_time": "2026-02-01T00:00:00+00:00",
-             "settlement_ts": "2026-02-01T12:00:00+00:00"},
-        ]
-        # 200 intraday markets in the SAME exact-title group ("EV" | "Q") —
-        # each has an explicit open_time/close_time 2 hours apart, so
-        # _can_ever_enter drops every one of them before grouping.
+        # The time-series pair of TestRunBacktestPnL: SA ("by February 1,
+        # 2026") and SB ("by February 14, 2026"), at its first-Monday quotes
+        valid_markets = _time_series_markets()
+        # 200 markets asking the same question by an earlier deadline,
+        # January 10, 2026, each in an event of its own. Each opens and closes
+        # two hours apart that Saturday, so no Monday checkpoint falls inside
+        # its life and _can_ever_enter drops every one of them before grouping.
         noise_markets = [
             {"ticker": f"NOISE-{i}", "event_ticker": f"NEV-{i}", "event_title": "EV",
-             "title": "Q", "subtitle": "", "result": "yes",
+             "title": "Will the launch happen by January 10, 2026?", "subtitle": "",
+             "result": "yes",
              "open_time": "2026-01-10T00:00:00+00:00",
              "close_time": "2026-01-10T02:00:00+00:00",
              "settlement_ts": "2026-01-10T02:00:00+00:00"}
             for i in range(200)
         ]
         markets = valid_markets + noise_markets
+        # CONTROL: unfiltered, each noise market is an earlier deadline of SA's
+        # question (January 10, 22 days before SA's), so it would pair with SA
+        # and its candles would be fetched
+        unfiltered = _extract_pairs(_group_by_normalized_title(markets))
+        assert any(a["ticker"].startswith("NOISE-") and b["ticker"] == "SA"
+                   for a, b, *_ in unfiltered)
 
-        candles = {
-            "SA": [_candle(_MONDAY_TS, 0.70, 0.32)],
-            "SB": [_candle(_MONDAY_TS, 0.55, 0.47)],
-        }
+        candles = _parity_candles()
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: markets)
 
@@ -4886,20 +4204,28 @@ class TestRunBacktestEndToEndWithPrefilter:
 
         assert len(trades) == 1
         t = trades[0]
-        assert t.ticker_a == "SA"
-        assert t.ticker_b == "SB"
+        assert (t.pair_type, t.ticker_a, t.ticker_b) == ("time_series", "SA", "SB")
         assert t.balance_at_entry == pytest.approx(1000.0)
         assert t.profit == pytest.approx(t.expected_payoff)
         final_value = float(equity["portfolio_value"].iloc[-1])
         assert final_value == pytest.approx(1000.0 + t.profit)
+        # The same trade the pair makes with no noise beside it (BacktestTrade's
+        # equality compares every field but its quotes and its report-only ones)
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: valid_markets)
+        alone, _ = run_backtest(
+            hist_client=MagicMock(), live_client=MagicMock(),
+            start_date=date(2026, 1, 1), initial_balance=1000.0,
+        )
+        assert trades == alone
 
 
 class TestExtractPairsPerformanceSmoke:
     """Performance regression guard for the windowed time-series sweep.
 
     Scoped to _extract_pairs directly rather than the full run_backtest
-    pipeline: grouping (_group_by_normalized_title / _group_by_exact_title)
-    is already a single O(n) pass over the market list, so it was never the
+    pipeline: grouping (_group_by_normalized_title) is already a single
+    O(n) pass over the market list, so it was never the
     bottleneck — _extract_pairs' pairwise enumeration is the O(n^2) risk this
     whole change exists to fix, so it's the meaningful unit to time here.
 
@@ -5482,16 +4808,8 @@ class TestFetchCandlesParallel:
         # Same guarantee end-to-end: the three existing run_backtest fixtures
         # rely on an unknown ticker raising KeyError out of the whole run as a
         # prefilter regression guard, so the pool must stay transparent there.
-        markets = [
-            {"ticker": "SA", "event_ticker": "EA", "event_title": "EV",
-             "title": "Q", "subtitle": "", "result": "yes",
-             "close_time": "2026-02-01T00:00:00+00:00",
-             "settlement_ts": "2026-02-01T12:00:00+00:00"},
-            {"ticker": "SB", "event_ticker": "EB", "event_title": "EV",
-             "title": "Q", "subtitle": "", "result": "yes",
-             "close_time": "2026-02-01T00:00:00+00:00",
-             "settlement_ts": "2026-02-01T12:00:00+00:00"},
-        ]
+        # The fixture is one time-series pair, so both legs' candles are asked for.
+        markets = _time_series_markets()
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: markets)
         monkeypatch.setattr(backtester, "fetch_candlesticks",
@@ -5815,10 +5133,10 @@ class TestPrepareEntriesMemoryInstrumentation:
         - EC shares no grouping key with anything, so it is never copied into
           the groupable subset; only the CORPUS list holds it, and it goes with
           `del markets` right after the second walk.
-        - ED and EE share both keys (identical wording on two events of ONE
-          series), so they ARE materialized into the groupable subset, yet the
-          one-series rule (DR-02) keeps them out of every candidate pair; only
-          the post-extraction `del ts_groups, same_groups, groupable` frees
+        - ED and EE share the grouping key (identical wording on two events
+          of ONE series), so they ARE materialized into the groupable subset,
+          yet the one-series rule (DR-02) keeps them out of every candidate
+          pair; only the post-extraction `del ts_groups, groupable` frees
           them.
 
         Residency, not peak: the process high-water mark is already set by
@@ -5878,7 +5196,7 @@ class TestPrepareEntriesMemoryInstrumentation:
         # EB, ED, EE of 5 eligible), and really formed no pair.
         assert ("Groupable subset: materializing 4 of 5 eligible markets"
                 in caplog.text)
-        assert "Potential pairs: 1 time-series, 0 same-title" in caplog.text
+        assert "Potential pairs: 1 time-series" in caplog.messages
         assert [(t.ticker_a, t.ticker_b) for t in trades] == [("EA", "EB")]
         # The unpaired records are gone; the two that a candidate pair holds
         # are still alive, because the pair lists legitimately reference them.
@@ -6911,75 +6229,17 @@ class TestEquityCurveCarriesOpenPositionsAtCost:
             / self._INITIAL, abs=1e-12)
 
 
-class TestDropCrossTypeDuplicates:
-    """Pass 1 must not carry the same ticker pair as both a same-title and a
-    time-series candidate — the live pipeline never does (main._dedup_pairs)."""
-
-    def test_drop_cross_type_duplicates_prefers_same_title(self, caplog):
-        same = {"pair_type": "same_title",
-                "mA": {"ticker": "X"}, "mB": {"ticker": "Y"}}
-        # Same two tickers as `same`, but discovered in the OPPOSITE leg order:
-        # the frozenset key must still recognise it as the same pair.
-        dupe = {"pair_type": "time_series",
-                "mA": {"ticker": "Y"}, "mB": {"ticker": "X"}}
-        other = {"pair_type": "time_series",
-                 "mA": {"ticker": "P"}, "mB": {"ticker": "Q"}}
-
-        with caplog.at_level("INFO"):
-            result = backtester._drop_cross_type_duplicates([same, dupe, other])
-
-        # Input order is preserved and only the cross-type duplicate is dropped
-        assert result == [same, other]
-        messages = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
-        assert any("Dropped 1 time-series candidate(s) already covered" in m
-                   for m in messages), messages
-
-    def test_no_duplicates_logs_nothing_and_returns_input_order(self, caplog):
-        same = {"pair_type": "same_title",
-                "mA": {"ticker": "X"}, "mB": {"ticker": "Y"}}
-        other = {"pair_type": "time_series",
-                 "mA": {"ticker": "P"}, "mB": {"ticker": "Q"}}
-
-        with caplog.at_level("INFO"):
-            result = backtester._drop_cross_type_duplicates([other, same])
-
-        assert result == [other, same]
-        assert not any("already covered by a same-title candidate" in r.getMessage()
-                       for r in caplog.records)
-
-
-class TestRunBacktestCrossTypeDedup:
-    """The cross-type collision the dedup (C4) exists for can no longer arise
-    from the two finders, and this pins WHY.
-
-    Fixture shape: two markets sharing an identical (event_title, title,
-    subtitle) — so _group_by_exact_title groups them as same_title — whose
-    titles therefore also normalize to one key, so _group_by_normalized_title
-    GROUPS the same two tickers for time_series too.
-
-    That used to yield both copies, which is what _drop_cross_type_duplicates
-    was built to resolve. It no longer can: a time-series pair must state two
-    DIFFERENT cumulative deadlines, and identical wording cannot state two of
-    anything. The two conditions are mutually exclusive on one ticker pair,
-    so Pass 1 produces at most the same-title copy and the dedup has nothing
-    to drop. The helper stays — it is still the right thing to do if a
-    collision ever arises another way — and TestDropCrossTypeDuplicates
-    unit-tests it directly; what changed is that the FINDERS no longer
-    manufacture one.
-
-    Two versions of the fixture, since DR-74. _ALIGNED_MARKETS close at one
-    instant, so the same-title close gate admits the pair and the same-title
-    copy is the only one. _MARKETS close a week apart — two fixtures, not one
-    question — so the close gate refuses the same-title copy, and because
-    identical wording can never form a time-series pair (DR-67) the refused
-    copy does not come back relabelled as one: NOTHING reaches the dedup.
-    That second version is the relabel guard for a same-title-only gate.
+class TestIdenticalWordingFormsNoTimeSeriesPair:
+    """Two identically worded markets on two series group together on the
+    time-series key (their titles normalize to one key), but form no
+    time-series pair: a time-series pair must state two DIFFERENT cumulative
+    deadlines, and identical wording cannot state two of anything — undated
+    ("Q") or dated (one deadline stated twice) — whether the two close at one
+    instant or a week apart.
     """
 
     # Closes a week apart: DA Feb 1, DB Feb 8 — two fixtures of one
-    # identically worded question on two series. The same-title close gate
-    # (DR-74) refuses the pair and the time-series branch refuses identical
-    # wording, so no candidate of either type forms.
+    # identically worded question on two series.
     _MARKETS = [
         {"ticker": "DA", "event_ticker": "EA", "event_title": "EV",
          "title": "Q", "subtitle": "", "result": "yes",
@@ -6990,14 +6250,12 @@ class TestRunBacktestCrossTypeDedup:
          "close_time": "2026-02-08T00:00:00+00:00",
          "settlement_ts": "2026-02-08T12:00:00+00:00"},
     ]
-    # The same two markets closing at ONE instant (both Feb 1) — the
-    # flow-through fixture. DA yes 0.30 / no 0.70; DB yes 0.60 / no 0.40.
-    # Same-title copy: DB is the pricier side, gap 0.30 >= 0.05, legs
-    # nA+pB = 0.40+0.30 = 0.70 <= 0.95. A time-series copy would clear the
-    # 15% short-gap tier on price alone (DB priced 0.30 above DA, legs
-    # pA+nB = 0.30+0.40 = 0.70 <= 0.85), but it is refused earlier than any
-    # of that, at extraction: both legs are worded "Q", so they state no
-    # deadline at all, let alone two different ones.
+    # The same two markets closing at ONE instant (both Feb 1). DA yes 0.30 /
+    # no 0.70; DB yes 0.60 / no 0.40. A time-series pair would clear the 15%
+    # short-gap tier on price alone (DB priced 0.30 above DA, legs pA+nB =
+    # 0.30+0.40 = 0.70 <= 0.85), but it is refused earlier than any of that,
+    # at extraction: both legs are worded "Q", so they state no deadline at
+    # all, let alone two different ones.
     _ALIGNED_MARKETS = [
         {**_MARKETS[0]},
         {**_MARKETS[1], "close_time": "2026-02-01T00:00:00+00:00",
@@ -7008,99 +6266,42 @@ class TestRunBacktestCrossTypeDedup:
         "DB": [_candle(_MONDAY_TS, 0.60, 0.40)],
     }
 
-    def test_fixture_lands_in_both_groupings_but_only_one_yields_a_candidate(self):
-        # GROUPING is untouched by the cumulative-deadline rule, so the pair is
-        # still discovered by both keys...
-        assert len(_group_by_exact_title(self._ALIGNED_MARKETS)) == 1
-        assert len(_group_by_normalized_title(self._ALIGNED_MARKETS)) == 1
-        # ...but only the same-title branch produces a candidate. The legs are
-        # worded "Q", so they state no deadline at all, and the time-series
-        # branch refuses them.
-        assert len(_extract_pairs(_group_by_exact_title(self._ALIGNED_MARKETS))) == 1
-        assert _extract_pairs(_group_by_normalized_title(self._ALIGNED_MARKETS)) == []
+    @pytest.mark.parametrize("closes", ["aligned", "a week apart"])
+    def test_the_markets_group_but_form_no_pair(self, closes):
+        # GROUPING is untouched by the cumulative-deadline rule, so the two
+        # land in one group; the wording rule refuses the pair.
+        markets = self._ALIGNED_MARKETS if closes == "aligned" else self._MARKETS
+        assert len(_group_by_normalized_title(markets)) == 1
+        assert _extract_pairs(_group_by_normalized_title(markets)) == []
 
-    def test_differing_closes_yield_no_candidate_of_either_type(self):
-        # regression (DR-74) — the relabel guard. The same two tickers, a week
-        # apart: still discovered by both keys, and now refused by both
-        # branches — the same-title one by the close gate, the time-series
-        # one by the wording rule, as before.
-        assert len(_group_by_exact_title(self._MARKETS)) == 1
-        assert len(_group_by_normalized_title(self._MARKETS)) == 1
-        assert _extract_pairs(_group_by_exact_title(self._MARKETS)) == []
-        assert _extract_pairs(_group_by_normalized_title(self._MARKETS)) == []
-
-    def _run_with_dedup_spy(self, monkeypatch, markets):
+    @pytest.mark.parametrize("closes", ["aligned", "a week apart"])
+    def test_run_backtest_makes_no_trade_and_asks_for_no_candle(self, monkeypatch, closes):
+        # End to end: no candidate of either market forms, so no candle is
+        # asked for and nothing trades.
+        markets = self._ALIGNED_MARKETS if closes == "aligned" else self._MARKETS
+        fetched: list = []
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
-                            lambda *a, **k: markets)
+                            lambda *a, **k: [dict(m) for m in markets])
         monkeypatch.setattr(backtester, "fetch_candlesticks",
-                            lambda _c, ticker, *a, **k: self._CANDLES[ticker])
-
-        real = backtester._drop_cross_type_duplicates
-        seen: dict = {"in": [], "out": []}
-
-        def _spy(candidates):
-            seen["in"] = list(candidates)
-            out = real(candidates)
-            seen["out"] = list(out)
-            return out
-
-        monkeypatch.setattr(backtester, "_drop_cross_type_duplicates", _spy)
-
+                            lambda _c, ticker, *a, **k: fetched.append(ticker)
+                            or self._CANDLES[ticker])
         trades, _ = run_backtest(
             hist_client=MagicMock(), live_client=MagicMock(),
             start_date=date(2026, 1, 1), initial_balance=1000.0,
         )
-        return trades, seen
-
-    @staticmethod
-    def _typed(cands, pair_type):
-        key = frozenset({"DA", "DB"})
-        return [c for c in cands
-                if c["pair_type"] == pair_type
-                and frozenset({c["mA"]["ticker"], c["mB"]["ticker"]}) == key]
-
-    def test_no_time_series_duplicate_reaches_the_dedup(self, monkeypatch):
-        trades, seen = self._run_with_dedup_spy(monkeypatch, self._ALIGNED_MARKETS)
-
-        # Pass 1 produces the same-title copy ONLY: identical wording cannot
-        # state two different deadlines, so the time-series copy is refused at
-        # extraction and never reaches the dedup at all.
-        assert len(self._typed(seen["in"], "same_title")) == 1
-        assert self._typed(seen["in"], "time_series") == []
-        # The dedup is therefore a no-op here, and the same-title copy is
-        # carried into Pass 2 unchanged.
-        assert len(self._typed(seen["out"], "same_title")) == 1
-        assert self._typed(seen["out"], "time_series") == []
-
-        assert len(trades) == 1
-        assert trades[0].pair_type == "same_title"
-        # The same-title copy canonicalizes A as the pricier side (DB)
-        assert (trades[0].ticker_a, trades[0].ticker_b) == ("DB", "DA")
-
-    def test_nothing_reaches_the_dedup_when_the_closes_differ(self, monkeypatch):
-        # regression (DR-74) — the relabel guard end to end: with the closes a
-        # week apart the same-title copy is refused and no time-series copy
-        # replaces it, so the dedup sees no candidate for these tickers and no
-        # trade is made.
-        trades, seen = self._run_with_dedup_spy(monkeypatch, self._MARKETS)
-        assert self._typed(seen["in"], "same_title") == []
-        assert self._typed(seen["in"], "time_series") == []
         assert trades == []
+        assert fetched == []
 
-    def test_dated_identical_wording_is_same_title_only(self):
+    def test_dated_identical_wording_is_no_time_series_pair(self):
         # control — kills a mutant that drops the spans-differ requirement
-        # (`return True` in place of `spans_a != spans_b`). The class
-        # docstring's exclusivity claim was cited to
-        # test_fixture_lands_in_both_groupings_but_only_one_yields_a_candidate
-        # above, whose fixture states NO deadline at all ("Q"), so it only
-        # ever exercises the spans-differ conjunct's "both empty" branch. This
-        # fixture states a deadline IDENTICALLY on two DIFFERENT series, so
-        # the refusal comes from the spans-differ conjunct alone (the two
-        # spans are equal) — the one-series rule does not fire here, since
-        # _same_series_dicts is False on two different series. Both legs close
-        # at one instant, so the same-title close gate (DR-74) admits the
-        # same-title copy. Mirror of test_scanner.py::TestDeadlineGuardFinders::
-        # test_dated_identical_wording_is_same_title_only.
+        # (`return True` in place of `spans_a != spans_b`). The fixtures above
+        # state NO deadline at all ("Q"), so they only ever exercise the
+        # spans-differ conjunct's "both empty" branch. This fixture states a
+        # deadline IDENTICALLY on two DIFFERENT series, so the refusal comes
+        # from the spans-differ conjunct alone (the two spans are equal) — the
+        # one-series rule does not fire here, since _same_series_dicts is
+        # False on two different series. Mirror of test_scanner.py::
+        # TestDeadlineGuardFinders::test_dated_identical_wording_is_no_time_series_pair.
         title = "Will X happen by Dec 31, 2026?"
         mA = _md("A1", "EVA-1", title=title, event_title="EV")
         mA["close_time"] = "2026-12-01T00:00:00Z"
@@ -7115,41 +6316,32 @@ class TestRunBacktestCrossTypeDedup:
         )
         assert backtester._identical_wording_dicts(mA, mB) is True
         assert backtester._same_series_dicts(mA, mB) is False
-        assert backtester._comparable_closes_dicts(mA, mB) is not None
-        assert len(_extract_pairs(_group_by_exact_title([mA, mB]))) == 1
         assert _extract_pairs(_group_by_normalized_title([mA, mB])) == []
 
         # Positive control: B's wording states a DIFFERENT deadline on the
-        # same two series, at the same prices and the same close instant — the
-        # WORDING is the only thing that changed. The spans now differ, so the
-        # time-series candidate forms — proving the [] above comes from the
-        # spans-differ conjunct rather than from the close times or the two
-        # series being distinct.
+        # same two series, at the same close instant — the WORDING is the only
+        # thing that changed. The spans now differ, so the time-series
+        # candidate forms — proving the [] above comes from the spans-differ
+        # conjunct rather than from the close times or the two series being
+        # distinct.
         mB3 = _md("B1", "EVB-1", title="Will X happen by Dec 20, 2026?", event_title="EV")
         mB3["close_time"] = mA["close_time"]
         assert len(_extract_pairs(_group_by_normalized_title([mA, mB3]))) == 1
 
     @pytest.mark.parametrize("title", ["Q", "Will X happen by Dec 31, 2026?"])
-    def test_identical_wording_closing_apart_forms_no_pair_of_either_type(self, title):
-        # regression (DR-74) — the relabel guard through both _extract_pairs
-        # branches, undated and dated. Identical wording on two DIFFERENT
-        # series closing 19 days apart: the same-title branch refuses it at
-        # the close gate, and the time-series branch refuses identical wording
-        # whether it states no deadline ("Q") or one deadline twice. Mirror of
-        # test_scanner.py::TestDeadlineGuardFinders::
-        # test_identical_wording_closing_apart_forms_no_pair_of_either_type.
+    def test_identical_wording_closing_apart_forms_no_time_series_pair(self, title):
+        # Identical wording on two DIFFERENT series closing 19 days apart: the
+        # time-series rule refuses identical wording whether it states no
+        # deadline ("Q") or one deadline twice. Mirror of test_scanner.py::
+        # TestDeadlineGuardFinders::
+        # test_identical_wording_closing_apart_forms_no_time_series_pair.
         mA = _md("A1", "EVA-1", title=title, event_title="EV")
         mA["close_time"] = "2026-12-01T00:00:00Z"
         mB = _md("B1", "EVB-1", title=title, event_title="EV")
         mB["close_time"] = "2026-12-20T00:00:00Z"
         assert backtester._same_series_dicts(mA, mB) is False
-        assert len(_group_by_exact_title([mA, mB])) == 1
         assert len(_group_by_normalized_title([mA, mB])) == 1
-        assert _extract_pairs(_group_by_exact_title([mA, mB])) == []
         assert _extract_pairs(_group_by_normalized_title([mA, mB])) == []
-        # Positive control: B on A's close instant — the same-title pair forms.
-        mB["close_time"] = mA["close_time"]
-        assert len(_extract_pairs(_group_by_exact_title([mA, mB]))) == 1
 
 
 @pytest.mark.usefixtures("pre_toggle_defaults")
@@ -7159,36 +6351,48 @@ class TestCheckpointOpeningBalanceSizing:
     feeding every compute_trade call), and never spend more than the running
     cash (live: strategy.select_portfolio shrinks a spec to the cash left).
     Nothing is open here, so the opening value is the opening cash. Sizes are
-    at pre_toggle_defaults' 20% cap for every pair, with no extra same-title
-    cap."""
+    at pre_toggle_defaults' k 0.75 and 20% cap unless a test says otherwise.
 
-    # Two same-title pairs whose only qualifying Monday is 2026-01-05. Distinct
-    # event_titles ("EV1"/"EV2") keep them in separate (event_title, title,
-    # subtitle) groups, so Pass 1's best-per-group filter keeps both.
+    Fixture: two time-series pairs that both trade on their first qualifying
+    Monday, 2026-01-05. Each market has one candle, at that checkpoint, which
+    stays every later Monday's latest quote, so each pair also qualifies on
+    01-12, 01-19 and 01-26, before its earlier market closes on February 1.
+    Each asks its own question ("Will the launch happen ...?", "Will the
+    landing happen ...?") by February 1 and by February 14, 2026, on two events
+    of different series, so the two pairs have no event and no question in
+    common: they share no ladder, and the one-open-trade-per-ladder rule
+    (DR-76) holds neither back. Every market settles YES. Both pairs have the
+    same first-Monday quotes, in dollars:
+      earlier market A: YES ask 0.20, NO ask 0.80 (YES bid 0.20, YES mid 0.20)
+      later market B:   YES ask 0.70, NO ask 0.30 (YES bid 0.70, YES mid 0.70)
+    The bot buys YES on A at 0.20 and NO on B at 0.30: legs $0.50 a contract
+    pair. The 13-day deadline gap is in the short tier (a price gap of at
+    least 0.15 and legs of at most 0.85; here 0.50 and 0.50), and neither
+    book is crossed. The mid spread is 0.70 - 0.20 = 0.50, the fee
+    approximation 0.07 x (0.20 x 0.80 + 0.30 x 0.70) = 0.0259 a pair, and
+    Kelly's b = (1 - 0.50 - 0.0259) / (0.50 + 0.0259) = 0.9015."""
+
     @staticmethod
     def _markets():
         out = []
-        for n, ev in ((1, "EV1"), (2, "EV2")):
-            out.append({"ticker": f"S{n}A", "event_ticker": f"E{n}A", "event_title": ev,
-                        "title": f"Q{n}", "subtitle": "", "result": "yes",
-                        "close_time": "2026-02-01T00:00:00+00:00",
-                        "settlement_ts": "2026-02-01T12:00:00+00:00"})
-            out.append({"ticker": f"S{n}B", "event_ticker": f"E{n}B", "event_title": ev,
-                        "title": f"Q{n}", "subtitle": "", "result": "yes",
-                        "close_time": "2026-02-01T00:00:00+00:00",
-                        "settlement_ts": "2026-02-01T12:00:00+00:00"})
+        for n, subject in ((1, "launch"), (2, "landing")):
+            for leg, deadline, close in (("A", "February 1, 2026", "2026-02-01"),
+                                         ("B", "February 14, 2026", "2026-02-14")):
+                out.append({"ticker": f"S{n}{leg}", "event_ticker": f"E{n}{leg}",
+                            "event_title": "EV",
+                            "title": f"Will the {subject} happen by {deadline}?",
+                            "subtitle": "", "result": "yes",
+                            "close_time": f"{close}T00:00:00+00:00",
+                            "settlement_ts": f"{close}T12:00:00+00:00"})
         return out
 
-    # Identical prices for both pairs: expensive leg yes 0.60 / no 0.40, cheap
-    # leg yes 0.35 — a 0.25 gap, so both clear SAME_TITLE_MIN_PRICE_DIFF and
-    # both land on the same capped Kelly fraction.
     @staticmethod
     def _candles():
         return {
-            "S1A": [_candle(_MONDAY_TS, 0.60, 0.40)],
-            "S1B": [_candle(_MONDAY_TS, 0.35, 0.65)],
-            "S2A": [_candle(_MONDAY_TS, 0.60, 0.40)],
-            "S2B": [_candle(_MONDAY_TS, 0.35, 0.65)],
+            "S1A": [_candle(_MONDAY_TS, 0.20, 0.80)],
+            "S1B": [_candle(_MONDAY_TS, 0.70, 0.30)],
+            "S2A": [_candle(_MONDAY_TS, 0.20, 0.80)],
+            "S2B": [_candle(_MONDAY_TS, 0.70, 0.30)],
         }
 
     def _patch(self, monkeypatch):
@@ -7204,6 +6408,15 @@ class TestCheckpointOpeningBalanceSizing:
         # and record the same balance_at_entry: the first's cost must not
         # lower the second's base. The cash left never binds here (20% + 20%
         # of $1,000 fits); the next test is the case where it does.
+        #
+        # By hand at k 0.75: p = 1 - 0.75 x 0.50 = 0.625, so f* = 0.625 -
+        # 0.375 / 0.9015 = 0.209, capped at 0.20: a $200 budget for each pair.
+        # 380 pairs cost $190.00 plus exact fees of $4.26 (0.07 x 380 x 0.20 x
+        # 0.80 = 4.256, up to the cent) and $5.59 (0.07 x 380 x 0.30 x 0.70 =
+        # 5.586), $199.85; 381 would cost $190.50 + $4.27 + $5.61 = $200.38.
+        # Sized on what the first pair left instead, the second would get less:
+        # 20% of the $800.15 cash, or of the $990.15 value with the first
+        # pair's $190.00 of contracts.
         self._patch(monkeypatch)
 
         trades, _ = run_backtest(
@@ -7212,9 +6425,13 @@ class TestCheckpointOpeningBalanceSizing:
         )
 
         assert len(trades) == 2
+        assert sorted((t.pair_type, t.ticker_a, t.ticker_b) for t in trades) == [
+            ("time_series", "S1A", "S1B"), ("time_series", "S2A", "S2B")]
         assert {t.entry_date for t in trades} == {date(2026, 1, 5)}
-        assert trades[0].n == trades[1].n
+        assert trades[0].n == trades[1].n == 380
         for t in trades:
+            assert t.kelly_fraction == pytest.approx(0.20)
+            assert t.total_cost + t.fees == pytest.approx(199.85, abs=1e-9)
             assert t.balance_at_entry == pytest.approx(1000.0)
             # Each trade's fee-inclusive outlay fits the Kelly budget taken off
             # the CHECKPOINT balance, not off whatever cash was left.
@@ -7226,16 +6443,21 @@ class TestCheckpointOpeningBalanceSizing:
         # the cap to 0.60 for this test only — backtester imports the constant
         # by value (`from .config import BUDGET_FRACTION`), so patching the
         # module attribute is what `_resolve_size_cap(None)` reads at call
-        # time, and Pass 1b sizes at `min(cap, kelly_f)` with that cap.
+        # time, and Pass 1b sizes at `min(cap, kelly_f)` with that cap. A
+        # time-series f* is always below 1 - k (0.25 at k 0.75), so k is
+        # lowered to 0.30 too, on config and on backtester's by-value copy.
         #
-        # Worked by hand. Each pair's legs are NO on A at 0.40 and YES on B at
-        # 0.35, $0.75 a contract pair; its Kelly fraction (p 0.95, about 0.77)
-        # is capped at 0.60. The first pair's budget is 0.60 x $1,000 = $600:
-        # 766 pairs cost $574.50 plus fees of $12.87 + $12.20 = $599.57, and
-        # 767 would cost $575.25 + $12.89 + $12.22 = $600.36. That leaves
-        # $400.43 of cash, under the second pair's $600 budget, so the second
-        # pair is sized on the cash: 511 pairs cost $383.25 + $8.59 + $8.14 =
-        # $399.98, and 512 would cost $384.00 + $8.61 + $8.16 = $400.77.
+        # Worked by hand. At k 0.30, p = 1 - 0.30 x 0.50 = 0.85, so f* = 0.85
+        # - 0.15 / 0.9015 = 0.684, capped at 0.60. The first pair's budget is
+        # 0.60 x $1,000 = $600: 1,140 pairs cost $570.00 plus exact fees of
+        # $12.77 (0.07 x 1,140 x 0.16 = 12.768, up to the cent) and $16.76
+        # (0.07 x 1,140 x 0.21 = 16.758), $599.53, and 1,141 would cost
+        # $570.50 + $12.78 + $16.78 = $600.06. That leaves $400.47 of cash,
+        # under the second pair's $600 budget, so the second pair is sized on
+        # the cash: 761 pairs cost $380.50 + $8.53 + $11.19 = $400.22, and 762
+        # would cost $381.00 + $8.54 + $11.21 = $400.75.
+        monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.30)
+        monkeypatch.setattr(backtester, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.30)
         monkeypatch.setattr(backtester, "BUDGET_FRACTION", 0.60)
         self._patch(monkeypatch)
 
@@ -7246,10 +6468,11 @@ class TestCheckpointOpeningBalanceSizing:
 
         # Both trade: the second is shrunk to the cash the first left, as
         # select_portfolio shrinks a spec that no longer fits
-        assert [t.n for t in trades] == [766, 511]
+        assert [t.n for t in trades] == [1140, 761]
         assert [t.total_cost + t.fees for t in trades] == [
-            pytest.approx(599.57), pytest.approx(399.98)]
+            pytest.approx(599.53), pytest.approx(400.22)]
         for t in trades:
+            assert t.pair_type == "time_series"
             assert t.kelly_fraction == pytest.approx(0.60)
             # Both are sized on the same checkpoint value
             assert t.balance_at_entry == pytest.approx(1000.0)
@@ -7266,8 +6489,8 @@ class TestRunBacktestTimeSeriesFlow:
     Fixture (the plan's hand-picked illustrative numbers, not market data):
     EA closes 2026-02-01 and EB 2026-02-14 (13-day gap, short tier, threshold
     0.15), same event_title "EV", distinct event tickers, titles that
-    normalize to one key but are NOT exact-title equal (so no same-title copy
-    forms to dedup the pair away), open_time 2026-01-01, settlement = close +
+    normalize to one key (two deadlines of one question), open_time
+    2026-01-01, settlement = close +
     12h. Candles at the first Monday: EA yes 0.30 / no 0.70, EB yes 0.60 / no
     0.40. Balance $10,000.
 
@@ -7320,13 +6543,11 @@ class TestRunBacktestTimeSeriesFlow:
             start_date=date(2026, 1, 1), initial_balance=10_000.0,
         )
 
-    def test_fixture_is_a_time_series_group_only(self):
-        # The pair must be discovered by the normalized-title grouping and NOT
-        # by the exact-title one — otherwise the cross-type dedup would drop
-        # the very candidate this class exercises.
+    def test_fixture_is_one_time_series_group(self):
+        # The pair must be discovered by the normalized-title grouping, the
+        # one the backtest groups by.
         markets = self._markets("yes", "yes")
         assert len(_group_by_normalized_title(markets)) == 1
-        assert _group_by_exact_title(markets) == {}
 
     @staticmethod
     def _expected_kelly(pA, nB, pB, nA=None):
@@ -7639,9 +6860,8 @@ class TestRunBacktestSameDateLegOrder:
     @staticmethod
     def _markets(result_early: str, result_late: str) -> list[dict]:
         # LATE first on purpose — this is the ordering the defect needed.
-        # Titles normalize to one key (the date text is stripped) but are not
-        # exact-title equal, so only the time-series grouping forms the pair
-        # and the cross-type dedup has nothing to drop.
+        # Titles normalize to one key (the date text is stripped), so the
+        # time-series grouping forms the pair.
         return [
             {"ticker": "LATE", "event_ticker": "EVL", "event_title": "EV",
              "title": "Team wins by February 10, 2026", "subtitle": "",
@@ -7673,10 +6893,9 @@ class TestRunBacktestSameDateLegOrder:
             start_date=date(2026, 1, 1), initial_balance=10_000.0,
         )
 
-    def test_fixture_is_a_time_series_group_only(self):
+    def test_fixture_is_one_time_series_group(self):
         markets = self._markets("yes", "yes")
         assert len(_group_by_normalized_title(markets)) == 1
-        assert _group_by_exact_title(markets) == {}
         # And the pair really does reach _find_entry LATE-first.
         pairs = _extract_pairs(_group_by_normalized_title(markets))
         assert len(pairs) == 1
@@ -7749,7 +6968,9 @@ class TestIntervalCalibration:
         # None means there is no table to print (nothing measurable) — but
         # since DR-72 the caller (_log_interval_calibration) is no longer
         # silent on None: it logs one explanatory line instead of an
-        # all-zero table. See TestLogIntervalCalibration for that line.
+        # all-zero table. See TestLogIntervalCalibration for that line. A
+        # record of another pair type is not measured: only a time-series
+        # record has an in-between cell
         assert _interval_calibration([]) is None
         assert _interval_calibration([
             _cal_entry(None, 0.60, 0.50, "yes", "no", pair_type="same_title"),
@@ -7965,7 +7186,7 @@ class TestCalibrationObservationsAreCarried:
         return [
             _cal_entry(3, 0.10, 0.70, "no", "yes", event_ticker="KXSPACEX-14"),  # in-between
             _cal_entry(None, 0.60, 0.50, "yes", "no", pair_type="same_title",
-                       event_ticker="KXST-1"),                                     # same-title
+                       event_ticker="KXST-1"),                                     # not time-series
             _cal_entry(5, 0.20, 0.60, "yes", "yes", event_ticker="KXFED-26"),     # by A
             _cal_entry(3, 0.10, 0.70, "", "yes", event_ticker="KXVOID-1"),         # unsettled
             _cal_entry(20, 0.25, 0.75, "yes", "no", event_ticker="KXBAD-1"),       # violation
@@ -7977,7 +7198,8 @@ class TestCalibrationObservationsAreCarried:
 
     def test_observations_are_exactly_the_measured_population_in_order(self):
         calib = _interval_calibration(self._mixed_entries())
-        # Same-title, unsettled and premise-violating entries never become one
+        # Records of another pair type, unsettled and premise-violating
+        # entries never become one
         assert [o.event_ticker for o in calib.observations] == [
             "KXSPACEX-14", "KXFED-26", "KXFED-27", "KXNOGAP-1"]
         assert len(calib.observations) == calib.pooled.n == 4
@@ -8613,33 +7835,34 @@ _MONDAY2_TS = _MONDAY_TS + 7 * 86_400
 
 
 class TestPrepareEntriesGolden:
-    """_prepare_entries, now composed of _prepare_candidates and one
+    """_prepare_entries, composed of _prepare_candidates and one
     _entries_for_band pass at the default band, must produce EXACTLY the
-    entries it produced before the split.
+    rows below.
 
-    The expected rows below are LITERALS captured by running main's
-    _prepare_entries (fe0a758, before the split existed) over this fixture —
-    not re-derived from the code under test, which would make the check
-    tautological. The fixture is the TestRunBacktestSweep EA/EB time-series
-    pair; a same-event ladder whose rungs close at one instant (so the stated
-    gap, not close_time, orders the legs and picks the 0.30 tier — Monday 1's
-    0.25 spread would clear the 0.15 tier a close gap of 0 picks, so the
-    ladder entering on Monday 2 is what proves the stated gap was used), with
-    the later rung listed first; a same-title pair whose B leg is the pricier
-    one (canonicalized by price); a cross-event time-series pair that never
-    qualifies (a pricier earlier contract on both Mondays); and two short-gap
-    cross-event pairs at the two extremes a band can act on — TA/TB at a
-    spread of exactly the 0.15 short tier and WA/WB at 0.98, the widest two
-    live [0.01, 0.99] YES asks can make. Those two are what let the capture
-    SEE a band: without them every grid band with floor <= 0.30 and ceiling
-    >= 0.40 reproduced the rows, so _prepare_entries could have silently
-    started banding with the golden still green. With them, any floor above
-    the short tier or ceiling below 0.98 moves the rows — i.e. every band
-    that could change an entry on any data (the band tests below pin both
-    directions). Both are voided (result ""), so they never trade. It is run
-    with ladders
-    on AND off. The fetch and candle seams are mocked exactly as
-    TestRunBacktestSweep mocks them.
+    The expected rows are the time-series rows of LITERALS captured by
+    running main's _prepare_entries (fe0a758, before the split existed) over
+    this fixture — not re-derived from the code under test, which would make
+    the check tautological. The fixture is the TestRunBacktestSweep EA/EB
+    time-series pair; a same-event ladder whose rungs close at one instant
+    (so the stated gap, not close_time, orders the legs and picks the 0.30
+    tier — Monday 1's 0.25 spread would clear the 0.15 tier a close gap of 0
+    picks, so the ladder entering on Monday 2 is what proves the stated gap
+    was used), with the later rung listed first; SA and SB, two markets
+    worded alike ("Q") on events of two different series that close
+    together, which the backtest does not pair (so every test that reads
+    these rows also shows that pair is not found); a cross-event time-series
+    pair that never qualifies (a pricier earlier contract on both Mondays);
+    and two short-gap cross-event pairs at the two extremes a band can act on
+    — TA/TB at a spread of exactly the 0.15 short tier and WA/WB at 0.98, the
+    widest two live [0.01, 0.99] YES asks can make. Those two are what let
+    the capture SEE a band: without them every grid band with floor <= 0.30
+    and ceiling >= 0.40 reproduced the rows, so _prepare_entries could have
+    silently started banding with the golden still green. With them, any
+    floor above the short tier or ceiling below 0.98 moves the rows — i.e.
+    every band that could change an entry on any data (the band tests below
+    pin both directions). Both are voided (result ""), so they never trade.
+    It is run with ladders on AND off. The fetch and candle seams are mocked
+    exactly as TestRunBacktestSweep mocks them.
 
     Each row's last field lists the pair's later qualifying Mondays (DR-75).
     Those dates come from an independent source too: the old first-Monday-only
@@ -8699,7 +7922,7 @@ class TestPrepareEntriesGolden:
     #  first-Monday-only scan from the day after each Monday it found. Each
     #  pair's prices stay at its last candle's, so once a pair qualifies it
     #  keeps qualifying every Monday up to the day before its earlier leg closes.
-    # EA/EB, TA/TB, WA/WB and SB/SA (first Monday 1/5, earlier close 2/1):
+    # EA/EB, TA/TB and WA/WB (first Monday 1/5, earlier close 2/1):
     _LATER_WEEKS = (date(2026, 1, 12), date(2026, 1, 19), date(2026, 1, 26))
     # The ladder with the tier floors on (first Monday 1/12, both rungs close 3/20):
     _LADDER_LATER = (date(2026, 1, 19), date(2026, 1, 26), date(2026, 2, 2),
@@ -8715,12 +7938,11 @@ class TestPrepareEntriesGolden:
               date(2026, 1, 5), 0.3, 0.45, 0.7, 0.5, 9, "TA", "TB", _LATER_WEEKS)
     _WA_WB = ("time_series", "hail | hail falls by", "hail | hail falls by",
               date(2026, 1, 5), 0.01, 0.99, 0.99, 0.01, 9, "WA", "WB", _LATER_WEEKS)
-    _SAME_TITLE = ("same_title", "Q", ("EVS", "Q", ""),
-                   date(2026, 1, 5), 0.6, 0.35, 0.4, 0.65, None, "SB", "SA", _LATER_WEEKS)
-    _GOLDEN = {True: [_EA_EB, _LADDER, _TA_TB, _WA_WB, _SAME_TITLE],
-               False: [_EA_EB, _TA_TB, _WA_WB, _SAME_TITLE]}
+    _GOLDEN = {True: [_EA_EB, _LADDER, _TA_TB, _WA_WB],
+               False: [_EA_EB, _TA_TB, _WA_WB]}
     # The census total main reported over the same fixture: every market is
-    # eligible (each spans a Monday on/after the start date).
+    # eligible (each spans a Monday on/after the start date), SA and SB
+    # included: the census counts every eligible market, paired or not.
     _GOLDEN_CENSUS_TOTAL = 12
 
     def _patch(self, monkeypatch):
@@ -8794,19 +8016,6 @@ class TestPrepareEntriesGolden:
         rows = self._rows(backtester._entries_for_band(candidates, spread_band=band))
         assert rows == self._GOLDEN[True]
 
-    def test_splitting_by_pair_type_concatenates_to_the_default(self, monkeypatch):
-        # The band sweep computes the same-title entries once and the
-        # time-series entries per band; ts + st must be the default call.
-        self._patch(monkeypatch)
-        candidates = backtester._prepare_candidates(
-            MagicMock(), MagicMock(), self._START, True, None, same_event_ladders=True,
-        )
-        ts = backtester._entries_for_band(candidates, pair_types=("time_series",))
-        st = backtester._entries_for_band(candidates, pair_types=("same_title",))
-        assert self._rows(ts) == [self._EA_EB, self._LADDER, self._TA_TB, self._WA_WB]
-        assert self._rows(st) == [self._SAME_TITLE]
-        assert self._rows(ts + st) == self._rows(backtester._entries_for_band(candidates))
-
     @pytest.mark.parametrize("ladders", [True, False])
     def test_every_non_default_grid_band_changes_the_rows(self, monkeypatch, ladders):
         # The capture is an oracle for "_prepare_entries applies NO band" only
@@ -8851,7 +8060,7 @@ class TestPrepareEntriesGolden:
     def test_prepare_entries_runs_its_entry_pass_at_no_band(self, monkeypatch):
         # A direct pin on the composition's arguments, beside the capture that
         # pins their effect: one entry pass, spread_band None (the default
-        # band) and pair_types left at both types.
+        # band) and the tier floors on (the default).
         self._patch(monkeypatch)
         real = backtester._entries_for_band
         calls: list = []
@@ -8868,22 +8077,22 @@ class TestPrepareEntriesGolden:
         )
         assert len(calls) == 1
         assert calls[0]["spread_band"] is None
-        assert calls[0]["pair_types"] == ("time_series", "same_title")
+        assert calls[0]["tier_floors"] is True
         assert self._rows(entries) == self._GOLDEN[True]
 
     @pytest.mark.parametrize("ladders,prepared,line", [
-        (True, "Prepared 5 candidate entries for sizing",
-         "Qualifying Mondays at band 0-1: 26 over 5 entries (5 qualify on more than one)"),
-        (False, "Prepared 4 candidate entries for sizing",
-         "Qualifying Mondays at band 0-1: 16 over 4 entries (4 qualify on more than one)"),
+        (True, "Prepared 4 candidate entries for sizing",
+         "Qualifying Mondays at band 0-1: 22 over 4 entries (4 qualify on more than one)"),
+        (False, "Prepared 3 candidate entries for sizing",
+         "Qualifying Mondays at band 0-1: 12 over 3 entries (3 qualify on more than one)"),
     ], ids=["ladders-on", "ladders-off"])
     def test_the_entry_pass_logs_its_qualifying_mondays(
         self, monkeypatch, caplog, ladders, prepared, line,
     ):
         # One INFO line per entry pass, counting every qualifying Monday its
-        # entries recorded — from the rows above: 1 + 3 for each short pair
-        # and for SB/SA, 1 + 9 for the ladder
-        assert sum(1 + len(row[-1]) for row in self._GOLDEN[ladders]) == (26 if ladders else 16)
+        # entries recorded — from the rows above: 1 + 3 for each of the three
+        # short pairs, 1 + 9 for the ladder
+        assert sum(1 + len(row[-1]) for row in self._GOLDEN[ladders]) == (22 if ladders else 12)
         with caplog.at_level(logging.INFO):
             self._prepare(monkeypatch, ladders)
         messages = caplog.messages
@@ -8910,8 +8119,7 @@ def _random_find_entry_cases(seed: int, count: int) -> list[tuple]:
     band ceiling to exceed, say), the Monday gets qualifying prices instead;
     and an earlier check can refuse a Monday before its filter is reached (a
     horizon cap, when one is drawn, skips Mondays before any price is read).
-    A same-title pair's pricier side is drawn afresh each Monday, so which
-    market is A can change. The legs also start late, skip weeks (the last
+    The legs also start late, skip weeks (the last
     candle then stands), carry in some weeks an extra earlier candle that
     the Monday's own candle replaces and one just after a Monday that only a
     later Monday can read, and are passed in either order. Prices are whole
@@ -8955,24 +8163,10 @@ def _random_find_entry_cases(seed: int, count: int) -> list[tuple]:
             quotes[rng.choice((0, 2))] = rng.choice((0.5, 99.5))
         return quotes
 
-    def st_quotes(kind: str) -> tuple[list, list]:
-        # (yes, no) in cents for the pricier and the cheaper market
-        cheap = ri(5, 60)
-        rich = cheap + (ri(0, 4) if kind == "tier" else ri(6, 30))
-        rich_q, cheap_q = [rich, 100 - rich], [cheap, 100 - cheap]
-        if kind == "leg-sum-ceiling":
-            rich_q[1] = min(99, 96 - cheap + ri(0, 3))
-        elif kind == "dead-no-leg":
-            rich_q[1] = 0.5
-        elif kind == "dead-yes-quote":
-            rng.choice((rich_q, cheap_q))[0] = rng.choice((0.5, 99.5))
-        return rich_q, cheap_q
-
     kinds = ["qualifying"] * 6 + ["dead-yes-quote", "unparseable-quote", "tier",
                                   "band-ceiling", "dead-no-leg", "leg-sum-ceiling",
                                   "fee", "non-positive-spread"]
     for k in range(count):
-        pair_type = "same_title" if rng.random() < 0.35 else "time_series"
         weeks = ri(4, 10)
         # Each Monday's checkpoint from 2026-01-05 (17:00 UTC; 16:00 after the March change)
         checkpoints = [int(backtester._checkpoint_datetime(
@@ -8985,27 +8179,20 @@ def _random_find_entry_cases(seed: int, count: int) -> list[tuple]:
         kw: dict = {"tier_floors": rng.random() < 0.6, "spread_band": band}
         if rng.random() < 0.15:
             kw["max_horizon_days"] = ri(10, 7 * weeks + 30)
-        if pair_type == "time_series":
-            gap_days = rng.choice([1, 5, 9, 13, 15, 16, 20, 29, 30, 31])
-            close_b = close_a + timedelta(days=gap_days, hours=ri(0, 5))
-            lo, hi = BACKTEST_DEFAULT_SPREAD_BAND if band is None else band
-            tier = round(100 * min_price_diff_for_gap(
-                gap_days, spread_min=lo, tier_floors=kw["tier_floors"]))
-            ceiling = round(100 * hi)
-        else:
-            close_b = close_a + timedelta(minutes=ri(0, 50))
+        gap_days = rng.choice([1, 5, 9, 13, 15, 16, 20, 29, 30, 31])
+        close_b = close_a + timedelta(days=gap_days, hours=ri(0, 5))
+        lo, hi = BACKTEST_DEFAULT_SPREAD_BAND if band is None else band
+        tier = round(100 * min_price_diff_for_gap(
+            gap_days, spread_min=lo, tier_floors=kw["tier_floors"]))
+        ceiling = round(100 * hi)
         mA = {"ticker": f"A{k}", "event_ticker": f"EA{k}-1", "close_time": close_a.isoformat()}
         mB = {"ticker": f"B{k}", "event_ticker": f"EB{k}-1", "close_time": close_b.isoformat()}
         late = (ri(0, 1) * ri(0, 2), ri(0, 1) * ri(0, 2))
         candles: tuple[list, list] = ([], [])
         for week in range(weeks):
             kind = rng.choice(kinds)
-            if pair_type == "time_series":
-                pA, nA, pB, nB = ts_quotes(kind, tier, ceiling)
-                legs = [[pA, nA], [pB, nB]]
-            else:
-                rich_q, cheap_q = st_quotes(kind)
-                legs = [rich_q, cheap_q] if rng.random() < 0.5 else [cheap_q, rich_q]
+            pA, nA, pB, nB = ts_quotes(kind, tier, ceiling)
+            legs = [[pA, nA], [pB, nB]]
             if kind == "unparseable-quote":
                 rng.choice(legs)[ri(0, 1)] = rng.choice((None, "abc"))
             checkpoint = checkpoints[week]
@@ -9028,9 +8215,9 @@ def _random_find_entry_cases(seed: int, count: int) -> list[tuple]:
                                          "no_ask_close": ri(5, 95) / 100})
         start = date(2026, 1, 1) + timedelta(days=ri(0, 20) if rng.random() < 0.2 else 0)
         if rng.random() < 0.5:
-            cases.append((candles[0], candles[1], mA, mB, pair_type, start, kw))
+            cases.append((candles[0], candles[1], mA, mB, "time_series", start, kw))
         else:
-            cases.append((candles[1], candles[0], mB, mA, pair_type, start, kw))
+            cases.append((candles[1], candles[0], mB, mA, "time_series", start, kw))
     return cases
 
 
@@ -9077,12 +8264,6 @@ class TestFindEntryRecordsEveryQualifyingMonday:
             assert got["mA"] is want["mA"] and got["mB"] is want["mB"]
         return len(recorded)
 
-    @staticmethod
-    def _tx_ty():
-        markets = {m["ticker"]: m
-                   for m in TestActiveTickerRelease._markets("2026-01-08T12:00:00+00:00")}
-        return markets, TestActiveTickerRelease._candles()
-
     def test_later_is_the_scan_restarted_after_each_monday(self, monkeypatch):
         # Every golden pair, at the default band and every grid band, with the
         # tier floors on and off
@@ -9100,27 +8281,24 @@ class TestFindEntryRecordsEveryQualifyingMonday:
                             c.start_date, max_horizon_days=c.max_horizon_days,
                             same_event_ladders=c.same_event_ladders, spread_band=band,
                             tier_floors=tier_floors)
-        # Not vacuous: at the default band EA/EB and SB/SA qualify on 4 Mondays,
-        # the ladder on 10 with the tiers on and 11 with them off (Monday 1
-        # too), and FA/FB (a pricier earlier contract) on none
-        assert counts[("EA", None, True)] == counts[("SA", None, True)] == 4
+        # The golden pairs are the five time-series ones: SA and SB, worded
+        # alike on two series, are no pair. Not vacuous: at the default band
+        # EA/EB qualifies on 4 Mondays, the ladder on 10 with the tiers on and
+        # 11 with them off (Monday 1 too), and FA/FB (a pricier earlier
+        # contract) on none
+        assert {ticker for ticker, _band, _tiers in counts} == {
+            "EA", "RUNG-EARLY", "FA", "TA", "WA"}
+        assert counts[("EA", None, True)] == 4
         assert (counts[("RUNG-EARLY", None, True)],
                 counts[("RUNG-EARLY", None, False)]) == (10, 11)
         assert counts[("FA", None, True)] == counts[("FA", None, False)] == 0
-        # ... and the same-title TX/TY pair, whose A changes from TX to TY on
-        # Monday 2, passed in either order
-        markets, candles = self._tx_ty()
-        for first, second in (("TX", "TY"), ("TY", "TX")):
-            assert self._assert_later_is_the_restarted_scan(
-                candles[first], candles[second], markets[first], markets[second],
-                "same_title", date(2026, 1, 1)) == 4
 
     def test_later_is_the_restarted_scan_on_random_pairs(self):
-        # The same check over 300 seeded random pairs whose qualifying Mondays
-        # are mixed with Mondays each filter refuses, at both tier settings and
-        # under band ceilings, on time-series and same-title pairs (see
+        # The same check over 300 seeded random time-series pairs whose
+        # qualifying Mondays are mixed with Mondays each filter refuses, at
+        # both tier settings and under band ceilings (see
         # _random_find_entry_cases)
-        entered = multi = stepped_past = flipped = 0
+        entered = multi = stepped_past = 0
         for candles_a, candles_b, mA, mB, pair_type, start, kw in _random_find_entry_cases(
                 20260927, 300):
             recorded = self._assert_later_is_the_restarted_scan(
@@ -9136,33 +8314,10 @@ class TestFindEntryRecordsEveryQualifyingMonday:
             # to step past
             stepped_past += any((b - a).days > 7
                                 for a, b in zip(dates[:-1], dates[1:], strict=True))
-            flipped += len({m["mA"]["ticker"] for m in mondays}) > 1
-        # Not vacuous. This seed gives 269, 234, 150 and 78; bounds rather
-        # than pins, since random's integer draws are not promised to repeat
+        # Not vacuous. This seed gives 254, 214 and 140; bounds rather than
+        # pins, since random's integer draws are not promised to repeat
         # across Python versions
-        assert entered >= 200 and multi >= 150 and stepped_past >= 100 and flipped >= 50
-
-    def test_each_later_monday_carries_its_own_same_title_legs(self):
-        markets, candles = self._tx_ty()
-        entry = _find_entry(candles["TX"], candles["TY"], markets["TX"], markets["TY"],
-                            "same_title", date(2026, 1, 1))
-        # Monday 1: TX (YES 0.40) is the pricier side, so it is A
-        assert (entry["entry_date"], entry["mA"]["ticker"], entry["mB"]["ticker"]) == (
-            date(2026, 1, 5), "TX", "TY")
-        assert (entry["pA"], entry["pB"], entry["nA"], entry["nB"]) == (0.40, 0.30, 0.60, 0.70)
-        assert entry["gap_days"] is None
-        # From Monday 2 TY (YES 0.60) is: every later Monday holds the legs the
-        # other way round, with its own quotes
-        assert [m["entry_date"] for m in entry["later"]] == [
-            date(2026, 1, 12), date(2026, 1, 19), date(2026, 1, 26)]
-        for monday in entry["later"]:
-            assert monday["mA"] is markets["TY"] and monday["mB"] is markets["TX"]
-            assert (monday["pA"], monday["pB"], monday["nA"], monday["nB"]) == (
-                0.60, 0.40, 0.40, 0.60)
-            assert monday["gap_days"] is None
-        # ... whichever way round the pair was passed in
-        assert _find_entry(candles["TY"], candles["TX"], markets["TY"], markets["TX"],
-                           "same_title", date(2026, 1, 1)) == entry
+        assert entered >= 200 and multi >= 150 and stepped_past >= 100
 
     # Mondays 1 and 3 of the refusal cases below, ((A yes, A no), (B yes, B
     # no)): a 0.40 spread on legs pA 0.20 + nB 0.40 = 0.60, well clear of the
@@ -9275,16 +8430,13 @@ class TestFindEntryRecordsEveryQualifyingMonday:
                 assert legs <= corpus
                 for monday in entry["later"]:
                     assert monday is not entry and "later" not in monday
-                    # The pair's own two records — for a time-series pair in
-                    # the first Monday's order (a same-title pair's A is
-                    # decided per Monday; see the TX/TY test)
+                    # The pair's own two records, in the first Monday's order
                     assert {id(monday["mA"]), id(monday["mB"])} == legs
-                    if rec["pair_type"] == "time_series":
-                        assert monday["mA"] is entry["mA"] and monday["mB"] is entry["mB"]
+                    assert monday["mA"] is entry["mA"] and monday["mB"] is entry["mB"]
                     seen += 1
-        # 3 later Mondays for each short pair and SB/SA, plus the ladder's 9
-        # with the tiers on and 10 with them off
-        assert seen == (3 * 4 + 9) + (3 * 4 + 10)
+        # 3 later Mondays for each of the three short pairs, plus the ladder's
+        # 9 with the tiers on and 10 with them off
+        assert seen == (3 * 3 + 9) + (3 * 3 + 10)
 
     def test_the_count_line_is_logged_at_zero_and_names_the_tier_setting(self, caplog):
         # Logged on every pass, zero included (DR-66); an entry built without
@@ -9396,34 +8548,6 @@ def _dr75_halves(entries: list[dict], split_date: date) -> tuple[list[dict], lis
                 m for m in r["entry"].get("later", ()) if m["entry_date"] < split_date)}}
              for r in entries if r["entry"]["entry_date"] < split_date]
     return first, [r for r in entries if r["entry"]["entry_date"] >= split_date]
-
-
-def _flipping_same_title_record() -> tuple[dict, dict, dict]:
-    """(record, X, Y): a same-title pair on two series (X and Y), through the
-    real _find_entry. On 2026-01-05 X is the pricier side (YES 0.53 against
-    0.47), so A = X: a 0.06 gap on legs summing to 0.94 — it qualifies, but
-    its Kelly fraction is about -0.99. From 2026-01-12 Y is (YES 0.70 against
-    0.40), so A = Y on every later Monday, at about +0.81. X settled YES and Y
-    NO. Every other per-leg field differs between the two markets too — title,
-    subtitle, close, settlement, and an event filed under another category
-    (KXBTC: Crypto, KXGOLD: Finance) — so each field of a trade says which
-    leg it was read from. No finder would pair two such markets (their wording
-    differs and they close a week apart); _find_entry, which built this
-    record, reads neither the wording nor DR-74's close gap, only the closes'
-    scan window (to 2026-02-01, the earlier close's eve)."""
-    x = {"ticker": "X", "event_ticker": "KXBTCX-1", "event_title": "EV",
-         "title": "Will X happen?", "subtitle": "X label", "result": "yes",
-         "close_time": "2026-02-02T00:00:00+00:00",
-         "settlement_ts": "2026-02-03T12:00:00+00:00"}
-    y = {"ticker": "Y", "event_ticker": "KXGOLDY-1", "event_title": "EV",
-         "title": "Will Y happen?", "subtitle": "Y label", "result": "no",
-         "close_time": "2026-02-09T00:00:00+00:00",
-         "settlement_ts": "2026-02-10T12:00:00+00:00"}
-    candles = {"X": [_candle(_MONDAY_TS, 0.53, 0.47), _candle(_MONDAY2_TS, 0.40, 0.60)],
-               "Y": [_candle(_MONDAY_TS, 0.47, 0.53), _candle(_MONDAY2_TS, 0.70, 0.30)]}
-    entry = _find_entry(candles["X"], candles["Y"], x, y, "same_title", date(2026, 1, 1))
-    return {"pair_type": "same_title", "canon": "Q", "group_key": ("EV", "Q", ""),
-            "entry": entry}, x, y
 
 
 @pytest.mark.usefixtures("pre_toggle_defaults")
@@ -9637,40 +8761,6 @@ class TestKellyPicksTheEarliestPassingMonday:
         assert t.holding_days == (close_1 - self._M2).days == 67
         assert t.monthly_profit_ratio == pytest.approx(t.profit_ratio * 30.0 / 67)
 
-    def test_a_same_title_pair_settles_on_the_chosen_mondays_legs(self):
-        rec, x, y = _flipping_same_title_record()
-        m1, m2, *rest = backtester._entry_mondays(rec["entry"])
-        # _find_entry re-decides A every Monday: X on the first, Y from the second
-        assert (m1["entry_date"], m2["entry_date"]) == (self._M1, self._M2)
-        assert m1["mA"] is x and m1["mB"] is y
-        assert all(m["mA"] is y and m["mB"] is x for m in (m2, *rest))
-        f1, f2, *_ = self._kelly(rec, backtester.TIME_SERIES_INTERVAL_PROB_DISCOUNT)
-        assert f1 == pytest.approx(-0.99, abs=0.01) and f2 == pytest.approx(0.81, abs=0.01)
-        (t,) = self._sim([rec]).trades
-        # Every figure is Monday 2's, on Monday 2's legs: A = Y, B = X
-        assert (t.entry_date, t.ticker_a, t.ticker_b) == (self._M2, "Y", "X")
-        assert (t.entry_pA, t.entry_pB, t.entry_nA, t.entry_nB) == (0.70, 0.40, 0.30, 0.60)
-        # ... and so is every per-leg field, each of which differs between X
-        # and Y, so none can have been read off Monday 1's legs (A = X, B = Y)
-        assert (t.title_a, t.title_b) == ("Will Y happen?", "Will X happen?")
-        assert (t.subtitle_a, t.subtitle_b) == ("Y label", "X label")
-        assert (t.close_date_a, t.close_date_b) == (date(2026, 2, 9), date(2026, 2, 2))
-        assert (t.settled_date_a, t.settled_date_b) == (date(2026, 2, 10), date(2026, 2, 3))
-        assert (t.event_ticker, t.category) == ("KXGOLDY-1", "Finance")
-        assert historical.infer_category(x["event_ticker"]) == "Crypto"
-        # Held from the chosen Monday to the later leg's settlement
-        assert t.exit_date == date(2026, 2, 10)
-        assert t.holding_days == (date(2026, 2, 10) - self._M2).days == 29
-        # ... and it settles on them: NO on Y (settled NO) and YES on X
-        # (settled YES) both pay — where the first Monday's orientation (A = X)
-        # would have paid nothing on the same settlement
-        assert (t.outcome_a, t.outcome_b) == ("no", "yes")
-        assert t.actual_payoff == _settlement_receipt(t.n, "no", "yes", "same_title") == 2 * t.n
-        assert _settlement_receipt(t.n, "yes", "no", "same_title") == 0
-        assert t.total_cost == t.n * (0.30 + 0.40)
-        # CONTROL: its first Monday alone never enters
-        assert self._sim([_without_later(rec)]).trades == []
-
 
 @pytest.mark.usefixtures("pre_toggle_defaults")
 class TestSplitHalvesKeepEachHalfOnItsSide:
@@ -9795,8 +8885,7 @@ class TestSplitHalvesKeepEachHalfOnItsSide:
             caps=(0.05, backtester.BUDGET_FRACTION, 1.0), primary_cap=backtester.BUDGET_FRACTION,
             bands=(band,),
             ks=(0.90,), primary_k=0.90, start_date=g._START, initial_balance=10_000.0,
-            split_date=g._M2, checks=True, entries_by_band={band: [rec]}, st_entries=[],
-            eager={})
+            split_date=g._M2, checks=True, entries_by_band={band: [rec]}, eager={})
         cell = cs.cell(band, 0.90)
         uncut = backtester._half_split(([rec], []), g._START, 10_000.0, 0.90, band,
                                        size_cap=1.0, quiet=True)
@@ -9816,8 +8905,10 @@ class TestSplitHalvesKeepEachHalfOnItsSide:
 class TestExTopEventReadsEveryMonday:
     """_ex_top_event drops every entry whose market-A event ticker is the top
     event on ANY of its qualifying Mondays: a trade records market A of the
-    Monday it entered on, and for a same-title pair which market is A can
-    change from Monday to Monday (DR-75)."""
+    Monday it entered on (DR-75). The entries are built by hand with market A
+    on different events on different Mondays, so a reader of one Monday alone
+    would keep one; a time-series pair found by _find_entry has the same
+    market A on every Monday."""
 
     def test_an_entry_is_dropped_when_any_of_its_mondays_names_the_event(self, monkeypatch):
         seen: list = []
@@ -9827,12 +8918,12 @@ class TestExTopEventReadsEveryMonday:
             return SimpleNamespace(equity_df=pd.DataFrame({"portfolio_value": [100.0]}))
 
         monkeypatch.setattr(backtester, "_simulate_at_discount", _fake)
-        # A same-title entry whose first Monday's A is on E1 and later
-        # Monday's on E2, beside one on E3
-        flip = {"pair_type": "same_title",
+        # An entry whose first Monday's A is on E1 and later Monday's on E2,
+        # beside one on E3
+        flip = {"pair_type": "time_series",
                 "entry": {"mA": {"event_ticker": "E1"},
                           "later": ({"mA": {"event_ticker": "E2"}},)}}
-        other = {"pair_type": "same_title", "entry": {"mA": {"event_ticker": "E3"}}}
+        other = {"pair_type": "time_series", "entry": {"mA": {"event_ticker": "E3"}}}
         for top, kept in (("E2", [other]), ("E1", [other]), ("E3", [flip])):
             point = backtester.SweepPoint(k=0.6, equity_df=pd.DataFrame(),
                                           trades=[TestSweepHelpers._trade(top, 5.0)])
@@ -9851,11 +8942,11 @@ class TestExTopEventReadsEveryMonday:
             return SimpleNamespace(equity_df=pd.DataFrame({"portfolio_value": [100.0]}))
 
         monkeypatch.setattr(backtester, "_simulate_at_discount", _fake)
-        back = {"pair_type": "same_title",
+        back = {"pair_type": "time_series",
                 "entry": {"mA": {"event_ticker": "E4"},
                           "later": ({"mA": {"event_ticker": "E5"}},
                                     {"mA": {"event_ticker": "E4"}})}}
-        other = {"pair_type": "same_title", "entry": {"mA": {"event_ticker": "E3"}}}
+        other = {"pair_type": "time_series", "entry": {"mA": {"event_ticker": "E3"}}}
         for top, kept in (("E5", [other]), ("E4", [other]), ("E3", [back])):
             point = backtester.SweepPoint(k=0.6, equity_df=pd.DataFrame(),
                                           trades=[TestSweepHelpers._trade(top, 5.0)])
@@ -9864,21 +8955,6 @@ class TestExTopEventReadsEveryMonday:
                                             (0.0, 1.0))[0] == top
             assert seen == [[id(r) for r in kept]], top
 
-    def test_the_traded_monday_s_event_takes_its_entry_out(self):
-        # End to end: the X/Y pair trades on Monday 2 with A = Y, so its trade
-        # carries Y's event, which its FIRST Monday (A = X) does not name —
-        # yet the re-simulation without that event must drop it
-        rec, x, y = _flipping_same_title_record()
-        start = date(2026, 1, 1)
-        point = backtester._simulate_at_discount([rec], start, 10_000.0)
-        (t,) = point.trades
-        assert t.event_ticker == y["event_ticker"]
-        assert rec["entry"]["mA"]["event_ticker"] == x["event_ticker"] != y["event_ticker"]
-        assert backtester._total_return(point, 10_000.0) > 0
-        # Without its only entry there is nothing left to trade
-        assert backtester._ex_top_event(point, [rec], start, 10_000.0, (0.0, 1.0)) == (
-            y["event_ticker"], 0.0)
-
 
 @pytest.mark.usefixtures("pre_toggle_defaults")
 class TestCapSweepEntryEventsReadEveryMonday:
@@ -9886,7 +8962,9 @@ class TestCapSweepEntryEventsReadEveryMonday:
     of every entry — a superset of the events any cell's trades carry, since
     a trade carries market A of the Monday it entered on (DR-75). The
     dashboard lists its categories and tags from it before any cell is
-    simulated."""
+    simulated. The entries are built by hand with market A on different
+    events on different Mondays; a time-series pair found by _find_entry has
+    the same market A on every Monday."""
 
     @staticmethod
     def _sweep(entries):
@@ -9895,11 +8973,10 @@ class TestCapSweepEntryEventsReadEveryMonday:
             caps=(backtester.BUDGET_FRACTION,), primary_cap=backtester.BUDGET_FRACTION,
             bands=(band,), ks=(0.75,),
             primary_k=0.75, start_date=date(2026, 1, 1), initial_balance=10_000.0,
-            split_date=None, checks=False, entries_by_band={band: entries}, st_entries=[],
-            eager={})
+            split_date=None, checks=False, entries_by_band={band: entries}, eager={})
 
     def test_both_events_of_a_flipping_entry_are_listed(self):
-        flip = {"pair_type": "same_title",
+        flip = {"pair_type": "time_series",
                 "entry": {"mA": {"event_ticker": "KXONE-1"},
                           "later": ({"mA": {"event_ticker": "KXTWO-1"}},)}}
         events = self._sweep([flip]).entry_events()
@@ -9909,24 +8986,13 @@ class TestCapSweepEntryEventsReadEveryMonday:
     def test_a_middle_monday_s_event_is_listed_too(self):
         # A = X, Y, X: KXFOUR-1 is named by the MIDDLE Monday only, so a
         # reader of the first and last Mondays alone would miss it
-        back = {"pair_type": "same_title",
+        back = {"pair_type": "time_series",
                 "entry": {"mA": {"event_ticker": "KXTHREE-1"},
                           "later": ({"mA": {"event_ticker": "KXFOUR-1"}},
                                     {"mA": {"event_ticker": "KXTHREE-1"}})}}
         events = self._sweep([back]).entry_events()
         assert events == {("KXTHREE-1", historical.infer_category("KXTHREE-1")),
                           ("KXFOUR-1", historical.infer_category("KXFOUR-1"))}
-
-    def test_every_traded_event_is_listed(self):
-        rec, x, y = _flipping_same_title_record()
-        events = self._sweep([rec]).entry_events()
-        (t,) = backtester._simulate_at_discount([rec], date(2026, 1, 1), 10_000.0).trades
-        assert (t.event_ticker, t.category) in events
-        # ... though the entry's FIRST Monday names the other series' event,
-        # filed under another category
-        assert events == {(m["event_ticker"], historical.infer_category(m["event_ticker"]))
-                          for m in (x, y)}
-        assert len({category for _event, category in events}) == 2
 
 
 @pytest.mark.usefixtures("pre_toggle_defaults")
@@ -10011,17 +9077,6 @@ def _ladder_record(mA: dict, mB: dict, question: str, mondays) -> dict:
             "entry": {**first, "later": tuple(rest)}}
 
 
-def _ladder_same_title(mA: dict, mB: dict, mondays) -> dict:
-    """A same-title record qualifying on each of `mondays`, market A the
-    pricier at YES 0.70 against B's 0.40 (legs nA 0.30 and pB 0.40, Kelly
-    about +0.81)."""
-    rows = [{"entry_date": day, "pA": 0.70, "pB": 0.40, "nA": 0.30, "nB": 0.60,
-             "mA": mA, "mB": mB, "gap_days": None} for day in mondays]
-    first, *rest = rows
-    return {"pair_type": "same_title", "canon": "Q", "group_key": ("EV", "Q", mA["ticker"]),
-            "entry": {**first, "later": tuple(rest)}}
-
-
 def _traded(point) -> list[tuple[str, date]]:
     """(market A's ticker, entry date) of every trade, in order."""
     return [(t.ticker_a, t.entry_date) for t in point.trades]
@@ -10033,10 +9088,9 @@ class TestOpenLadderExposure:
     ladder. A ladder is one question asked at several deadlines: two markets
     are on one ladder when they share an event or ask the same question once
     the dates are removed. A time-series pair is skipped on a Monday while an
-    open trade of either kind has a market on one of its ladders, and is
-    tried again on its next passing Monday; a same-title pair is not. A
-    market frees its ladders on the day it pays out. Figures are at
-    pre_toggle_defaults (k 0.75, a 20% cap)."""
+    open trade has a market on one of its ladders, and is tried again on its
+    next passing Monday. A market frees its ladders on the day it pays out.
+    Figures are at pre_toggle_defaults (k 0.75, a 20% cap)."""
 
     _START = date(2026, 1, 1)
 
@@ -10182,34 +9236,28 @@ class TestOpenLadderExposure:
                 assert _traded(self._sim(records)) == [("HIA", _LADDER_M1)]
             assert self._ladder_lines(caplog) == [_LADDER_LINE + "1"]
 
-    def test_a_time_series_pair_short_of_cash_is_tried_again_and_a_same_title_one_is_not(self):
+    def test_a_time_series_pair_short_of_cash_is_tried_again(self):
         # A trade is shrunk to the cash left, so a pair is short of cash only
         # when the cash left cannot buy ONE contract pair that still pays in a
         # win after the exact fees (every pair here does at one pair). The
         # balance is tiny for that reason. Each pair is on its own ladder, and X ranks
         # first on Monday 1 (it pays out soonest, on 01-11).
         #
-        # Worked by hand, at k 0.40 with no size cap (and no same-title cap
-        # under pre_toggle_defaults). X and Y buy YES at 0.20 and NO at 0.40:
-        # Kelly about 0.570, and one contract pair costs $0.60 plus $0.02 +
-        # $0.02 of fees = $0.64 (two cost $1.27). S buys NO at 0.30 and YES
-        # at 0.40: Kelly about 0.814, one pair $0.70 + $0.02 + $0.02 = $0.74.
-        # X trades one pair on Monday 1 once 0.570 x the balance reaches
-        # $0.64, i.e. from $1.13. Neither Y nor S can buy a pair from the
-        # cash X leaves (the balance less $0.64) while that is under $0.64,
-        # i.e. below $1.28. So every assertion below holds from $1.13 to just
-        # under $1.28; at $1.20: X leaves $0.56; Y alone budgets 0.570 x
-        # $1.20 = $0.68 and S alone 0.814 x $1.20 = $0.98, one pair each;
-        # X pays $1 on 01-11, so Monday 2 has $1.56 of cash and nothing open,
-        # and Y budgets $0.89 and S $1.27 — one pair each.
+        # Worked by hand, at k 0.40 with no size cap. X and Y buy YES at 0.20
+        # and NO at 0.40: Kelly about 0.570, and one contract pair costs $0.60
+        # plus $0.02 + $0.02 of fees = $0.64 (two cost $1.27). X trades one
+        # pair on Monday 1 once 0.570 x the balance reaches $0.64, i.e. from
+        # $1.13. Y cannot buy a pair from the cash X leaves (the balance less
+        # $0.64) while that is under $0.64, i.e. below $1.28. So every
+        # assertion below holds from $1.13 to just under $1.28; at $1.20: X
+        # leaves $0.56; Y alone budgets 0.570 x $1.20 = $0.68, one pair; X
+        # pays $1 on 01-11, so Monday 2 has $1.56 of cash and nothing open,
+        # and Y budgets $0.89 — one pair.
         x = _ladder_record(_ladder_market("XA", "EVX-1", "2026-01-11"),
                            _ladder_market("XB", "EVX-2", "2026-01-11"), "x", [_LADDER_M1])
         y = _ladder_record(_ladder_market("YA", "EVY-1", "2026-03-20"),
                            _ladder_market("YB", "EVY-2", "2026-03-20"), "y",
                            [_LADDER_M1, _LADDER_M2])
-        s = _ladder_same_title(_ladder_market("SA", "EVS-1", "2026-03-20"),
-                               _ladder_market("SB", "EVS-2", "2026-03-20", result="yes"),
-                               [_LADDER_M1, _LADDER_M2])
         run = {"balance": 1.20, "k": 0.40, "size_cap": 1.0}
         assert [t.n for t in self._sim([x], **run).trades] == [1]
         # Y is skipped for cash on Monday 1 and taken on Monday 2
@@ -10224,75 +9272,6 @@ class TestOpenLadderExposure:
         assert y_trade.n < x_trade.n
         assert (y_trade.total_cost + y_trade.fees
                 <= 10_000.0 - (x_trade.total_cost + x_trade.fees) + 1e-9)
-        # S is skipped on Monday 1 and never tried again ...
-        assert _traded(self._sim([x, s], **run)) == [("XA", _LADDER_M1)]
-        assert _traded(self._sim([s], **run)) == [("SA", _LADDER_M1)]
-        # ... though, listed from Monday 2, it fits there
-        s_from_2 = _ladder_same_title(s["entry"]["mA"], s["entry"]["mB"], [_LADDER_M2])
-        assert _traded(self._sim([x, s_from_2], **run)) == [("XA", _LADDER_M1),
-                                                             ("SA", _LADDER_M2)]
-
-    def test_an_open_same_title_trade_blocks_a_time_series_pair_and_not_the_reverse(
-        self, caplog,
-    ):
-        s = _ladder_same_title(_ladder_market("SA", "EVS-1", "2026-02-20"),
-                               _ladder_market("SB", "EVT-1", "2026-02-20", result="yes"),
-                               [_LADDER_M1])
-        t = _ladder_record(_ladder_market("TA", "EVS-1", "2026-03-20"),
-                           _ladder_market("TB", "EVU-1", "2026-03-20"), "t",
-                           [_LADDER_M2, _LADDER_M3])
-        with caplog.at_level(logging.INFO):
-            assert _traded(self._sim([s, t])) == [("SA", _LADDER_M1)]
-        assert self._ladder_lines(caplog) == [_LADDER_LINE + "2"]
-        assert _traded(self._sim([t])) == [("TA", _LADDER_M2)]
-        # The reverse: an open time-series trade never holds a same-title pair back
-        t2 = _ladder_record(_ladder_market("T2A", "EVV-1", "2026-03-20"),
-                            _ladder_market("T2B", "EVW-1", "2026-03-20"), "t2", [_LADDER_M1])
-        s2 = _ladder_same_title(_ladder_market("S2A", "EVV-1", "2026-02-20"),
-                                _ladder_market("S2B", "EVX-1", "2026-02-20", result="yes"),
-                                [_LADDER_M2])
-        caplog.clear()
-        with caplog.at_level(logging.INFO):
-            assert _traded(self._sim([t2, s2])) == [("T2A", _LADDER_M1), ("S2A", _LADDER_M2)]
-        assert self._ladder_lines(caplog) == []
-
-    def test_both_same_title_markets_hold_their_event_and_their_question(self, caplog):
-        # An open same-title trade holds market B's event as well as A's: TB
-        # shares only SB's event and is refused on Mondays 2 and 3
-        s = _ladder_same_title(_ladder_market("SA", "EVS-1", "2026-02-20"),
-                               _ladder_market("SB", "EVT-1", "2026-02-20", result="yes"),
-                               [_LADDER_M1])
-        tb = _ladder_record(_ladder_market("TA", "EVT-1", "2026-03-20"),
-                            _ladder_market("TB", "EVU-1", "2026-03-20"), "tb",
-                            [_LADDER_M2, _LADDER_M3])
-        with caplog.at_level(logging.INFO):
-            assert _traded(self._sim([s, tb])) == [("SA", _LADDER_M1)]
-        assert self._ladder_lines(caplog) == [_LADDER_LINE + "2"]
-
-        # ... and each market's question. QA and QB ask one dated question in
-        # two events; TQ asks it at two later deadlines in two more. QB pays
-        # out on 01-15, so TQ is refused on Monday 2 (01-12) though QA paid
-        # out on 01-10, and trades on Monday 3
-        def snow(ticker, event, deadline, paid_out, result="no"):
-            market = _ladder_market(ticker, event, paid_out, result=result)
-            market["title"] = f"Will it snow by {deadline}, 2026?"
-            return market
-
-        sq = _ladder_same_title(snow("QA", "EVQ-1", "January 20", "2026-01-10"),
-                                snow("QB", "EVQ-2", "January 20", "2026-01-15", result="yes"),
-                                [_LADDER_M1])
-        tq_a = snow("TQA", "EVR-1", "February 20", "2026-03-20")
-        tq_b = snow("TQB", "EVR-2", "March 5", "2026-03-20")
-        question = backtester._ts_group_key(tq_a)
-        assert question and all(backtester._ts_group_key(m) == question
-                                for m in (sq["entry"]["mA"], sq["entry"]["mB"], tq_b))
-        tq = _ladder_record(tq_a, tq_b, question, [_LADDER_M2, _LADDER_M3])
-        caplog.clear()
-        with caplog.at_level(logging.INFO):
-            assert _traded(self._sim([sq, tq])) == [("QA", _LADDER_M1), ("TQA", _LADDER_M3)]
-        assert self._ladder_lines(caplog) == [_LADDER_LINE + "1"]
-        # CONTROL: alone, TQ trades on Monday 2
-        assert _traded(self._sim([tq])) == [("TQA", _LADDER_M2)]
 
     def test_a_retried_pair_is_ranked_and_held_from_the_monday_it_trades(self, caplog):
         # B holds question "q" on Monday 1 and pays out on 01-10. P passes on
@@ -10685,12 +9664,6 @@ class TestSizesOnPortfolioValue:
 
 # ─── Adding to held pairs, in the backtest ──────────────────────────────────
 
-def _worded_market(ticker: str, event: str, title: str, paid_out: str, *,
-                   result: str = "no") -> dict:
-    """A _ladder_market with its own title, so markets can ask one question."""
-    return {**_ladder_market(ticker, event, paid_out, result=result), "title": title}
-
-
 def _pair_cost(n: int, price_a: float, price_b: float) -> float:
     """What n contract pairs spend at these leg prices: the contracts plus both
     legs' exact fees, added in the order Pass 2's fee loop adds them, so a
@@ -10733,8 +9706,10 @@ def _live_add_on(first, value: float, cash: float, *, k: float, size_cap: float,
 
 
 def _same_title_record(rows, group_key=("", "Will it rain by March 1, 2026?", "")) -> dict:
-    """A same-title record from (date, market A, market B, pA, pB) rows, one per
-    qualifying Monday. Market A is that Monday's pricier side by YES ask."""
+    """A record labelled same-title, from (date, market A, market B, pA, pB)
+    rows, one per qualifying Monday, built by hand: the backtest simulates
+    time-series pairs only, so _simulate_at_discount refuses it
+    (TestTheSimulationRefusesAnyOtherPairType)."""
     built = [{"entry_date": day, "pA": pA, "pB": pB, "nA": round(1.0 - pA, 4),
               "nB": round(1.0 - pB, 4), "mA": mA, "mB": mB, "gap_days": None}
              for day, mA, mB, pA, pB in rows]
@@ -10743,7 +9718,6 @@ def _same_title_record(rows, group_key=("", "Will it rain by March 1, 2026?", ""
             "entry": {**first, "later": tuple(rest)}}
 
 
-_RAIN = "Will it rain by March 1, 2026?"
 _ADD_ON_LINE = "Trades that added to a held pair ("
 # The add-on gate's two hold-back lines: the wait after a trade, and the minimum price move
 _ADD_ON_WAIT_LINE = "Adds skipped because the held pair traded fewer than"
@@ -10751,6 +9725,121 @@ _ADD_ON_MOVE_LINE = "Adds skipped because the held pair's price had not moved"
 _ADD_ON_CAP_LINE = "Adds skipped because the held pair is already at its target size ("
 _ADD_ON_LADDER_LINE = ("Adds skipped because another open trade is on the same ladder, or the "
                        "two markets share no ladder (")
+
+
+@pytest.mark.usefixtures("pre_toggle_defaults")
+class TestTheSimulationRefusesAnyOtherPairType:
+    """_simulate_at_discount simulates time-series pairs only. A record of any
+    other pair type (labelled same-title, or anything else) is refused before
+    it is scored: never priced, sized, recorded or counted, and named on one
+    WARNING after the scoring loop (DEBUG when quiet). Records from
+    _entries_for_band are all time-series, so only a hand-built record can be
+    refused."""
+
+    _START = date(2026, 1, 1)
+    _LINE = ("Refused {n} entry record(s) that are not time-series pairs; nothing was "
+             "priced, sized or recorded for them (the backtest simulates time-series "
+             "pairs only): ")
+
+    @staticmethod
+    def _same_title(tag: str = "") -> dict:
+        """SB and SA of the golden corpus labelled same-title: one question on
+        two series, SB the pricier side (YES 0.60 against 0.35) on every
+        Monday from 2026-01-05 until both close."""
+        markets = {m["ticker"]: m for m in TestPrepareEntriesGolden._markets()}
+        sa = {**markets["SA"], "ticker": f"SA{tag}"}
+        sb = {**markets["SB"], "ticker": f"SB{tag}"}
+        return _same_title_record(
+            [(day, sb, sa, 0.60, 0.35)
+             for day in (date(2026, 1, 5), *TestPrepareEntriesGolden._LATER_WEEKS)],
+            group_key=("EVS", "Q", ""))
+
+    def _sim(self, records, **kw):
+        return backtester._simulate_at_discount(records, self._START, 10_000.0,
+                                                 end_date=date(2026, 4, 1), **kw)
+
+    def test_a_refused_record_is_never_priced_sized_or_recorded(self, monkeypatch, caplog):
+        def scored(*_a, **_k):
+            pytest.fail("a refused record was scored")
+
+        for name in ("_leg_prices_for", "fee_per_pair_approx", "time_series_profit_prob",
+                     "_size_trade", "_settlement_receipt"):
+            monkeypatch.setattr(backtester, name, scored)
+        with caplog.at_level(logging.INFO):
+            point = self._sim([self._same_title()], add_to_held=True, trim_to_kelly=True)
+        assert point.trades == [] and point.peak_kelly_fraction == 0.0
+        assert point.cap_free_from == 0.0
+        assert (point.equity_df["portfolio_value"] == 10_000.0).all()
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings == [self._LINE.format(n=1) + "SB / SA ('same_title')"]
+
+    def test_the_warning_is_debug_when_quiet_and_names_at_most_the_example_cap(self, caplog):
+        many = [self._same_title(str(i)) for i in range(config.INTEGRITY_MAX_EXAMPLES + 1)]
+        many.append({**self._same_title("X"), "pair_type": "bogus"})
+        with caplog.at_level(logging.DEBUG):
+            assert self._sim(many, quiet=True).trades == []
+        (record,) = [r for r in caplog.records if r.getMessage().startswith("Refused ")]
+        assert record.levelno == logging.DEBUG
+        examples = "; ".join(f"SB{i} / SA{i} ('same_title')"
+                             for i in range(config.INTEGRITY_MAX_EXAMPLES))
+        assert record.getMessage() == (
+            self._LINE.format(n=config.INTEGRITY_MAX_EXAMPLES + 2) + examples + "; ...")
+
+    @pytest.mark.parametrize("options", [{}, {"add_to_held": True, "trim_to_kelly": True},
+                                         {"size_cap": 1.0}],
+                             ids=["default", "rebalancing", "no cap"])
+    def test_a_mixed_list_simulates_exactly_as_the_time_series_records_alone(
+        self, monkeypatch, caplog, options,
+    ):
+        entries, _ = TestPrepareEntriesGolden()._prepare(monkeypatch, True)
+        assert entries and all(rec["pair_type"] == "time_series" for rec in entries)
+        mixed = [self._same_title("0"), *entries[:2], self._same_title("1"), *entries[2:],
+                 {**self._same_title("2"), "pair_type": "bogus"}]
+        alone = self._sim(entries, **options)
+        with caplog.at_level(logging.INFO):
+            point = self._sim(mixed, **options)
+        assert alone.trades and [astuple(t) for t in point.trades] == [
+            astuple(t) for t in alone.trades]
+        pd.testing.assert_frame_equal(point.equity_df, alone.equity_df)
+        assert (point.peak_kelly_fraction, point.cap_free_from) == (
+            alone.peak_kelly_fraction, alone.cap_free_from)
+        assert all(t.pair_type == "time_series" for t in point.trades)
+        (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Refused ")]
+        assert line == self._LINE.format(n=3) + (
+            "SB0 / SA0 ('same_title'); SB1 / SA1 ('same_title'); SB2 / SA2 ('bogus')")
+
+    def test_a_mixed_list_splits_into_the_same_halves_as_its_time_series_records(
+        self, monkeypatch,
+    ):
+        """_half_split on a list that mixes in records of other types gives
+        exactly the HalfSplit its time-series records give alone: the same
+        returns and trade counts, and entry counts of the time-series records
+        only, since each half's simulation refuses the others unscored."""
+        entries, _ = TestPrepareEntriesGolden()._prepare(monkeypatch, True)
+        split = date(2026, 1, 12)
+
+        def on_the_split(rec):
+            # The same record, first qualifying on the split, so it falls in H2
+            return {**rec, "entry": {**rec["entry"], "entry_date": split, "later": ()}}
+
+        mixed = [self._same_title("0"), *entries[:2], on_the_split(self._same_title("1")),
+                 *entries[2:], {**self._same_title("2"), "pair_type": "bogus"}]
+        halves, halves_alone = (backtester._split_halves(recs, split)
+                                for recs in (mixed, entries))
+        # Not vacuous: each half holds time-series records and refused ones
+        for half, half_alone in zip(halves, halves_alone, strict=True):
+            assert half_alone and len(half) > len(half_alone)
+        got, alone = (backtester._half_split(h, self._START, 10_000.0, 0.75, (0.0, 1.0),
+                                             end_date=date(2026, 4, 1))
+                      for h in (halves, halves_alone))
+        assert got == alone
+        assert (got.h1_entries, got.h2_entries) == tuple(len(h) for h in halves_alone)
+        assert alone.h1_trades + alone.h2_trades > 0
+
+    def test_the_same_title_population_is_refused_like_any_unknown_label(self):
+        assert "same_title" not in backtester._SCENARIO_POPULATIONS
+        with pytest.raises(ValueError, match="population must be one of"):
+            self._sim([], population="same_title")
 
 
 @pytest.mark.usefixtures("pre_toggle_defaults")
@@ -10764,7 +9853,7 @@ class TestAddToHeldPairs:
     pair would stake, and never more than the cash left. The pair's stake is
     what its open trades cost: their contracts plus the fees paid for them,
     which the portfolio value leaves out. Figures are at pre_toggle_defaults
-    (k 0.75, a 20% cap, no extra same-title cap)."""
+    (k 0.75, a 20% cap)."""
 
     _START = date(2026, 1, 1)
     # At k 0.85 these time-series quotes (pA, pB, nB) pass the Kelly gate at
@@ -10912,6 +10001,27 @@ class TestAddToHeldPairs:
         assert self._lines(caplog, _ADD_ON_CAP_LINE) == [
             _ADD_ON_CAP_LINE + "k=0.850, band 0-1, all, adding to held pairs): 1"]
 
+    def test_a_pair_at_its_capped_share_is_counted_as_already_at_its_target_size(self, caplog):
+        """The add-on check reads a pair's Kelly share after the size cap,
+        min(cap, Kelly fraction), as the live sizer does. Here the Kelly
+        fraction is about 10% on both Mondays at k 0.85 but the cap is 5%:
+        Monday 1 buys the pair at its 5% share, so on Monday 2 it already
+        holds its target size, and it is skipped and counted on the
+        target-size line. A check that read the share without the cap would
+        see room and leave the pair to the sizer, which caps it at 5% and
+        adds nothing either, so only this count tells the two apart."""
+        p = _ladder_record(_ladder_market("PA", "EVA-1", "2026-03-20"),
+                           _ladder_market("PB", "EVB-1", "2026-03-20"), "q",
+                           [(_LADDER_M1, *self._WIDE), (_LADDER_M2, *self._WIDE)])
+        assert _uncapped_kelly(p, 0.85) > 0.05
+        with caplog.at_level(logging.INFO):
+            on = self._sim([p], k=0.85, size_cap=0.05, add_to_held=True)
+        assert _traded(on) == [("PA", _LADDER_M1)]
+        assert on.trades[0].kelly_fraction == pytest.approx(0.05, abs=1e-12)
+        assert self._lines(caplog, _ADD_ON_CAP_LINE) == [
+            _ADD_ON_CAP_LINE + "k=0.850, band 0-1, all, cap 5%, adding to held pairs): 1"]
+        assert self._lines(caplog, _ADD_ON_LINE) == []
+
     def test_a_held_pair_at_unchanged_quotes_adds_nothing(self, caplog):
         """A held pair's stake counts the fees paid for it, while the
         portfolio value leaves them out (they are spent), so a pair that
@@ -10976,81 +10086,71 @@ class TestAddToHeldPairs:
         assert spec.kelly_fraction == pytest.approx(add.kelly_fraction, abs=1e-12)
         assert spec.total_cost_with_fees == pytest.approx(add.total_cost + add.fees, abs=1e-9)
 
+    # Seven other time-series pairs (pA, pB, nB), each on its own ladder and
+    # sized at about 13.2% of the account at k 0.85 (see _cash_bound_fixture)
+    _R_QUOTE, _R_COUNT = (0.10, 0.85, 0.15), 7
+
     def _cash_bound_fixture(self):
-        """The widening pair P and a same-title pair R that asks another
-        question, both opening on Monday 1; R pays out on 2026-02-20, after
-        Monday 2. Run with no per-trade cap, R's Kelly fraction (about 0.93)
-        leaves P too little cash on Monday 2 to buy what it is missing of its
-        Kelly share: on the pair alone the cash can never bind, since
+        """The widening pair P and seven pairs R0 to R6, each asking its own
+        question in two events of its own, all opening on Monday 1; the R
+        pairs pay out on 2026-02-20, after Monday 2. Run with no per-trade
+        cap, each R stakes its Kelly fraction of the account at k 0.85
+        (about 0.132: a time-series fraction is below 1 - k = 0.15), and
+        together they leave P, whose first trade is about 4% of the account,
+        too little cash on Monday 2 to buy what it is missing of its Kelly
+        share. On the pair alone the cash can never bind, since
         f x value - stake is at most the cash when f is at most 1."""
-        title = "Will it hail by March 1, 2026?"
-        ra = _worded_market("RA", "EVR-1", title, "2026-02-20")
-        rb = _worded_market("RB", "EVS-1", title, "2026-02-20", result="yes")
-        r = _same_title_record([(_LADDER_M1, ra, rb, 0.85, 0.15)], group_key=("", title, ""))
-        return [self._widening_pair(), r]
+        pairs = [_ladder_record(_ladder_market(f"R{i}A", f"EVR{i}-1", "2026-02-20"),
+                                _ladder_market(f"R{i}B", f"EVR{i}-2", "2026-02-20"),
+                                f"r{i}", [(_LADDER_M1, *self._R_QUOTE)])
+                 for i in range(self._R_COUNT)]
+        return [self._widening_pair(), *pairs]
 
     def test_the_cash_left_limits_an_add_on_as_it_limits_live(self):
         entries = self._cash_bound_fixture()
-        p, r = entries
-        fr = _uncapped_kelly({"pair_type": "same_title", "entry": r["entry"]}, 0.85)
+        p, *rs = entries
+        fr = _uncapped_kelly(rs[0], 0.85)
         f2 = _uncapped_kelly({"pair_type": "time_series", "entry": p["entry"]["later"][0]}, 0.85)
-        assert 0.90 < fr < 0.95 and 0 < f2 < 0.20
+        # Seven R pairs at 0.132 of the account each take about 92.7% of it
+        assert 0.13 < fr < 0.135 and 0 < f2 < 0.20
         on = self._sim(entries, k=0.85, size_cap=1.0, add_to_held=True)
-        # R ranks first on Monday 1 (its monthly return is the larger)
-        assert _traded(on) == [("RA", _LADDER_M1), ("PA", _LADDER_M1), ("PA", _LADDER_M2)]
-        r_trade, first, add = on.trades
-        assert (r_trade.add_on, first.add_on, add.add_on) == (False, False, True)
-        # Monday 2: R and P's first trade are both open at contract cost
-        cash = 10_000.0 - (r_trade.total_cost + r_trade.fees) - (first.total_cost + first.fees)
+        # The R pairs rank first on Monday 1 (their monthly return is the
+        # larger). P's first trade buys its Kelly share (520 pairs, $404.84)
+        # out of the $733.75 they leave, and P adds on Monday 2
+        assert sorted(_traded(on)[:7]) == [(f"R{i}A", _LADDER_M1) for i in range(7)]
+        assert _traded(on)[7:] == [("PA", _LADDER_M1), ("PA", _LADDER_M2)]
+        *r_trades, first, add = on.trades
+        assert [t.add_on for t in on.trades] == [False] * 8 + [True]
+        # Monday 2: the R pairs and P's first trade are all open at contract cost
+        earlier = [*r_trades, first]
+        cash = 10_000.0 - sum(t.total_cost + t.fees for t in earlier)
         value = add.balance_at_entry
-        assert value == pytest.approx(cash + r_trade.total_cost + first.total_cost, abs=1e-9)
+        assert value == pytest.approx(cash + sum(t.total_cost for t in earlier), abs=1e-9)
         stake = first.total_cost + first.fees
         assert add.kelly_fraction == pytest.approx(
             held_pair_fraction(f2, stake, value), abs=1e-12)
         # The cash binds: the pair is missing more of its Kelly share than
-        # the cash left can buy (by hand, $575.37 of it against $328.24 of
-        # cash, the stake counting the first trade's $14.84 of fees)
+        # the cash left can buy (the stake counting the first trade's fees).
+        # By hand: each R buys 4,991 pairs for $1,247.75 plus $76.00 of fees,
+        # $1,323.75 against 13.24% of $10,000 (every Monday-1 trade is sized
+        # on the opening $10,000); seven of them and P's first trade (520
+        # pairs, $404.84 with fees) leave $328.91 of cash on Monday 2. P's
+        # share then is f2 = 10.36% of the $9,453.16 value, less its $404.84
+        # stake: $574.17 missing against $328.91 of cash, which buys 625 pairs
+        # ($312.50 plus $16.19 of fees; 626 would cost $329.23)
         assert cash < f2 * value - stake - 100.0
         assert kelly_budget(value, add.kelly_fraction, cash) == cash
         # The largest count whose contracts and exact fees fit the cash left
         legs = (add.entry_pA, add.entry_nB)
+        assert add.n > 0
         assert _pair_cost(add.n, *legs) <= cash + 1e-9 < _pair_cost(add.n + 1, *legs)
         # ... and what live compute_trade sizes on that value, cash and stake
         spec = _live_add_on(first, value, cash, k=0.85, size_cap=1.0, quotes=(0.20, 0.70, 0.30))
         assert spec.x == add.n
         assert spec.total_cost_with_fees == pytest.approx(add.total_cost + add.fees, abs=1e-9)
-        # CONTROL: without R the same add-on is not limited by the cash
+        # CONTROL: without the R pairs the same add-on is not limited by the cash
         alone = self._sim([self._widening_pair()], k=0.85, size_cap=1.0, add_to_held=True)
         assert alone.trades[1].add_on and alone.trades[1].n > add.n
-
-    def test_another_open_trade_on_its_ladder_refuses_the_add_on(self, caplog):
-        # P asks "will it snow by ...?" at two deadlines, narrow on Monday 1
-        # and wide on Monday 3. S, a same-title pair asking the same question
-        # in two more events, opens on Monday 2 (an open time-series trade
-        # never holds a same-title pair back) and is still open on Monday 3.
-        tqa = _worded_market("TQA", "EVR-1", "Will it snow by February 20, 2026?", "2026-03-20")
-        tqb = _worded_market("TQB", "EVR-2", "Will it snow by March 5, 2026?", "2026-03-20")
-        question = backtester._ts_group_key(tqa)
-        p = _ladder_record(tqa, tqb, question,
-                           [(_LADDER_M1, *self._NARROW), (_LADDER_M3, *self._WIDE)])
-        title = "Will it snow by January 30, 2026?"
-        s = _same_title_record(
-            [(_LADDER_M2, _worded_market("QA", "EVQ-1", title, "2026-02-10"),
-              _worded_market("QB", "EVQ-2", title, "2026-02-10", result="yes"), 0.70, 0.40)],
-            group_key=("", title, ""))
-        assert question and all(backtester._ts_group_key(m) == question
-                                for m in (tqb, s["entry"]["mA"], s["entry"]["mB"]))
-        # CONTROL: alone, P adds on Monday 3
-        assert _traded(self._sim([p], k=0.85, add_to_held=True)) == [
-            ("TQA", _LADDER_M1), ("TQA", _LADDER_M3)]
-        with caplog.at_level(logging.INFO):
-            on = self._sim([p, s], k=0.85, add_to_held=True)
-        assert _traded(on) == [("TQA", _LADDER_M1), ("QA", _LADDER_M2)]
-        # Counted on the add-on line, not the line for pairs held back from
-        # opening
-        assert self._lines(caplog, _ADD_ON_LADDER_LINE) == [
-            _ADD_ON_LADDER_LINE + "k=0.850, band 0-1, all, adding to held pairs): 1"]
-        assert self._lines(caplog, "Time-series pairs skipped on a Monday") == []
 
     def test_an_add_on_needs_both_markets_unpaid(self):
         # PA pays out on 01-10, before Monday 2; PB stays open. The same pair
@@ -11079,70 +10179,6 @@ class TestAddToHeldPairs:
             "Time-series pairs skipped on a Monday because we still held a trade on the "
             "same ladder (k=0.850, band 0-1, all, adding to held pairs): 1"]
         assert self._lines(caplog, _ADD_ON_LADDER_LINE) == []
-
-    def test_an_add_on_whose_markets_share_no_ladder_is_refused(self, caplog):
-        # SA and SB sit in two events and are worded differently, so they
-        # share no ladder label: live would never find them as a held pair
-        sa = _ladder_market("SA", "EVS-1", "2026-03-01")
-        sb = _ladder_market("SB", "EVT-1", "2026-03-01", result="yes")
-        assert not (backtester._ladder_keys_dict(sa) & backtester._ladder_keys_dict(sb))
-        rows = [(_LADDER_M1, sa, sb, 0.70, 0.40), (_LADDER_M3, sa, sb, 0.80, 0.30)]
-        with caplog.at_level(logging.INFO):
-            on = self._sim([_same_title_record(rows, group_key=("", "Q", ""))],
-                           size_cap=1.0, add_to_held=True)
-        assert _traded(on) == [("SA", _LADDER_M1)]
-        assert self._lines(caplog, _ADD_ON_LADDER_LINE) == [
-            _ADD_ON_LADDER_LINE + "k=0.750, band 0-1, all, no cap, adding to held pairs): 1"]
-        # CONTROL: worded alike, the same quotes add on Monday 3
-        xa = _worded_market("XA", "EVX-1", _RAIN, "2026-03-01")
-        xb = _worded_market("XB", "EVY-1", _RAIN, "2026-03-01", result="yes")
-        rows = [(_LADDER_M1, xa, xb, 0.70, 0.40), (_LADDER_M3, xa, xb, 0.80, 0.30)]
-        assert _traded(self._sim([_same_title_record(rows)], size_cap=1.0,
-                                 add_to_held=True)) == [("XA", _LADDER_M1),
-                                                        ("XA", _LADDER_M3)]
-
-    def test_a_same_title_pair_adds_on_only_with_the_same_legs(self):
-        # XA and XB ask one question on two series. On Monday 2 XB is the
-        # pricier side, so that Monday is the opposite trade and is never an
-        # add-on, though its Kelly fraction is the largest; Monday 3 has
-        # Monday 1's legs and a wider divergence, so it adds on. No per-trade
-        # cap, so the fractions are Kelly's own.
-        xa = _worded_market("XA", "EVX-1", _RAIN, "2026-03-01")
-        xb = _worded_market("XB", "EVY-1", _RAIN, "2026-03-01", result="yes")
-        rec = _same_title_record([(_LADDER_M1, xa, xb, 0.70, 0.40),
-                                  (_LADDER_M2, xb, xa, 0.90, 0.10),
-                                  (_LADDER_M3, xa, xb, 0.80, 0.30)])
-        f1, f2, f3 = (_uncapped_kelly({"pair_type": "same_title", "entry": m}, 0.75)
-                      for m in backtester._entry_mondays(rec["entry"]))
-        assert 0 < f1 < f3 < f2
-        off = self._sim([rec], size_cap=1.0)
-        on = self._sim([rec], size_cap=1.0, add_to_held=True)
-        assert _traded(off) == [("XA", _LADDER_M1)]
-        assert _traded(on) == [("XA", _LADDER_M1), ("XA", _LADDER_M3)]
-        assert [(t.ticker_b, t.add_on) for t in on.trades] == [("XB", False), ("XB", True)]
-        assert astuple(on.trades[0]) == astuple(off.trades[0])
-        # The peak covers the Mondays a trade may be made on — Monday 3 when
-        # adding, never the opposite trade of Monday 2
-        assert off.peak_kelly_fraction == pytest.approx(f1, abs=1e-12)
-        assert on.peak_kelly_fraction == pytest.approx(f3, abs=1e-12)
-
-    def test_a_same_title_group_loser_never_trades(self):
-        # W and L are one title group; W closes sooner, so its monthly ratio
-        # is larger and it wins the group. L's later Monday could only add to
-        # a trade L never made.
-        def pair(a, b, a_event, b_event, paid_out):
-            ma = _worded_market(a, a_event, _RAIN, paid_out)
-            mb = _worded_market(b, b_event, _RAIN, paid_out, result="yes")
-            return _same_title_record([(_LADDER_M1, ma, mb, 0.70, 0.40),
-                                       (_LADDER_M3, ma, mb, 0.80, 0.30)])
-
-        w = pair("WA", "WB", "EVW-1", "EVW-2", "2026-02-20")
-        loser = pair("LA", "LB", "EVL-1", "EVL-2", "2026-03-20")
-        assert _traded(self._sim([loser, w], size_cap=1.0, add_to_held=True)) == [
-            ("WA", _LADDER_M1), ("WA", _LADDER_M3)]
-        # CONTROL: alone, L trades and adds on
-        assert _traded(self._sim([loser], size_cap=1.0, add_to_held=True)) == [
-            ("LA", _LADDER_M1), ("LA", _LADDER_M3)]
 
     def test_the_completion_line_names_an_add_on_run(self, caplog):
         p = self._widening_pair()
@@ -11237,6 +10273,34 @@ class TestAddToALoneLeg:
         assert self._lines(caplog, _ADD_ON_LADDER_LINE) == [
             _ADD_ON_LADDER_LINE + "k=0.850, band 0-1, all, adding to held pairs): 1"]
 
+    def test_a_pair_bought_onto_a_lone_leg_is_not_added_to_while_the_leg_s_trade_is_open(
+        self, caplog,
+    ):
+        """Adding more to a held pair is refused while another open trade is
+        on a ladder of either of its markets, as in live trading. P (YES PA /
+        NO PB) is bought on Monday 1 and PA pays out on 01-10, leaving PB a
+        lone leg. On Monday 2, Q (YES QA / NO PB) adds to that leg. On Monday
+        3 Q's quotes widen and Q would add to its own open trade, but P's
+        trade still holds PB: the add-on is refused and counted on the ladder
+        line. This is the part of the held-pair refusal that a real record
+        can reach."""
+        pb = _ladder_market("PB", "EVB-1", "2026-03-20")
+        p = _ladder_record(_ladder_market("PA", "EVA-1", "2026-01-10"), pb, "q",
+                           [(_LADDER_M1, *self._NARROW)])
+        q = _ladder_record(_ladder_market("QA", "EVQ-1", "2026-03-20"), pb, "q",
+                           [(_LADDER_M2, *self._NARROW), (_LADDER_M3, *self._WIDE)])
+        with caplog.at_level(logging.INFO):
+            on = self._sim([p, q], k=0.85, add_to_held=True)
+        assert _traded(on) == [("PA", _LADDER_M1), ("QA", _LADDER_M2)]
+        assert [t.add_on for t in on.trades] == [False, True]
+        assert self._lines(caplog, _ADD_ON_LADDER_LINE) == [
+            _ADD_ON_LADDER_LINE + "k=0.850, band 0-1, all, adding to held pairs): 1"]
+        # CONTROL: Q alone, with no lone leg to add to, is bought on Monday 2
+        # and adds to itself on Monday 3
+        alone = self._sim([q], k=0.85, add_to_held=True)
+        assert _traded(alone) == [("QA", _LADDER_M2), ("QA", _LADDER_M3)]
+        assert [t.add_on for t in alone.trades] == [False, True]
+
 
 @pytest.mark.usefixtures("pre_toggle_defaults")
 class TestAddToHeldCapParity:
@@ -11246,8 +10310,8 @@ class TestAddToHeldCapParity:
     it. That sharing is exact only because the cap reaches an add-on's size
     through min(pair cap, f*) alone, as it reaches any trade's, and because
     the peak covers every Monday an add-on may be made on; a rule that
-    multiplied the portfolio value by the cap, or a peak that skipped a
-    same-title pair's later Mondays, would break it. The portfolio value, the
+    multiplied the portfolio value by the cap, or a peak that skipped the
+    later Monday an add-on is made on, would break it. The portfolio value, the
     cash left and a pair's stake are walk state that every cap at or above
     the peak shares. The gate: every cap of SIZE_CAP_SWEEP equals a fresh
     _simulate_at_discount(..., add_to_held=True, size_cap=cap) on trades and
@@ -11263,7 +10327,7 @@ class TestAddToHeldCapParity:
             caps=backtester.SIZE_CAP_SWEEP, primary_cap=0.20, bands=(self._BAND,),
             ks=tuple(ks), primary_k=ks[0], start_date=self._START,
             initial_balance=10_000.0, split_date=split_date, checks=checks,
-            entries_by_band={self._BAND: entries}, st_entries=[], eager={},
+            entries_by_band={self._BAND: entries}, eager={},
             add_to_held=True,
             end_dates={(self._BAND, k, pop): self._END for k in ks for pop in self._POPS})
 
@@ -11300,42 +10364,31 @@ class TestAddToHeldCapParity:
             assert all(id(p.trades) != id(above[0].trades) for p in below)
         return add_ons
 
-    # The same-title pair's second Monday, after P's and R's trades
-    _ST_M2 = date(2026, 2, 2)
-
     def _cap_bound_fixture(self):
         """P passes at about +0.041 (Monday 1) and +0.104 (Monday 2) at k 0.85,
         so its add-on is bound by a cap of 5% or 10% and by nothing from 15%
-        up; R, on its own ladder, competes for the cash on Monday 1. U, a
-        same-title pair (whose Kelly fraction does not depend on k), opens on
-        Monday 3 at about +0.235 and adds on 2026-02-02, with the same legs, at
-        about +0.527: the caps from 25% to 50%, above its first Monday's
-        fraction and below its later one's, still bind its add-on, so only the
-        later Monday's fraction marks where the caps stop mattering. Under the
-        class's pre_toggle_defaults the extra same-title cap is 100%, so the
-        sweep's cap is U's only cap."""
+        up; R, on its own ladder, competes for the cash on Monday 1."""
         p = TestAddToHeldPairs()._widening_pair()
         r = _ladder_record(_ladder_market("RA", "EVR-1", "2026-02-20"),
                            _ladder_market("RB", "EVS-1", "2026-02-20"), "r", [_LADDER_M1])
-        ua = _worded_market("UA", "EVU-1", _RAIN, "2026-03-01")
-        ub = _worded_market("UB", "EVV-1", _RAIN, "2026-03-01", result="yes")
-        u = _same_title_record([(_LADDER_M3, ua, ub, 0.55, 0.45),
-                                (self._ST_M2, ua, ub, 0.57, 0.43)])
-        return [p, r, u]
+        return [p, r]
+
+    @staticmethod
+    def _add_on(cell, cap, ticker="PA"):
+        """The one add-on trade on market `ticker` in the cell's point at `cap`."""
+        (t,) = [t for t in cell[cap]["all"].trades if t.add_on and t.ticker_a == ticker]
+        return t
 
     def test_every_cap_of_a_cap_bound_add_on_equals_a_fresh_simulation(self):
         entries = self._cap_bound_fixture()
-        p, _r, u = entries
+        p, _r = entries
         cs = self._sweep(entries, (0.75, 0.85))
         assert self._assert_every_cap_is_fresh(cs, entries) > 0
         assert cs.simulated > 0 and cs.reused > 0
         # Not vacuous: at k 0.85 the cap binds P's add-on at 5% and 10% and
         # not from 15%, where every cap sizes it alike
         cell = cs.cell(self._BAND, 0.85)
-
-        def add_on(cap, ticker="PA"):
-            (t,) = [t for t in cell[cap]["all"].trades if t.add_on and t.ticker_a == ticker]
-            return t
+        add_on = functools.partial(self._add_on, cell)
 
         f2 = _uncapped_kelly({"pair_type": "time_series", "entry": p["entry"]["later"][0]}, 0.85)
         assert 0.10 < f2 < 0.15
@@ -11368,23 +10421,10 @@ class TestAddToHeldCapParity:
         # cap no longer binds and every cap adds 1,188
         assert [add_on(cap).n for cap in (0.05, 0.10, 0.15, 0.5, 1.0)] == [
             177, 1121, 1188, 1188, 1188]
-        # The same-title add-on: its later Monday's fraction, not its first
-        # one's, is the cell's peak, so the caps between the two are each
-        # simulated rather than shared (a peak read off a same-title pair's
-        # first Monday alone would share them, and differ from a fresh run)
-        u1, u2 = (_uncapped_kelly({"pair_type": "same_title", "entry": m}, 0.85)
-                  for m in backtester._entry_mondays(u["entry"]))
-        assert 0.20 < u1 < 0.25 < 0.50 < u2 < 0.55
-        assert cell[1.0]["all"].peak_kelly_fraction == pytest.approx(u2, abs=1e-12)
-        st = {cap: add_on(cap, "UA") for cap in (0.25, 0.30, 0.40, 0.50, 0.55, 1.0)}
-        assert all(t.entry_date == self._ST_M2 for t in st.values())
-        assert (st[0.25].kelly_fraction < st[0.30].kelly_fraction
-                < st[0.40].kelly_fraction < st[0.50].kelly_fraction
-                < st[0.55].kelly_fraction == st[1.0].kelly_fraction)
 
     def test_every_cap_of_a_cash_bound_add_on_equals_a_fresh_simulation(self):
-        # TestAddToHeldPairs' cash-bound fixture: with no cap, R leaves P too
-        # little cash on Monday 2 to buy what it is missing of its share
+        # TestAddToHeldPairs' cash-bound fixture: with no cap, the seven R pairs
+        # leave P too little cash on Monday 2 to buy what it is missing of its share
         entries = TestAddToHeldPairs()._cash_bound_fixture()
         cs = self._sweep(entries, (0.85,))
         assert self._assert_every_cap_is_fresh(cs, entries) > 0
@@ -11481,16 +10521,12 @@ class TestAddToHeldCapParity:
             entries, self._START, 10_000.0, k=0.85, spread_band=self._BAND,
             size_cap=0.20, quiet=True, end_date=self._END)
         with pytest.raises(ValueError, match="takes no eager points"):
-            self._plain_sweep(entries, checks=False, st_entries=[],
+            self._plain_sweep(entries, checks=False,
                               eager={(self._BAND, 0.85, "all"): eager}, add_to_held=True)
-        with pytest.raises(ValueError, match="takes no eager points"):
-            self._plain_sweep(entries, checks=False, st_entries=[], eager={},
-                              same_title_eager=eager, add_to_held=True)
-        # CONTROL: the same eager points are a plain sweep's seeds, and an
+        # CONTROL: the same eager point is a plain sweep's seed, and an
         # add-on sweep with none builds
-        self._plain_sweep(entries, checks=False, st_entries=[],
-                          eager={(self._BAND, 0.85, "all"): eager}, same_title_eager=eager)
-        self._plain_sweep(entries, checks=False, st_entries=[], eager={}, add_to_held=True)
+        self._plain_sweep(entries, checks=False, eager={(self._BAND, 0.85, "all"): eager})
+        self._plain_sweep(entries, checks=False, eager={}, add_to_held=True)
 
     def test_an_add_on_cell_with_no_end_day_is_refused(self):
         """An add-on sweep has no eager point to end a cell's curves where the
@@ -11499,30 +10535,17 @@ class TestAddToHeldCapParity:
         whatever day the cell happens to be read, before anything is
         simulated."""
         entries = [TestAddToHeldPairs()._widening_pair()]
-        noisy = self._plain_sweep(entries, checks=False, st_entries=[], eager={},
+        noisy = self._plain_sweep(entries, checks=False, eager={},
                                   add_to_held=True,
                                   end_dates={(self._BAND, 0.85000001, "all"): self._END})
         with pytest.raises(ValueError, match=r"end_dates has no day for .*0\.85, 'all'"):
             noisy.cell(self._BAND, 0.85)
         assert noisy.simulated == 0
-        # The same-title population needs its own day too
-        ua = _worded_market("UA", "EVU-1", _RAIN, "2026-03-01")
-        ub = _worded_market("UB", "EVV-1", _RAIN, "2026-03-01", result="yes")
-        st = [_same_title_record([(_LADDER_M3, ua, ub, 0.55, 0.45)])]
-        cells_only = self._plain_sweep(
-            entries + st, checks=True, split_date=_LADDER_M3, st_entries=st, eager={},
-            add_to_held=True, end_dates={(self._BAND, 0.85, pop): self._END
-                       for pop in ("all", "time_series", "ladder", "cross")})
-        with pytest.raises(ValueError, match=r"end_dates has no day for .*'same_title'"):
-            cells_only.same_title()
         # CONTROL: the exact keys end every curve on the day given
         exact = self._plain_sweep(
-            entries + st, checks=True, split_date=_LADDER_M3, st_entries=st, eager={},
-            add_to_held=True, end_dates={**{(self._BAND, 0.85, pop): self._END
-                          for pop in ("all", "time_series", "ladder", "cross")},
-                       (None, 0.85, "same_title"): self._END})
+            entries, checks=False, eager={}, add_to_held=True,
+            end_dates={(self._BAND, 0.85, pop): self._END for pop in self._POPS})
         points = [p for by_pop in exact.cell(self._BAND, 0.85).values() for p in by_pop.values()]
-        points += list(exact.same_title().values())
         assert points and all(p.equity_df["date"].iloc[-1] == self._END for p in points)
 
 
@@ -11565,12 +10588,96 @@ class TestPrepareCandidates:
             same_event_ladders=True,
         )
         types = [pt for _, pt in c.all_pairs]
-        # EA/EB, the ladder, FA/FB, TA/TB and WA/WB, then the one same-title
-        # pair
-        assert types == ["time_series"] * 5 + ["same_title"]
+        # EA/EB, the ladder, FA/FB, TA/TB and WA/WB: time-series pairs only,
+        # since the backtest finds no same-title pairs
+        assert types == ["time_series"] * 5
         for (mA, mB, _canon, _key), _pt in c.all_pairs:
             assert mA["ticker"] in c.candles_by_ticker
             assert mB["ticker"] in c.candles_by_ticker
+
+
+class TestTheBacktestFindsNoSameTitlePair:
+    """The backtest looks for time-series pairs only (one question at two
+    deadlines). Beside a time-series pair, two identically worded markets on
+    two DIFFERENT series form no pair, even in the shape a same-title pair
+    takes: they close at one instant, their series are filed alike (with no
+    /series listing both fall back to their ticker prefix, "Other ·
+    General"), neither event names a competition, and their YES asks are 30
+    cents apart. No event's competition is read, and no entry point is
+    handed the /series listing."""
+
+    _TITLE = "Will the album top the chart?"
+
+    @classmethod
+    def _corpus(cls) -> list[dict]:
+        def rec(ticker, event):
+            return {"ticker": ticker, "event_ticker": event, "event_title": "Chart race",
+                    "title": cls._TITLE, "subtitle": "", "result": "yes",
+                    "open_time": "2026-01-01T00:00:00+00:00",
+                    "close_time": "2026-02-20T00:00:00+00:00",
+                    "settlement_ts": "2026-02-20T12:00:00+00:00"}
+        return _time_series_markets() + [rec("KXSTA-26-X", "KXSTA-26"),
+                                          rec("KXSTB-26-X", "KXSTB-26")]
+
+    @staticmethod
+    def _candles() -> dict[str, list[dict]]:
+        return {**_parity_candles(),
+                "KXSTA-26-X": [_candle(_MONDAY_TS, 0.30, 0.70)],
+                "KXSTB-26-X": [_candle(_MONDAY_TS, 0.60, 0.40)]}
+
+    def _patch(self, monkeypatch) -> list[str]:
+        corpus, candles = self._corpus(), self._candles()
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: [dict(m) for m in corpus])
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+        # The events whose fee override the run reads: its pair markets' events
+        events: list[str] = []
+        monkeypatch.setattr(historical, "_fetch_event_fee_override",
+                            lambda client, event_ticker: events.append(event_ticker) or None)
+        return events
+
+    def test_the_two_markets_are_worded_alike_on_two_series(self):
+        # The premise: one wording, two series, one close, filed alike
+        _ts, _tb, sta, stb = self._corpus()
+        assert backtester._identical_wording_dicts(sta, stb) is True
+        assert backtester._same_series_dicts(sta, stb) is False
+        assert sta["close_time"] == stb["close_time"]
+        filed = {historical.series_labels(m["event_ticker"],
+                                          historical.infer_category(m["event_ticker"]), {})
+                 for m in (sta, stb)}
+        assert len(filed) == 1
+
+    def test_prepare_candidates_finds_the_time_series_pair_only(self, monkeypatch, caplog):
+        events = self._patch(monkeypatch)
+        with caplog.at_level(logging.INFO):
+            candidates = backtester._prepare_candidates(
+                MagicMock(), MagicMock(), date(2026, 1, 1), True, None)
+        assert [(mA["ticker"], mB["ticker"], pair_type)
+                for (mA, mB, _canon, _key), pair_type in candidates.all_pairs] == [
+            ("SA", "SB", "time_series")]
+        assert "Potential pairs: 1 time-series" in caplog.messages
+        # Only the time-series pair's markets are pair markets: candles are
+        # fetched, and fee overrides read, for those two alone
+        assert sorted(candidates.candles_by_ticker) == ["SA", "SB"]
+        assert sorted(events) == ["EA", "EB"]
+        # No log line names a same-title search or a competition read
+        assert not any(m.startswith(("Same-title", "Event competitions"))
+                       for m in caplog.messages)
+
+    def test_run_backtest_trades_the_time_series_pair_only(self, monkeypatch):
+        self._patch(monkeypatch)
+        trades, _ = run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
+                                 start_date=date(2026, 1, 1), initial_balance=1000.0)
+        assert [(t.pair_type, t.ticker_a, t.ticker_b) for t in trades] == [
+            ("time_series", "SA", "SB")]
+
+    def test_no_entry_point_takes_a_series_listing(self):
+        # No backtester step files a market by its /series category and tag,
+        # so no entry point is handed the listing
+        for func in (backtester._prepare_candidates, backtester._prepare_entries,
+                     run_backtest, run_backtest_sweep):
+            assert "series_categories" not in inspect.signature(func).parameters, func.__name__
 
 
 # ─── SS-1: key every eligible record, materialize only the groupable subset ──
@@ -11592,36 +10699,16 @@ def _ss1_record(ticker, event_ticker, title, *, subtitle="", event_title="",
             "settlement_ts": close_t}
 
 
-# Fill titles that can never form a TIME-SERIES pair (no stated deadline, a
-# snapshot wording, a title that normalizes away, or one deadline shared by
-# every record that carries it). Their fill records all close at one instant
-# (DR-74), so their same-title candidates survive the close gate and keep
-# SS-1's exactness tests covering the same-title branch with real pairs; the
-# Rain/Snow fill keeps its random closes, so those tests still cover the
-# gate's refusals too, and every time-series pair is unchanged.
-_SS1_SAME_TITLE_ONLY_TITLES = frozenset({
-    "Q", "March 1, 2026", "Bitcoin price on Sep 15, 2026?",
-    "Will X happen by March 5, 2026?",
-})
-_SS1_SHARED_CLOSE = "2026-02-20"
-
-
 def _ss1_corpus(seed: int) -> list[dict]:
     """Hand-placed anchors for every case the subset must get right, plus a
     seeded random fill whose small title/subtitle/event pools make keys
-    collide (shared) about as often as they stay unique (singletons).
-
-    Since DR-74 a same-title candidate forms only when its two markets close
-    within SAME_TITLE_MAX_CLOSE_GAP_SECONDS, and a 50-day random close spread
-    would refuse nearly every one (measured: 4/5/4 same-title pairs for
-    seeds 0/1/2, against 126/117/93 before the gate). So a fill record whose
-    title can only ever pair as same-title closes at _SS1_SHARED_CLOSE — the
-    anchors' default close, so those records share it with SA/SB and DA/DB —
-    giving 78/65/50. The random close is still DRAWN for every record, so the
-    rng stream, every other field and every time-series pair are unchanged."""
+    collide (shared) about as often as they stay unique (singletons). Some
+    fill titles can never form a time-series pair (no stated deadline, a
+    snapshot wording, a title that normalizes away, or one deadline shared by
+    every record that carries it), so the fill holds records that share a key
+    and still form no pair."""
     anchors = [
-        # A cross-event time-series pair: shared time-series key, distinct
-        # same-title keys ...
+        # A cross-event time-series pair: one question at two deadlines ...
         _ss1_record("RA", "RAINA-1", "Rain falls by March 1, 2026",
                     event_title="RAIN", close="2026-03-01"),
         _ss1_record("RB", "RAINB-1", "Rain falls by March 20, 2026",
@@ -11630,7 +10717,8 @@ def _ss1_corpus(seed: int) -> list[dict]:
         # must skip without shifting any position.
         _ss1_record("RX", "RAINX-1", "Rain falls by March 9, 2026",
                     event_title="RAIN", eligible=False),
-        # A same-title pair on two series (shares BOTH keys).
+        # Identically worded on two series: they share the time-series key
+        # and form no pair.
         _ss1_record("SA", "SERA-1", "Q", event_title="EVS"),
         _ss1_record("SB", "SERB-1", "Q", event_title="EVS"),
         # A same-event deadline ladder, later rung listed first (DR-73).
@@ -11640,8 +10728,8 @@ def _ss1_corpus(seed: int) -> list[dict]:
         _ss1_record("L1", "KXSTAR-14",
                     "Will SpaceX launch another Starship by March 1, 2026?",
                     close="2026-03-20"),
-        # Kept ONLY through the same-title key: the title normalizes away, so
-        # the time-series key is empty.
+        # Identically worded too, but the title normalizes away, so the
+        # time-series key is empty: never grouped, so never kept.
         _ss1_record("DA", "DATEA-1", "March 1, 2026"),
         _ss1_record("DB", "DATEB-1", "March 1, 2026"),
         # Singletons of each kind, plus a record with no wording at all.
@@ -11669,8 +10757,6 @@ def _ss1_corpus(seed: int) -> list[dict]:
         title = (f"Unique question {seed}-{i}" if rng.random() < 0.4
                  else rng.choice(titles))
         close = (date(2026, 2, 1) + timedelta(days=rng.randint(0, 50))).isoformat()
-        if title in _SS1_SAME_TITLE_ONLY_TITLES:
-            close = _SS1_SHARED_CLOSE
         rec = _ss1_record(
             f"R{seed}-{i}",
             f"{rng.choice('ABCDE')}SER-{rng.randint(1, 4)}",
@@ -11686,21 +10772,9 @@ def _ss1_corpus(seed: int) -> list[dict]:
     return anchors + fill
 
 
-def _old_group_by_exact_title(markets):
-    """The pre-SS-1 _group_by_exact_title, verbatim — an oracle that does not
-    route through the _st_group_key it is checking."""
-    groups = defaultdict(list)
-    for m in markets:
-        event_title = m.get("event_title") or ""
-        title = m.get("title") or ""
-        subtitle = m.get("subtitle") or ""
-        if title or subtitle:
-            groups[(event_title, title, subtitle)].append(m)
-    return {k: v for k, v in groups.items() if len(v) >= 2}
-
-
 def _old_group_by_normalized_title(markets):
-    """The pre-SS-1 _group_by_normalized_title, verbatim (see above)."""
+    """The pre-SS-1 _group_by_normalized_title, verbatim — an oracle that does
+    not route through the _ts_group_key it is checking."""
     groups = defaultdict(list)
     for m in markets:
         norm = scanner.time_series_group_key(
@@ -11762,13 +10836,13 @@ class _DriftingCorpus:
 
 
 class TestGroupableSubset:
-    """SS-1: a 7-day window measured 7,260,952 eligible records of which only
-    184,255 share either grouping key with another eligible record. Both
-    grouping functions drop every single-member group, so _prepare_candidates
-    keys every eligible record in a first pass (hashes only) and materializes
-    only the records whose key is shared in a second. That must be EXACT: the
-    same groups, pairs, census and log numbers as grouping the whole eligible
-    list, which the old code did.
+    """SS-1: on a long window most eligible records share no grouping key
+    with any other eligible record. The grouping drops every single-member
+    group, so _prepare_candidates keys every eligible record in a first pass
+    (hashes only, on the time-series key) and materializes only the records
+    whose key is shared in a second. That must be EXACT: the same time-series
+    groups, members, member order, pairs, census and log numbers as grouping
+    the whole eligible list.
     """
 
     @staticmethod
@@ -11798,10 +10872,7 @@ class TestGroupableSubset:
     def _reference_pairs(eligible, ladders):
         ts_pairs = _extract_pairs(_old_group_by_normalized_title(eligible),
                                   same_event_ladders=ladders)
-        same_pairs = _extract_pairs(_old_group_by_exact_title(eligible),
-                                    same_event_ladders=ladders)
-        return ([(p, "time_series") for p in ts_pairs]
-                + [(p, "same_title") for p in same_pairs])
+        return [(p, "time_series") for p in ts_pairs]
 
     # ── (1) exactness ────────────────────────────────────────────────────
 
@@ -11812,24 +10883,24 @@ class TestGroupableSubset:
         subset = self._subset(markets)
 
         old_ts = _old_group_by_normalized_title(eligible)
-        old_st = _old_group_by_exact_title(eligible)
         # Keys, insertion order, and member identity and order — all equal.
         assert _group_shape(_group_by_normalized_title(subset)) == _group_shape(old_ts)
-        assert _group_shape(_group_by_exact_title(subset)) == _group_shape(old_st)
 
         # And the subset is EXACTLY the records some group of two or more
         # holds, in corpus order (no hash collision is plausible at this size;
         # the collision case has its own test below).
-        grouped = {id(m) for g in (old_ts, old_st) for v in g.values() for m in v}
+        grouped = {id(m) for v in old_ts.values() for m in v}
         assert [id(m) for m in subset] == [id(m) for m in eligible if id(m) in grouped]
 
         # Not vacuous: the fixture really exercises every case.
         assert len(eligible) < len(markets)          # prefiltered records
         assert len(subset) < len(eligible)           # singletons dropped
         by_ticker = {m["ticker"]: m for m in markets}
+        assert by_ticker["SA"] in subset             # a shared key, and no pair
+        # DA and DB are worded alike, but share no time-series key (theirs is
+        # empty), so neither is kept
         assert backtester._ts_group_key(by_ticker["DA"]) == ""
-        assert by_ticker["DA"] in subset             # kept via same-title only
-        for lone in ("DZ", "NW", "LONE", "RX"):
+        for lone in ("DA", "DB", "DZ", "NW", "LONE", "RX"):
             assert all(m is not by_ticker[lone] for m in subset)
 
     @pytest.mark.parametrize("ladders", [True, False])
@@ -11845,13 +10916,10 @@ class TestGroupableSubset:
         expected = self._reference_pairs(eligible, ladders)
         assert _pair_shape(c.all_pairs) == _pair_shape(expected)
         assert c.label_coverage == backtester._log_outcome_label_coverage(eligible)
-        # Not vacuous: both pair types present, and the ladder with ladders on.
-        types = {pt for _, pt in c.all_pairs}
-        assert types == {"time_series", "same_title"}
-        # ... and the same-title branch with real pairs, not the anchors' token
-        # few: the fill's same-title-only titles share one close (DR-74), so
-        # their candidates survive the close gate (78/65 for seeds 0/1).
-        assert sum(pt == "same_title" for _, pt in c.all_pairs) >= 40
+        # Not vacuous: real pairs, every one a time-series pair, and the
+        # ladder with ladders on.
+        assert len(c.all_pairs) >= 10
+        assert {pt for _, pt in c.all_pairs} == {"time_series"}
         ladder = {"L1", "L2"}
         assert any({mA["ticker"], mB["ticker"]} == ladder
                    for (mA, mB, _c, _k), _pt in c.all_pairs) is ladders
@@ -11888,7 +10956,7 @@ class TestGroupableSubset:
 
     def test_a_hash_collision_can_only_keep_extra_records(self, monkeypatch, caplog):
         """Every key hashes to ONE value here, so every eligible record with a
-        key of either kind reads as "shared" and is materialized. The exact
+        time-series key reads as "shared" and is materialized. The exact
         grouping then drops the true singletons, so the pairs and census are
         unchanged — the whole safety argument for keying on hash()."""
         markets = _ss1_corpus(1)
@@ -11900,10 +10968,12 @@ class TestGroupableSubset:
             c = self._prepare()
         assert _pair_shape(c.all_pairs) == _pair_shape(expected)
         assert c.label_coverage == backtester._log_outcome_label_coverage(eligible)
-        # Every eligible record has a key of some kind here, so all are kept.
-        assert all(backtester._ts_group_key(m) or backtester._st_group_key(m)
-                   for m in eligible)
-        assert (f"Groupable subset: materializing {len(eligible)} of "
+        # Every eligible record with a key is kept, singletons included; one
+        # with an empty key (a title that normalizes away) is still not
+        keyed = [m for m in eligible if backtester._ts_group_key(m)]
+        grouped = sum(len(v) for v in _old_group_by_normalized_title(eligible).values())
+        assert grouped < len(keyed) < len(eligible)
+        assert (f"Groupable subset: materializing {len(keyed)} of "
                 f"{len(eligible)} eligible markets") in caplog.text
 
     def test_the_shared_mask_never_counts_an_invalid_placeholder(self):
@@ -11989,7 +11059,7 @@ class TestGroupableSubset:
             # Same tickers in the same order, but one eligible record's
             # grouping field changed between the walks: the keep flags were
             # chosen on keys this record no longer has. One row per field
-            # either key reads, so dropping any one of them from the identity
+            # the key reads, so dropping any one of them from the identity
             # is caught.
             second = [dict(m) for m in first]
             i = next(k for k, m in enumerate(second) if m["ticker"] == "LONE")
@@ -12051,8 +11121,7 @@ class TestGroupableSubset:
         template = _ss1_corpus(0)
         eligible = self._eligible(template)
         old_ts = _old_group_by_normalized_title(eligible)
-        old_st = _old_group_by_exact_title(eligible)
-        grouped = {m["ticker"] for g in (old_ts, old_st) for v in g.values() for m in v}
+        grouped = {m["ticker"] for v in old_ts.values() for m in v}
         expected = [m["ticker"] for m in eligible if m["ticker"] in grouped]
         assert 0 < len(expected) < len(eligible)
 
@@ -12348,13 +11417,14 @@ class TestPrefilterLinesSayItRanDuringAssembly:
 class TestEntriesForBand:
     """_entries_for_band reads the start date, horizon and ladder flag FROM the
     candidates — never as arguments — and hands the band verbatim to every
-    _find_entry call."""
+    _find_entry call. It hands _find_entry time-series pairs only: a pair of
+    any other type is refused with one WARNING per call."""
 
     @staticmethod
     def _candidates(**overrides):
         pair = ({"ticker": "A"}, {"ticker": "B"}, "canon", "key")
         fields = {
-            "all_pairs": [(pair, "time_series"), (pair, "same_title")],
+            "all_pairs": [(pair, "time_series")],
             "candles_by_ticker": {"A": ["ca"], "B": ["cb"]},
             "label_coverage": None,
             "start_date": date(2026, 3, 2),
@@ -12368,9 +11438,8 @@ class TestEntriesForBand:
         # Risk 2 of the plan: a second copy of any of these could disagree
         # with the one extraction and the candle fetch used.
         params = inspect.signature(backtester._entries_for_band).parameters
-        assert list(params) == ["candidates", "spread_band", "pair_types", "tier_floors",
-                                "_pairs"]
-        assert params["pair_types"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert list(params) == ["candidates", "spread_band", "tier_floors", "_pairs"]
+        assert params["tier_floors"].kind is inspect.Parameter.KEYWORD_ONLY
         # PB7's private subset of pairs to scan: keyword-only, defaulting to
         # the full candidates.all_pairs scan
         assert params["_pairs"].kind is inspect.Parameter.KEYWORD_ONLY
@@ -12389,54 +11458,94 @@ class TestEntriesForBand:
             self._candidates(same_event_ladders=ladders), spread_band=(0.3, 0.6),
         )
         assert seen == [
-            (["ca"], ["cb"], pt, date(2026, 3, 2),
+            (["ca"], ["cb"], "time_series", date(2026, 3, 2),
              {"max_horizon_days": 21, "same_event_ladders": ladders,
               "spread_band": (0.3, 0.6), "tier_floors": True})
-            for pt in ("time_series", "same_title")
         ]
 
-    def test_pair_types_filters_without_reordering(self, monkeypatch):
+    _REFUSED_LINE = ("Refused {n} candidate pair(s) that are not time-series pairs before "
+                     "their entry pass (the backtest simulates time-series pairs only): ")
+
+    def test_a_pair_of_any_other_type_is_refused_before_its_entry_pass(self, monkeypatch,
+                                                                          caplog):
+        # Labelled same-title (or anything else), a pair never reaches
+        # _find_entry and produces no entry; the time-series pair beside it
+        # is scanned as before. One WARNING names how many, with examples
         seen: list = []
-        monkeypatch.setattr(backtester, "_find_entry",
-                            lambda *a, **k: seen.append(a[4]))
-        backtester._entries_for_band(self._candidates(), pair_types=("same_title",))
-        assert seen == ["same_title"]
+
+        def _spy(ca, cb, mA, mB, pair_type, start_date, **kwargs):
+            seen.append((mA["ticker"], mB["ticker"], pair_type))
+            return {"entry_date": start_date}
+
+        monkeypatch.setattr(backtester, "_find_entry", _spy)
+        ts = ({"ticker": "A"}, {"ticker": "B"}, "canon", "key")
+        st = ({"ticker": "SA"}, {"ticker": "SB"}, "canon", "key")
+        other = ({"ticker": "XA"}, {"ticker": "XB"}, "canon", "key")
+        candidates = self._candidates(
+            all_pairs=[(st, "same_title"), (ts, "time_series"), (other, "bogus")])
+        with caplog.at_level(logging.INFO):
+            entries = backtester._entries_for_band(candidates)
+        assert seen == [("A", "B", "time_series")]
+        assert [(rec["pair_type"], rec["entry"]) for rec in entries] == [
+            ("time_series", {"entry_date": date(2026, 3, 2)})]
+        assert [(r.levelname, r.getMessage()) for r in caplog.records] == [
+            ("WARNING", self._REFUSED_LINE.format(n=2)
+             + "SA / SB ('same_title'); XA / XB ('bogus')")]
+        # CONTROL: the time-series pair alone is scanned alike, and nothing is logged
         seen.clear()
-        # Order of the pair_types tuple is irrelevant: scan order wins
-        backtester._entries_for_band(self._candidates(),
-                                     pair_types=("same_title", "time_series"))
-        assert seen == ["time_series", "same_title"]
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert backtester._entries_for_band(
+                self._candidates(all_pairs=[(ts, "time_series")])) == entries
+        assert seen == [("A", "B", "time_series")]
+        assert caplog.records == []
 
-    @pytest.mark.parametrize("bad", [("time-series",), "time_series", ("same_title", "x")])
-    def test_an_unknown_pair_type_is_refused(self, bad):
-        with pytest.raises(ValueError, match="pair_types"):
-            backtester._entries_for_band(self._candidates(), pair_types=bad)
-
-    @pytest.mark.parametrize("empty", [(), ""])
-    def test_an_empty_pair_types_is_refused(self, monkeypatch, empty):
-        # An empty selection scans nothing and would read as a band with no
-        # tradeable pair.
+    def test_the_warning_names_at_most_the_example_cap(self, monkeypatch, caplog):
         monkeypatch.setattr(backtester, "_find_entry",
                             lambda *a, **k: pytest.fail("nothing may be scanned"))
-        with pytest.raises(ValueError, match="pair_types"):
-            backtester._entries_for_band(self._candidates(), pair_types=empty)
+        many = [(({"ticker": f"S{i}A"}, {"ticker": f"S{i}B"}, "c", "k"), "same_title")
+                for i in range(config.INTEGRITY_MAX_EXAMPLES + 2)]
+        with caplog.at_level(logging.WARNING):
+            assert backtester._entries_for_band(self._candidates(all_pairs=many)) == []
+        (line,) = [r.getMessage() for r in caplog.records]
+        examples = "; ".join(f"S{i}A / S{i}B ('same_title')"
+                             for i in range(config.INTEGRITY_MAX_EXAMPLES))
+        assert line == (self._REFUSED_LINE.format(n=config.INTEGRITY_MAX_EXAMPLES + 2)
+                        + examples + "; ...")
+
+    def test_a_mixed_list_enters_exactly_the_time_series_pairs(self, monkeypatch, caplog):
+        # The golden pairs with a same-title copy of each one between them
+        # enter exactly as the golden pairs alone, in the same order
+        golden = TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        candidates = backtester._prepare_candidates(
+            MagicMock(), MagicMock(), golden._START, True, None, same_event_ladders=True)
+        alone = backtester._entries_for_band(candidates)
+        mixed = [item for pair, pair_type in candidates.all_pairs
+                 for item in ((pair, "same_title"), (pair, pair_type))]
+        with caplog.at_level(logging.WARNING):
+            entries = backtester._entries_for_band(dc_replace(candidates, all_pairs=mixed))
+        assert golden._rows(entries) == golden._rows(alone)
+        assert golden._rows(alone) == golden._GOLDEN[True]
+        (line,) = [r.getMessage() for r in caplog.records
+                   if r.getMessage().startswith("Refused ")]
+        assert line.startswith(self._REFUSED_LINE.format(n=len(candidates.all_pairs)))
 
     @pytest.mark.parametrize(
         "band,exc",
         [((0.6, 0.3), ValueError), ((0.1, 0.2, 0.3), ValueError), (0.3, TypeError)],
     )
     @pytest.mark.parametrize(
-        "all_pairs,pair_types",
+        "all_pairs",
         [
             # No candidate at all
-            ([], ("time_series", "same_title")),
-            # Candidates exist, but none of the requested type
-            ([(({"ticker": "A"}, {"ticker": "B"}, "c", "k"), "same_title")],
-             ("time_series",)),
+            [],
+            # A candidate, but of a type the pass refuses
+            [(({"ticker": "A"}, {"ticker": "B"}, "c", "k"), "same_title")],
         ],
     )
     def test_an_invalid_band_is_refused_even_with_nothing_to_scan(
-        self, monkeypatch, band, exc, all_pairs, pair_types,
+        self, monkeypatch, band, exc, all_pairs,
     ):
         # Validated up front, not left to _find_entry: a pass that happens to
         # scan no pair must not return [] for a band that could never apply.
@@ -12445,15 +11554,13 @@ class TestEntriesForBand:
         with pytest.raises(exc):
             backtester._entries_for_band(
                 self._candidates(all_pairs=all_pairs), spread_band=band,
-                pair_types=pair_types,
             )
 
 
 class TestFindEntrySpreadBand:
     """_find_entry's backtest-only spread band: the floor is layered on the
-    deadline-gap tier (and the leg-price-sum ceiling stays 1 - that floor), the
-    ceiling refuses one Monday and lets the scan continue, and same-title
-    pairs never read the band."""
+    deadline-gap tier (and the leg-price-sum ceiling stays 1 - that floor), and
+    the ceiling refuses one Monday and lets the scan continue."""
 
     _START = date(2026, 1, 1)
 
@@ -12559,35 +11666,11 @@ class TestFindEntrySpreadBand:
         assert entry(None)["gap_days"] == 19
         assert entry((0.0, 0.40)) is None
 
-    @staticmethod
-    def _st_entry(pa_yes, pb_yes, band):
-        mA = {"ticker": "SA", "event_ticker": "SERA-1",
-              "close_time": "2026-02-01T00:00:00+00:00"}
-        mB = {"ticker": "SB", "event_ticker": "SERB-1",
-              "close_time": "2026-02-01T00:00:00+00:00"}
-        return _find_entry([_candle(_MONDAY_TS, pa_yes, 1.0 - pa_yes)],
-                           [_candle(_MONDAY_TS, pb_yes, 1.0 - pb_yes)],
-                           mA, mB, "same_title", date(2026, 1, 1), spread_band=band)
-
-    @pytest.mark.parametrize(
-        "band",
-        [(lo, hi) for lo in SPREAD_BAND_SWEEP_FLOORS for hi in SPREAD_BAND_SWEEP_CEILINGS]
-        + [(0.40, 0.45)],
-    )
-    @pytest.mark.parametrize("pa_yes,pb_yes", [(0.85, 0.15), (0.55, 0.45)])
-    def test_same_title_is_untouched_at_any_band(self, band, pa_yes, pb_yes):
-        # A 0.70 gap (above every ceiling) and a 0.10 gap (below every floor
-        # above 0.10) enter exactly as they do with no band.
-        default = self._st_entry(pa_yes, pb_yes, None)
-        assert default is not None
-        assert self._st_entry(pa_yes, pb_yes, band) == default
-
-    @pytest.mark.parametrize("pair_type", ["time_series", "same_title"])
-    def test_an_invalid_band_is_refused_before_any_data_check(self, pair_type):
+    def test_an_invalid_band_is_refused_before_any_data_check(self):
         # Resolved before the close_time early return, so a caller bug
         # surfaces even on a pair that could never enter.
         with pytest.raises(ValueError, match="spread band"):
-            _find_entry([], [], {}, {}, pair_type, date(2026, 1, 1),
+            _find_entry([], [], {}, {}, "time_series", date(2026, 1, 1),
                         spread_band=(0.6, 0.3))
 
     @pytest.mark.parametrize("band,exc", [((0.1, 0.2, 0.3), ValueError), (0.3, TypeError)])
@@ -12599,10 +11682,10 @@ class TestFindEntrySpreadBand:
 
 class TestBacktestTradePopulationLabels:
     """BacktestTrade.event_ticker / same_event_ladder: reporting-only labels
-    set by _simulate_at_discount, so a report can split the ladder,
-    cross-event and same-title populations and group P&L by event."""
+    set by _simulate_at_discount, so a report can split the ladder and
+    cross-event populations and group P&L by event."""
 
-    def test_a_ladder_a_cross_event_pair_and_a_same_title_pair(self, monkeypatch):
+    def test_a_ladder_and_a_cross_event_pair(self, monkeypatch):
         golden = TestPrepareEntriesGolden()
         golden._patch(monkeypatch)
         entries, _ = backtester._prepare_entries(
@@ -12611,13 +11694,12 @@ class TestBacktestTradePopulationLabels:
         )
         point = backtester._simulate_at_discount(entries, golden._START, 10_000.0)
         by_a = {t.ticker_a: t for t in point.trades}
-        assert set(by_a) == {"EA", "RUNG-EARLY", "SB"}
+        # The golden corpus trades a cross-event pair and a ladder; SA and SB,
+        # worded alike on two series, form no pair
+        assert set(by_a) == {"EA", "RUNG-EARLY"}
         assert (by_a["EA"].event_ticker, by_a["EA"].same_event_ladder) == ("EVA", False)
         assert (by_a["RUNG-EARLY"].event_ticker,
                 by_a["RUNG-EARLY"].same_event_ladder) == ("KXSTARSHIP-14", True)
-        # Market A of a same-title trade is the pricier side AFTER
-        # canonicalization (SB here), and a same-title pair is never a ladder.
-        assert (by_a["SB"].event_ticker, by_a["SB"].same_event_ladder) == ("SERB-1", False)
 
     def test_two_missing_event_tickers_are_not_one_event(self):
         # "" == "" must not read as a ladder: an unknown event cannot be
@@ -12735,13 +11817,11 @@ def golden_band_sweep(tmp_path_factory):
             calls["candidates"].append(c)
             return c
 
-        def entries_spy(candidates, spread_band=None, *, pair_types=("time_series", "same_title"),
-                        **private):
-            out = real_entries(candidates, spread_band, pair_types=pair_types, **private)
-            calls["entries"].append((spread_band, pair_types, out))
+        def entries_spy(candidates, spread_band=None, **kw):
+            out = real_entries(candidates, spread_band, **kw)
+            calls["entries"].append((spread_band, out))
             # PB7: which pairs each pass scanned (None = candidates.all_pairs)
-            calls["scanned"].append((spread_band, pair_types, private.get("_pairs"),
-                                     candidates.all_pairs))
+            calls["scanned"].append((spread_band, kw.get("_pairs"), candidates.all_pairs))
             return out
 
         # A FIXED six-parameter spy: this sweep runs with the tier-floors-off
@@ -12794,16 +11874,20 @@ def golden_band_sweep(tmp_path_factory):
 @pytest.mark.usefixtures("golden_band_sweep")
 class TestBandSweep:
     """run_backtest_sweep(band_sweep=True): every band of the config grid x
-    every swept k over ONE fetch, with standalone ladder / cross-event /
-    same-title populations, a split-half check and a concentration check.
+    every swept k over ONE fetch, with standalone time-series / ladder /
+    cross-event populations, a split-half check and a concentration check.
 
     The fixture (TestPrepareEntriesGolden, ladders on) is small enough to
     reason about by hand: the ladder (spread 0.40, 19-day stated gap) enters
     at every grid band; the cross-event pairs are EA/EB (0.30, 13-day gap —
     kept at floors <= 0.30), TA/TB (0.15 — floor 0 only) and WA/WB (0.98 —
     ceiling 1.0 only), so the cross-event population is empty at exactly the
-    ten bands with floor 0.35 or 0.40 and a ceiling below 1.0; and the
-    same-title pair trades at every band and k."""
+    ten bands with floor 0.35 or 0.40 and a ceiling below 1.0; and SA and SB,
+    worded alike on two series, form no pair, so every "all" point simulates
+    exactly its cell's time-series entries. At k = 0.95 and 1.00 nothing trades at any band: EA/EB's and the
+    ladder's Kelly fractions are negative there, the gate skips TA/TB (its
+    later quote is crossed), and WA/WB, which passes it at 0.95, is voided
+    and dropped after it."""
 
     # Floors 0 / 0.20 / 0.25 / 0.30 keep EA/EB at every ceiling; floors 0.35
     # and 0.40 keep only WA/WB, and only at the 1.0 ceiling.
@@ -12821,17 +11905,16 @@ class TestBandSweep:
         assert len(_GRID_BANDS) == 36 and len(INTERVAL_DISCOUNT_SWEEP) == 13
         assert sorted((p.spread_band, p.k) for p in by_pop["all"]) == sorted(
             (b, k) for b in _GRID_BANDS for k in INTERVAL_DISCOUNT_SWEEP)
-        # ... each with both robustness checks
-        assert all(p.halves is not None and p.ex_top_event is not None
-                   for p in by_pop["all"])
-        # PB7: a time-series point at every cell (the ladder enters at every
-        # band), each with its own split-half check, and an ex-top check
-        # exactly where it traded an event (at k = 1.00 nothing trades).
+        # PB7: a time-series point at every cell too (the ladder enters at
+        # every band). Each "all" and "time_series" point has its own
+        # split-half check, and an ex-top check exactly where it traded an
+        # event (at k = 0.95 and 1.00 nothing trades).
         assert sorted((p.spread_band, p.k) for p in by_pop["time_series"]) == sorted(
             (b, k) for b in _GRID_BANDS for k in INTERVAL_DISCOUNT_SWEEP)
-        assert all(p.halves is not None for p in by_pop["time_series"])
-        assert all((p.ex_top_event is not None) == any(t.event_ticker for t in p.trades)
-                   for p in by_pop["time_series"])
+        for population in ("all", "time_series"):
+            assert all(p.halves is not None for p in by_pop[population])
+            assert all((p.ex_top_event is not None) == any(t.event_ticker for t in p.trades)
+                       for p in by_pop[population])
         # A ladder point at every band (the ladder enters everywhere) and a
         # cross point exactly where the cross population is non-empty — an
         # empty population is skipped, never simulated as an empty scenario.
@@ -12839,10 +11922,6 @@ class TestBandSweep:
         assert len(by_pop["ladder"]) == 36 * 13
         assert sorted({p.spread_band for p in by_pop["cross"]}) == self._CROSS_BANDS
         assert len(by_pop["cross"]) == 26 * 13
-        # ... plus ONE same-title point, outside the scenarios
-        assert res.same_title_point is not None
-        assert res.same_title_point.population == "same_title"
-        assert [t.pair_type for t in res.same_title_point.trades] == ["same_title"]
 
     def test_the_sweep_records_its_entry_checkpoint(self, golden_band_sweep):
         # Both runs record their checkpoints' schedule, for the dashboard header
@@ -12866,7 +11945,7 @@ class TestBandSweep:
 
     def test_points_and_primary_equal_a_single_band_run(self, golden_band_sweep):
         res, single = golden_band_sweep.result, golden_band_sweep.single
-        assert single.scenarios == [] and single.same_title_point is None
+        assert single.scenarios == []
         assert single.split_date is None
         assert [p.k for p in res.points] == [p.k for p in single.points]
         for swept, alone in zip(res.points, single.points, strict=True):
@@ -12888,11 +11967,9 @@ class TestBandSweep:
     def test_preparation_once_and_one_time_series_pass_per_band(self, golden_band_sweep):
         calls = golden_band_sweep.calls
         assert calls["prepare"] == 1
-        ts_bands = [band for band, types, _ in calls["entries"] if types == ("time_series",)]
-        st_passes = [band for band, types, _ in calls["entries"] if types == ("same_title",)]
+        ts_bands = [band for band, _ in calls["entries"]]
         assert sorted(ts_bands) == _GRID_BANDS           # each band exactly once
-        assert len(st_passes) == 1                       # same-title entries once
-        assert len(calls["entries"]) == 36 + 1           # and nothing else
+        assert len(calls["entries"]) == 36               # and nothing else
 
     def test_the_candles_are_released_before_any_simulation(self, golden_band_sweep):
         # ... and the pair list with them: nothing after the entry passes
@@ -12907,15 +11984,16 @@ class TestBandSweep:
         labels = [p.rsplit(", ", 1)[1] for p in prefixes]
         assert labels.count("all") == 468
         assert labels.count("time_series") == 468
-        # The time-series point re-simulates without its top event only where
-        # it traded one (an ex-top run needs an event to drop).
+        # A point re-simulates without its top event only where it traded one
+        # (an ex-top run needs an event to drop). An "all" point simulates
+        # exactly its cell's time-series entries, so it trades where its
+        # time-series twin does: the two populations run as many ex-top runs.
         ts_ex_top = sum(1 for p in golden_band_sweep.result.scenarios
                         if p.population == "time_series" and p.ex_top_event is not None)
-        assert labels.count("time_series/ex-top") == ts_ex_top
-        # 468 x (all + ladder + H1 + H2 + ex-top) + 26 x 13 cross + 1 same-title
-        # + 468 x (time_series + its H1 + its H2) + its ex-top runs
-        assert len(prefixes) == 468 * 5 + 26 * 13 + 1 + 468 * 3 + ts_ex_top
-        assert labels.count("same_title") == 1
+        assert labels.count("time_series/ex-top") == labels.count("all/ex-top") == ts_ex_top
+        # 468 x (all + ladder + H1 + H2) + 26 x 13 cross + 468 x (time_series +
+        # its H1 + its H2) + both populations' ex-top runs, and nothing else
+        assert len(prefixes) == 468 * 4 + 26 * 13 + 468 * 3 + 2 * ts_ex_top
 
     def test_every_scenario_s_entries_lie_within_its_stamped_band(self, golden_band_sweep):
         eps = backtester.PRICE_EPSILON
@@ -12941,30 +12019,17 @@ class TestBandSweep:
     def test_robustness_checks_live_only_on_band_sweep_all_points(self, golden_band_sweep):
         res, single = golden_band_sweep.result, golden_band_sweep.single
         for p in res.scenarios:
-            if p.population == "all":
-                assert p.halves is not None and p.ex_top_event is not None
-            elif p.population == "time_series":
+            if p.population in ("all", "time_series"):
                 # PB7: the population the dashboard's banner reads carries
-                # its own checks too (ex-top only where it traded an event)
+                # its own checks too; on both, ex-top only where it traded an
+                # event
                 assert p.halves is not None
                 assert (p.ex_top_event is not None) == any(t.event_ticker for t in p.trades)
             else:
                 assert p.halves is None and p.ex_top_event is None
-        assert res.same_title_point.halves is None
-        assert res.same_title_point.ex_top_event is None
         assert all(p.halves is None and p.ex_top_event is None for p in single.points)
         # No retained point carries a split-half / ex-top run label
         assert all("/" not in p.population for p in res.scenarios)
-
-    def test_the_same_title_point_is_simulated_once(self, golden_band_sweep):
-        sims = [c for c in golden_band_sweep.calls["simulate"]
-                if c["population"] == "same_title"]
-        assert len(sims) == 1
-        assert sims[0]["point"] is golden_band_sweep.result.same_title_point
-        # Band- and k-independent: its band stamp is None, its k the primary's
-        assert golden_band_sweep.result.same_title_point.spread_band is None
-        assert golden_band_sweep.result.same_title_point.k == golden_band_sweep.result.primary.k
-        assert all(rec["pair_type"] == "same_title" for rec in sims[0]["entries"])
 
     def test_populations_are_standalone_simulations_of_their_entries(self, golden_band_sweep):
         start = golden_band_sweep.start
@@ -12998,10 +12063,10 @@ class TestBandSweep:
         res, start = golden_band_sweep.result, golden_band_sweep.start
         by_point = {id(c["point"]): c for c in golden_band_sweep.calls["simulate"]}
         entries = by_point[id(res.primary)]["entries"]
-        # split_date is the median_low of the primary band's entry dates: four
-        # of its five entries enter on Monday 1, the ladder on Monday 2.
+        # split_date is the median_low of the primary band's entry dates: three
+        # of its four entries enter on Monday 1, the ladder on Monday 2.
         assert sorted(rec["entry"]["entry_date"] for rec in entries) == [
-            date(2026, 1, 5)] * 4 + [date(2026, 1, 12)]
+            date(2026, 1, 5)] * 3 + [date(2026, 1, 12)]
         assert res.split_date == date(2026, 1, 5)
         # H1 (strictly before the split) is empty, so H2 is every entry and
         # must reproduce the primary's own return and trade count.
@@ -13047,6 +12112,7 @@ class TestBandSweep:
         alls = [p for p in res.scenarios if p.population == "all"]
         assert len(alls) == 468
         contents = set()
+        no_event = 0
         for p in alls:
             own = by_point[id(p)]["entries"]
             contents.add(tuple(sorted((r["entry"]["mA"]["ticker"], r["entry"]["mB"]["ticker"])
@@ -13068,14 +12134,22 @@ class TestBandSweep:
             for t in p.trades:
                 if t.event_ticker:
                     pnl[t.event_ticker] = pnl.get(t.event_ticker, 0.0) + t.profit
+            if not pnl:
+                # A cell that traded no event (nothing trades at k = 0.95 or
+                # 1.00) has no top event to drop, so no ex-top run
+                assert p.ex_top_event is None
+                assert (p.spread_band, p.k, "all/ex-top") not in by_key
+                no_event += 1
+                continue
             top = min(pnl, key=lambda ev: (-pnl[ev], ev))
             ex = by_key[(p.spread_band, p.k, "all/ex-top")]
             assert [id(r) for r in ex["entries"]] == [
                 id(r) for r in own if r["entry"]["mA"]["event_ticker"] != top]
             assert p.ex_top_event == (top, self._return(ex["point"]))
         # Not vacuous: the bands hand their checks different entry SETS, not
-        # merely different copies of one set.
+        # merely different copies of one set, and both ex-top branches run.
         assert len(contents) > 1
+        assert 0 < no_event < len(alls)
 
     def test_a_non_primary_cell_s_checks_re_simulate_independently(self, golden_band_sweep):
         # (0.35, 1.0) keeps a different entry set from the primary band's, so
@@ -13135,12 +12209,12 @@ class TestBandSweep:
             f"Qualifying Mondays at band {backtester._band_label(b)}" for b in _GRID_BANDS)
         assert all(messages[messages.index(m) - 1].startswith("Prepared ") for m in lines)
         # The default band's is the golden rows' own count (1 + 3 for each
-        # short pair and SB/SA, 1 + 9 for the ladder) ...
-        assert ("Qualifying Mondays at band 0-1: 26 over 5 entries "
-                "(5 qualify on more than one)") in lines
-        # ... and at a 0.35 floor with a 0.5 ceiling only the ladder and SB/SA enter
-        assert ("Qualifying Mondays at band 0.35-0.5: 14 over 2 entries "
-                "(2 qualify on more than one)") in lines
+        # of the three short pairs, 1 + 9 for the ladder) ...
+        assert ("Qualifying Mondays at band 0-1: 22 over 4 entries "
+                "(4 qualify on more than one)") in lines
+        # ... and at a 0.35 floor with a 0.5 ceiling only the ladder enters
+        assert ("Qualifying Mondays at band 0.35-0.5: 10 over 1 entries "
+                "(1 qualify on more than one)") in lines
 
     def test_the_sweep_records_the_resolved_ladder_setting(self, golden_band_sweep):
         assert golden_band_sweep.result.same_event_ladders is True
@@ -13208,25 +12282,24 @@ class TestBandSweepEdges:
             res = self._run(monkeypatch)
         assert len(res.points) == 13 and res.scenarios == []
         messages = [r.getMessage() for r in caplog.records]
-        # The golden fixture prepares five entries: three cross-event pairs
-        # and the same-title pair on Monday 1, the ladder on Monday 2.
+        # The golden fixture prepares four entries: three cross-event pairs
+        # on Monday 1, the ladder on Monday 2.
         prepared = [m for m in messages if m.startswith("Prepared ")]
-        assert prepared == ["Prepared 5 candidate entries for sizing"]
-        assert ("Re-simulating 5 prepared entries at 13 interval discounts "
+        assert prepared == ["Prepared 4 candidate entries for sizing"]
+        assert ("Re-simulating 4 prepared entries at 13 interval discounts "
                 "(primary k = 0.750)") in messages
-        assert not any(m.startswith(("Same-title candidate entries", "Split-half check",
-                                     "Simulating spread band", "Simulating the same-title"))
+        assert not any(m.startswith(("Split-half check", "Simulating spread band"))
                        for m in messages)
         assert [m for m in messages if m.startswith("Spread band ")] == [
             "Spread band 1/1: 0-1 (primary)"]
 
     @pytest.mark.parametrize("band,prepared,line", [
-        (None, "Prepared 5 candidate entries for sizing",
-         "Qualifying Mondays at band 0-1: 26 over 5 entries (5 qualify on more than one)"),
-        # At 0.3-0.6 TA/TB (0.15) and WA/WB (0.98) no longer enter: EA/EB's 4,
-        # the ladder's 10 and SB/SA's 4
-        ((0.3, 0.6), "Prepared 3 candidate entries for sizing",
-         "Qualifying Mondays at band 0.3-0.6: 18 over 3 entries (3 qualify on more than one)"),
+        (None, "Prepared 4 candidate entries for sizing",
+         "Qualifying Mondays at band 0-1: 22 over 4 entries (4 qualify on more than one)"),
+        # At 0.3-0.6 TA/TB (0.15) and WA/WB (0.98) do not enter: EA/EB's 4 and
+        # the ladder's 10
+        ((0.3, 0.6), "Prepared 2 candidate entries for sizing",
+         "Qualifying Mondays at band 0.3-0.6: 14 over 2 entries (2 qualify on more than one)"),
     ], ids=["default-band", "band-0.3-0.6"])
     def test_a_single_band_run_logs_its_qualifying_mondays(
         self, monkeypatch, caplog, band, prepared, line,
@@ -13243,7 +12316,7 @@ class TestBandSweepEdges:
                                                  same_event_ladders=True)
         assert res.scenarios == []
         assert res.calibrations_by_band == {}
-        assert res.same_title_point is None and res.split_date is None
+        assert res.split_date is None
         assert res.label_coverage is None
         # The resolved ladder setting is still recorded, and the empty point
         # still carries the band it would have been simulated at
@@ -13265,7 +12338,7 @@ class TestBandSweepEdges:
     def test_a_single_band_run_keeps_its_calibration_keyed_by_band(self, monkeypatch):
         res = self._run(monkeypatch, sweep=False)
         assert res.calibrations_by_band == {BACKTEST_DEFAULT_SPREAD_BAND: res.calibration}
-        assert res.scenarios == [] and res.same_title_point is None
+        assert res.scenarios == []
         assert res.primary.spread_band == BACKTEST_DEFAULT_SPREAD_BAND
 
     def test_an_invalid_band_fails_before_anything_is_logged_or_fetched(
@@ -13489,9 +12562,7 @@ class TestBandSweepSplitAndPopulationWiring:
         primary = BACKTEST_DEFAULT_SPREAD_BAND
         by_band: dict = {}
 
-        def entries_for_band(candidates, spread_band=None, *, pair_types=(), **_private):
-            if pair_types == ("same_title",):
-                return []
+        def entries_for_band(candidates, spread_band=None, **_kw):
             if spread_band == primary:
                 spec = [(D1, True), (D2, False), (D3, True)]            # median_low D2
             else:
@@ -13568,22 +12639,18 @@ class TestBandSweepPhaseOneSubset:
 
     def test_every_band_s_entries_equal_a_full_scan(self, golden_band_sweep, monkeypatch):
         rows = TestPrepareEntriesGolden._rows
-        swept = {band: out for band, types, out in golden_band_sweep.calls["entries"]
-                 if types == ("time_series",)}
+        swept = dict(golden_band_sweep.calls["entries"])
         assert sorted(swept) == _GRID_BANDS
         distinct = set()
         for band, out in swept.items():
-            full = backtester._entries_for_band(self._fresh(monkeypatch), band,
-                                                pair_types=("time_series",))
+            full = backtester._entries_for_band(self._fresh(monkeypatch), band)
             assert rows(out) == rows(full), band
             distinct.add(tuple(rows(full)))
         # Not vacuous: the bands really do select different entry lists
         assert len(distinct) > 1
 
     def test_the_no_band_band_is_the_one_full_scan(self, golden_band_sweep):
-        scanned = golden_band_sweep.calls["scanned"]
-        ts = [(band, pairs, all_pairs) for band, types, pairs, all_pairs in scanned
-              if types == ("time_series",)]
+        ts = golden_band_sweep.calls["scanned"]
         # The pre-pass comes FIRST, is the (0, 1) band, and scans all_pairs
         assert ts[0][0] == (0.0, 1.0) and ts[0][1] is None
         # ... and is never run twice: every other band is handed the subset
@@ -13596,13 +12663,14 @@ class TestBandSweepPhaseOneSubset:
         # the rescan is the four time-series pairs that did, in scan order
         assert [(item[0][0]["ticker"], item[0][1]["ticker"]) for item in subset] == [
             ("EA", "EB"), ("RUNG-EARLY", "RUNG-LATE"), ("TA", "TB"), ("WA", "WB")]
-        # all_pairs itself is never mutated: still the six candidates, and
-        # the subset is a separate list
+        # all_pairs itself is never mutated: still the five candidates (SA and
+        # SB, worded alike on two series, are none), and the subset is a
+        # separate list
         all_pairs = ts[0][2]
         assert subset is not all_pairs
         assert [(item[0][0]["ticker"], item[1]) for item in all_pairs] == [
             ("EA", "time_series"), ("RUNG-EARLY", "time_series"), ("FA", "time_series"),
-            ("TA", "time_series"), ("WA", "time_series"), ("SA", "same_title")]
+            ("TA", "time_series"), ("WA", "time_series")]
 
     def test_the_pre_pass_is_announced_with_its_count(self, golden_band_sweep):
         messages = golden_band_sweep.messages
@@ -13617,29 +12685,27 @@ class TestBandSweepPhaseOneSubset:
         seen: list = []
         real = backtester._entries_for_band
 
-        def spy(c, spread_band=None, *, pair_types=("time_series", "same_title"), **private):
-            seen.append((spread_band, pair_types, private))
-            return real(c, spread_band, pair_types=pair_types, **private)
+        def spy(c, spread_band=None, **kw):
+            seen.append((spread_band, kw))
+            return real(c, spread_band, **kw)
 
         monkeypatch.setattr(backtester, "_entries_for_band", spy)
         backtester._sweep_from_candidates(candidates, 10_000.0, interval_discount=None,
                                           sweep=False, spread_band=(0.3, 0.6),
                                           band_sweep=False)
-        # No pre-pass and no subset: one same-title pass and one full
-        # time-series pass at the primary band
-        assert seen == [((0.3, 0.6), ("same_title",), {}),
-                        ((0.3, 0.6), ("time_series",), {})]
+        # No pre-pass and no subset: one full time-series pass at the
+        # primary band
+        assert seen == [((0.3, 0.6), {})]
 
     def test_pairs_narrows_the_scan_and_keeps_its_order(self, monkeypatch):
         candidates = self._fresh(monkeypatch)
         rows = TestPrepareEntriesGolden._rows
-        full = backtester._entries_for_band(candidates, pair_types=("time_series",))
+        full = backtester._entries_for_band(candidates)
         # Hand the scan a reordered subset: it scans exactly those items, in
         # the order given, and all_pairs is untouched
         before = list(candidates.all_pairs)
         subset = [candidates.all_pairs[3], candidates.all_pairs[0]]
-        narrowed = backtester._entries_for_band(candidates, pair_types=("time_series",),
-                                                _pairs=subset)
+        narrowed = backtester._entries_for_band(candidates, _pairs=subset)
         # r[9] is ticker_a (counted from the front: later_dates is the last column)
         assert [r[9] for r in rows(narrowed)] == ["TA", "EA"]
         assert set(rows(narrowed)) <= set(rows(full))
@@ -13702,10 +12768,9 @@ class TestBandSweepPhaseOneSubset:
         real = backtester._entries_for_band
         passes: list = []
 
-        def spy(c, spread_band=None, *, pair_types=("time_series", "same_title"), **private):
-            out = real(c, spread_band, pair_types=pair_types, **private)
-            if pair_types == ("time_series",):
-                passes.append((spread_band, private.get("_pairs"), out))
+        def spy(c, spread_band=None, **kw):
+            out = real(c, spread_band, **kw)
+            passes.append((spread_band, kw.get("_pairs"), out))
             return out
 
         def fake_simulate(raw_entries, start_date, initial_balance, k=None,
@@ -13727,7 +12792,7 @@ class TestBandSweepPhaseOneSubset:
         by_band = {band: out for band, _pairs, out in passes}
         assert sorted(by_band) == _GRID_BANDS
         for band, out in by_band.items():
-            full = real(self._own_candidates(monkeypatch), band, pair_types=("time_series",))
+            full = real(self._own_candidates(monkeypatch), band)
             assert rows(out) == rows(full), band
         return by_band
 
@@ -13764,8 +12829,7 @@ class TestBandSweepPhaseOneSubset:
         with monkeypatch.context() as m:
             m.setattr(backtester, "min_price_diff_for_gap",
                       lambda gap, spread_min=None, **_kw: spread_min or tier_rule(gap))
-            loosened = real(self._own_candidates(m), (0.20, 1.0),
-                            pair_types=("time_series",))
+            loosened = real(self._own_candidates(m), (0.20, 1.0))
         assert "FOG-A" in [r["entry"]["mA"]["ticker"] for r in loosened]
 
     def test_the_tier_off_rescan_comes_from_its_own_pre_pass(self, monkeypatch):
@@ -13781,11 +12845,9 @@ class TestBandSweepPhaseOneSubset:
         real = backtester._entries_for_band
         passes: list = []
 
-        def spy(c, spread_band=None, *, pair_types=("time_series", "same_title"), **private):
-            out = real(c, spread_band, pair_types=pair_types, **private)
-            if pair_types == ("time_series",):
-                passes.append((spread_band, private.get("tier_floors", True),
-                               private.get("_pairs"), out))
+        def spy(c, spread_band=None, **kw):
+            out = real(c, spread_band, **kw)
+            passes.append((spread_band, kw.get("tier_floors", True), kw.get("_pairs"), out))
             return out
 
         def fake_simulate(raw_entries, start_date, initial_balance, k=None,
@@ -13823,8 +12885,7 @@ class TestBandSweepPhaseOneSubset:
         # Every tier-off pass is a full tier-off scan's entries
         rows = TestPrepareEntriesGolden._rows
         for band, _tf, _pairs, out in off:
-            full = real(self._own_candidates(monkeypatch), band, pair_types=("time_series",),
-                        tier_floors=False)
+            full = real(self._own_candidates(monkeypatch), band, tier_floors=False)
             assert rows(out) == rows(full), band
 
         # Not vacuous: FOG-A enters at every tier-off band, and at no tier-on one
@@ -13839,9 +12900,10 @@ class TestBandSweepPhaseOneSubset:
 @pytest.mark.usefixtures("golden_band_sweep")
 class TestTimeSeriesPopulation:
     """The standalone "time_series" population — ladders and cross-event
-    together, same-title excluded — which the dashboard's heatmap and
-    fragility banner read, so a same-title result (band- and k-independent)
-    cannot dilute them. It carries its own split-half and ex-top checks."""
+    together — which the dashboard's heatmap and fragility banner read.
+    Every entry the backtest simulates is a time-series one, so it holds the
+    same entries as the "all" run. It carries its own split-half and ex-top
+    checks."""
 
     def test_it_is_the_band_s_time_series_entries_simulated_alone(self, golden_band_sweep):
         calls = golden_band_sweep.calls["simulate"]
@@ -13854,10 +12916,10 @@ class TestTimeSeriesPopulation:
             own = by_point[id(p)]["entries"]
             everything = by_key[(p.spread_band, p.k, "all")]["entries"]
             # Exactly the time-series entries of the same band's "all" run,
-            # in order — the same-title entry is the one left out
+            # in order: every one of them
             assert [id(r) for r in own] == [
                 id(r) for r in everything if r["pair_type"] == "time_series"]
-            assert len(everything) == len(own) + 1
+            assert len(everything) == len(own)
             assert all(t.pair_type == "time_series" for t in p.trades)
         # A standalone run from the initial balance, not a slice of "all"
         p = next(p for p in ts_points if p.spread_band == BACKTEST_DEFAULT_SPREAD_BAND
@@ -13896,12 +12958,12 @@ class TestTimeSeriesPopulation:
                 assert p.ex_top_event == (top, ret(ex["point"]))
 
     def test_the_golden_split_leaves_h1_empty_and_says_so(self, golden_band_sweep):
-        # Four of the primary band's five entries (three of its four
-        # time-series ones) enter on Monday 1, so the median_low split date IS
-        # Monday 1 and H1 (strictly before it) is empty in every cell.
+        # Three of the primary band's four entries (every one a time-series
+        # entry) enter on Monday 1, so the median_low split date IS Monday 1
+        # and H1 (strictly before it) is empty in every cell.
         res = golden_band_sweep.result
         assert res.split_date == date(2026, 1, 5)
-        assert (res.primary.halves.h1_entries, res.primary.halves.h2_entries) == (0, 5)
+        assert (res.primary.halves.h1_entries, res.primary.halves.h2_entries) == (0, 4)
         ts = next(p for p in res.scenarios if p.population == "time_series"
                   and p.spread_band == res.primary.spread_band and p.k == res.primary.k)
         assert (ts.halves.h1_entries, ts.halves.h2_entries) == (0, 4)
@@ -13913,19 +12975,18 @@ class TestTimeSeriesPopulation:
             "entries before it, 4 on or after it)"]
 
     @staticmethod
-    def _rec(i, when, pair_type="time_series"):
-        return {"pair_type": pair_type, "canon": f"c{i}", "group_key": f"g{i}",
+    def _rec(i, when):
+        return {"pair_type": "time_series", "canon": f"c{i}", "group_key": f"g{i}",
                 "entry": {"entry_date": when,
                           "mA": {"ticker": f"A{i}", "event_ticker": f"EV{i}"},
                           "mB": {"ticker": f"B{i}", "event_ticker": f"X{i}"}}}
 
-    def _sweep(self, monkeypatch, ts_dates, st_dates):
+    def _sweep(self, monkeypatch, ts_dates):
         ts = [self._rec(i, d) for i, d in enumerate(ts_dates)]
-        st = [self._rec(100 + i, d, "same_title") for i, d in enumerate(st_dates)]
         sims: list = []
 
-        def entries_for_band(candidates, spread_band=None, *, pair_types=(), **_private):
-            return list(st) if pair_types == ("same_title",) else list(ts)
+        def entries_for_band(candidates, spread_band=None, **_kw):
+            return list(ts)
 
         def fake_simulate(raw_entries, start_date, initial_balance, k=None,
                           spread_band=None, population="all"):
@@ -13946,19 +13007,9 @@ class TestTimeSeriesPopulation:
             spread_band=None, band_sweep=True)
         return res, sims
 
-    def test_same_title_entries_cannot_move_the_split(self, monkeypatch):
-        D1, D2, D3, D4 = (date(2026, 1, 5), date(2026, 1, 12), date(2026, 1, 19),
-                          date(2026, 1, 26))
-        # All six dates' median_low is D1; the time-series three's is D3.
-        res, sims = self._sweep(monkeypatch, [D2, D3, D4], [D1, D1, D1])
-        assert statistics.median_low([D2, D3, D4, D1, D1, D1]) == D1
-        assert res.split_date == D3
-        ts_h1 = [entries for pop, entries in sims if pop == "time_series/H1"]
-        assert ts_h1 and all([r["entry"]["entry_date"] for r in e] == [D2] for e in ts_h1)
-
     def test_no_time_series_entry_means_no_time_series_point(self, monkeypatch, caplog):
         with caplog.at_level(logging.WARNING):
-            res, sims = self._sweep(monkeypatch, [], [date(2026, 1, 5)])
+            res, sims = self._sweep(monkeypatch, [])
         assert {p.population for p in res.scenarios} == {"all"}
         assert not any(pop.startswith("time_series") for pop, _ in sims)
         # With no time-series entry at the primary band both halves are empty
@@ -13968,7 +13019,7 @@ class TestTimeSeriesPopulation:
     def test_no_warning_when_both_halves_have_entries(self, monkeypatch, caplog):
         with caplog.at_level(logging.WARNING):
             res, _ = self._sweep(monkeypatch, [date(2026, 1, 5), date(2026, 1, 12),
-                                               date(2026, 1, 19)], [])
+                                               date(2026, 1, 19)])
         assert res.split_date == date(2026, 1, 12)
         assert "not measurable" not in caplog.text
         halves = [p.halves for p in res.scenarios if p.population == "time_series"]
@@ -14005,14 +13056,14 @@ class TestExactLabels:
 # ─── C1: the per-trade size cap as a parameter, and the lazy cap sweep ───────
 
 def _uncapped_kelly(rec: dict, k: float) -> float | None:
-    """Pass 1b's uncapped Kelly fraction at one prepared entry's first
-    qualifying Monday (or, handed {"pair_type": ..., "entry": monday}, at
-    that Monday), rebuilt from the config helpers — the oracle for
+    """Pass 1b's uncapped Kelly fraction at one prepared time-series entry's
+    first qualifying Monday (or, handed {"pair_type": ..., "entry": monday},
+    at that Monday), rebuilt from the config helpers — the oracle for
     peak_kelly_fraction wherever a pair's later Mondays repeat its first
-    Monday's quotes, as TestPrepareEntriesGolden's tier-on entries do. A
-    time-series forecast reads that Monday's mid spread (DR-78). None when
-    the net spread leaves nothing to size, or a time-series Monday's quote is
-    crossed on either market (the gate skips it)."""
+    Monday's quotes, as TestPrepareEntriesGolden's tier-on entries do. The
+    forecast reads that Monday's mid spread (DR-78). None when the net spread
+    leaves nothing to size, or the Monday's quote is crossed on either market
+    (the gate skips it)."""
     e = rec["entry"]
     price_a, price_b = backtester._leg_prices_for(rec["pair_type"], e["pA"], e["nA"],
                                                   e["pB"], e["nB"])
@@ -14021,14 +13072,11 @@ def _uncapped_kelly(rec: dict, k: float) -> float | None:
     if net <= 0:
         return None
     b = net / (price_a + price_b + fee)
-    if rec["pair_type"] == "time_series":
-        if (e["pA"] + e["nA"] < 1.0 - PRICE_EPSILON
-                or e["pB"] + e["nB"] < 1.0 - PRICE_EPSILON):
-            return None
-        p = time_series_profit_prob(
-            time_series_mid_spread(e["pA"], e["nA"], e["pB"], e["nB"]), k=k)
-    else:
-        p = SAME_TITLE_CO_RESOLVE_PROB
+    if (e["pA"] + e["nA"] < 1.0 - PRICE_EPSILON
+            or e["pB"] + e["nB"] < 1.0 - PRICE_EPSILON):
+        return None
+    p = time_series_profit_prob(
+        time_series_mid_spread(e["pA"], e["nA"], e["pB"], e["nB"]), k=k)
     return p - (1.0 - p) / b
 
 
@@ -14042,7 +13090,7 @@ def _completion_lines(caplog) -> list[str]:
 class TestSizeCap:
     """_simulate_at_discount(size_cap=..., quiet=...): the per-trade Kelly cap
     as a simulation parameter, defaulting to BUDGET_FRACTION at call time.
-    Figures are at pre_toggle_defaults (a 20% cap, no same-title cap, k 0.75)."""
+    Figures are at pre_toggle_defaults (a 20% cap, k 0.75)."""
 
     _START = date(2026, 1, 1)
 
@@ -14144,18 +13192,20 @@ class TestSizeCap:
         golden = TestPrepareEntriesGolden()
         entries, _ = golden._prepare(monkeypatch, True)
         for k in (0.5, 0.75, 1.0):
-            expected = max(f for f in (_uncapped_kelly(r, k) for r in entries)
-                           if f is not None and f > 0)
+            # At k = 1.0 no entry passes the Kelly gate, so the peak is 0.0
+            expected = max((f for f in (_uncapped_kelly(r, k) for r in entries)
+                            if f is not None and f > 0), default=0.0)
             peaks = {self._sim(entries, k=k, size_cap=cap).peak_kelly_fraction
                      for cap in (0.05, backtester.BUDGET_FRACTION, 1.0)}
             # ... the same at every cap: Pass 1b scores before any sizing
             assert len(peaks) == 1
             assert peaks.pop() == pytest.approx(expected, abs=1e-12)
-        # The same-title pair (f* ~0.77) is the golden peak at k = 0.75
-        st = next(r for r in entries if r["pair_type"] == "same_title")
-        assert self._sim(entries).peak_kelly_fraction == pytest.approx(
-            _uncapped_kelly(st, 0.75), abs=1e-12)
-        assert _uncapped_kelly(st, 0.75) == pytest.approx(0.77, abs=0.01)
+        # WA/WB (f* ~0.249; voided, so dropped after the gate) is the golden
+        # peak at k = 0.75, above EA/EB's ~0.162 and the ladder's ~0.194
+        f = {r["entry"]["mA"]["ticker"]: _uncapped_kelly(r, 0.75) for r in entries}
+        assert self._sim(entries).peak_kelly_fraction == pytest.approx(f["WA"], abs=1e-12)
+        assert (f["WA"], f["EA"], f["RUNG-EARLY"]) == pytest.approx((0.249, 0.162, 0.194),
+                                                                   abs=1e-3)
 
     def test_a_candidate_dropped_after_the_kelly_gate_still_counts(self, monkeypatch):
         # The golden fixture's two voided pairs never trade. At k = 0.75 WA/WB
@@ -14174,71 +13224,6 @@ class TestSizeCap:
         assert _uncapped_kelly(ta, 0.75) is None
         assert point.peak_kelly_fraction == pytest.approx(_uncapped_kelly(wa, 0.75), abs=1e-12)
         assert point.peak_kelly_fraction == pytest.approx(0.249, abs=1e-3)
-
-    def test_the_same_title_cap_binds_same_title_only(self, monkeypatch):
-        # SAME_TITLE_SIZE_CAP (backtester's binding, read at call time, applied
-        # through config.pair_size_cap) caps every same-title candidate at every
-        # cap and never a time-series one. The golden same-title f* is ~0.77.
-        golden = TestPrepareEntriesGolden()
-        entries, _ = golden._prepare(monkeypatch, True)
-        st = [r for r in entries if r["pair_type"] == "same_title"]
-        st_f = _uncapped_kelly(st[0], backtester.TIME_SERIES_INTERVAL_PROB_DISCOUNT)
-        assert st_f == pytest.approx(0.77, abs=0.01)
-        monkeypatch.setattr(backtester, "SAME_TITLE_SIZE_CAP", 1.0)
-        no_extra = self._sim(st, size_cap=1.0)
-        assert [t.kelly_fraction for t in no_extra.trades] == [pytest.approx(st_f)]
-        monkeypatch.setattr(backtester, "SAME_TITLE_SIZE_CAP", 0.2)
-        capped = self._sim(st, size_cap=1.0)
-        assert [t.kelly_fraction for t in capped.trades] == [pytest.approx(0.2)]
-        assert capped.trades[0].n < no_extra.trades[0].n
-        # A sizing cap only: the peak stays the uncapped f* the cap sweep seeds on
-        assert capped.peak_kelly_fraction == no_extra.peak_kelly_fraction
-        assert capped.size_cap == 1.0
-        # The tighter of the two caps binds
-        assert self._sim(st, size_cap=0.05).trades[0].kelly_fraction == pytest.approx(0.05)
-        # A time-series candidate never reads it: the wide-gap f* (~0.216) sizes in full
-        ts = self._entries(monkeypatch)
-        ts_f = _uncapped_kelly(ts[0], backtester.TIME_SERIES_INTERVAL_PROB_DISCOUNT)
-        assert ts_f > 0.2
-        assert self._sim(ts, size_cap=1.0).trades[0].kelly_fraction == pytest.approx(ts_f)
-
-    # Values config.LiveSettings refuses for a same-title cap. Unvalidated,
-    # pair_size_cap's min() would read NaN as no cap (min(1.0, nan) is 1.0), 0
-    # or below as no same-title trade, and None would raise deep in Pass 1b
-    _INVALID_ST_CAPS = [float("nan"), 0, 0.0, -0.5, 1.5, float("inf"), True,
-                        np.bool_(True), "0.2", Decimal("0.2"), None, np.float64("nan")]
-
-    @pytest.mark.parametrize("st_cap", _INVALID_ST_CAPS)
-    def test_an_invalid_same_title_cap_raises_before_any_entry_is_scored(
-        self, monkeypatch, st_cap,
-    ):
-        entries = self._entries(monkeypatch)
-        monkeypatch.setattr(backtester, "SAME_TITLE_SIZE_CAP", st_cap)
-        monkeypatch.setattr(backtester, "time_series_profit_prob",
-                            lambda *a, **k: pytest.fail("an entry was scored"))
-        with pytest.raises(ValueError, match="SAME_TITLE_SIZE_CAP"):
-            self._sim(entries, size_cap=1.0)
-
-    @pytest.mark.parametrize("st_cap", _INVALID_ST_CAPS)
-    def test_an_invalid_same_title_cap_fails_the_sweep_before_any_log_or_fetch(
-        self, monkeypatch, caplog, st_cap,
-    ):
-        monkeypatch.setattr(backtester, "SAME_TITLE_SIZE_CAP", st_cap)
-        monkeypatch.setattr(backtester, "_prepare_candidates",
-                            lambda *a, **k: pytest.fail("the fetch ran"))
-        with caplog.at_level(logging.DEBUG), \
-                pytest.raises(ValueError, match="SAME_TITLE_SIZE_CAP"):
-            run_backtest_sweep(MagicMock(), MagicMock(), self._START, 10_000.0)
-        assert caplog.records == []
-
-    @pytest.mark.parametrize("st_cap,value", [
-        (np.float64(0.35), 0.35), (Fraction(1, 4), 0.25), (1, 1.0),
-    ])
-    def test_a_real_same_title_cap_resolves_to_a_builtin_float(self, monkeypatch, st_cap,
-                                                               value):
-        monkeypatch.setattr(backtester, "SAME_TITLE_SIZE_CAP", st_cap)
-        resolved = backtester._resolve_same_title_size_cap()
-        assert resolved == value and type(resolved) is float
 
     def test_the_peak_is_zero_when_nothing_passes_the_kelly_gate(self, monkeypatch):
         entries = self._entries(monkeypatch)
@@ -14431,16 +13416,17 @@ class TestSizeCap:
         entries, _ = golden._prepare(monkeypatch, True)
         first = [r for r in entries if r["entry"]["entry_date"] < date(2026, 1, 12)]
         second = [r for r in entries if r["entry"]["entry_date"] >= date(2026, 1, 12)]
-        split = backtester._half_split((first, second), golden._START, 10_000.0, 0.75,
+        split = backtester._half_split((first, second), golden._START, 10_000.0, 0.5,
                                        BACKTEST_DEFAULT_SPREAD_BAND, size_cap=1.0)
-        default = backtester._half_split((first, second), golden._START, 10_000.0, 0.75,
+        default = backtester._half_split((first, second), golden._START, 10_000.0, 0.5,
                                          BACKTEST_DEFAULT_SPREAD_BAND)
-        alone = backtester._simulate_at_discount(first, golden._START, 10_000.0, k=0.75,
+        alone = backtester._simulate_at_discount(first, golden._START, 10_000.0, k=0.5,
                                                  size_cap=1.0)
         final = float(alone.equity_df["portfolio_value"].iloc[-1])
         assert split.h1_return == pytest.approx((final - 10_000.0) / 10_000.0)
-        # Not vacuous: the first half's same-title trade (f* ~0.77) sizes
-        # bigger with no cap, so the two halves' returns differ
+        # Not vacuous: at k = 0.5 the first half's EA/EB trade (f* ~0.44) sizes
+        # bigger with no cap than at the 20% cap, so the two halves' returns
+        # differ
         assert split.h1_return != default.h1_return
 
     def test_half_split_quiet_sends_both_halves_to_debug(self, monkeypatch, caplog):
@@ -14615,8 +13601,8 @@ class TestCapSweep:
     def test_the_eager_points_are_unchanged_by_the_flag(self, cap_sweep_run):
         on, off = cap_sweep_run.on, cap_sweep_run.off
         assert len(on.scenarios) == len(off.scenarios) > 0
-        for a, b in zip([on.primary, on.same_title_point, *on.scenarios],
-                        [off.primary, off.same_title_point, *off.scenarios], strict=True):
+        for a, b in zip([on.primary, *on.scenarios], [off.primary, *off.scenarios],
+                        strict=True):
             assert (a.spread_band, a.k, a.population) == (b.spread_band, b.k, b.population)
             assert [astuple(t) for t in a.trades] == [astuple(t) for t in b.trades]
             pd.testing.assert_frame_equal(a.equity_df, b.equity_df)
@@ -14636,20 +13622,8 @@ class TestCapSweep:
         # The eager seeds are exactly the sweep's scenarios, by identity
         assert cs.eager.keys() == self._eager(on).keys()
         assert all(cs.eager[key] is point for key, point in self._eager(on).items())
-        assert cs.same_title_eager is on.same_title_point
         # Nothing simulated yet — every cap cell is lazy
         assert (cs.simulated, cs.reused) == (0, 0)
-
-    def test_the_pinned_toggles_hold_through_every_cell_read(self, cap_sweep_run):
-        # Must stay after test_the_cap_sweep_s_shape, which asserts nothing is
-        # simulated yet: this read simulates. The parity checks cannot see the
-        # toggles undone too early, so check one directly: at "no cap" the golden
-        # same-title pair sizes at its full f* (~0.77), which the shipped 0.20
-        # same-title cap would prevent
-        st = cap_sweep_run.on.cap_sweep.same_title()
-        [trade] = st[1.0].trades
-        assert trade.kelly_fraction == pytest.approx(0.77, abs=0.01)
-        assert trade.kelly_fraction > 0.2
 
     def test_each_population_s_primary_cap_point_is_the_eager_object(self, cap_sweep_run):
         on = cap_sweep_run.on
@@ -14670,8 +13644,6 @@ class TestCapSweep:
         assert ts.peak_kelly_fraction == 0.0
         assert eager[((0.0, 1.0), 1.0, "ladder")].peak_kelly_fraction == 0.0
         assert low_peaks > 0
-        st = on.cap_sweep.same_title()
-        assert st[self._PRIMARY_CAP] is on.same_title_point
 
     def test_every_cap_equals_a_fresh_simulation(self, cap_sweep_run):
         on, start = cap_sweep_run.on, cap_sweep_run.start
@@ -14686,12 +13658,6 @@ class TestCapSweep:
                     self._assert_parity(point, subsets[pop], start, k, band, pop, cap,
                                         on.split_date, checks=True, end_date=end)
                     checked += 1
-        st_end = backtester._curve_end_date(cs.same_title_eager)
-        for cap, point in cs.same_title().items():
-            self._assert_parity(point, cs.st_entries, start, cs.primary_k, None,
-                                "same_title", cap, on.split_date, checks=True,
-                                end_date=st_end)
-            checked += 1
         assert checked > 500
 
     @staticmethod
@@ -14749,15 +13715,16 @@ class TestCapSweep:
                     assert first.trades is not eager.trades
                     assert all(p.trades is first.trades for p in points)
                     assert all(p.equity_df is first.equity_df for p in points)
-        # Both regimes occur in the fixture: at k = 0.75 the "all" population's
-        # peak is the same-title f* ~0.77, far above the 20% cap
+        # Both regimes occur in the fixture: at k = 0.5 every population's peak
+        # (an f* of 0.44 to 0.50) sits above the 20% cap, while at k = 1.0 no
+        # Monday passes the Kelly gate and every peak is 0.0
         assert seeded > 0 and capped > 0
 
     def test_the_simulated_count_is_the_caps_below_the_seeds(self, cap_sweep_run):
         on = cap_sweep_run.on
         cs = on.cap_sweep
         expected_sim = expected_reuse = 0
-        eager_points = [*self._eager(on).values(), on.same_title_point]
+        eager_points = list(self._eager(on).values())
         for eager in eager_points:
             seed = eager.peak_kelly_fraction
             below = [c for c in cs.caps if c < seed and c != cs.primary_cap]
@@ -14768,7 +13735,6 @@ class TestCapSweep:
         before = (cs.simulated, cs.reused)
         for _band, _k, _cell in self._cells(on):
             pass
-        cs.same_title()
         assert (cs.simulated - before[0], cs.reused - before[1]) == (
             expected_sim, expected_reuse)
         assert expected_sim < len(eager_points) * (len(cs.caps) - 1)
@@ -14776,8 +13742,7 @@ class TestCapSweep:
     def test_entry_events_cover_every_trade_s_event_and_category(self, cap_sweep_run):
         on = cap_sweep_run.on
         events = on.cap_sweep.entry_events()
-        traded = {(t.event_ticker, t.category)
-                  for p in [*on.scenarios, on.same_title_point] for t in p.trades}
+        traded = {(t.event_ticker, t.category) for p in on.scenarios for t in p.trades}
         assert traded and traded <= events
         assert {ev for ev, _cat in events} == {
             r["entry"]["mA"]["event_ticker"]
@@ -14800,8 +13765,6 @@ class TestCapSweep:
                                     cs.entries_by_band[BACKTEST_DEFAULT_SPREAD_BAND],
                                     start, k, BACKTEST_DEFAULT_SPREAD_BAND, "all", cap, None,
                                     checks=False, end_date=backtester._curve_end_date(eager))
-        # No band sweep, no same-title population of its own
-        assert cs.same_title() == {}
 
     def test_a_checked_cell_s_cap_runs_stay_out_of_the_info_log(self, cap_sweep_run, caplog):
         # A band-sweep cell: its "all" and "time_series" cap points each run a
@@ -14815,7 +13778,6 @@ class TestCapSweep:
         with caplog.at_level(logging.DEBUG):
             for k in (0.75, 1.0):
                 cs.cell((0.0, 1.0), k)
-            cs.same_title()
         assert cs.simulated > before
         assert not [(r.levelname, r.getMessage()) for r in caplog.records
                     if r.levelno >= logging.INFO]
@@ -14823,138 +13785,11 @@ class TestCapSweep:
         done = [r.getMessage() for r in caplog.records
                 if r.getMessage().startswith("Backtest complete")]
         for run in ("all", "all/H1", "all/H2", "all/ex-top", "time_series",
-                    "time_series/H1", "time_series/H2", "time_series/ex-top", "same_title"):
+                    "time_series/H1", "time_series/H2", "time_series/ex-top"):
             assert any(f", {run}, cap " in m for m in done), run
         # (The golden fixture settles no premise-violating candidate, so the
         # premise WARNING's DEBUG level is pinned directly, on _half_split and
         # _simulate_at_discount, in TestSizeCap.)
-
-
-@pytest.fixture(scope="class")
-def st_cap_sweep_run():
-    """cap_sweep_run's narrowed golden band sweep, with cap_sweep=True, at
-    config.py's shipped caps — backtester.BUDGET_FRACTION 1.0 (no per-trade
-    cap) and SAME_TITLE_SIZE_CAP 0.2 — its one difference from cap_sweep_run.
-    Both caps sit over apply_pre_toggle_defaults on the toggles MonkeyPatch,
-    which outlasts mp because the lazy cells read them at call time."""
-    toggles = pytest.MonkeyPatch()
-    mp = pytest.MonkeyPatch()
-    try:
-        apply_pre_toggle_defaults(toggles)
-        toggles.setattr(backtester, "BUDGET_FRACTION", 1.0)
-        toggles.setattr(backtester, "SAME_TITLE_SIZE_CAP", 0.2)
-        golden = TestPrepareEntriesGolden()
-        golden._patch(mp)
-        mp.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.35))
-        mp.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.5, 1.0))
-        mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5, 1.0))
-        on = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
-                                start_date=golden._START, initial_balance=10_000.0,
-                                same_event_ladders=True, band_sweep=True, cap_sweep=True)
-        mp.undo()
-        yield SimpleNamespace(on=on, start=golden._START)
-    finally:
-        mp.undo()
-        toggles.undo()
-
-
-@pytest.mark.usefixtures("st_cap_sweep_run")
-class TestCapSweepSameTitleCap:
-    """The size-cap sweep with SAME_TITLE_SIZE_CAP tighter than the per-trade
-    cap. At every cap C a same-title candidate sizes at most
-    min(C, SAME_TITLE_SIZE_CAP) (config.pair_size_cap). Reuse still holds —
-    at a cap C at or above a point's peak f*, a candidate sizes at f*
-    (time-series) or min(SAME_TITLE_SIZE_CAP, f*) (same-title), neither
-    depending on C — so every cap of every cell must equal a fresh
-    simulation, shared copies included."""
-
-    def test_the_run_records_both_caps(self, st_cap_sweep_run):
-        on = st_cap_sweep_run.on
-        assert on.primary.size_cap == 1.0
-        assert on.same_title_size_cap == 0.2
-        cs = on.cap_sweep
-        assert cs.primary_cap == 1.0 and cs.caps == backtester.SIZE_CAP_SWEEP
-        # Every same-title trade the eager run made sits at the 20% cap
-        st_trades = [t for p in [*on.scenarios, on.same_title_point] for t in p.trades
-                     if t.pair_type == "same_title"]
-        assert st_trades
-        assert all(t.kelly_fraction == pytest.approx(0.2) for t in st_trades)
-        # ... while that cap never reaches a time-series trade: some size above 20%
-        ts_trades = [t for p in on.scenarios for t in p.trades
-                     if t.pair_type == "time_series"]
-        assert any(t.kelly_fraction > 0.2 + 1e-9 for t in ts_trades)
-
-    def test_every_cap_equals_a_fresh_simulation(self, st_cap_sweep_run):
-        on, start = st_cap_sweep_run.on, st_cap_sweep_run.start
-        cs = on.cap_sweep
-        checked = st_capped = ts_above = 0
-        for band in cs.bands:
-            for k in cs.ks:
-                cell = cs.cell(band, k)
-                subsets = _cap_sweep_subsets(cs.entries_by_band[band])
-                for cap in cs.caps:
-                    for pop, point in cell[cap].items():
-                        end = backtester._curve_end_date(cs.eager[(band, k, pop)])
-                        TestCapSweep._assert_parity(point, subsets[pop], start, k, band, pop,
-                                                    cap, on.split_date, checks=True,
-                                                    end_date=end)
-                        checked += 1
-                        for t in point.trades:
-                            if t.pair_type == "same_title":
-                                assert t.kelly_fraction <= min(cap, 0.2) + 1e-12
-                                st_capped += t.kelly_fraction == pytest.approx(0.2)
-                            else:
-                                # Parity cannot catch the same-title cap
-                                # leaking onto these (a fresh run would leak
-                                # it too), so only the cap bounds them
-                                assert t.kelly_fraction <= cap + 1e-12
-                                ts_above += t.kelly_fraction > 0.2 + 1e-9
-        st_end = backtester._curve_end_date(cs.same_title_eager)
-        for cap, point in cs.same_title().items():
-            TestCapSweep._assert_parity(point, cs.st_entries, start, cs.primary_k, None,
-                                        "same_title", cap, on.split_date, checks=True,
-                                        end_date=st_end)
-            checked += 1
-        assert checked > 500
-        # Not vacuous: the same-title cap bound, and time-series trades sized above it
-        assert st_capped > 0
-        assert ts_above > 0
-
-    def test_a_population_holding_same_title_trades_reuses_the_eager_point(
-        self, st_cap_sweep_run,
-    ):
-        # The primary cap (1.0) reaches every peak, so every other cap at or
-        # above the same-title peak f* (~0.77) copies the eager point, sized at 20%
-        cs = st_cap_sweep_run.on.cap_sweep
-        before = cs.reused
-        points = cs.same_title()
-        assert cs.reused > before
-        eager = cs.same_title_eager
-        assert eager.trades and eager.peak_kelly_fraction > 0.2
-        shared = [c for c, p in points.items()
-                  if c >= eager.peak_kelly_fraction and p is not eager]
-        assert shared
-        for cap in shared:
-            assert points[cap].trades is eager.trades
-            assert points[cap].size_cap == cap
-        assert all(t.kelly_fraction == pytest.approx(0.2) for t in eager.trades)
-        # ... and on a cell's "all" population (checked alone: its time-series
-        # populations reuse on their own) exactly the non-primary caps at or
-        # above its peak f* (~0.77) share the eager point's trades
-        on = st_cap_sweep_run.on
-        band, k = on.primary.spread_band, on.primary.k
-        cell = cs.cell(band, k)
-        eager_all = cs.eager[(band, k, "all")]
-        assert cell[cs.primary_cap]["all"] is eager_all
-        assert any(t.pair_type == "same_title" for t in eager_all.trades)
-        assert eager_all.peak_kelly_fraction > 0.2
-        shared = [c for c in cs.caps
-                  if c != cs.primary_cap and cell[c]["all"].trades is eager_all.trades]
-        assert shared
-        assert shared == [c for c in cs.caps
-                          if c != cs.primary_cap and c >= eager_all.peak_kelly_fraction]
-        for cap in shared:
-            assert cell[cap]["all"] is not eager_all and cell[cap]["all"].size_cap == cap
 
 
 class TestCapSweepSeeding:
@@ -14985,7 +13820,7 @@ class TestCapSweepSeeding:
         cs = backtester.CapSweep(
             caps=caps, primary_cap=0.2, bands=(self._BAND,), ks=(0.75,), primary_k=0.75,
             start_date=date(2026, 1, 1), initial_balance=100.0, split_date=None,
-            checks=False, entries_by_band={self._BAND: []}, st_entries=[], eager=eager)
+            checks=False, entries_by_band={self._BAND: []}, eager=eager)
         by_cap = {cap: pops["all"] for cap, pops in cs.cell(self._BAND, 0.75).items()}
         return cs, eager.get((self._BAND, 0.75, "all")), by_cap, simulated
 
@@ -15071,7 +13906,6 @@ class TestCapSweepEndDate:
         points = [(cap, pop, point)
                   for k in cs.ks for cap, by_pop in cs.cell((0.0, 1.0), k).items()
                   for pop, point in by_pop.items()]
-        points += [(cap, "same_title", point) for cap, point in cs.same_title().items()]
         # Not vacuous: caps were simulated after midnight, across populations
         assert cs.simulated > before
         eager_rows = len(run.primary.equity_df)
@@ -15102,7 +13936,9 @@ class TestCapSweepEndDate:
                 peak_kelly_fraction=0.4)
 
         monkeypatch.setattr(backtester, "_simulate_at_discount", fake_simulate)
-        entries = [{"pair_type": "same_title", "entry": {
+        # A cross-event time-series entry: the "all", "time_series" and
+        # "cross" populations each hold it, and each has an eager point
+        entries = [{"pair_type": "time_series", "entry": {
             "mA": {"event_ticker": "E1"}, "mB": {"event_ticker": "E2"},
             "entry_date": date(2026, 1, 5)}}]
         eager = backtester.SweepPoint(
@@ -15113,11 +13949,14 @@ class TestCapSweepEndDate:
             caps=(0.1, 0.2), primary_cap=0.2, bands=(band,), ks=(0.75,), primary_k=0.75,
             start_date=date(2026, 1, 1), initial_balance=100.0,
             split_date=date(2026, 1, 1), checks=True, entries_by_band={band: entries},
-            st_entries=[], eager={(band, 0.75, "all"): eager})
+            eager={(band, 0.75, pop): eager for pop in ("all", "time_series", "cross")})
         cs.cell(band, 0.75)
-        # The 10% cap's run, its two halves and its top-event re-simulation
+        # The 10% cap's run of each population, and the two checked
+        # populations' two halves and top-event re-simulation
         assert seen == [("all", day), ("all/H1", day), ("all/H2", day),
-                        ("all/ex-top", day)]
+                        ("all/ex-top", day), ("time_series", day),
+                        ("time_series/H1", day), ("time_series/H2", day),
+                        ("time_series/ex-top", day), ("cross", day)]
 
     @pytest.mark.parametrize("frame", [
         pd.DataFrame({"portfolio_value": [100.0]}),       # no "date" column
@@ -15142,7 +13981,7 @@ class TestCapSweepEndDate:
 @pytest.mark.usefixtures("pre_toggle_defaults")
 class TestCapSweepLogging:
     """The run names its per-trade cap and whether the cap sweep rides it (at
-    pre_toggle_defaults, so the default line has no same-title clause)."""
+    pre_toggle_defaults)."""
 
     def test_the_cap_line_follows_the_band_line_and_the_infeasible_run_has_none(
         self, monkeypatch, caplog,
@@ -15161,34 +14000,21 @@ class TestCapSweepLogging:
         assert cap == band + 1
         assert res.cap_sweep is None
 
-    def test_the_cap_line_names_the_same_title_cap_only_when_it_binds_tighter(
-        self, monkeypatch, caplog,
-    ):
-        # Only a same-title cap tighter than the per-trade cap is named; the
-        # infeasible construction records the value either way
+    def test_the_cap_line_names_the_per_trade_cap_alone(self, monkeypatch, caplog):
+        # The backtest simulates time-series pairs only, and there is no
+        # same-title cap anywhere: the line names the per-trade cap alone and
+        # the run records no other
         monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
-        base = ("Per-trade size cap (backtest): "
-                f"{backtester._cap_percent(backtester.BUDGET_FRACTION)}% "
-                "(config.BUDGET_FRACTION)")
-
-        def run(st_cap):
-            monkeypatch.setattr(backtester, "SAME_TITLE_SIZE_CAP", st_cap)
-            caplog.clear()
-            with caplog.at_level(logging.INFO):
-                res = run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0)
-            lines = [r.getMessage() for r in caplog.records
-                     if r.getMessage().startswith("Per-trade size cap")]
-            assert len(lines) == 1
-            return lines[0], res
-
-        for st_cap in (1.0, backtester.BUDGET_FRACTION):
-            line, res = run(st_cap)
-            assert line == base + "; size-cap sweep off"
-            assert res.same_title_size_cap == st_cap
-        line, res = run(0.10)
-        assert line == (base + ", same-title never above 10% (config.SAME_TITLE_SIZE_CAP); "
-                        "size-cap sweep off")
-        assert res.same_title_size_cap == 0.10
+        assert not hasattr(config, "SAME_TITLE_SIZE_CAP")
+        with caplog.at_level(logging.INFO):
+            res = run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0)
+        lines = [r.getMessage() for r in caplog.records
+                 if r.getMessage().startswith("Per-trade size cap")]
+        assert lines == ["Per-trade size cap (backtest): "
+                         f"{backtester._cap_percent(backtester.BUDGET_FRACTION)}% "
+                         "(config.BUDGET_FRACTION); size-cap sweep off"]
+        assert not hasattr(res, "same_title_size_cap")
+        assert not hasattr(backtester, "SAME_TITLE_SIZE_CAP")
 
     def test_the_cap_sweep_summary_names_every_cap(self, monkeypatch, caplog):
         golden = TestPrepareEntriesGolden()
@@ -15296,10 +14122,10 @@ class TestLiveRuleLine:
         assert messages[-1].startswith(self._PREFIX)
         assert any(m.startswith("Size-cap sweep:") for m in messages[:-1])
 
-    # The thirteen fields a saved-defaults read records, all or none
+    # The twelve fields a saved-defaults read records, all or none
     _LIVE_FIELDS = ("live_tier_floors", "live_spread_band", "live_exclude_categories", "live_exclude_tags",
                     "live_origin", "live_interval_discount", "live_size_cap",
-                    "live_same_title_size_cap", "live_rebalance", "live_min_price_move",
+                    "live_rebalance", "live_min_price_move",
                     "live_rebalance_min_days_to_maturity", "live_sell_at", "live_sell_min_days")
 
     @pytest.mark.parametrize("feasible", [False, True])
@@ -15355,13 +14181,14 @@ class TestLiveRuleLine:
             "when this run started, and live runs refuse to start without them")
         assert bool(res.calibrations_by_band) is feasible
 
-    def test_the_thirteen_fields_are_recorded_from_one_read(self, monkeypatch, caplog):
+    def test_the_twelve_fields_are_recorded_from_one_read(self, monkeypatch, caplog):
         from kalshi_betting import config
         saved = config.save_live_defaults(
-            config.LiveSettings(False, (0.1, 0.8), 0.6, 0.35, 0.25, ("Economics",), ("Fed",),
+            config.LiveSettings(tier_floors=False, spread_band=(0.1, 0.8), interval_discount=0.6,
+                                size_cap=0.35,
+                                exclude_categories=("Economics",), exclude_tags=("Fed",),
                                 rebalance=True, min_price_move=0.10,
-                                rebalance_min_days_to_maturity=7,
-                                sell_at=0.85, sell_min_days=3),
+                                rebalance_min_days_to_maturity=7, sell_at=0.85, sell_min_days=3),
             source="a note")
         reads: list = []
         real = config.read_saved_live_defaults
@@ -15384,16 +14211,18 @@ class TestLiveRuleLine:
             "live_tier_floors": False, "live_spread_band": (0.1, 0.8),
             "live_exclude_categories": ("Economics",), "live_exclude_tags": ("Fed",),
             "live_origin": saved.origin, "live_interval_discount": 0.6,
-            "live_size_cap": 0.35, "live_same_title_size_cap": 0.25,
+            "live_size_cap": 0.35,
             "live_rebalance": True, "live_min_price_move": 0.10,
             "live_rebalance_min_days_to_maturity": 7,
             "live_sell_at": 0.85, "live_sell_min_days": 3}
+        # There is no same-title cap to save or record
+        assert not hasattr(res, "live_same_title_size_cap")
 
-    def test_the_live_rule_fields_are_thirteen_keys_or_none(self):
+    def test_the_live_rule_fields_are_twelve_keys_or_none(self):
         from kalshi_betting import config
         assert backtester._live_rule_fields(None) == {}
         fields = backtester._live_rule_fields(config.LIVE_DEFAULTS_SEED)
-        assert tuple(fields) == self._LIVE_FIELDS and len(fields) == 13
+        assert tuple(fields) == self._LIVE_FIELDS and len(fields) == 12
         # Each is a BacktestSweep field, so it can be passed straight to the sweep
         assert set(fields) <= set(backtester.BacktestSweep.__dataclass_fields__)
         assert fields["live_origin"] == config.LIVE_DEFAULTS_SEED.origin
@@ -15584,8 +14413,8 @@ class TestLiveRuleLine:
             10_000.0, sweep=res).read_text(encoding="utf-8")
         found = re.findall(r"Live rule \(saved live defaults\): ([^<]*)</p>", page)
         assert len(found) == 1
-        assert found[0].startswith(html.escape(rule, quote=False) + "; ")
-        assert found[0].endswith(" — " + page_tail)
+        # The rule, then where the page shows it, as the log line words it
+        assert found[0] == html.escape(rule, quote=False) + " — " + page_tail
         # The log's verdict and the page's are the one verdict
         where = backtester._live_rule_view(res).where
         assert line.endswith("— not simulated by this run") == (
@@ -15611,33 +14440,32 @@ class TestLiveRuleLine:
         config.save_live_defaults(config.LIVE_DEFAULTS_SEED, source="")
         res = self._infeasible(monkeypatch, caplog)
         assert res.live_size_cap == 0.10 and res.primary.size_cap != 0.10
-        run = (f"k {config._exact_number(res.primary.k)}, per-trade cap "
-               f"{config._cap_text(res.primary.size_cap, 'no cap')} and same-title cap "
-               f"{config._cap_text(res.same_title_size_cap, 'no extra cap')}")
+        run = (f"k {config._exact_number(res.primary.k)} and per-trade cap "
+               f"{config._cap_text(res.primary.size_cap, 'no cap')}")
         # The seed also rebalances, so its note follows the sizing note
         assert self._line(caplog).endswith(
-            "; the live defaults size at k 0.8, per-trade cap 10% and same-title cap 20%, "
+            "; the live defaults size at k 0.8 and per-trade cap 10%, "
             f"where this run's primary sized at {run}"
             "; the live defaults rebalance held pairs, which this run's primary does not")
 
     def test_no_sizing_note_when_the_saved_sizing_is_the_runs(self, monkeypatch, caplog):
-        # _live saves config.py's own k and caps, which this run sized at too
+        # _live saves config.py's own k and per-trade cap, which this run sized
+        # at too
         self._live(monkeypatch, True, (0.0, 1.0))
         res = self._infeasible(monkeypatch, caplog)
-        assert (res.live_interval_discount, res.live_size_cap,
-                res.live_same_title_size_cap) == (res.primary.k, res.primary.size_cap,
-                                                  res.same_title_size_cap)
+        assert (res.live_interval_discount, res.live_size_cap) == (res.primary.k,
+                                                                    res.primary.size_cap)
         assert "the live defaults size at" not in self._line(caplog)
 
     def test_the_sizing_note_needs_every_value_recorded(self):
         from kalshi_betting import config
         point = backtester._simulate_at_discount([], date(2026, 1, 5), 1000.0)
         sweep = backtester.BacktestSweep(
-            primary=point, points=[point], calibration=None, same_title_size_cap=0.2,
+            primary=point, points=[point], calibration=None,
             **backtester._live_rule_fields(config.LIVE_DEFAULTS_SEED))
         assert backtester._live_sizing_note(sweep).startswith("; the live defaults size at ")
         # One unrecorded value on either side: nothing to compare
-        for changes in ({"live_size_cap": None}, {"same_title_size_cap": None},
+        for changes in ({"live_size_cap": None}, {"live_interval_discount": None},
                         {"primary": dc_replace(point, size_cap=None)}):
             assert backtester._live_sizing_note(dc_replace(sweep, **changes)) == ""
 
@@ -15877,7 +14705,8 @@ class TestLiveRuleLine:
         from kalshi_betting import config
         for categories, tags in [(None, None), (("Economics",), None), (None, ("Fed",)),
                                  (("Oil, Gas", "Sports"), ("a|b",))]:
-            settings = config.LiveSettings(True, (0.0, 1.0), 0.75, 0.2,
+            settings = config.LiveSettings(tier_floors=True, spread_band=(0.0, 1.0),
+                                           interval_discount=0.75, size_cap=0.2,
                                            exclude_categories=categories, exclude_tags=tags)
             assert backtester._live_filter_text(categories, tags) == \
                 config.describe_trade_filter(settings)
@@ -16219,13 +15048,6 @@ class TestTierFloorsOff:
             for hi in SPREAD_BAND_SWEEP_CEILINGS:
                 assert self._entry("FA", "FB", "time_series", (lo, hi), False) is None
 
-    def test_same_title_enters_identically_either_way(self):
-        default = self._entry("SA", "SB", "same_title", None, True)
-        assert default is not None
-        for band in _GRID_BANDS:
-            for tier_floors in (True, False):
-                assert self._entry("SA", "SB", "same_title", band, tier_floors) == default
-
     def test_a_tier_off_simulation_is_named_and_stamped_as_one(self, caplog, monkeypatch):
         with caplog.at_level(logging.INFO):
             off = backtester._simulate_at_discount([], date(2026, 1, 1), 1000.0, k=0.75,
@@ -16320,7 +15142,6 @@ def golden_tier_off_sweep():
             out = real_entries(candidates, spread_band, **kw)
             calls["entries"].append({
                 "band": spread_band,
-                "pair_types": kw.get("pair_types", ("time_series", "same_title")),
                 "tier_floors": kw.get("tier_floors", True),
                 "pairs": kw.get("_pairs"), "out": out})
             return out
@@ -16414,7 +15235,6 @@ class TestTierOffSweep:
                 self._same_point(a, b)
         assert res.calibration == plain.calibration
         assert res.calibrations_by_band == plain.calibrations_by_band
-        self._same_point(res.same_title_point, plain.same_title_point)
         assert res.split_date == plain.split_date == date(2026, 1, 5)
         assert res.same_event_ladders is plain.same_event_ladders is True
 
@@ -16424,8 +15244,7 @@ class TestTierOffSweep:
         assert sorted({p.spread_band for p in off}) == _TIER_BOUND_BANDS
         assert sorted(res.tier_off_calibrations_by_band) == _TIER_BOUND_BANDS
         assert all(p.tier_floors is False for p in off)
-        assert all(p.tier_floors is True
-                   for p in [res.primary, *res.points, *res.scenarios, res.same_title_point])
+        assert all(p.tier_floors is True for p in [res.primary, *res.points, *res.scenarios])
         # Every bound band x k has all four populations (the ladder enters at
         # every bound band, and EA/EB keeps the cross population non-empty)
         cells = sorted((b, k) for b in _TIER_BOUND_BANDS for k in INTERVAL_DISCOUNT_SWEEP)
@@ -16434,14 +15253,22 @@ class TestTierOffSweep:
         assert len(off) == 18 * 13 * 4
         # The checks sit where the tier-on sweep puts them: halves on every
         # "all" and "time_series" point, ex-top wherever a trade names an
-        # event (every "all" point trades the same-title pair's)
+        # event
         for p in off:
             if p.population in ("all", "time_series"):
                 assert p.halves is not None
                 assert (p.ex_top_event is not None) == any(t.event_ticker for t in p.trades)
             else:
                 assert p.halves is None and p.ex_top_event is None
-        assert all(p.ex_top_event is not None for p in off if p.population == "all")
+        # ... which is every "all" point but those at k = 0.95 and 1.00, where
+        # nothing trades: the ladder's and EA/EB's Kelly fractions are
+        # negative there on every Monday (the ladder's best, from Monday 2,
+        # is -0.022 at 0.95), the gate skips TA/TB (its later quote is
+        # crossed), and WA/WB, which passes it at 0.95, is voided and dropped
+        # after it
+        assert sorted((p.spread_band, p.k) for p in off
+                      if p.population == "all" and p.ex_top_event is None) == sorted(
+            (b, k) for b in _TIER_BOUND_BANDS for k in (0.95, 1.0))
         # Same order as scenarios: band, then k, then population
         order = {"all": 0, "time_series": 1, "ladder": 2, "cross": 3}
         keys = [(p.spread_band, p.k, order[p.population]) for p in off]
@@ -16449,7 +15276,6 @@ class TestTierOffSweep:
 
     def test_the_tier_off_pre_pass_matches_a_full_scan(self, golden_tier_off_sweep, monkeypatch):
         passes = [c for c in golden_tier_off_sweep.calls["entries"] if c["tier_floors"] is False]
-        assert all(c["pair_types"] == ("time_series",) for c in passes)
         # One full scan, of (0, 1), first; every other tier-off band rescans
         # one shared subset — the four pairs that entered there
         assert passes[0]["band"] == (0.0, 1.0) and passes[0]["pairs"] is None
@@ -16464,15 +15290,14 @@ class TestTierOffSweep:
         assert sorted(by_band) == _TIER_BOUND_BANDS
         for band, out in by_band.items():
             full = backtester._entries_for_band(TestBandSweepPhaseOneSubset._fresh(monkeypatch),
-                                                band, pair_types=("time_series",),
-                                                tier_floors=False)
+                                                band, tier_floors=False)
             assert rows(out) == rows(full), band
 
     def test_the_ladder_row_moves_to_monday_1(self, golden_tier_off_sweep):
         golden, rows = TestPrepareEntriesGolden, TestPrepareEntriesGolden._rows
         entries = golden_tier_off_sweep.calls["entries"]
         on = next(c["out"] for c in entries if c["tier_floors"] is True
-                  and c["band"] == (0.0, 1.0) and c["pair_types"] == ("time_series",))
+                  and c["band"] == (0.0, 1.0))
         off = next(c["out"] for c in entries if c["tier_floors"] is False
                    and c["band"] == (0.0, 1.0))
         assert rows(on) == [golden._EA_EB, golden._LADDER, golden._TA_TB, golden._WA_WB]
@@ -16544,10 +15369,10 @@ class TestTierOffSweep:
         assert all(messages[messages.index(m) - 1].startswith("Tier floors off: prepared ")
                    for m in off)
         # With the tiers off the ladder qualifies on Monday 1 too: 11, not 10
-        assert ("Qualifying Mondays at band 0-1: 26 over 5 entries "
-                "(5 qualify on more than one)") in on
-        assert ("Qualifying Mondays at band 0-1 with the tier floors off: 27 over 5 entries "
-                "(5 qualify on more than one)") in off
+        assert ("Qualifying Mondays at band 0-1: 22 over 4 entries "
+                "(4 qualify on more than one)") in on
+        assert ("Qualifying Mondays at band 0-1 with the tier floors off: 23 over 4 entries "
+                "(4 qualify on more than one)") in off
 
     def test_every_completion_prefix_is_unique_across_both_families(self, golden_tier_off_sweep):
         prefixes = _completion_prefixes(golden_tier_off_sweep.messages)
@@ -16806,8 +15631,7 @@ class TestTierOffCapSweep:
         # The pinned 0.20, never read back off backtester.BUDGET_FRACTION
         assert off.primary_cap == on.primary_cap == 0.20
         assert off.primary_k == on.primary_k and off.split_date == on.split_date
-        assert off.checks is True and off.st_entries == [] and off.same_title_eager is None
-        assert off.same_title() == {}
+        assert off.checks is True
         assert sorted(off.entries_by_band) == list(self._BINDING)
         # Nothing simulated yet — every cap cell is lazy
         assert (off.simulated, off.reused) == (0, 0)
@@ -16820,15 +15644,6 @@ class TestTierOffCapSweep:
         messages = tier_off_cap_run.messages
         assert messages.index(lines[0]) > next(
             i for i, m in enumerate(messages) if m.startswith("Size-cap sweep:"))
-
-    def test_the_pinned_toggles_hold_through_every_cell_read(self, tier_off_cap_run):
-        # Must stay after test_its_shape, which asserts nothing is simulated yet:
-        # this read simulates. TestCapSweep's twin, on a tier-off cell's "all"
-        # population
-        cell = tier_off_cap_run.both.tier_off_cap_sweep.cell((0.0, 1.0), 0.75)
-        [trade] = [t for t in cell[1.0]["all"].trades if t.pair_type == "same_title"]
-        assert trade.kelly_fraction == pytest.approx(0.77, abs=0.01)
-        assert trade.kelly_fraction > 0.2
 
     def test_its_seeds_are_the_family_s_points_and_never_a_tier_on_one(self, tier_off_cap_run):
         both = tier_off_cap_run.both
@@ -16988,14 +15803,16 @@ class TestCapSweepTierSetting:
                 peak_kelly_fraction=sim_peak)
 
         monkeypatch.setattr(backtester, "_simulate_at_discount", fake_simulate)
-        entries = [{"pair_type": "same_title", "entry": {
+        # One cross-event time-series entry: with checks, the "time_series"
+        # and "cross" populations hold it beside "all"
+        entries = [{"pair_type": "time_series", "entry": {
             "mA": {"event_ticker": "E1"}, "mB": {"event_ticker": "E2"},
             "entry_date": date(2026, 1, 5)}}]
         cs = backtester.CapSweep(
             caps=caps, primary_cap=0.2, bands=(self._BAND,), ks=(0.75,), primary_k=0.75,
             start_date=date(2026, 1, 1), initial_balance=100.0,
             split_date=date(2026, 1, 1), checks=checks,
-            entries_by_band={self._BAND: entries}, st_entries=[], eager={},
+            entries_by_band={self._BAND: entries}, eager={},
             tier_floors=tier_floors)
         cell = cs.cell(self._BAND, 0.75)
         return cs, cell, seen
@@ -17003,8 +15820,12 @@ class TestCapSweepTierSetting:
     def test_a_tier_off_sweep_forwards_the_setting_to_every_run(self, monkeypatch):
         cs, cell, seen = self._run(monkeypatch, tier_floors=False, caps=(0.1, 1.0),
                                    sim_peak=0.9, checks=True)
-        # The cap point, its two halves and its ex-top run, at both caps
-        assert [pop for pop, _kw in seen] == ["all", "all/H1", "all/H2", "all/ex-top"] * 2
+        # The cap point, its two halves and its ex-top run, at both caps, of
+        # each checked population, and the "cross" population's cap points
+        assert [pop for pop, _kw in seen] == (
+            ["all", "all/H1", "all/H2", "all/ex-top"] * 2
+            + ["time_series", "time_series/H1", "time_series/H2", "time_series/ex-top"] * 2
+            + ["cross"] * 2)
         assert all(kw.get("tier_floors") is False for _pop, kw in seen)
         assert all(point.tier_floors is False for by_pop in cell.values()
                    for point in by_pop.values())
@@ -17469,27 +16290,6 @@ class TestSizesAtMarket:
         curve = point.equity_df.set_index("date")["portfolio_value"]
         for day, change in curve.diff().iloc[1:].items():
             assert change == pytest.approx(steps.get(day, 0.0), abs=1e-6), day
-
-
-class TestSameTitleFlipAtMarket:
-    """A same-title pair whose pricier side flips between Mondays enters on
-    the Monday its gate passes, A = Y there; its marks follow that Monday's
-    legs (Pass 1b matches the quotes by ticker): NO on Y and YES on X."""
-
-    def test_the_marks_follow_the_traded_legs(self):
-        rec, _x, _y = _flipping_same_title_record()
-        candles = {"X": [_candle(_MONDAY_TS, 0.53, 0.47), _candle(_MONDAY2_TS, 0.40, 0.60),
-                         _candle(_at(date(2026, 1, 14), 9), 0.50, 0.50)],
-                   "Y": [_candle(_MONDAY_TS, 0.47, 0.53), _candle(_MONDAY2_TS, 0.70, 0.30),
-                         _candle(_at(date(2026, 1, 14), 9), 0.75, 0.25)]}
-        _quoted([rec], candles)
-        point = backtester._simulate_at_discount([rec], date(2026, 1, 1), 10_000.0, k=0.75,
-                                                 size_cap=1.0, end_date=date(2026, 3, 1))
-        (t,) = point.trades
-        assert (t.ticker_a, t.ticker_b, t.entry_date) == ("Y", "X", _LADDER_M2)
-        assert (t.marks[0].ticker, t.marks[1].ticker) == ("Y", "X")
-        # Monday 3: NO on Y at 0.25 and YES on X at 0.50
-        assert backtester._open_value(t, _LADDER_M3) == pytest.approx(t.n * 0.75)
 
 
 class TestAddOnStakeAtMarket:
@@ -18743,7 +17543,6 @@ class TestSalesComeBeforePurchases:
                                               entry["nB"]))
         settings = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0),
                                 interval_discount=cls._K, size_cap=1.0,
-                                same_title_size_cap=backtester.SAME_TITLE_SIZE_CAP,
                                 rebalance=add_to_held)
         return compute_trade(pair, backtester._cents(value), settings=settings,
                              cash_cents=backtester._cents(cash))
@@ -19108,13 +17907,15 @@ def sell_run():
     Every simulation DURING the runs goes through a spy; the spy is undone
     before any cell is read.
 
-    The fixture's sales come 13, 20, 26, 33, 53 or 60 days before their
-    positions mature, and its no-selling runs reach the 25% level at most
-    26, 53 or 60 days out, depending on the setting and the cap: the day
-    options 1, 14, 21 and 30
-    give sold_grid all three kinds of cell (a run it simulates, a run it
-    already simulated, and the no-selling run because the minimum is past
-    the reach), and a 21-day run that differs from the 1-day one."""
+    The fixture's sales come 26, 33, 53 or 60 days before their positions
+    mature, at every k and cap: EA/EB's 33 days out at the 5% level and 26
+    at 25%; the ladder's 60 at 5% and 25% and 53 at 50% with the tier floors
+    on, and 53 at 5% and 25% with them off. So its no-selling runs reach a
+    level at most 60 days out (53 at 50%) with the tier floors on and 53
+    with them off: the day options 1, 14, 21 and 54 give sold_grid all
+    three kinds of cell (a run it simulates, a run it already simulated, and
+    the no-selling run because the minimum is past the reach), and a 54-day
+    run that differs from the 1-day one."""
     toggles = pytest.MonkeyPatch()
     mp = pytest.MonkeyPatch()
     try:
@@ -19125,7 +17926,7 @@ def sell_run():
         mp.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
         mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
         mp.setattr(backtester, "TAKE_PROFIT_LEVELS", (1.0, 0.05, 0.25, 0.5))
-        mp.setattr(backtester, "TAKE_PROFIT_MIN_DAYS", (21, 1, 30, 14))
+        mp.setattr(backtester, "TAKE_PROFIT_MIN_DAYS", (21, 1, 54, 14))
         mp.setattr(backtester, "datetime", type(
             "Clock", (TestCapSweepEndDate._Clock,),
             {"moment": datetime(2026, 9, 26, 12, 0, tzinfo=UTC)}))
@@ -19229,8 +18030,8 @@ class TestSellSweep:
         sell = on.sell_sweep
         assert sell.levels == (0.05, 0.25, 0.5, 1.0)
         # The patched options, ascending
-        assert sell.min_days == (1, 14, 21, 30)
-        assert sell_run.no_cap.sell_sweep.min_days == (1, 14, 21, 30)
+        assert sell.min_days == (1, 14, 21, 54)
+        assert sell_run.no_cap.sell_sweep.min_days == (1, 14, 21, 54)
         family = on.rebalance_sweep
         assert sell.caps == family.caps and len(sell.caps) == 20
         assert sell.bands == family.bands
@@ -19424,8 +18225,8 @@ class TestSellSweep:
 
     # Every minimum of days from 1 to one past the fixture's farthest reach
     # (60 days): the four options above never sit on a cover's or a reach's
-    # boundary (sales 13, 20, 26, 33, 53 and 60 days out; reaches 26, 53 and
-    # 60), and every whole number does
+    # boundary (sales 26, 33, 53 and 60 days out; reaches 53 and 60), and
+    # every whole number does
     _WIDE_DAYS = tuple(range(1, 62))
 
     def _wide_parity(self, sell_run) -> Counter:
@@ -19663,7 +18464,7 @@ class TestCapSweepSells:
         defaults = {"caps": (0.5, 1.0), "primary_cap": 0.5, "bands": (self._BAND,),
                     "ks": (0.75,), "primary_k": 0.75, "start_date": date(2026, 1, 1),
                     "initial_balance": 100.0, "split_date": date(2026, 1, 1), "checks": False,
-                    "entries_by_band": {self._BAND: []}, "st_entries": [], "eager": {}}
+                    "entries_by_band": {self._BAND: []}, "eager": {}}
         return backtester.CapSweep(**{**defaults, **kw})
 
     def test_a_selling_sweep_takes_no_eager_point(self):
@@ -19703,15 +18504,20 @@ class TestCapSweepSells:
                 sell_min_days=kw.get("sell_min_days"))
 
         monkeypatch.setattr(backtester, "_simulate_at_discount", fake_simulate)
-        entries = [{"pair_type": "same_title", "entry": {
+        # One cross-event time-series entry: the "all", "time_series" and
+        # "cross" populations each hold it
+        entries = [{"pair_type": "time_series", "entry": {
             "mA": {"event_ticker": "E1"}, "mB": {"event_ticker": "E2"},
             "entry_date": date(2026, 1, 5)}}]
         cs = self._sweep(sell_at=0.25, sell_min_days=min_days, checks=True,
                          entries_by_band={self._BAND: entries},
-                         end_dates={(self._BAND, 0.75, "all"): date(2026, 3, 1)})
+                         end_dates={(self._BAND, 0.75, pop): date(2026, 3, 1)
+                                    for pop in ("all", "time_series", "cross")})
         cs.cell(self._BAND, 0.75)
         assert seen and all(level == 0.25 for _pop, level, _kw in seen)
-        assert {pop for pop, _level, _kw in seen} == {"all", "all/H1", "all/H2", "all/ex-top"}
+        assert {pop for pop, _level, _kw in seen} == {
+            "all", "all/H1", "all/H2", "all/ex-top", "time_series", "time_series/H1",
+            "time_series/H2", "time_series/ex-top", "cross"}
         # The minimum reaches every run and check (the excluding-top-event
         # run reads it off the point), and is not forwarded when unset
         if min_days is None:
@@ -19724,13 +18530,13 @@ class TestCapSweepSells:
         # cap of a CapSweep (a sell run neither adds nor trims) with a minimum
         # of days before maturity equals a fresh simulation at that cap,
         # level and minimum. At 50% (with a 3-day minimum) every sale comes
-        # 53 days before maturity, so none is held back; at 25% some come 13
-        # days before, which a 21-day minimum holds back
+        # 53 days before maturity, so none is held back; at 25% EA/EB's comes
+        # 26 days before, which a 30-day minimum holds back
         sell, start = sell_run.on.sell_sweep, sell_run.start
         settings = ((True, sell.bands, sell.entries_by_band, sell.end_dates),
                     (False, sell.off_bands, sell.off_entries_by_band, sell.off_end_dates))
         checked = sold = held_back = 0
-        for level, min_days in ((0.5, 3), (0.25, 21)):
+        for level, min_days in ((0.5, 3), (0.25, 30)):
             for tier_floors, bands, entries_by_band, end_dates in settings:
                 for band in bands:
                     for k in sell.ks:
@@ -19760,9 +18566,9 @@ class TestCapSweepSells:
                             if ([astuple(t) for t in point.trades]
                                     != [astuple(t) for t in without[cap]["all"].trades]):
                                 held_back += 1
-                                assert (level, min_days) == (0.25, 21)
+                                assert (level, min_days) == (0.25, 30)
         assert checked == 2 * 2 * len(sell.ks) * len(sell.caps)
-        # Not vacuous: positions sell, and the 21-day minimum holds some back
+        # Not vacuous: positions sell, and the 30-day minimum holds some back
         assert sold > 0 and held_back > 0
 
 
@@ -19846,8 +18652,8 @@ class TestWalkedTradeParity:
     """With a depth model, Pass 2 sizes each trade with the live code over a
     synthetic book: a walked backtest trade is exactly what scanner._enrich_pair
     and strategy.compute_trade make of the same books, portfolio value and
-    cash, for a time-series pair, a same-title pair and an add-on. Figures at
-    pre_toggle_defaults (k 0.75, a 20% cap, no extra same-title cap)."""
+    cash, for a time-series pair and an add-on. Figures at
+    pre_toggle_defaults (k 0.75, a 20% cap)."""
 
     _START = date(2026, 1, 1)
     _BALANCE = 10_000.0
@@ -19856,8 +18662,7 @@ class TestWalkedTradeParity:
     @staticmethod
     def _settings(k: float = 0.75, cap: float = 0.2, add: bool = False) -> LiveSettings:
         return LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=k,
-                            size_cap=cap, same_title_size_cap=backtester.SAME_TITLE_SIZE_CAP,
-                            rebalance=add)
+                            size_cap=cap, rebalance=add)
 
     @staticmethod
     def _ts(quotes=(0.20, 0.60, 0.40)) -> tuple[dict, dict]:
@@ -19897,22 +18702,6 @@ class TestWalkedTradeParity:
         assert not top.book_walked
         assert (top.fill_price_a, top.fill_price_b) == (top.entry_pA, top.entry_nB)
         assert top.n > trade.n
-
-    def test_a_same_title_trade_is_the_live_spec(self, caplog):
-        model = _walk_model()
-        rec = _ladder_same_title(_ladder_market("SA", "EVA-1", "2026-03-20"),
-                                 _ladder_market("SB", "EVB-1", "2026-03-20"), [_LADDER_M1])
-        candles = {"SA": [_vol_candle(_LADDER_M1, 0.70, 0.30)],
-                   "SB": [_vol_candle(_LADDER_M1, 0.40, 0.60)]}
-        with caplog.at_level(logging.DEBUG):
-            point = self._sim(_walked([rec], candles, model))
-        (trade,) = point.trades
-        spec = _live_walk(rec, _LADDER_M1, candles, model, self._settings(),
-                          self._BALANCE, self._BALANCE)
-        _assert_trade_is_spec(trade, spec)
-        # NO on A at 0.30 and YES on B at 0.40 at the top; a 20% share walks past both
-        assert trade.fill_price_a > 0.30 and trade.fill_price_b > 0.40
-        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
     def test_an_add_on_is_the_live_spec_on_its_stake(self, caplog):
         # At k 0.40 and no cap the first trade walks deep into Monday 1's book;
@@ -19964,37 +18753,53 @@ class TestWalkedTradeParity:
             assert not [m for m in caplog.messages if m.startswith("Trades refused when")]
 
     def test_a_walked_trade_the_cash_left_cannot_buy_is_counted_apart(self, caplog):
-        # On $2.80, a same-title pair on Monday 1 spends all but $0.59. On
-        # Monday 2 the largest Kelly share a time-series pair may take (25% of
-        # about $2.69) is more than that, and $0.59 cannot buy one contract
-        # pair at its best prices (0.20 + 0.40). The cash, not the book, stops it
+        # At k 0.05 and no cap, so that one time-series pair can spend most of
+        # the account (its Kelly share is below 1 - k = 0.95). On $2.80, the
+        # pair S (YES on SA at 0.20, NO on SB at 0.40), on a ladder of its own,
+        # spends all but $0.28 on Monday 1. By hand: the mid spread is 0.60 -
+        # 0.20 = 0.40, so p = 1 - 0.05 x 0.40 = 0.98; the fee approximation is
+        # 0.07 x (0.20 x 0.80 + 0.40 x 0.60) = 0.028 a pair, b = (0.40 -
+        # 0.028) / (0.60 + 0.028) = 0.5924 and f* = 0.98 - 0.02 / 0.5924 =
+        # 0.9462, a budget of $2.65. Four pairs fill at the best level of each
+        # book (it holds 60 contracts): $2.40 plus exact fees of $0.05 (0.07 x
+        # 4 x 0.16 = 0.0448, up to the cent) and $0.07 (0.07 x 4 x 0.24 =
+        # 0.0672), $2.52; five would cost $3.00 before fees. On Monday 2, at unchanged
+        # quotes, the portfolio is the $0.28 cash plus S at its asks (4 x 0.60
+        # = $2.40), $2.68. The largest Kelly share a time-series pair may take
+        # (95% of $2.68, $2.55) is more than the cash, and $0.28 cannot buy one
+        # contract pair at its best prices (0.20 + 0.40). The cash, not the
+        # book, stops it
         def records(model):
-            same = _ladder_same_title(_ladder_market("SA", "EVA-1", "2026-03-20"),
-                                      _ladder_market("SB", "EVB-1", "2026-03-20"), [_LADDER_M1])
+            sink = _ladder_record(_ladder_market("SA", "EVS-1", "2026-03-20"),
+                                  _ladder_market("SB", "EVS-2", "2026-03-20"), "s",
+                                  [(_LADDER_M1, 0.20, 0.60, 0.40)])
             ts = _ladder_record(_ladder_market("OA", "EVO-1", "2026-03-20"),
                                 _ladder_market("OB", "EVO-2", "2026-03-20"), "o",
                                 [(_LADDER_M2, 0.20, 0.60, 0.40)])
-            candles = {"SA": [_vol_candle(_LADDER_M1, 0.70, 0.30),
-                              _vol_candle(_LADDER_M2, 0.70, 0.30)],
-                       "SB": [_vol_candle(_LADDER_M1, 0.40, 0.60),
-                              _vol_candle(_LADDER_M2, 0.40, 0.60)],
+            candles = {"SA": [_vol_candle(_LADDER_M1, 0.20, 0.80),
+                              _vol_candle(_LADDER_M2, 0.20, 0.80)],
+                       "SB": [_vol_candle(_LADDER_M1, 0.60, 0.40),
+                              _vol_candle(_LADDER_M2, 0.60, 0.40)],
                        "OA": [_vol_candle(_LADDER_M2, 0.20, 0.80)],
                        "OB": [_vol_candle(_LADDER_M2, 0.60, 0.40)]}
-            return _walked([same, ts], candles, model)
+            return _walked([sink, ts], candles, model)
 
         def run(model, **kw):
-            return backtester._simulate_at_discount(records(model), self._START, 2.80, k=0.75,
+            return backtester._simulate_at_discount(records(model), self._START, 2.80, k=0.05,
                                                      size_cap=1.0, end_date=self._END, **kw)
 
         line = ("Trades skipped with no cash left for one contract pair "
-                "(k=0.750, band 0-1, all, no cap): 1")
+                "(k=0.050, band 0-1, all, no cap): 1")
         with caplog.at_level(logging.DEBUG):
             point = run(_walk_model())
         assert [(t.ticker_a, t.entry_date) for t in point.trades] == [("SA", _LADDER_M1)]
+        (spent,) = point.trades
+        assert (spent.pair_type, spent.n) == ("time_series", 4)
+        assert spent.total_cost + spent.fees == pytest.approx(2.52, abs=1e-9)
         assert line in caplog.messages
         # Counted by the test behind the live enrichment's own note
         assert any(m.startswith("No affordable contract pairs for")
-                   and "the $0.59 of cash binds" in m for m in caplog.messages)
+                   and "the $0.28 of cash binds" in m for m in caplog.messages)
         assert not [m for m in caplog.messages if m.startswith("Trades refused when")]
         # At the top of the book the same pair is skipped too, and neither line is logged
         caplog.clear()
@@ -20039,7 +18844,9 @@ def _pass2_candidate(rec: dict, marks=None) -> dict:
 class TestCandidatePairCarriesTheMidSpread:
     """_candidate_pair gives a time-series candidate its mid spread at that
     Monday's quotes (config.time_series_mid_spread), never at the market
-    records' own quotes, and a same-title candidate none. A candle NO ask
+    records' own quotes, and a candidate of any other pair type none (the
+    walk refuses such a record before scoring it, so only a direct call can
+    hand one over). A candle NO ask
     the fetch clamped to 0.99 is read as it comes, a YES bid of 0.01. On a
     walked book the live enrichment writes it again from the book's top,
     which is those quotes, so it comes out the same."""
@@ -20081,9 +18888,10 @@ class TestCandidatePairCarriesTheMidSpread:
         assert pair.mid_spread == pytest.approx(
             time_series_mid_spread(0.30, 1.0, 0.62, 0.42) - 0.005, abs=1e-12)
 
-    def test_a_same_title_candidate_carries_none(self):
-        rec = _ladder_same_title(_ladder_market("SA", "EVA-1", "2026-03-20"),
-                                 _ladder_market("SB", "EVB-1", "2026-03-20"), [_LADDER_M1])
+    def test_a_candidate_of_another_pair_type_carries_none(self):
+        rec = _ladder_record(_ladder_market("SA", "EVA-1", "2026-03-20"),
+                             _ladder_market("SB", "EVB-1", "2026-03-20"), "s", [_LADDER_M1])
+        rec = {**rec, "pair_type": "same_title"}
         assert backtester._candidate_pair(_pass2_candidate(rec), None, {}).mid_spread is None
 
     def test_the_sized_pair_carries_it_at_the_top_of_the_book_and_on_a_walked_book(self):
@@ -20443,9 +19251,9 @@ class TestWalkedCapSweepParity:
 class TestCapFreeFrom:
     """SweepPoint.cap_free_from is the cap at and above which no trade of the
     simulation depends on the cap: the peak with no walked book, and with one,
-    at least the live search's own ceiling for each pair type that can walk
-    (config.max_kelly_fraction with no per-trade cap), decided from the
-    candidates. CapSweep shares from it (_sharing_floor)."""
+    at least the live search's own ceiling (config.max_kelly_fraction with no
+    per-trade cap), decided from the candidates. CapSweep shares from it
+    (_sharing_floor)."""
 
     _START = date(2026, 1, 1)
 
@@ -20462,13 +19270,6 @@ class TestCapFreeFrom:
         walked = self._sim(_walked([rec], candles, _walk_model()), k=0.75)
         # round(1 - 0.75, 12): the time-series ceiling on f*
         assert walked.cap_free_from == max(walked.peak_kelly_fraction, 0.25)
-        same = _ladder_same_title(_ladder_market("SA", "EVA-1", "2026-03-20"),
-                                  _ladder_market("SB", "EVB-1", "2026-03-20"), [_LADDER_M1])
-        st_candles = {"SA": [_vol_candle(_LADDER_M1, 0.70, 0.30)],
-                      "SB": [_vol_candle(_LADDER_M1, 0.40, 0.60)]}
-        point = self._sim(_walked([same], st_candles, _walk_model()), k=0.75)
-        # min(same-title cap 1.0, the 0.95 co-resolution prior)
-        assert point.cap_free_from == max(point.peak_kelly_fraction, SAME_TITLE_CO_RESOLVE_PROB)
 
     def test_the_sharing_floor_reads_both(self):
         def point(peak, free):
@@ -20523,7 +19324,7 @@ class TestCapSweepSharesFromCapFreeFrom:
                                  bands=(self._BAND,), ks=(k,), primary_k=k,
                                  start_date=self._START, initial_balance=10_000.0,
                                  split_date=None, checks=False,
-                                 entries_by_band={self._BAND: entries}, st_entries=[],
+                                 entries_by_band={self._BAND: entries},
                                  eager={(self._BAND, k, "all"): eager})
         cell = cs.cell(self._BAND, k)
         assert tuple(cell) == backtester.SIZE_CAP_SWEEP
@@ -20607,7 +19408,7 @@ class TestCapSweepSharesFromCapFreeFrom:
                                  bands=(self._BAND,), ks=(k,), primary_k=k,
                                  start_date=self._START, initial_balance=10_000.0,
                                  split_date=split, checks=checks,
-                                 entries_by_band={self._BAND: entries}, st_entries=[],
+                                 entries_by_band={self._BAND: entries},
                                  eager=eager, end_dates=end_dates, **options)
         cell = cs.cell(self._BAND, k)
         assert tuple(cell) == backtester.SIZE_CAP_SWEEP
@@ -20641,30 +19442,55 @@ class TestCapSweepSharesFromCapFreeFrom:
 class TestCashIsReadInWholeCents:
     """A trade is sized on the cash left in whole cents, as live's cash is, so
     a float cash a hair below a cent buys what that cent buys and is never
-    refused for float noise. Two same-title pairs on one Monday, no depth
-    model, no cap: the first leaves the cash just under $186.57."""
+    refused for float noise. Two time-series pairs on one Monday, no depth
+    model, no cap, at k 0.05 (so Kelly wants about 95% of the account for
+    each): the first leaves the cash just under $52.88."""
 
     @staticmethod
-    def _record(a: str, b: str, pA: float, pB: float) -> dict:
-        row = {"entry_date": _LADDER_M1, "pA": pA, "pB": pB, "nA": round(1.0 - pA, 4),
-               "nB": round(1.0 - pB, 4), "gap_days": None,
-               "mA": _ladder_market(a, f"EV{a}-1", "2026-03-20", result="yes"),
-               "mB": _ladder_market(b, f"EV{b}-1", "2026-03-20", result="yes")}
-        return {"pair_type": "same_title", "canon": a, "group_key": ("EV", a, a),
-                "entry": {**row, "later": ()}}
+    def _record(a: str, b: str, pA: float, pB: float, nB: float) -> dict:
+        """A prepared time-series record: markets a and b, each in an event of
+        its own, filed as one question named `a` (so two records with no
+        market in common share no ladder), quoted pA / pB / nB (the NO ask on B)
+        on the first Monday and both settling YES."""
+        return _ladder_record(
+            _ladder_market(a, f"EV{a}-1", "2026-03-20", result="yes"),
+            _ladder_market(b, f"EV{b}-1", "2026-03-20", result="yes"), a,
+            [(_LADDER_M1, pA, pB, nB)])
 
     def test_the_cash_left_to_the_cent_is_spent(self):
-        records = [self._record("SA", "SB", 0.70, 0.40), self._record("SC", "SD", 0.69, 0.39)]
-        point = backtester._simulate_at_discount(records, date(2026, 1, 1), 1_000.01, k=0.75,
+        # First pair: YES on SA at 0.20, NO on SB at 0.30. The mid spread is
+        # 0.70 - 0.20 = 0.50, so p = 1 - 0.05 x 0.50 = 0.975; with the fee
+        # approximation 0.0259 per pair, b = (0.50 - 0.0259) / (0.50 + 0.0259)
+        # = 0.9015 and f* = 0.975 - 0.025 / 0.9015 = 0.9473, a budget of
+        # $947.80 on $1,000.56: 1,802 pairs, which cost $901.00 plus exact
+        # fees of $20.19 and $26.49, $947.68 (1,803 would cost $948.21),
+        # leaving $52.88 as a float just under it, 52.87999999999988, which
+        # stays under the cent even times 100. The second pair (YES on SC at
+        # 0.30, NO on SD at 0.30) has a mid spread of 0.70 - 0.30 = 0.40, so
+        # p = 0.98; with the fee
+        # approximation 0.0294, b = 0.3706 / 0.6294 = 0.5888 and f* = 0.98 -
+        # 0.02 / 0.5888 = 0.9460, far more than the cash left, so the cash
+        # decides its size.
+        records = [self._record("SA", "SB", 0.20, 0.70, 0.30),
+                   self._record("SC", "SD", 0.30, 0.70, 0.30)]
+        point = backtester._simulate_at_discount(records, date(2026, 1, 1), 1_000.56, k=0.05,
                                                  size_cap=1.0, end_date=date(2026, 4, 1))
         first, second = point.trades
+        assert first.n == 1802
         # The cash left, as the walk spends it (the spec's cost with fees)
-        cash = 1_000.01 - (first.total_cost + fee_leg_exact(first.n, first.fill_price_a)
+        cash = 1_000.56 - (first.total_cost + fee_leg_exact(first.n, first.fill_price_a)
                            + fee_leg_exact(first.n, first.fill_price_b))
-        assert cash < 186.57 and backtester._cents(cash) == 18_657
-        # The second trade is what the live sizer buys with $186.57: every cent
-        assert (second.ticker_a, second.n) == ("SC", 255)
-        assert second.total_cost + second.fees == pytest.approx(186.57, abs=1e-9)
+        # Read in whole cents it is $52.88; cut to whole cents without the
+        # rounding _cents does first, the float noise would cost a cent
+        assert cash < 52.88 and backtester._cents(cash) == 5_288
+        assert math.floor(cash * 100) == 5_287
+        # The second trade is what the live sizer buys with $52.88: every cent.
+        # By hand, 84 pairs cost 84 x 0.60 = $50.40 plus two fees of $1.24
+        # (0.07 x 84 x 0.30 x 0.70 = 1.2348, up to the cent), $52.88; 85 would
+        # cost $51.00 + 2 x $1.25 = $53.50. With a cent less, $52.87, it would
+        # buy 83: $49.80 + 2 x $1.23 = $52.26
+        assert (second.ticker_a, second.n) == ("SC", 84)
+        assert second.total_cost + second.fees == pytest.approx(52.88, abs=1e-9)
 
 
 class TestBandReachesEveryResimulation:
@@ -20740,17 +19566,15 @@ class TestNoDepthModelChangesNothing:
     crossed and the Kelly gate skips it."""
 
     # Captured by running the same _sweep_digest over run_backtest_sweep's
-    # golden band sweep; with every point's peak Kelly fraction left out, it
-    # equals the same digest of the code before the walk
-    _DIGEST = "0ac44e6d6ef30481217001dcbaee2988749375d6fcbf3681419a8a4a132c7e91"
+    # golden band sweep. With every point's peak Kelly fraction left out, it
+    # equals the same digest of the code before the walk over the corpus's
+    # time-series pairs alone (the corpus without SA and SB)
+    _DIGEST = "5c50102b3626d6b6444877abb851d848d58a78852e70a53e8880e9915ef9a0d9"
 
     @staticmethod
     def _sweep_digest(result) -> str:
         h = hashlib.sha256()
-        points = list(result.scenarios)
-        if result.same_title_point is not None:
-            points.append(result.same_title_point)
-        for p in points:
+        for p in result.scenarios:
             h.update(repr((p.population, p.spread_band, round(p.k, 9), p.tier_floors,
                            p.size_cap, round(p.peak_kelly_fraction, 9))).encode())
             for t in p.trades:
@@ -20819,11 +19643,6 @@ class TestDepthModelIsRecorded:
     def test_a_simulation_refuses_k_zero(self):
         with pytest.raises(ValueError, match="interval_discount"):
             backtester._simulate_at_discount([], date(2026, 1, 1), 1000.0, k=0.0)
-
-    def test_an_off_grid_same_title_cap_is_refused_naming_it(self, monkeypatch):
-        monkeypatch.setattr(backtester, "SAME_TITLE_SIZE_CAP", 0.37)
-        with pytest.raises(ValueError, match="SAME_TITLE_SIZE_CAP must be a multiple of 5%.*0.37"):
-            backtester._resolve_same_title_size_cap()
 
 
 # ─── Selling down a modeled bid ladder ───────────────────────────────────────
@@ -20955,22 +19774,25 @@ class TestPositionSaleValueWalksTheLadder:
         # Not a checkpoint of these quotes: no ladder
         assert quotes.sale_ladder(_LADDER_M3, 0.40) is None
 
-    def test_a_lone_leg_add_on_totals_by_ticker(self):
-        # X is held NO as market B of a time-series trade and as market A of a
-        # same-title one (an add-on to the lone leg): 160 NO contracts on X
-        # walk one ladder, though each trade's 80 fit its best level
+    def test_a_time_series_lone_leg_add_on_totals_by_ticker(self):
+        # X is held NO as market B of two time-series trades: the first pair
+        # (YES on Y) and a second trade (YES on W) that also holds NO on X, as
+        # an add-on to X would once Y had paid out. Their 160 NO
+        # contracts on X walk one ladder, though each trade's 80 fit its best
+        # level: 100 at the 0.60 bid and 60 one cent down, an average of
+        # (100 x 0.60 + 60 x 0.59) / 160 = 0.59625
         levels = ((0.0, 100.0), (0.01, 1000.0))
         model = _ladder_model(levels)
         x = _sale_quotes("X", 0.38, 0.60, model)
         first = _held_trade(80, _sale_quotes("Y", 0.40, 0.58, model), x)
-        add = _held_trade(80, x, _sale_quotes("W", 0.45, 0.53, model), "same_title")
+        add = _held_trade(80, _sale_quotes("W", 0.45, 0.53, model), x)
         on_x = _walk_average(0.60, 160, levels)
-        assert on_x < 0.60
+        assert on_x == pytest.approx(0.59625, abs=1e-12) and on_x < 0.60
         (sale_1, sale_2), *_ = backtester._position_sale_value([first, add], _LADDER_M2)
-        assert sale_1[2] == (0.40, on_x) and sale_2[2] == (on_x, 0.45)
+        assert sale_1[2] == (0.40, on_x) and sale_2[2] == (0.45, on_x)
         # Alone, each trade's X sells at the best bid
         assert backtester._position_sale_value([first], _LADDER_M2)[0][0][2] == (0.40, 0.60)
-        assert backtester._position_sale_value([add], _LADDER_M2)[0][0][2] == (0.60, 0.45)
+        assert backtester._position_sale_value([add], _LADDER_M2)[0][0][2] == (0.45, 0.60)
         # Together past the ladder's 1,100 contracts: not sold, though each fits alone
         big = dc_replace(add, n=1050)
         assert backtester._position_sale_value([big], _LADDER_M2) is not None
@@ -21212,11 +20034,10 @@ class TestTrimHelpers:
         first = self._pair(10)
         assert backtester._exact_pair([first])
         assert backtester._exact_pair([first, dc_replace(first, n=3, add_on=True)])
-        # A third market, the legs the other way round, or another pair type is not
+        # A third market or the legs the other way round is not
         assert not backtester._exact_pair([first, dc_replace(first, ticker_b="QC")])
         assert not backtester._exact_pair(
             [first, dc_replace(first, ticker_a="QB", ticker_b="QA")])
-        assert not backtester._exact_pair([first, dc_replace(first, pair_type="same_title")])
 
     def test_the_latest_trade_is_sold_first(self):
         position = [self._pair(100), self._pair(30), self._pair(20)]
@@ -21256,7 +20077,7 @@ class TestTrimHelpers:
     def test_a_position_that_is_not_one_exact_pair_is_left_alone(self):
         first = self._pair(5000)
         mixed = [first, dc_replace(first, ticker_b="QC")]
-        assert backtester._kelly_trim(mixed, _LADDER_M2, 100.0, 0.75, 0.05, 1.0) \
+        assert backtester._kelly_trim(mixed, _LADDER_M2, 100.0, 0.75, 0.05) \
             == (backtester._NO_TRIM, None)
 
     def test_a_paid_out_market_that_leaves_no_lone_leg_is_left_alone(self):
@@ -21277,12 +20098,11 @@ class TestTrimHelpers:
             "both paid out": _held_trade(5000, paid_a, paid_b),
             "the earlier market's YES held paid $1": _held_trade(5000, won, open_b),
             "the earlier market's payout unknown": _held_trade(5000, unknown, open_b),
-            "a same-title pair": _held_trade(5000, paid_a, open_b, pair_type="same_title"),
         }
         for why, trade in cases.items():
             assert backtester._lone_leg(trade, day) is False, why
             assert backtester._fresh_bids(trade, day) is None, why
-            assert backtester._kelly_trim([trade], day, 100.0, 0.75, 0.05, 1.0) == (
+            assert backtester._kelly_trim([trade], day, 100.0, 0.75, 0.05) == (
                 backtester._NO_TRIM, None), why
         # Neither paid out: a pair, judged as one
         assert backtester._lone_leg(_held_trade(5000, open_a, open_b), day) is None
@@ -21296,7 +20116,7 @@ class TestTrimHelpers:
         # YES on QA (bid 0.40), NO on QB (bid 0.55); asks are 1 - the other side's bid
         trade = self._pair(5000)
         decision, (sold, per_trade) = backtester._kelly_trim(
-            [trade], _LADDER_M2, 10_000.0, 0.75, 0.20, 1.0)
+            [trade], _LADDER_M2, 10_000.0, 0.75, 0.20)
         win = config.held_pair_win_prob("time_series", 1 - 0.58, 1 - 0.40, 1 - 0.55, 1 - 0.44,
                                         0.75)
         top = 0.40 + 0.55 - fee_per_pair_approx(0.40, 0.55)
@@ -21318,7 +20138,7 @@ class TestTrimHelpers:
         top = 0.40 + 0.55 - fee_per_pair_approx(0.40, 0.55)
         sells = {}
         for k in (0.75, 0.5):
-            decision, _sale = backtester._kelly_trim([trade], _LADDER_M2, 10_000.0, k, 1.0, 1.0)
+            decision, _sale = backtester._kelly_trim([trade], _LADDER_M2, 10_000.0, k, 1.0)
             win = config.held_pair_win_prob("time_series", 1 - 0.58, 1 - 0.40, 1 - 0.55,
                                             1 - 0.44, k)
             assert config.kelly_hold_fraction(win, top) < 0.9   # below the position's share
@@ -21328,17 +20148,16 @@ class TestTrimHelpers:
             sells[k] = decision.sell
         assert sells[0.75] > sells[0.5] > 0
 
-    def test_a_same_title_pair_is_capped_by_the_same_title_cap(self):
-        a, b = _sale_quotes("QA", 0.60, 0.30, None), _sale_quotes("QB", 0.25, 0.70, None)
-        trade = _held_trade(5000, a, b, pair_type="same_title")
-        loose, _ = backtester._kelly_trim([trade], _LADDER_M2, 10_000.0, 0.75, 1.0, 1.0)
-        tight, _ = backtester._kelly_trim([trade], _LADDER_M2, 10_000.0, 0.75, 1.0, 0.10)
+    def test_a_time_series_pair_is_capped_by_the_size_cap_alone(self):
+        trade = self._pair(5000)
+        loose, _ = backtester._kelly_trim([trade], _LADDER_M2, 10_000.0, 0.75, 1.0)
+        tight, _ = backtester._kelly_trim([trade], _LADDER_M2, 10_000.0, 0.75, 0.10)
         assert tight.sell > loose.sell
 
     def test_a_thin_ladder_sells_no_more_than_it_holds(self):
         model = _ladder_model(((0.0, 100.0), (0.01, 200.0)))
         decision, (sold, _per_trade) = backtester._kelly_trim(
-            [self._pair(5000, model)], _LADDER_M2, 10_000.0, 0.75, 0.05, 1.0)
+            [self._pair(5000, model)], _LADDER_M2, 10_000.0, 0.75, 0.05)
         # The modeled bids hold 300 contracts a market
         assert decision.sell == 300 and sold == [300]
 
@@ -21597,31 +20416,49 @@ class TestTrimToKelly:
                                                                     for t in free.trades]
         assert shared >= 2 and differing >= 2
 
-    def test_a_converged_same_title_pair_is_sold_whole_and_frees_its_markets(self, caplog):
-        # NO on TA and YES on TB, bought on Monday 1. On Monday 2 the two
-        # bids (0.52 and 0.49) come to more than the 0.95 the pair is
-        # expected to pay: there is nothing left to hold it for
-        a = _ladder_market("TA", "EVT-1", "2026-03-20", result="no")
-        b = _ladder_market("TB", "EVU-1", "2026-03-20", result="yes")
-        # A time-series pair on TA passes on Mondays 2 and 3
-        c = _ladder_market("TC", "EVV-1", "2026-03-25")
-        later = _ladder_record(a, c, "later", (_LADDER_M2, _LADDER_M3))
-        candles = {"TA": [_candle(_ck(_LADDER_M1), 0.70, 0.30), *_held(_LADDER_M2, 0.48, 0.54)],
-                   "TB": [_candle(_ck(_LADDER_M1), 0.40, 0.62), *_held(_LADDER_M2, 0.51, 0.51)],
-                   "TC": [_candle(_ck(_LADDER_M2), 0.60, 0.42)]}
-        records = _quoted([_ladder_same_title(a, b, (_LADDER_M1,)), later], candles)
-        base = self._sim(records, cap=0.10)
-        # Without the switch TA stays taken until it pays out: the second pair never trades
-        assert _traded(base) == [("TA", _LADDER_M1)]
+    def test_a_time_series_pair_the_trim_sells_whole_frees_its_markets(self, caplog):
+        # The class's pair on $15 under a 5% cap. Monday 1: Kelly's f* at the
+        # record's quotes (p = 1 - 0.75 x 0.40 = 0.70, f* about 0.19) is above
+        # the cap, so the budget is 0.05 x $15 = $0.75, and one
+        # contract pair (YES on SA at 0.20, NO on SB at 0.40) costs $0.60 plus
+        # two exact fees of $0.02 (0.07 x 0.20 x 0.80 = 0.0112 and 0.07 x 0.40
+        # x 0.60 = 0.0168, up to the cent), $0.64; two would cost $1.27.
+        # Monday 2: the portfolio is the $14.36 cash plus the pair at its asks
+        # (0.30 + 0.57), $15.23, so the cap lets the pair keep $0.76 (Kelly's
+        # own share, 44%, is far larger). The pair now sells for its bids less
+        # the fee per pair: 0.28 + 0.55 - 0.0314 = $0.80 at the best bids, and
+        # selling the one pair returns $0.26 + $0.53 = $0.79 after its exact
+        # fees. Either way one pair is worth more than the $0.76 it may keep,
+        # so the trim keeps none and sells it whole.
+        sa = _ladder_market("SA", "EVS-1", "2026-02-10")
+        # A time-series pair on SA's ladder (SA by an earlier deadline than a
+        # third market SC) passes on Mondays 2 and 3
+        sc = _ladder_market("SC", "EVS-3", "2026-03-25")
+        later = _ladder_record(sa, sc, "later", (_LADDER_M2, _LADDER_M3))
+        candles = dict(self._SUITE._candles(), SC=[_candle(_ck(_LADDER_M2), 0.60, 0.42)])
+        records = _quoted([self._SUITE._record(a=sa), later], candles)
+
+        def run(**kw):
+            return backtester._simulate_at_discount(
+                records, self._START, 15.0, k=0.75, size_cap=0.05,
+                end_date=date(2026, 4, 1), **kw)
+        base = run()
+        # Without the switch SA stays taken until it pays out: the second pair never trades
+        assert _traded(base) == [("SA", _LADDER_M1)]
+        assert base.trades[0].n == 1
         with caplog.at_level(logging.INFO):
-            point = self._sim(records, cap=0.10, trim_to_kelly=True)
+            point = run(trim_to_kelly=True)
+        # Two trades: the pair, sold whole (no part of it is left held), and the later pair
         sold, bought = point.trades
+        assert (sold.ticker_a, sold.ticker_b) == ("SA", "SB")
         assert sold.sold and sold.exit_date == _LADDER_M2 and sold.n == base.trades[0].n
-        assert (sold.sale_price_a, sold.sale_price_b) == (0.52, 0.49)
-        # TA is free again, but not at the checkpoint it was sold at
-        assert (bought.pair_type, bought.ticker_a, bought.entry_date) == (
-            "time_series", "TA", _LADDER_M3)
-        assert f"contract pairs sold: {sold.n})" in caplog.text
+        assert (sold.sale_price_a, sold.sale_price_b) == (0.28, 0.55)
+        assert sold.actual_payoff == _sale_value(1, ("bid", 0.28), ("bid", 0.55))
+        # SA is free again, but not at the checkpoint it was sold at
+        assert (bought.pair_type, bought.ticker_a, bought.ticker_b, bought.entry_date) == (
+            "time_series", "SA", "SC", _LADDER_M3)
+        assert (f"{self._LINE} ({_label(0.05)}, trimming to Kelly): 1 "
+                f"(contract pairs sold: {sold.n})") in caplog.text
 
     def test_with_adding_on_the_latest_contracts_are_sold_first(self):
         # The pair is bought on Monday 1 and added to on Monday 2, when its
@@ -21757,16 +20594,12 @@ class TestTrimMinMove:
     def test_the_pair_s_price_is_the_ask_of_each_side_it_holds(self):
         candles = self._TRIM._SUITE._candles()
         (held,) = self._plain(self._records()).trades
-        same_title = dc_replace(held, pair_type="same_title")
         for day, total in self._ASKS.items():
             (a,) = [c for c in candles["SA"] if c["ts"] == _ck(day)]
             (b,) = [c for c in candles["SB"] if c["ts"] == _ck(day)]
             # A time-series pair holds YES on its first market and NO on its second
             assert a["yes_ask_close"] + b["no_ask_close"] == pytest.approx(total, abs=1e-12)
             assert backtester._pair_price(held, day) == a["yes_ask_close"] + b["no_ask_close"]
-            # ... and a same-title pair NO on its first and YES on its second
-            assert backtester._pair_price(same_title, day) == (
-                a["no_ask_close"] + b["yes_ask_close"])
         # With no later candle the last asks stand; once SA has paid out
         # (02-10, "no"), its YES leg counts at its payout, nothing
         assert backtester._pair_price(held, date(2026, 2, 2)) == pytest.approx(0.77, abs=1e-12)
@@ -22162,7 +20995,7 @@ class TestTrimCapSweep:
             "caps": backtester.SIZE_CAP_SWEEP, "primary_cap": 0.20, "bands": (self._BAND,),
             "ks": tuple(ks), "primary_k": ks[0], "start_date": self._START,
             "initial_balance": 10_000.0, "split_date": None, "checks": False,
-            "entries_by_band": {self._BAND: entries}, "st_entries": [], "eager": {},
+            "entries_by_band": {self._BAND: entries}, "eager": {},
             "add_to_held": add, "trim_to_kelly": True,
             "end_dates": {(self._BAND, k, "all"): self._END for k in ks}, **kw}
         return backtester.CapSweep(**options)
@@ -22266,8 +21099,6 @@ class TestTrimCapSweep:
         eager = self._fresh(entries, 0.75, 0.20, trim=False)
         with pytest.raises(ValueError, match="trims to Kelly simulates every cap itself"):
             self._sweep(entries, (0.75,), eager={(self._BAND, 0.75, "all"): eager})
-        with pytest.raises(ValueError, match="takes no eager points"):
-            self._sweep(entries, (0.75,), same_title_eager=eager)
 
     def test_it_runs_no_checks(self):
         # A half's trims can depend on the cap where the full run's do not
@@ -23554,7 +22385,7 @@ class TestLoneLegTrim:
                           volume_ahead_checkpoints=[1_000.0], volume_share=_SHARE)
         assert (paid.volume_cap_at(day), open_b.volume_cap_at(day)) == (0, 100)
         decision, (sold, ((_value, fees, prices),)) = backtester._kelly_trim(
-            [_held_trade(3000, paid, open_b)], day, 10_000.0, 0.75, 0.20, 1.0)
+            [_held_trade(3000, paid, open_b)], day, 10_000.0, 0.75, 0.20)
         assert decision.sell == 100 and sold == [100]
         assert prices == (None, 0.75) and fees == fee_leg_exact(100, 0.75)
 
@@ -23589,7 +22420,7 @@ class TestLoneLegTrim:
             3000, 10_000.0, win, 0.20, top,
             lambda count: _sale_value(count, ("paid", 0.0), ("bid", 0.75))).sell == 286
         decision, (sold, ((value, fees, prices),)) = backtester._kelly_trim(
-            [trade], day, 10_000.0, 0.75, 0.20, 1.0)
+            [trade], day, 10_000.0, 0.75, 0.20)
         assert decision.sell == 192 and sold == [192]
         average = _walk_average(0.75, 192, levels)
         assert average == pytest.approx(139.40 / 192, abs=1e-12)
@@ -23625,7 +22456,7 @@ class TestLoneLegTrim:
         # Nothing changed since Monday 3, so the 249 of the fresh Monday 3 above
         assert part.n == 249 and part.sale_price_a is None
 
-    def test_a_same_title_pair_or_a_lone_earlier_market_is_left_alone(self):
+    def test_a_lone_earlier_market_is_left_alone(self):
         # The earlier market still open beside a later one that paid out
         # first: its YES has grown past the cap (a YES bid of 0.78 on LA from
         # Monday 3), but it is no lone leg the trim sells
@@ -23639,14 +22470,6 @@ class TestLoneLegTrim:
         (held,) = point.trades
         assert backtester._lone_leg(held, _LADDER_M3) is False
         assert backtester._fresh_bids(held, _LADDER_M3) is None
-        # A same-title pair whose first market paid out: left alone too
-        day = _LADDER_M2
-        paid = _sale_quotes("QA", float("nan"), float("nan"), None, paid=True)
-        trade = _held_trade(5000, paid, _sale_quotes("QB", 0.23, 0.75, None),
-                            pair_type="same_title")
-        assert backtester._lone_leg(trade, day) is False
-        assert backtester._kelly_trim([trade], day, 10_000.0, 0.75, 0.20, 1.0) == (
-            backtester._NO_TRIM, None)
 
     @pytest.mark.parametrize("add", [False, True])
     def test_every_cap_equals_a_fresh_simulation(self, add):
@@ -23873,10 +22696,15 @@ class TestAddOnWaitsForAMove:
         assert point.moves == (pytest.approx((-0.25,), abs=1e-12) if adds else ())
         assert len(self._lines(caplog, _ADD_ON_MOVE_LINE)) == (0 if adds else 1)
 
-    def test_a_lone_leg_s_move_reads_its_own_market_from_its_last_trade(self):
+    def _p_trade(self):
+        """P's first trade (YES PA / NO PB, Monday 1), carrying PB's quotes."""
         (p_trade,) = backtester._simulate_at_discount(
             self._lone()[:1], self._START, 10_000.0, k=0.85, size_cap=0.20,
             end_date=self._END).trades
+        return p_trade
+
+    def test_a_lone_leg_s_move_reads_its_own_market_from_its_last_trade(self):
+        p_trade = self._p_trade()
         legs = [{"trade": p_trade, "ticker": "PB"}]
         move = backtester._lone_leg_move
         # From P's purchase: PB's NO ask, 0.55 then and 0.25 on Monday 3
@@ -23886,15 +22714,6 @@ class TestAddOnWaitsForAMove:
         assert move(legs, _LADDER_M3, {("PA", "PB"): _LADDER_M2}) == (
             _LADDER_M2, pytest.approx(-0.05, abs=1e-12))
         assert move(legs, _LADDER_M3, {("QA", "PB"): _LADDER_M2})[0] == _LADDER_M1
-        # The held market can be market A in one trade and market B in another:
-        # each trade's own side of it is read (here a same-title trade holding NO
-        # on PB as its market A, bought on Monday 2)
-        flipped = dc_replace(p_trade, pair_type="same_title", ticker_a="PB", ticker_b="XB",
-                             marks=(p_trade.marks[1], p_trade.marks[0]),
-                             entry_date=_LADDER_M2)
-        assert backtester.leg_sides("same_title")[0] == backtester.leg_sides("time_series")[1]
-        both = [*legs, {"trade": flipped, "ticker": "PB"}]
-        assert move(both, _LADDER_M3, {}) == (_LADDER_M2, pytest.approx(-0.05, abs=1e-12))
         # No quotes, no move
         assert move([{"trade": dc_replace(p_trade, marks=None), "ticker": "PB"}],
                     _LADDER_M3, {}) == (_LADDER_M1, None)
@@ -25076,11 +23895,9 @@ class TestRebalanceSweep:
 
     @classmethod
     def _others(cls, messages) -> list:
-        """A run's INFO lines but for the Rebalance ones, the two that report the
-        process's peak memory and the one that says how many event competitions
-        came from the cache, which differ from one run to the next."""
-        return [m for m in messages if not m.startswith(
-            (cls._REBALANCING, "Peak RSS", "Event competitions:"))]
+        """A run's INFO lines but for the Rebalance ones and the two that report
+        the process's peak memory, which differ from one run to the next."""
+        return [m for m in messages if not m.startswith((cls._REBALANCING, "Peak RSS"))]
 
     @staticmethod
     def _settings(family) -> tuple:
@@ -25169,8 +23986,7 @@ class TestRebalanceSweep:
             # Both steps on, always: no sweep adds alone or trims alone
             assert (cs.add_to_held, cs.trim_to_kelly, cs.tier_floors, cs.checks,
                     cs.min_move) == (True, True, tier, False, None)
-            assert cs.eager == {} and cs.same_title_eager is None and cs.split_date is None
-            assert cs.st_entries == []
+            assert cs.eager == {} and cs.split_date is None
             assert cs.bands == (family.bands if tier else family.off_bands)
             assert cs.caps == family.caps and cs.ks == family.ks
         assert family.entry_events() == (on.cap_sweep.entry_events()
@@ -26158,100 +24974,6 @@ def _save_details(records: list) -> None:
         [dict(r, status="finalized", level=market_details.LEVEL_FULL) for r in records], False)
 
 
-class TestScheduledCloseSameTitleGate:
-    """The same-title close gate on the closes a live run would have read: a pair
-    whose realized closes drifted apart but whose scheduled closes match is one
-    question, and is admitted with the switch on."""
-
-    _TITLE = "Will the album top the chart?"
-
-    def _corpus(self):
-        def rec(ticker, event, close):
-            return {"ticker": ticker, "event_ticker": event, "event_title": "",
-                    "title": self._TITLE, "subtitle": "", "result": "no",
-                    "open_time": "2026-01-01T00:00:00+00:00", "close_time": close,
-                    "settlement_ts": close}
-        # Realized closes 1.5 h apart, more than the one-hour gate
-        return [rec("KXSTA-26-X", "KXSTA-26", "2026-02-20T00:00:00+00:00"),
-                rec("KXSTB-26-X", "KXSTB-26", "2026-02-20T01:30:00+00:00")]
-
-    def _setup(self, monkeypatch):
-        corpus = self._corpus()
-        TestGroupableSubset._patch(monkeypatch, corpus)
-        _save_capture(_capture_of("KXSTA", 20) + _capture_of("KXSTB", 20))
-        _save_details([
-            {"ticker": "KXSTA-26-X", "event_ticker": "KXSTA-26",
-             "close_time": "2026-02-20T00:00:00Z",
-             "latest_expiration_time": "2026-02-27T00:00:00Z",
-             "expected_expiration_time": "2026-02-20T00:00:00Z"},
-            {"ticker": "KXSTB-26-X", "event_ticker": "KXSTB-26",
-             "close_time": "2026-02-20T01:30:00Z",
-             "latest_expiration_time": "2026-02-27T00:00:00Z",
-             "expected_expiration_time": "2026-02-20T00:00:00Z"}])
-        return corpus
-
-    def _prepare(self, monkeypatch, caplog, scheduled):
-        corpus = self._setup(monkeypatch)
-        with caplog.at_level(logging.INFO):
-            candidates = backtester._prepare_candidates(
-                MagicMock(), MagicMock(), _SS1_START, True, None,
-                scheduled_close=scheduled)
-        return corpus, candidates
-
-    def test_on_the_pair_is_admitted(self, monkeypatch, caplog):
-        corpus, candidates = self._prepare(monkeypatch, caplog, True)
-        assert [p[1] for p in candidates.all_pairs] == ["same_title"]
-        assert candidates.scheduled_close is True
-        assert {s: r[:3] for s, r in candidates.close_rules.items()} == {
-            "KXSTA": ("latest_expiration_time", 0, frozenset({_RULE_GAP})),
-            "KXSTB": ("latest_expiration_time", 0, frozenset({_RULE_GAP}))}
-        assert all(m[backtester._SCHEDULED_CLOSE_KEY] == _epoch("2026-02-27T00:00:00+00:00")
-                   for m in corpus)
-        assert ("Scheduled close: same-title candidates the close gate judged otherwise "
-                "than on their realized closes: 1 admitted, 0 refused") in caplog.messages
-        assert ("Scheduled close: 2 of 2 pair markets use it, 0 keep their realized close "
-                "(no rule for their series)") in caplog.messages
-        assert not any(m.startswith(_ST_CLOSE_GAP) for m in caplog.messages)
-
-    def test_off_it_is_refused_as_today(self, monkeypatch, caplog):
-        corpus, candidates = self._prepare(monkeypatch, caplog, False)
-        assert candidates.all_pairs == [] and candidates.scheduled_close is False
-        assert candidates.close_rules == {}
-        assert _logged_counts(caplog)[_ST_CLOSE_GAP] == 1
-        assert not any(m.startswith("Scheduled close") for m in caplog.messages)
-        assert not any(backtester._SCHEDULED_CLOSE_KEY in m for m in corpus)
-
-    def test_a_series_with_no_rule_keeps_its_realized_close(self, monkeypatch, caplog):
-        self._setup(monkeypatch)
-        _save_capture(_capture_of("KXSTA", 20))
-        with caplog.at_level(logging.INFO):
-            candidates = backtester._prepare_candidates(
-                MagicMock(), MagicMock(), _SS1_START, True, None, scheduled_close=True)
-        # KXSTB keeps its realized close, 1.5 h after KXSTA's realized one and
-        # 6.5 days before its scheduled one: refused, on the usual line
-        assert candidates.all_pairs == []
-        assert _logged_counts(caplog)[_ST_CLOSE_GAP] == 1
-
-    def test_a_market_of_another_fingerprint_keeps_its_realized_close(self, monkeypatch,
-                                                                      caplog):
-        self._setup(monkeypatch)
-        # KXSTB's own latest − expected gap is not the one its rule was learned on
-        _save_details([{"ticker": "KXSTB-26-X", "event_ticker": "KXSTB-26",
-                        "close_time": "2026-02-20T01:30:00Z",
-                        "latest_expiration_time": "2026-02-27T00:00:00Z",
-                        "expected_expiration_time": "2026-02-21T00:00:00Z"}])
-        with caplog.at_level(logging.INFO):
-            candidates = backtester._prepare_candidates(
-                MagicMock(), MagicMock(), _SS1_START, True, None, scheduled_close=True)
-        assert candidates.all_pairs == []
-        assert _logged_counts(caplog)[_ST_CLOSE_GAP] == 1
-
-    def test_none_reads_the_constant_at_call_time(self, monkeypatch, caplog):
-        monkeypatch.setattr(backtester, "BACKTEST_SCHEDULED_CLOSE", False)
-        _corpus, candidates = self._prepare(monkeypatch, caplog, None)
-        assert candidates.all_pairs == [] and candidates.scheduled_close is False
-
-
 class TestScheduledCloseSwitchOff:
     """With the switch off nothing is read, no record carries a scheduled close, and
     every trade, curve and log line is the run's with no rule at all (C4's)."""
@@ -26270,9 +24992,8 @@ class TestScheduledCloseSwitchOff:
             mp.setattr(market_details, "_CLOSES_DIR",
                        market_details._CLOSES_DIR.parent / f"closes-{captures}")
             # Every run starts from the same caches: each market's details
-            # saved, no event label read yet
-            for path in (historical._EVENT_COMPETITIONS_CACHE,
-                         historical._EVENT_FEE_OVERRIDES_CACHE, historical._EVENT_FACTS_CACHE,
+            # saved, no event read yet
+            for path in (historical._EVENT_FEE_OVERRIDES_CACHE, historical._EVENT_FACTS_CACHE,
                          market_details._DETAILS_CACHE):
                 path.unlink(missing_ok=True)
             def details_of(m):
@@ -26337,69 +25058,6 @@ class TestScheduledCloseSwitchOff:
                    for m in on_log)
 
 
-class TestDeferredGateIsTheGate:
-    """With no scheduled close carried, the deferred same-title gate
-    (_extract_pairs(defer_close_gate=True) then _close_gate_and_labels) returns
-    the very pairs and count lines the gate inside _extract_pairs does."""
-
-    @pytest.mark.parametrize("seed", [0, 1, 2])
-    def test_same_pairs_same_lines(self, caplog, seed):
-        recs = TestOneSeriesAndSameEventCounts._fuzz(seed)
-        for k, rec in enumerate(recs):
-            if k % 17 == 5:
-                rec["close_time"] = "not a date" if k == 5 else None
-        listing = {"KXAA": ("Sports", ("Football",))}
-        st_groups = _group_by_exact_title(recs)
-        with caplog.at_level(logging.INFO):
-            direct = _extract_pairs(st_groups, series_categories=listing)
-        direct_lines = sorted(caplog.messages)
-        caplog.clear()
-        with caplog.at_level(logging.INFO):
-            deferred = backtester._close_gate_and_labels(
-                _extract_pairs(st_groups, series_categories=listing, defer_close_gate=True),
-                listing)
-        assert deferred == direct
-        assert sorted(caplog.messages) == direct_lines
-        counts = _logged_counts(caplog)
-        assert counts[_ST_CLOSE_GAP] and counts[_ST_LABEL] and counts[_ST_UNDATED]
-
-    @pytest.mark.parametrize("seed", [0, 1, 2])
-    def test_with_scheduled_closes_every_candidate_lands_on_one_line(self, caplog, seed):
-        recs = TestOneSeriesAndSameEventCounts._fuzz(seed)
-        rng = random.Random(seed)
-        for rec in recs:
-            close = backtester._parse_iso_datetime(rec.get("close_time"))
-            if close is not None and close.utcoffset() is not None and rng.random() < 0.5:
-                rec[backtester._SCHEDULED_CLOSE_KEY] = int(close.timestamp()) + rng.choice(
-                    (0, 1_800, 7_200, 86_400))
-        listing = {"KXAA": ("Sports", ("Football",))}
-        st_groups = _group_by_exact_title(recs)
-        candidates = sum(len(v) * (len(v) - 1) // 2 for v in st_groups.values())
-        with caplog.at_level(logging.INFO):
-            kept = backtester._close_gate_and_labels(
-                _extract_pairs(st_groups, series_categories=listing, defer_close_gate=True),
-                listing)
-        st = _logged_counts(caplog)
-        assert candidates == (len(kept) + st[_ST_SAME_EVENT] + st[_ST_SERIES]
-                              + st[_ST_UNDATED] + st[_ST_CLOSE_GAP] + st[_ST_LABEL])
-        for mA, mB, _, _ in kept:
-            assert not scanner.closes_apart(backtester._maturity_close(mA),
-                                            backtester._maturity_close(mB))
-
-    def test_the_deferred_lines_are_the_inline_lines_verbatim(self, caplog):
-        with caplog.at_level(logging.INFO):
-            backtester._log_close_gap_refusals(3)
-            backtester._log_label_refusals(2)
-        recs = TestSameTitleCloseGapBacktest._wiu()
-        caplog_lines = list(caplog.messages)
-        caplog.clear()
-        with caplog.at_level(logging.INFO):
-            _extract_pairs(_group_by_exact_title(recs))
-        inline = [m for m in caplog.messages if m.startswith(_ST_CLOSE_GAP)][0]
-        assert caplog_lines[0].rsplit(": ", 1)[0] == inline.rsplit(": ", 1)[0]
-        assert caplog_lines[1].startswith(_ST_LABEL)
-
-
 class TestScheduledCloseIsThreaded:
     """The switch rides keyword-only through every entry point and is recorded on the sweep."""
 
@@ -26433,6 +25091,24 @@ class TestScheduledCloseIsThreaded:
                      scheduled_close=False)
         assert seen == [False]
 
+    @pytest.mark.parametrize("configured", [True, False])
+    def test_none_reads_the_constant_at_call_time(self, monkeypatch, configured):
+        # _prepare_candidates resolves None to this module's
+        # BACKTEST_SCHEDULED_CLOSE when it runs, so a patch of that name takes
+        # effect, and it reads the close rules only with the switch on
+        monkeypatch.setattr(backtester, "BACKTEST_SCHEDULED_CLOSE", configured)
+        TestGroupableSubset._patch(monkeypatch, [
+            _ss1_record("RA", "RAINA-1", "Rain falls by March 1, 2026", close="2026-03-01"),
+            _ss1_record("RB", "RAINB-1", "Rain falls by March 20, 2026", close="2026-03-20")])
+        reads: list = []
+        monkeypatch.setattr(market_details, "load_close_rules",
+                            lambda *a, **k: reads.append(a) or {})
+        candidates = backtester._prepare_candidates(
+            MagicMock(), MagicMock(), _SS1_START, True, None, scheduled_close=None)
+        assert candidates.scheduled_close is configured
+        assert len(reads) == (1 if configured else 0)
+        assert [pt for _, pt in candidates.all_pairs] == ["time_series"]
+
 
 class TestApplyScheduledCloses:
     """_apply_scheduled_closes writes each pair market's scheduled close and counts the rest."""
@@ -26455,7 +25131,7 @@ class TestApplyScheduledCloses:
         info = {"A1": details(7, _RULE_GAP), "A2": details(7, _RULE_GAP + 3_600),
                 "A3": details(-1, _RULE_GAP), "B1": details(7, _RULE_GAP)}
         with caplog.at_level(logging.INFO):
-            backtester._apply_scheduled_closes(needed, info, rules, {}, {}, [], True)
+            backtester._apply_scheduled_closes(needed, info, rules, [], True)
         assert needed["A1"][backtester._SCHEDULED_CLOSE_KEY] == int(
             (close + timedelta(days=7)).timestamp())
         assert all(backtester._SCHEDULED_CLOSE_KEY not in needed[t] for t in ("A2", "A3", "B1"))
@@ -26471,7 +25147,7 @@ class TestApplyScheduledCloses:
     def test_off_pops_every_key_and_logs_nothing(self, caplog):
         needed = {"A1": {"ticker": "A1", backtester._SCHEDULED_CLOSE_KEY: 5}}
         with caplog.at_level(logging.INFO):
-            backtester._apply_scheduled_closes(needed, {}, None, {}, {}, [], True)
+            backtester._apply_scheduled_closes(needed, {}, None, [], True)
         assert needed["A1"] == {"ticker": "A1"} and caplog.messages == []
 
 
@@ -26668,20 +25344,6 @@ class TestStaleQuoteSkipsAMonday:
         alone = self._sim(_stale_attached(only_m2, candles))
         assert on.peak_kelly_fraction == alone.peak_kelly_fraction
         assert off.peak_kelly_fraction > on.peak_kelly_fraction > 0
-
-    def test_a_same_title_pair_moves_on_to_its_next_qualifying_monday(self):
-        a, b = _ladder_market("TA", "EVT-1", "2026-03-20"), _ladder_market("TB", "EVU-1",
-                                                                          "2026-03-20")
-        rec = _ladder_same_title(a, b, [_LADDER_M1, _LADDER_M2])
-        candles = {"TA": [_moved(_LADDER_M1, 3 * 86_400, 0.70, 0.30),
-                          _still(_LADDER_M1, 3_600, 0.70, 0.30),
-                          _moved(_LADDER_M2, 3_600, 0.70, 0.30)],
-                   "TB": [_moved(_LADDER_M1, 3_600, 0.40, 0.60),
-                          _moved(_LADDER_M2, 3_600, 0.40, 0.60)]}
-        off = self._sim(_stale_attached([copy.deepcopy(rec)], candles, limit=None))
-        on = self._sim(_stale_attached([rec], candles))
-        assert _traded(off) == [("TA", _LADDER_M1)]
-        assert _traded(on) == [("TA", _LADDER_M2)]
 
     def test_a_record_without_quotes_is_not_checked(self):
         records, _candles = self._ts(2 * 86_400)
@@ -26972,7 +25634,7 @@ class TestStaleQuoteKeepsEveryLazyFamilyExact:
                                  bands=(self._BAND,), ks=self._KS, primary_k=self._KS[0],
                                  start_date=self._START, initial_balance=10_000.0,
                                  split_date=split, checks=checks,
-                                 entries_by_band={self._BAND: entries}, st_entries=[],
+                                 entries_by_band={self._BAND: entries},
                                  eager=eager, end_dates=end_dates, **options)
         parity = TestMarketCapSweepParity()
         unchecked = self._entries(limit=None)
@@ -27044,9 +25706,8 @@ class TestStaleQuoteSwitch:
             # The memory figure, and what the side caches already held when
             # the run began (a second run in one test reads what the first saved)
             messages = [m for m in caplog.messages
-                        if not m.startswith(("Peak RSS", "Event competitions:",
-                                             "Event fee overrides:", "Event facts:", "Market details:",
-                                             "Trades:"))]
+                        if not m.startswith(("Peak RSS", "Event fee overrides:",
+                                             "Event facts:", "Market details:", "Trades:"))]
         return res, messages
 
     @staticmethod
@@ -27571,58 +26232,32 @@ class TestExtraDataReport:
         return [m for m in caplog.messages if m.startswith("Report only — ")]
 
     def test_each_count_fires_on_a_crafted_pair_and_not_on_an_agreeing_one(self, caplog):
-        same = [(self._m("SA", "EA"), self._m("SB", "EB"), "q", ("e", "t", "s")),
-                (self._m("SC", "EC"), self._m("SD", "ED"), "q", ("e", "t", "s"))]
         ts = [(self._m("TA", "EL"), self._m("TB", "EL"), "q", "k"),
               (self._m("TC", "EX"), self._m("TD", "EY"), "q", "k")]
-        details = {"SA": self._FULL, "SB": dict(self._FULL, floor_strike=89.5),
-                   "SC": self._FULL, "SD": dict(self._FULL),
-                   "TA": self._FULL,
+        details = {"TA": self._FULL,
                    "TB": dict(self._FULL, rules_primary=self._FULL["rules_primary"].replace(
                        "Oct 17, 2026", "Oct 24, 2026")),
                    "TC": self._FULL,
                    "TD": dict(self._FULL, rules_primary="If it rains in NYC by Oct 17, 2026, Yes.")}
-        facts = {"EA": {"settlement_sources": ("NFL",), "mutually_exclusive": False},
-                 "EB": {"settlement_sources": ("NCAA",), "mutually_exclusive": False},
-                 "EC": {"settlement_sources": ("NFL",), "mutually_exclusive": False},
-                 "ED": {"settlement_sources": ("NFL",), "mutually_exclusive": None},
-                 "EL": {"settlement_sources": (), "mutually_exclusive": True}}
+        facts = {"EL": {"settlement_sources": (), "mutually_exclusive": True}}
         with caplog.at_level(logging.INFO):
-            counts = backtester._report_pair_facts(ts, same, details, facts)
-        assert counts == {"strikes_differ": 1, "strikes_checked": 2,
-                          "sources_differ": 1, "sources_checked": 2,
-                          "rules_differ": 1, "rules_checked": 2,
+            counts = backtester._report_pair_facts(ts, details, facts)
+        assert counts == {"rules_differ": 1, "rules_checked": 2,
                           "option_ladders": 1, "ladders_checked": 1}
         lines = self._lines(caplog)
         assert lines == [
-            "Report only — same-title pairs whose strikes differ: 1 of 2 checked",
-            "Report only — same-title pairs whose events name different settlement "
-            "sources: 1 of 2 checked",
             "Report only — time-series pairs whose rules texts differ beyond their "
             "dates: 1 of 2 checked",
             "Report only — same-event ladder pairs whose event is a set of mutually "
             "exclusive options: 1 of 1 checked"]
         # Each count names its pairs, both tickers
-        assert caplog.messages.count("  SA / SB") == 2
         assert "  TC / TD" in caplog.messages and "  TA / TB" in caplog.messages
         # Dates alone never make two rules texts differ: TA / TB is named
         # once, under the option-set ladders
         assert caplog.messages.count("  TA / TB") == 1
-        assert "  TA / TB" == caplog.messages[caplog.messages.index(lines[3]) + 1]
-
-    def test_a_date_in_a_custom_strike_is_not_a_different_strike(self):
-        # The weekly Brent market carries a strike_date its monthly twin does
-        # not (real records of KXBRENTW/KXBRENTMON-26MAY2917-T98.99)
-        monthly = {"strike_type": "greater", "floor_strike": 98.99, "cap_strike": None,
-                   "custom_strike": {"front_month_contract": "BRENTQ6"}}
-        weekly = dict(monthly, custom_strike={"front_month_contract": "BRENTQ6",
-                                              "strike_date": "2026-05-29T21:00:00.000Z"})
-        assert not backtester._strikes_differ(monthly, weekly)
-        assert backtester._strikes_differ(monthly, dict(weekly, floor_strike=96.99))
-        assert backtester._strikes_differ(
-            monthly, dict(monthly, custom_strike={"front_month_contract": "BRENTU6"}))
-        assert backtester._strikes_differ({"custom_strike": {"Word": "Windmill"}},
-                                          {"custom_strike": {"Word": "Wind"}})
+        assert "  TA / TB" == caplog.messages[caplog.messages.index(lines[1]) + 1]
+        # The counts are exactly ExtraDataReport's report fields
+        assert set(counts) <= {f.name for f in fields(backtester.ExtraDataReport)}
 
     def test_rules_texts_that_differ_only_in_their_window_compare_equal(self):
         # Real rules of KXTRUMPSAY-25DEC15-WIND and -25DEC22-WIND
@@ -27644,25 +26279,20 @@ class TestExtraDataReport:
         assert (backtester._rules_skeleton(a)
                 != backtester._rules_skeleton(a.replace("Windmill", "Wind")))
 
-    def test_the_four_lines_are_logged_at_zero(self, caplog):
+    def test_the_two_lines_are_logged_at_zero(self, caplog):
         with caplog.at_level(logging.INFO):
-            counts = backtester._report_pair_facts([], [], {}, {})
+            counts = backtester._report_pair_facts([], {}, {})
         assert set(counts.values()) == {0}
-        assert len(self._lines(caplog)) == 4
+        assert len(self._lines(caplog)) == 2
         assert all(m.endswith(": 0 of 0 checked") for m in self._lines(caplog))
 
     def test_unknown_records_and_facts_are_not_checked(self, caplog):
-        same = [(self._m("SA", "EA"), self._m("SB", "EB"), "q", ("e", "t", "s"))]
         ts = [(self._m("TA", "EL"), self._m("TB", "EL"), "q", "k")]
-        # A timing-only record carries no strike, a blank rules text no rules,
-        # an event with no sources and an unknown flag no comparison
-        details = {"SA": {"level": "timing"}, "SB": self._FULL,
-                   "TA": dict(self._FULL, rules_primary="  "), "TB": self._FULL}
-        facts = {"EA": {"settlement_sources": (), "mutually_exclusive": None},
-                 "EB": {"settlement_sources": ("NFL",), "mutually_exclusive": None},
-                 "EL": {"settlement_sources": (), "mutually_exclusive": None}}
+        # A blank rules text carries no rules, and an unknown flag no comparison
+        details = {"TA": dict(self._FULL, rules_primary="  "), "TB": self._FULL}
+        facts = {"EL": {"settlement_sources": (), "mutually_exclusive": None}}
         with caplog.at_level(logging.INFO):
-            counts = backtester._report_pair_facts(ts, same, details, facts)
+            counts = backtester._report_pair_facts(ts, details, facts)
         assert set(counts.values()) == {0}
 
     def test_log_extra_data_returns_what_it_logged(self):
@@ -27726,17 +26356,16 @@ class TestExtraDataReport:
         assert report.pair_markets > 0 and report.anomaly_markets == 0
         assert [name for name, _ in report.integrity_failures] == list(
             market_details.CHECK_NAMES)
-        assert len([m for m in base_lines if m.startswith("Report only — ")]) == 4
+        assert len([m for m in base_lines if m.startswith("Report only — ")]) == 2
         # Every event's facts disagree: each listed under a source of its own,
-        # each a set of mutually exclusive options
+        # each a set of mutually exclusive options. The report reads only the
+        # mutually_exclusive flag, so the facts reach the ladder count alone
         monkeypatch.setattr(backtester, "load_event_facts", lambda client, events: {
             e: {"settlement_sources": (e,), "mutually_exclusive": True}
             for e in events if e})
         other, _ = TestStaleQuoteSwitch()._run(monkeypatch, caplog)
         TestStaleQuoteSwitch._same(other, base)
         assert other.extra_data_report.option_ladders == other.extra_data_report.ladders_checked
-        assert (other.extra_data_report.sources_differ
-                == other.extra_data_report.sources_checked > 0)
         assert other.extra_data_report.ladders_checked > 0
 
     def test_the_infeasible_window_records_no_report(self, monkeypatch):

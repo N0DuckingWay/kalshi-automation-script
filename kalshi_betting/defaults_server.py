@@ -35,12 +35,14 @@ Purpose:
         orders). Closing the tab cancels; nothing is written on the way in.
         With no live defaults saved, every live run refuses to start, so this
         is also how the first file is made. A file an older version saved
-        (holding add_to_held_pairs, trim_to_kelly and trim_min_rise, which
-        rebalance and min_price_move replaced) is refused by every live run
-        too: this page then counts nothing as in force, says so above the
-        table, and one Confirm and save replaces the file. The other pages
-        (/, /trade, /saved) show a notice with a link to this page holding
-        the old file's values in their new form.
+        (one holding a setting this version replaced or no longer has, such
+        as add_to_held_pairs, trim_to_kelly and trim_min_rise, which
+        rebalance and min_price_move replaced, or the same-title cap, which
+        nothing replaced) is refused by every live run too: this page
+        then counts nothing as in force, says so above the table, and one
+        Confirm and save replaces the file. The other pages (/, /trade,
+        /saved) show a notice with a link to this page holding the old
+        file's values in their new form.
       - /trade shows the saved defaults and offers Dry run and Confirm and
         trade with them.
       - /runs/<id> shows one run: while it runs, its progress and the end of
@@ -54,7 +56,7 @@ Purpose:
         port).
 
     Each run is its own `python -m kalshi_betting.main --mode prod` process,
-    started with all twelve toggles as explicit flags (config.live_settings_argv)
+    started with all eleven toggles as explicit flags (config.live_settings_argv)
     so it trades exactly what its page showed, in a new session (so Ctrl-C on
     this server, or closing its terminal, never reaches it), from
     config.PROJECT_ROOT, writing everything it prints to its own folder under
@@ -62,13 +64,15 @@ Purpose:
 
 Dependencies:
     Imports config and run_lock only (besides the standard library). From
-    config: LiveSettings, LIVE_TOGGLE_FIELDS (the twelve toggle names the
+    config: LiveSettings, LIVE_TOGGLE_FIELDS (the eleven toggle names the
     fingerprint reads), LiveDefaultsError (a refused saved file),
     LiveDefaultsOutdated (a file an older version saved, which carries what
-    it reads as now, offered here for one more save) and the
-    saved-defaults helpers (read_saved_live_defaults, save_live_defaults,
-    live_settings_changes, describe_live_settings, live_rule_warnings,
-    rebalance_change_warnings, live_defaults_source), live_settings_argv (a run's
+    it reads as now, offered here for one more save), _RETIREMENTS (the old
+    settings each change retired; the notice about such a file reads which
+    ones Rebalance replaced) and the saved-defaults helpers
+    (read_saved_live_defaults, save_live_defaults, live_settings_changes,
+    describe_live_settings, live_rule_warnings, rebalance_change_warnings,
+    live_defaults_source), live_settings_argv (a run's
     flags), the seed values and their source note, the source-note pattern,
     the exit codes, the run result's format tag, the DEFAULTS_SERVER_*,
     DASHBOARD_FILENAME, DASHBOARD_MARKER_SCAN_BYTES and SCHEDULER_*
@@ -185,6 +189,7 @@ from urllib.parse import parse_qs, urlencode
 
 from . import config, run_lock
 from .config import (
+    _RETIREMENTS,
     DASHBOARD_FILENAME,
     DASHBOARD_MARKER_SCAN_BYTES,
     DEFAULTS_SERVER_CHECKOUT_MAX_BYTES,
@@ -231,21 +236,23 @@ from .config import (
 
 # The fields a confirmation request carries, in the GET query and repeated in
 # the POST body; the signed text is built from exactly these, as raw strings
-_FIELDS = ("tier_floors", "spread_min", "spread_max", "k", "size_cap",
-           "same_title_size_cap", "rebalance", "min_price_move",
-           "rebalance_min_days_to_maturity", "sell_at", "sell_min_days",
+_FIELDS = ("tier_floors", "spread_min", "spread_max", "k", "size_cap", "rebalance",
+           "min_price_move", "rebalance_min_days_to_maturity", "sell_at", "sell_min_days",
            "exclude_category", "exclude_tag", "source")
-# The fields a link built by an older version could carry: add_to_held_pairs,
-# trim_to_kelly and trim_min_rise, which rebalance and min_price_move replaced;
-# category (a category to trade), which exclude_category replaced; and tag (a
-# tag to trade), which exclude_tag replaced. A link naming one is refused with
-# a message that says which change it predates
-_RETIRED_FIELDS = ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise", "category", "tag")
+# The fields a link built by an older version could carry, in the order the
+# changes came: add_to_held_pairs, trim_to_kelly and trim_min_rise, which
+# rebalance and min_price_move replaced; category (a category to trade), which
+# exclude_category replaced; tag (a tag to trade), which exclude_tag replaced;
+# and same_title_size_cap (an extra per-trade cap on same-title pairs), which
+# nothing replaced, since the bot trades time-series pairs only. A link naming
+# one is refused with a message that says which change it predates
+_RETIRED_FIELDS = ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise", "category", "tag",
+                   "same_title_size_cap")
 # The fields a proposal must carry; every other one may be left out
 _REQUIRED = ("tier_floors", "spread_min", "spread_max", "k", "size_cap")
 # The fields a request may give more than once: one per excluded category or tag named
 _REPEATABLE = ("exclude_category", "exclude_tag")
-# The largest number of fields a query or form may hold: its fourteen fields, the
+# The largest number of fields a query or form may hold: its thirteen fields, the
 # fingerprint, nonce, token, action and acknowledgement (with room to spare),
 # plus the most categories and tags a link may name; more is refused unread
 _MAX_FIELDS = 20 + 2 * DEFAULTS_SERVER_MAX_FILTER_NAMES
@@ -916,23 +923,29 @@ def _proposal(params: dict[str, list[str]],
     Turn a confirmation request's fields into the proposed live defaults.
 
     Required: tier_floors ("on"/"off"), spread_min, spread_max, k and
-    size_cap (a fraction, e.g. 0.2). Optional: same_title_size_cap,
-    rebalance ("on"/"off"), min_price_move ("off" or dollars, e.g. 0.1 for
-    10c), rebalance_min_days_to_maturity (0, 1 or 7 days; 0 is "maturity",
-    always rebalance), sell_at ("off" or a share in (0, 1]) and sell_min_days
-    ("off" or whole days). One left out keeps the saved value (for a file an
-    older version saved, its value in the new form), or takes the seed's when
-    none is saved or (all but same_title_size_cap) when the link carries the
-    seed's note, so such a link still proposes exactly the seed. The one
-    exception: a link that names rebalance=off and leaves
-    rebalance_min_days_to_maturity out clears it, so a page built before that
-    field existed can still turn rebalancing off.
+    size_cap (a fraction, e.g. 0.2). Optional: rebalance ("on"/"off"),
+    min_price_move ("off" or dollars, e.g. 0.1 for 10c),
+    rebalance_min_days_to_maturity (0, 1 or 7 days; 0 is "maturity", always
+    rebalance), sell_at ("off" or a share in (0, 1]) and sell_min_days ("off"
+    or whole days). One left out keeps the saved value (for a file an older
+    version saved, its value in the new form), or takes the seed's when none
+    is saved or when the link carries the seed's note, so a link with the
+    seed's note that leaves some out still proposes exactly the seed,
+    whatever is saved. The one exception: a link that names rebalance=off and
+    leaves rebalance_min_days_to_maturity out clears it, so a link that turns
+    rebalancing off without naming the limit (what the Save button of a
+    dashboard page without the "Rebalance until" choices sends while its
+    Rebalance is no, or a link made by hand) is not refused over a saved
+    limit.
     LiveSettings refuses a minimum price movement or a days-to-maturity limit
     with rebalancing off, as it refuses a minimum of days with no sell level.
     A link that names one of _RETIRED_FIELDS (built before rebalance and
     min_price_move replaced the first three, before exclude_category replaced
-    category, or before exclude_tag replaced tag) is refused, with a message
-    saying how to get a new one.
+    category, before exclude_tag replaced tag, or before the same-title cap,
+    same_title_size_cap, was removed) is refused, with a message saying how
+    to get a new one. A link naming the same-title cap beside an older
+    retired field was built before that older change, so its message is the
+    older change's.
 
     exclude_category and exclude_tag may each repeat, one name per field, at
     most config.DEFAULTS_SERVER_MAX_FILTER_NAMES of each as sent; a missing
@@ -964,19 +977,27 @@ def _proposal(params: dict[str, list[str]],
             values.
     """
     retired = [field_name for field_name in _RETIRED_FIELDS if field_name in params]
-    if retired and set(retired) <= {"category", "tag"}:
+    # The same-title cap was the last of these changes, and a page built before
+    # an older one could send it too: a link that also names an older retired
+    # field was built before that older change, and is told about it
+    older = [field_name for field_name in retired if field_name != "same_title_size_cap"]
+    if retired and not older:
+        raise ValueError("this link names same_title_size_cap, which is no longer used (the "
+                         "bot trades time-series pairs only): rebuild the backtest dashboard, "
+                         "or open this server's start page")
+    if older and set(older) <= {"category", "tag"}:
         # Categories or tags to trade, where a link now names the ones to exclude;
         # a link naming both is told about both
         plural = {"category": "categories", "tag": "tags"}
-        kinds = " and ".join(plural[name] for name in retired)
-        filters = (f"the {retired[0]} filter is now a list of {kinds}" if len(retired) == 1
+        kinds = " and ".join(plural[name] for name in older)
+        filters = (f"the {older[0]} filter is now a list of {kinds}" if len(older) == 1
                    else f"the category and tag filters are now lists of {kinds}")
-        raise ValueError(f"this link names {' and '.join(retired)}, which "
-                         f"{' and '.join('exclude_' + name for name in retired)} replaced "
+        raise ValueError(f"this link names {' and '.join(older)}, which "
+                         f"{' and '.join('exclude_' + name for name in older)} replaced "
                          f"({filters} NOT to trade): rebuild the backtest dashboard, or "
                          "open this server's start page")
-    if retired:
-        raise ValueError(f"this link was built before Rebalance (it names {retired[0]}): "
+    if older:
+        raise ValueError(f"this link was built before Rebalance (it names {older[0]}): "
                          "rebuild the backtest dashboard, or open this server's start page")
     unknown = sorted(set(params) - set(_FIELDS))
     if unknown:
@@ -998,12 +1019,6 @@ def _proposal(params: dict[str, list[str]],
         raise ValueError(f"{missing[0]} is missing")
     if value["tier_floors"] not in ("on", "off"):
         raise ValueError(f"tier_floors must be on or off, got {value['tier_floors']!r}")
-    if "same_title_size_cap" in value:
-        same_title = _number(value["same_title_size_cap"], "same_title_size_cap")
-    elif current is not None:
-        same_title = current.same_title_size_cap
-    else:
-        same_title = LIVE_DEFAULTS_SEED.same_title_size_cap
     source = value.get("source", "")
     if "rebalance" in value:
         if value["rebalance"] not in ("on", "off"):
@@ -1023,8 +1038,9 @@ def _proposal(params: dict[str, list[str]],
         rebalance_until = _whole_number(value["rebalance_min_days_to_maturity"],
                                         "rebalance_min_days_to_maturity")
     elif "rebalance" in value and not rebalance:
-        # A page built before this field existed says rebalance=off and knows
-        # nothing of it; the limit goes with the switch rather than refuse the link
+        # A link that says rebalance=off without naming the limit (from a
+        # dashboard page without the "Rebalance until" choices, or made by
+        # hand): the limit goes with the switch rather than refuse the link
         rebalance_until = None
     else:
         rebalance_until = _kept("rebalance_min_days_to_maturity", current, source)
@@ -1049,7 +1065,7 @@ def _proposal(params: dict[str, list[str]],
     # applies them
     if live_defaults_source(source) != source:
         raise ValueError(f"source must have no spaces around it, got {source!r}")
-    # LiveSettings checks every value (the band, k, each cap on its grid, the
+    # LiveSettings checks every value (the band, k, the cap on its grid, the
     # names and a tied tag's two halves, a minimum without its switch) and names
     # the field it refuses
     settings = LiveSettings(
@@ -1058,7 +1074,6 @@ def _proposal(params: dict[str, list[str]],
                      _number(value["spread_max"], "spread_max")),
         interval_discount=_number(value["k"], "k"),
         size_cap=_number(value["size_cap"], "size_cap"),
-        same_title_size_cap=same_title,
         exclude_categories=exclude_categories,
         exclude_tags=exclude_tags,
         rebalance=rebalance,
@@ -1099,7 +1114,6 @@ def _settings_query(values: LiveSettings, *, source: str = "") -> str:
         ("spread_max", repr(values.spread_band[1])),
         ("k", repr(values.interval_discount)),
         ("size_cap", repr(values.size_cap)),
-        ("same_title_size_cap", repr(values.same_title_size_cap)),
         ("rebalance", "on" if values.rebalance else "off"),
         ("min_price_move",
          "off" if values.min_price_move is None else repr(values.min_price_move)),
@@ -1138,8 +1152,9 @@ def _current_defaults() -> LiveSettings | None:
 
     Raises:
         LiveDefaultsOutdated: If the file was saved by an older version (it
-            holds settings rebalance and min_price_move replaced); it carries
-            what the file reads as now, which the pages offer for one save.
+            holds a setting this version replaced or no longer has, such as
+            the same-title cap); it carries what the file reads as now, which
+            the pages offer for one save.
         LiveDefaultsError: If a file exists but is refused for any other reason.
     """
     # config's strict read, the one a live run makes through live_defaults(),
@@ -1170,7 +1185,7 @@ def _fingerprint(current: LiveSettings | None,
 
     Returns:
         str: The SHA-256 hex digest of "none", of the outdated file's
-            refusal, or of the origin and the twelve toggles as JSON.
+            refusal, or of the origin and the eleven toggles as JSON.
     """
     if outdated is not None:
         proposal = outdated.proposal
@@ -1400,14 +1415,18 @@ def _outdated_when(outdated: LiveDefaultsOutdated) -> str:
     Say which changes an outdated saved file was saved before.
 
     The changes came in this order: Rebalance, the category filter becoming a
-    list of categories to exclude, then the tag filter becoming a list of
-    tags to exclude. A file saved before one of them also holds the old keys
-    of every later one. A later change whose old key was null (any category,
-    any tag) still reads as it did, with nothing excluded, so only the
-    earliest change is named; a later one is named too when its old key
+    list of categories to exclude, the tag filter becoming a list of tags to
+    exclude, then the same-title cap's removal. A file saved before one of
+    them also holds the old keys of every later one (every file an older
+    version saved holds the same-title cap, which every older version
+    required). A later change that leaves what the file trades as it was is
+    not named: an old category or tag key that was null (any category, any
+    tag) reads as nothing excluded, and the same-title cap limited only
+    same-title pairs, which this version never trades. So only the earliest
+    change is named; a later filter change is named too when its old key
     listed names to trade (its values in their new form then trade every
-    category or every tag), or when the file cannot be read in its new form
-    (_outdated_changes).
+    category or every tag), and every change the file predates is named when
+    it cannot be read in its new form (_outdated_changes).
 
     Args:
         outdated (LiveDefaultsOutdated): Why the saved file is refused; its
@@ -1416,10 +1435,11 @@ def _outdated_when(outdated: LiveDefaultsOutdated) -> str:
     Returns:
         str: "before Rebalance", "before the category filter became a list of
             categories to exclude", "before the tag filter became a list of
-            tags to exclude", or several joined by "and"; "by an older
-            version" when the refusal names no retired setting.
+            tags to exclude", "before the same-title cap was removed", or
+            several joined by "and"; "by an older version" when the refusal
+            names no retired setting.
     """
-    rebalance, categories, tags = _outdated_changes(outdated)
+    rebalance, categories, tags, same_title_cap = _outdated_changes(outdated)
     changes = []
     if rebalance:
         changes.append("before Rebalance")
@@ -1427,39 +1447,45 @@ def _outdated_when(outdated: LiveDefaultsOutdated) -> str:
         changes.append("before the category filter became a list of categories to exclude")
     if tags:
         changes.append("before the tag filter became a list of tags to exclude")
+    if same_title_cap:
+        changes.append("before the same-title cap was removed")
     return " and ".join(changes) if changes else "by an older version"
 
 
-# The retired settings each filter change replaced; every other retired
-# setting is one Rebalance replaced
-_FILTER_RETIREMENTS = ("categories", "tags")
+# The retired settings Rebalance replaced (add_to_held_pairs, trim_to_kelly and
+# trim_min_rise), as config's list of retirements names them: its first entry,
+# which config keeps first
+_REBALANCE_RETIREMENTS = _RETIREMENTS[0][0]
 
 
-def _outdated_changes(outdated: LiveDefaultsOutdated) -> tuple[bool, bool, bool]:
+def _outdated_changes(outdated: LiveDefaultsOutdated) -> tuple[bool, bool, bool, bool]:
     """
-    Say which of the three retirements an outdated saved file's notice names.
+    Say which of the four retirements an outdated saved file's notice names.
 
-    The earliest change the file was saved before is always named; a later
-    filter change is named when the file's old list named names to trade, or
-    when the file has no reading in its new form.
+    The earliest change the file was saved before is always named. A later
+    filter change is named when the file's old list named names to trade; a
+    later change of any kind is named when the file has no reading in its new
+    form (see _outdated_when).
 
     Args:
         outdated (LiveDefaultsOutdated): Why the saved file is refused.
 
     Returns:
-        tuple[bool, bool, bool]: Whether to name Rebalance, the change of the
-            category filter and the change of the tag filter (see
-            _outdated_when).
+        tuple[bool, bool, bool, bool]: Whether to name Rebalance, the change
+            of the category filter, the change of the tag filter and the
+            removal of the same-title cap.
     """
     retired = getattr(outdated, "retired", ()) or ()
-    rebalance = any(name not in _FILTER_RETIREMENTS for name in retired)
+    rebalance = any(name in _REBALANCE_RETIREMENTS for name in retired)
     unreadable = outdated.proposal is None
     categories = "categories" in retired and (
         _old_categories(outdated) is not None or unreadable or not rebalance)
     tags = "tags" in retired and (
         _old_tags(outdated) is not None or unreadable
         or not (rebalance or "categories" in retired))
-    return rebalance, categories, tags
+    same_title_cap = "same_title_size_cap" in retired and (
+        unreadable or not (rebalance or "categories" in retired or "tags" in retired))
+    return rebalance, categories, tags, same_title_cap
 
 
 def _old_categories(outdated: LiveDefaultsOutdated) -> tuple[str, ...] | None:
@@ -1565,8 +1591,9 @@ def _outdated_reading(outdated: LiveDefaultsOutdated) -> str:
 
     Names only what the retired settings became: the Rebalance choice and
     its minimum for a file saved before Rebalance, "no category excluded"
-    when the category change is named and "no tag excluded" when the tag
-    change is named (_outdated_changes).
+    when the category change is named, "no tag excluded" when the tag change
+    is named and "no same-title cap" when the same-title cap's removal is
+    named (_outdated_changes).
 
     Args:
         outdated (LiveDefaultsOutdated): Why the saved file is refused; its
@@ -1575,13 +1602,13 @@ def _outdated_reading(outdated: LiveDefaultsOutdated) -> str:
     Returns:
         str: e.g. "Rebalance yes and Min. price movement 10c" ("any" with no
             minimum), "Rebalance no", "no category excluded", "no tag
-            excluded" or several joined by "and".
+            excluded", "no same-title cap" or several joined by "and".
     """
     proposal = outdated.proposal
-    rebalance, categories, tags = _outdated_changes(outdated)
+    rebalance, categories, tags, same_title_cap = _outdated_changes(outdated)
     parts = []
-    # A refusal naming no change reads as the Rebalance choice, as before
-    if rebalance or not (categories or tags):
+    # A refusal that names no retired setting is read as the Rebalance choice
+    if rebalance or not (categories or tags or same_title_cap):
         if not proposal.rebalance:
             parts.append("Rebalance no")
         else:
@@ -1592,6 +1619,8 @@ def _outdated_reading(outdated: LiveDefaultsOutdated) -> str:
         parts.append("no category excluded")
     if tags:
         parts.append("no tag excluded")
+    if same_title_cap:
+        parts.append("no same-title cap")
     return " and ".join(parts)
 
 
@@ -3633,7 +3662,7 @@ class _App:
         The one place the server starts a process. It makes the run's folder
         under config.LIVE_RUNS_DIR, writes run.json (what the run is) before
         anything starts, locks output.log and starts
-        `python -m kalshi_betting.main --mode prod` with all twelve toggles as
+        `python -m kalshi_betting.main --mode prod` with all eleven toggles as
         flags (config.live_settings_argv), --result-file in the folder and,
         for a dry run, --dry-run, from config.PROJECT_ROOT, its output going
         to output.log. The process inherits the lock through its output, so
@@ -3663,7 +3692,7 @@ class _App:
         started = datetime.now(UTC)
         folder = config.LIVE_RUNS_DIR / f"{started.strftime(_FOLDER_TIME)}-{run_id}"
         folder.mkdir(parents=True)
-        # All twelve toggles as flags, so the run trades exactly these settings
+        # All eleven toggles as flags, so the run trades exactly these settings
         argv = [sys.executable, "-m", "kalshi_betting.main", "--mode", "prod",
                 *live_settings_argv(settings), "--result-file", str(folder / _RESULT_NAME)]
         if dry_run:

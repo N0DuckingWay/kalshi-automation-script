@@ -1708,7 +1708,8 @@ INVENTORY_DESCRIPTIONS = {
     "event_titles.json": ("The older event title file, read once to bring its titles into "
                           "event_titles_v2.json; no longer read."),
     "event_competitions.json": ("The competition each event names (a league, for example), "
-                                "used by the same-title sport check."),
+                                "left by an earlier backtest; no longer read, and safe to "
+                                "delete."),
     "series_categories.json": "Kalshi's category and tags for each series, refreshed weekly.",
     "treasury_bill_rates.json": ("The 8-week Treasury bill auction yields the dashboards "
                                  "subtract from Sharpe and Sortino."),

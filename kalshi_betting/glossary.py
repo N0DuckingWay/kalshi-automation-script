@@ -93,14 +93,6 @@ TERMS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
      "Rungs of one ladder tend to settle alike, so the two kinds are shown "
      "apart.",
      _BOTH),
-    ("Same-title pair",
-     "Two identically worded markets on different series, filed under the same "
-     "Kalshi category, tag and competition and closing within an hour of each other, "
-     "whose Yes prices differ by 5 cents or more; the bot buys No on the pricier "
-     "and Yes on the cheaper.",
-     "If both settle the same way one leg pays, so it is close to a sure gain; it "
-     "loses only if the pricier one settles Yes and the cheaper one No.",
-     _BACKTEST),
     ("In-between outcome",
      "A time-series pair whose earlier market settled No and later market Yes: "
      "the event happened between the deadlines, and both legs lose.",
@@ -133,8 +125,7 @@ TERMS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
      _BACKTEST),
     ("Size cap",
      "The most of the portfolio value one new trade may stake, whatever the Kelly "
-     "fraction says; same-title pairs also have a cap of their own, and the lower "
-     "of the two applies.",
+     "fraction says.",
      "Limits how much one wrong forecast can cost.",
      _BACKTEST),
     ("Rebalance",
@@ -225,8 +216,8 @@ TERMS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
     ("Slippage",
      "A trade's profit minus what it would have made held to a win, in dollars (not "
      "price slippage).",
-     "Zero for a trade held to a win; negative for a loss or a trade sold early; "
-     "positive only for a same-title pair where both legs paid.",
+     "Zero for a trade held to a win; negative for a loss, and almost always for a "
+     "trade sold early.",
      _BACKTEST),
     ("Split-half check (H1 / H2)",
      "The same scenario run again from the starting balance on the entries before, "

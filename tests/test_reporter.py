@@ -2,8 +2,8 @@
 fallback around append_to_prod_log() (BS-18), the run note (main._run_prod's
 live toggles) it appends to the separator row on both paths, plus the row/Notes/candidates
 sheet layout after the 2026-09 strategy change (side-neutral x/y headers, the
-"[<pair_type>: <SIDE_A> A / <SIDE_B> B[ nB=…]] " Notes prefix, and the "nB (NO
-ask)" candidates column), and the run result main.py --result-file writes
+"[<pair_type>: <SIDE_A> A / <SIDE_B> B nB=… fees=$…] " Notes prefix, and the
+"nB (NO ask)" candidates column), and the run result main.py --result-file writes
 (trade_record, report_trades — with the Kalshi category and tag it files each
 record under — write_run_report and RunReportHandler). All tests run offline
 against tmp_path; no real Kalshi API interaction.
@@ -60,9 +60,9 @@ def make_result(
     The default pair is a coherent time-series pair under the 2026-09
     direction: the LATER contract (market_b) is priced above the earlier
     (pA=0.30 → pB=0.60), the legs bought are YES on A at pA=0.30 and NO on B at
-    nB=0.40, and nA=0.70 is A's reporting-only NO ask. `pair_type` can be
-    switched to "same_title" to exercise the other Notes prefix — the prices
-    are then the same-title legs nA/pB and nB is reporting-only."""
+    nB=0.40, and nA=0.70 is A's reporting-only NO ask. `pair_type` can be set
+    to another type to check how reporter handles a result the side helpers
+    cannot describe."""
     pair = CandidatePair(
         market_a=make_market(f"TICK-A-{ticker_suffix}"),
         market_b=make_market(f"TICK-B-{ticker_suffix}"),
@@ -239,16 +239,18 @@ class TestResultToRow:
         row = reporter._result_to_row(make_result("1"), datetime(2026, 9, 8))
         assert row[17] == "[time_series: YES A / NO B nB=0.4000 fees=$0.10] "
 
-    def test_notes_prefix_same_title_names_sides_without_nb(self):
-        # nB is reporting-only for a same-title pair, so it is not in the prefix
-        row = reporter._result_to_row(
-            make_result("1", pair_type="same_title"), datetime(2026, 9, 8),
-        )
-        assert row[17] == "[same_title: NO A / YES B fees=$0.10] "
+    def test_a_result_of_another_pair_type_is_given_no_sides(self):
+        # scanner.leg_sides gives sides to time-series pairs only, so a row
+        # is never written for another type with the NO-on-A, YES-on-B sides;
+        # a run hands the trade log none (select_portfolio refuses such a
+        # pair before any order)
+        with pytest.raises(ValueError,
+                           match=re.escape("not a time-series pair type: 'same_title'")):
+            reporter._result_to_row(make_result("1", pair_type="same_title"),
+                                    datetime(2026, 9, 8))
 
     @pytest.mark.parametrize("pair_type, prefix", [
         ("time_series", "[time_series: YES A / NO B nB=0.4000 fees=$0.10 adds to 30 held] "),
-        ("same_title", "[same_title: NO A / YES B fees=$0.10 adds to 30 held] "),
     ])
     def test_an_add_on_row_names_the_held_count(self, pair_type, prefix):
         # A trade adding to a held pair says so inside the Notes bracket; no
@@ -377,11 +379,8 @@ class TestSeparatorRunNote:
 class TestWriteDevSimulationCandidatesSheet:
     def test_candidates_sheet_has_nb_column_and_percent_formats(self, reporter_paths):
         ts_result = make_result("1")
-        st_result = make_result("2", pair_type="same_title")
         path = reporter.write_dev_simulation(
-            [ts_result, st_result],
-            [ts_result.spec.pair, st_result.spec.pair],
-            balance_cents=100_000,
+            [ts_result], [ts_result.spec.pair], balance_cents=100_000,
         )
 
         wb = openpyxl.load_workbook(path)
@@ -394,16 +393,13 @@ class TestWriteDevSimulationCandidatesSheet:
         assert header(12) == "Price Diff"
         assert header(13) == "Tradeable?"
 
-        # Row 2 is the time-series candidate, row 3 the same-title one
+        # Row 2 is the time-series candidate
         assert ws.cell(row=2, column=1).value == "time_series"
         assert ws.cell(row=2, column=11).value == pytest.approx(0.40)
-        # Price Diff is the gap the finder tested: pB − pA for time-series...
+        # Price Diff is the gap the finder tested: the later market's YES ask
+        # above the earlier's, pB − pA
         assert ws.cell(row=2, column=12).value == pytest.approx(0.30)
-        # ...and pA − pB for same-title (negative here because the fixture's
-        # prices are a time-series shape — the sign is what's being pinned)
-        assert ws.cell(row=3, column=1).value == "same_title"
-        assert ws.cell(row=3, column=11).value == pytest.approx(0.40)
-        assert ws.cell(row=3, column=12).value == pytest.approx(-0.30)
+        assert ws.max_row == 2
 
         # Percent formats on the five price columns pA, pB, nA, nB, Price Diff
         for col in (8, 9, 10, 11, 12):
@@ -550,7 +546,6 @@ class TestTradeRecord:
 
     @pytest.mark.parametrize("pair_type, sides, prices", [
         ("time_series", ("yes", "no"), (0.30, 0.40)),
-        ("same_title", ("no", "yes"), (0.70, 0.60)),
     ])
     def test_each_leg_is_described_by_the_pair_type(self, pair_type, sides, prices):
         result = make_result("X", status="rolled_back", pair_type=pair_type,
@@ -629,6 +624,33 @@ class TestReportTrades:
         errors = [r for r in caplog.records if r.levelno == logging.ERROR]
         assert len(errors) == 1
         assert errors[0].getMessage().startswith("Could not describe a pair for the run result:")
+
+    def test_a_pair_of_another_type_is_kept_as_any_pair_it_cannot_describe(self, caplog):
+        # scanner.leg_sides gives sides to time-series pairs only, so
+        # trade_record cannot describe a pair of another type. A run hands
+        # report_trades none (select_portfolio refuses such a pair before any
+        # order), but one handed over anyway is logged and kept in its place
+        # as what could be read of it, and every other record is whole
+        first = make_result("1")
+        other = make_result("2", status="manual_review", pair_type="same_title",
+                            error="Unhandled exception in _execute_one")
+        last = make_result("3", status="failed", error="NO leg FoK not filled")
+        with pytest.raises(ValueError,
+                           match=re.escape("not a time-series pair type: 'same_title'")):
+            reporter.trade_record(other)
+        with caplog.at_level(logging.ERROR):
+            records = reporter.report_trades([first, other, last])
+        assert records[0] == reporter.trade_record(first)
+        assert records[2] == reporter.trade_record(last)
+        assert records[1] == reporter.TradeRecord(
+            status="manual_review", error="Unhandled exception in _execute_one",
+            pair_type="same_title", title="test pair",
+            a=reporter.LegRecord("TICK-A-2", None, None, 5, None),
+            b=reporter.LegRecord("TICK-B-2", None, None, 5, None),
+            cost_with_fees=None, profit_if_won=None)
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert errors == ["Could not describe a pair for the run result: not a time-series "
+                          "pair type: 'same_title'"]
 
     def test_only_plain_values_are_kept_from_a_result_it_cannot_read(self, caplog):
         # A result that is not a TradeResult at all, and one whose fields are

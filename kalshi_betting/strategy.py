@@ -21,16 +21,20 @@ Dependencies:
     model, LiveSettings, held_pair_fraction, which sizes a trade that adds to
     a pair the account holds, and count_text for the "adds to N held"
     marker) and scanner (CandidatePair, pair_held, pair_mid_spread, the
-    forecast's input, and order-book pricing helpers). main calls
+    forecast's input, pair_log_name, which names a refused pair in its log
+    line, and order-book pricing helpers). main calls
     compute_trade and select_portfolio; trader and reporter read TradeSpec.
 
 Notes:
-    Prices here are leg prices (scanner.leg_prices): (nA, pB) same-title, (pA, nB) time-series.
+    compute_trade and select_portfolio take time-series pairs only: any other
+    pair type is refused first, with one WARNING, since nothing forms one.
+    Prices here are leg prices (scanner.leg_prices): (pA, nB), YES on the
+    earlier market and NO on the later — the time-series legs.
     cost_with_fees_a/_b are per market, not per side; trader funds each market's shard from them.
     cash_need_cents is never below what shard funding asks for, so the cash set aside covers it in total.
     backtester and dashboard copy the Kelly formula, and backtester the ticker and ladder rules.
     Change every copy together.
-    k (the time-series model's discount) and the size caps come from the LiveSettings
+    k (the time-series model's discount) and the per-trade cap come from the LiveSettings
     each call is handed, or config.py's when none is.
     An add-on is a candidate that buys more of a pair the account already holds
     (CandidatePair.held, read through scanner.pair_held). Kelly sizes the whole
@@ -47,7 +51,6 @@ from typing import NamedTuple
 
 from .config import (
     PRICE_EPSILON,
-    SAME_TITLE_CO_RESOLVE_PROB,
     SIZE_SOLVE_MAX_ITERATIONS,
     LiveSettings,
     count_text,
@@ -68,6 +71,7 @@ from .scanner import (
     leg_sides,
     pair_held,
     pair_ladder_keys,
+    pair_log_name,
     pair_mid_spread,
     prefix_fill_prices,
     v2_effective_cap,
@@ -96,7 +100,8 @@ class TradeSpec:
         cost_with_fees_a (float): market_a's leg cost with its fee; trader funds that market's shard from it.
         cost_with_fees_b (float): market_b's leg cost with its fee. Both default to 0.0.
         cash_need_cents (int | None): Most cash the two orders can take, in whole cents; None if built by hand.
-        interval_discount (float | None): The k (time-series discount) the spec was sized at; None for same-title.
+        interval_discount (float | None): The k (time-series discount) the spec was sized at;
+            None only for a spec built by hand without one, which is never shrunk.
         fee_multipliers (tuple[float, float]): The fee multiplier each leg was priced at,
             (market_a's, market_b's) in market order (scanner.leg_fee_multipliers). (1.0, 1.0)
             is the full fee on both.
@@ -136,10 +141,10 @@ def _depth_levels(pair: CandidatePair) -> tuple:
 
 def _kelly_p(pair: CandidatePair, settings: LiveSettings) -> float | None:
     """
-    The pair's chance of profit under the run's k; None when a time-series pair has no mid spread.
+    The pair's chance of profit under the run's k; None when it has no forecast.
 
-    _kelly_p_at with the run's k (settings.interval_discount); see it for both
-    models.
+    _kelly_p_at with the run's k (settings.interval_discount); see it for the
+    model.
 
     Args:
         pair (CandidatePair): Supplies pair_type and, for time_series, mid_spread.
@@ -147,7 +152,8 @@ def _kelly_p(pair: CandidatePair, settings: LiveSettings) -> float | None:
 
     Returns:
         float | None: p, the "p" in compute_trade's Kelly formula; None for a
-            time-series pair without a usable mid spread.
+            pair that is not time-series, or a time-series pair without a
+            usable mid spread.
     """
     return _kelly_p_at(pair, settings.interval_discount)
 
@@ -171,18 +177,21 @@ def _kelly_p_at(pair: CandidatePair, k: float | None) -> float | None:
     caller must not size the pair, since the model's zero clamp would read it
     as riskless.
 
-    same_title: the fixed SAME_TITLE_CO_RESOLVE_PROB prior. It is only valid
-    for pairs the scanner confirmed ask one question — same wording, different
-    series, closing within SAME_TITLE_MAX_CLOSE_GAP_SECONDS (DR-02, DR-74).
+    Any other pair type (anything but the exact string "time_series") has no
+    forecast: None. The bot trades time-series pairs only, and no sizing step
+    hands it one: compute_trade refuses any other type before it sizes
+    anything, and select_portfolio before it shrinks a spec (_spec_at_count).
 
     Args:
         pair (CandidatePair): Supplies pair_type and, for time_series, mid_spread.
-        k (float | None): The run's time-series discount; None reads config's
-            value, so only same-title may pass None.
+        k (float | None): The run's time-series discount. None reads config.py's
+            TIME_SERIES_INTERVAL_PROB_DISCOUNT (time_series_profit_prob's
+            default); no caller passes None: each hands it the run's k or the
+            k a spec was sized at.
 
     Returns:
-        float | None: The chance of profit, in (0, 1]; None for a time-series
-            pair without a usable mid spread.
+        float | None: The chance of profit, in (0, 1]; None for a pair that is
+            not time-series, or a time-series pair without a usable mid spread.
     """
     if pair.pair_type == "time_series":
         # Read by type: None means nothing to forecast on
@@ -190,7 +199,8 @@ def _kelly_p_at(pair: CandidatePair, k: float | None) -> float | None:
         # Single shared definition of the time-series model — backtester and
         # dashboard call the same helper so the three sizers cannot drift
         return None if spread is None else time_series_profit_prob(spread, k=k)
-    return SAME_TITLE_CO_RESOLVE_PROB
+    # The bot trades time-series pairs only: nothing to forecast on
+    return None
 
 
 class _Sizing(NamedTuple):
@@ -271,7 +281,7 @@ def _evaluate_size(
         levels (tuple): The pair's book levels; () means use the stored prices.
         n (int): Contract pairs to price; ignored when levels is empty.
         portfolio_value_cents (int): The value the Kelly share is taken of, in cents.
-        settings (LiveSettings): The run's settings (k and the size caps).
+        settings (LiveSettings): The run's settings (k and the per-trade cap).
         cash_cents (int | None): Keyword-only. The cash on hand in cents; None means it is all cash.
         refusal_out (dict | None): Keyword-only. When given, its "holds_kelly_share" key is
             set True if an add-on's held pair already holds its Kelly share at this price
@@ -289,8 +299,8 @@ def _evaluate_size(
             return None
         price_a, price_b = fills
     else:
-        # The two prices the legs actually cost — which of the pair's four quotes
-        # they are depends on the pair type; leg_prices is the single source of truth
+        # The two prices the legs actually cost — which two of the pair's four
+        # quotes they are comes from leg_prices, the single source of truth
         price_a, price_b = leg_prices(pair)
 
     # 0 or 1 means a settled market and breaks the fee formula
@@ -336,9 +346,9 @@ def _evaluate_size(
         return None
 
     # The one cap definition, shared with the backtester and enrichment's bound
-    kelly_fraction_capped = min(
-        pair_size_cap(pair.pair_type, settings.size_cap, settings.same_title_size_cap),
-        kelly_fraction)
+    # (compute_trade refuses a pair that is not time-series before it gets here)
+    kelly_fraction_capped = min(pair_size_cap(pair.pair_type, settings.size_cap),
+                                kelly_fraction)
     held = pair_held(pair)
     if held is not None:
         # An add-on: Kelly sizes the whole position, so this trade takes only
@@ -436,7 +446,7 @@ def _holds_kelly_share(
         pair (CandidatePair): The pair compute_trade could not size.
         levels (tuple): The pair's book levels; () means use the stored prices.
         portfolio_value_cents (int): The value the Kelly share is taken of, in cents.
-        settings (LiveSettings): The run's settings (k and the size caps).
+        settings (LiveSettings): The run's settings (k and the per-trade cap).
         cash_cents (int | None): Keyword-only. The cash on hand in cents, as compute_trade
             got it; None means it is all cash.
 
@@ -568,6 +578,12 @@ def compute_trade(
     """
     Size a candidate pair into a TradeSpec, or return None if it is not worth trading.
 
+    The bot trades time-series pairs only, and nothing forms any other kind,
+    so a pair of another type is refused first, before the settings are
+    resolved or anything is priced, with one WARNING (warnings are unchanged
+    when quiet) and no add-on line, so an add-on of another type is never
+    logged as holding its Kelly share.
+
     With a book, the count and its price are found together (_solve_marginal_size);
     without one, the pair's stored prices are used. The count is then lowered
     until the cost plus fees fits the trade's budget: its Kelly share of the
@@ -599,14 +615,23 @@ def compute_trade(
             DEBUG instead of INFO (the backtest sizes many trades); warnings are unchanged.
 
     Returns:
-        TradeSpec | None: The sized trade, or None if the pair is not tradeable, a time-series
-            pair has no mid spread to forecast on, no size is worth buying, or it is an
-            add-on whose held pair already holds its Kelly share.
+        TradeSpec | None: The sized trade, or None if the pair is not a time-series pair, is
+            not tradeable, has no mid spread to forecast on, no size is worth buying, or it
+            is an add-on whose held pair already holds its Kelly share.
 
     Raises:
         AttributeError/TypeError: If a market's close_time is None (only a hand-built pair can have one).
         ValueError: If settings is None and a config.py setting is invalid.
     """
+    # The bot trades time-series pairs only, and nothing forms any other kind:
+    # a pair of another type here is a bug, refused before anything else
+    # (even an add-on's line, whose reason would be false)
+    if pair.pair_type != "time_series":
+        # Named by its title, or by its tickers when it has none, without raising
+        logging.warning(
+            "Pair %s not sized: its type is %r, not a time-series pair, and the bot "
+            "trades time-series pairs only", pair_log_name(pair), pair.pair_type)
+        return None
     # Resolved once, so every size this call evaluates reads one k and cap
     settings = live_settings() if settings is None else settings
     # The level of this call's INFO lines
@@ -618,7 +643,7 @@ def compute_trade(
     # scanner.pair_mid_spread reads the forecast's input by type: None when
     # the pair carries no usable one (missing, not a finite number, or not
     # above PRICE_EPSILON)
-    if pair.pair_type == "time_series" and pair_mid_spread(pair) is None:
+    if pair_mid_spread(pair) is None:
         # Nothing to forecast on. An add-on says so on its add-on line
         # instead, so every refused pair gets one line
         if pair_held(pair) is None:
@@ -749,15 +774,14 @@ def compute_trade(
     # 30-day equivalent so short and long trades rank fairly
     monthly_profit_ratio = profit_ratio * 30.0 / days_to_close
 
-    # Name the sides so a time-series line isn't read as the same-title layout
+    # The side each leg buys (scanner.leg_sides), named beside its price
     side_a, side_b = leg_sides(pair.pair_type)
     # The held pair this trade adds to, if any; the _priced_pair copy below
     # keeps it, so it reaches spec.pair
     held = pair_held(pair)
-    # A time-series line names the mid spread its p was read from
-    # (scanner.pair_mid_spread; never None here, the check above refused that)
-    mid_text = (f" (mid spread {pair_mid_spread(pair):.3f})"
-                if pair.pair_type == "time_series" else "")
+    # The line names the mid spread p was read from (scanner.pair_mid_spread;
+    # never None here, the check above refused that)
+    mid_text = f" (mid spread {pair_mid_spread(pair):.3f})"
     logging.log(
         info,
         "Trade computed: %s [%s] | %s(A)@%.2f + %s(B)@%.2f | p=%.2f%s kelly=%.1f%% n=%d "
@@ -801,9 +825,8 @@ def compute_trade(
         cost_with_fees_a=cost_with_fees_a,
         cost_with_fees_b=cost_with_fees_b,
         cash_need_cents=cash_need_cents,
-        # Only time-series pricing uses k
-        interval_discount=(settings.interval_discount
-                           if pair.pair_type == "time_series" else None),
+        # The k p was read at, which a shrink (_spec_at_count) re-prices p with
+        interval_discount=settings.interval_discount,
         fee_multipliers=(mult_a, mult_b),
     )
 
@@ -850,14 +873,13 @@ def _spec_at_count(spec: TradeSpec, n: int) -> TradeSpec | None:
         n (int): The contract pairs wanted. At least 1.
 
     Returns:
-        TradeSpec | None: A new spec at n, or None if a check fails or a time-series spec has
-            no interval_discount or no mid spread.
+        TradeSpec | None: A new spec at n, or None if a check fails or the spec has no
+            interval_discount or no mid spread.
     """
     pair = spec.pair
     k = spec.interval_discount
-    if pair.pair_type == "time_series" and (
-            not isinstance(k, (int, float)) or isinstance(k, bool)):
-        # Without its k, a time-series spec cannot be re-priced
+    if not isinstance(k, (int, float)) or isinstance(k, bool):
+        # Without its k, the spec cannot be re-priced
         return None
     levels = _depth_levels(pair)
     if levels:
@@ -942,14 +964,17 @@ def select_portfolio(specs: list, cash_cents: int, *,
     """
     Pick trades best-first without spending more than the cash.
 
-    Specs are taken in order of monthly return (same-title first on ties). A
-    spec is skipped if it reuses a ticker already picked, or, for a
-    time-series spec, if it is on a ladder (one question asked at several
-    deadlines) the account holds or this run already picked. Each spec takes
-    its cash_need_cents from the cash left; one that no longer fits is shrunk
-    to the largest size that does, or skipped if not even one contract pair
-    fits, and the walk goes on. The backtester copies the ticker and ladder
-    rules; change both together.
+    The bot trades time-series pairs only, and nothing forms any other kind,
+    so a spec whose pair is of another type is refused first, before the
+    ranking, with one WARNING each, and claims no ticker, ladder or cash.
+    The rest are taken in order of monthly return; specs with equal returns
+    keep the order they were handed in. A spec is skipped if it reuses a
+    ticker already picked, or if it is on a ladder (one question asked at
+    several deadlines) the account holds or this run already picked. Each
+    spec takes its cash_need_cents from the cash left; one that no longer
+    fits is shrunk to the largest size that does, or skipped if not even one
+    contract pair fits, and the walk goes on. The backtester copies the
+    ticker and ladder rules; change both together.
 
     Markets the account holds are kept out upstream (main._run_prod),
     except the markets the run adds to: the two of a held pair, or one lone
@@ -970,16 +995,28 @@ def select_portfolio(specs: list, cash_cents: int, *,
     Returns:
         list: The picked specs in ranking order, a shrunk spec in place of the original; may be empty.
     """
+    # The bot trades time-series pairs only, and nothing forms any other kind:
+    # a spec of another type here is a bug, refused before the ranking so it
+    # claims no ticker, ladder or cash
+    time_series_specs = []
+    for spec in specs:
+        if spec.pair.pair_type != "time_series":
+            # Named by its title, or by its tickers when it has none, without raising
+            logging.warning(
+                "Trade on %s not picked for the portfolio: its type is %r, not a "
+                "time-series pair, and the bot trades time-series pairs only",
+                pair_log_name(spec.pair), spec.pair.pair_type)
+            continue
+        time_series_specs.append(spec)
+
     # Cash left to spend, in whole cents
     available = cash_cents
 
-    # Primary sort: monthly_profit_ratio descending (best capital efficiency first).
-    # Secondary sort: same_title > time_series at equal monthly return.
-    specs_sorted = sorted(
-        specs,
-        key=lambda s: (s.monthly_profit_ratio, s.pair.pair_type == "same_title"),
-        reverse=True,
-    )
+    # Best monthly return first (best capital efficiency). Python's sort is
+    # stable under reverse=True, so specs with equal returns keep the order
+    # they were handed in
+    specs_sorted = sorted(time_series_specs, key=lambda s: s.monthly_profit_ratio,
+                          reverse=True)
     selected = []
     used_tickers: set[str] = set()
     # Ladders we already hold, plus those of the specs picked earlier in this
@@ -1007,7 +1044,7 @@ def select_portfolio(specs: list, cash_cents: int, *,
             # A lone held leg's new market may meet the leg's own held ladders
             # and no other held one
             blocking = picked_ladders | (set(held_ladders) - held.labels)
-        if spec.pair.pair_type == "time_series" and keys & blocking:
+        if keys & blocking:
             ladder_skips += 1
             continue
         need = _cash_need(spec)

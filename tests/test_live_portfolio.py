@@ -10,7 +10,9 @@ All offline. historical._historical_get is replaced by FakeKalshi, which
 serves each listing page by page by cursor, and by FakeCandles for the daily
 candles, so no request ever leaves the machine. The trade logs are written by
 reporter.append_to_prod_log itself, with its paths pointed at tmp_path (as
-tests/test_reporter.py does) and its clock and the host's time zone pinned.
+tests/test_reporter.py does) and its clock and the host's time zone pinned;
+a same-title purchase row, which reporter does not write, is added as the
+literal cells it wrote for one (_append_same_title_row).
 The ledger's cash is checked against a separate running-position formula over
 300 random fill sequences, and the pair-weighted median against numpy's
 median over 200 random sets of purchases.
@@ -656,14 +658,43 @@ def _lone_trim(ticker: str, partner: str, *, sell: int = 43, of: int = 129,
     return dataclasses.replace(sale, plan=plan)
 
 
+def _append_same_title_row(path, ticker_a: str, ticker_b: str, count: int) -> None:
+    """
+    Append to the trade log, as literal cells, a same-title purchase row.
+
+    The account's trade log may hold rows of same-title pairs, bought NO on
+    market A and YES on market B, which reporter does not write: it writes
+    time-series rows only. These are the 18 cells reporter wrote for such a
+    pair (its Notes start "[same_title: NO A / YES B"), at _trade_result's
+    quotes and costs; the date and time are the last row's, so the row
+    belongs to the run written just before it.
+
+    Args:
+        path: The trade log (log_paths).
+        ticker_a (str): Market A's ticker, held NO.
+        ticker_b (str): Market B's ticker, held YES.
+        count (int): Contracts bought on each market.
+    """
+    book = openpyxl.load_workbook(path)
+    sheet = book.active
+    last = [cell.value for cell in sheet[sheet.max_row]]
+    sheet.append([last[0], last[1], f"Will {ticker_a}?", ticker_a, f"Will {ticker_b}?",
+                  ticker_b, "", "", 0.3, 0.6, 0.7, count, count, 9.41, 3.0, 0.3, "executed",
+                  "[same_title: NO A / YES B fees=$0.31] "])
+    book.save(path)
+    book.close()
+
+
 class TestReadTradeLogs:
     def test_runs_trades_and_windows(self, log_paths, pacific, monkeypatch):
         run1, dry, run2 = T0, T0 + timedelta(hours=1), T0 + timedelta(hours=2)
         _write_run(monkeypatch, run1, [
             _trade_result("A1", "B1", "executed"),
             _trade_result("A2", "B2", "rolled_back"),
-            _trade_result("A3", "B3", "executed", pair_type="same_title", count=4),
         ], 132.45)
+        # Run 1's third purchase is a same-title pair, as an older trade log
+        # holds one: still read, its legs NO on A3 and YES on B3
+        _append_same_title_row(log_paths, "A3", "B3", 4)
         _write_run(monkeypatch, dry, [_trade_result("A1", "B1", "simulated")], 120.00)
         _write_run(monkeypatch, run2, [
             _trade_result("A4", "B4", "failed"),
@@ -681,6 +712,7 @@ class TestReadTradeLogs:
         assert same_title.legs == (BotLeg("A3", "no", D(4)), BotLeg("B3", "yes", D(4)))
         assert first.title == "Will A1?"
         assert (first.logged_at, first.run_after) == (run1, run1 - window)
+        assert (same_title.logged_at, same_title.run_after) == (run1, run1 - window)
         # The dry run in between does not move the second run's window
         assert (review.logged_at, review.run_after) == (run2, run1)
         assert [(s.logged_at, s.run_after, s.cash_before) for s in starts] == [

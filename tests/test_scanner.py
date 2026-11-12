@@ -21,7 +21,6 @@ from kalshi_betting.config import (
     DEFAULT_EXCHANGE_INDEX,
     MAX_DEADLINE_GAP_DAYS,
     PRICE_EPSILON,
-    SAME_TITLE_LEG_SIDES,
     SPREAD_ABOVE_CEILING,
     SPREAD_BELOW_FLOOR,
     SPREAD_NOT_POSITIVE,
@@ -60,7 +59,6 @@ from kalshi_betting.scanner import (
     fetch_open_events_with_markets,
     fetch_shard_statuses,
     filter_markets_within_horizon,
-    find_same_title_pairs,
     find_time_series_pairs,
     get_held_positions,
     held_pairs,
@@ -88,6 +86,19 @@ from kalshi_betting.scanner import (
 # buys), so an ample balance makes it never bind and these tests keep exercising
 # the depth path alone. Tests that mean to exercise the cap set their own.
 _AMPLE_BALANCE_CENTS = 100_000_000
+
+# Pair types that are not time-series, each refused where pairs come in: the
+# retired same-title type, a missing type, an empty one, an unknown one and a
+# test double's auto-attribute
+_OTHER_PAIR_TYPES = ["same_title", None, "", "bogus", MagicMock().pair_type]
+_OTHER_PAIR_TYPE_IDS = ["same_title", "none", "empty", "bogus", "mock"]
+
+
+def _must_not_run(name: str):
+    """A stand-in for `name` that fails the test if anything calls it."""
+    def fail(*args, **kwargs):
+        raise AssertionError(f"{name} ran after the refusal")
+    return fail
 
 
 class TestNormalizeTitle:
@@ -213,18 +224,12 @@ def _mock_market(
     yes_ask: float = 0.50,
     no_ask: float = 0.50,
     close_time=None,
-    series_labels=("Test", "General"),
-    competition="",
 ):
     """Build a SimpleNamespace Kalshi-market stand-in with the fields the scanner reads.
 
     SimpleNamespace (not MagicMock) is used so that `getattr(m, "_event_title", "")`
     returns the empty string when no event title was attached — MagicMock would
     auto-vivify a child mock and break the pair_key fallback.
-
-    Every stand-in carries the same series labels and no competition by
-    default, so the same-title sport check (DR-79) passes and each fixture
-    keeps meaning what it meant; a test of that check passes its own values.
     """
     from datetime import UTC, datetime
     attrs = {
@@ -236,8 +241,6 @@ def _mock_market(
         "no_ask_dollars": str(no_ask),
         "yes_bid_dollars": str(max(yes_ask - 0.02, 0.01)),
         "close_time": close_time or datetime(2026, 6, 1, tzinfo=UTC),
-        "_series_labels": series_labels,
-        "_event_competition": competition,
     }
     if event_title is not None:
         attrs["_event_title"] = event_title
@@ -301,72 +304,6 @@ class TestDisplayTitle:
             event_title="2024 Election Winner",
         )
         assert display_title(m) == "2024 Election Winner: Trump"
-
-
-class TestSameTitleGrouping:
-    """Validates that the combined-key grouping eliminates cross-event MVE collisions."""
-
-    def test_cross_event_same_option_label_does_not_pair(self):
-        # Two MVE markets with identical option label "Trump" but in completely
-        # different events — must NOT be paired.
-        mA = _mock_market(
-            ticker="ELECT-TRUMP", event_ticker="ELECT-2024",
-            title="Trump", event_title="2024 Election Winner",
-            yes_ask=0.45, no_ask=0.55,
-        )
-        mB = _mock_market(
-            ticker="TIME-TRUMP", event_ticker="TIME-2024",
-            title="Trump", event_title="2024 Time Person of the Year",
-            yes_ask=0.20, no_ask=0.80,
-        )
-        pairs = find_same_title_pairs([mA, mB])
-        assert pairs == [], f"Expected no pairs across unrelated events; got {pairs}"
-
-    def test_same_event_title_does_pair(self):
-        # Two markets with identical event_title + market title but different
-        # event_ticker — the legitimate same-title arbitrage case.
-        #
-        # RE-PINNED (DR-02/DR-54): the fixture used to put both markets on
-        # EVT-A/EVT-B, which share the series prefix "EVT". That modelled two
-        # instances of ONE recurring fixture, and the assertion below passed
-        # only because the finder had no way to tell. The event tickers now
-        # name two DIFFERENT series — the shape the 95% co-resolution prior was
-        # built for, one question listed by two independent series — so the
-        # assertion holds for the reason it always claimed to.
-        mA = _mock_market(
-            ticker="A1", event_ticker="EVA-1",
-            title="Republicans control Senate after 2026", event_title="2026 Senate Control",
-            yes_ask=0.30, no_ask=0.70,
-        )
-        mB = _mock_market(
-            ticker="B1", event_ticker="EVB-1",
-            title="Republicans control Senate after 2026", event_title="2026 Senate Control",
-            yes_ask=0.40, no_ask=0.60,
-        )
-        pairs = find_same_title_pairs([mA, mB])
-        # Should produce exactly one pair (best-per-group)
-        assert len(pairs) == 1
-        # Pair must reference both markets
-        tickers = {pairs[0].market_a.ticker, pairs[0].market_b.ticker}
-        assert tickers == {"A1", "B1"}
-
-    def test_within_event_filter_still_applies(self):
-        # Same event_title (so they group), same event_ticker (so within-event filter
-        # rejects). This catches the multi-choice-options-in-the-same-event case.
-        mA = _mock_market(
-            ticker="X-TRUMP", event_ticker="MVE-2024",
-            title="Trump", event_title="2024 Election Winner",
-            yes_ask=0.45, no_ask=0.55,
-        )
-        mB = _mock_market(
-            ticker="X-HARRIS", event_ticker="MVE-2024",
-            title="Harris", event_title="2024 Election Winner",
-            yes_ask=0.50, no_ask=0.50,
-        )
-        # Different market titles, but event_title shared. find_same_title_pairs
-        # groups by (event_title, title, subtitle) — different titles mean they
-        # land in different groups, so no pair regardless.
-        assert find_same_title_pairs([mA, mB]) == []
 
 
 class TestTimeSeriesGrouping:
@@ -615,13 +552,12 @@ class TestOneEventSeriesIsTwoFixtures:
     two events of one series are two instances of one recurring fixture — two
     ball games, two 15-minute price windows, two combos. Identical wording
     across them is the same question asked about two DIFFERENT events, not one
-    question listed twice, so the SAME_TITLE_CO_RESOLVE_PROB prior does not
-    apply: the sweep's own NPB pair was quoted at yes asks 0.97 and 0.01.
+    question listed twice: the sweep's own NPB pair was quoted at yes asks
+    0.97 and 0.01.
 
-    Both finders must refuse it. Gating only find_same_title_pairs would merely
-    relabel the trade: the same two tickers also clear the time-series filter
-    (gap 1 day, pB - pA = 0.96), and main._dedup_pairs only ever dropped that
-    copy because a same-title copy existed.
+    The time-series finder refuses it on its one-series check, ahead of its
+    wording check, which would refuse identical wording too: the same two
+    tickers clear the time-series price filter (gap 1 day, pB - pA = 0.96).
     """
 
     # The real pair the 2026-09-15 prod dry run selected and sized: one
@@ -650,40 +586,17 @@ class TestOneEventSeriesIsTwoFixtures:
         )
         return mA, mB
 
-    def test_same_title_finder_rejects_two_game_days_of_one_fixture(self):
-        mA, mB = self._npb_markets()
-        assert find_same_title_pairs([mA, mB]) == []
-
     def test_time_series_finder_rejects_the_same_two_markets(self):
-        # Without this the same-title gate would only RELABEL the trade: the
-        # markets close 1 day apart and pB - pA = 0.96 clears the 15% tier.
+        # The markets close 1 day apart and pB - pA = 0.96 clears the 15%
+        # tier, so only the finder's own checks refuse them.
         mA, mB = self._npb_markets()
         assert find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB]) == []
 
-    def test_dedup_has_nothing_left_to_relabel(self):
-        # End state on the live path: both finders come back empty, so the
-        # merge main performs produces no trade at all.
-        from kalshi_betting.main import _dedup_pairs
-        mA, mB = self._npb_markets()
-        same = find_same_title_pairs([mA, mB])
-        ts = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB])
-        assert _dedup_pairs(same, ts) == []
-
-    def test_the_skip_is_reported_once_with_a_count(self, caplog):
-        mA, mB = self._npb_markets()
-        with caplog.at_level(logging.INFO):
-            find_same_title_pairs([mA, mB])
-        lines = [r.getMessage() for r in caplog.records
-                 if "two instances of one event series" in r.getMessage()]
-        assert len(lines) == 1
-        assert lines[0].endswith(": 1")
-
     def test_the_time_series_skip_is_reported_once_per_candidate(self, caplog):
-        # M10: the time-series finder's one-series conjunct used to `continue`
-        # with no count, so a run whose time-series zero it caused logged no
-        # cause at all (the same-title finder has always counted its twin).
-        # THREE game days of one fixture make three candidates, so a counter
-        # bumped once per GROUP (which would read 1) cannot pass.
+        # M10: the time-series finder's one-series conjunct counts every
+        # candidate it refuses, so a run whose time-series zero it causes logs
+        # the cause. THREE game days of one fixture make three candidates, so
+        # a counter bumped once per GROUP (which would read 1) cannot pass.
         mA, mB = self._npb_markets()
         mC = _mock_market(
             ticker="KXNPBRFI-26SEP140500FUKORI-Y",
@@ -712,28 +625,6 @@ class TestOneEventSeriesIsTwoFixtures:
             )) == 1
         assert "one event series" not in caplog.text
 
-    def test_a_same_event_same_title_skip_is_reported_once_per_candidate(self, caplog):
-        # M10: two markets of ONE event under one (event_title, title,
-        # subtitle) key are that event's own markets, not one question listed
-        # by two events. The skip was this finder's one uncounted refusal.
-        # Three such markets make three candidates, none of which reaches the
-        # series rule — so the two counters cannot stand in for each other.
-        markets = [
-            _mock_market(ticker=f"KXDUP-26-{i}", event_ticker="KXDUP-26",
-                         title="Q", subtitle="Yes", event_title="E",
-                         yes_ask=round(0.2 + 0.2 * i, 2),
-                         no_ask=round(0.8 - 0.2 * i, 2))
-            for i in range(3)
-        ]
-        with caplog.at_level(logging.INFO):
-            assert find_same_title_pairs(markets) == []
-        assert caplog.messages.count(
-            "Same-title candidates skipped because both markets carry the same "
-            "event ticker (one event's own markets, not one question listed by "
-            "two events): 3"
-        ) == 1
-        assert "one event series" not in caplog.text
-
     def test_two_matches_of_one_table_tennis_player_are_rejected(self):
         # Two matches of one player within half an hour of each other,
         # which settled yes and no — the shape a close-time gate would have
@@ -753,7 +644,6 @@ class TestOneEventSeriesIsTwoFixtures:
             event_title="TT Elite Series", yes_ask=0.20, no_ask=0.80,
             close_time=close - timedelta(minutes=25),
         )
-        assert find_same_title_pairs([mA, mB]) == []
         assert find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB]) == []
 
     def test_two_fifteen_minute_price_windows_are_rejected(self):
@@ -772,7 +662,6 @@ class TestOneEventSeriesIsTwoFixtures:
             event_title="Natural gas price high", yes_ask=0.80, no_ask=0.20,
             close_time=close + timedelta(minutes=15),
         )
-        assert find_same_title_pairs([mA, mB]) == []
         assert find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB]) == []
 
     def test_two_combo_events_are_rejected(self):
@@ -799,7 +688,6 @@ class TestOneEventSeriesIsTwoFixtures:
             event_title="Cross-category combo", yes_ask=0.20, no_ask=0.80,
             close_time=close + timedelta(minutes=2),
         )
-        assert find_same_title_pairs([mA, mB]) == []
         assert find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB]) == []
 
     @staticmethod
@@ -807,15 +695,14 @@ class TestOneEventSeriesIsTwoFixtures:
         # DR-55: the SAME combo wording listed under two DIFFERENT KXMVE*
         # series. Measured in backtest_cache/live_days/2026-09-14.json.gz,
         # 10,643 distinct (event_title, title, subtitle) wordings appear under
-        # both KXMVECROSSCATEGORY and KXMVECROSSCATEGORY0. Before the family
+        # both KXMVECROSSCATEGORY and KXMVECROSSCATEGORY0. Without the family
         # collapse these read as two different series, so the one-series rule
-        # never fired and both finders formed the pair.
+        # would not fire.
         #
-        # The prices are deliberately chosen so that NOTHING ELSE rejects the
-        # pair: the YES asks diverge 0.25 (>= SAME_TITLE_MIN_PRICE_DIFF for the
-        # same-title finder) and, with the earlier leg the cheaper one, give
-        # pB - pA = 0.25 at a zero-day gap (pA + nB = 0.75) for the time-series
-        # finder, which both the tier-on rule and config.py's admit.
+        # The prices are deliberately chosen so that the time-series price
+        # rule admits the pair: with the earlier leg the cheaper one they give
+        # pB - pA = 0.25 at a zero-day gap (pA + nB = 0.75), which both the
+        # tier-on rule and config.py's admit.
         close = datetime(2026, 9, 15, 20, tzinfo=UTC)
         earlier = _mock_market(
             ticker="KXMVECROSSCATEGORY-SHARD1-S6471E4699E9-Y",
@@ -833,42 +720,17 @@ class TestOneEventSeriesIsTwoFixtures:
         )
         return earlier, later
 
-    def test_same_title_finder_rejects_two_combo_series(self):
+    def test_time_series_finder_rejects_two_combo_series(self):
+        # _same_series is the second half of find_time_series_pairs' skip
+        # conjunct. Guard that the fixture is the shape the rule must catch:
+        # identical wording, two literal prefixes, one collapsed series.
         earlier, later = self._cross_prefix_combo_markets()
-        # Guard that the fixture is the shape the rule must catch: identical
-        # wording, two literal prefixes, one collapsed series.
         assert scanner._identical_wording(earlier, later) is True
         assert earlier.event_ticker.split("-")[0] != later.event_ticker.split("-")[0]
         assert scanner._same_series(earlier, later) is True
-        assert find_same_title_pairs([earlier, later]) == []
-
-    def test_time_series_finder_rejects_two_combo_series(self):
-        # This direction matters on its own: _same_series is also the second
-        # half of find_time_series_pairs' skip conjunct, so gating only the
-        # same-title finder would relabel the trade rather than remove it.
-        earlier, later = self._cross_prefix_combo_markets()
         assert find_time_series_pairs(
             MagicMock(), held_tickers=set(), markets=[earlier, later]
         ) == []
-
-    def test_two_different_series_asking_one_question_still_pair(self):
-        # The premise of the same-title strategy, and the only shape that
-        # survives the rule: one question listed by two INDEPENDENT series.
-        mA = _mock_market(
-            ticker="KXFEDDEC-26-T25", event_ticker="KXFEDDEC-26",
-            title="Fed cuts rates in December?", subtitle="Yes",
-            event_title="Fed December decision", yes_ask=0.40, no_ask=0.60,
-        )
-        mB = _mock_market(
-            ticker="FEDCUTDEC-26-T25", event_ticker="FEDCUTDEC-26",
-            title="Fed cuts rates in December?", subtitle="Yes",
-            event_title="Fed December decision", yes_ask=0.30, no_ask=0.70,
-        )
-        pairs = find_same_title_pairs([mA, mB])
-        assert len(pairs) == 1
-        assert {pairs[0].market_a.ticker, pairs[0].market_b.ticker} == {
-            "KXFEDDEC-26-T25", "FEDCUTDEC-26-T25"
-        }
 
     @staticmethod
     def _sold_family(preposition: str) -> tuple:
@@ -919,16 +781,16 @@ class TestOneEventSeriesIsTwoFixtures:
         ) == []
 
     def test_skipping_the_widest_candidate_promotes_the_next_one(self):
-        # The rule is not only subtractive. Both finders keep ONE best pair per
+        # The rule is not only subtractive. The finder keeps ONE best pair per
         # group, so removing a group's top candidate promotes the runner-up:
-        # this scanner can now propose a pair on tickers the previous code
-        # never proposed at all.
+        # this scanner can propose a pair on tickers it would never propose
+        # without the rule.
         #
-        # A and B are identically worded on one series (KXZ) and were the
-        # group's pick at gap 0.67 — and its same-title pick too. C dates its
-        # own deadline, so A/C survives the conjunct and wins the slot at gap
-        # 0.30. That promotion is intended: A/C is the pair the group actually
-        # supports once the look-alike is gone.
+        # A and B are identically worded on one series (KXZ) and would be the
+        # group's pick at gap 0.67. C dates its own deadline, so A/C survives
+        # the conjunct and wins the slot at gap 0.30. That promotion is
+        # intended: A/C is the pair the group actually supports once the
+        # look-alike is gone.
         base = datetime(2026, 12, 1, tzinfo=UTC)
         look_alike_title = "Will Z happen by December 1, 2026?"
         mA = _mock_market(
@@ -952,9 +814,6 @@ class TestOneEventSeriesIsTwoFixtures:
         )
         assert (pair.market_a.ticker, pair.market_b.ticker) == ("KXZ-A-T", "KXZ-C-T")
         assert pair.pB - pair.pA == pytest.approx(0.30)
-        # The look-alike is gone from the same-title side too, so dedup has
-        # nothing to prefer over the promoted time-series pair.
-        assert find_same_title_pairs([mA, mB, mC]) == []
 
     def test_a_differing_subtitle_breaks_the_identical_wording_half(self):
         # GUARD on the conjunct's wording half: same series, same title, but
@@ -972,8 +831,7 @@ class TestEventSeries:
     identity — the literal prefix, with every combo (KXMVE*) prefix collapsed
     onto one family), _same_series (fixture identity, failing CLOSED on an unreadable
     ticker) and _identical_wording (the raw title/subtitle/event-title
-    triple), plus the silent-at-zero half of find_same_title_pairs' skip
-    summary."""
+    triple)."""
 
     @pytest.mark.parametrize("ticker,expected", [
         ("KXNPBRFI-26SEP160500FUKORI", "KXNPBRFI"),
@@ -1032,8 +890,8 @@ class TestEventSeries:
         assert scanner.event_series("-26SEP14") == ""
 
     def test_same_series_fails_closed_on_an_unreadable_ticker(self):
-        # A pair whose fixture identity cannot be read must NOT be priced on
-        # the co-resolution prior, so an unknown series reads as "same".
+        # A pair whose fixture identity cannot be read cannot be shown to be
+        # two different fixtures, so an unknown series reads as "same".
         known = SimpleNamespace(event_ticker="KXSOLD-26SEP14")
         blank = SimpleNamespace(event_ticker="")
         missing = SimpleNamespace(event_ticker=None)
@@ -1060,235 +918,12 @@ class TestEventSeries:
             other = _mock_market(ticker="B1", event_ticker="KXB-1", **{**base, **differing})
             assert scanner._identical_wording(a, other) is False, differing
 
-    def test_the_skip_summary_is_silent_when_nothing_is_skipped(self, caplog):
-        # Same idiom as the trading-inactive shard skip count: one summary line
-        # when there is something to report, and no line at all at zero.
-        mA = _mock_market(ticker="A1", event_ticker="KXFEDDEC-26", title="Q",
-                          subtitle="Yes", event_title="E", yes_ask=0.40, no_ask=0.60)
-        mB = _mock_market(ticker="B1", event_ticker="FEDCUTDEC-26", title="Q",
-                          subtitle="Yes", event_title="E", yes_ask=0.30, no_ask=0.70)
-        with caplog.at_level(logging.INFO):
-            assert len(find_same_title_pairs([mA, mB])) == 1
-        assert "one event series" not in caplog.text
-        # M10's same-event count follows the same idiom.
-        assert "same event ticker" not in caplog.text
-
-
-class TestSameTitleCloseGap:
-    """DR-74: identical wording on two DIFFERENT series is one question only
-    when both markets close at the same moment.
-
-    The one-series rule (DR-02/DR-54) is necessary but not sufficient. A men's
-    and a women's college basketball game between the same two schools
-    (KXNCAAMBGAME / KXNCAAWBGAME) share title, subtitle and event title on two
-    different series; so do the Champions League and La Liga fixtures of one
-    matchup. They close hours or days apart, and the 95% co-resolution prior
-    is false for them: on the 365-day backtest 17 of 21 trades were such M/W
-    pairs. scanner.closes_apart is the one definition of the gate, and
-    find_same_title_pairs reads it through _closes_apart, right after the
-    series test. Live close_time is the SCHEDULED close. Mirror:
-    test_backtester.py::TestSameTitleCloseGapBacktest.
-    """
-
-    _WIU_TITLE = "Western Illinois at Eastern Illinois Winner?"
-    _REFUSAL = (
-        "Same-title candidates refused because the two markets close more than "
-        "60 minutes apart (two different games or instants, not one question "
-        "listed twice): "
-    )
-
-    @classmethod
-    def _wiu_markets(cls, *, womens_close=None):
-        # The real pair: KXNCAAMBGAME-26JAN13WIUEIU-WIU vs
-        # KXNCAAWBGAME-26JAN13WIUEIU-WIU — identical title, subtitle and event
-        # title on two series. Their SCHEDULED closes (what live reads) fall at
-        # 01:30Z and 23:00Z, 2.5 h apart, as checked on archived payloads; the
-        # calendar day here is the fixture's own.
-        mens = _mock_market(
-            ticker="KXNCAAMBGAME-26JAN13WIUEIU-WIU",
-            event_ticker="KXNCAAMBGAME-26JAN13WIUEIU",
-            title=cls._WIU_TITLE, subtitle="Western Illinois",
-            event_title="Western Illinois at Eastern Illinois",
-            yes_ask=0.40, no_ask=0.60,
-            close_time=datetime(2026, 1, 28, 1, 30, tzinfo=UTC),
-        )
-        womens = _mock_market(
-            ticker="KXNCAAWBGAME-26JAN13WIUEIU-WIU",
-            event_ticker="KXNCAAWBGAME-26JAN13WIUEIU",
-            title=cls._WIU_TITLE, subtitle="Western Illinois",
-            event_title="Western Illinois at Eastern Illinois",
-            yes_ask=0.25, no_ask=0.75,
-            close_time=womens_close or datetime(2026, 1, 27, 23, 0, tzinfo=UTC),
-        )
-        return mens, womens
-
-    @staticmethod
-    def _refusals(caplog) -> list[str]:
-        return [m for m in caplog.messages if "close more than" in m]
-
-    def test_mens_and_womens_game_are_refused_and_counted_once(self, caplog):
-        mens, womens = self._wiu_markets()
-        # The fixture is the shape the gate must catch: identical wording,
-        # two different series, so the one-series rule does NOT fire.
-        assert scanner._identical_wording(mens, womens) is True
-        assert scanner._same_series(mens, womens) is False
-        with caplog.at_level(logging.INFO):
-            assert find_same_title_pairs([mens, womens]) == []
-        assert self._refusals(caplog) == [self._REFUSAL + "1"]
-
-    def test_the_same_game_pair_at_one_close_instant_forms(self):
-        # Positive control: move the women's game onto the men's close and
-        # nothing else — the pair forms, so the refusal above is the gate.
-        mens, womens = self._wiu_markets(womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC))
-        [pair] = find_same_title_pairs([mens, womens])
-        assert {pair.market_a.ticker, pair.market_b.ticker} == {mens.ticker, womens.ticker}
-
-    def test_champions_league_and_la_liga_fixtures_are_refused(self):
-        # Two competitions' fixtures of one matchup, ten days apart.
-        title = "Atletico Madrid vs Barcelona Winner?"
-        ucl = _mock_market(
-            ticker="KXUCLGAME-26OCT21ATMBAR-BAR", event_ticker="KXUCLGAME-26OCT21ATMBAR",
-            title=title, subtitle="Barcelona", event_title="Atletico Madrid vs Barcelona",
-            yes_ask=0.55, no_ask=0.45, close_time=datetime(2026, 10, 21, 21, tzinfo=UTC),
-        )
-        liga = _mock_market(
-            ticker="KXLALIGAGAME-26OCT31ATMBAR-BAR", event_ticker="KXLALIGAGAME-26OCT31ATMBAR",
-            title=title, subtitle="Barcelona", event_title="Atletico Madrid vs Barcelona",
-            yes_ask=0.40, no_ask=0.60, close_time=datetime(2026, 10, 31, 20, tzinfo=UTC),
-        )
-        assert scanner._same_series(ucl, liga) is False
-        assert find_same_title_pairs([ucl, liga]) == []
-
-    def test_weekly_and_monthly_listings_at_one_close_still_pair(self):
-        # The shape the same-title strategy was built for, and what the
-        # 365-day backtest's 3 surviving trades were: one Brent question listed
-        # by a weekly and a monthly series, both closing at 21:00Z the same
-        # day. (Series names here are stand-ins for the weekly and monthly
-        # Brent series.)
-        close = datetime(2026, 9, 25, 21, tzinfo=UTC)
-        title = "Brent crude oil price on Sep 25, 2026?"
-        weekly = _mock_market(
-            ticker="KXBRENTW-26SEP25-T70", event_ticker="KXBRENTW-26SEP25",
-            title=title, subtitle="$70 or above", event_title="Brent crude oil price",
-            yes_ask=0.45, no_ask=0.55, close_time=close,
-        )
-        monthly = _mock_market(
-            ticker="KXBRENTMON-26SEP-T70", event_ticker="KXBRENTMON-26SEP",
-            title=title, subtitle="$70 or above", event_title="Brent crude oil price",
-            yes_ask=0.35, no_ask=0.65, close_time=close,
-        )
-        assert scanner._closes_apart(weekly, monthly) is False
-        assert len(find_same_title_pairs([weekly, monthly])) == 1
-
-    @pytest.mark.parametrize("gap_seconds,pairs", [
-        (0, 1),
-        (3_599, 1),
-        # Exactly the bound is NOT apart: the gate is a strict `>` (kills a
-        # `>=` mutant).
-        (3_600, 1),
-        (3_601, 0),
-    ])
-    def test_the_bound_is_one_hour_inclusive(self, gap_seconds, pairs):
-        assert config.SAME_TITLE_MAX_CLOSE_GAP_SECONDS == 3_600
-        mens, womens = self._wiu_markets(
-            womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC)
-            - timedelta(seconds=gap_seconds),
-        )
-        assert len(find_same_title_pairs([mens, womens])) == pairs
-
-    def test_the_gate_reads_the_scanner_binding(self, monkeypatch, caplog):
-        # The finder reads scanner's by-value binding of the constant, so a
-        # test narrows the bound by patching THAT name (the precedent
-        # TIME_SERIES_SAME_EVENT_LADDERS set; patching config.* would be a
-        # silent no-op here). A 60 s bound admits 60 s and refuses 61 s, and
-        # the refusal line prints the patched bound (one minute — singular).
-        monkeypatch.setattr(scanner, "SAME_TITLE_MAX_CLOSE_GAP_SECONDS", 60)
-        base = datetime(2026, 1, 28, 1, 30, tzinfo=UTC)
-        mens, at_60 = self._wiu_markets(womens_close=base - timedelta(seconds=60))
-        assert len(find_same_title_pairs([mens, at_60])) == 1
-        mens, at_61 = self._wiu_markets(womens_close=base - timedelta(seconds=61))
-        with caplog.at_level(logging.INFO):
-            assert find_same_title_pairs([mens, at_61]) == []
-        assert self._refusals(caplog) == [
-            self._REFUSAL.replace("60 minutes", "1 minute") + "1"
-        ]
-
-    def test_a_naive_and_an_aware_close_are_refused(self, caplog):
-        # Fail CLOSED: the two cannot be subtracted, so the pair cannot be
-        # shown to close at one moment — even though the wall-clock readings
-        # coincide.
-        mens, womens = self._wiu_markets(womens_close=datetime(2026, 1, 28, 1, 30))
-        assert womens.close_time.utcoffset() is None
-        with caplog.at_level(logging.INFO):
-            assert find_same_title_pairs([mens, womens]) == []
-        assert self._refusals(caplog) == [self._REFUSAL + "1"]
-
-    def test_the_line_is_silent_at_zero(self, caplog):
-        mens, womens = self._wiu_markets(womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC))
-        with caplog.at_level(logging.INFO):
-            assert len(find_same_title_pairs([mens, womens])) == 1
-        assert self._refusals(caplog) == []
-
-    def test_the_line_avoids_the_absence_pinned_substrings(self, caplog):
-        # Other tests pin "one event series" and "same event ticker" as ABSENT
-        # from runs that never skip on those rules, so the close-gap line must
-        # not contain either — or it would fail them for the wrong reason.
-        mens, womens = self._wiu_markets()
-        with caplog.at_level(logging.INFO):
-            find_same_title_pairs([mens, womens])
-        assert self._refusals(caplog)
-        assert "one event series" not in caplog.text
-        assert "same event ticker" not in caplog.text
-
-    def test_each_candidate_is_counted_once_on_one_line(self, caplog):
-        # The gate sits AFTER the series test: a one-series candidate is
-        # counted on the series line and never reaches the close gate, so the
-        # two counts partition the refusals. Three markets, three candidates:
-        # M/W (two series, apart) is a close-gap refusal; the two women's
-        # listings of ONE series (apart too) are a series refusal; the men's
-        # game vs the second women's listing is a close-gap refusal.
-        mens, womens = self._wiu_markets()
-        womens_2 = _mock_market(
-            ticker="KXNCAAWBGAME-26FEB10WIUEIU-WIU",
-            event_ticker="KXNCAAWBGAME-26FEB10WIUEIU",
-            title=self._WIU_TITLE, subtitle="Western Illinois",
-            event_title="Western Illinois at Eastern Illinois",
-            yes_ask=0.30, no_ask=0.70, close_time=datetime(2026, 2, 24, 23, tzinfo=UTC),
-        )
-        with caplog.at_level(logging.INFO):
-            assert find_same_title_pairs([mens, womens, womens_2]) == []
-        assert self._refusals(caplog) == [self._REFUSAL + "2"]
-        assert caplog.messages.count(
-            "Same-title candidates skipped as two instances of one event series "
-            "(identical wording, different fixture): 1"
-        ) == 1
-
-    def test_refusing_the_widest_candidate_promotes_the_runner_up(self):
-        # One best pair per group: the widest divergence (A vs B, 0.40) closes
-        # two days apart and is refused, so the group's slot goes to A vs C
-        # (0.20), which close at one instant. A pairs table diff is therefore
-        # not a pure deletion.
-        close = datetime(2026, 9, 25, 21, tzinfo=UTC)
-        common = {"title": "Q", "subtitle": "Yes", "event_title": "E"}
-        mA = _mock_market(ticker="KXA-1-Y", event_ticker="KXA-1", yes_ask=0.60,
-                          no_ask=0.40, close_time=close, **common)
-        mB = _mock_market(ticker="KXB-1-Y", event_ticker="KXB-1", yes_ask=0.20,
-                          no_ask=0.80, close_time=close + timedelta(days=2), **common)
-        mC = _mock_market(ticker="KXC-1-Y", event_ticker="KXC-1", yes_ask=0.40,
-                          no_ask=0.60, close_time=close, **common)
-        [pair] = find_same_title_pairs([mA, mB, mC])
-        assert (pair.market_a.ticker, pair.market_b.ticker) == ("KXA-1-Y", "KXC-1-Y")
-        assert pair.pA - pair.pB == pytest.approx(0.20)
-        # Control: with B on the shared close the widest candidate wins.
-        mB_aligned = _mock_market(ticker="KXB-1-Y", event_ticker="KXB-1", yes_ask=0.20,
-                                  no_ask=0.80, close_time=close, **common)
-        [pair] = find_same_title_pairs([mA, mB_aligned, mC])
-        assert (pair.market_a.ticker, pair.market_b.ticker) == ("KXA-1-Y", "KXB-1-Y")
-
 
 class TestClosesApart:
     """Unit contract of scanner.closes_apart — the ONE definition of the
-    same-title close gate — and its live reader _closes_apart (DR-74)."""
+    close-time test held_pair_kind applies when a stated deadline cannot be
+    read, against the held-pair close bound (HELD_PAIR_CLOSE_GAP_SECONDS, one
+    hour) — and of its reader _closes_apart."""
 
     _T = datetime(2026, 9, 25, 21, tzinfo=UTC)
 
@@ -1323,6 +958,15 @@ class TestClosesApart:
         assert cest.hour == 23
         assert scanner.closes_apart(self._T, cest) is False
 
+    def test_the_bound_is_one_hour(self):
+        # The held-pair close bound ships at one hour, and scanner's copy, the
+        # one closes_apart reads, is config's
+        assert config.HELD_PAIR_CLOSE_GAP_SECONDS == 60 * 60 == 3_600
+        assert scanner.HELD_PAIR_CLOSE_GAP_SECONDS == config.HELD_PAIR_CLOSE_GAP_SECONDS
+        # The bound has this one name in both modules
+        for module in (config, scanner):
+            assert not hasattr(module, "SAME_TITLE_MAX_CLOSE_GAP_SECONDS"), module.__name__
+
     @pytest.mark.parametrize("seconds,apart", [
         (0, False), (3_600, False), (3_601, True), (-3_600, False), (-3_601, True),
     ])
@@ -1330,561 +974,25 @@ class TestClosesApart:
         assert scanner.closes_apart(self._T, self._T + timedelta(seconds=seconds)) is apart
         assert scanner.closes_apart(self._T + timedelta(seconds=seconds), self._T) is apart
 
-    @pytest.mark.parametrize("seconds,text", [
-        (3_600, "60 minutes"),
-        (15 * 60, "15 minutes"),
-        (60, "1 minute"),
-        # Not a whole number of minutes: printed in seconds, never truncated
-        # into a different bound ("1 minutes" for 90 s would be false).
-        (90, "90 seconds"),
-        (59, "59 seconds"),
-        (1, "1 second"),
-    ])
-    def test_the_bound_text_never_misstates_the_bound(self, seconds, text):
-        assert scanner.close_gap_bound_text(seconds) == text
-
-    def test_the_bound_text_reads_the_gates_binding_at_call_time(self, monkeypatch):
-        # No argument reads scanner's binding at CALL time — the one
-        # closes_apart reads — so a patched bound reaches the refusal lines of
-        # both paths, and never a def-time copy.
-        assert scanner.close_gap_bound_text() == "60 minutes"
-        monkeypatch.setattr(scanner, "SAME_TITLE_MAX_CLOSE_GAP_SECONDS", 90)
-        assert scanner.close_gap_bound_text() == "90 seconds"
+    def test_the_bound_is_scanners_binding_read_at_call_time(self, monkeypatch):
+        # closes_apart reads scanner's own copy of the bound each time it is
+        # called, so a test narrows the bound by patching scanner's name (the
+        # TIME_SERIES_SAME_EVENT_LADDERS precedent). Patching config's copy
+        # changes nothing: a 61-second gap is still within scanner's hour
+        monkeypatch.setattr(config, "HELD_PAIR_CLOSE_GAP_SECONDS", 60)
+        assert scanner.closes_apart(self._T, self._T + timedelta(seconds=61)) is False
+        # A 60-second bound in scanner admits a 60-second gap and refuses 61
+        monkeypatch.setattr(scanner, "HELD_PAIR_CLOSE_GAP_SECONDS", 60)
+        assert scanner.closes_apart(self._T, self._T + timedelta(seconds=60)) is False
+        assert scanner.closes_apart(self._T, self._T + timedelta(seconds=61)) is True
 
     def test_the_live_reader_reads_close_time_by_type(self):
         dated = SimpleNamespace(close_time=self._T)
         assert scanner._closes_apart(dated, SimpleNamespace(close_time=self._T)) is False
         # A MagicMock's auto-attribute is not a datetime; a missing attribute
-        # reads as None. Both fail closed.
+        # reads as None. Both read as apart.
         assert scanner._closes_apart(dated, MagicMock()) is True
         assert scanner._closes_apart(dated, SimpleNamespace()) is True
-
-
-# The two events of the 2026-10-16 incident, as Kalshi's /events replies
-# carried them (the fields the finder reads). One title, "Kentucky vs
-# Oklahoma", over a women's college volleyball match and a college football
-# game; only the events' product_metadata and the series' tags tell them apart.
-_VOLLEYBALL_EVENT = {
-    "event_ticker": "KXNCAAWVMATCH-26OCT161900UKOU",
-    "series_ticker": "KXNCAAWVMATCH",
-    "title": "Kentucky vs Oklahoma",
-    "sub_title": "UK vs OU (Oct 16)",
-    "category": "Sports",
-    "product_metadata": {"competition": "NCAA Volleyball (W)", "competition_scope": "Game"},
-    "markets": [
-        {"ticker": "KXNCAAWVMATCH-26OCT161900UKOU-UK",
-         "event_ticker": "KXNCAAWVMATCH-26OCT161900UKOU", "title": "Kentucky wins",
-         "yes_sub_title": "Kentucky", "no_sub_title": "Kentucky", "status": "active",
-         "close_time": "2026-10-18T23:00:00Z", "yes_ask_dollars": "0.9600",
-         "no_ask_dollars": "0.2900", "yes_bid_dollars": "0.7100", "exchange_index": 0,
-         "price_level_structure": "linear_cent",
-         "price_ranges": [{"end": "1.0000", "start": "0.0000", "step": "0.0100"}]},
-        {"ticker": "KXNCAAWVMATCH-26OCT161900UKOU-OU",
-         "event_ticker": "KXNCAAWVMATCH-26OCT161900UKOU", "title": "Oklahoma wins",
-         "yes_sub_title": "Oklahoma", "no_sub_title": "Oklahoma", "status": "active",
-         "close_time": "2026-10-18T23:00:00Z", "yes_ask_dollars": "0.1700",
-         "no_ask_dollars": "0.9600", "yes_bid_dollars": "0.0400", "exchange_index": 0,
-         "price_level_structure": "linear_cent",
-         "price_ranges": [{"end": "1.0000", "start": "0.0000", "step": "0.0100"}]},
-    ],
-}
-_FOOTBALL_EVENT = {
-    "event_ticker": "KXNCAAFGAME-26OCT16UKOKLA",
-    "series_ticker": "KXNCAAFGAME",
-    "title": "Kentucky vs Oklahoma",
-    "sub_title": "UK vs OKLA (Oct 16)",
-    "category": "Sports",
-    "product_metadata": {"competition": "NCAA Football", "competition_scope": "Game"},
-    "markets": [
-        {"ticker": "KXNCAAFGAME-26OCT16UKOKLA-UK",
-         "event_ticker": "KXNCAAFGAME-26OCT16UKOKLA", "title": "Kentucky wins",
-         "yes_sub_title": "Kentucky", "no_sub_title": "Kentucky", "status": "active",
-         "close_time": "2026-10-19T00:00:00Z", "yes_ask_dollars": "0.3200",
-         "no_ask_dollars": "0.6900", "yes_bid_dollars": "0.3100", "exchange_index": 0,
-         "price_level_structure": "linear_cent",
-         "price_ranges": [{"end": "1.0000", "start": "0.0000", "step": "0.0100"}]},
-        {"ticker": "KXNCAAFGAME-26OCT16UKOKLA-OKLA",
-         "event_ticker": "KXNCAAFGAME-26OCT16UKOKLA", "title": "Oklahoma wins",
-         "yes_sub_title": "Oklahoma", "no_sub_title": "Oklahoma", "status": "active",
-         "close_time": "2026-10-19T00:00:00Z", "yes_ask_dollars": "0.6900",
-         "no_ask_dollars": "0.3200", "yes_bid_dollars": "0.6800", "exchange_index": 0,
-         "price_level_structure": "linear_cent",
-         "price_ranges": [{"end": "1.0000", "start": "0.0000", "step": "0.0100"}]},
-    ],
-}
-# The two series as the cached /series listing files them (category, tags)
-_INCIDENT_LISTING = {"KXNCAAWVMATCH": ("Sports", ("Volleyball",)),
-                     "KXNCAAFGAME": ("Sports", ("Football",))}
-
-
-class TestSameTitleSportCheck:
-    """DR-79: identical wording on two series that close together is one
-    question only when both series are filed under one Kalshi category and
-    first tag, and both events name the same competition or neither names one.
-
-    Rebuilt from the real payloads of the 2026-10-16 incident, parsed as
-    fetch_open_events_with_markets parses them (_market_from_dict with the
-    event's title and competition) and filed as main._attach_series_labels
-    files a run's markets. Kentucky vs Oklahoma in women's volleyball and in
-    football share every word ("Kentucky vs Oklahoma: Kentucky wins") on two
-    series, and their scheduled closes sit exactly 3,600 s apart, which the
-    close gate admits."""
-
-    _LABEL_LINE = (
-        "Same-title candidates refused because the two series are filed under "
-        "different Kalshi categories or tags (two different sports or subjects, "
-        "not one question listed twice): "
-    )
-    _COMPETITION_LINE = (
-        "Same-title candidates refused because the two events name different "
-        "competitions (two leagues, genders or formats, not one question listed "
-        "twice): "
-    )
-
-    @staticmethod
-    def _incident_markets() -> list:
-        """The four incident markets, parsed and filed as a production run has them."""
-        from kalshi_betting import main
-        markets = [scanner._market_from_dict(m, ev["title"], scanner.event_competition(ev))
-                   for ev in (_VOLLEYBALL_EVENT, _FOOTBALL_EVENT) for m in ev["markets"]]
-        main._attach_series_labels(markets, _INCIDENT_LISTING)
-        return markets
-
-    @classmethod
-    def _sport_lines(cls, caplog) -> list[str]:
-        return [m for m in caplog.messages
-                if m.startswith((cls._LABEL_LINE, cls._COMPETITION_LINE))]
-
-    @staticmethod
-    def _game(ticker, event, *, labels, competition, yes_ask, close, title="Kentucky wins",
-              event_title="Kentucky vs Oklahoma", subtitle="Kentucky"):
-        """One market of a game, as _mock_market builds it, with its labels and competition."""
-        return _mock_market(ticker=ticker, event_ticker=event, title=title, subtitle=subtitle,
-                            event_title=event_title, yes_ask=yes_ask, no_ask=1 - yes_ask,
-                            close_time=close, series_labels=labels, competition=competition)
-
-    def test_the_incident_markets_carry_their_labels(self):
-        by_ticker = {m.ticker: m for m in self._incident_markets()}
-        volleyball = by_ticker["KXNCAAWVMATCH-26OCT161900UKOU-UK"]
-        football = by_ticker["KXNCAAFGAME-26OCT16UKOKLA-UK"]
-        assert volleyball._event_competition == "NCAA Volleyball (W)"
-        assert football._event_competition == "NCAA Football"
-        assert volleyball._series_labels == ("Sports", "Volleyball")
-        assert football._series_labels == ("Sports", "Football")
-        # Every older same-title check passes: the shape only this check catches
-        assert scanner._identical_wording(volleyball, football)
-        assert not scanner._same_series(volleyball, football)
-        assert not scanner._closes_apart(volleyball, football)
-        assert (football.close_time - volleyball.close_time).total_seconds() == 3_600
-
-    def test_both_incident_pairs_are_refused_on_the_label_line(self, caplog):
-        with caplog.at_level(logging.INFO):
-            assert find_same_title_pairs(self._incident_markets()) == []
-        # "Kentucky wins" and "Oklahoma wins": two candidates, each counted
-        # once, on the label line (the competition check is never reached)
-        assert self._sport_lines(caplog) == [self._LABEL_LINE + "2"]
-        assert not any("close more than" in m for m in caplog.messages)
-
-    def test_with_labels_and_competitions_alike_the_incident_markets_pair(self):
-        # Control: file both series alike and give both events one competition,
-        # and both pairs form, so the refusal above is this check
-        markets = self._incident_markets()
-        for m in markets:
-            m._series_labels = ("Sports", "Football")
-            m._event_competition = "NCAA Football"
-        pairs = find_same_title_pairs(markets)
-        assert sorted(p.market_a.ticker for p in pairs) == [
-            "KXNCAAFGAME-26OCT16UKOKLA-OKLA", "KXNCAAWVMATCH-26OCT161900UKOU-UK"]
-
-    def test_one_tag_and_two_competitions_is_refused_on_the_competition_line(self, caplog):
-        # A men's and a women's game at ONE scheduled close, both series tagged
-        # Basketball: only the competitions tell them apart (stand-in labels)
-        close = datetime(2026, 1, 28, 1, 30, tzinfo=UTC)
-        mens = self._game("KXNCAAMBGAME-26JAN27WIUEIU-WIU", "KXNCAAMBGAME-26JAN27WIUEIU",
-                          labels=("Sports", "Basketball"), competition="College Basketball (M)",
-                          yes_ask=0.40, close=close)
-        womens = self._game("KXNCAAWBGAME-26JAN27WIUEIU-WIU", "KXNCAAWBGAME-26JAN27WIUEIU",
-                            labels=("Sports", "Basketball"),
-                            competition="College Basketball (W)", yes_ask=0.25, close=close)
-        with caplog.at_level(logging.INFO):
-            assert find_same_title_pairs([mens, womens]) == []
-        assert self._sport_lines(caplog) == [self._COMPETITION_LINE + "1"]
-
-    def test_one_event_naming_a_competition_and_the_other_none_is_refused(self, caplog):
-        close = datetime(2026, 12, 1, tzinfo=UTC)
-        named = self._game("KXA-1-Y", "KXA-1", labels=("Sports", "Football"),
-                           competition="NCAA Football", yes_ask=0.60, close=close)
-        unnamed = self._game("KXB-1-Y", "KXB-1", labels=("Sports", "Football"),
-                             competition="", yes_ask=0.30, close=close)
-        with caplog.at_level(logging.INFO):
-            assert find_same_title_pairs([named, unnamed]) == []
-        assert self._sport_lines(caplog) == [self._COMPETITION_LINE + "1"]
-
-    def test_labels_and_competitions_that_differ_only_in_letter_case_pair(self, caplog):
-        close = datetime(2026, 12, 1, tzinfo=UTC)
-        a = self._game("KXA-1-Y", "KXA-1", labels=("Sports", "Football"),
-                       competition="NCAA Football", yes_ask=0.60, close=close)
-        b = self._game("KXB-1-Y", "KXB-1", labels=("SPORTS", "football"),
-                       competition=" ncaa football ", yes_ask=0.30, close=close)
-        with caplog.at_level(logging.INFO):
-            assert len(find_same_title_pairs([a, b])) == 1
-        assert self._sport_lines(caplog) == []
-
-    def test_weekly_and_monthly_brent_listings_still_pair(self, caplog):
-        # One question on a weekly and a monthly series, filed alike, whose
-        # events name no competition
-        close = datetime(2026, 9, 25, 21, tzinfo=UTC)
-        title = "Brent crude oil price on Sep 25, 2026?"
-        weekly = self._game("KXBRENTW-26SEP25-T70", "KXBRENTW-26SEP25",
-                            labels=("Commodities", "Oil & Gas"), competition="",
-                            yes_ask=0.45, close=close, title=title,
-                            event_title="Brent crude oil price", subtitle="$70 or above")
-        monthly = self._game("KXBRENTMON-26SEP-T70", "KXBRENTMON-26SEP",
-                             labels=("Commodities", "Oil & Gas"), competition="",
-                             yes_ask=0.35, close=close, title=title,
-                             event_title="Brent crude oil price", subtitle="$70 or above")
-        with caplog.at_level(logging.INFO):
-            assert len(find_same_title_pairs([weekly, monthly])) == 1
-        assert self._sport_lines(caplog) == []
-        # held_pair_kind reads the held pair as same-title too
-        assert scanner.held_pair_kind(yes_market=monthly, no_market=weekly) == (
-            "same_title", weekly, monthly)
-
-    def test_weekly_and_monthly_copper_listings_still_pair(self, caplog):
-        # The same shape on copper, filed Commodities · Metals on both series
-        # (the first of their several tags), with no competition
-        from kalshi_betting import main
-        close = datetime(2026, 10, 16, 21, tzinfo=UTC)
-        title = "Copper price on Oct 16, 2026?"
-        weekly = self._game("KXCOPPERW-26OCT16-T5.10", "KXCOPPERW-26OCT16",
-                            labels=None, competition="", yes_ask=0.55, close=close,
-                            title=title, event_title="Copper price", subtitle="$5.10 or above")
-        monthly = self._game("KXCOPPERMON-26OCT-T5.10", "KXCOPPERMON-26OCT",
-                             labels=None, competition="", yes_ask=0.45, close=close,
-                             title=title, event_title="Copper price", subtitle="$5.10 or above")
-        tags = ("Metals", "Copper", "Industrial Metals")
-        main._attach_series_labels([weekly, monthly],
-                                   {"KXCOPPERW": ("Commodities", tags),
-                                    "KXCOPPERMON": ("Commodities", tags)})
-        assert weekly._series_labels == monthly._series_labels == ("Commodities", "Metals")
-        with caplog.at_level(logging.INFO):
-            assert len(find_same_title_pairs([weekly, monthly])) == 1
-        assert self._sport_lines(caplog) == []
-
-    @pytest.mark.parametrize("missing", [None, ("Sports",), ["Sports", "Football"],
-                                         ("Sports", None), "Sports"])
-    def test_a_market_without_readable_labels_is_refused(self, caplog, missing):
-        markets = self._incident_markets()
-        for m in markets:
-            m._series_labels = ("Sports", "Football")
-            m._event_competition = "NCAA Football"
-        markets[0]._series_labels = missing
-        with caplog.at_level(logging.INFO):
-            pairs = find_same_title_pairs(markets)
-        # The volleyball Kentucky market has no readable labels: its pair is
-        # refused, the Oklahoma pair still forms
-        assert [p.market_a.ticker for p in pairs] == ["KXNCAAFGAME-26OCT16UKOKLA-OKLA"]
-        assert self._sport_lines(caplog) == [self._LABEL_LINE + "1"]
-
-    def test_an_apimarket_never_filed_is_refused(self):
-        # ApiMarket's own default: no labels until main attaches them
-        markets = [scanner._market_from_dict(m, ev["title"], scanner.event_competition(ev))
-                   for ev in (_VOLLEYBALL_EVENT, _FOOTBALL_EVENT) for m in ev["markets"]]
-        assert all(m._series_labels is None for m in markets)
-        assert find_same_title_pairs(markets) == []
-
-    def test_a_competition_that_is_not_a_string_is_refused(self, caplog):
-        markets = self._incident_markets()
-        for m in markets:
-            m._series_labels = ("Sports", "Football")
-            m._event_competition = "NCAA Football"
-        markets[0]._event_competition = None
-        with caplog.at_level(logging.INFO):
-            pairs = find_same_title_pairs(markets)
-        assert [p.market_a.ticker for p in pairs] == ["KXNCAAFGAME-26OCT16UKOKLA-OKLA"]
-        assert self._sport_lines(caplog) == [self._COMPETITION_LINE + "1"]
-
-    def test_both_lines_are_silent_at_zero_and_avoid_the_pinned_substrings(self, caplog):
-        with caplog.at_level(logging.INFO):
-            find_same_title_pairs(self._incident_markets())
-        markets = self._incident_markets()
-        for m in markets:
-            m._series_labels = ("Sports", "Football")
-        with caplog.at_level(logging.INFO):
-            find_same_title_pairs(markets)
-        lines = self._sport_lines(caplog)
-        assert lines == [self._LABEL_LINE + "2", self._COMPETITION_LINE + "2"]
-        for line in lines:
-            for pinned in ("one event series", "same event ticker", "close more than"):
-                assert pinned not in line
-        caplog.clear()
-        close = datetime(2026, 12, 1, tzinfo=UTC)
-        a = self._game("KXA-1-Y", "KXA-1", labels=("Sports", "Football"), competition="",
-                       yes_ask=0.60, close=close)
-        b = self._game("KXB-1-Y", "KXB-1", labels=("Sports", "Football"), competition="",
-                       yes_ask=0.30, close=close)
-        with caplog.at_level(logging.INFO):
-            assert len(find_same_title_pairs([a, b])) == 1
-        assert self._sport_lines(caplog) == []
-
-    def test_each_candidate_is_counted_once_on_one_line(self, caplog):
-        # Five groups of two identically worded markets, each candidate failing
-        # every rule from its line onward, and a sixth that passes them all.
-        # Each lands on the FIRST line its rules reach, once: the five lines
-        # partition the refusals
-        close = datetime(2026, 12, 1, tzinfo=UTC)
-        later = close + timedelta(days=1)
-        football, volleyball = ("Sports", "Football"), ("Sports", "Volleyball")
-
-        def group(question, first, second):
-            # (event ticker, labels, competition, close) for each market
-            return [self._game(f"{event}-{question}", event, labels=labels,
-                               competition=competition, yes_ask=price, close=when,
-                               title=f"{question} wins", subtitle=question)
-                    for (event, labels, competition, when), price
-                    in ((first, 0.60), (second, 0.30))]
-
-        markets = (
-            # One event's own markets (and every later rule broken too)
-            group("Q1", ("KXA-1", football, "NCAA Football", close),
-                  ("KXA-1", volleyball, "NCAA Volleyball (W)", later))
-            # Two events of one series
-            + group("Q2", ("KXA-2", football, "NCAA Football", close),
-                    ("KXA-3", volleyball, "NCAA Volleyball (W)", later))
-            # Two series closing a day apart
-            + group("Q3", ("KXA-4", football, "NCAA Football", close),
-                    ("KXB-4", volleyball, "NCAA Volleyball (W)", later))
-            # Two series at one close, filed differently
-            + group("Q4", ("KXA-5", football, "NCAA Football", close),
-                    ("KXB-5", volleyball, "NCAA Volleyball (W)", close))
-            # Two series at one close, filed alike, two competitions
-            + group("Q5", ("KXA-6", football, "NCAA Football", close),
-                    ("KXB-6", football, "NCAA Volleyball (W)", close))
-            # Every rule passed
-            + group("Q6", ("KXA-7", football, "NCAA Football", close),
-                    ("KXB-7", football, "NCAA Football", close)))
-        with caplog.at_level(logging.INFO):
-            [pair] = find_same_title_pairs(markets)
-        assert pair.market_a.ticker == "KXA-7-Q6"
-        refusals = [m for m in caplog.messages if m.startswith("Same-title candidates")]
-        assert sorted(refusals) == sorted([
-            "Same-title candidates skipped because both markets carry the same event "
-            "ticker (one event's own markets, not one question listed by two events): 1",
-            "Same-title candidates skipped as two instances of one event series "
-            "(identical wording, different fixture): 1",
-            "Same-title candidates refused because the two markets close more than "
-            "60 minutes apart (two different games or instants, not one question "
-            "listed twice): 1",
-            self._LABEL_LINE + "1",
-            self._COMPETITION_LINE + "1",
-        ])
-
-    def test_held_pair_kind_reads_a_held_incident_pair_as_no_kind(self):
-        by_ticker = {m.ticker: m for m in self._incident_markets()}
-        volleyball = by_ticker["KXNCAAWVMATCH-26OCT161900UKOU-UK"]
-        football = by_ticker["KXNCAAFGAME-26OCT16UKOKLA-UK"]
-        # Held either way round, the pair is no known kind, so it is never
-        # trimmed on the same-title chance of paying
-        assert scanner.held_pair_kind(yes_market=football, no_market=volleyball) is None
-        assert scanner.held_pair_kind(yes_market=volleyball, no_market=football) is None
-        # Each check refuses on its own. One competition, filed differently:
-        volleyball._event_competition = football._event_competition
-        assert scanner.held_pair_kind(yes_market=football, no_market=volleyball) is None
-        # Filed alike, naming two competitions:
-        volleyball._event_competition = "NCAA Volleyball (W)"
-        volleyball._series_labels = football._series_labels
-        assert scanner.held_pair_kind(yes_market=football, no_market=volleyball) is None
-        # Control: filed alike and one competition, and it reads as same-title
-        volleyball._event_competition = football._event_competition
-        assert scanner.held_pair_kind(yes_market=football, no_market=volleyball) == (
-            "same_title", volleyball, football)
-
-    def test_ingest_attaches_each_events_competition(self, monkeypatch, caplog):
-        # Both event loops read the competition from product_metadata: an event
-        # with none gives "", and one whose label is not a string gives None
-        # (unknown), which the competition check refuses
-        monkeypatch.setattr(scanner, "INCLUDE_MVE_MARKETS", True)
-        standard = [
-            _VOLLEYBALL_EVENT,
-            {"title": "Weather Event", "markets": [_raw_market("STD-NONE", "Rain tomorrow")]},
-            {"title": "Odd Event", "product_metadata": {"competition": 7},
-             "markets": [_raw_market("STD-ODD", "Snow tomorrow")]},
-        ]
-        mve = [
-            {"title": "Parlay", "product_metadata": {"competition": "  NBA  "},
-             "markets": [_raw_market("MVE-NBA", "All legs hit")]},
-            {"title": "Parlay 2", "markets": [_raw_market("MVE-NONE", "All legs hit")]},
-        ]
-        client = MagicMock()
-        client.get_events_without_preload_content = MagicMock(return_value=_raw_page(standard))
-        client.get_multivariate_events_without_preload_content = MagicMock(
-            return_value=_raw_page(mve))
-        with caplog.at_level(logging.INFO):
-            by_ticker = {m.ticker: m for m in fetch_open_events_with_markets(client)}
-        assert {t: m._event_competition for t, m in by_ticker.items()} == {
-            "KXNCAAWVMATCH-26OCT161900UKOU-UK": "NCAA Volleyball (W)",
-            "KXNCAAWVMATCH-26OCT161900UKOU-OU": "NCAA Volleyball (W)",
-            "STD-NONE": "", "STD-ODD": None, "MVE-NBA": "NBA", "MVE-NONE": ""}
-        # Ingest leaves the series labels to main
-        assert all(m._series_labels is None for m in by_ticker.values())
-        # One always-logged count of the markets whose event names a
-        # competition, and a WARNING for the label it could not read
-        assert "Markets whose event names a competition: 3 of 6" in caplog.messages
-        assert ("Markets whose event's competition label is not text: 1 (read as "
-                "unknown, so none of them forms a same-title pair)") in caplog.messages
-
-    def test_the_competition_count_is_logged_at_zero_with_no_warning(self, monkeypatch,
-                                                                     caplog):
-        # Every event naming none: the count reads 0, the shape a label Kalshi
-        # moved or renamed would show, and nothing is unreadable
-        monkeypatch.setattr(scanner, "INCLUDE_MVE_MARKETS", False)
-        client = MagicMock()
-        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([
-            {"title": "Weather Event", "markets": [_raw_market("STD-NONE", "Rain tomorrow")]},
-        ]))
-        with caplog.at_level(logging.INFO):
-            fetch_open_events_with_markets(client)
-        assert "Markets whose event names a competition: 0 of 1" in caplog.messages
-        assert not any("competition label is not text" in m for m in caplog.messages)
-
-    def test_two_events_whose_competition_is_not_text_form_no_pair(self, caplog):
-        # A payload whose competition is reshaped (a list here) on both events
-        # reads as unknown on both, never as "names none", so the pair is still
-        # refused, on the competition line, even with both series filed alike
-        def reshaped(event):
-            return {**event, "product_metadata": {
-                "competition": [event["product_metadata"]["competition"]]}}
-
-        markets = [scanner._market_from_dict(m, ev["title"], scanner.event_competition(ev))
-                   for ev in map(reshaped, (_VOLLEYBALL_EVENT, _FOOTBALL_EVENT))
-                   for m in ev["markets"]]
-        assert all(m._event_competition is None for m in markets)
-        for m in markets:
-            m._series_labels = ("Sports", "Football")
-        with caplog.at_level(logging.INFO):
-            assert find_same_title_pairs(markets) == []
-        assert self._sport_lines(caplog) == [self._COMPETITION_LINE + "2"]
-
-    def test_a_looked_up_held_market_carries_its_events_competition(self):
-        # A held market missing from the run's list is read with its event, as
-        # the market list reads it, so its competition is the event's own
-        raw = dict(_FOOTBALL_EVENT["markets"][0])
-        event = {k: v for k, v in _FOOTBALL_EVENT.items() if k != "markets"}
-        client = MagicMock()
-        client.get_market_without_preload_content.return_value = _json_reply({"market": raw})
-        client.get_event_without_preload_content.return_value = _json_reply({"event": event})
-        memo: dict = {}
-        market = scanner.market_for_labels(client, raw["ticker"], {}, memo)
-        assert market._event_competition == "NCAA Football"
-        assert memo == {raw["event_ticker"]: ("Kentucky vs Oklahoma", "NCAA Football")}
-
-
-class TestEventCompetition:
-    """scanner.event_competition: the competition an event names, "" when it
-    names none, and None when a label is there but cannot be read."""
-
-    @pytest.mark.parametrize("event,label", [
-        ({"product_metadata": {"competition": "NCAA Football"}}, "NCAA Football"),
-        ({"product_metadata": {"competition": "  College Basketball (W)\n"}},
-         "College Basketball (W)"),
-        ({"product_metadata": {"competition": ""}}, ""),
-        ({"product_metadata": {"cadence": "weekly"}}, ""),
-        ({"product_metadata": {"competition": None}}, ""),
-        ({"product_metadata": {"competition": "   "}}, ""),
-        ({"product_metadata": None}, ""),
-        ({"title": "No metadata"}, ""),
-        ({}, ""),
-        # A label that is there but is not text: unknown, never "names none"
-        ({"product_metadata": {"competition": 3}}, None),
-        ({"product_metadata": {"competition": ["NCAA Football"]}}, None),
-        ({"product_metadata": {"competition": {"name": "NCAA Football"}}}, None),
-        ({"product_metadata": {"competition": True}}, None),
-        ({"product_metadata": ["competition"]}, None),
-        ({"product_metadata": "NCAA Football"}, None),
-        (None, None),
-        ([], None),
-        ("NCAA Football", None),
-    ])
-    def test_it_reads_a_string_label_and_nothing_else(self, event, label):
-        assert scanner.event_competition(event) == label
-
-    def test_a_mock_event_reads_as_unknown(self):
-        assert scanner.event_competition(MagicMock()) is None
-
-
-class TestLabelsDiffer:
-    """scanner.labels_differ and its live reader _labels_differ: two series
-    are alike only when both are filed under one (category, tag)."""
-
-    @pytest.mark.parametrize("a,b,differ", [
-        (("Sports", "Football"), ("Sports", "Football"), False),
-        (("Sports", "Football"), ("sports", "FOOTBALL"), False),
-        (("Sports", "Football"), ("Sports", "Volleyball"), True),
-        (("Sports", "Football"), ("Politics", "Football"), True),
-        (("Commodities", "Oil & Gas"), ("Commodities", "Oil & Gas"), False),
-        # Fails closed on anything that is not a (category, tag) pair of strings
-        (None, ("Sports", "Football"), True),
-        (("Sports", "Football"), None, True),
-        (None, None, True),
-        (["Sports", "Football"], ["Sports", "Football"], True),
-        (("Sports",), ("Sports",), True),
-        (("Sports", "Football", "x"), ("Sports", "Football", "x"), True),
-        (("Sports", None), ("Sports", None), True),
-        ("Sports", "Sports", True),
-    ])
-    def test_two_series_are_alike_only_on_one_category_and_tag(self, a, b, differ):
-        assert scanner.labels_differ(a, b) is differ
-        assert scanner.labels_differ(b, a) is differ
-
-    def test_spaces_are_not_ignored(self):
-        # Labels come straight from Kalshi's listing, compared as written but for case
-        assert scanner.labels_differ(("Sports", "Football"), ("Sports", " Football")) is True
-
-    def test_the_live_reader_reads_series_labels_by_type(self):
-        filed = SimpleNamespace(_series_labels=("Sports", "Football"))
-        assert scanner._labels_differ(filed, SimpleNamespace(
-            _series_labels=("Sports", "Football"))) is False
-        # A missing attribute, and a MagicMock's auto-attribute, fail closed
-        assert scanner._labels_differ(filed, SimpleNamespace()) is True
-        assert scanner._labels_differ(filed, MagicMock()) is True
-
-
-class TestCompetitionsDiffer:
-    """scanner.competitions_differ and its live reader _competitions_differ:
-    two events are alike only when they name one competition, or neither
-    names one."""
-
-    @pytest.mark.parametrize("a,b,differ", [
-        ("", "", False),
-        ("NCAA Football", "NCAA Football", False),
-        ("NCAA Football", " ncaa football ", False),
-        ("College Basketball (M)", "College Basketball (W)", True),
-        ("NCAA Football", "NCAA Volleyball (W)", True),
-        # One event naming a competition and the other none counts as different
-        ("NCAA Football", "", True),
-        ("", "NCAA Football", True),
-        ("  ", "", False),
-        # Fails closed on anything that is not a str
-        (None, "", True),
-        ("", None, True),
-        (None, None, True),
-        (0, 0, True),
-        (["NCAA Football"], "NCAA Football", True),
-    ])
-    def test_two_events_are_alike_only_on_one_competition(self, a, b, differ):
-        assert scanner.competitions_differ(a, b) is differ
-        assert scanner.competitions_differ(b, a) is differ
-
-    def test_the_live_reader_reads_event_competition_by_type(self):
-        named = SimpleNamespace(_event_competition="NCAA Football")
-        assert scanner._competitions_differ(named, SimpleNamespace(
-            _event_competition="NCAA Football")) is False
-        assert scanner._competitions_differ(
-            SimpleNamespace(_event_competition=""),
-            SimpleNamespace(_event_competition="")) is False
-        # A missing attribute, and a MagicMock's auto-attribute, fail closed
-        assert scanner._competitions_differ(named, SimpleNamespace()) is True
-        assert scanner._competitions_differ(named, MagicMock()) is True
 
 
 class TestTimeSeriesGroupKey:
@@ -1933,7 +1041,7 @@ class TestTimeSeriesGroupKey:
     def test_magicmock_subtitle_reads_as_absent(self):
         # Fail-safe by TYPE, not truthiness: a MagicMock stand-in answers any
         # attribute with a truthy child mock, and regex-substituting one would
-        # raise. Same rule leg_sides and strategy._depth_levels follow.
+        # raise. Same rule strategy._depth_levels follows.
         assert time_series_group_key("Will BTC exceed $80k", MagicMock()) == normalize_title(
             "Will BTC exceed $80k"
         )
@@ -2221,8 +1329,8 @@ class TestCumulativeDeadlineRule:
         (123, [], {}),
     ])
     def test_non_string_fields_read_as_absent_and_never_raise(self, args):
-        # Same fail-safe-by-type rule leg_sides and strategy._depth_levels
-        # follow. Real: historical._market_to_dict stores subtitle as
+        # Same fail-safe-by-type rule strategy._depth_levels follows. Real:
+        # historical._market_to_dict stores subtitle as
         # `subtitle or yes_sub_title`, which is None when both are absent.
         assert scanner.deadline_phrasing(*args) == scanner.DEADLINE_UNKNOWN
 
@@ -2882,7 +1990,7 @@ class TestStatedDeadline:
         assert set(head.split("|")) == readable
 
     def test_a_non_str_span_reads_as_absent(self):
-        # Same fail-safe-by-type rule leg_sides and _depth_levels follow: a
+        # Same fail-safe-by-type rule strategy._depth_levels follows: a
         # MagicMock auto-attribute must not raise out of the parser.
         assert scanner._span_deadline(MagicMock()) is None
         assert scanner._span_deadline(None) is None
@@ -3475,7 +2583,8 @@ class TestPairGapDays:
     @pytest.mark.parametrize("bad", [True, 19.0, "19", MagicMock()])
     def test_anything_that_is_not_an_int_falls_back(self, bad):
         # bool is an int SUBCLASS, so isinstance would read True as a one-day
-        # ladder — the same fail-safe-by-type rule leg_sides follows.
+        # ladder — the same fail-safe-by-type rule strategy._depth_levels
+        # follows.
         assert scanner.pair_gap_days(self._pair(bad, close_gap=9)) == 9
 
     @pytest.mark.usefixtures("pre_toggle_defaults")
@@ -3681,7 +2790,7 @@ class TestDeadlineGuardFinders:
         assert (pair.market_a.ticker, pair.market_b.ticker) == ("T1", "T3")
         assert pair.pB - pair.pA == pytest.approx(0.30)
 
-    def test_dated_identical_wording_is_same_title_only(self):
+    def test_dated_identical_wording_is_no_time_series_pair(self):
         # control — kills a mutant that drops the spans-differ requirement
         # (`return True` in place of `spans_a != spans_b`). Identical wording
         # that STATES a deadline is refused by the cumulative-deadline rule's
@@ -3689,10 +2798,9 @@ class TestDeadlineGuardFinders:
         # one-series rule. The two legs sit on DIFFERENT series here, so
         # _same_series is False and would not refuse the pair on its own;
         # only the spans-differ check does. Both legs close at the SAME
-        # instant, so the same-title close gate (DR-74) admits the same-title
-        # copy — the one-pair, one-type exclusivity DR-67 guarantees. Mirror
-        # of test_backtester.py::TestRunBacktestCrossTypeDedup::
-        # test_dated_identical_wording_is_same_title_only.
+        # instant, so the close times cannot be what refuses it. The mirror
+        # is test_backtester.py::TestIdenticalWordingFormsNoTimeSeriesPair::
+        # test_dated_identical_wording_is_no_time_series_pair.
         title = "Will X happen by Dec 31, 2026?"
         close = datetime(2026, 12, 1, tzinfo=UTC)
         mA = _mock_market(
@@ -3713,7 +2821,6 @@ class TestDeadlineGuardFinders:
         assert scanner._identical_wording(mA, mB) is True
         assert scanner._same_series(mA, mB) is False
         assert scanner._closes_apart(mA, mB) is False
-        assert len(find_same_title_pairs([mA, mB])) == 1
         assert find_time_series_pairs(
             MagicMock(), held_tickers=set(), markets=[mA, mB],
         ) == []
@@ -3735,20 +2842,14 @@ class TestDeadlineGuardFinders:
         )) == 1
 
     @pytest.mark.parametrize("title", ["Q", "Will X happen by Dec 31, 2026?"])
-    def test_identical_wording_closing_apart_forms_no_pair_of_either_type(self, title):
-        # regression (DR-74) — the RELABEL guard. Identical wording on two
-        # DIFFERENT series whose markets close 19 days apart is two fixtures,
-        # so the same-title close gate refuses it; and because the finders
-        # are mutually exclusive on one ticker pair (DR-67: identical wording
-        # states the same deadline spans, or none), the refused same-title
-        # copy cannot come back as a time-series pair either — undated ("Q",
-        # unknown wording) or dated (one deadline stated twice). So nothing
-        # reaches main._dedup_pairs, and a same-title-only gate cannot
-        # relabel the trade. Mirror of test_backtester.py::
-        # TestRunBacktestCrossTypeDedup::
-        # test_identical_wording_closing_apart_forms_no_pair_of_either_type.
-        from kalshi_betting.main import _dedup_pairs
-
+    def test_identical_wording_closing_apart_forms_no_time_series_pair(self, title):
+        # regression (DR-67) — identical wording on two DIFFERENT series whose
+        # markets close 19 days apart is two fixtures, and it forms no
+        # time-series pair: identical wording states the same deadline spans,
+        # or none — undated ("Q", unknown wording) or dated (one deadline
+        # stated twice) — however far apart the two close. The mirror is
+        # test_backtester.py::TestIdenticalWordingFormsNoTimeSeriesPair::
+        # test_identical_wording_closing_apart_forms_no_time_series_pair.
         mA = _mock_market(
             ticker="A1", event_ticker="EVA-1", title=title, event_title="EV",
             yes_ask=0.30, no_ask=0.70, close_time=datetime(2026, 12, 1, tzinfo=UTC),
@@ -3761,22 +2862,9 @@ class TestDeadlineGuardFinders:
         assert scanner._identical_wording(mA, mB) is True
         assert scanner._same_series(mA, mB) is False
         assert scanner._closes_apart(mA, mB) is True
-        same_title = find_same_title_pairs([mA, mB])
-        time_series = find_time_series_pairs(
+        assert find_time_series_pairs(
             MagicMock(), held_tickers=set(), markets=[mA, mB],
-        )
-        assert same_title == []
-        assert time_series == []
-        assert _dedup_pairs(same_title, time_series) == []
-
-        # Positive control: B moved onto A's close instant, nothing else
-        # changed — the same-title pair forms, so the [] above is the close
-        # gate and not the price, the wording or the series.
-        mB_aligned = _mock_market(
-            ticker="B1", event_ticker="EVB-1", title=title, event_title="EV",
-            yes_ask=0.60, no_ask=0.40, close_time=datetime(2026, 12, 1, tzinfo=UTC),
-        )
-        assert len(find_same_title_pairs([mA, mB_aligned])) == 1
+        ) == []
 
 
 class TestSpansFromDecidingField:
@@ -4540,7 +3628,7 @@ class TestTimeSeriesTieredThreshold:
         # asks — so this is not a candidate at all.
         #
         # RE-PINNED: it used to be carried as an untradeable row. That was not
-        # free — both finders keep ONE pair per group, so a pair no trade can
+        # free — the finder keeps ONE pair per group, so a pair no trade can
         # ever come from could win the slot and block a sound runner-up. The
         # explicit skip in find_time_series_pairs is what removes it; the
         # tradeable flag alone never did.
@@ -4608,46 +3696,6 @@ class TestTimeSeriesTieredThreshold:
         )
         assert find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB]) == []
 
-    def test_same_title_pairs_ignore_the_deadline_tier_but_not_the_close_gap(self):
-        # Same-title pairs keep the flat 5% threshold — a 6% divergence, far
-        # under either time-series tier, is still a candidate when the two
-        # markets close at one instant (the deadline-gap tiers apply only to
-        # time-series pairs).
-        #
-        # INVERTED (DR-74): this test used to pin that a pair closing 20 DAYS
-        # apart "is still a candidate" — exactly the shape DR-74 refuses.
-        # Identical wording on two series closing 20 days apart is two
-        # fixtures (two games, two instants), not one question, so the
-        # co-resolution prior does not apply; the same-title close gate now
-        # refuses it. RE-PINNED earlier (DR-02/DR-54): the two event tickers
-        # were EVT-A and EVT-B, one series; they name two DIFFERENT series, so
-        # only the close gate decides the first assertion below.
-        from datetime import UTC, datetime
-        mA = _mock_market(
-            ticker="A1", event_ticker="EVA-1",
-            title="Republicans control Senate after 2026", event_title="2026 Senate Control",
-            yes_ask=0.36, no_ask=0.64,
-            close_time=datetime(2026, 3, 1, tzinfo=UTC),
-        )
-        mB = _mock_market(
-            ticker="B1", event_ticker="EVB-1",
-            title="Republicans control Senate after 2026", event_title="2026 Senate Control",
-            yes_ask=0.30, no_ask=0.70,
-            close_time=datetime(2026, 3, 21, tzinfo=UTC),
-        )
-        assert find_same_title_pairs([mA, mB]) == []
-
-        # Within the gap: B at A's close instant — the 6% divergence pairs.
-        mB_aligned = _mock_market(
-            ticker="B1", event_ticker="EVB-1",
-            title="Republicans control Senate after 2026", event_title="2026 Senate Control",
-            yes_ask=0.30, no_ask=0.70,
-            close_time=datetime(2026, 3, 1, tzinfo=UTC),
-        )
-        pairs = find_same_title_pairs([mA, mB_aligned])
-        assert len(pairs) == 1
-        assert pairs[0].pA - pairs[0].pB == pytest.approx(0.06)
-
 
 def _raw_book_response(ob: dict) -> SimpleNamespace:
     """Wrap one orderbook_fp side dict as a raw *_without_preload_content response.
@@ -4709,7 +3757,6 @@ def _ts_orderbook_client(
 
 def _st_orderbook_client(
     *, nA_fill: float, pB_fill: float, qty: int = 100, ticker_a: str = "A1",
-    pA_ref: float | None = None,
 ):
     """Mock KalshiClient serving SAME-TITLE-shaped depth at exactly one level.
 
@@ -4718,20 +3765,13 @@ def _st_orderbook_client(
     (YES ask = 1 - NO bid) — so a YES bid of (1 - nA_fill) on ticker_a and a
     NO bid of (1 - pB_fill) on every other ticker yield qualifying depth
     priced at exactly nA_fill + pB_fill. This is the book shape the scanner
-    read for EVERY pair before the 2026-09 time-series inversion.
-
-    pA_ref mirrors _ts_orderbook_client's pB_ref: it rests a NO bid of
-    (1 - pA_ref) on ticker_a so A's best YES ask is exactly pA_ref — the
-    reference quote for THIS pair type. Left None, A's NO side stays empty and
-    the pair keeps its scan-time pA.
+    read for EVERY pair before the 2026-09 time-series inversion. A's NO side
+    is empty.
     """
     def fake_orderbook(ticker):
         if ticker == ticker_a:  # market A — YES bids become NO ask levels
             ob = {"yes_dollars": [[str(round(1.0 - nA_fill, 4)), str(qty)]],
-                  "no_dollars": (
-                      [] if pA_ref is None
-                      else [[str(round(1.0 - pA_ref, 4)), str(qty)]]
-                  )}
+                  "no_dollars": []}
         else:                   # market B — NO bids become YES ask levels
             ob = {"yes_dollars": [],
                   "no_dollars": [[str(round(1.0 - pB_fill, 4)), str(qty)]]}
@@ -4869,10 +3909,11 @@ class TestPrefixFillPrices:
 
 
 def _st_candidate(*, pA: float, pB: float, nA: float, nB: float = 0.70) -> CandidatePair:
-    """Build a same_title CandidatePair on tickers A1/B1.
+    """Build a CandidatePair of the same_title type on tickers A1/B1.
 
-    (nA, pB) are the leg prices (NO on A, YES on B); pA is the reference quote
-    and nB is reporting-only for this pair type.
+    Two identically worded markets on two series: a pair type the bot does
+    not trade, which the side helpers refuse and every entry point refuses
+    first.
     """
     mA = _mock_market(ticker="A1", event_ticker="EVT-A", title="Q", yes_ask=pA, no_ask=nA)
     mB = _mock_market(ticker="B1", event_ticker="EVT-B", title="Q", yes_ask=pB, no_ask=nB)
@@ -5044,29 +4085,15 @@ class TestEnrichmentStoresOrientedDepthLevels:
         # market_a's entry is the YES leg (pA), market_b's the NO leg (nB)
         assert leg_prices(enriched) == pytest.approx((0.32, 0.42))
 
-    def test_same_title_levels_are_nA_then_pB(self):
-        pair = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
-        client = _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, qty=100)
-        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
-        [level] = enriched.depth_levels
-        assert level == pytest.approx((0.44, 0.31, 100.0))
-        # market_a's entry is the NO leg (nA), market_b's the YES leg (pB)
-        assert leg_prices(enriched) == pytest.approx((0.44, 0.31))
-
-    def test_levels_match_leg_prices_ordering_for_both_types(self):
+    def test_levels_match_leg_prices_ordering(self):
         # The orientation contract stated once: depth_levels[i][0] always
         # belongs to market_a and [1] to market_b, whichever side each buys.
         ts = _ts_candidate(gap_days=10, pA=0.30, pB=0.62, nB=0.50)
         [ts_e] = enrich_with_orderbook_prices(
             _ts_orderbook_client(pA_fill=0.32, nB_fill=0.42, pB_ref=0.62), [ts], _AMPLE_BALANCE_CENTS,
         )
-        st = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
-        [st_e] = enrich_with_orderbook_prices(
-            _st_orderbook_client(nA_fill=0.44, pB_fill=0.31), [st], _AMPLE_BALANCE_CENTS,
-        )
-        for enriched in (ts_e, st_e):
-            a, b, _ = enriched.depth_levels[0]
-            assert (a, b) == pytest.approx(leg_prices(enriched))
+        a, b, _ = ts_e.depth_levels[0]
+        assert (a, b) == pytest.approx(leg_prices(ts_e))
 
     def test_unenriched_pair_has_empty_levels(self):
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.62, nB=0.50)
@@ -5164,23 +4191,38 @@ class TestTimeSeriesEnrichmentSides:
         assert no_levels == [(pytest.approx(0.42), 9.0)]
         assert yes_levels == [(pytest.approx(0.32), 5.0)]
 
-    def test_leg_ask_levels_same_title_reads_a_yes_bids_and_b_no_bids(self):
-        pair = SimpleNamespace(pair_type="same_title")
-        ob_a = {"yes": [["0.55", "7"]], "no": [["0.40", "5"]]}   # YES bid 0.55 → NO ask 0.45
-        ob_b = {"yes": [["0.20", "9"]], "no": [["0.69", "3"]]}   # NO bid 0.69 → YES ask 0.31
-        no_levels, yes_levels = _leg_ask_levels(pair, ob_a, ob_b)
-        assert no_levels == [(pytest.approx(0.45), 7.0)]
-        assert yes_levels == [(pytest.approx(0.31), 3.0)]
+    @pytest.mark.parametrize(
+        "pair", [*(SimpleNamespace(pair_type=t) for t in _OTHER_PAIR_TYPES), SimpleNamespace()],
+        ids=[*_OTHER_PAIR_TYPE_IDS, "no-type"])
+    def test_book_sides_raise_for_any_other_pair_type_before_a_book_is_read(self, pair):
+        # Which side of each book a leg buys from comes from leg_sides, which
+        # gives sides to time-series pairs only: a pair of any other type (or
+        # with no type) raises before either book is read, never priced off
+        # the NO-on-A, YES-on-B sides. Enrichment and validate_pair_price
+        # refuse such a pair before they get here
+        class Unreadable(dict):
+            """A book that fails the test if any side of it is read."""
 
-    def test_leg_ask_levels_unknown_pair_type_uses_same_title_sides(self):
-        # Fail-safe like leg_sides: None / a bogus type / a bare namespace with
-        # no pair_type all read the same-title sides
-        ob_a = {"yes": [["0.55", "7"]], "no": []}
-        ob_b = {"yes": [], "no": [["0.69", "3"]]}
-        for pair in (SimpleNamespace(), SimpleNamespace(pair_type=None), SimpleNamespace(pair_type="bogus")):
-            no_levels, yes_levels = _leg_ask_levels(pair, ob_a, ob_b)
-            assert no_levels == [(pytest.approx(0.45), 7.0)]
-            assert yes_levels == [(pytest.approx(0.31), 3.0)]
+            def __getitem__(self, side):
+                """
+                Fail on every side read.
+
+                Args:
+                    side (str): The side read ("yes" or "no").
+
+                Raises:
+                    AssertionError: Always.
+                """
+                raise AssertionError(f"the {side!r} side of a book was read")
+
+        book = Unreadable()
+        with pytest.raises(ValueError, match="not a time-series pair type"):
+            _leg_ask_levels(pair, book, book)
+        with pytest.raises(ValueError, match="not a time-series pair type"):
+            _reference_yes_ask(pair, book, book)
+        # Control: as a time-series pair the same books are read, and fail the test
+        with pytest.raises(AssertionError, match="side of a book was read"):
+            _leg_ask_levels(SimpleNamespace(pair_type="time_series"), book, book)
 
     def test_enrichment_writes_fills_to_pA_nB_and_refreshes_pB_leaving_nA(self):
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40)
@@ -5218,70 +4260,9 @@ class TestTimeSeriesEnrichmentSides:
         assert validate_pair_price(client, SimpleNamespace(pair=pair, x=9)) is True
 
 
-class TestSameTitleEnrichmentByteIdentity:
-    """Same-title behaviour must not change with the time-series inversion:
-    NO on A still consumes A's YES bids, YES on B still consumes B's NO bids,
-    and the fills still land in nA/pB with nB untouched. pA is refreshed from
-    A's NO bids (TS-34) — the reporting-only reference quote — but same-title
-    is deliberately NOT direction-guarded: its model is the fixed co-resolution
-    prior, so nothing sizes on pA and there is no clamp to protect."""
-
-    @staticmethod
-    def _pair() -> CandidatePair:
-        return _st_candidate(pA=0.55, pB=0.30, nA=0.45, nB=0.70)
-
-    def test_enrichment_writes_fills_to_nA_pB_and_refreshes_pA_leaving_nB(self):
-        pair = self._pair()
-        client = _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, qty=100, pA_ref=0.57)
-        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
-        assert enriched.tradeable is True
-        assert enriched.max_contracts == 100
-        assert enriched.nA == pytest.approx(0.44)
-        assert enriched.pB == pytest.approx(0.31)
-        # pA is same_title's reference quote — refreshed from A's NO bids in the
-        # same snapshot as the fills (scan-time was 0.55)
-        assert enriched.pA == pytest.approx(0.57)
-        # nB is reporting-only for this pair type — byte-identical to the input
-        assert enriched.nB == pair.nB
-        assert leg_prices(enriched) == (pytest.approx(0.44), pytest.approx(0.31))
-
-    def test_ceiling_is_flat_five_percent(self):
-        # 0.50 + 0.46 = 0.96 > 0.95 — the same-title ceiling, no deadline tiering
-        pair = self._pair()
-        client = _st_orderbook_client(nA_fill=0.50, pB_fill=0.46)
-        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
-        assert enriched.tradeable is False
-        client_ok = _st_orderbook_client(nA_fill=0.50, pB_fill=0.45)
-        [enriched_ok] = enrich_with_orderbook_prices(client_ok, [pair], _AMPLE_BALANCE_CENTS)
-        assert enriched_ok.tradeable is True
-
-    def test_validate_pair_price_same_title(self):
-        pair = self._pair()
-        client = _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, qty=100)
-        assert validate_pair_price(client, SimpleNamespace(pair=pair, x=100)) is True
-        assert validate_pair_price(client, SimpleNamespace(pair=pair, x=101)) is False
-
-    def test_time_series_shaped_books_yield_no_depth_for_same_title(self):
-        # The inverse of the time-series wrong-shape test: a same-title pair
-        # served time-series-shaped books (A NO bids, B YES bids) finds nothing.
-        pair = self._pair()
-
-        def fake_orderbook(ticker):
-            if ticker == "A1":
-                ob = {"yes_dollars": [], "no_dollars": [["0.56", "100"]]}
-            else:
-                ob = {"yes_dollars": [["0.69", "100"]], "no_dollars": []}
-            return _raw_book_response(ob)
-
-        client = MagicMock()
-        client.get_market_orderbook_without_preload_content = MagicMock(side_effect=fake_orderbook)
-        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
-        assert enriched.tradeable is False
-
-
 class TestEnrichmentRefreshesReferenceQuote:
     """enrich_with_orderbook_prices must refresh the pair's REFERENCE YES ask —
-    the non-leg market's YES ask (pB for time_series, pA for same_title) — from
+    the non-leg market's YES ask, pB, the later market's — from
     the book it already fetched, and drop a time-series pair with no fresh
     reference (fail closed), a crossed book or a refused spread.
 
@@ -5304,28 +4285,6 @@ class TestEnrichmentRefreshesReferenceQuote:
         assert enriched.pA == pytest.approx(0.30)
         assert enriched.nB == pytest.approx(0.50)
         assert enriched.nA == pair.nA
-
-    def test_enrichment_refreshes_the_same_title_reference_ask(self):
-        # Mirror: for a same-title pair the YES leg is on B, so the reference
-        # is A's YES ask (pA), read from A's NO bids
-        mA = _mock_market(ticker="A1", event_ticker="EVT-A", title="Q", yes_ask=0.55, no_ask=0.45)
-        mB = _mock_market(ticker="B1", event_ticker="EVT-B", title="Q", yes_ask=0.30, no_ask=0.70)
-        pair = CandidatePair(
-            market_a=mA, market_b=mB,
-            pA=0.55, pB=0.30, nA=0.45,
-            tradeable=True,
-            canonical_title="Q",
-            pair_type="same_title",
-            nB=0.70,
-        )
-        client = _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, pA_ref=0.60)
-        [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
-        assert enriched.tradeable is True
-        assert enriched.pA == pytest.approx(0.60)
-        assert enriched.pA != pytest.approx(pair.pA)
-        assert enriched.nA == pytest.approx(0.44)
-        assert enriched.pB == pytest.approx(0.31)
-        assert enriched.nB == pair.nB
 
     @staticmethod
     def _inverted_pair_and_client():
@@ -5392,8 +4351,8 @@ class TestEnrichmentRefreshesReferenceQuote:
         assert enriched.tradeable is False
 
     def test_reference_ask_falls_back_to_scan_time_when_side_is_empty(self, caplog):
-        # The fallback is SAME-TITLE only: a time-series pair with no later YES
-        # ask fails closed, its scan-time pB left as it was (never None).
+        # A time-series pair with no later YES ask fails closed, its scan-time
+        # pB left as it was (never None).
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
         client = _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50)
         with caplog.at_level(logging.INFO):
@@ -5405,15 +4364,6 @@ class TestEnrichmentRefreshesReferenceQuote:
                  if "the later contract has no YES ask on its book" in r.getMessage()]
         assert len(drops) == 1
         assert drops[0].levelno == logging.WARNING
-
-        # A same-title pair with A's NO side empty keeps its scan-time pA: its
-        # model is the fixed prior, so pA is a reporting-only reference.
-        st = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
-        [st_e] = enrich_with_orderbook_prices(
-            _st_orderbook_client(nA_fill=0.44, pB_fill=0.31), [st], _AMPLE_BALANCE_CENTS,
-        )
-        assert st_e.tradeable is True
-        assert st_e.pA == st.pA
 
     @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_ceiling_tier_is_the_stated_gap_for_a_ladder(self, caplog):
@@ -5620,7 +4570,7 @@ class TestEnrichmentSpreadRule:
     def _lines(caplog, text):
         return [r for r in caplog.records if text in r.getMessage()]
 
-    def test_no_reference_fails_closed_for_time_series_only(self, caplog):
+    def test_no_reference_fails_closed(self, caplog):
         ts = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
         with caplog.at_level(logging.INFO):
             [ts_e] = enrich_with_orderbook_prices(
@@ -5629,12 +4579,6 @@ class TestEnrichmentSpreadRule:
         assert ts_e.tradeable is False
         [line] = self._lines(caplog, "no YES ask on its book (no resting NO bids)")
         assert line.levelno == logging.WARNING
-        # same-title still falls back to its scan-time reference
-        st = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
-        [st_e] = enrich_with_orderbook_prices(
-            _st_orderbook_client(nA_fill=0.44, pB_fill=0.31), [st], _AMPLE_BALANCE_CENTS,
-            settings=_live())
-        assert st_e.tradeable is True and st_e.pA == st.pA
 
     def test_a_crossed_later_book_is_dropped(self, caplog):
         # LATE: YES bid 0.60, YES ask 0.55 — crossed; the 0.25 spread clears
@@ -5869,12 +4813,6 @@ class TestEnrichmentSpreadRule:
         [line] = self._lines(caplog, "No affordable contract pairs")
         assert ("the budget affords 0; the per-trade bound is 0 (k = 1.00: time-series "
                 "Kelly cannot be positive); skipping") in line.getMessage()
-        # control: a same-title pair under the same settings is not bounded at 0
-        st = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
-        [st_e] = enrich_with_orderbook_prices(
-            _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, pA_ref=0.60), [st],
-            _AMPLE_BALANCE_CENTS, settings=_live(interval_discount=1.0, size_cap=1.0))
-        assert st_e.tradeable is True
 
     def test_the_bound_is_max_kelly_fraction_exactly(self):
         # $10,000 at a best level of 0.80: 0.20 affords 2500 pairs, the unrounded
@@ -5884,13 +4822,7 @@ class TestEnrichmentSpreadRule:
             _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50, qty=5000, pB_ref=0.62), [ts],
             1_000_000, settings=_live(interval_discount=0.8, size_cap=1.0))
         assert ts_e.max_contracts == 2500
-        # Same-title at no cap: the 0.95 co-resolution prior, over 0.75
-        st = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
-        [st_e] = enrich_with_orderbook_prices(
-            _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, qty=20000, pA_ref=0.60), [st],
-            1_000_000, settings=_live(size_cap=1.0))
-        assert st_e.max_contracts == int(10_000 * 0.95 / 0.75)
-        # _live()'s 20% cap bounds it at 0.20 too
+        # _live()'s 20% cap bounds the time-series pair at 0.20 too
         [ts_t] = enrich_with_orderbook_prices(
             _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50, qty=5000, pB_ref=0.62), [ts],
             1_000_000, settings=_live())
@@ -5913,10 +4845,12 @@ class TestEnrichmentSpreadRule:
 
 # enrich_with_orderbook_prices as it was before its per-pair loop moved into
 # scanner._enrich_pair, kept as the oracle the split must match: the same
-# pairs, the same log lines, the same fetches. It is that code word for word
-# (only renamed), but for the mid spread's lines, which are the live code's:
-# the earlier market's best NO ask and YES ask read in the time-series block,
-# and mid_spread written beside the refreshed pB.
+# pairs, the same log lines, the same fetches. It is that loop's path for a
+# time-series pair word for word (only renamed; its branches for other pair
+# types are left out, as every case hands it time-series pairs), but for the
+# mid spread's lines, which are the live code's: the earlier market's best NO
+# ask and YES ask read beside the spread checks, and mid_spread written
+# beside the refreshed pB.
 def _old_enrich_with_orderbook_prices(
     client: Any, pairs: list, portfolio_value_cents: int, *,
     settings: LiveSettings | None = None, cash_cents: int | None = None,
@@ -5985,15 +4919,14 @@ def _old_enrich_with_orderbook_prices(
 
         # Derive the ask levels each leg would consume — each buy fills against
         # the OPPOSITE-side bids of ITS OWN market, and which market carries the
-        # NO leg depends on the pair type (see _leg_ask_levels)
+        # NO leg comes from leg_sides (see _leg_ask_levels)
         no_levels, yes_levels = _leg_ask_levels(pair, ob_a, ob_b)
 
         # Merge-pair the NO and YES depth levels into (yes_price, no_price, qty) tuples
         paired     = _pair_orderbooks(no_levels, yes_levels)
 
-        # Keep only contract pairs where the combined fill price leaves the required
-        # gap: same_title requires >= SAME_TITLE_MIN_PRICE_DIFF; time_series requires
-        # the run's entry floor — see _pair_max_sum for the exact ceilings.
+        # Keep only contract pairs where the combined fill price leaves the
+        # run's entry floor — see _pair_max_sum for the exact ceiling.
         max_sum    = _pair_max_sum(pair, settings)
         qualifying = [
             (yp, np_, qty)
@@ -6049,10 +4982,11 @@ def _old_enrich_with_orderbook_prices(
             # — the sub-one-contract hole that overloaded sentinel used to have.
             # Both figures are named because they are different faults with
             # different fixes (add funds vs. the book is too thin), and the
-            # binding one is whichever is smaller. A bound of 0 gets its own wording: only
-            # a time-series 1 - k rounding to 0 (k = 1) makes one (no cap can be 0).
+            # binding one is whichever is smaller. A bound of 0 gets its own
+            # wording: only 1 - k rounding to 0 (k = 1) makes one, since a
+            # time-series pair's per-trade cap is never 0.
             why = ""
-            if bound == 0 and pair.pair_type == "time_series":
+            if bound == 0:
                 why = (
                     f"; the per-trade bound is 0 (k = {settings.interval_discount:.2f}: "
                     "time-series Kelly cannot be positive)"
@@ -6078,70 +5012,66 @@ def _old_enrich_with_orderbook_prices(
         # read a quote of this snapshot, never a scan-time one.
         ref_yes = _reference_yes_ask(pair, ob_a, ob_b)
 
-        # Time-series only: same_title's model is the fixed co-resolution prior,
-        # so its pA is not a model input and there is no clamp to protect
-        is_time_series = leg_sides(pair.pair_type) == TIME_SERIES_LEG_SIDES
         direction_ok = True
-        if is_time_series:
-            # pair_gap_days: a same-event ladder is tiered on its STATED gap (DR-73)
-            gap = pair_gap_days(pair)
-            # The earlier market's best NO ask (1 - its best YES bid), 1.0 with
-            # no YES bid, and its best YES ask: the mid spread's A side
-            a_no_asks = _bids_to_ask_levels(ob_a["yes"], _pair_ticker(pair, "market_a"))
-            no_ask_a = a_no_asks[0][0] if a_no_asks else 1.0
-            yes_ask_a = yes_levels[0][0]
-            if ref_yes is None:
-                # Nothing prices the in-between mass now: fail CLOSED. A stale pB below the
-                # book's YES bid would let Kelly exceed 1 - k, which a cap above 1 - k (the
-                # 100% default) does not stop. backtester._find_entry does not mirror this
-                # (CLAUDE.md: "Known residual of the live spread rule").
-                direction_ok = False
+        # pair_gap_days: a same-event ladder is tiered on its STATED gap (DR-73)
+        gap = pair_gap_days(pair)
+        # The earlier market's best NO ask (1 - its best YES bid), 1.0 with
+        # no YES bid, and its best YES ask: the mid spread's A side
+        a_no_asks = _bids_to_ask_levels(ob_a["yes"], _pair_ticker(pair, "market_a"))
+        no_ask_a = a_no_asks[0][0] if a_no_asks else 1.0
+        yes_ask_a = yes_levels[0][0]
+        if ref_yes is None:
+            # Nothing prices the in-between mass now: fail CLOSED. A stale pB below the
+            # book's YES bid would let Kelly exceed 1 - k, which a cap above 1 - k (the
+            # 100% default) does not stop. backtester._find_entry does not mirror this
+            # (CLAUDE.md: "Known residual of the live spread rule").
+            direction_ok = False
+            logging.warning(
+                "Pair '%s' dropped: the later contract has no YES ask on its book "
+                "(no resting NO bids), so nothing prices its in-between mass now",
+                pair.canonical_title)
+        elif ref_yes + no_levels[0][0] < 1.0 - PRICE_EPSILON:
+            # no_levels[0][0] is the later market's best NO ask, 1 - its best YES bid; a
+            # YES ask below that bid is a crossed book, where Kelly could exceed 1 - k
+            direction_ok = False
+            logging.warning(
+                "Pair '%s' dropped: the later contract's YES ask %.4f sits below "
+                "its own YES bid %.4f — a crossed book",
+                pair.canonical_title, ref_yes, 1.0 - no_levels[0][0])
+        elif yes_ask_a + no_ask_a < 1.0 - PRICE_EPSILON:
+            # The earlier book crossed: its YES ask below its own YES bid
+            direction_ok = False
+            logging.warning(
+                "Pair '%s' dropped: the earlier contract's YES ask %.4f sits below "
+                "its own YES bid %.4f — a crossed book",
+                pair.canonical_title, yes_ask_a, 1.0 - no_ask_a)
+        else:
+            # Positivity and the floor are tested on the YES-ask gap at the
+            # YES leg's fill (the prefix average the order pays), the
+            # ceiling on the TOP of the book. Past the guards above, the
+            # price-sum ceiling implies the floor to within 2 * PRICE_EPSILON
+            # and the edge cut leaves a spread above the fee, so only the
+            # ceiling is live here; the other two stay as defence (TS-34).
+            basis = f"fresh reference ask {ref_yes:.4f}"
+            refusal = time_series_spread_refusal(ref_yes - avg_yes, gap, settings)
+            if refusal is None:
+                refusal = time_series_spread_refusal(
+                    ref_yes - qualifying[0][0], gap, settings)
+            direction_ok = refusal is None
+            if refusal == SPREAD_NOT_POSITIVE:
                 logging.warning(
-                    "Pair '%s' dropped: the later contract has no YES ask on its book "
-                    "(no resting NO bids), so nothing prices its in-between mass now",
-                    pair.canonical_title)
-            elif ref_yes + no_levels[0][0] < 1.0 - PRICE_EPSILON:
-                # no_levels[0][0] is the later market's best NO ask, 1 - its best YES bid; a
-                # YES ask below that bid is a crossed book, where Kelly could exceed 1 - k
-                direction_ok = False
+                    "Pair '%s' dropped: the later contract no longer prices above "
+                    "the YES leg fill %.4f — %s", pair.canonical_title, avg_yes, basis)
+            elif refusal == SPREAD_BELOW_FLOOR:
                 logging.warning(
-                    "Pair '%s' dropped: the later contract's YES ask %.4f sits below "
-                    "its own YES bid %.4f — a crossed book",
-                    pair.canonical_title, ref_yes, 1.0 - no_levels[0][0])
-            elif yes_ask_a + no_ask_a < 1.0 - PRICE_EPSILON:
-                # The earlier book crossed: its YES ask below its own YES bid
-                direction_ok = False
+                    "Pair '%s' dropped: pB - pA %.4f at the YES leg fill is under the "
+                    "%.2f entry floor — %s", pair.canonical_title, ref_yes - avg_yes,
+                    live_time_series_floor(gap, settings), basis)
+            elif refusal == SPREAD_ABOVE_CEILING:
                 logging.warning(
-                    "Pair '%s' dropped: the earlier contract's YES ask %.4f sits below "
-                    "its own YES bid %.4f — a crossed book",
-                    pair.canonical_title, yes_ask_a, 1.0 - no_ask_a)
-            else:
-                # Positivity and the floor are tested on the YES-ask gap at the
-                # YES leg's fill (the prefix average the order pays), the
-                # ceiling on the TOP of the book. Past the guards above, the
-                # price-sum ceiling implies the floor to within 2 * PRICE_EPSILON
-                # and the edge cut leaves a spread above the fee, so only the
-                # ceiling is live here; the other two stay as defence (TS-34).
-                basis = f"fresh reference ask {ref_yes:.4f}"
-                refusal = time_series_spread_refusal(ref_yes - avg_yes, gap, settings)
-                if refusal is None:
-                    refusal = time_series_spread_refusal(
-                        ref_yes - qualifying[0][0], gap, settings)
-                direction_ok = refusal is None
-                if refusal == SPREAD_NOT_POSITIVE:
-                    logging.warning(
-                        "Pair '%s' dropped: the later contract no longer prices above "
-                        "the YES leg fill %.4f — %s", pair.canonical_title, avg_yes, basis)
-                elif refusal == SPREAD_BELOW_FLOOR:
-                    logging.warning(
-                        "Pair '%s' dropped: pB - pA %.4f at the YES leg fill is under the "
-                        "%.2f entry floor — %s", pair.canonical_title, ref_yes - avg_yes,
-                        live_time_series_floor(gap, settings), basis)
-                elif refusal == SPREAD_ABOVE_CEILING:
-                    logging.warning(
-                        "Pair '%s' dropped: pB - pA %.4f at the top of the book exceeds "
-                        "the spread band's %g ceiling — %s", pair.canonical_title,
-                        ref_yes - qualifying[0][0], settings.spread_band[1], basis)
+                    "Pair '%s' dropped: pB - pA %.4f at the top of the book exceeds "
+                    "the spread band's %g ceiling — %s", pair.canonical_title,
+                    ref_yes - qualifying[0][0], settings.spread_band[1], basis)
 
         # Re-validate tradeability at the depth-weighted prices (the pair may still be
         # unprofitable if all qualifying contracts are at the edge of the gap threshold).
@@ -6157,29 +5087,17 @@ def _old_enrich_with_orderbook_prices(
 
         new_tradeable = profitable and direction_ok
 
-        # Replace the LEG prices and contract count with depth-accurate values,
-        # writing back to whichever fields are the leg prices for this pair type
-        # (nA/pB for same_title, pA/nB for time_series — the fields
-        # leg_prices() reads); strategy.py sizes the final Kelly trade on them
-        if leg_sides(pair.pair_type) == TIME_SERIES_LEG_SIDES:
-            leg_updates = {"pA": avg_yes, "nB": avg_no}
-            # pB is the reference quote, not a leg price — written fresh from
-            # the book. Left alone when None, which has dropped the pair above.
-            if ref_yes is not None:
-                leg_updates["pB"] = ref_yes
-                # The mid spread at the tops of both books
-                leg_updates["mid_spread"] = time_series_mid_spread(
-                    yes_ask_a, no_ask_a, ref_yes, no_levels[0][0])
-        else:
-            leg_updates = {"nA": avg_no, "pB": avg_yes}
-            # Mirror: pA is same_title's reference quote. Nothing sizes on it
-            # (_kelly_p uses the fixed co-resolution prior here) and it is NOT
-            # guarded above, but it is the operand of the reported pA - pB
-            # "Price Diff", which otherwise subtracts a scan-time quote from a
-            # depth-weighted fill and can print a negative gap for a pair that
-            # passed the finder's directional filter. Refreshed for coherence.
-            if ref_yes is not None:
-                leg_updates["pA"] = ref_yes
+        # Replace the LEG prices and contract count with depth-accurate values:
+        # pA and nB, the fields leg_prices() reads; strategy.py sizes the final
+        # Kelly trade on them
+        leg_updates = {"pA": avg_yes, "nB": avg_no}
+        # pB is the reference quote, not a leg price — written fresh from
+        # the book. Left alone when None, which has dropped the pair above.
+        if ref_yes is not None:
+            leg_updates["pB"] = ref_yes
+            # The mid spread at the tops of both books
+            leg_updates["mid_spread"] = time_series_mid_spread(
+                yes_ask_a, no_ask_a, ref_yes, no_levels[0][0])
         enriched.append(dc_replace(
             pair,
             tradeable=new_tradeable,
@@ -6253,15 +5171,6 @@ def _ts_books(levels, *, pB_ref=None, late="LATE", ref_qty=1000,
     }
 
 
-def _st_books(nA, pB, *, qty=100, pA_ref=None) -> dict:
-    """Same-title books: NO on A1 at nA, YES on B1 at pB; A1's YES ask is pA_ref."""
-    return {
-        "A1": {"yes_dollars": _bids((1 - nA, qty)),
-               "no_dollars": [] if pA_ref is None else _bids((1 - pA_ref, qty))},
-        "B1": {"yes_dollars": [], "no_dollars": _bids((1 - pB, qty))},
-    }
-
-
 def _mid_books(*, a_yes_bids=((0.27, 100),), a_no_bids=((0.70, 100),),
                b_yes_bids=((0.52, 100),), b_no_bids=((0.36, 100),)) -> dict:
     """
@@ -6314,7 +5223,6 @@ def _late2(pair):
 # single tradeable pair, or None)
 def _enrichment_cases() -> dict:
     ts = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
-    st = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
     tiers_off = _live(tier_floors=False)
     k_one = _live(interval_discount=1.0, size_cap=1.0)
     big = _AMPLE_BALANCE_CENTS
@@ -6384,26 +5292,15 @@ def _enrichment_cases() -> dict:
             {"EARLY": {"yes_dollars": [], "no_dollars": _bids((0.70, 100), (0.47, 2000))},
              "LATE": {"yes_dollars": _bids((0.55, 2100)), "no_dollars": _bids((0.44, 1000))}},
             1_000_000, tiers_off, None, {}, None),
-        "st-tradeable": ([st], _st_books(0.44, 0.31, pA_ref=0.60), big, _live(), None, {},
-                         None),
-        "st-no-reference-kept": ([st], _st_books(0.44, 0.31), big, _live(), None, {}, None),
-        "st-no-qualifying": ([_st_candidate(pA=0.60, pB=0.40, nA=0.60)],
-                             _st_books(0.60, 0.40, pA_ref=0.60), big, _live(), None, {},
-                             scanner.ENRICH_NO_QUALIFYING),
-        "st-no-cash": ([st], _st_books(0.44, 0.31, pA_ref=0.60), big, _live(), 0, {},
-                       scanner.ENRICH_UNAFFORDABLE),
-        "st-unprofitable": ([st], _st_books(0.44, 0.31, pA_ref=0.60), big, _live(), None,
-                            fee, scanner.ENRICH_UNPROFITABLE),
         # EARLY's book serves both time-series pairs, fetched once
         "shared-book": (
-            [ts, _late2(ts), st],
+            [ts, _late2(ts)],
             {**_ts_books([(0.30, 0.50, 100)], pB_ref=0.65),
-             **_ts_books([(0.30, 0.50, 100)], pB_ref=0.85, late="LATE2"),
-             **_st_books(0.44, 0.31, pA_ref=0.60)},
+             **_ts_books([(0.30, 0.50, 100)], pB_ref=0.85, late="LATE2")},
             big, _TIERS_OFF_HALF, None, {}, None),
         # LATE2 has no book; the pair before it is passed through untouched
         "missing-book": (
-            [dataclasses.replace(st, tradeable=False), _late2(ts), ts],
+            [dataclasses.replace(ts, tradeable=False), _late2(ts), ts],
             _ts_books([(0.30, 0.50, 100)], pB_ref=0.65), big, _live(), None, {}, None),
     }
 
@@ -6491,6 +5388,9 @@ class TestEnrichPairMatchesTheOldLoop:
         assert old_records[-1][1].startswith("Orderbook depth check:")
 
     def test_every_refusal_code_is_reached(self):
+        # Every code but ENRICH_NOT_TIME_SERIES, the refusal of a pair that is
+        # not time-series, which the old loop never made:
+        # TestEnrichPairRefusesOtherPairTypes reaches that one
         codes = {c[6] for c in _ENRICHMENT_CASES.values() if len(c[0]) == 1}
         assert codes == {
             None, scanner.ENRICH_NO_EDGE_AFTER_FEE, scanner.ENRICH_NO_QUALIFYING,
@@ -6498,13 +5398,13 @@ class TestEnrichPairMatchesTheOldLoop:
             scanner.ENRICH_CROSSED, scanner.ENRICH_UNPROFITABLE, config.SPREAD_NOT_POSITIVE,
             config.SPREAD_BELOW_FLOOR, config.SPREAD_ABOVE_CEILING}
         # Each code is its own short string
-        enrich_codes = [scanner.ENRICH_NO_EDGE_AFTER_FEE, scanner.ENRICH_NO_QUALIFYING,
-                        scanner.ENRICH_UNAFFORDABLE, scanner.ENRICH_THIN_BOOK,
-                        scanner.ENRICH_NO_REFERENCE, scanner.ENRICH_CROSSED,
-                        scanner.ENRICH_UNPROFITABLE]
+        enrich_codes = [scanner.ENRICH_NOT_TIME_SERIES, scanner.ENRICH_NO_EDGE_AFTER_FEE,
+                        scanner.ENRICH_NO_QUALIFYING, scanner.ENRICH_UNAFFORDABLE,
+                        scanner.ENRICH_THIN_BOOK, scanner.ENRICH_NO_REFERENCE,
+                        scanner.ENRICH_CROSSED, scanner.ENRICH_UNPROFITABLE]
         spread_codes = [config.SPREAD_NOT_POSITIVE, config.SPREAD_BELOW_FLOOR,
                         config.SPREAD_ABOVE_CEILING]
-        assert len(set(enrich_codes + spread_codes)) == 10
+        assert len(set(enrich_codes + spread_codes)) == 11
 
     def test_an_unusable_book_level_is_still_logged_by_the_book_reader(self, caplog):
         # log gets _enrich_pair's own lines; the book reader's WARNING about a
@@ -6548,6 +5448,80 @@ class TestEnrichPairMatchesTheOldLoop:
         assert "the later contract has no YES ask on its book" in record.getMessage()
 
 
+class _UnreadBook:
+    """An order book that fails the test if anything reads either of its sides."""
+
+    def __getitem__(self, side):
+        raise AssertionError(f"the book's {side!r} side was read after the refusal")
+
+    def get(self, side, default=None):
+        raise AssertionError(f"the book's {side!r} side was read after the refusal")
+
+
+class TestEnrichPairRefusesOtherPairTypes:
+    """_enrich_pair, which prices a pair off its two order books (live
+    enrichment calls it for every tradeable pair, the backtest's _size_trade
+    directly), refuses a pair that is not time-series first: one WARNING
+    naming the pair and its type, the refusal code ENRICH_NOT_TIME_SERIES,
+    and the pair back with only tradeable changed, before either book is
+    read or anything is priced. Nothing forms such a pair, so one reaching
+    it is a bug."""
+
+    @staticmethod
+    def _odd(pair_type) -> CandidatePair:
+        """The oracle's tradeable time-series pair, given another type."""
+        return dataclasses.replace(_ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50),
+                                   pair_type=pair_type)
+
+    @pytest.mark.parametrize("pair_type", _OTHER_PAIR_TYPES, ids=_OTHER_PAIR_TYPE_IDS)
+    def test_it_is_refused_before_a_book_is_read(self, caplog, monkeypatch, pair_type):
+        # Nothing after the refusal runs: neither book is read, and no level,
+        # ceiling, fee multiplier, reference quote or bound is worked out
+        for name in ("_leg_ask_levels", "_bids_to_ask_levels", "_pair_max_sum",
+                     "_side_fee_multipliers", "_reference_yes_ask", "max_kelly_fraction"):
+            monkeypatch.setattr(scanner, name, _must_not_run(name))
+        pair = self._odd(pair_type)
+        lines = []
+
+        def log(level, msg, *args):
+            lines.append((level, msg % args))
+
+        with caplog.at_level(logging.DEBUG):
+            priced, refusal = scanner._enrich_pair(
+                pair, _UnreadBook(), _UnreadBook(), _AMPLE_BALANCE_CENTS, settings=_live(),
+                cash_cents=None, log=log)
+        assert refusal == scanner.ENRICH_NOT_TIME_SERIES
+        # The pair comes back with only tradeable changed; the input is untouched
+        assert priced == dataclasses.replace(pair, tradeable=False)
+        assert pair.tradeable is True
+        # One WARNING, sent to log alone, naming the pair and its type
+        assert lines == [(logging.WARNING,
+                          f"Pair '{pair.canonical_title}' not priced from its order books: "
+                          f"its type is {pair_type!r}, not a time-series pair, and the bot "
+                          "trades time-series pairs only")]
+        assert caplog.records == []
+
+    def test_enrichment_still_prices_the_time_series_pair_beside_it(self, caplog):
+        # Through enrich_with_orderbook_prices, logging as a live run does:
+        # the refused pair gets its one WARNING and nothing else, and the
+        # time-series pair on the same books is priced exactly as it is alone
+        ts = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
+        books = _ts_books([(0.30, 0.50, 100)], pB_ref=0.65)
+        alone = enrich_with_orderbook_prices(_books_client(books), [ts], _AMPLE_BALANCE_CENTS,
+                                             settings=_live())
+        assert alone[0].tradeable is True
+        odd = self._odd("same_title")
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            got = enrich_with_orderbook_prices(_books_client(books), [odd, ts],
+                                               _AMPLE_BALANCE_CENTS, settings=_live())
+        assert got == [dataclasses.replace(odd, tradeable=False), *alone]
+        assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == [
+            f"Pair '{odd.canonical_title}' not priced from its order books: its type is "
+            "'same_title', not a time-series pair, and the bot trades time-series pairs only"]
+        assert "Orderbook depth check: 1/2 pairs remain tradeable" in caplog.text
+
+
 class TestPairMidSpread:
     """pair_mid_spread reads CandidatePair.mid_spread by type: only a finite
     int or float above PRICE_EPSILON counts, and anything else reads as None
@@ -6570,7 +5544,7 @@ class TestPairMidSpread:
         assert pair_mid_spread(SimpleNamespace(mid_spread=value)) is None
 
     def test_a_pair_never_priced_off_its_books_has_none(self):
-        # The field's default, what the finders leave; an object without the
+        # The field's default, what the finder leaves; an object without the
         # field; and a MagicMock pair, whose truthy auto-attribute is no number
         mA, mB = _ts_pair_markets(gap_days=10, pA=0.30, pB=0.60)
         [found] = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB],
@@ -6646,14 +5620,6 @@ class TestEnrichmentWritesTheMidSpread:
         assert enriched.pA == pytest.approx(0.328)
         assert enriched.nB == pytest.approx(0.498)
         assert enriched.mid_spread == time_series_mid_spread(*_MID_TOPS)
-
-    def test_a_same_title_pair_carries_none(self):
-        st = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
-        [enriched] = enrich_with_orderbook_prices(
-            _books_client(_st_books(0.44, 0.31, pA_ref=0.60)), [st], _AMPLE_BALANCE_CENTS,
-            settings=_live())
-        assert enriched.tradeable is True
-        assert enriched.mid_spread is None
 
     @pytest.mark.parametrize("books, cash, code", [
         # 0.45 + 0.48 sits over the 0.85 price-sum ceiling: nothing qualifies
@@ -6798,12 +5764,52 @@ class TestValidatePairPriceSpreadRule:
         assert validate_pair_price(_ts_multilevel_client(levels, pB_ref=0.62),
                                    SimpleNamespace(pair=pair, x=100), settings=_live()) is True
 
-    def test_same_title_reads_no_reference(self):
-        # Same-title reads no reference: with A's NO side empty it still passes
-        pair = _st_candidate(pA=0.55, pB=0.30, nA=0.45, nB=0.70)
-        client = _st_orderbook_client(nA_fill=0.44, pB_fill=0.31, qty=100)
-        assert validate_pair_price(client, SimpleNamespace(pair=pair, x=100),
-                                   settings=_TIERS_OFF_HALF) is True
+
+class TestValidatePairPriceRefusesOtherPairTypes:
+    """validate_pair_price, the last price check before a trade's orders are
+    sent, refuses a pair that is not time-series first: one WARNING naming
+    the pair and its type, before the settings are resolved or either order
+    book is fetched. Nothing forms such a pair, so one reaching it is a bug."""
+
+    @staticmethod
+    def _spec(pair_type: str) -> SimpleNamespace:
+        """Ten contract pairs of a time-series pair the fresh book below passes, as `pair_type`."""
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40)
+        return SimpleNamespace(pair=dataclasses.replace(pair, pair_type=pair_type), x=10)
+
+    @staticmethod
+    def _client():
+        """Fresh books that hold the spec at its prices, with a later YES ask."""
+        return _ts_orderbook_client(pA_fill=0.30, nB_fill=0.40, pB_ref=0.60)
+
+    def test_the_spec_as_a_time_series_pair_passes(self):
+        # Control: the same spec, the same books, the type the bot trades
+        assert validate_pair_price(self._client(), self._spec("time_series"),
+                                   settings=_live()) is True
+
+    @pytest.mark.parametrize("pair_type", _OTHER_PAIR_TYPES, ids=_OTHER_PAIR_TYPE_IDS)
+    def test_it_is_refused_before_a_book_is_fetched(self, caplog, monkeypatch, pair_type):
+        # Handed no settings: they would be resolved only after the refusal
+        monkeypatch.setattr(scanner, "live_settings", _must_not_run("live_settings"))
+        client = self._client()
+        spec = self._spec(pair_type)
+        with caplog.at_level(logging.DEBUG):
+            assert validate_pair_price(client, spec) is False
+        client.get_market_orderbook_without_preload_content.assert_not_called()
+        assert client.mock_calls == []
+        assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
+            (logging.WARNING,
+             f"Pre-execution check failed for '{spec.pair.canonical_title}' — its type is "
+             f"{pair_type!r}, not a time-series pair, and the bot trades time-series pairs "
+             "only; dropping")]
+
+    def test_a_pair_with_no_title_is_named_by_its_tickers(self, caplog):
+        spec = self._spec("same_title")
+        spec.pair = dataclasses.replace(spec.pair, canonical_title="")
+        with caplog.at_level(logging.WARNING):
+            assert validate_pair_price(self._client(), spec, settings=_live()) is False
+        [record] = caplog.records
+        assert record.getMessage().startswith("Pre-execution check failed for EARLY / LATE — ")
 
 
 class TestTimeSeriesBestPairPerGroup:
@@ -7258,139 +6264,53 @@ class TestAddOnFor:
         assert self._find(a, b) is None
 
 
-_ST_HELD_LINE = ("Same-title candidates refused because they pair a held pair's market "
-                 "with another market: ")
-_ST_SIDE_LINE = ("Same-title candidates refused for buying a held pair's sides the wrong "
-                 "way round: ")
-
-
-def _st_market(ticker: str, event_ticker: str, yes_ask: float, no_ask: float):
-    """One listing of a question four series ask, each closing at one instant."""
-    return _mock_market(ticker=ticker, event_ticker=event_ticker,
-                        title="Will the Fed cut rates in March?", subtitle="Yes",
-                        event_title="Fed decision", yes_ask=yes_ask, no_ask=no_ask)
-
-
-class TestSameTitleAddsToHeldPairs:
-    """find_same_title_pairs lets through exactly the held pair a run may add
-    to, buying NO on the market held NO and YES on the one held YES; any other
-    candidate touching one of its markets is refused before the group contest,
-    so an unheld pair of the same group can still win."""
-
-    # The account holds NO on X and YES on Y
-    _ADD_ONS = {frozenset({"X-1", "Y-1"}): _add_on(("X-1", "no"), ("Y-1", "yes"), count=10.0)}
-
-    @staticmethod
-    def _held_pair(x_yes: float = 0.60, y_yes: float = 0.40):
-        """The held pair's two markets, X pricier by default."""
-        return (_st_market("X-1", "KXA-1", x_yes, round(1.02 - x_yes, 2)),
-                _st_market("Y-1", "KXB-1", y_yes, round(1.02 - y_yes, 2)))
-
-    @staticmethod
-    def _other_pair(z_yes: float, w_yes: float):
-        """An unheld pair asking the same question on two more series."""
-        return (_st_market("Z-1", "KXC-1", z_yes, round(1.02 - z_yes, 2)),
-                _st_market("W-1", "KXD-1", w_yes, round(1.02 - w_yes, 2)))
-
-    def test_the_exact_held_pair_is_emitted(self):
-        [pair] = find_same_title_pairs(list(self._held_pair()), add_on_pairs=self._ADD_ONS)
-        assert (pair.market_a.ticker, pair.market_b.ticker) == ("X-1", "Y-1")
-        assert pair.held is self._ADD_ONS[frozenset({"X-1", "Y-1"})]
-
-    def test_an_unheld_pair_with_the_wider_gap_takes_the_groups_slot(self, caplog):
-        markets = [*self._held_pair(), *self._other_pair(0.75, 0.45)]
-        with caplog.at_level(logging.INFO):
-            [pair] = find_same_title_pairs(markets, add_on_pairs=self._ADD_ONS)
-        assert (pair.market_a.ticker, pair.market_b.ticker) == ("Z-1", "W-1")
-        assert pair_held(pair) is None
-        # X-Z, X-W, Y-Z and Y-W are refused before the contest
-        assert _ST_HELD_LINE + "4" in caplog.text
-
-    def test_the_held_pair_with_the_wider_gap_takes_the_groups_slot(self, caplog):
-        markets = [*self._held_pair(), *self._other_pair(0.55, 0.45)]
-        with caplog.at_level(logging.INFO):
-            [pair] = find_same_title_pairs(markets, add_on_pairs=self._ADD_ONS)
-        assert (pair.market_a.ticker, pair.market_b.ticker) == ("X-1", "Y-1")
-        assert pair_held(pair) is not None
-        assert _ST_HELD_LINE + "4" in caplog.text
-
-    def test_crossed_prices_would_buy_the_held_pair_the_other_way_round(self, caplog):
-        # Y is the pricier market now, so the pair would buy NO on Y
-        markets = [*self._held_pair(x_yes=0.40, y_yes=0.60), *self._other_pair(0.55, 0.45)]
-        with caplog.at_level(logging.INFO):
-            [pair] = find_same_title_pairs(markets, add_on_pairs=self._ADD_ONS)
-        assert (pair.market_a.ticker, pair.market_b.ticker) == ("Z-1", "W-1")
-        assert _ST_SIDE_LINE + "1" in caplog.text
-
-    def test_a_lone_leg_pairs_with_a_market_not_held(self):
-        # X paid out; YES is still held on Y, which pairs with Z (NO on the
-        # pricier Z, YES on Y)
-        lone = {frozenset({"Y-1"}): _lone("Y-1", "yes", frozenset(), count=10.0)}
-        _x, y = self._held_pair()
-        z, _w = self._other_pair(0.60, 0.45)
-        [pair] = find_same_title_pairs([y, z], add_on_pairs=lone)
-        assert (pair.market_a.ticker, pair.market_b.ticker) == ("Z-1", "Y-1")
-        assert pair.held is lone[frozenset({"Y-1"})]
-
-    def test_a_lone_leg_bought_on_the_other_side_is_refused(self, caplog):
-        # Y is the pricier market now, so the pair would buy NO on Y
-        lone = {frozenset({"Y-1"}): _lone("Y-1", "yes", frozenset(), count=10.0)}
-        _x, y = self._held_pair(y_yes=0.60)
-        z, _w = self._other_pair(0.40, 0.45)
-        with caplog.at_level(logging.INFO):
-            assert find_same_title_pairs([y, z], add_on_pairs=lone) == []
-        assert _ST_SIDE_LINE + "1" in caplog.text
-
-    def test_an_empty_add_on_set_changes_nothing(self, caplog):
-        markets = [*self._held_pair(), *self._other_pair(0.75, 0.45)]
-        with caplog.at_level(logging.INFO):
-            plain = find_same_title_pairs(markets)
-            plain_log = caplog.text
-            caplog.clear()
-            explicit = find_same_title_pairs(markets, add_on_pairs={})
-        assert explicit == plain
-        assert caplog.text == plain_log
-        assert "held pair" not in plain_log
-
-
 class TestLegHelpers:
     """leg_sides / leg_prices / deadline_gap_days are the cross-module contract
-    for which side each leg buys and what it costs."""
+    for which side each leg buys and what it costs. The side helpers accept
+    time-series pairs only: every place a pair comes in refuses any other type
+    first, so one reaching them is a bug, and they raise rather than give it
+    sides or prices."""
 
     def test_leg_sides_time_series(self):
         assert leg_sides("time_series") == TIME_SERIES_LEG_SIDES == ("yes", "no")
 
-    def test_leg_sides_same_title(self):
-        assert leg_sides("same_title") == SAME_TITLE_LEG_SIDES == ("no", "yes")
+    @pytest.mark.parametrize(
+        "pair_type", [*_OTHER_PAIR_TYPES, "Time_Series", "time_series ", "time-series"],
+        ids=[*_OTHER_PAIR_TYPE_IDS, "capitalised", "trailing-space", "hyphen"])
+    def test_the_side_helpers_raise_for_any_other_pair_type(self, pair_type):
+        # Only the exact string "time_series" has sides: anything else, the
+        # retired same-title label and near misses of the real one included,
+        # raises, and is never given NO on market A and YES on market B nor
+        # priced at (nA, pB)
+        refused = re.escape(f"not a time-series pair type: {pair_type!r}")
+        with pytest.raises(ValueError, match=refused):
+            leg_sides(pair_type)
+        # A real pair of that type, its quotes those of a time-series pair
+        real = dc_replace(_ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40),
+                          pair_type=pair_type)
+        with pytest.raises(ValueError, match=refused):
+            leg_prices(real)
+        # ... and a bare stand-in with all four quotes
+        stub = SimpleNamespace(pair_type=pair_type, pA=0.30, pB=0.60, nA=0.70, nB=0.40)
+        with pytest.raises(ValueError, match=refused):
+            leg_prices(stub)
+        # Control: the same pair as a time-series pair is priced YES on A, NO on B
+        assert leg_prices(dc_replace(real, pair_type="time_series")) == (0.30, 0.40)
 
-    def test_leg_sides_fail_safe_to_same_title(self):
-        # None, a bogus string, and a MagicMock auto-attribute all resolve to
-        # the same-title sides — an unknown pair type must never be traded as
-        # the directional time-series bet
-        assert leg_sides(None) == SAME_TITLE_LEG_SIDES
-        assert leg_sides("bogus") == SAME_TITLE_LEG_SIDES
-        assert leg_sides(MagicMock().pair_type) == SAME_TITLE_LEG_SIDES
+    def test_a_pair_with_no_type_raises_value_error_not_attribute_error(self):
+        # pair_type is read with a default of None, so a pair that carries
+        # none is refused like any other type, never failed on the attribute
+        untyped = SimpleNamespace(pA=0.30, pB=0.60, nA=0.70, nB=0.40)
+        with pytest.raises(ValueError, match=re.escape("not a time-series pair type: None")):
+            leg_prices(untyped)
 
     def test_leg_prices_time_series_real_pair(self):
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40)
         assert leg_prices(pair) == (0.30, 0.40)
 
-    def test_leg_prices_same_title_real_pair(self):
-        mA = _mock_market(ticker="A1", event_ticker="EVT-A", title="Q", yes_ask=0.55, no_ask=0.45)
-        mB = _mock_market(ticker="B1", event_ticker="EVT-B", title="Q", yes_ask=0.30, no_ask=0.70)
-        pair = CandidatePair(
-            market_a=mA, market_b=mB, pA=0.55, pB=0.30, nA=0.45,
-            tradeable=True, canonical_title="Q", pair_type="same_title", nB=0.70,
-        )
-        assert leg_prices(pair) == (0.45, 0.30)
-
     def test_leg_prices_simple_namespace(self):
         ts = SimpleNamespace(pair_type="time_series", pA=0.30, pB=0.60, nA=0.70, nB=0.40)
-        st = SimpleNamespace(pair_type="same_title", pA=0.30, pB=0.60, nA=0.70, nB=0.40)
-        untyped = SimpleNamespace(pA=0.30, pB=0.60, nA=0.70, nB=0.40)
         assert leg_prices(ts) == (0.30, 0.40)
-        assert leg_prices(st) == (0.70, 0.60)
-        assert leg_prices(untyped) == (0.70, 0.60)
 
     def test_leg_prices_reads_nB_directly(self):
         # No getattr default: a time-series stub without nB must fail loudly
@@ -7705,6 +6625,37 @@ class TestFetchOpenEventsMveStatusFilter:
         assert m.subtitle == ""                      # absent in raw JSON → ""
         assert m.close_time == datetime(2026, 6, 1, 12, 30, tzinfo=UTC)
         assert m.event_ticker == "EVT-STD-1"
+
+    def test_each_market_carries_its_own_events_title_in_both_loops(self, monkeypatch,
+                                                                     caplog):
+        # Both event loops put each event's title on every market of that
+        # event, the title its ladder labels are read from; an event with no
+        # title gives "", as it does for a looked-up held market. An event
+        # that names a competition gives its markets nothing more: no market
+        # carries the label and no line mentions it
+        monkeypatch.setattr(scanner, "INCLUDE_MVE_MARKETS", True)
+        league = {"competition": "NBA"}
+        standard = [
+            {"title": "Weather Event", "markets": [_raw_market("STD-RAIN", "Rain tomorrow"),
+                                                   _raw_market("STD-SNOW", "Snow tomorrow")]},
+            {"title": "Other Event", "product_metadata": league,
+             "markets": [_raw_market("STD-HAIL", "Hail tomorrow")]},
+            {"markets": [_raw_market("STD-NONE", "Fog tomorrow")]},
+        ]
+        mve = [{"title": "Parlay", "product_metadata": league,
+                "markets": [_raw_market("MVE-1", "All legs hit")]}]
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page(standard))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page(mve))
+        with caplog.at_level(logging.INFO):
+            by_ticker = {m.ticker: m for m in fetch_open_events_with_markets(client)}
+        assert {t: m._event_title for t, m in by_ticker.items()} == {
+            "STD-RAIN": "Weather Event", "STD-SNOW": "Weather Event",
+            "STD-HAIL": "Other Event", "STD-NONE": "", "MVE-1": "Parlay"}
+        assert not any(hasattr(m, "_event_competition") for m in by_ticker.values())
+        assert caplog.messages
+        assert not any("competition" in message.lower() for message in caplog.messages)
 
     def test_pagination_follows_cursor(self):
         # Two pages on the standard endpoint: the fetch must request the second
@@ -8790,8 +7741,8 @@ class TestMarketForLabels:
         # Its labels are its listed ladder-mate's: the same event and question
         assert market_ladder_keys(got) == market_ladder_keys(
             _star_rung(_RUNG_EARLY, "Mar 1, 2026"))
-        # The memo keeps each event's title and the competition it names
-        assert titles == {_STAR_EVENT: (_STAR_TITLE, "")}
+        # The memo keeps each looked-up event's title, and nothing else
+        assert titles == {_STAR_EVENT: _STAR_TITLE}
 
     def test_one_event_is_asked_about_once(self):
         raws = {t: _star_raw(t, d) for t, d in
@@ -8828,6 +7779,116 @@ class TestMarketForLabels:
         client = MagicMock()
         assert scanner.market_for_labels(client, ticker, {}, {}) is None
         client.get_market_without_preload_content.assert_not_called()
+
+
+def _market_fields(market) -> dict:
+    """Every field of an ApiMarket by name, so a mismatch names the field that differs."""
+    return {f.name: getattr(market, f.name) for f in dataclasses.fields(scanner.ApiMarket)}
+
+
+class TestHeldMarketLookupMemo:
+    """Two markets of one event that the run's market list lacks, looked up
+    one after the other with one memo of event titles: the first lookup
+    reads the event and keeps its title in the memo, and the second builds
+    its market from that kept title without asking for the event again.
+    Both looked-up markets must be exactly the markets built from their own
+    replies and the event's title. A market built from a wrong title asks a
+    different question, so its question label matches none of its
+    ladder-mates': the run would not know the account holds that question,
+    so the time-series finder could buy a second pair on it, and a held pair
+    on two events would read as two lone legs."""
+
+    # Two rungs of the Starship ladder on one event; NOV30 sorts first, so a
+    # held-ladder read looks it up first
+    _RAWS = {t: _star_raw(t, d) for t, d in
+             (("KXSTAR-14-NOV30", "Nov 30, 2026"), ("KXSTAR-14-OCT16", "Oct 16, 2026"))}
+
+    # The requests both lookups make together: one per market, and one event
+    # request, made by the first lookup
+    _REQUESTS = [
+        ("get_market_without_preload_content", {"ticker": "KXSTAR-14-NOV30"}),
+        ("get_event_without_preload_content", {"event_ticker": _STAR_EVENT}),
+        ("get_market_without_preload_content", {"ticker": "KXSTAR-14-OCT16"}),
+    ]
+
+    @staticmethod
+    def _requests(client) -> list:
+        """The client's requests in the order they were made, as (method, keywords)."""
+        return [(name, kwargs) for name, _args, kwargs in client.mock_calls]
+
+    def _built(self, title: str = _STAR_TITLE) -> dict:
+        """Each ticker's market as _market_from_dict builds it from its own reply and this title."""
+        return {t: _market_from_dict(raw, title) for t, raw in self._RAWS.items()}
+
+    def test_one_held_ladder_read_asks_for_the_event_once_and_builds_both_markets(
+            self, monkeypatch):
+        client = _lookup_client(self._RAWS)
+        # Keep each market the held-market lookup returns, and the memo it is handed
+        found: list = []
+        real_lookup = scanner._fetch_held_market
+
+        def lookup(client_, ticker, event_titles, **kwargs):
+            market = real_lookup(client_, ticker, event_titles, **kwargs)
+            found.append((ticker, market, event_titles))
+            return market
+
+        monkeypatch.setattr(scanner, "_fetch_held_market", lookup)
+        labels: dict = {}
+        keys = resolve_held_ladders(client, [], set(self._RAWS), labels_out=labels)
+        # One market request per ticker and one event request in all: the
+        # second lookup took the event's title from the memo
+        assert self._requests(client) == self._REQUESTS
+        assert [ticker for ticker, _, _ in found] == sorted(self._RAWS)
+        # Each looked-up market, the first and the one built from the memo,
+        # is the market built from its own reply and its event's title
+        built = self._built()
+        for ticker, market, _ in found:
+            assert _market_fields(market) == _market_fields(built[ticker]), ticker
+        # Both lookups shared one memo, which keeps the event's title alone
+        assert found[0][2] is found[1][2]
+        assert found[0][2] == {_STAR_EVENT: _STAR_TITLE}
+        # So each market's ladder labels are those of the market built from
+        # its reply, and the labels returned and filled in are exactly those
+        want = {ticker: market_ladder_keys(market) for ticker, market in built.items()}
+        assert labels == want
+        assert keys == frozenset().union(*want.values())
+        # The two share their event, and both ask their listed ladder-mate's question
+        first, second = (labels[ticker] for ticker in sorted(self._RAWS))
+        assert ("event", _STAR_EVENT) in first & second
+        assert _question_label(_star_rung(_RUNG_EARLY, "Mar 1, 2026")) in first & second
+
+    def test_one_shared_memo_through_market_for_labels_asks_for_the_event_once(self):
+        # As seller.plan_sales and seller.plan_trims use it: one memo for
+        # every lookup of one call, beside a ladder-mate that is in the run's
+        # market list
+        listed = _star_rung(_RUNG_EARLY, "Mar 1, 2026")
+        client = _lookup_client(self._RAWS)
+        memo: dict = {}
+        got = {ticker: scanner.market_for_labels(client, ticker, {listed.ticker: listed}, memo)
+               for ticker in (listed.ticker, *sorted(self._RAWS))}
+        # The listed market needs no request; the other two cost one each,
+        # and one event request in all
+        assert got[listed.ticker] is listed
+        assert self._requests(client) == self._REQUESTS
+        built = self._built()
+        for ticker in self._RAWS:
+            assert _market_fields(got[ticker]) == _market_fields(built[ticker]), ticker
+            assert market_ladder_keys(got[ticker]) == market_ladder_keys(built[ticker]), ticker
+        assert memo == {_STAR_EVENT: _STAR_TITLE}
+        first, second = (market_ladder_keys(got[ticker]) for ticker in sorted(self._RAWS))
+        assert ("event", _STAR_EVENT) in first & second
+        assert _question_label(listed) in first & second
+
+    def test_a_title_already_in_the_memo_is_used_with_no_event_request(self):
+        # An event an earlier lookup of the same caller read: its title, a
+        # plain string in the memo, is the looked-up market's event title
+        client = _lookup_client(self._RAWS)
+        memo = {_STAR_EVENT: "Kept title"}
+        market = scanner.market_for_labels(client, "KXSTAR-14-OCT16", {}, memo)
+        assert _market_fields(market) == _market_fields(self._built("Kept title")["KXSTAR-14-OCT16"])
+        assert self._requests(client) == [
+            ("get_market_without_preload_content", {"ticker": "KXSTAR-14-OCT16"})]
+        assert memo == {_STAR_EVENT: "Kept title"}
 
 
 # Five settlements as the live reply sent them (GET /portfolio/settlements, read
@@ -10106,13 +9167,72 @@ def _cross(ticker, event, deadline_text, close, *, yes_ask=0.20, no_ask=None, ti
 
 
 class TestHeldPairKind:
-    """held_pair_kind tells, from two held markets alone, a same-title from a
-    time-series pair and which is market A. A wrong answer would trim on the
-    wrong chance of paying, so it uses the finders' own tests and gives None
-    when unsure. Pairs a finder forms are asserted to form first, so a None
-    here is this reader's refusal."""
+    """held_pair_kind tells, from two held markets alone, whether they are a
+    time-series pair held as one, and which is market A. Two identically
+    worded markets (a same-title pair) are never a pair to trim. A wrong
+    answer would trim on the wrong chance of paying, so it uses the
+    time-series finder's own tests and gives None when unsure. Each pair is
+    first shown to be one an account can hold — a time-series pair by the
+    time-series finder forming it, a same-title pair by the shape such a pair
+    has (_assert_same_title_shape) — so a None here is this reader's
+    refusal."""
 
-    _WIU = TestSameTitleCloseGap._wiu_markets
+    _WIU_TITLE = "Western Illinois at Eastern Illinois Winner?"
+
+    @classmethod
+    def _wiu_markets(cls, *, womens_close=None):
+        """The men's and the women's game of one matchup, on two series.
+
+        The real pair: KXNCAAMBGAME-26JAN13WIUEIU-WIU vs
+        KXNCAAWBGAME-26JAN13WIUEIU-WIU — identical title, subtitle and event
+        title on two series. Their SCHEDULED closes fall at 01:30Z and
+        23:00Z, 2.5 h apart, as checked on archived payloads; the calendar day
+        here is the fixture's own. The men's game is the pricier (YES ask 0.40
+        against 0.25).
+
+        Args:
+            womens_close (datetime | None): Keyword-only. The women's game's
+                close; None keeps its own, 2.5 h before the men's.
+
+        Returns:
+            tuple: (the men's market, the women's market).
+        """
+        mens = _mock_market(
+            ticker="KXNCAAMBGAME-26JAN13WIUEIU-WIU",
+            event_ticker="KXNCAAMBGAME-26JAN13WIUEIU",
+            title=cls._WIU_TITLE, subtitle="Western Illinois",
+            event_title="Western Illinois at Eastern Illinois",
+            yes_ask=0.40, no_ask=0.60,
+            close_time=datetime(2026, 1, 28, 1, 30, tzinfo=UTC),
+        )
+        womens = _mock_market(
+            ticker="KXNCAAWBGAME-26JAN13WIUEIU-WIU",
+            event_ticker="KXNCAAWBGAME-26JAN13WIUEIU",
+            title=cls._WIU_TITLE, subtitle="Western Illinois",
+            event_title="Western Illinois at Eastern Illinois",
+            yes_ask=0.25, no_ask=0.75,
+            close_time=womens_close or datetime(2026, 1, 27, 23, 0, tzinfo=UTC),
+        )
+        return mens, womens
+
+    @staticmethod
+    def _assert_same_title_shape(dear, cheap):
+        """
+        Assert two markets have the shape of a same-title pair, dear the pricier.
+
+        One wording (title, subtitle and event title) on two different
+        series, the two closing within an hour of each other: a pair an
+        account can hold, bought NO on the market with the higher YES ask and
+        YES on the other.
+
+        Args:
+            dear: The market with the higher YES ask.
+            cheap: The other market.
+        """
+        assert scanner._identical_wording(dear, cheap)
+        assert not scanner._same_series(dear, cheap)
+        assert not scanner._closes_apart(dear, cheap)
+        assert float(dear.yes_ask_dollars) > float(cheap.yes_ask_dollars)
 
     @staticmethod
     def _ts(markets, monkeypatch, *, ladders=True):
@@ -10132,17 +9252,16 @@ class TestHeldPairKind:
                 _ladder_rung("RUNG-LATE", late, yes_ask=0.60, no_ask=0.40, close=close_b,
                              event=event, event_title=event_title))
 
-    # ── same-title ──────────────────────────────────────────────────────────
+    # ── identically worded markets are never a pair to trim ─────────────────
 
-    def test_a_same_title_pair_reads_as_same_title_with_the_finders_a_and_b(self):
-        mens, womens = self._WIU(womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC))
-        [pair] = find_same_title_pairs([mens, womens])
-        assert pair.pair_type == "same_title"
-        kind = _kind_of(pair)
-        assert kind is not None and kind[0] == "same_title"
-        # A is the market held NO, B the one held YES, as the finder has them
-        assert kind[1] is pair.market_a and kind[2] is pair.market_b
-        assert (kind[1], kind[2]) == (mens, womens)
+    def test_a_same_title_pair_is_no_pair_to_trim(self):
+        mens, womens = self._wiu_markets(
+            womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC))
+        self._assert_same_title_shape(mens, womens)
+        # Held as such a pair was bought (NO on the pricier market, YES on
+        # the other), or the other way round
+        assert scanner.held_pair_kind(yes_market=womens, no_market=mens) is None
+        assert scanner.held_pair_kind(yes_market=mens, no_market=womens) is None
 
     def test_a_weekly_and_a_monthly_listing_at_one_close(self):
         close = datetime(2026, 9, 25, 21, tzinfo=UTC)
@@ -10155,35 +9274,40 @@ class TestHeldPairKind:
             ticker="KXBRENTMON-26SEP-T70", event_ticker="KXBRENTMON-26SEP", title=title,
             subtitle="$70 or above", event_title="Brent crude oil price", yes_ask=0.35,
             no_ask=0.65, close_time=close)
-        [pair] = find_same_title_pairs([weekly, monthly])
-        assert _kind_of(pair) == ("same_title", weekly, monthly)
-        # Snapshot wording ("price on <date>") is never time-series: the
-        # identical wording alone makes it same-title
+        self._assert_same_title_shape(weekly, monthly)
+        # The same-title pair, held either way round, is no pair to trim
+        assert scanner.held_pair_kind(yes_market=weekly, no_market=monthly) is None
+        assert scanner.held_pair_kind(yes_market=monthly, no_market=weekly) is None
+        # Snapshot wording ("price on <date>") is never time-series either
         assert scanner._market_deadline_profile(weekly)[0] == scanner.DEADLINE_SNAPSHOT
 
-    def test_a_same_title_pair_is_read_from_the_sides_held(self):
-        # A is the market held NO (leg_sides), even where today's prices would
-        # make the other one the finder's A
-        mens, womens = self._WIU(womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC))
-        assert leg_sides("same_title") == ("no", "yes")
-        assert scanner.held_pair_kind(yes_market=mens, no_market=womens) == (
-            "same_title", womens, mens)
-        assert scanner.held_pair_kind(yes_market=womens, no_market=mens) == (
-            "same_title", mens, womens)
+    def test_a_same_title_pair_is_no_pair_whichever_side_is_held(self):
+        # Neither the sides such a pair was bought on (NO on the pricier, YES
+        # on the other) nor the other way round, whichever market today's
+        # prices make the pricier
+        for dear_is_mens in (True, False):
+            mens, womens = self._wiu_markets(
+                womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC))
+            dear, cheap = (mens, womens) if dear_is_mens else (womens, mens)
+            dear.yes_ask_dollars, cheap.yes_ask_dollars = "0.40", "0.25"
+            self._assert_same_title_shape(dear, cheap)
+            assert scanner.held_pair_kind(yes_market=cheap, no_market=dear) is None
+            assert scanner.held_pair_kind(yes_market=dear, no_market=cheap) is None
 
-    @pytest.mark.parametrize("gap_seconds, reads", [(0, True), (3_600, True), (3_601, False),
-                                                    (9_000, False)])
-    def test_identical_wording_closing_apart_is_no_pair(self, gap_seconds, reads):
-        # The same-title close gate, bound included; identical wording is never
-        # time-series either
-        mens, womens = self._WIU(
+    @pytest.mark.parametrize("gap_seconds, within", [(0, True), (3_600, True), (3_601, False),
+                                                     (9_000, False)])
+    def test_identical_wording_is_no_pair_at_any_close_gap(self, gap_seconds, within):
+        # Within the held-pair close bound (an hour, the bound included) or
+        # past it, held identical wording is no pair, and never time-series
+        # either
+        mens, womens = self._wiu_markets(
             womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC)
             - timedelta(seconds=gap_seconds))
-        assert len(find_same_title_pairs([mens, womens])) == (1 if reads else 0)
+        assert scanner._identical_wording(mens, womens)
+        assert not scanner._same_series(mens, womens)
+        assert scanner._closes_apart(mens, womens) is not within
         for held in ((mens, womens), (womens, mens)):
-            kind = scanner.held_pair_kind(*held)
-            assert (kind is not None) is reads
-            assert kind is None or kind[0] == "same_title"
+            assert scanner.held_pair_kind(*held) is None
 
     def test_identical_wording_in_one_series_is_no_pair(self):
         # Two game days of one recurring fixture (DR-02): two questions
@@ -10195,13 +9319,14 @@ class TestHeldPairKind:
                            event_ticker="KXNPBRFI-26SEP150500FUKORI", title="Run in the first?",
                            subtitle="Yes", yes_ask=0.30, no_ask=0.70, close_time=close)
         assert scanner._same_series(one, two) and not scanner._closes_apart(one, two)
-        assert find_same_title_pairs([one, two]) == []
         assert scanner.held_pair_kind(one, two) is None
         assert scanner.held_pair_kind(two, one) is None
-        # Control: the same two markets on two series are a same-title pair
+        # Control: on two series the two have a same-title pair's shape, and
+        # held, they are still no pair
         two.event_ticker = "KXNPBALT-26SEP150500FUKORI"
-        assert len(find_same_title_pairs([one, two])) == 1
-        assert scanner.held_pair_kind(two, one) == ("same_title", one, two)
+        self._assert_same_title_shape(one, two)
+        assert scanner.held_pair_kind(two, one) is None
+        assert scanner.held_pair_kind(one, two) is None
 
     @pytest.mark.parametrize("event_a, event_b", [
         ("KXAA-1", "KXAA-1"),    # one event's own markets
@@ -10216,28 +9341,30 @@ class TestHeldPairKind:
                          subtitle="Yes", yes_ask=0.60, no_ask=0.40, close_time=close)
         b = _mock_market(ticker="T-B", event_ticker=event_b, title="Same question?",
                          subtitle="Yes", yes_ask=0.30, no_ask=0.70, close_time=close)
-        assert find_same_title_pairs([a, b]) == []
+        # One event, or a series that cannot be read: not two series at all
+        assert scanner._same_series(a, b)
         assert scanner.held_pair_kind(a, b) is None
         assert scanner.held_pair_kind(b, a) is None
 
     def test_identical_blank_wording_is_no_pair(self):
-        # The same-title finder groups a market only by a title or a subtitle
+        # Two markets with no title, subtitle or event title at all
         close = datetime(2026, 9, 25, 21, tzinfo=UTC)
         a = _mock_market(ticker="T-A", event_ticker="KXAA-1", yes_ask=0.60, no_ask=0.40,
                          close_time=close)
         b = _mock_market(ticker="T-B", event_ticker="KXBB-1", yes_ask=0.30, no_ask=0.70,
                          close_time=close)
         assert scanner._identical_wording(a, b)
-        assert find_same_title_pairs([a, b]) == []
         assert scanner.held_pair_kind(a, b) is None
         assert scanner.held_pair_kind(b, a) is None
-        # Control: a subtitle alone is wording enough, as it is for the finder
+        # Control: with a subtitle alone the two have a same-title pair's
+        # shape, and held, they are still no pair
         a.subtitle = b.subtitle = "Team A"
-        assert len(find_same_title_pairs([a, b])) == 1
-        assert scanner.held_pair_kind(b, a) == ("same_title", a, b)
+        self._assert_same_title_shape(a, b)
+        assert scanner.held_pair_kind(b, a) is None
+        assert scanner.held_pair_kind(a, b) is None
 
     def test_one_market_is_never_its_own_pair(self):
-        mens, _womens = self._WIU()
+        mens, _womens = self._wiu_markets()
         assert scanner.held_pair_kind(mens, mens) is None
 
     # ── two rungs of one event ──────────────────────────────────────────────
@@ -10442,20 +9569,51 @@ class TestHeldPairKind:
     ])
     @pytest.mark.parametrize("gap_seconds, reads", [(1_800, False), (3_600, False),
                                                     (3_601, True), (7_200, True)])
-    def test_an_unread_stated_day_needs_closes_past_the_same_title_bound(
+    def test_an_unread_stated_day_needs_closes_past_the_held_pair_close_bound(
             self, monkeypatch, wording_a, wording_b, gap_seconds, reads):
-        # With no stated day to tell them apart, closes within the same-title
-        # bound could be one question respelled: not shown to be time-series
+        # With no stated day to tell them apart, closes within the held-pair
+        # close bound (an hour) could be one question respelled: not shown to
+        # be time-series
         close = datetime(2027, 3, 31, 12, tzinfo=UTC)
         a = _cross("X-A", "KXAA-1", wording_a, close)
         b = _cross("X-B", "KXBB-1", wording_b, close + timedelta(seconds=gap_seconds),
                    yes_ask=0.60)
-        assert config.SAME_TITLE_MAX_CLOSE_GAP_SECONDS == 3_600
+        assert config.HELD_PAIR_CLOSE_GAP_SECONDS == 3_600
         # The finder forms the pair either way
         [pair] = self._ts([a, b], monkeypatch)
         assert (pair.market_a, pair.market_b) == (a, b)
         assert _kind_of(pair) == (("time_series", a, b) if reads else None)
         assert scanner.held_pair_kind(b, a) is None
+
+    @pytest.mark.parametrize("bound", [60, 7_200])
+    def test_the_unread_day_refusal_moves_with_scanners_bound(self, monkeypatch, bound):
+        # held_pair_kind reads scanner's own copy of the held-pair close bound
+        # each time it is called, so the refusal moves with it, narrower or
+        # wider than the hour: with a stated day unread, closes up to the
+        # bound apart are no pair, and closes a second past it read
+        close = datetime(2027, 3, 31, 12, tzinfo=UTC)
+
+        def kind_at(gap_seconds):
+            """held_pair_kind of a year-less pair closing gap_seconds apart, and its time-series kind."""
+            a = _cross("X-A", "KXAA-1", "by March 1", close)
+            b = _cross("X-B", "KXBB-1", "by March 9", close + timedelta(seconds=gap_seconds),
+                       yes_ask=0.60)
+            # The finder forms the pair at every gap, A the first to close
+            [pair] = self._ts([a, b], monkeypatch)
+            assert (pair.market_a, pair.market_b) == (a, b)
+            return _kind_of(pair), ("time_series", a, b)
+
+        # Patching config's copy moves nothing: scanner's hour still decides
+        monkeypatch.setattr(config, "HELD_PAIR_CLOSE_GAP_SECONDS", bound)
+        for gap_seconds in (bound, bound + 1):
+            kind, as_time_series = kind_at(gap_seconds)
+            assert kind == (as_time_series if gap_seconds > 3_600 else None), gap_seconds
+        # Scanner's copy moves it, on both sides of the bound and of the hour
+        monkeypatch.setattr(scanner, "HELD_PAIR_CLOSE_GAP_SECONDS", bound)
+        for gap_seconds, reads in ((bound, False), (bound + 1, True),
+                                   (3_600, 3_600 > bound), (3_601, 3_601 > bound)):
+            kind, as_time_series = kind_at(gap_seconds)
+            assert kind == (as_time_series if reads else None), gap_seconds
 
     @pytest.mark.parametrize("gap_seconds, reads", [(1_800, False), (3_600, False),
                                                     (3_601, True)])
@@ -10463,7 +9621,7 @@ class TestHeldPairKind:
             self, monkeypatch, gap_seconds, reads):
         # One question on two series, one label respelled without its year:
         # the finder sees two deadlines, but one states no calendar day, so
-        # within the same-title bound it is no pair
+        # within the held-pair close bound (an hour) it is no pair
         close = datetime(2027, 3, 31, 12, tzinfo=UTC)
 
         def listing(ticker, event, label, close_time, yes_ask):
@@ -10483,11 +9641,15 @@ class TestHeldPairKind:
             "time_series", dated, respelled)
         assert _kind_of(pair) == (("time_series", dated, respelled) if reads else None)
         assert scanner.held_pair_kind(respelled, dated) is None
-        # Spelled alike, they are the same-title pair they may have been bought
-        # as, inside the bound
+        # Spelled alike, inside the bound they have the shape of the
+        # same-title pair they may have been bought as: identically worded,
+        # never a pair to trim, at any gap
         respelled.subtitle = dated.subtitle
-        assert scanner.held_pair_kind(respelled, dated) == (
-            None if reads else ("same_title", dated, respelled))
+        assert scanner._identical_wording(dated, respelled)
+        assert not scanner._same_series(dated, respelled)
+        assert scanner._closes_apart(dated, respelled) is reads
+        assert scanner.held_pair_kind(respelled, dated) is None
+        assert scanner.held_pair_kind(dated, respelled) is None
 
     @pytest.mark.parametrize("close_a, close_b", [
         (None, datetime(2026, 3, 9, tzinfo=UTC)),
@@ -10551,7 +9713,8 @@ class TestHeldPairKind:
         b = _mock_market(ticker="X-B", event_ticker="KXBB-1", title=title_b, yes_ask=0.60,
                          no_ask=0.40, close_time=datetime(2026, 3, 9, tzinfo=UTC))
         assert self._ts([a, b], monkeypatch) == []
-        assert find_same_title_pairs([a, b]) == []
+        # ... nor worded as one question twice
+        assert not scanner._identical_wording(a, b)
         assert scanner.held_pair_kind(a, b) is None
         assert scanner.held_pair_kind(b, a) is None
 
@@ -10575,18 +9738,21 @@ class TestHeldPairKind:
         [pair] = self._ts([low, same], monkeypatch)
         assert _kind_of(pair) == ("time_series", low, same)
 
-    # ── every pair the finders form ─────────────────────────────────────────
+    # ── every shape an account can hold ─────────────────────────────────────
 
-    def test_every_pair_the_finders_form_reads_as_its_own_kind(self, monkeypatch):
-        # Seeded sweep of the three shapes a run can hold. Same-title pairs and
-        # ladders read as their own kind, A and B as the finder has them. A
-        # cross-event pair reads as time-series exactly when its stated days
-        # read, differ and agree with its closes, or (a day unread) its closes
-        # are past the same-title bound; otherwise as no pair. Never the other
-        # kind, and a time-series pair held the other way round never reads
+    def test_every_shape_an_account_can_hold_reads_as_time_series_or_as_no_pair(
+            self, monkeypatch):
+        # Seeded sweep of the three shapes an account can hold. A same-title
+        # pair reads as no pair, held either way round. A ladder reads as
+        # time-series, A and B as the finder has them. A cross-event pair
+        # reads as time-series exactly when its stated days read, differ and
+        # agree with its closes, or (a day unread) its closes are further
+        # apart than the held-pair close bound; otherwise as no pair. Never
+        # as same-title, and a time-series pair held the other way round
+        # never reads
         rng = random.Random(2026)
         base = datetime(2026, 3, 1, 12, tzinfo=UTC)
-        bound = config.SAME_TITLE_MAX_CLOSE_GAP_SECONDS
+        bound = config.HELD_PAIR_CLOSE_GAP_SECONDS
         seen = {"same_title": 0, "ladder": 0, "cross_read": 0, "cross_refused": 0}
 
         def spelled(day, dated):
@@ -10608,9 +9774,13 @@ class TestHeldPairKind:
                                      title=f"Who wins game {n}?", subtitle="Home",
                                      event_title=f"Game {n}", yes_ask=p_low,
                                      no_ask=round(1.0 - p_low, 2), close_time=base + close_gap)
-                [pair] = find_same_title_pairs(rng.sample([dear, cheap], 2))
-                assert _kind_of(pair) == ("same_title", dear, cheap)
-                assert self._ts([dear, cheap], monkeypatch) == []
+                self._assert_same_title_shape(dear, cheap)
+                # Held as such a pair is bought (NO on the pricier, YES on the
+                # other), or the other way round
+                assert scanner.held_pair_kind(yes_market=cheap, no_market=dear) is None
+                assert scanner.held_pair_kind(dear, cheap) is None
+                # ... and never a time-series pair, in either listing order
+                assert self._ts(rng.sample([dear, cheap], 2), monkeypatch) == []
                 seen["same_title"] += 1
                 continue
             day_a = date(2026, 3, 1) + timedelta(days=rng.randint(0, 20))
@@ -10630,7 +9800,7 @@ class TestHeldPairKind:
                 assert pair.stated_gap_days == (day_b - day_a).days
                 assert _kind_of(pair) == ("time_series", early, late)
                 assert scanner.held_pair_kind(late, early) is None
-                assert find_same_title_pairs([early, late]) == []
+                assert not scanner._identical_wording(early, late)
                 seen["ladder"] += 1
                 continue
             # One question on two events: the first to close is the cheaper,
@@ -10664,7 +9834,9 @@ def _named(ticker: str) -> SimpleNamespace:
 class TestHeldPairMatches:
     """HeldPair.matches says whether a candidate buys exactly what the account
     holds: the same two tickers, each leg buying the side held on it. The
-    other way round would close the held pair rather than add to it."""
+    other way round would close the held pair rather than add to it. A
+    candidate that is not time-series is refused first, with one WARNING:
+    nothing forms such a pair, so one reaching it is a bug."""
 
     _PAIR = HeldPair(sides=(("KX-A", "yes"), ("KX-C", "no")), count=30.0,
                      cost_dollars=18.9, value_dollars=18.0, fees_dollars=0.9)
@@ -10672,16 +9844,13 @@ class TestHeldPairMatches:
     def test_the_held_sides_match(self):
         # Time-series: YES on market A, NO on market B
         assert self._PAIR.matches(_named("KX-A"), _named("KX-C"), "time_series")
-        # Same-title: NO on market A, YES on market B
-        assert self._PAIR.matches(_named("KX-C"), _named("KX-A"), "same_title")
 
     def test_the_legs_the_other_way_round_do_not_match(self):
         assert not self._PAIR.matches(_named("KX-C"), _named("KX-A"), "time_series")
-        assert not self._PAIR.matches(_named("KX-A"), _named("KX-C"), "same_title")
 
     def test_one_ticker_named_twice_does_not_match(self):
         assert not self._PAIR.matches(_named("KX-A"), _named("KX-A"), "time_series")
-        assert not self._PAIR.matches(_named("KX-C"), _named("KX-C"), "same_title")
+        assert not self._PAIR.matches(_named("KX-C"), _named("KX-C"), "time_series")
 
     def test_another_ticker_does_not_match(self):
         assert not self._PAIR.matches(_named("KX-A"), _named("KX-B"), "time_series")
@@ -10692,13 +9861,30 @@ class TestHeldPairMatches:
     def test_a_lone_leg_matches_its_held_side_beside_any_other_market(self):
         lone = _lone("KX-C", "no", frozenset())
         assert lone.lone and not self._PAIR.lone
-        # Time-series: NO is bought on market B, same-title on market A
+        # Time-series: NO is bought on market B
         assert lone.matches(_named("KX-NEW"), _named("KX-C"), "time_series")
-        assert lone.matches(_named("KX-C"), _named("KX-NEW"), "same_title")
         # The held market bought on its other side, or not bought at all
         assert not lone.matches(_named("KX-C"), _named("KX-NEW"), "time_series")
         assert not lone.matches(_named("KX-A"), _named("KX-B"), "time_series")
         assert not lone.matches(_named("KX-C"), _named("KX-C"), "time_series")
+
+    @pytest.mark.parametrize("pair_type", _OTHER_PAIR_TYPES, ids=_OTHER_PAIR_TYPE_IDS)
+    def test_any_other_pair_type_is_refused_with_one_warning(self, caplog, monkeypatch,
+                                                             pair_type):
+        # Each candidate below buys exactly what is held on the sides the
+        # retired same-title type bought (NO on market A, YES on market B).
+        # Refused before its sides are read: leg_sides is never asked
+        monkeypatch.setattr(scanner, "leg_sides", _must_not_run("leg_sides"))
+        lone = _lone("KX-C", "no", frozenset())
+        with caplog.at_level(logging.DEBUG):
+            assert self._PAIR.matches(_named("KX-C"), _named("KX-A"), pair_type) is False
+            assert lone.matches(_named("KX-C"), _named("KX-NEW"), pair_type) is False
+        # One WARNING a call, naming the held tickers and the type
+        tail = (f"the candidate's type is {pair_type!r}, not a time-series pair, and the "
+                "bot trades time-series pairs only")
+        assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
+            (logging.WARNING, f"Not adding to the held position on KX-A / KX-C: {tail}"),
+            (logging.WARNING, f"Not adding to the held position on KX-C: {tail}")]
 
 
 class TestPairHeld:
@@ -11388,80 +10574,6 @@ class TestSubtitleFallback:
         assert m.subtitle == ""
 
 
-class TestSameTitleSubtitleDiscriminator:
-    """Regression: distinct outcomes sharing one title must not be paired.
-
-    Before the yes_sub_title fallback, every market parsed with subtitle="",
-    so the (event_title, title, subtitle) grouping key collapsed to
-    (event_title, title) — two DIFFERENT outcomes under one shared question
-    title on different event tickers would group together and be traded under
-    the 95% co-resolution assumption. Real money, wrong contract.
-    """
-
-    @staticmethod
-    def _pope_event(event_ticker, ticker, sub, yes_ask, no_ask):
-        # Same event *title* on both sides so the event_title component of the
-        # grouping key matches — the subtitle is the only discriminator left.
-        return {"title": "Papal Conclave", "markets": [
-            _raw_market(
-                ticker, "Who will the next Pope be?",
-                event_ticker=event_ticker,
-                yes_sub_title=sub,
-                yes_ask_dollars=str(yes_ask), no_ask_dollars=str(no_ask),
-            ),
-        ]}
-
-    @staticmethod
-    def _markets(events):
-        client = MagicMock()
-        client.get_events_without_preload_content = MagicMock(return_value=_raw_page(events))
-        client.get_multivariate_events_without_preload_content = MagicMock(
-            return_value=_raw_page([])
-        )
-        markets = fetch_open_events_with_markets(client)
-        # A run files every market under its series' labels before pairing
-        # (main._attach_series_labels); both series here are filed alike, so
-        # the subtitle stays the only thing that tells the two apart
-        for m in markets:
-            m._series_labels = ("Politics", "General")
-        return markets
-
-    def test_distinct_outcomes_under_shared_title_do_not_pair(self):
-        # RE-PINNED (DR-02/DR-54): the fixture used EVT-A/EVT-B, one series, so
-        # after the one-series rule this assertion would have passed for the
-        # wrong reason — the pair would be refused as two instances of one
-        # fixture before the subtitle was ever consulted. Two distinct series
-        # keep the SUBTITLE the only thing separating these two markets.
-        markets = self._markets([
-            self._pope_event("EVA-1", "POPE-PIZZABALLA", "Pierbattista Pizzaballa", 0.45, 0.55),
-            self._pope_event("EVB-1", "POPE-TURKSON", "Peter Turkson", 0.30, 0.70),
-        ])
-        # Both parsed subtitles must be populated — otherwise the assertion
-        # below would pass for the wrong reason (e.g. a parse failure).
-        assert {m.subtitle for m in markets} == {"Pierbattista Pizzaballa", "Peter Turkson"}
-        pairs = find_same_title_pairs(markets)
-        assert pairs == [], f"Different outcomes must not be same-title paired; got {pairs}"
-
-    def test_identical_outcome_across_events_still_pairs(self):
-        # Positive control: same outcome label, different event tickers, price
-        # gap well above SAME_TITLE_MIN_PRICE_DIFF — the legitimate arbitrage.
-        #
-        # RE-PINNED (DR-02/DR-54): EVT-A/EVT-B shared the series prefix "EVT",
-        # which the finder now reads as two instances of one recurring fixture
-        # and refuses. The tickers name two DIFFERENT series now — one question
-        # listed by two independent series, the shape the co-resolution prior
-        # was built for — so the assertion is unchanged.
-        markets = self._markets([
-            self._pope_event("EVA-1", "POPE-A", "Pierbattista Pizzaballa", 0.45, 0.55),
-            self._pope_event("EVB-1", "POPE-B", "Pierbattista Pizzaballa", 0.30, 0.70),
-        ])
-        pairs = find_same_title_pairs(markets)
-        assert len(pairs) == 1
-        assert {pairs[0].market_a.ticker, pairs[0].market_b.ticker} == {"POPE-A", "POPE-B"}
-        # market_a is canonicalized to the more expensive side
-        assert pairs[0].market_a.ticker == "POPE-A"
-
-
 class TestFilterMarketsWithinHorizon:
     def test_none_horizon_returns_markets_unchanged(self):
         markets = [
@@ -11831,9 +10943,9 @@ class TestFetchShardStatusesEmptyBreakdown:
 
 
 class TestFilterActiveMarketsCloseTimeGuard:
-    """A market whose close_time failed to parse must be dropped at the shared
-    entry filter, not carried into the finders where a None deadline crashes
-    the close_time sort, the orderbook ceiling, and strategy.compute_trade()."""
+    """A market whose close_time failed to parse must be dropped at the entry
+    filter, not carried into the finder where a None deadline crashes the
+    close_time sort, the orderbook ceiling, and strategy.compute_trade()."""
 
     @staticmethod
     def _bad_close_time_market(ticker: str, event_ticker: str):
@@ -11969,9 +11081,9 @@ class TestPriceEpsilonThresholds:
     TS-09: prices are floats parsed from cent-quantized dollar strings, so a
     pair sitting EXACTLY on a documented threshold can evaluate a hair under it
     and be rejected for representation noise rather than for its price.
-    Measured over live books: the same-title 5c test rejected 50 of 94
-    qualifying pairs, the 15c tier 21 of 84, the 30c tier 15 of 69. The tiers
-    bind only with the tier floors on (pre_toggle_defaults).
+    Measured over live books, a bare comparison rejected 21 of 84 pairs
+    qualifying at the 15c tier and 15 of 69 at the 30c tier. The tiers bind
+    only with the tier floors on (pre_toggle_defaults).
     """
 
     def test_the_float_noise_this_exists_for_is_real(self):
@@ -11986,33 +11098,6 @@ class TestPriceEpsilonThresholds:
         # representation noise — never a real one-tick price difference.
         assert config.PRICE_EPSILON <= 0.0001 / 100
 
-    @staticmethod
-    def _same_title(pA: float, pB: float):
-        from datetime import UTC, datetime
-        close = datetime(2026, 3, 1, tzinfo=UTC)
-        # RE-PINNED (DR-02/DR-54): EV-A/EV-B share the series prefix "EV", which
-        # the finder now refuses as two instances of one recurring fixture —
-        # both the positive and the negative epsilon assertion below would have
-        # gone green for that reason instead of for the price threshold they
-        # exist to pin. Two DIFFERENT series keep the 5% test the only gate.
-        mA = _mock_market(ticker="A1", event_ticker="EA-1", title="Same question",
-                          subtitle="Yes", yes_ask=pA, no_ask=round(1.0 - pA, 4),
-                          close_time=close)
-        mB = _mock_market(ticker="B1", event_ticker="EB-1", title="Same question",
-                          subtitle="Yes", yes_ask=pB, no_ask=round(1.0 - pB, 4),
-                          close_time=close)
-        return find_same_title_pairs([mA, mB])
-
-    def test_same_title_pair_exactly_at_threshold_qualifies(self):
-        # 0.35 - 0.30 == 0.04999999999999999, one ULP under the 5% threshold.
-        pairs = self._same_title(0.35, 0.30)
-        assert len(pairs) == 1
-        assert pairs[0].pA == pytest.approx(0.35)
-
-    def test_same_title_pair_a_cent_under_threshold_is_still_rejected(self):
-        # GUARD: the epsilon must not admit a genuinely sub-threshold pair.
-        assert self._same_title(0.34, 0.30) == []
-
     def test_time_series_pair_exactly_at_the_short_tier_qualifies(self):
         # 0.35 - 0.20 == 0.14999999999999997, one ULP under the 15% tier.
         mA, mB = _ts_pair_markets(gap_days=10, pA=0.20, pB=0.35)
@@ -12025,6 +11110,7 @@ class TestPriceEpsilonThresholds:
         assert find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB]) == []
 
 
+@pytest.mark.usefixtures("pre_toggle_defaults")
 class TestValidatePairPriceReachableDepth:
     """
     The pre-execution re-check must ask the question the wire asks: will the
@@ -12032,67 +11118,55 @@ class TestValidatePairPriceReachableDepth:
     every contract that merely clears the gap let a spec whose top levels rest
     above its own FoK limit pass here and then be killed on the exchange,
     reported as "NO leg FoK not filled" (TS-08).
+
+    The pair is a time-series pair: YES on market A (its YES asks come from
+    A's resting NO bids) and NO on market B (its NO asks come from B's resting
+    YES bids). B's NO bids give the later market's YES ask, 0.70, which the
+    check needs so a time-series pair is not dropped for want of one.
+
+    Market B closes 10 days after market A. The 10-day gap's 15-cent floor
+    sets a price-sum ceiling of 0.85, which both levels (0.30 + 0.32 and
+    0.30 + 0.37) clear, so only the reach check drops the 600.
     """
 
     @staticmethod
-    def _client(a_yes_bids, b_no_bids):
-        client = MagicMock()
-
-        def _raw(ticker, *a, **k):
-            book = {"A1": {"yes": a_yes_bids, "no": []},
-                    "B1": {"yes": [], "no": b_no_bids}}[ticker]
-            return {"orderbook_fp": {"yes_dollars": book["yes"], "no_dollars": book["no"]}}
-
-        client._get = _raw
-        return client
-
-    @staticmethod
-    def _pair(nA, pB):
-        from datetime import UTC, datetime
+    def _pair(pA, nB):
+        from datetime import UTC, datetime, timedelta
         close = datetime(2026, 3, 1, tzinfo=UTC)
         mA = SimpleNamespace(ticker="A1", title="A", subtitle="", event_ticker="EV-A",
                              close_time=close, exchange_index=0,
                              price_level_structure="", price_ranges=None)
         mB = SimpleNamespace(ticker="B1", title="B", subtitle="", event_ticker="EV-B",
-                             close_time=close, exchange_index=0,
+                             close_time=close + timedelta(days=10), exchange_index=0,
                              price_level_structure="", price_ranges=None)
         return CandidatePair(
-            market_a=mA, market_b=mB, pA=1.0 - nA, pB=pB, nA=nA, nB=1.0 - pB,
+            market_a=mA, market_b=mB, pA=pA, pB=0.70, nA=1.0 - pA, nB=nB,
             tradeable=True, canonical_title="reachability pair",
-            pair_type="same_title",
+            pair_type="time_series",
         )
 
     def _run(self, monkeypatch, x):
-        # NO leg (market_a) ladders 0.32@300 then 0.37@300; YES leg flat 0.30.
-        # The spec is priced at the top level, so its NO cap is 0.33 and only
-        # the first 300 contracts are reachable.
-        pair = self._pair(nA=0.32, pB=0.30)
+        # NO leg (market_b) ladders 0.32@300 then 0.37@300; YES leg (market_a)
+        # flat 0.30@600. The spec is priced at the top level, so its NO cap is
+        # 0.33 and only the first 300 contracts are reachable.
+        pair = self._pair(pA=0.30, nB=0.32)
         spec = SimpleNamespace(pair=pair, x=x)
-        client = self._client(
-            a_yes_bids=[["0.68", "300"], ["0.63", "300"]],
-            b_no_bids=[["0.70", "600"]],
-        )
-        monkeypatch.setattr(scanner, "_fetch_orderbook",
-                            lambda c, t: {"A1": {"yes": [["0.68", "300"], ["0.63", "300"]], "no": []},
-                                          "B1": {"yes": [], "no": [["0.70", "600"]]}}[t])
-        return validate_pair_price(client, spec)
+        books = {
+            # Market A: NO bids 0.70 x 600 are YES asks of 0.30 x 600
+            "A1": {"yes": [], "no": [["0.70", "600"]]},
+            # Market B: YES bids 0.68 x 300 and 0.63 x 300 are NO asks of 0.32
+            # and 0.37; its NO bid 0.30 is the later YES ask of 0.70
+            "B1": {"yes": [["0.68", "300"], ["0.63", "300"]], "no": [["0.30", "10"]]},
+        }
+        monkeypatch.setattr(scanner, "_fetch_orderbook", lambda c, t: books[t])
+        return validate_pair_price(MagicMock(), spec)
 
-    def test_spec_within_reachable_depth_passes(self):
-        import pytest as _p
-        mp = _p.MonkeyPatch()
-        try:
-            assert self._run(mp, 300) is True
-        finally:
-            mp.undo()
+    def test_spec_within_reachable_depth_passes(self, monkeypatch):
+        assert self._run(monkeypatch, 300) is True
 
-    def test_spec_beyond_reachable_depth_is_dropped(self):
+    def test_spec_beyond_reachable_depth_is_dropped(self, monkeypatch):
         # 600 contracts clear the gap, but only 300 rest at or below the cap.
-        import pytest as _p
-        mp = _p.MonkeyPatch()
-        try:
-            assert self._run(mp, 600) is False
-        finally:
-            mp.undo()
+        assert self._run(monkeypatch, 600) is False
 
     def test_the_rejection_names_reachability_not_thin_depth(self, caplog, monkeypatch):
         with caplog.at_level(logging.WARNING):
@@ -12120,88 +11194,81 @@ class TestValidatePairPriceLogsFreshPrices:
     """
 
     @staticmethod
-    def _pair(nA, pB):
-        # Same-title: NO on A1 (market_a), YES on B1 (market_b)
-        close = datetime(2026, 3, 1, tzinfo=UTC)
-        mA = SimpleNamespace(ticker="A1", title="A", subtitle="", event_ticker="EV-A",
-                             close_time=close, exchange_index=0,
-                             price_level_structure="", price_ranges=None)
-        mB = SimpleNamespace(ticker="B1", title="B", subtitle="", event_ticker="EV-B",
-                             close_time=close, exchange_index=0,
-                             price_level_structure="", price_ranges=None)
-        return CandidatePair(
-            market_a=mA, market_b=mB, pA=1.0 - nA, pB=pB, nA=nA, nB=1.0 - pB,
-            tradeable=True, canonical_title="fresh price pair",
-            pair_type="same_title",
-        )
+    def _pair(pA, nB):
+        # Time-series: YES on EARLY (market_a), NO on LATE (market_b), ten days
+        # apart; LATE's YES ask (pB) is 0.60, as its book below gives it
+        return _ts_candidate(gap_days=10, pA=pA, pB=0.60, nB=nB)
 
-    def _run(self, monkeypatch, caplog, *, a_yes_bids, b_no_bids, x, nA=0.32, pB=0.30):
-        # A1's YES bids become the NO leg's asks (1 - bid), B1's NO bids the YES leg's
-        books = {"A1": {"yes": a_yes_bids, "no": []}, "B1": {"yes": [], "no": b_no_bids}}
+    def _run(self, monkeypatch, caplog, *, early_no_bids, late_yes_bids, x, pA=0.30, nB=0.50):
+        # EARLY's NO bids become the YES leg's asks (1 - bid), LATE's YES bids
+        # the NO leg's. LATE's NO bid of 0.40 puts its YES ask, the later
+        # contract's reference quote, at 0.60: a spread of 0.30, inside the band
+        books = {"EARLY": {"yes": [], "no": early_no_bids},
+                 "LATE": {"yes": late_yes_bids, "no": [["0.40", "1000"]]}}
         monkeypatch.setattr(scanner, "_fetch_orderbook", lambda c, t: books[t])
-        spec = SimpleNamespace(pair=self._pair(nA=nA, pB=pB), x=x)
+        spec = SimpleNamespace(pair=self._pair(pA=pA, nB=nB), x=x)
         with caplog.at_level(logging.INFO):
             ok = validate_pair_price(MagicMock(), spec)
         lines = [r for r in caplog.records if "Pre-execution prices" in r.getMessage()]
         return ok, lines
 
     def test_unchanged_books_log_unchanged_word_for_word(self, monkeypatch, caplog):
-        ok, lines = self._run(monkeypatch, caplog, a_yes_bids=[["0.68", "300"]],
-                              b_no_bids=[["0.70", "600"]], x=300)
+        ok, lines = self._run(monkeypatch, caplog, early_no_bids=[["0.70", "600"]],
+                              late_yes_bids=[["0.50", "300"]], x=300)
         assert ok is True
         assert [(r.levelno, r.getMessage()) for r in lines] == [(
             logging.INFO,
-            "Pre-execution prices for 'fresh price pair', 300 contract(s) per leg: "
-            "NO on A1 scanned $0.3200, now $0.3200; YES on B1 scanned $0.3000, "
-            "now $0.3000 — unchanged",
+            "Pre-execution prices for 'will btc exceed $80k by', 300 contract(s) per leg: "
+            "YES on EARLY scanned $0.3000, now $0.3000; NO on LATE scanned $0.5000, "
+            "now $0.5000 — unchanged",
         )]
 
     def test_a_dearer_book_that_still_passes_is_logged_as_moved(self, monkeypatch, caplog):
-        # The NO leg's ask rose 1c to 0.33, still within its order's limit
-        # (0.32 plus one tick), so the trade passes and only this line shows it
-        ok, lines = self._run(monkeypatch, caplog, a_yes_bids=[["0.67", "300"]],
-                              b_no_bids=[["0.70", "600"]], x=300)
+        # The NO leg's ask rose 1c to 0.51, still within its order's limit
+        # (0.50 plus one tick), so the trade passes and only this line shows it
+        ok, lines = self._run(monkeypatch, caplog, early_no_bids=[["0.70", "600"]],
+                              late_yes_bids=[["0.49", "300"]], x=300)
         assert ok is True
         [line] = lines
-        assert "NO on A1 scanned $0.3200, now $0.3300;" in line.getMessage()
+        assert "NO on LATE scanned $0.5000, now $0.5100 —" in line.getMessage()
         assert line.getMessage().endswith(
             "— moved: one contract pair now costs $0.0100 more")
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
     def test_a_cheaper_book_is_logged_as_costing_less(self, monkeypatch, caplog):
         # The YES leg's ask fell 1c to 0.29
-        ok, lines = self._run(monkeypatch, caplog, a_yes_bids=[["0.68", "300"]],
-                              b_no_bids=[["0.71", "600"]], x=300)
+        ok, lines = self._run(monkeypatch, caplog, early_no_bids=[["0.71", "600"]],
+                              late_yes_bids=[["0.50", "300"]], x=300)
         assert ok is True
         [line] = lines
-        assert "YES on B1 scanned $0.3000, now $0.2900" in line.getMessage()
+        assert "YES on EARLY scanned $0.3000, now $0.2900;" in line.getMessage()
         assert line.getMessage().endswith(
             "— moved: one contract pair now costs $0.0100 less")
 
     def test_prices_are_averaged_over_the_trades_own_count(self, monkeypatch, caplog):
-        # The NO leg was scanned at 0.34, its average over 600 contracts across
-        # two levels (0.32 and 0.36). The same book now reads the same average,
-        # so the line says unchanged, though the top of the book is 0.32. The
+        # The NO leg was scanned at 0.52, its average over 600 contracts across
+        # two levels (0.50 and 0.54). The same book now reads the same average,
+        # so the line says unchanged, though the top of the book is 0.50. The
         # trade is then dropped (only 300 contracts sit within its limit), and
         # the price line still comes first.
-        ok, lines = self._run(monkeypatch, caplog,
-                              a_yes_bids=[["0.68", "300"], ["0.64", "300"]],
-                              b_no_bids=[["0.70", "600"]], x=600, nA=0.34)
+        ok, lines = self._run(monkeypatch, caplog, early_no_bids=[["0.70", "600"]],
+                              late_yes_bids=[["0.50", "300"], ["0.46", "300"]],
+                              x=600, nB=0.52)
         assert ok is False
         [line] = lines
-        assert "NO on A1 scanned $0.3400, now $0.3400;" in line.getMessage()
+        assert "NO on LATE scanned $0.5200, now $0.5200 —" in line.getMessage()
         assert line.getMessage().endswith("— unchanged")
         records = caplog.records
         drop = next(r for r in records if r.levelno == logging.WARNING)
         assert records.index(line) < records.index(drop)
 
     def test_a_book_too_thin_for_the_count_gives_no_fresh_price(self, monkeypatch, caplog):
-        ok, lines = self._run(monkeypatch, caplog, a_yes_bids=[["0.68", "300"]],
-                              b_no_bids=[["0.70", "600"]], x=301)
+        ok, lines = self._run(monkeypatch, caplog, early_no_bids=[["0.70", "600"]],
+                              late_yes_bids=[["0.50", "300"]], x=301)
         assert ok is False
         assert [r.getMessage() for r in lines] == [
-            "Pre-execution prices for 'fresh price pair', 301 contract(s) per leg: "
-            "NO on A1 scanned $0.3200; YES on B1 scanned $0.3000 — the thinner book "
+            "Pre-execution prices for 'will btc exceed $80k by', 301 contract(s) per leg: "
+            "YES on EARLY scanned $0.3000; NO on LATE scanned $0.5000 — the thinner book "
             "now holds only 300.0 of them, so there is no fresh price"
         ]
 
@@ -12224,28 +11291,27 @@ class TestValidatePairPriceLogsFreshPrices:
 class TestCloseTimeWarningOncePerRun:
     """
     TS-22: _filter_active_markets emits one summary WARNING naming how many
-    markets it dropped for a missing close_time. Both finders call it on the
-    SAME list in one run, so the line appeared TWICE. CLAUDE.md specifies one
-    summary WARNING carrying the count.
+    markets it dropped for a missing close_time. find_time_series_pairs, the
+    finder every run mode calls once, calls it once, so a run logs that line
+    once. CLAUDE.md specifies one summary WARNING carrying the count. Its
+    keyword-only warn_missing_close=False drops the same markets without the
+    line.
     """
 
     @staticmethod
     def _markets():
         from datetime import UTC, datetime
         close = datetime(2026, 3, 1, tzinfo=UTC)
-        # RE-PINNED (DR-02/DR-54): EV-A/EV-B share the series prefix "EV", so
-        # the good same-title pair this fixture exists to carry alongside the
-        # two bad markets was silently skipped as two instances of one fixture.
-        # EA-1/EB-1 are two DIFFERENT series, so the pair forms again and the
-        # run still exercises pairing while the close-time assertion below
-        # (emitted by _filter_active_markets, upstream of the series rule) is
-        # unchanged.
-        good_a = _mock_market(ticker="A1", event_ticker="EA-1", title="Q",
-                              subtitle="Yes", yes_ask=0.35, no_ask=0.65,
-                              close_time=close)
-        good_b = _mock_market(ticker="B1", event_ticker="EB-1", title="Q",
-                              subtitle="Yes", yes_ask=0.30, no_ask=0.70,
-                              close_time=close)
+        # A good time-series pair beside the two bad markets, so the run
+        # still pairs what it kept: A1 by March 1, B1 by March 11, the later
+        # contract 0.20 dearer on a 10-day gap
+        good_a = _mock_market(ticker="A1", event_ticker="EA-1",
+                              title="Will Q happen by March 1, 2026?",
+                              yes_ask=0.30, no_ask=0.70, close_time=close)
+        good_b = _mock_market(ticker="B1", event_ticker="EB-1",
+                              title="Will Q happen by March 11, 2026?",
+                              yes_ask=0.50, no_ask=0.50,
+                              close_time=close + timedelta(days=10))
         # _mock_market substitutes a default for a falsy close_time, so the
         # missing-deadline markets are built directly.
         bad_1 = SimpleNamespace(ticker="X1", event_ticker="EV-X", title="Q2",
@@ -12258,20 +11324,20 @@ class TestCloseTimeWarningOncePerRun:
                                 close_time=None)
         return [good_a, good_b, bad_1, bad_2]
 
-    def test_one_warning_across_both_finders_in_one_run(self, caplog):
-        # The duplication happens one level up from _filter_active_markets, so
-        # a test that invokes it once is tautologically satisfied and cannot
-        # see this. Drive BOTH finders on one list, as both run modes do.
+    def test_one_warning_from_the_finder_over_one_list(self, caplog):
+        # A duplicate would come from one level up from _filter_active_markets
+        # (a second call over the same list), which a test that invokes it
+        # once cannot see. Drive the finder a run calls on one list.
         markets = self._markets()
         with caplog.at_level(logging.WARNING):
-            find_time_series_pairs(MagicMock(), held_tickers=set(), markets=markets)
-            find_same_title_pairs(markets, held_tickers=set())
+            [pair] = find_time_series_pairs(MagicMock(), held_tickers=set(),
+                                            markets=markets)
+        assert (pair.market_a.ticker, pair.market_b.ticker) == ("A1", "B1")
         lines = [r.getMessage() for r in caplog.records
                  if "missing/unparseable close_time" in r.getMessage()]
-        assert len(lines) == 1
-        assert "2" in lines[0]
+        assert lines == ["Skipped 2 markets with missing/unparseable close_time"]
 
-    def test_the_markets_are_still_dropped_by_the_quiet_caller(self):
+    def test_warn_missing_close_false_still_drops_the_same_markets(self):
         # GUARD: the flag suppresses the REPORT, never the filtering.
         markets = self._markets()
         kept = scanner._filter_active_markets(markets, set(), warn_missing_close=False)
@@ -12699,12 +11765,18 @@ class TestLegFeeMultipliers:
         # Side order: YES on A, NO on B
         assert scanner._side_fee_multipliers(pair) == (1.0, 0.5)
 
-    def test_a_same_title_no_leg_on_a_gets_as_multiplier(self, half_confirmed):
+    def test_a_pair_of_another_type_has_market_multipliers_but_no_side_order(
+            self, half_confirmed):
+        # Each market's own multiplier is read whatever the pair's type
+        # (market order needs no sides), but side order needs leg_sides,
+        # which gives sides to time-series pairs only: a same-title pair
+        # raises rather than having its NO leg priced on market A
         pair = _st_candidate(pA=0.70, pB=0.60, nA=0.32)
         pair.market_a._fee_multiplier = 0.5
         assert scanner.leg_fee_multipliers(pair) == (0.5, 1.0)
-        # Side order: YES on B, NO on A
-        assert scanner._side_fee_multipliers(pair) == (1.0, 0.5)
+        with pytest.raises(ValueError,
+                           match=re.escape("not a time-series pair type: 'same_title'")):
+            scanner._side_fee_multipliers(pair)
 
     def test_an_unconfirmed_multiplier_reads_the_full_fee(self):
         pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.45)

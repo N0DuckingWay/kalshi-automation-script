@@ -7,12 +7,13 @@ Purpose:
     Turns TradeSpec objects (from strategy.py) into Kalshi orders and sends
     them. Each pair is two orders ("legs") sent one after the other: the NO
     leg first, then the YES leg only if the NO leg filled. Which market gets
-    which side depends on the pair type and comes only from _ordered_legs()
-    (through scanner.leg_sides / scanner.leg_prices): for a same_title pair
-    the NO leg is market_a (the pricier contract), for a time_series pair it
-    is market_b (the later deadline — by close_time, or by stated deadline
-    for a same-event ladder, DR-73). Never hardcode spec.pair.market_a as
-    the NO leg.
+    which side comes only from _ordered_legs() (through scanner.leg_sides /
+    scanner.leg_prices, which accept time-series pairs only): the NO leg is
+    market_b, the later deadline (by close_time, or by stated deadline for a
+    same-event ladder, DR-73). Never hardcode spec.pair.market_a as the NO
+    leg. A spec of any other pair type raises ValueError in _ordered_legs
+    before anything is read or sent; select_portfolio refuses such a spec
+    first, so only a bug can hand one here.
 
     Both buy legs carry a price limit, so an order against a book that moved
     since the pre-execution check is killed instead of filling at a loss. If
@@ -146,8 +147,8 @@ Notes:
     never an absolute sign — an unrelated holding in the same ticker would
     otherwise both fake a disproof and mask a real one. A process-lifetime
     latch (_V2_NO_MAPPING_CONFIRMED) keeps the cost at one extra positions
-    read per run; the latch is shared across pair types, because it verifies
-    the exchange's side mapping, not any particular market. A disproof sets a
+    read per run; the latch is shared across pairs, because it verifies the
+    exchange's side mapping, not any particular market. A disproof sets a
     second process-lifetime latch (_V2_NO_MAPPING_DISPROVEN), and every later
     pair of the run is then stopped before anything is read or sent (status
     "failed"). Until one of the two latches is set, execute_trades runs pairs
@@ -275,8 +276,8 @@ class _Leg:
     Built only by _ordered_legs(), the single place a pair type is translated
     into sides and prices. Every order builder, rollback-price helper and the
     execution state machine below takes a _Leg rather than a TradeSpec, so
-    none of them can hardcode "market_a is the NO leg" — true for a same_title
-    pair, false for a time_series pair.
+    none of them can hardcode "market_a is the NO leg", which is false for a
+    time_series pair (its NO leg is market_b).
 
     Attributes:
         market (Any): The market this leg trades — supplies the ticker, the
@@ -304,15 +305,11 @@ def _ordered_legs(spec: TradeSpec) -> tuple[_Leg, _Leg]:
 
     The NO leg is always submitted first and is the leg the rollback unwinds;
     the YES leg follows only once the NO leg has filled. Which market carries
-    which side comes from scanner.leg_sides (by pair type) and the matching
-    prices from scanner.leg_prices, so this function — never a builder — is
-    the only source of truth for the side/market assignment:
-
-      * same_title:  NO on market_a (spec.x @ pair.nA), then YES on market_b
-                     (spec.y @ pair.pB) — the wire behaviour this path has
-                     always had, unchanged.
-      * time_series: NO on market_b (spec.y @ pair.nB), then YES on market_a
-                     (spec.x @ pair.pA).
+    which side comes from scanner.leg_sides and the matching prices from
+    scanner.leg_prices, so this function — never a builder — is the only
+    source of truth for the side/market assignment. Both helpers accept only
+    a time_series pair and give its legs, so the legs are NO on market_b
+    (spec.y @ pair.nB), sent first, then YES on market_a (spec.x @ pair.pA).
 
     Counts follow the MARKET, not the side: spec.x is always market_a's
     contract count and spec.y market_b's (strategy.TradeSpec's invariant), so
@@ -327,9 +324,18 @@ def _ordered_legs(spec: TradeSpec) -> tuple[_Leg, _Leg]:
     Returns:
         tuple[_Leg, _Leg]: (no_leg, yes_leg). The two legs sit on different
             markets and buy opposite sides by construction — leg_sides returns
-            exactly one "no" and one "yes" for every pair type.
+            exactly one "no" and one "yes".
+
+    Raises:
+        ValueError: For a spec whose pair type is not "time_series"
+            (scanner.leg_sides), before any leg is built. select_portfolio
+            refuses such a spec first. Should one get here, the live path
+            stops before any position read or order and execute_trades
+            records the pair as manual_review; a dry run raises out of
+            execute_trades.
     """
-    # Cross-module: the pair type alone decides which market buys which side
+    # Cross-module: which market buys which side, the time-series legs (YES on
+    # market_a, NO on market_b); any other pair type raises here
     side_a, side_b = leg_sides(spec.pair.pair_type)
     # Cross-module: the per-contract prices of exactly those sides, in the
     # same (market_a, market_b) order
@@ -357,11 +363,10 @@ _V2_PRICE_QUANTUM = Decimal("0.0001")
 # exactly -count (i.e. an `ask` really did open a NO position, as _V2_LEG_SIDE
 # hypothesises). One confirmation proves the mapping for every later trade
 # this run — so once confirmed the check is skipped and the backstop costs
-# one extra positions read per PROCESS, not one per trade. Shared across pair
-# types on purpose:
-# it verifies the exchange's side mapping, not any market, so a same_title NO
-# fill (on market_a) proves it for a time_series NO fill (on market_b) and
-# vice versa. Deliberately not persisted anywhere: a fresh process
+# one extra positions read per PROCESS, not one per trade. Shared across
+# pairs on purpose: it verifies the exchange's side mapping, not any market,
+# so one pair's NO fill proves it for every later pair's NO leg, whichever
+# market that leg is on. Deliberately not persisted anywhere: a fresh process
 # re-verifies, which is cheap and keeps the check honest across restarts and
 # API changes.
 _V2_NO_MAPPING_CONFIRMED = False
@@ -816,9 +821,9 @@ def _rollback_floor_cents(no_leg: _Leg) -> int:
         int: The floor in cents, always within [1, 99].
     """
     # round() BEFORE int: this bound is deliberately cent-quantized regardless
-    # of the market's own tick grid, and no_leg.price_dollars (pair.nA for a
-    # same_title pair, pair.nB for a time_series pair) is generally NOT a clean
-    # cent value by the time it reaches here — scanner.enrich_with_orderbook_prices
+    # of the market's own tick grid, and no_leg.price_dollars (pair.nB of a
+    # time_series pair) is generally NOT a clean cent value by the time it
+    # reaches here — scanner.enrich_with_orderbook_prices
     # replaces the raw best-ask with a depth-weighted average across qualifying
     # book levels, so it can land anywhere in (0, 1) as a float (e.g. 0.57
     # stored as 0.5699999999999998), which int() alone would truncate to 56.
@@ -941,8 +946,8 @@ def _build_no_order_v2(leg: _Leg) -> dict:
     verification at the first live submission — correct it in _V2_LEG_SIDE.
 
     Args:
-        leg (_Leg): The NO leg from _ordered_legs (market_a for a same_title
-            pair, market_b for a time_series pair). Uses leg.market for the
+        leg (_Leg): The NO leg from _ordered_legs (market_b, the later
+            contract of a time_series pair). Uses leg.market for the
             ticker, tick grid and exchange shard, leg.price_dollars for the
             price cap, and leg.count for the contract count.
 
@@ -988,8 +993,8 @@ def _build_yes_order_v2(leg: _Leg) -> dict:
     it in _V2_LEG_SIDE.
 
     Args:
-        leg (_Leg): The YES leg from _ordered_legs (market_b for a same_title
-            pair, market_a for a time_series pair). Uses leg.market for the
+        leg (_Leg): The YES leg from _ordered_legs (market_a, the earlier
+            contract of a time_series pair). Uses leg.market for the
             ticker, tick grid and exchange shard, leg.price_dollars for the
             price cap, and leg.count for the contract count.
 
@@ -1032,9 +1037,8 @@ def _build_rollback_order_v2(no_leg: _Leg) -> dict:
     close as rollback_failed.
 
     Args:
-        no_leg (_Leg): The NO leg to unwind (market_a for a same_title pair,
-            market_b for a time_series pair). Supplies the price, ticker,
-            shard and count.
+        no_leg (_Leg): The NO leg to unwind (market_b, the later contract of
+            a time_series pair). Supplies the price, ticker, shard and count.
 
     Returns:
         dict: JSON body for POST config.V2_ORDER_PATH.
@@ -1810,9 +1814,9 @@ def _required_cents_by_shard(portfolio: list) -> dict[int, int]:
     market_a leg charges spec.pair.market_a.exchange_index (cost_with_fees_a)
     and the market_b leg charges spec.pair.market_b.exchange_index
     (cost_with_fees_b) — whichever side each buys. TradeSpec.cost_with_fees_a
-    / cost_with_fees_b are MARKET costs, not side costs, which is what lets
-    this pairing stay the same for both pair types. A pair whose legs share a
-    shard simply adds both costs to that one shard.
+    / cost_with_fees_b are MARKET costs, not side costs, which is what keeps
+    this pairing independent of which side each leg buys. A pair whose legs
+    share a shard simply adds both costs to that one shard.
 
     Args:
         portfolio (list): TradeSpec objects selected for execution. Each must
@@ -2388,7 +2392,7 @@ def _confirm_v2_no_mapping(
 
     _execute_one calls it after the NO leg filled and before the YES leg is
     sent. After one confirmation (_V2_NO_MAPPING_CONFIRMED) it does nothing
-    for the rest of the process, for every market and pair type, unless the
+    for the rest of the process, for every market and pair, unless the
     mapping has been disproven (below). Its reads (_position_count_once) are
     single-shot, never retried, because they happen while the NO position
     is unhedged.
@@ -2620,7 +2624,9 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     (fill_or_kill), then, if it filled, the YES leg (fill_or_kill). If the
     YES leg does not fill, it unwinds the NO leg with _rollback_no_leg, which
     checks that the unwind closed it. Every order goes through
-    _submit_order_v2, and the rules are the same for both pair types.
+    _submit_order_v2. A spec of any pair type but time-series raises
+    ValueError at _ordered_legs, before any position is read or any order is
+    built.
 
     A "canceled" reply (including Kalshi's 409 kill) means the order did not
     fill. An exception is uncertain — the order may have filled before a
@@ -2692,6 +2698,11 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
             earlier in this process, or an add-on that no longer matched the
             held pair it adds to), "rolled_back", "rollback_failed" or
             "manual_review" (see reporter.TradeResult).
+
+    Raises:
+        ValueError: For a spec whose pair type is not "time_series"
+            (_ordered_legs), with nothing read or sent; execute_trades
+            records the pair as manual_review.
     """
     # However the pair ends, an unsent held place goes back to the pacer
     writes = _PairWrites(_ORDER_WRITE_PACER)
@@ -2734,8 +2745,8 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
             ),
         )
 
-    # Submission order is a property of the pair type, resolved in exactly one
-    # place: the NO leg is always first and is the leg the rollback unwinds.
+    # Submission order is resolved in exactly one place (_ordered_legs): the
+    # NO leg is always first and is the leg the rollback unwinds.
     no_leg, yes_leg = _ordered_legs(spec)
     order_no  = _build_no_order_v2(no_leg)
     order_yes = _build_yes_order_v2(yes_leg)
@@ -3034,10 +3045,10 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
     Execute each TradeSpec as a sequential two-leg trade, with pairs running
     concurrently across specs once the V2 NO-leg mapping is settled.
 
-    In live mode, each spec is handled by _execute_one(): the NO leg (market_a
-    for a same_title pair, market_b for a time_series pair — see
-    _ordered_legs) is submitted first, then the YES leg only if the NO leg
-    filled, with a floored-limit rollback of the NO leg if the YES leg fails.
+    In live mode, each spec is handled by _execute_one(): the NO leg (market_b,
+    the later contract of a time_series pair — see _ordered_legs) is
+    submitted first, then the YES leg only if the NO leg filled, with a
+    floored-limit rollback of the NO leg if the YES leg fails.
     Specs run concurrently via ThreadPoolExecutor, and their POSTs share one
     pacer (_ORDER_WRITE_PACER), where a pair's YES leg and unwind go ahead of
     other pairs' NO legs.
@@ -3076,8 +3087,8 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
 
     In dry_run mode, no orders are submitted. The function logs the intended
     trade — both legs in SUBMISSION order (NO leg first), with each leg's own
-    count and traded price, which for a time_series pair are NOT the pair's
-    nA/pB, ending " | adds to N held" for an add-on — and returns TradeResult
+    count and traded price (nB for the NO leg, pA for the YES leg), ending
+    " | adds to N held" for an add-on — and returns TradeResult
     objects with status="simulated", which are still written to the dev
     simulation Excel file by reporter.py.
 
@@ -3102,8 +3113,15 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
             "manual_review" (a
             leg's fill state could not be attributed to this order, or an
             exception escaped the worker — no automated order was submitted in
-            response). The list is in SUBMISSION order: results[i] corresponds
-            to specs[i].
+            response, which includes a spec of a pair type other than
+            time-series, stopped by _ordered_legs before any read or order).
+            The list is in SUBMISSION order: results[i] corresponds to
+            specs[i].
+
+    Raises:
+        ValueError: In dry_run mode only, for a spec whose pair type is not
+            "time_series" (_ordered_legs). select_portfolio refuses such a
+            spec first.
     """
     # ThreadPoolExecutor(max_workers=0) raises ValueError, so short-circuit empty input
     if not specs:
@@ -3966,8 +3984,9 @@ def sell_positions(client: Any, plans: list, *, dry_run: bool) -> list[SaleResul
     Sell the held contracts each plan names, one plan at a time, in order.
 
     A plan is a take-profit sale of a whole position, or a Kelly trim, which
-    sells an exact held pair, or a lone leg whose partner has paid out, down
-    to its Kelly size. main._run_prod calls this before it buys anything.
+    sells an exact held time-series pair, or a lone leg whose partner has
+    paid out, down to its Kelly size. main._run_prod calls this before it
+    buys anything.
     Each held market gets at most one order (a partner that has paid out
     gets none), sent once, never retried; nothing is sent for a position
     whose markets no longer hold what the plan was made on, or while the V2

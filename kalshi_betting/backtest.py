@@ -40,9 +40,9 @@ Dependencies:
     Imports run_backtest_sweep and BacktestSweep from backtester.py,
     generate_dashboard from dashboard.py, build_historical_client /
     build_prod_live_client / load_series_categories (Kalshi's /series
-    listing, read once and handed to both the sweep, whose same-title sport
-    check files each series by it, and the dashboard's returns-by-category
-    labels) / load_series_fee_multipliers (each series' fee multiplier from
+    listing, read once and handed to the dashboard's returns-by-category
+    labels and the Data page) / load_series_fee_multipliers (each series'
+    fee multiplier from
     the same listing, handed to the sweep and carried, not yet used) from
     historical.py, load_risk_free_rates
     (the T-bill yields the page's Sharpe and Sortino subtract) from
@@ -210,7 +210,7 @@ Notes:
     --no-cap-sweep returns cap_sweep=None, and the dashboard then offers the
     run's own cap only — a far smaller page, built far faster. Like the band
     and k sweeps it is backtest-only: live sizing reads
-    its caps from its run's config.LiveSettings, built from the saved live
+    its cap from its run's config.LiveSettings, built from the saved live
     defaults.
 
     The "Sell" family is ON by default too (sell_sweep=True): the result
@@ -1376,8 +1376,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Read each settled market's scheduled close (the close a live run "
              "saw, from a rule learned per series from the captures under "
              "backtest_cache/scheduled_closes/) for days to maturity, the "
-             "ranking, a cross-event pair's order, gap and horizon and the "
-             "same-title close gate; a series with no rule keeps the realized "
+             "ranking, and a cross-event pair's order, gap and horizon; a "
+             "series with no rule keeps the realized "
              "close (default: config.BACKTEST_SCHEDULED_CLOSE, currently "
              f"{'on' if BACKTEST_SCHEDULED_CLOSE else 'off'}). Backtest only.",
     )
@@ -1446,9 +1446,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-cap-sweep", action="store_true",
         help="Skip the per-trade size-cap sweep: the dashboard offers the "
              "run's own cap (config.BUDGET_FRACTION) only — a far smaller, "
-             "faster page. Backtest only — live sizing reads its caps from "
-             "the saved live defaults, or main.py's own --size-cap / "
-             "--same-title-size-cap for one live run",
+             "faster page. Backtest only — live sizing reads its cap from "
+             "the saved live defaults, or main.py's own --size-cap for one "
+             "live run",
     )
     parser.add_argument(
         "--no-sell-sweep", action="store_true",
@@ -1844,10 +1844,10 @@ def main() -> None:
             " (the band sweep's grid bands are unaffected)" if band_sweep else "",
         )
 
-    # Kalshi's /series listing, read once: the same-title sport check files
-    # each series by it (DR-79), and the dashboard files each trade under its
-    # series' category and tags. One cached read-only GET of /series, which
-    # never raises (it falls back to a stale copy or to {})
+    # Kalshi's /series listing, read once: the dashboard files each trade under
+    # its series' category and tags. One cached read-only GET of /series, which
+    # never raises (it falls back to a stale copy or to {}); its weekly
+    # refresh also rewrites the fee multipliers read just below
     series_categories = load_series_categories(live_client)
     # ... and each series' fee multiplier from the same cache file (the line
     # above's refresh writes both; upgrade=True makes the one fetch that adds
@@ -1887,11 +1887,9 @@ def main() -> None:
         maturity_sweep=maturity_sweep,
         # Every trade's order book is built from this table (None: top of book)
         depth_model=depth_model,
-        # The listing the same-title label check files each series by
-        series_categories=series_categories,
         # Each series' fee multiplier (carried only)
         fee_multipliers=fee_multipliers,
-    )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep, and the lazy sell and Rebalance families (sell_sweep, rebalance_sweep) unless --no-sell-sweep / --no-rebalance-sweep
+    )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep, and the lazy sell and Rebalance families (sell_sweep, rebalance_sweep) unless --no-sell-sweep / --no-rebalance-sweep
     # What the dashboard is handed, saved before the page is built, so
     # --dashboard-only can rebuild the page (or finish a build that stopped)
     # without running the backtest again. period_end is the window's last day,
@@ -1953,9 +1951,9 @@ def main() -> None:
     # interval_discount is the resolved k these trades were sized at, which
     # the Risk section's Kelly scatter must price on
     #
-    # series_categories (read above, the same copy the sweep's pairs were
-    # filed by) files each trade under Kalshi's own series category and tags
-    # for the Returns Decomposition breakdown.
+    # series_categories (read above, before the sweep) files each trade under
+    # Kalshi's own series category and tags for the Returns Decomposition
+    # breakdown.
 
     # The T-bill yields every Sharpe and Sortino on the page subtracts; never
     # raises (falls back to the saved copy, then "unavailable"), but an

@@ -15,7 +15,7 @@ python3 -m kalshi_betting.main --mode dev --sandbox-balance 1000
 python3 -m kalshi_betting.main --mode dev --dry-run
 
 # Production live trading, from the saved live defaults (live_defaults.json in the
-# repo root: tier floors, spread band, k, per-trade and same-title caps, category/tag
+# repo root: tier floors, spread band, k, per-trade cap, category/tag
 # filter, rebalancing with its minimum price movement and "rebalance until" days (with it
 # on, a production run trims held pairs before it buys and may add to them), and the sell
 # level and its minimum of days — each overridable for one run by the flags below, which
@@ -23,8 +23,10 @@ python3 -m kalshi_betting.main --mode dev --dry-run
 # "(default: X)" on its "Live settings:" line and, when it submits orders under one,
 # names in a WARNING). With no saved file, a refused one, or one an older version saved
 # (holding add_to_held_pairs, trim_to_kelly or trim_min_rise, which rebalance and
-# min_price_move replaced, or categories, the old list of categories to trade, which
-# exclude_categories replaced — every file saved before that change holds it: save it
+# min_price_move replaced; categories or tags, the old lists of categories and tags to
+# trade, which exclude_categories and exclude_tags replaced; or same_title_size_cap, an
+# extra cap on same-title pairs, which nothing replaced, since the bot trades
+# time-series pairs only — every file saved before that last change holds it: save it
 # again through the defaults server, do not delete it),
 # every live run (prod and
 # dev, scheduled or by hand) exits 2 before anything is logged or requested; it never
@@ -53,19 +55,19 @@ python3 -m kalshi_betting.main --mode prod --dry-run
 python3 -m kalshi_betting.main --mode prod --dry-run --result-file /tmp/run_result.json
 
 # Production dry run replaying the live rule as it stood before the 2026-09-27
-# decision, for this run only. It gives all twelve toggles, because a toggle no flag
-# gives keeps its saved value (--no-rebalance and --no-sell too, so a saved "yes" or a
+# decision, for this run only (for time-series pairs, the only kind the bot trades).
+# It gives all eleven toggles, because a toggle no flag gives keeps its saved value (--no-rebalance and --no-sell too, so a saved "yes" or a
 # saved sell level does not leak into a replay of a rule that never rebalanced or sold;
 # --no-rebalance clears the saved minimum price movement and "rebalance until" setting as
 # well); each flag that
 # departs from the saved live defaults is marked "(default: X)" on the "Live
 # settings:" line
-python3 -m kalshi_betting.main --mode prod --dry-run --tier-floors --spread-min 0 --spread-max 1 --interval-discount 0.75 --size-cap 20 --same-title-size-cap 100 --no-rebalance --no-sell --no-exclude-category --no-exclude-tag
+python3 -m kalshi_betting.main --mode prod --dry-run --tier-floors --spread-min 0 --spread-max 1 --interval-discount 0.75 --size-cap 20 --no-rebalance --no-sell --no-exclude-category --no-exclude-tag
 
 # Production dry run that rebalances (no orders, nothing saved): before buying, sell part of each
-# exact held pair, and of each lone leg whose earlier market paid out $0 (the later market of a
-# time-series pair, still held), that has outgrown its Kelly share of the portfolio value, by the
-# backtest's rule (config.kelly_trim_count), once 7 calendar days
+# exact held time-series pair, and of each lone leg whose earlier market paid out $0 (the later
+# market of a time-series pair, still held), that has outgrown its Kelly share of the portfolio
+# value, by the backtest's rule (config.kelly_trim_count), once 7 calendar days
 # (config.REBALANCE_MIN_DAYS_SINCE_TRADE) have passed since the last fill on its markets, a fill
 # by hand included, and only if
 # Kalshi's list of the account's fills reaches back that far; and add to the pairs the account
@@ -226,8 +228,8 @@ python3 -m kalshi_betting.backtest --no-band-sweep
 # and the scenario explorer — skipping it gives a far smaller, faster page whose
 # Size cap selects offer the run's own cap only — with the tier floors off too, since
 # the tier-floors-off runs then have no size-cap sweep of their own either; backtest
-# only — live sizing reads its caps from the saved live defaults, or main.py's --size-cap /
-# --same-title-size-cap for one live run, through the run's LiveSettings)
+# only — live sizing reads its cap from the saved live defaults, or main.py's --size-cap
+# for one live run, through the run's LiveSettings)
 python3 -m kalshi_betting.backtest --no-cap-sweep
 
 # Backtest without the dashboard's "Rebalance" family (ON by default in the CLI, and lazy like
@@ -358,9 +360,10 @@ python3 -m kalshi_betting.scheduler
 # server keeps running, opening nothing. Run
 # it in the scheduler's checkout before the first live run, in the first-run order of the
 # saved-live-defaults paragraph under Key Patterns (--seed proposes Rebalance yes): with no
-# saved file, or one saved before Rebalance, every live run exits 2. Confirm and trade (on /confirm it saves
+# saved file, or one an older version saved (every file saved before the same-title cap was
+# removed), every live run exits 2. Confirm and trade (on /confirm it saves
 # first; on /trade it trades the saved defaults) and Dry run (no orders, nothing saved) start
-# `python -m kalshi_betting.main --mode prod` with all twelve toggles as flags, in its own
+# `python -m kalshi_betting.main --mode prod` with all eleven toggles as flags, in its own
 # session; each run's folder is under live_runs/, and its page is /runs/<id>. Run it again
 # while this checkout's servers run and it only opens the page again (nothing started); a
 # defaults-server port held by that server running code from before a change to the
