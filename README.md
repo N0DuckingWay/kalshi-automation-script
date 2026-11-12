@@ -343,7 +343,7 @@ main.py
   │                                   fits); at most one time-series trade per ladder (none on
   │                                   a held ladder, and none on the ladder of a trade picked earlier in the run;
   │                                   an add-on to a held pair is blocked only by the run's earlier picks)
-  ├─ trader.pre_execution_check()  — re-fetch order books, drop pairs whose prices moved or whose depth is no longer reachable at the limit about to be submitted, counting only the fresh levels that still keep an edge after the fee (a time-series pair also when its later book has no YES ask now, or its fresh spread exceeds the band's ceiling)
+  ├─ trader.pre_execution_check()  — re-fetch order books, drop pairs whose prices moved or whose depth is no longer reachable at the limit about to be submitted, counting only the fresh levels that still keep an edge after the fee (a time-series pair also when its later book has no YES ask now, or its fresh spread exceeds the band's ceiling); first logs each pair's scanned and fresh leg prices, so a price that moved without dropping the pair still shows in the run log
   ├─ trader.ensure_shard_collateral() — move funds onto the shards the selected legs settle against (prod; dry-run only plans)
   ├─ trader.execute_trades()       — submit fill-or-kill orders leg-by-leg to the V2 order endpoint, each leg routed to its own market's shard (parallel across pairs once the first NO fill confirms the V2 order mapping, one at a time before that; rollback on partial fill; a disproven mapping stops the rest of the run)
   ├─ auth.read_account_balance()   — re-read the post-trade cash for the Excel log (falls back to the pre-trade cash if this read fails)

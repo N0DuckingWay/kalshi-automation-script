@@ -6805,6 +6805,71 @@ def enrich_with_orderbook_prices(
     return enriched
 
 
+def _log_rechecked_prices(spec: Any, paired: list[tuple[float, float, float]]) -> None:
+    """
+    Log one trade's scanned leg prices beside the prices its fresh books give now.
+
+    validate_pair_price calls this once per trade, right after it reads both
+    order books again and before it decides anything, so every trade the
+    re-check sees leaves one INFO line in the run log, whether it then passes
+    or is dropped. That line is how a run's log shows a price that moved
+    between the scan and the orders without moving far enough to drop the
+    trade.
+
+    Both prices are a leg's average over the trade's own contract count
+    (spec.x), the way the sizer priced it: the scanned price is the one stored
+    on the pair (leg_prices), and the fresh price is prefix_fill_prices over
+    the fresh books. The fresh books are read before the gap and fee filters,
+    so a trade that is then dropped still shows how far its prices went. The
+    line ends "unchanged" when both legs are within config.PRICE_EPSILON of
+    their scanned prices; otherwise "moved", with how much more or less one
+    contract pair (one contract on each leg) now costs. When the fresh books
+    no longer hold the full count, the line says so and gives no fresh price.
+
+    Args:
+        spec (Any): The TradeSpec about to be sent; its pair and its count x
+            (whole contracts per leg, >= 1).
+        paired (list[tuple[float, float, float]]): The fresh books' levels
+            from _pair_orderbooks: (YES leg price, NO leg price, contracts),
+            prices in dollars, cheapest first.
+    """
+    pair = spec.pair
+    side_a, side_b = leg_sides(pair.pair_type)
+    scanned_a, scanned_b = leg_prices(pair)
+    # Put each level in market order (market_a's leg first), the order the
+    # sizer's prices are stored in; leg_sides says which market buys NO
+    a_is_no = side_a == "no"
+    levels = [(np_, yp, q) if a_is_no else (yp, np_, q) for yp, np_, q in paired]
+    # Each leg's average over the trade's own count, from the fresh books
+    fresh = prefix_fill_prices(levels, spec.x)
+    leg_a = f"{side_a.upper()} on {pair.market_a.ticker} scanned ${scanned_a:.4f}"
+    leg_b = f"{side_b.upper()} on {pair.market_b.ticker} scanned ${scanned_b:.4f}"
+    if fresh is None:
+        held = sum(q for _, _, q in levels)
+        logging.info(
+            "Pre-execution prices for '%s', %d contract(s) per leg: %s; %s — the "
+            "thinner book now holds only %.1f of them, so there is no fresh price",
+            pair.canonical_title, spec.x, leg_a, leg_b, held)
+        return
+    fresh_a, fresh_b = fresh
+    if (abs(fresh_a - scanned_a) <= PRICE_EPSILON
+            and abs(fresh_b - scanned_b) <= PRICE_EPSILON):
+        verdict = "unchanged"
+    else:
+        # The change in what one contract on each leg costs together
+        change = (fresh_a + fresh_b) - (scanned_a + scanned_b)
+        if change > PRICE_EPSILON:
+            verdict = f"moved: one contract pair now costs ${change:.4f} more"
+        elif change < -PRICE_EPSILON:
+            verdict = f"moved: one contract pair now costs ${-change:.4f} less"
+        else:
+            verdict = "moved: one contract pair costs the same in total"
+    logging.info(
+        "Pre-execution prices for '%s', %d contract(s) per leg: %s, now $%.4f; "
+        "%s, now $%.4f — %s",
+        pair.canonical_title, spec.x, leg_a, fresh_a, leg_b, fresh_b, verdict)
+
+
 def validate_pair_price(client: Any, spec: Any, *, settings: LiveSettings | None = None) -> bool:
     """
     Re-fetch both order books for a TradeSpec immediately before execution and
@@ -6822,6 +6887,9 @@ def validate_pair_price(client: Any, spec: Any, *, settings: LiveSettings | None
     is not time-series) and the trade should be skipped. Every False return
     is logged here, once, at WARNING, with its reason — callers must not log
     the drop again.
+    Once both books are read, before any price check, it logs one INFO line
+    with each leg's scanned and fresh prices (_log_rechecked_prices), so a
+    price that moved without dropping the trade still shows in the run log.
 
     Args:
         client: Authenticated KalshiClient from auth.build_client().
@@ -6861,6 +6929,9 @@ def validate_pair_price(client: Any, spec: Any, *, settings: LiveSettings | None
     # opposite-side bids, and the NO leg's market comes from leg_sides
     no_levels, yes_levels = _leg_ask_levels(pair, ob_a, ob_b)
     paired     = _pair_orderbooks(no_levels, yes_levels)
+    # One INFO line per trade with its scanned and fresh leg prices, before any
+    # check, so the log shows a price that moved even when the trade still passes
+    _log_rechecked_prices(spec, paired)
     # The scan-time price-sum ceiling: the trade must still qualify now
     max_sum    = _pair_max_sum(pair, settings)
     qualifying = [
