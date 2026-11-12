@@ -51,7 +51,7 @@ In this file:
 | Pair | Two contracts bought together as one bet: Yes on one market, No on another |
 | Leg | One of the two contracts in a pair |
 | Time-series pair | One question at two deadlines; the bot buys Yes on the earlier and No on the later. It loses if the event happens between the deadlines |
-| Same-title pair | Two identically worded markets, listed separately, whose Yes prices differ by 5¢ or more; the bot buys No on the pricier and Yes on the cheaper |
+| Same-title pair | Two identically worded markets listed by two different series. The bot bought them (No on the pricier, Yes on the cheaper) until November 2026; it no longer looks for them and never trims one it holds |
 | Ladder | One event that lists the same question at several deadlines |
 | Kelly size | How much the sizing rule says to put on a trade, from its chance of paying and its price after fees, held to the size cap |
 | Portfolio value | Cash plus what the open positions are worth |
@@ -73,7 +73,7 @@ A pull request bullet. Before: "`_ChunkVisitor.maturity` files a simulated run a
 
 A title. Before: "Backtest "Rebalance until": the Rebalance family covers the three choices (rebalance lone legs, PR 4b)". After: "Backtest also runs "stop rebalancing 1 or 7 days before the close", ready for the dashboard (PR 4b of rebalance lone legs)".
 
-A code comment. Before: "# DR-74 gate (added 2026-09-25 after the NCAA mispair drove a −48% drawdown); fail closed on None". After: "# Same-title pairs must close within an hour of each other (DR-74), so a men's and a women's game with the same title are never paired. An unknown close time refuses the pair."
+A code comment. Before: "# DR-02/54: skip same-series identical wording". After: "# Two events of one series worded identically are two different games or windows, not one question at two deadlines (DR-02), so they are never paired."
 
 The opening of a pull request description:
 

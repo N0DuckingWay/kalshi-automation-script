@@ -1206,10 +1206,10 @@ LARGE_GROUP_WARN_THRESHOLD    = 1000
 # and 99c: combos trade by request for quote, so most list $0.00 / $1.00.
 # Those that pass are parlays of sports games or races whose
 # wording names no deadline, which the cumulative-deadline rule refuses, so
-# none can be a time-series leg. A same-title pair needs the exact title on
-# both markets; a combo's title is its list of picks ("yes A,yes B,..."),
-# which no ordinary market's title was found to match, and two combos never
-# pair (DR-54/55, the one-series rule). The measurements are in
+# none can be a time-series leg. Two identically worded combos are refused
+# even before that rule: the one-series rule, checked first, refuses
+# identical wording on two events of one series, and it counts every combo
+# series (KXMVE*) as one series (DR-54/55). The measurements are in
 # docs/claude/overview.md's MVE paragraph.
 #
 # When off: the live fetch (scanner.fetch_open_events_with_markets) skips the

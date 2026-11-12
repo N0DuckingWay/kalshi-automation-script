@@ -10134,7 +10134,6 @@ def _prepare_candidates(
 
     It looks for time-series pairs only (one question at two deadlines):
     one grouping (_group_by_normalized_title) and one _extract_pairs call.
-    The backtest finds no same-title pairs.
 
     The corpus (the settled markets the fetch returns, normally streamed off
     disk) is walked TWICE: _index_eligible_keys counts it, prefilters it,
