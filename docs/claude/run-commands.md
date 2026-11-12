@@ -91,7 +91,7 @@ python3 -m kalshi_betting.main --mode prod --dry-run --tier-floors --spread-min 
 # `Dry run: sizing as if the sales filled — cash $X (+$Y)`: the buys are then sized on the cash
 # those trims would free, and the pairs trimmed stay held and are not added to. A saved file
 # without the setting reads it as off. Run `v2_probe --step yes-close` (below) and see it PASS
-# before saving rebalance on: with it saved, every live run, the Monday one included, trims before
+# before saving rebalance on: with it saved, every live run, the scheduled ones included, trims before
 # it buys. First-run order for rebalancing: the paragraph after the live-trimming one under Key
 # Patterns
 python3 -m kalshi_betting.main --mode prod --dry-run --rebalance
@@ -123,7 +123,7 @@ python3 -m kalshi_betting.main --mode prod --dry-run --no-rebalance
 # `Positions to sell this run: N of M` and, when something would sell, `Dry run: sizing as
 # if the sales filled — cash $X (+$Y)`: the buys are then sized on the cash those sales
 # would free, and the markets sold stay out of them. Run `v2_probe --step yes-close` (below)
-# and see it PASS before saving a sell level: with one saved, every live run, the Monday one
+# and see it PASS before saving a sell level: with one saved, every live run, the scheduled ones
 # included, sells before it buys. --no-sell sells nothing this run whatever is saved (and
 # clears the saved minimum of days too). First-run order for selling: the live-selling
 # paragraph under Key Patterns
@@ -327,10 +327,10 @@ python3 -m kalshi_betting.market_details capture-closes
 # timing fields. Read-only, prints the counts and a few examples of each failing check, exits 1 on any failure
 python3 -m kalshi_betting.market_details check
 
-# Weekly scheduler daemon (runs prod every Monday 09:00 on the host's clock —
-# config.SCHEDULED_RUN, from the saved live defaults; logs CRITICAL at startup unless the
-# host keeps America/Los_Angeles, and an ERROR when no live defaults are saved or the file
-# is refused, since every run would exit 2)
+# Scheduler daemon (runs prod every day at 07:00 and 21:00 on the host's clock —
+# config.SCHEDULER_RUN_TIMES, from the saved live defaults; logs CRITICAL at startup unless
+# the host keeps America/Los_Angeles, and an ERROR when no live defaults are saved or the
+# file is refused, since every run would exit 2)
 python3 -m kalshi_betting.scheduler
 
 # The dashboard, the live defaults and trading from a browser. ./start_dashboard.sh starts two

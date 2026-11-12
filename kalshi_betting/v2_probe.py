@@ -58,7 +58,7 @@ Dependencies:
     NOTHING IMPORTS THIS MODULE. It is not referenced by main.py, scheduler.py,
     trader.py, or any other pipeline module, and tests/test_v2_probe.py asserts
     that stays true. Adding an import of v2_probe anywhere in the pipeline would
-    put real-money probe orders one code path away from the weekly scheduler.
+    put real-money probe orders one code path away from the scheduler.
 
 Notes:
     PROD ONLY. auth.build_client("prod") is hardcoded — the sandbox implements

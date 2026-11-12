@@ -124,7 +124,7 @@ from .strategy import TradeSpec
 PROD_LOG_PATH = PROJECT_ROOT / "trade_log.xlsx"
 
 # Sidecar lock file coordinating concurrent writers to PROD_LOG_PATH (e.g. the
-# weekly scheduler and a manual run racing) — see _acquire_lock().
+# scheduler and a manual run racing) — see _acquire_lock().
 _LOCK_PATH = PROD_LOG_PATH.with_name(PROD_LOG_PATH.name + ".lock")
 # Bounded acquire loop: a non-blocking flock() attempt polled at this interval,
 # up to this many total seconds, rather than a blocking flock() call — so a

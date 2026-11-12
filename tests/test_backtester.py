@@ -12855,8 +12855,8 @@ class TestBandSweep:
                  if m.startswith("Entry checkpoint (backtest): ")]
         assert len(lines) == 1
         assert lines[0].startswith(
-            f"Entry checkpoint (backtest): {label} (config.SCHEDULED_RUN, the live "
-            "scheduler's run time): ")
+            f"Entry checkpoint (backtest): {label} (config.SCHEDULED_RUN, once a "
+            "week; the live scheduler runs at config.SCHEDULER_RUN_TIMES instead): ")
 
     def test_scenarios_are_ordered_band_then_k_then_population(self, golden_band_sweep):
         order = {"all": 0, "time_series": 1, "ladder": 2, "cross": 3}
@@ -15915,7 +15915,8 @@ class TestEntryCheckpointLogging:
     start near date.max still reaches _prepare_candidates' own error."""
 
     _PREFIX = "Entry checkpoint (backtest): "
-    _SOURCE = " (config.SCHEDULED_RUN, the live scheduler's run time): "
+    _SOURCE = (" (config.SCHEDULED_RUN, once a week; the live scheduler runs at "
+               "config.SCHEDULER_RUN_TIMES instead): ")
 
     @staticmethod
     def _freeze(monkeypatch, today: date) -> None:

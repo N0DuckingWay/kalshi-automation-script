@@ -553,8 +553,8 @@ Notes:
     itself read against the configured switch the run recorded
     (BacktestSweep.config_same_event_ladders), naming a departure from this
     checkout's config rather than rendering a bare on/off. The line under it
-    names the entry checkpoint (BacktestSweep.entry_checkpoint), the live
-    scheduler's weekly run time at which every simulated trade was opened. The
+    names the entry checkpoint (BacktestSweep.entry_checkpoint), the weekly
+    moment (config.SCHEDULED_RUN) at which every simulated trade was opened. The
     fills line after it says how many of the primary scenario's trades walked
     a modeled order book and how many filled at the top of the book, and, with
     no depth model, that every trade did (_fills_html). Trade rows read what
@@ -5510,21 +5510,22 @@ def _entry_checkpoint_html(sweep: BacktestSweep | None) -> str:
     """
     Render the page-header line naming the weekly moment at which the run opened its trades.
 
-    That moment is the live bot's weekly run time (config.SCHEDULED_RUN),
-    recorded as BacktestSweep.entry_checkpoint; generate_dashboard() prints
-    this line under the run-settings line. Anything but a non-empty str (no
-    sweep, a hand-built sweep, a test stand-in) reads "not recorded".
+    That moment is config.SCHEDULED_RUN, recorded as
+    BacktestSweep.entry_checkpoint; the live bot runs at other times
+    (config.SCHEDULER_RUN_TIMES), so the line says so. generate_dashboard()
+    prints this line under the run-settings line. Anything but a non-empty
+    str (no sweep, a hand-built sweep, a test stand-in) reads "not recorded".
 
     Args:
         sweep (BacktestSweep | None): The run's sweep payload, or None.
 
     Returns:
-        str: One grey <p> line: "Entry checkpoint: <label> — the live
-            scheduler's run time", or "Entry checkpoint: not recorded".
+        str: One grey <p> line: "Entry checkpoint: <label>, once a week (live
+            runs are at other times)", or "Entry checkpoint: not recorded".
     """
     label = None if sweep is None else getattr(sweep, "entry_checkpoint", None)
     if isinstance(label, str) and label:
-        text = f"{html.escape(label)} — the live scheduler's run time"
+        text = f"{html.escape(label)}, once a week (live runs are at other times)"
     else:
         text = "not recorded"
     return f'<p style="color:#616161; font-size:14px;">Entry checkpoint: {text}</p>'
@@ -7262,7 +7263,7 @@ def _sell_select_title(hold_days: int) -> str:
         live_rule = (f"has held its level for {hold_days} days in a row (read on Kalshi's "
                      "hourly candles for the days before the run)")
     return ("no selling: every position is held until its markets pay out. A level: at each "
-            "weekly checkpoint (the live run's time), a position (a pair) is sold whole "
+            "weekly entry checkpoint, a position (a pair) is sold whole "
             "once its realized profit (what selling it at the "
             f"bids would return, after the sale's fees, less what it cost) {rule} It is sold "
             "only while at least the days the Min. days to maturity select names remain "
