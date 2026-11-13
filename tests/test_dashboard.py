@@ -3,11 +3,12 @@ the _max_drawdown empty/all-NaN guard (BS-30), the _sharpe/_sortino
 annualization base and its per-row use in the benchmark table (DR-56), the
 interval-discount (k) section, whose curve and per-k table follow the page-wide
 filter bar's k and size cap, the risk-free rate every Sharpe and Sortino
-subtracts (the TestRiskFree* classes and TestCapitalDeployedParity), and the
-filter bar's "Save as live defaults…" button (TestSaveLiveDefaultsButton), whose
-clicked address is read back through defaults_server's own request handler and
-proposal parser, and its "Trade using defaults…" link (TestTradeUsingDefaultsLink),
-whose id sits near the top of the page.
+subtracts (the TestRiskFree* classes and TestCapitalDeployedParity), the
+filter bar's sync with the live dashboard's Trading tab (TestTradingSync),
+whose told query is read back through defaults_server's own request handler
+and proposal parser and which shows the Trading tab's proposal, and the names
+file each page writes for that tab (TestFilterNamesFile), read back by
+defaults_server's own reader.
 
 generate_dashboard() pulls in yfinance (network) and Plotly's full HTML
 serialization; the escaping and drawdown fixes are exercised directly against
@@ -2766,7 +2767,7 @@ class TestLiveRuleHeader:
         or a twin's), every other tag counting in full — and as
         config.trade_filter_for of the ticks themselves: the categories
         ticked, and the tags ticked, each tied to its category, exactly what
-        the save button sends. The short way of saying the tags (All tags,
+        the bar tells the Trading tab. The short way of saying the tags (All tags,
         then the tags kept unticked) must leave the same ticks.
 
         Args:
@@ -4183,8 +4184,10 @@ class TestDashboardFileIsOverwritten:
                                               date(2026, 1, 5), 1000.0)
         assert first == second == tmp_path / "backtest_dashboard.html"
         assert "stale" not in second.read_text(encoding="utf-8")
-        # Nothing else is left behind: no timestamped page, no temporary file
-        assert sorted(p.name for p in tmp_path.iterdir()) == ["backtest_dashboard.html"]
+        # Nothing else is left behind: no timestamped page, no temporary file;
+        # beside the page only the names its bar's menus list
+        assert sorted(p.name for p in tmp_path.iterdir()) == sorted([
+            "backtest_dashboard.html", config.BACKTEST_FILTER_NAMES_FILENAME])
 
 
 class TestEmpiricalKHatByBand:
@@ -6617,10 +6620,15 @@ class TestFilterSummary:
                          "D.text.unavailable", "D.text.khat_sized_at", "T.sell_note",
                          "D.text.sidecar_missing", "D.text.sidecar_empty",
                          "D.sell_levels[level].phrase", "D.sell_days[parseInt(d, 10)].phrase",
-                         # The menus' and a mix's words, and the save button's
-                         # reasons while the ticks stop a save
-                         "D.text.save_all_excluded", "D.text.save_too_long",
-                         "D.text.save_refused", "D.text.save_twin_split", "T.none_kept",
+                         # The menus' and a mix's words, and the notes on what
+                         # the Trading tab cannot follow or the bar cannot show
+                         "D.text.sync_all_excluded", "D.text.sync_too_long",
+                         "D.text.sync_refused", "D.text.sync_twin_split",
+                         "D.text.sync_unrecorded", "D.text.sync_not_here",
+                         "D.text.sync_join", "T.sync_off_grid", "T.sync_no_view",
+                         "T.sync_unlisted", "T.sync_not_with", "T.sync_fields",
+                         "T.sync_band_value", "T.sync_on", "T.sync_off", "T.sync_any",
+                         "T.none_kept",
                          "T.mix_note", "D.text.mix_unavailable", "D.text.mix_still_all",
                          "D.text.mix_still", "D.text.mix_still_at", "T.names_join",
                          "T.names_more", "T.sel_none", "T.sel_only", "T.sel_excluded",
@@ -6647,7 +6655,14 @@ class TestFilterSummary:
                        "nothing is left after the exclusions", "narrowed to",
                        "with tags excluded", "more tag", "except some tags",
                        "the whole run",
-                       "the run with"):
+                       "the run with",
+                       # Nor the notes on what the Trading tab cannot follow
+                       # or the bar cannot show
+                       "is not following this bar", "cannot show all of",
+                       "not among this page", "not shown on this page",
+                       "not listed on this page", "not shown together with",
+                       "changes only the settings chosen", "could not show the Trading",
+                       "stays excluded"):
             assert phrase not in js, phrase
 
 
@@ -6801,7 +6816,8 @@ def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
                 strict_ids: bool = False, setup_js: str = "",
                 files_root: Path | None | object = _PAGE_FOLDER,
                 files_missing: tuple = (), files_empty: tuple = (),
-                files_damaged: tuple = (), files_deferred: tuple = ()) -> dict:
+                files_damaged: tuple = (), files_deferred: tuple = (),
+                framed: bool = False) -> dict:
     """
     Run the page's scripts — the filter script, and with explorer=True the
     scenario explorer's before it — over a rendered page under
@@ -6824,13 +6840,17 @@ def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
             ["tick", id] — a reader clicking a check box of the Exclude
             categories or Exclude tags menu (_tick_category, _tick_tag) — ["open",
             id], ["outside", id] and ["key", name] — a reader opening a
-            menu, clicking elsewhere on the page and pressing a key — and
-            ["snap", name];
+            menu, clicking elsewhere on the page and pressing a key —
+            ["message", origin, source, data] — a message delivered to the
+            page's window from that origin, source "parent" (the window the
+            page is framed in), "self" or any other word (another page's
+            window) — and ["snap", name];
             each snapshot also carries "buttons" (id -> disabled), "titles"
             (id -> a button's hover text as it stands), "menus"
-            (each check-box menu's button text, ticks and rows) and "opened",
+            (each check-box menu's button text, ticks and rows), "opened",
             the window.open calls since the last snapshot as {url, target,
-            features}).
+            features}, and "posted", the messages the page sent its parent
+            window since the last snapshot as {message, origin}).
         pre (tuple): (select id, value) pairs set BEFORE the scripts run — a
             browser restoring a reader's last choice (for a check-box menu,
             the ticked row indexes joined by commas).
@@ -6875,6 +6895,10 @@ def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
             damaged gzip block's would.
         files_deferred (tuple): Keyword-only. Srcs whose load waits for a
             ["resolve_file", src] or ["reject_file", src] step.
+        framed (bool): Keyword-only. Run the page as the live dashboard
+            shows it, in a frame of its tab page: window.parent is another
+            window, whose postMessage records each message. False (default)
+            runs it as a page opened on its own.
 
     Returns:
         dict: The snapshots the steps took, by name.
@@ -6906,6 +6930,7 @@ def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
         *(f"__DAMAGED[{json.dumps(i)}] = true;" for i in damaged),
         *(f"__DEFERRED[{json.dumps(i)}] = true;" for i in deferred),
         "__setup(__PAGE);",
+        "__frame();" if framed else "",
         "__WAIT_EXPLORER = true;" if with_explorer else "",
         *(f"document.getElementById({json.dumps(i)}).value = {json.dumps(v)};" for i, v in pre),
         setup_js,
@@ -8148,25 +8173,111 @@ class TestFilterKAndCap:
             "(not recorded), k = 0.75, cap not recorded: 1 of its 5 trades.")
 
 
-# ─── The filter bar's "Save as live defaults…" button ────────────────────────
+# ─── The filter bar and the live dashboard's Trading tab ─────────────────────
 
-# The defaults server's confirmation page, as the button's address names it
-_SAVE_URL = f"http://{config.DEFAULTS_SERVER_HOST}:{config.DEFAULTS_SERVER_PORT}/confirm"
-# The Host header a browser sends to that address
-_SAVE_HOST = f"{config.DEFAULTS_SERVER_HOST}:{config.DEFAULTS_SERVER_PORT}"
+# The live dashboard's tab page at its two addresses, in config's order: the
+# only windows the bar tells its choices, and the only senders it listens to
+_ORIGINS = list(config.LIVE_DASHBOARD_ORIGINS)
+# The Host header a browser sends to the defaults server
+_SERVER_HOST = f"{config.DEFAULTS_SERVER_HOST}:{config.DEFAULTS_SERVER_PORT}"
+# A change event on the k select with its value as it stands: the script draws
+# the scenario on screen again and tells the Trading tab, as after any choice
+# the reader makes
+_AGAIN = [["fire", "flt-k"], ["settle"]]
 
 
-class TestSaveLiveDefaultsButton:
-    """The filter bar's "Save as live defaults…" button: rendered disabled,
-    enabled by the script only while the bar's scenario on screen can become
-    the live settings, and opening the defaults server's confirmation page for
-    exactly that scenario — never the selects' choice while a chunk loads, and
-    never the Scenario Explorer's own selects. The address names each category
-    ticked in the Exclude categories menu as a category to exclude, and no tag;
-    the button stays disabled while a tag is ticked or every category is
-    excluded. The address it opens is checked against the server's own parser. Its script
-    tests are skipped without a JavaScript runtime; its render and
-    _save_target tests are not."""
+def _told(snap: dict, kind: str = "kalshi-bar") -> list:
+    """
+    The messages of one kind the page told the dashboard's tab page in a snapshot's window.
+
+    Each message must go to both of the tab page's addresses, in config's
+    order, the same message to each, and hold no field but "type" and
+    "query".
+
+    Args:
+        snap (dict): A snapshot of a framed run (_run_script(framed=True)).
+        kind (str): The message type: "kalshi-bar" (default) or "kalshi-ready".
+
+    Returns:
+        list: For kalshi-bar, each message's query; for any other kind, each
+            message itself, in the order sent.
+    """
+    posted = snap["posted"]
+    assert len(posted) % len(_ORIGINS) == 0, posted
+    out = []
+    for i in range(0, len(posted), len(_ORIGINS)):
+        group = posted[i:i + len(_ORIGINS)]
+        assert [p["origin"] for p in group] == _ORIGINS, group
+        assert all(p["message"] == group[0]["message"] for p in group), group
+        message = group[0]["message"]
+        assert set(message) <= {"type", "query"}, message
+        if message["type"] == kind:
+            out.append(message["query"] if kind == "kalshi-bar" else message)
+    return out
+
+
+def _sync_notes(page: str) -> str:
+    """The part of a page's filter bar from the end of its Exclude tags menu
+    to the red note (flt-sync-note): where the grey notes on what the Trading
+    tab proposes instead of the saved live defaults sit."""
+    bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
+    return bar[bar.index("</details>", bar.index('id="flt-tag"')):bar.index('id="flt-sync-note"')]
+
+
+def _last_told(snaps: dict, names) -> dict:
+    """
+    For snapshots taken in this order, the query the page had last told the tab page as each was taken.
+
+    A snapshot whose window told nothing (ticks left as they were, or ticks
+    the Trading tab cannot follow) keeps the query told before it; read the
+    red note (_note) to tell the two apart.
+
+    Args:
+        snaps (dict): A framed run's snapshots, by name.
+        names: The snapshots' names, in the order they were taken.
+
+    Returns:
+        dict: Each name -> the last query told by then, or None before any.
+    """
+    out, last = {}, None
+    for name in names:
+        told = _told(snaps[name])
+        last = told[-1] if told else last
+        out[name] = last
+    return out
+
+
+def _note(snap: dict) -> str:
+    """The red note on the bar (flt-sync-note) as it stands: "" while empty."""
+    return snap["text"].get("flt-sync-note", "")
+
+
+def _apply(query: str, origin: str = _ORIGINS[0], source: str = "parent") -> list:
+    """The steps of the tab page telling the page the Trading tab's proposal
+    (kalshi-apply), from that origin and window, then a settle."""
+    return [["message", origin, source, {"type": "kalshi-apply", "query": query}], ["settle"]]
+
+
+def _proposed(**fields) -> config.LiveSettings:
+    """The seed's live settings with these fields changed: a proposal the
+    Trading tab may show, every field it leaves out the seed's (what the
+    defaults server keeps for a field a query leaves out when none are
+    saved)."""
+    return dataclasses.replace(config.LIVE_DEFAULTS_SEED, **fields)
+
+
+class TestTradingSync:
+    """The filter bar and the live dashboard's Trading tab show the same
+    settings. Shown in the dashboard's Backtest frame, the page tells the tab
+    page, after each choice the reader makes is drawn (or shown as a scenario
+    the run never simulated), the bar's settings as the trading page's query,
+    and never the Scenario Explorer's own selects; a choice the Trading tab
+    cannot take is not told, and the red note says why. The query is checked
+    against the defaults server's own parser and application. The other way,
+    the Trading tab's proposal is shown on the bar, its settings the page
+    cannot show named, and nothing told back. Opened on its own the page
+    tells and hears nothing. Script tests are skipped without a JavaScript
+    runtime; render and _sync_target tests are not."""
 
     @staticmethod
     def _page(monkeypatch, tmp_path, sweep=None, series=_FLT_SERIES) -> str:
@@ -8204,33 +8315,24 @@ class TestSaveLiveDefaultsButton:
         return _kc_page(monkeypatch, tmp_path, sweep or _kc_sweep())
 
     @staticmethod
-    def _query(data: dict, opened: dict) -> dict[str, str]:
+    def _query(query: str) -> dict[str, str]:
         """
-        Read one window.open call's address, checked against the page's save target.
+        Read one query the page told the tab page, strictly.
 
-        The call must open a new tab with "noopener", the address before its
-        query must be the save target's (the defaults server's confirmation
-        page), and every field of the query but exclude_category and
-        exclude_tag must appear exactly once.
+        Every field but exclude_category and exclude_tag must appear exactly once.
 
         Args:
-            data (dict): The page's base block.
-            opened (dict): One recorded window.open call: url, target, features.
+            query (str): The query, as told (no "?").
 
         Returns:
             dict: The query's fields and their one value each; exclude_category
                 and exclude_tag, when sent, map to the list of their values in
-                the address's order.
+                the query's order.
 
         Raises:
-            AssertionError: If the target, the features or the address differ
-                from those above, the query cannot be parsed strictly, or a
+            AssertionError: If the query cannot be parsed strictly, or a
                 field other than exclude_category and exclude_tag repeats.
         """
-        assert opened["target"] == "_blank" and opened["features"] == "noopener"
-        url = opened["url"]
-        base, _, query = url.partition("?")
-        assert base == data["save"]["url"] == _SAVE_URL
         fields = parse_qs(query, keep_blank_values=True, strict_parsing=True)
         lists = ("exclude_category", "exclude_tag")
         assert all(len(values) == 1 for name, values in fields.items()
@@ -8241,7 +8343,7 @@ class TestSaveLiveDefaultsButton:
     @staticmethod
     def _expected(data: dict, bi: int, ki: int, ci: int, tier: str = "on") -> dict:
         """
-        Give the fields a click on scenario [bi, ki, ci] must send, from the base block.
+        Give the fields a choice of scenario [bi, ki, ci] must send, from the base block.
 
         Args:
             data (dict): The page's base block.
@@ -8269,7 +8371,7 @@ class TestSaveLiveDefaultsButton:
         (one exclude_category each, in the menu's order), the tags ticked
         (one exclude_tag each, "Category · Tag", in the menu's order), and
         no other field: no same-title cap among them, since the defaults
-        server refuses a link that names one. The rebalancing and selling
+        server refuses a query that names one. The rebalancing and selling
         fields may also be present (pages with those views send them); the
         caller checks their values. The "Rebalance until" days go only beside
         the Rebalance fields, and as 0 (no limit) whenever Rebalance is off.
@@ -8281,7 +8383,7 @@ class TestSaveLiveDefaultsButton:
             ki (int): The k's index.
             ci (int): The size cap's index.
             tier (str): The Tier floors choice on screen, "on" or "off".
-            excluded (tuple): The category names the address must exclude, in
+            excluded (tuple): The category names the query must exclude, in
                 order.
             excluded_tags (tuple): The "Category · Tag" names it must exclude,
                 in order.
@@ -8296,7 +8398,7 @@ class TestSaveLiveDefaultsButton:
         for name, value in expected.items():
             assert float(query[name]) == value, name
         assert "same_title_size_cap" not in query
-        assert query["source"] == data["save"]["source"]
+        assert query["source"] == data["sync"]["source"]
         assert query.get("exclude_category", []) == list(excluded)
         assert query.get("exclude_tag", []) == list(excluded_tags)
         assert "category" not in query and "tag" not in query
@@ -8306,7 +8408,7 @@ class TestSaveLiveDefaultsButton:
                  "sell_min_days"}
         assert set(query) <= known
         # Rebalance's two fields are always sent together: the server refuses
-        # a minimum with rebalancing off, and keeps a saved one a link leaves out
+        # a minimum with rebalancing off, and keeps a saved one a query leaves out
         assert len({name in query for name in ("rebalance", "min_price_move")}) == 1
         assert query.get("rebalance") != "off" or query.get("min_price_move") == "off"
         # ... and the days limit only beside them, never asking for a limit
@@ -8315,151 +8417,183 @@ class TestSaveLiveDefaultsButton:
             assert "rebalance" in query
             assert query["rebalance"] != "off" or query["rebalance_min_days_to_maturity"] == "0"
 
-    def test_the_button_is_rendered_disabled_with_its_words(self, monkeypatch, tmp_path):
+    def test_the_bar_has_no_button_and_ships_where_it_talks(self, monkeypatch, tmp_path):
         page = self._page(monkeypatch, tmp_path)
-        button = re.search(r'<button id="flt-save"([^>]*)>(.*?)</button>', page)
-        assert button is not None
-        assert button.group(2) == html.escape(dashboard._SAVE_LABEL)
-        assert f'title="{html.escape(dashboard._SAVE_TITLE)}"' in button.group(1)
-        assert _page_elements(page)["buttons"] == {"flt-save": {"disabled": True}}
-        assert html.escape(dashboard._SAVE_NOTE) in page
-        # After the Exclude tags menu, before the summary line
-        assert page.index('id="flt-tag"') < page.index('id="flt-save"') \
+        # No button, no link opening a page, and nothing the script opens
+        assert 'id="flt-save"' not in page and 'id="flt-trade"' not in page
+        assert 'id="live-trade"' not in page
+        assert _page_elements(page)["buttons"] == {}
+        assert "window.open" not in dashboard._FILTER_JS
+        for gone in ("_SAVE_LABEL", "_SAVE_TITLE", "_SAVE_NOTE", "_TRADE_LABEL", "_TRADE_TITLE",
+                     "_trade_url", "_trade_link_html", "_trade_paragraph_html", "_save_target",
+                     "_BUTTON_LINK_STYLE"):
+            assert not hasattr(dashboard, gone), gone
+        assert not hasattr(config, "DASHBOARD_MARKER_SCAN_BYTES")
+        # The red note, rendered empty, after the Exclude tags menu and before
+        # the summary line
+        assert re.search(r'<span id="flt-sync-note" style="color:#B71C1C; font-size:13px;">'
+                         r"</span>", page)
+        assert page.index('id="flt-tag"') < page.index('id="flt-sync-note"') \
             < page.index('id="flt-summary"')
         data = TestFilterPage._data(page)
-        # Each band carries its bounds for the button's spread_min / spread_max
+        # Each band carries its bounds, for the query's spread_min / spread_max
         assert [b["value"] for b in data["bands"]] == [[0.0, 1.0], [0.3, 0.6], [0.3, 1.0]]
-        save = data["save"]
-        assert save["url"] == _SAVE_URL
-        # The page sends no same-title cap: the defaults server refuses a link
-        # that names one
-        assert "same_title_size_cap" not in save
+        sync = data["sync"]
+        assert "save" not in data and "save_refused" not in data and "url" not in sync
+        assert sync["dashboard_origins"] == _ORIGINS
+        # The page proposes no same-title cap: the defaults server refuses a
+        # query that names one
+        assert "same_title_size_cap" not in sync
         assert "same_title_size_cap" not in dashboard._FILTER_JS
-        assert re.fullmatch(config.LIVE_DEFAULTS_SOURCE_PATTERN, save["source"], re.ASCII)
-        assert save["source"].startswith(f"backtest dashboard for {_FLT_START.isoformat()} to ")
-        # Every word about the button is Python's: the script writes none
-        for words in (dashboard._SAVE_LABEL, dashboard._SAVE_TITLE, dashboard._SAVE_NOTE,
-                      dashboard._SAVE_BLOCKED_TEXT["save_all_excluded"],
-                      dashboard._SAVE_BLOCKED_TEXT["save_refused"],
-                      dashboard._SAVE_BLOCKED_TEXT["save_twin_split"],
-                      data["text"]["save_too_long"]):
-            assert words not in dashboard._FILTER_JS
+        assert re.fullmatch(config.LIVE_DEFAULTS_SOURCE_PATTERN, sync["source"], re.ASCII)
+        assert sync["source"].startswith(f"backtest dashboard for {_FLT_START.isoformat()} to ")
+        # Every word the bar shows about the Trading tab is Python's: the
+        # script writes none
+        for key in (*dashboard._SYNC_BLOCKED_TEXT, "sync_too_long", "sync_not_here",
+                    "sync_off_grid", "sync_no_view", "sync_unlisted", "sync_not_with",
+                    "sync_unshown"):
+            assert data["text"][key] not in dashboard._FILTER_JS, key
+        assert data["text"]["sync_fields"] == dashboard._SYNC_APPLY_TEXT["sync_fields"]
         # The too-long text states the very limits the page ships, which the
         # script tests
-        assert data["text"]["save_too_long"] == dashboard._save_too_long_text(save)
-        assert f"{save['max_query_bytes']:,}" in data["text"]["save_too_long"]
-        assert f"{save['max_form_bytes']:,}" in data["text"]["save_too_long"]
-        # ... and the address comes from config, never spelled on the page's side
+        assert data["text"]["sync_too_long"] == dashboard._sync_too_long_text(sync)
+        assert f"{sync['max_query_bytes']:,}" in data["text"]["sync_too_long"]
+        assert f"{sync['max_form_bytes']:,}" in data["text"]["sync_too_long"]
+        # The addresses and the limits come from config, never written in the script
+        for origin in _ORIGINS:
+            assert origin not in dashboard._FILTER_JS
+        assert str(config.LIVE_DASHBOARD_PORT) not in dashboard._FILTER_JS
         assert config.DEFAULTS_SERVER_HOST not in dashboard._FILTER_JS
-        assert str(config.DEFAULTS_SERVER_PORT) not in dashboard._FILTER_JS
-        # The server's limits travel in the save target, never in the script
-        assert save["max_names"] == config.DEFAULTS_SERVER_MAX_FILTER_NAMES
-        assert save["max_query_bytes"] == dashboard._save_max_query_bytes()
-        assert save["max_form_bytes"] == dashboard._save_max_form_bytes()
-        assert "D.save.max_names" in dashboard._FILTER_JS
-        assert "D.save.max_query_bytes" in dashboard._FILTER_JS
-        assert "D.save.max_form_bytes" in dashboard._FILTER_JS
+        assert sync["max_names"] == config.DEFAULTS_SERVER_MAX_FILTER_NAMES
+        assert sync["max_query_bytes"] == config.TRADING_QUERY_MAX_BYTES
+        assert sync["max_form_bytes"] == dashboard._sync_max_form_bytes()
+        for name in ("D.sync.max_names", "D.sync.max_query_bytes", "D.sync.max_form_bytes",
+                     "D.sync.dashboard_origins"):
+            assert name in dashboard._FILTER_JS, name
 
-    def test_once_loaded_a_click_opens_the_primary_scenario(self, monkeypatch, tmp_path):
+    def test_one_query_limit_the_tab_page_s_own(self):
+        # The page's longest query is config's one limit, which the tab page
+        # takes too, each counting an apostrophe as the three bytes (%27) the
+        # browser sends: the bar never sends a choice the tab page drops
+        import kalshi_betting.live_dashboard as live_dashboard
+        assert config.TRADING_QUERY_MAX_BYTES == min(
+            config.DEFAULTS_SERVER_MAX_REQUEST_BYTES - len("/confirm?"),
+            config.DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES - len("GET /confirm? HTTP/1.1\r\n"))
+        assert live_dashboard._TRADING_QUERY_MAX == config.TRADING_QUERY_MAX_BYTES
+        assert dashboard._sync_limits()["max_query_bytes"] == config.TRADING_QUERY_MAX_BYTES
+        assert "return q.length + 2 * (q.length - q.replace(/'/g, '').length);" \
+            in dashboard._FILTER_JS
+        assert re.search(r"q\.length \+ 2 \* \(q\.length - q\.replace\(/\\x27/g, ''\)"
+                         r"\.length\) <= MAX_QUERY", live_dashboard._SCRIPT)
+
+    def test_opened_on_its_own_it_tells_nothing_and_hears_nothing(self, monkeypatch, tmp_path):
+        # Outside the dashboard (its parent is its own window): a reader's
+        # choice is drawn but told to no one, no note is shown, and a
+        # proposal from any window is not heard
+        page = self._kc(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        pb, _, _ = data["primary"]
+        proposal = defaults_server._settings_query(_proposed(
+            tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
+            interval_discount=data["ks"][0]["value"], size_cap=data["caps"][0]["value"]))
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["snap", "ready"], ["set", "flt-cap", "2"], ["fire", "flt-cap"],
+            ["settle"], ["snap", "chosen"], *_apply(proposal, source="self"),
+            *_apply(proposal, source="parent"), ["snap", "applied"]], strict=True)
+        for name in ("ready", "chosen", "applied"):
+            assert snaps[name]["posted"] == [] and _note(snaps[name]) == "", name
+        assert snaps["chosen"]["reacts"]
+        assert snaps["applied"]["reacts"] == []
+        assert snaps["applied"]["selects"]["flt-cap"]["value"] == "2"
+        assert snaps["applied"]["selects"]["flt-k"]["value"] == "1"
+
+    def test_framed_it_says_it_is_ready_once_then_tells_each_choice(self, monkeypatch, tmp_path):
         page = self._page(monkeypatch, tmp_path)
         data = TestFilterPage._data(page)
         snaps = _run_script(tmp_path, page, [
-            ["snap", "loaded"], ["wait"], ["snap", "ready"],
-            ["click", "flt-save"], ["snap", "clicked"]], strict=True)
-        assert snaps["loaded"]["buttons"]["flt-save"] is True
-        assert snaps["ready"]["buttons"]["flt-save"] is False
-        assert snaps["loaded"]["opened"] == snaps["ready"]["opened"] == []
-        [opened] = snaps["clicked"]["opened"]
-        self._assert_sends(data, self._query(data, opened), *data["primary"])
-        # A click draws nothing and changes no select
-        assert snaps["clicked"]["reacts"] == [] and snaps["clicked"]["updates"] == []
-        assert snaps["clicked"]["selects"] == snaps["ready"]["selects"]
+            ["snap", "loaded"], ["wait"], ["snap", "ready"], ["settle"], ["snap", "later"],
+            *_AGAIN, ["snap", "again"]], strict=True, framed=True)
+        assert snaps["loaded"]["posted"] == []
+        # Once the bar is ready, to each of the tab page's addresses, and
+        # no choice is told before the reader makes one
+        assert snaps["ready"]["posted"] == [{"message": {"type": "kalshi-ready"}, "origin": o}
+                                            for o in _ORIGINS]
+        assert snaps["later"]["posted"] == []
+        # A choice drawn: the scenario on screen, and never "ready" again
+        [query] = _told(snaps["again"])
+        assert _told(snaps["again"], "kalshi-ready") == []
+        self._assert_sends(data, self._query(query), *data["primary"])
+        assert _note(snaps["again"]) == ""
 
     def test_it_follows_the_band_k_and_size_cap_on_screen(self, monkeypatch, tmp_path):
         page = self._kc(monkeypatch, tmp_path)
         data = TestFilterPage._data(page)
         snaps = _run_script(tmp_path, page, [
             ["wait"],
-            ["set", "flt-cap", "2"], ["fire", "flt-cap"], ["settle"],
-            ["click", "flt-save"], ["snap", "cap"],
-            ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"],
-            ["click", "flt-save"], ["snap", "k"],
-            ["set", "flt-k", "1"], ["fire", "flt-k"], ["settle"],
-            ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"],
-            ["click", "flt-save"], ["snap", "band"]], strict=True)
-        for name, (bi, ki, ci) in (("cap", (0, 1, 2)), ("k", (0, 0, 2)), ("band", (1, 1, 2))):
-            [opened] = snaps[name]["opened"]
-            self._assert_sends(data, self._query(data, opened), bi, ki, ci)
+            ["set", "flt-cap", "2"], ["fire", "flt-cap"], ["settle"], ["snap", "cap"],
+            ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "k"],
+            ["set", "flt-k", "1"], ["fire", "flt-k"], ["settle"], ["snap", "k back"],
+            ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"], ["snap", "band"]],
+            strict=True, framed=True)
+        for name, (bi, ki, ci) in (("cap", (0, 1, 2)), ("k", (0, 0, 2)), ("k back", (0, 1, 2)),
+                                   ("band", (1, 1, 2))):
+            [query] = _told(snaps[name])
+            self._assert_sends(data, self._query(query), bi, ki, ci)
         # The size cap sent is the cap on screen: "off (full Kelly)" is 1.0
-        [opened] = snaps["cap"]["opened"]
-        assert float(self._query(data, opened)["size_cap"]) == 1.0
+        [query] = _told(snaps["cap"])
+        assert float(self._query(query)["size_cap"]) == 1.0
 
-    def test_categories_and_tags_are_saved_as_exclusions(
-            self, monkeypatch, tmp_path):
-        # A category ticked in the Exclude categories menu is saved as a
+    def test_categories_and_tags_are_told_as_exclusions(self, monkeypatch, tmp_path):
+        # A category ticked in the Exclude categories menu is told as a
         # category to exclude, and a "Category · Tag" ticked in the Exclude
         # tags menu as a tag to exclude in that category. Every category left
-        # out keeps the button disabled with the reason as its hover text,
-        # and a click opens nothing. Once every box is unticked it saves the
-        # scenario again, excluding nothing
+        # out is not told, the note saying why. Once every box is unticked the
+        # scenario is told again, excluding nothing, and the note is cleared
         page = self._page(monkeypatch, tmp_path)
         data = TestFilterPage._data(page)
         sports = data["categories"].index("Sports")
         basketball = data["subcats"].index([sports, "Basketball"])
         snaps = _run_script(tmp_path, page, [
             ["wait"],
-            _tick_category(sports), ["settle"],
-            ["click", "flt-save"], ["snap", "category"],
-            *_clear_menus(), ["settle"],
+            _tick_category(sports), ["settle"], ["snap", "category"],
+            *_clear_menus(), ["settle"], ["snap", "cleared"],
             # A "Category · Tag" ticked with nothing else ticked leaves out
             # that tag and ticks no category
-            _tick_tag(basketball), ["settle"],
-            ["click", "flt-save"], ["snap", "tag"],
+            _tick_tag(basketball), ["settle"], ["snap", "tag"],
             # "All categories" with a tag ticked leaves out every category
             # and unticks the tag
-            _tick_category(""), ["settle"],
-            ["click", "flt-save"], ["snap", "all"],
+            _tick_category(""), ["settle"], ["snap", "all"],
             # ... and clicked again lets every one back in: nothing ticked
-            _tick_category(""), ["settle"],
-            ["click", "flt-save"], ["snap", "back"],
-            _tick_category(sports), ["settle"], *_clear_menus(), ["settle"],
-            ["click", "flt-save"], ["snap", "none"]], strict=True)
-        assert snaps["category"]["menus"]["flt-cat"]["ticked"] == [sports]
+            _tick_category(""), ["settle"], ["snap", "back"]], strict=True, framed=True)
         snap = snaps["category"]
-        assert snap["reacts"] and snap["buttons"]["flt-save"] is False
-        assert snap["titles"]["flt-save"] == dashboard._SAVE_TITLE
-        [opened] = snap["opened"]
-        self._assert_sends(data, self._query(data, opened), *data["primary"],
-                           excluded=("Sports",))
-        assert snaps["tag"]["menus"]["flt-cat"]["ticked"] == []
-        assert snaps["tag"]["menus"]["flt-tag"]["ticked"] == [basketball]
+        assert snap["menus"]["flt-cat"]["ticked"] == [sports] and snap["reacts"]
+        [query] = _told(snap)
+        self._assert_sends(data, self._query(query), *data["primary"], excluded=("Sports",))
         snap = snaps["tag"]
-        assert snap["reacts"] and snap["buttons"]["flt-save"] is False
-        assert snap["titles"]["flt-save"] == dashboard._SAVE_TITLE
-        [opened] = snap["opened"]
-        self._assert_sends(data, self._query(data, opened), *data["primary"],
+        assert snap["menus"]["flt-cat"]["ticked"] == []
+        assert snap["menus"]["flt-tag"]["ticked"] == [basketball]
+        [query] = _told(snap)
+        self._assert_sends(data, self._query(query), *data["primary"],
                            excluded_tags=("Sports · Basketball",))
-        assert snaps["all"]["menus"]["flt-cat"]["ticked"] == list(range(len(data["categories"])))
-        assert snaps["all"]["menus"]["flt-tag"]["ticked"] == []
         snap = snaps["all"]
-        # Drawn, and shut through it
-        assert snap["reacts"]
-        assert snap["buttons"]["flt-save"] is True and snap["opened"] == []
-        assert snap["titles"]["flt-save"] == data["text"]["save_all_excluded"]
-        for name in ("back", "none"):
+        assert snap["menus"]["flt-cat"]["ticked"] == list(range(len(data["categories"])))
+        assert snap["menus"]["flt-tag"]["ticked"] == []
+        # Drawn, and not told: the note says why
+        assert snap["reacts"] and _told(snap) == []
+        assert _note(snap) == data["text"]["sync_all_excluded"]
+        for name in ("cleared", "back"):
             snap = snaps[name]
             assert snap["menus"]["flt-cat"]["ticked"] == [], name
-            assert snap["buttons"]["flt-save"] is False, name
-            assert snap["titles"]["flt-save"] == dashboard._SAVE_TITLE, name
-            [opened] = snap["opened"]
-            self._assert_sends(data, self._query(data, opened), *data["primary"])
+            assert _note(snap) == "", name
+            query = _told(snap)[-1]
+            self._assert_sends(data, self._query(query), *data["primary"])
 
-    def test_excluding_every_category_with_a_trade_here_shuts_it(self, monkeypatch, tmp_path):
+    def test_excluding_every_category_with_a_trade_here_is_not_told(self, monkeypatch, tmp_path):
         # Band 0.3-0.6 trades only Sports and Commodities, while the menu also
         # lists categories other scenarios trade: excluding those two leaves a
-        # view with no trade, so the button shuts though not every listed
+        # view with no trade, which is not told, though not every listed
         # category is excluded. At the primary band the same two exclusions
-        # leave the time-series trades, and it saves
+        # leave the time-series trades, and are told
         page = self._page(monkeypatch, tmp_path)
         data = TestFilterPage._data(page)
         sports = data["categories"].index("Sports")
@@ -8467,25 +8601,23 @@ class TestSaveLiveDefaultsButton:
         assert len(data["categories"]) > 2
         snaps = _run_script(tmp_path, page, [
             ["wait"], ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"],
-            _tick_category(sports), ["settle"], _tick_category(commodities), ["settle"],
-            ["click", "flt-save"], ["snap", "empty"],
-            _tick_category(commodities), ["settle"],
-            ["click", "flt-save"], ["snap", "one_back"],
-            _tick_category(commodities), ["settle"],
+            ["snap", "band"], _tick_category(sports), ["settle"], ["snap", "sports"],
+            _tick_category(commodities), ["settle"], ["snap", "empty"],
+            _tick_category(commodities), ["settle"], ["snap", "one_back"],
+            _tick_category(commodities), ["settle"], ["snap", "empty again"],
             ["set", "flt-band", "0"], ["fire", "flt-band"], ["settle"],
-            ["click", "flt-save"], ["snap", "primary"]], strict=True)
+            ["snap", "primary"]], strict=True, framed=True)
+        assert len(_told(snaps["sports"])) == 1
         empty = snaps["empty"]
         assert empty["menus"]["flt-cat"]["ticked"] == sorted([sports, commodities])
-        assert empty["buttons"]["flt-save"] is True and empty["opened"] == []
-        assert empty["titles"]["flt-save"] == data["text"]["save_all_excluded"]
+        assert _told(empty) == [] and _note(empty) == data["text"]["sync_all_excluded"]
         one_back = snaps["one_back"]
-        assert one_back["buttons"]["flt-save"] is False
-        assert one_back["titles"]["flt-save"] == dashboard._SAVE_TITLE
-        assert len(one_back["opened"]) == 1
+        assert len(_told(one_back)) == 1 and _note(one_back) == ""
+        assert _told(snaps["empty again"]) == []
         primary = snaps["primary"]
-        assert primary["buttons"]["flt-save"] is False
-        [opened] = primary["opened"]
-        self._assert_sends(data, self._query(data, opened), *data["primary"],
+        assert _note(primary) == ""
+        [query] = _told(primary)
+        self._assert_sends(data, self._query(query), *data["primary"],
                            excluded=tuple(sorted(("Sports", "Commodities"),
                                                  key=data["categories"].index)))
 
@@ -8500,19 +8632,16 @@ class TestSaveLiveDefaultsButton:
         names = data["categories"]
         assert "sports" in names and "Sports" in names
         sports, commodities = names.index("Sports"), names.index("Commodities")
-        snaps = _run_script(tmp_path, page, [
+        snap = _run_script(tmp_path, page, [
             ["wait"], _tick_category(sports), _tick_category(commodities), ["settle"],
-            ["click", "flt-save"], ["snap", "s"]], strict=True)
-        snap = snaps["s"]
+            ["snap", "s"]], strict=True, framed=True)["s"]
         ticked = snap["menus"]["flt-cat"]["ticked"]
         assert set(ticked) == {commodities, sports, names.index("sports")}
         excluded = tuple(names[i] for i in sorted(ticked))
-        [opened] = snap["opened"]
-        self._assert_sends(data, self._query(data, opened), *data["primary"],
-                           excluded=excluded)
-        query = opened["url"].partition("?")[2]
+        query = _told(snap)[-1]
+        self._assert_sends(data, self._query(query), *data["primary"], excluded=excluded)
         response = defaults_server._App(config.DEFAULTS_SERVER_PORT).handle(
-            defaults_server._Request("GET", f"/confirm?{query}", _SAVE_HOST))
+            defaults_server._Request("GET", f"/confirm?{query}", _SERVER_HOST))
         assert response.status == 200, response.body
         settings, _ = defaults_server._proposal(defaults_server._params(query), None)
         # The second spelling of Sports is left out by the server: one category
@@ -8529,161 +8658,148 @@ class TestSaveLiveDefaultsButton:
         data = TestFilterPage._data(page)
         snaps = _run_script(tmp_path, page, [
             ["wait"],
-            ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"],
-            ["click", "flt-save"], ["snap", "off"],
-            ["set", "flt-tier", "on"], ["fire", "flt-tier"], ["settle"],
-            ["click", "flt-save"], ["snap", "on"]], strict=True)
-        [opened] = snaps["off"]["opened"]
-        self._assert_sends(data, self._query(data, opened), *data["primary"], tier="off")
-        [opened] = snaps["on"]["opened"]
-        self._assert_sends(data, self._query(data, opened), *data["primary"], tier="on")
+            ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"], ["snap", "off"],
+            ["set", "flt-tier", "on"], ["fire", "flt-tier"], ["settle"], ["snap", "on"]],
+            strict=True, framed=True)
+        [query] = _told(snaps["off"])
+        self._assert_sends(data, self._query(query), *data["primary"], tier="off")
+        [query] = _told(snaps["on"])
+        self._assert_sends(data, self._query(query), *data["primary"], tier="on")
 
-    def test_a_scenario_the_run_never_simulated_cannot_be_saved(self, monkeypatch, tmp_path):
-        # (0.3-0.6, k 0.60) was never simulated: the button is disabled and a
-        # click opens nothing; back on a simulated scenario it is enabled again
+    def test_a_scenario_the_run_never_simulated_is_told_too(self, monkeypatch, tmp_path):
+        # (0.3-0.6, k 0.60) was never simulated: the bar shows that, and the
+        # Trading tab follows it all the same, as any setting the bar can show
         page = self._kc(monkeypatch, tmp_path)
         data = TestFilterPage._data(page)
         assert _KC_GRID[1][0] == [None, None, None]
         snaps = _run_script(tmp_path, page, [
             ["wait"],
             ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"],
-            ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"],
-            ["click", "flt-save"], ["snap", "missing"],
-            ["set", "flt-k", "1"], ["fire", "flt-k"], ["settle"],
-            ["click", "flt-save"], ["snap", "back"]], strict=True)
+            ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"], ["snap", "missing"],
+            ["set", "flt-k", "1"], ["fire", "flt-k"], ["settle"], ["snap", "back"]],
+            strict=True, framed=True)
         missing, back = snaps["missing"], snaps["back"]
         assert missing["text"]["flt-summary"].startswith(
             data["text"]["missing"].format(scenario=_phrase(data, 1, 0, 1)))
-        assert missing["buttons"]["flt-save"] is True and missing["opened"] == []
-        assert back["buttons"]["flt-save"] is False
-        [opened] = back["opened"]
-        self._assert_sends(data, self._query(data, opened), 1, 1, 1)
+        query = _told(missing)[-1]
+        self._assert_sends(data, self._query(query), 1, 0, 1)
+        assert _note(missing) == ""
+        [query] = _told(back)
+        self._assert_sends(data, self._query(query), 1, 1, 1)
 
-    def test_while_a_chunk_loads_it_saves_nothing_then_the_scenario_on_screen(
+    def test_while_a_chunk_loads_nothing_is_told_then_the_scenario_on_screen(
             self, monkeypatch, tmp_path):
         page = self._kc(monkeypatch, tmp_path)
         data = TestFilterPage._data(page)
         assert _KC_GRID[1][1][1] == 4
         steps = [["wait"], ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"],
-                 ["click", "flt-save"], ["snap", "loading"]]
+                 ["snap", "loading"]]
         src = _chunk_src(page, 4)
-        resolved = _run_script(tmp_path, page, steps + [
-            ["resolve_file", src], ["snap", "drawn"],
-            ["click", "flt-save"], ["snap", "clicked"]],
-            strict=True, files_deferred=(src,))
+        resolved = _run_script(tmp_path, page, steps + [["resolve_file", src], ["snap", "drawn"]],
+                               strict=True, files_deferred=(src,), framed=True)
         loading = resolved["loading"]
         assert loading["pendingFiles"] == [src]
-        assert loading["buttons"]["flt-save"] is True and loading["opened"] == []
+        assert _told(loading) == []
         # Once drawn: the new scenario
-        assert resolved["drawn"]["buttons"]["flt-save"] is False
-        [opened] = resolved["clicked"]["opened"]
-        self._assert_sends(data, self._query(data, opened), 1, 1, 1)
-        # A chunk that fails: the scenario still shown, which the selects go back to
-        failed = _run_script(tmp_path, page, steps + [
-            ["resolve_file", src], ["snap", "failed"],
-            ["click", "flt-save"], ["snap", "clicked"]],
-            strict=True, files_deferred=(src,), files_damaged=(src,))
-        assert failed["loading"]["buttons"]["flt-save"] is True
+        [query] = _told(resolved["drawn"])
+        self._assert_sends(data, self._query(query), 1, 1, 1)
+        # A chunk that fails: the choice is put back, and nothing is told
+        failed = _run_script(tmp_path, page, steps + [["resolve_file", src], ["snap", "failed"]],
+                             strict=True, files_deferred=(src,), files_damaged=(src,),
+                             framed=True)
+        assert _told(failed["loading"]) == []
         assert failed["failed"]["selects"]["flt-band"]["value"] == "0"
-        assert failed["failed"]["buttons"]["flt-save"] is False
-        [opened] = failed["clicked"]["opened"]
-        self._assert_sends(data, self._query(data, opened), *data["primary"])
+        assert _told(failed["failed"]) == [] and _note(failed["failed"]) == ""
 
     @pytest.mark.parametrize("damaged", ["dash-data", "dash-chunk-0"])
-    def test_a_block_that_cannot_be_loaded_keeps_it_disabled(
-            self, monkeypatch, tmp_path, damaged):
+    def test_a_block_that_cannot_be_loaded_tells_nothing(self, monkeypatch, tmp_path, damaged):
         # The base block, or the primary scenario's chunk: the bar cannot
-        # work, and nothing can be saved from it
+        # work, is never ready, and tells nothing
         page = self._kc(monkeypatch, tmp_path)
         snap = _run_script(tmp_path, page, [
-            ["wait"], ["click", "flt-save"], ["snap", "s"]], damaged=(damaged,))["s"]
-        assert snap["buttons"]["flt-save"] is True and snap["opened"] == []
+            ["wait"], *_AGAIN, ["snap", "s"]], damaged=(damaged,), framed=True)["s"]
+        assert snap["posted"] == []
         assert snap["selects"]["flt-band"]["disabled"]
 
-    def test_a_browser_that_cannot_inflate_keeps_it_disabled(self, monkeypatch, tmp_path):
+    def test_a_browser_that_cannot_inflate_tells_nothing(self, monkeypatch, tmp_path):
         page = self._page(monkeypatch, tmp_path)
         snap = _run_script(tmp_path, page, [
-            ["wait"], ["click", "flt-save"], ["snap", "s"]], no_decompression=True)["s"]
-        assert snap["buttons"]["flt-save"] is True and snap["opened"] == []
+            ["wait"], *_AGAIN, ["snap", "s"]], no_decompression=True, framed=True)["s"]
+        assert snap["posted"] == []
 
     def test_without_a_series_listing_categories_are_still_excluded(
             self, monkeypatch, tmp_path):
-        # Trades filed by ticker prefix: the page has the same hover text as a
-        # page filed by Kalshi's listing, saves the scenario with nothing
-        # ticked, and saves a category ticked as one to exclude, by the name
-        # the page filed it under
+        # Trades filed by ticker prefix: the scenario with nothing ticked is
+        # told, and a category ticked as one to exclude, by the name the page
+        # filed it under
         page = self._page(monkeypatch, tmp_path, series=None)
         data = TestFilterPage._data(page)
         # Every trade is filed under "Other"; the k-hat population files one
         # observation under "Science", which no trade carries
         assert data["categories"] == ["Other", "Science"]
-        title = re.search(r'<button id="flt-save"[^>]*title="([^"]*)"', page).group(1)
-        assert html.unescape(title) == dashboard._SAVE_TITLE
         snaps = _run_script(tmp_path, page, [
-            ["wait"], ["click", "flt-save"], ["snap", "all"],
-            _tick_category("1"), ["settle"],
-            ["click", "flt-save"], ["snap", "category"],
-            _tick_category("0"), ["settle"], ["click", "flt-save"], ["snap", "empty"],
+            ["wait"], *_AGAIN, ["snap", "all"],
+            _tick_category("1"), ["settle"], ["snap", "category"],
+            _tick_category("0"), ["settle"], ["snap", "empty"],
             _tick_category("0"), ["settle"],
-            _tick_category("1"), ["settle"], ["click", "flt-save"], ["snap", "back"]],
-            strict=True)
-        [opened] = snaps["all"]["opened"]
-        self._assert_sends(data, self._query(data, opened), *data["primary"])
-        assert snaps["category"]["buttons"]["flt-save"] is False
-        [opened] = snaps["category"]["opened"]
-        self._assert_sends(data, self._query(data, opened), *data["primary"],
-                           excluded=("Science",))
-        # Excluding "Other" too leaves no trade: shut, saying why
+            _tick_category("1"), ["settle"], ["snap", "back"]], strict=True, framed=True)
+        [query] = _told(snaps["all"])
+        self._assert_sends(data, self._query(query), *data["primary"])
+        [query] = _told(snaps["category"])
+        self._assert_sends(data, self._query(query), *data["primary"], excluded=("Science",))
+        # Excluding "Other" too leaves no trade: not told, saying why
         empty = snaps["empty"]
-        assert empty["buttons"]["flt-save"] is True and empty["opened"] == []
-        assert empty["titles"]["flt-save"] == data["text"]["save_all_excluded"]
+        assert _told(empty) == [] and _note(empty) == data["text"]["sync_all_excluded"]
         # The category let back in leaves nothing ticked: the scenario is
-        # saved again, excluding nothing
+        # told again, excluding nothing
         back = snaps["back"]
-        assert back["buttons"]["flt-save"] is False
-        assert back["titles"]["flt-save"] == dashboard._SAVE_TITLE
-        [opened] = back["opened"]
-        self._assert_sends(data, self._query(data, opened), *data["primary"])
+        assert _note(back) == ""
+        query = _told(back)[-1]
+        self._assert_sends(data, self._query(query), *data["primary"])
 
     @pytest.mark.parametrize("cats, tags, text", [
         (("Sports",), None,
-         "Saving from this page saves the categories and tags excluded here, which "
-         "replace the saved excluded categories (Sports)."),
+         "A box ticked or unticked here makes the Trading tab propose the categories "
+         "and tags excluded here in place of the saved excluded categories (Sports); one "
+         "this page does not list stays excluded."),
         (None, ("Hockey",),
-         "Saving from this page saves the categories and tags excluded here, which "
-         "replace the saved excluded tags (Hockey)."),
+         "A box ticked or unticked here makes the Trading tab propose the categories "
+         "and tags excluded here in place of the saved excluded tags (Hockey); one this "
+         "page does not list stays excluded."),
         (("Politics", "Weather"), ("Sports · Hockey", "Fed"),
-         "Saving from this page saves the categories and tags excluded here, which "
-         "replace the saved excluded categories (Politics, Weather) and tags "
-         "(Sports · Hockey, Fed)."),
+         "A box ticked or unticked here makes the Trading tab propose the categories "
+         "and tags excluded here in place of the saved excluded categories (Politics, "
+         "Weather) and tags (Sports · Hockey, Fed); one this page does not list stays "
+         "excluded."),
         (None, None, None)])
-    def test_a_note_says_when_saving_replaces_saved_exclusions(
+    def test_a_note_says_when_the_proposal_replaces_saved_exclusions(
             self, monkeypatch, tmp_path, cats, tags, text):
-        # The button sends the categories and tags excluded here, so over
-        # saved live defaults that exclude categories or tags, a grey note
-        # after it says saving replaces them, naming them; with neither saved
-        # there is no note
+        # The bar tells the categories and tags excluded here, so over saved
+        # live defaults that exclude categories or tags, a grey note after the
+        # menus says the Trading tab's proposal replaces them, naming them;
+        # with neither saved there is no note
         shown = text is not None
         sweep = dataclasses.replace(_flt_sweep(), live_exclude_categories=cats,
                                     live_exclude_tags=tags)
         page = self._page(monkeypatch, tmp_path, sweep)
-        save = TestFilterPage._data(page)["save"]
-        assert save["live_tag_exclusions"] == (None if tags is None else list(tags))
-        assert save["live_exclusions"] == (None if cats is None else list(cats))
-        assert dashboard._filter_save_note(cats, tags) == text
-        note = (f'<span id="flt-filter-save-note" style="color:#9E9E9E; font-size:13px;">'
+        sync = TestFilterPage._data(page)["sync"]
+        assert sync["live_tag_exclusions"] == (None if tags is None else list(tags))
+        assert sync["live_exclusions"] == (None if cats is None else list(cats))
+        assert dashboard._filter_sync_note(cats, tags) == text
+        note = (f'<span id="flt-filter-sync-note" style="color:#9E9E9E; font-size:13px;">'
                 f"{html.escape(text or '')}</span>")
         assert (note in page) is shown
-        assert ('id="flt-filter-save-note"' in page) is shown
+        assert ('id="flt-filter-sync-note"' in page) is shown
         if shown:
-            # After the button, before the trade link
-            assert page.index('id="flt-save"') < page.index(note) < page.index('id="flt-trade"')
+            # After the Exclude tags menu, before the red note
+            assert page.index('id="flt-tag"') < page.index(note) \
+                < page.index('id="flt-sync-note"')
         # Python's words: the script writes none of them
-        assert "replace the saved excluded" not in dashboard._FILTER_JS
+        assert "in place of the saved excluded" not in dashboard._FILTER_JS
 
-    def test_a_save_clears_saved_category_and_tag_exclusions(self, monkeypatch, tmp_path):
+    def test_with_nothing_ticked_it_proposes_no_exclusion(self, monkeypatch, tmp_path):
         # Saved live defaults that exclude Politics and Sports' Hockey: the
-        # page with nothing ticked saves its scenario naming no category or
+        # page with nothing ticked tells its scenario naming no category or
         # tag, which the defaults server reads as nothing excluded
         config.save_live_defaults(dataclasses.replace(
             config.live_settings(), exclude_categories=("Politics",),
@@ -8696,23 +8812,21 @@ class TestSaveLiveDefaultsButton:
                                     live_exclude_tags=current.exclude_tags)
         page = self._page(monkeypatch, tmp_path, sweep)
         data = TestFilterPage._data(page)
-        assert data["save"]["live_tag_exclusions"] == ["Sports · Hockey"]
-        snap = _run_script(tmp_path, page, [
-            ["wait"], ["click", "flt-save"], ["snap", "s"]], strict=True)["s"]
-        assert snap["buttons"]["flt-save"] is False
-        assert snap["titles"]["flt-save"] == dashboard._SAVE_TITLE
-        [opened] = snap["opened"]
-        self._assert_sends(data, self._query(data, opened), *data["primary"])
-        query = opened["url"].partition("?")[2]
+        assert data["sync"]["live_tag_exclusions"] == ["Sports · Hockey"]
+        snap = _run_script(tmp_path, page, [["wait"], *_AGAIN, ["snap", "s"]], strict=True,
+                           framed=True)["s"]
+        assert _note(snap) == ""
+        [query] = _told(snap)
+        self._assert_sends(data, self._query(query), *data["primary"])
         response = defaults_server._App(config.DEFAULTS_SERVER_PORT).handle(
-            defaults_server._Request("GET", f"/confirm?{query}", _SAVE_HOST))
+            defaults_server._Request("GET", f"/confirm?{query}", _SERVER_HOST))
         assert response.status == 200, response.body
         settings, _ = defaults_server._proposal(defaults_server._params(query), current)
         assert settings.exclude_categories is None and settings.exclude_tags is None
         # Nothing was written by showing the page
         assert config.read_saved_live_defaults() == current
 
-    def test_a_k_that_is_not_positive_cannot_be_saved(self, monkeypatch, tmp_path):
+    def test_a_k_that_is_not_positive_is_not_told(self, monkeypatch, tmp_path):
         # The live settings need k in (0, 1]: a run's k of 0.0 is not one
         sweep = _flt_sweep()
         scenarios = [dataclasses.replace(p, k=0.0) if p.k == 0.60 else p
@@ -8724,11 +8838,12 @@ class TestSaveLiveDefaultsButton:
         assert data["grid"][0][zero][0] is not None
         snap = _run_script(tmp_path, page, [
             ["wait"], ["set", "flt-k", str(zero)], ["fire", "flt-k"], ["settle"],
-            ["click", "flt-save"], ["snap", "s"]], strict=True)["s"]
-        assert snap["buttons"]["flt-save"] is True and snap["opened"] == []
+            ["snap", "s"]], strict=True, framed=True)["s"]
+        assert snap["reacts"] and _told(snap) == []
+        assert _note(snap) == data["text"]["sync_unrecorded"]
 
     def test_a_k_of_many_decimals_is_sent_exactly(self, monkeypatch, tmp_path):
-        # A k such as backtest.py --interval-discount can name: the address
+        # A k such as backtest.py --interval-discount can name: the query
         # carries the number that reads back as that very k (a two-decimal
         # 0.33 would be another k), and the server reads it back as that k
         third = 1 / 3
@@ -8742,18 +8857,17 @@ class TestSaveLiveDefaultsButton:
         assert data["grid"][0][ki][0] is not None
         snap = _run_script(tmp_path, page, [
             ["wait"], ["set", "flt-k", str(ki)], ["fire", "flt-k"], ["settle"],
-            ["click", "flt-save"], ["snap", "s"]], strict=True)["s"]
-        [opened] = snap["opened"]
-        query = self._query(data, opened)
+            ["snap", "s"]], strict=True, framed=True)["s"]
+        [raw] = _told(snap)
+        query = self._query(raw)
         self._assert_sends(data, query, 0, ki, 0)
         assert float(query["k"]) == third
-        settings, _ = defaults_server._proposal(
-            defaults_server._params(opened["url"].partition("?")[2]), None)
+        settings, _ = defaults_server._proposal(defaults_server._params(raw), None)
         assert settings.interval_discount == third
 
-    def test_a_page_without_a_sweep_cannot_be_saved(self, monkeypatch, tmp_path):
+    def test_a_page_without_a_sweep_tells_nothing(self, monkeypatch, tmp_path):
         # No sweep: one "not recorded" band and cap (k is the page's own
-        # 0.75), so nothing to save
+        # 0.75), so there is nothing the Trading tab could follow
         trades = _flt_trades()
         curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
@@ -8766,104 +8880,72 @@ class TestSaveLiveDefaultsButton:
         pb, pk, pc = data["primary"]
         assert data["bands"][pb]["value"] is None and data["caps"][pc]["value"] is None
         assert data["ks"][pk]["value"] == 0.75
-        snap = _run_script(tmp_path, page, [
-            ["wait"], ["click", "flt-save"], ["snap", "s"]], strict=True)["s"]
+        snap = _run_script(tmp_path, page, [["wait"], *_AGAIN, ["snap", "s"]], strict=True,
+                           framed=True)["s"]
         assert not snap["selects"]["flt-band"]["disabled"]
-        assert snap["buttons"]["flt-save"] is True and snap["opened"] == []
+        assert _told(snap) == [] and _note(snap) == data["text"]["sync_unrecorded"]
 
-    def test_a_band_the_run_did_not_record_cannot_be_saved(self, monkeypatch, tmp_path):
-        # A sweep whose primary records no band but does record its k and
-        # cap: the band alone is what keeps the button disabled, on load and
-        # after a tag is ticked and unticked again (a tag change redraws at
-        # once, its chunk being the one on screen)
-        base = _flt_sweep()
-        primary = dataclasses.replace(base.primary, spread_band=None)
-        sweep = dataclasses.replace(base, primary=primary, points=[primary], scenarios=[])
+    @pytest.mark.parametrize("missing", ["band", "size cap"])
+    def test_a_band_or_cap_the_run_did_not_record_is_not_told(self, monkeypatch, tmp_path,
+                                                             missing):
+        # A sweep whose primary records no band (but its k and cap), or whose
+        # points record no size cap (the server would refuse a size_cap of
+        # null): that alone keeps the choice from the Trading tab, after a
+        # tag is ticked and unticked again too (a tag change redraws at once,
+        # its chunk being the one on screen)
+        if missing == "band":
+            base = _flt_sweep()
+            primary = dataclasses.replace(base.primary, spread_band=None)
+            sweep = dataclasses.replace(base, primary=primary, points=[primary], scenarios=[])
+        else:
+            sweep = _flt_sweep(size_cap=None)
         page = self._page(monkeypatch, tmp_path, sweep)
         data = TestFilterPage._data(page)
         pb, pk, pc = data["primary"]
-        assert data["bands"][pb]["value"] is None
-        assert data["ks"][pk]["value"] == 0.75 and data["caps"][pc]["value"] == 0.2
+        assert (data["bands"][pb]["value"] is None) is (missing == "band")
+        assert (data["caps"][pc]["value"] is None) is (missing == "size cap")
         tag = str(data["subcats"].index([data["categories"].index("Sports"), "Basketball"]))
         snaps = _run_script(tmp_path, page, [
-            ["wait"], ["click", "flt-save"], ["snap", "ready"],
-            _tick_tag(tag), ["settle"],
-            ["click", "flt-save"], ["snap", "category"],
-            _tick_tag(tag), ["settle"],
-            ["click", "flt-save"], ["snap", "back"]], strict=True)
-        ready, category, back = snaps["ready"], snaps["category"], snaps["back"]
-        assert not ready["selects"]["flt-band"]["disabled"]
-        assert ready["buttons"]["flt-save"] is True and ready["opened"] == []
-        # The tag was drawn, and the button stayed disabled through it (a
-        # ticked tag stops no save), its hover text Python's own
-        assert category["selects"]["flt-tag"]["value"] == tag and category["reacts"]
-        assert category["buttons"]["flt-save"] is True and category["opened"] == []
-        assert category["titles"]["flt-save"] == dashboard._SAVE_TITLE
-        # Unticked and drawn again: the band alone keeps it shut
-        assert back["selects"]["flt-tag"]["value"] == "" and back["reacts"]
-        assert back["buttons"]["flt-save"] is True and back["opened"] == []
-        assert back["titles"]["flt-save"] == dashboard._SAVE_TITLE
-
-    def test_a_size_cap_the_run_did_not_record_cannot_be_saved(self, monkeypatch, tmp_path):
-        # A sweep whose points record their band and k but no size cap: the
-        # cap alone is what keeps the button disabled, on load and after a
-        # tag is ticked and unticked again (the server would refuse a
-        # size_cap of null, so the page must not offer it)
-        page = self._page(monkeypatch, tmp_path, _flt_sweep(size_cap=None))
-        data = TestFilterPage._data(page)
-        pb, pk, pc = data["primary"]
-        assert data["bands"][pb]["value"] == [0.0, 1.0]
-        assert data["ks"][pk]["value"] == 0.75 and data["caps"][pc]["value"] is None
-        tag = str(data["subcats"].index([data["categories"].index("Sports"), "Basketball"]))
-        snaps = _run_script(tmp_path, page, [
-            ["wait"], ["click", "flt-save"], ["snap", "ready"],
-            _tick_tag(tag), ["settle"],
-            ["click", "flt-save"], ["snap", "category"],
-            _tick_tag(tag), ["settle"],
-            ["click", "flt-save"], ["snap", "back"]], strict=True)
-        ready, category, back = snaps["ready"], snaps["category"], snaps["back"]
-        assert not ready["selects"]["flt-band"]["disabled"]
-        assert ready["buttons"]["flt-save"] is True and ready["opened"] == []
-        # The tag was drawn, and the button stayed disabled through it (a
-        # ticked tag stops no save), its hover text Python's own
-        assert category["selects"]["flt-tag"]["value"] == tag and category["reacts"]
-        assert category["buttons"]["flt-save"] is True and category["opened"] == []
-        assert category["titles"]["flt-save"] == dashboard._SAVE_TITLE
-        # Unticked and drawn again: the size cap alone keeps it shut
-        assert back["selects"]["flt-tag"]["value"] == "" and back["reacts"]
-        assert back["buttons"]["flt-save"] is True and back["opened"] == []
-        assert back["titles"]["flt-save"] == dashboard._SAVE_TITLE
+            ["wait"], *_AGAIN, ["snap", "ready"],
+            _tick_tag(tag), ["settle"], ["snap", "category"],
+            _tick_tag(tag), ["settle"], ["snap", "back"]], strict=True, framed=True)
+        for name in ("ready", "category", "back"):
+            snap = snaps[name]
+            assert snap["reacts"], name
+            assert _told(snap) == [] and _note(snap) == data["text"]["sync_unrecorded"], name
+        assert snaps["category"]["selects"]["flt-tag"]["value"] == tag
+        assert snaps["back"]["selects"]["flt-tag"]["value"] == ""
 
     def test_a_ladder_setting_that_departs_is_named_in_the_source(self, monkeypatch, tmp_path):
         sweep = dataclasses.replace(_flt_sweep(), same_event_ladders=False,
                                     config_same_event_ladders=True)
         page = self._page(monkeypatch, tmp_path, sweep)
-        source = TestFilterPage._data(page)["save"]["source"]
+        source = TestFilterPage._data(page)["sync"]["source"]
         assert source.endswith(" (same-event ladders off, config.py on: its pairs are not "
                                "the live bot's)")
         assert re.fullmatch(config.LIVE_DEFAULTS_SOURCE_PATTERN, source, re.ASCII)
 
-    def test_the_save_target_s_source_note(self):
+    def test_the_sync_target(self):
         today = date(2026, 9, 28)
         sweep = _flt_sweep()
-        target = dashboard._save_target(sweep, _FLT_START, today)
-        assert target == {"url": _SAVE_URL,
+        target = dashboard._sync_target(sweep, _FLT_START, today)
+        assert target == {"dashboard_origins": _ORIGINS,
                           "source": "backtest dashboard for 2026-01-05 to 2026-09-28",
                           "live_rebalances": False, "live_rebalance_until": None,
                           "live_sells": False,
                           "live_exclusions": None, "live_tag_exclusions": None,
                           "max_names": config.DEFAULTS_SERVER_MAX_FILTER_NAMES,
-                          "max_query_bytes": dashboard._save_max_query_bytes(),
-                          "max_form_bytes": dashboard._save_max_form_bytes()}
+                          "max_query_bytes": config.TRADING_QUERY_MAX_BYTES,
+                          "max_form_bytes": dashboard._sync_max_form_bytes()}
         # "live_rebalances" is True only for a run that recorded saved
         # defaults that rebalance (a minimum price movement alone is not):
-        # Rebalance no turns it off
+        # Rebalance no proposes turning it off
         for rebalance, move, said in ((True, None, True), (True, 0.1, True),
                                       (False, None, False), (None, None, False),
                                       (None, 0.1, False)):
             swept = dataclasses.replace(sweep, live_rebalance=rebalance,
                                         live_min_price_move=move)
-            assert dashboard._save_target(swept, _FLT_START, today)[
+            assert dashboard._sync_target(swept, _FLT_START, today)[
                 "live_rebalances"] is said, (rebalance, move)
         # ... and "live_rebalance_until" names their days limit, only while
         # they rebalance (a limit means nothing without it)
@@ -8871,51 +8953,50 @@ class TestSaveLiveDefaultsButton:
                                       (False, 7, None), (None, 7, None)):
             swept = dataclasses.replace(sweep, live_rebalance=rebalance,
                                         live_rebalance_min_days_to_maturity=days)
-            assert dashboard._save_target(swept, _FLT_START, today)[
+            assert dashboard._sync_target(swept, _FLT_START, today)[
                 "live_rebalance_until"] == said, (rebalance, days)
         # ... and "live_sells" only for a recorded sell level (a minimum alone is no sale)
         for level, days, said in ((0.85, 3, True), (0.85, None, True), (None, None, False),
                                   (None, 3, False)):
             swept = dataclasses.replace(sweep, live_sell_at=level, live_sell_min_days=days)
-            assert dashboard._save_target(swept, _FLT_START, today)["live_sells"] is said
+            assert dashboard._sync_target(swept, _FLT_START, today)["live_sells"] is said
         # ... and "live_exclusions" and "live_tag_exclusions" name the saved
-        # excluded categories and tags, which a save replaces
+        # excluded categories and tags, which the proposal replaces
         for cats, tags in ((("Sports",), None), (None, ("Hockey",)),
                            (("Politics",), ("Sports · Hockey",)), (None, None)):
             swept = dataclasses.replace(sweep, live_exclude_categories=cats,
                                         live_exclude_tags=tags)
-            target = dashboard._save_target(swept, _FLT_START, today)
+            target = dashboard._sync_target(swept, _FLT_START, today)
             assert target["live_exclusions"] == (None if cats is None else list(cats))
             assert target["live_tag_exclusions"] == (None if tags is None else list(tags))
         # Only a recorded setting that differs from a recorded switch is named
         for ladders, configured in ((True, True), (False, None), (None, True)):
             swept = dataclasses.replace(sweep, same_event_ladders=ladders,
                                         config_same_event_ladders=configured)
-            assert dashboard._save_target(swept, _FLT_START, today)["source"] == \
+            assert dashboard._sync_target(swept, _FLT_START, today)["source"] == \
                 "backtest dashboard for 2026-01-05 to 2026-09-28"
         swept = dataclasses.replace(sweep, same_event_ladders=True,
                                     config_same_event_ladders=False)
-        assert dashboard._save_target(swept, _FLT_START, today)["source"].endswith(
+        assert dashboard._sync_target(swept, _FLT_START, today)["source"].endswith(
             " (same-event ladders on, config.py off: its pairs are not the live bot's)")
         # No sweep: nothing recorded
-        bare = dashboard._save_target(None, datetime(2026, 1, 5, 12, tzinfo=UTC), today)
+        bare = dashboard._sync_target(None, datetime(2026, 1, 5, 12, tzinfo=UTC), today)
         assert set(bare) == set(target)
         assert bare["source"] == "backtest dashboard for 2026-01-05 to 2026-09-28"
 
     def test_a_note_the_server_would_refuse_is_left_out(self, monkeypatch, tmp_path):
-        # Should the note ever not fit the server's pattern, the button sends
-        # none (the save then keeps no note) rather than a refused one
+        # Should the note ever not fit the server's pattern, the bar sends
+        # none (a save then keeps no note) rather than a refused one
         monkeypatch.setattr(dashboard, "LIVE_DEFAULTS_SOURCE_PATTERN", "seed only")
-        assert dashboard._save_target(_flt_sweep(), _FLT_START,
+        assert dashboard._sync_target(_flt_sweep(), _FLT_START,
                                       date(2026, 9, 28))["source"] is None
         page = self._page(monkeypatch, tmp_path)
-        data = TestFilterPage._data(page)
-        snap = _run_script(tmp_path, page, [
-            ["wait"], ["click", "flt-save"], ["snap", "s"]], strict=True)["s"]
-        [opened] = snap["opened"]
-        assert "source" not in self._query(data, opened)
+        snap = _run_script(tmp_path, page, [["wait"], *_AGAIN, ["snap", "s"]], strict=True,
+                           framed=True)["s"]
+        [query] = _told(snap)
+        assert "source" not in self._query(query)
 
-    def test_a_filter_that_cannot_be_built_leaves_no_button(self, monkeypatch, tmp_path):
+    def test_a_filter_that_cannot_be_built_leaves_no_bar(self, monkeypatch, tmp_path):
         def broken(*_a, **_k):
             """
             Stand in for _filter_payload: the filter's data cannot be built.
@@ -8931,15 +9012,18 @@ class TestSaveLiveDefaultsButton:
         monkeypatch.setattr(dashboard, "_filter_payload", broken)
         page = self._page(monkeypatch, tmp_path)
         assert 'id="flt-unavailable"' in page
-        assert 'id="flt-save"' not in page and "<button" not in page
-        assert html.escape(dashboard._SAVE_LABEL) not in page
+        # Nothing in its place but the notice: no note, no button, no link
+        assert 'id="flt-sync-note"' not in page and 'id="live-trade"' not in page
+        assert "<button" not in page and 'id="flt-trade"' not in page
         assert _page_elements(page)["buttons"] == {}
+        snap = _run_script(tmp_path, page, [["wait"], ["snap", "s"]], framed=True)["s"]
+        assert snap["posted"] == []
 
-    def test_the_scenario_explorer_s_own_selects_are_not_saved(self, monkeypatch, tmp_path):
-        # The explorer's band select moves only the explorer: the button still
-        # sends the bar's scenario on screen
+    def test_the_scenario_explorer_s_own_selects_are_not_told(self, monkeypatch, tmp_path):
+        # The explorer's band select moves only the explorer: nothing is told,
+        # and the bar's next choice tells the bar's scenario on screen
         base = _Grid.sweep()
-        # Every point stamped with a size cap, so the bar's scenario can be saved
+        # Every point stamped with a size cap, so the bar's scenario can be told
         scenarios = [dataclasses.replace(p, size_cap=0.2) for p in base.scenarios]
         primary = next(p for p in scenarios if p.population == "all"
                        and (p.spread_band, p.k) == (base.primary.spread_band, base.primary.k))
@@ -8950,32 +9034,33 @@ class TestSaveLiveDefaultsButton:
         pb = data["primary"][0]
         other = str(next(i for i in range(len(data["bands"])) if i != pb))
         snaps = _run_script(tmp_path, page, [
-            ["wait"], ["set", "scn-band-select", other], ["fire", "scn-band-select"],
-            ["click", "flt-save"], ["snap", "s"]], explorer=True)
-        snap = snaps["s"]
-        assert snap["selects"]["scn-band-select"]["value"] == other
-        assert snap["selects"]["flt-band"]["value"] == str(pb)
-        [opened] = snap["opened"]
-        query = self._query(data, opened)
+            ["wait"], ["snap", "ready"], ["set", "scn-band-select", other],
+            ["fire", "scn-band-select"], ["settle"], ["snap", "explorer"], *_AGAIN,
+            ["snap", "bar"]], explorer=True, framed=True)
+        assert snaps["explorer"]["selects"]["scn-band-select"]["value"] == other
+        assert snaps["explorer"]["selects"]["flt-band"]["value"] == str(pb)
+        assert snaps["explorer"]["posted"] == []
+        [raw] = _told(snaps["bar"])
+        query = self._query(raw)
         assert [float(query["spread_min"]), float(query["spread_max"])] == \
             data["bands"][pb]["value"]
-        assert query["source"] == data["save"]["source"]
+        assert query["source"] == data["sync"]["source"]
 
     @pytest.mark.parametrize("saved", [False, True])
-    def test_the_address_is_what_the_defaults_server_accepts(
+    def test_the_query_is_what_the_defaults_server_accepts(
             self, monkeypatch, tmp_path, saved):
-        # The clicked address, handed to the server's own application as a
-        # browser would send it: it answers with the confirmation page, and its
-        # parser reads exactly the scenario on screen — tier floors off, k
-        # 0.60, a 20% cap, no category or tag (any). It names no same-title
-        # cap, which the server would refuse
+        # The told query, handed to the server's own application as the tab
+        # page points the Trading tab at it: it answers with the trading page,
+        # and its parser reads exactly the scenario on screen — tier floors
+        # off, k 0.60, a 20% cap, no category or tag (any). It names no
+        # same-title cap, which the server would refuse
         page = self._kc(monkeypatch, tmp_path, _kc_sweep_tiers())
         data = TestFilterPage._data(page)
         snaps = _run_script(tmp_path, page, [
-            ["wait"], ["click", "flt-save"], ["snap", "primary"],
+            ["wait"], *_AGAIN, ["snap", "primary"],
             ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"],
             ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"],
-            ["click", "flt-save"], ["snap", "chosen"]], strict=True)
+            ["snap", "chosen"]], strict=True, framed=True)
         if saved:
             save_config_live_defaults()
         current = config.read_saved_live_defaults()
@@ -8997,11 +9082,10 @@ class TestSaveLiveDefaultsButton:
                 size_cap=data["caps"][pc]["value"], **rebalance)),
         )
         for name, expected in cases:
-            [opened] = snaps[name]["opened"]
-            self._query(data, opened)
-            query = opened["url"].partition("?")[2]
+            query = _told(snaps[name])[-1]
+            self._query(query)
             response = app.handle(defaults_server._Request("GET", f"/confirm?{query}",
-                                                           _SAVE_HOST))
+                                                           _SERVER_HOST))
             assert response.status == 200, response.body
             settings, source = defaults_server._proposal(defaults_server._params(query),
                                                          current)
@@ -9009,7 +9093,7 @@ class TestSaveLiveDefaultsButton:
             # Every field, one by one (equality skips none of the toggles)
             for field in config.LIVE_TOGGLE_FIELDS:
                 assert getattr(settings, field) == getattr(expected, field), (name, field)
-            assert source == data["save"]["source"]
+            assert source == data["sync"]["source"]
         # Nothing was written by showing the page
         assert config.read_saved_live_defaults() == current
 
@@ -9024,14 +9108,13 @@ class TestSaveLiveDefaultsButton:
         page = self._kc(monkeypatch, tmp_path)
         data = TestFilterPage._data(page)
         assert data["sell_blocks"] is None
-        snap = _run_script(tmp_path, page, [
-            ["wait"], ["click", "flt-save"], ["snap", "s"]], strict=True)["s"]
-        [opened] = snap["opened"]
-        query = self._query(data, opened)
+        snap = _run_script(tmp_path, page, [["wait"], *_AGAIN, ["snap", "s"]], strict=True,
+                           framed=True)["s"]
+        [raw] = _told(snap)
+        query = self._query(raw)
         self._assert_sends(data, query, *data["primary"])
         assert "sell_at" not in query and "sell_min_days" not in query
-        settings, _ = defaults_server._proposal(
-            defaults_server._params(opened["url"].partition("?")[2]), current)
+        settings, _ = defaults_server._proposal(defaults_server._params(raw), current)
         assert (settings.sell_at, settings.sell_min_days) == (0.9, 5)
 
     def test_a_page_without_the_rebalance_view_sends_none_of_its_fields(
@@ -9046,15 +9129,14 @@ class TestSaveLiveDefaultsButton:
         page = self._kc(monkeypatch, tmp_path)
         data = TestFilterPage._data(page)
         assert data["grid_rebalance"] is None
-        snap = _run_script(tmp_path, page, [
-            ["wait"], ["click", "flt-save"], ["snap", "s"]], strict=True)["s"]
-        [opened] = snap["opened"]
-        query = self._query(data, opened)
+        snap = _run_script(tmp_path, page, [["wait"], *_AGAIN, ["snap", "s"]], strict=True,
+                           framed=True)["s"]
+        [raw] = _told(snap)
+        query = self._query(raw)
         self._assert_sends(data, query, *data["primary"])
         for name in ("rebalance", "min_price_move", "rebalance_min_days_to_maturity"):
             assert name not in query, name
-        settings, _ = defaults_server._proposal(
-            defaults_server._params(opened["url"].partition("?")[2]), current)
+        settings, _ = defaults_server._proposal(defaults_server._params(raw), current)
         assert (settings.rebalance, settings.min_price_move) == (True, 0.1)
 
     @pytest.mark.parametrize("saved", [None, 7], ids=["saved-maturity", "saved-7-days"])
@@ -9062,9 +9144,9 @@ class TestSaveLiveDefaultsButton:
             self, monkeypatch, tmp_path, saved):
         # A page with the "Rebalance until" choices names the one shown every
         # time: 0 at maturity (so a saved days limit is turned off), the
-        # choice's days otherwise, and 0 with Rebalance no. The clicked
-        # address goes to the server's own application and parser, which read
-        # back exactly the scenario's own settings, whatever limit is saved.
+        # choice's days otherwise, and 0 with Rebalance no. Each told query
+        # goes to the server's own application and parser, which read back
+        # exactly the scenario's own settings, whatever limit is saved.
         config.save_live_defaults(
             dataclasses.replace(config.live_settings(), rebalance=True, min_price_move=None,
                                 rebalance_min_days_to_maturity=saved), source="")
@@ -9075,25 +9157,24 @@ class TestSaveLiveDefaultsButton:
         assert [entry["value"] for entry in data["maturity"]] == [1, 7]
         until = TestUntilScript._until
         snaps = TestUntilScript._run(tmp_path, page, [
-            ["wait"], *TestRebalanceScript.ON, ["click", "flt-save"], ["snap", "maturity"],
-            *until(2), ["click", "flt-save"], ["snap", "7 days"],
-            *TestMoveScript._move(2), ["click", "flt-save"], ["snap", "7 days at 10c"],
-            *until(0), ["click", "flt-save"], ["snap", "maturity at 10c"],
-            *until(1), *TestRebalanceScript.OFF, ["click", "flt-save"], ["snap", "no"]],
-            strict=True)
+            ["wait"], *TestRebalanceScript.ON, ["snap", "maturity"],
+            *until(2), ["snap", "7 days"],
+            *TestMoveScript._move(2), ["snap", "7 days at 10c"],
+            *until(0), ["snap", "maturity at 10c"],
+            *until(1), ["snap", "1 day at 10c"], *TestRebalanceScript.OFF, ["snap", "no"]],
+            strict=True, framed=True)
         app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
         pb, pk, pc = data["primary"]
         for name, yes, move, days in (("maturity", True, None, None), ("7 days", True, None, 7),
                                       ("7 days at 10c", True, 0.10, 7),
                                       ("maturity at 10c", True, 0.10, None),
                                       ("no", False, None, None)):
-            [opened] = snaps[name]["opened"]
-            query = self._query(data, opened)
+            raw = _told(snaps[name])[-1]
+            query = self._query(raw)
             self._assert_sends(data, query, pb, pk, pc)
             assert query["rebalance_min_days_to_maturity"] == str(days or 0), name
-            raw = opened["url"].partition("?")[2]
             response = app.handle(defaults_server._Request("GET", f"/confirm?{raw}",
-                                                           _SAVE_HOST))
+                                                           _SERVER_HOST))
             assert response.status == 200, response.body
             settings, source = defaults_server._proposal(defaults_server._params(raw), current)
             # The page has no Sell view, so the server keeps the saved selling
@@ -9106,7 +9187,7 @@ class TestSaveLiveDefaultsButton:
             assert settings == expected, name
             for field in config.LIVE_TOGGLE_FIELDS:
                 assert getattr(settings, field) == getattr(expected, field), (name, field)
-            assert source == data["save"]["source"]
+            assert source == data["sync"]["source"]
         # Nothing was written by showing the page
         assert config.read_saved_live_defaults() == current
 
@@ -9116,22 +9197,19 @@ class TestSaveLiveDefaultsButton:
         # A page with the Sell view names its choice every time: "off" twice
         # under no selling (so saved defaults that sell are turned off, and
         # the seed is not leaned on), the level and the minimum of days when a
-        # level is shown. The clicked address goes to the server's own
+        # level is shown. Each told query goes to the server's own
         # application and parser, whatever is saved.
         page = self._kc(monkeypatch, tmp_path, _kc_sweep_sell())
         data = TestFilterPage._data(page)
         assert data["sell_blocks"] is not None
         three = TestSellScript._di(3)
         snaps = TestSellScript._run(tmp_path, page, [
-            ["wait"], ["click", "flt-save"], ["snap", "none"],
-            ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
-            ["click", "flt-save"], ["snap", "level"],
-            ["set", "flt-days", three], ["fire", "flt-days"], ["settle"],
-            ["click", "flt-save"], ["snap", "days"],
-            ["set", "flt-sell", "1"], ["fire", "flt-sell"], ["settle"],
-            ["click", "flt-save"], ["snap", "other"],
-            ["set", "flt-sell", "none"], ["fire", "flt-sell"], ["settle"],
-            ["click", "flt-save"], ["snap", "back"]], strict=True)
+            ["wait"], *_AGAIN, ["snap", "none"],
+            ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"], ["snap", "level"],
+            ["set", "flt-days", three], ["fire", "flt-days"], ["settle"], ["snap", "days"],
+            ["set", "flt-sell", "1"], ["fire", "flt-sell"], ["settle"], ["snap", "other"],
+            ["set", "flt-sell", "none"], ["fire", "flt-sell"], ["settle"], ["snap", "back"]],
+            strict=True, framed=True)
         if saved != "nothing":
             save_config_live_defaults()
         if saved == "selling":
@@ -9153,14 +9231,13 @@ class TestSaveLiveDefaultsButton:
         cases = (("none", None, None), ("level", 0.25, 1), ("days", 0.25, 3),
                  ("other", 0.5, 3), ("back", None, None))
         for name, level, minimum in cases:
-            [opened] = snaps[name]["opened"]
-            query = self._query(data, opened)
+            [raw] = _told(snaps[name])
+            query = self._query(raw)
             self._assert_sends(data, query, pb, pk, pc)
             assert query["sell_at"] == ("off" if level is None else str(level)), name
             assert query["sell_min_days"] == ("off" if minimum is None else str(minimum)), name
-            raw = opened["url"].partition("?")[2]
             response = app.handle(defaults_server._Request("GET", f"/confirm?{raw}",
-                                                           _SAVE_HOST))
+                                                           _SERVER_HOST))
             assert response.status == 200, response.body
             settings, source = defaults_server._proposal(defaults_server._params(raw), current)
             expected = config.LiveSettings(
@@ -9171,7 +9248,7 @@ class TestSaveLiveDefaultsButton:
             assert settings == expected, name
             for field in config.LIVE_TOGGLE_FIELDS:
                 assert getattr(settings, field) == getattr(expected, field), (name, field)
-            assert source == data["save"]["source"]
+            assert source == data["sync"]["source"]
         # Nothing was written by showing the page
         assert config.read_saved_live_defaults() == current
 
@@ -9179,10 +9256,10 @@ class TestSaveLiveDefaultsButton:
     def test_a_sell_level_from_a_page_with_the_rebalance_view_sends_rebalance_no(
             self, monkeypatch, tmp_path, saved):
         # Sell shows a level only while Rebalance is no, so from a page with
-        # both views the address at a Sell level names rebalancing off (which
+        # both views the query at a Sell level names rebalancing off (which
         # turns saved rebalancing off), and with Rebalance yes it names no
         # selling. The defaults server's own application and parser read each
-        # address back, over saved defaults that rebalance and ones that do not.
+        # query back, over saved defaults that rebalance and ones that do not.
         config.save_live_defaults(
             dataclasses.replace(config.live_settings(), rebalance=saved, min_price_move=None),
             source="")
@@ -9193,26 +9270,25 @@ class TestSaveLiveDefaultsButton:
         assert data["sell_blocks"] is not None and data["grid_rebalance"] is not None
         snaps = TestSellScript._run(tmp_path, page, [
             ["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
-            ["click", "flt-save"], ["snap", "level"],
+            ["snap", "level"],
             ["set", "flt-sell", "none"], ["fire", "flt-sell"], ["settle"],
-            *TestRebalanceScript.ON, ["click", "flt-save"], ["snap", "rebalancing"]],
-            strict=True, js=TestRebalanceScript.WAIT)
+            ["snap", "none"], *TestRebalanceScript.ON, ["snap", "rebalancing"]],
+            strict=True, js=TestRebalanceScript.WAIT, framed=True)
         app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
         level, minimum = data["sell_levels"][0]["value"], data["sell_days"][0]["value"]
         pb, pk, pc = data["primary"]
         for name, yes, sell_at, sell_min_days in (("level", False, level, minimum),
                                                   ("rebalancing", True, None, None)):
-            [opened] = snaps[name]["opened"]
-            query = self._query(data, opened)
+            [raw] = _told(snaps[name])
+            query = self._query(raw)
             self._assert_sends(data, query, pb, pk, pc)
             assert query["rebalance"] == ("on" if yes else "off"), name
             assert query["min_price_move"] == "off", name
             assert query["sell_at"] == ("off" if sell_at is None else str(sell_at)), name
             assert query["sell_min_days"] == (
                 "off" if sell_min_days is None else str(sell_min_days)), name
-            raw = opened["url"].partition("?")[2]
             response = app.handle(defaults_server._Request("GET", f"/confirm?{raw}",
-                                                           _SAVE_HOST))
+                                                           _SERVER_HOST))
             assert response.status == 200, response.body
             settings, _ = defaults_server._proposal(defaults_server._params(raw), current)
             assert settings.rebalance is yes, name
@@ -9221,64 +9297,637 @@ class TestSaveLiveDefaultsButton:
         # Nothing was written by showing the page
         assert config.read_saved_live_defaults() == current
 
+    # ── The Trading tab's proposal, shown on the bar ─────────────────────────
 
-# The defaults server's trade page, as the dashboard's link must name it
-_TRADE_URL = f"http://{config.DEFAULTS_SERVER_HOST}:{config.DEFAULTS_SERVER_PORT}/trade"
+    def test_a_proposal_sets_every_select_and_tick_and_tells_nothing_back(
+            self, monkeypatch, tmp_path):
+        # The tab page tells the page the Trading tab's proposal: every select
+        # and tick is set to it, its letter-case twins with it, the scenario
+        # is drawn as a reader's choice would be, and nothing is told back
+        page = self._kc(monkeypatch, tmp_path, _kc_sweep_until(_kc_sweep_tiers()))
+        data = TestFilterPage._data(page)
+        assert data["grid_off"] is not None and data["grid_maturity"] is not None
+        # Other excluded and Sports' Basketball, which leaves Sports' Hockey
+        cats, subcats = data["categories"], data["subcats"]
+        basketball = subcats.index([cats.index("Sports"), "Basketball"])
+        proposal = _proposed(
+            tier_floors=False, spread_band=tuple(data["bands"][0]["value"]),
+            interval_discount=data["ks"][0]["value"], size_cap=data["caps"][2]["value"],
+            rebalance=True, min_price_move=data["moves"][1]["value"],
+            rebalance_min_days_to_maturity=data["maturity"][1]["value"],
+            exclude_categories=("Other",), exclude_tags=("Sports · Basketball",))
+        query = defaults_server._settings_query(proposal, source="seed values (config."
+                                                "LIVE_DEFAULTS_SEED)")
+        snaps = TestUntilScript._run(tmp_path, page, [
+            ["wait"], ["snap", "ready"], *_apply(query), ["snap", "applied"]],
+            strict=True, framed=True)
+        applied = snaps["applied"]
+        selects = applied["selects"]
+        assert {name: selects[name]["value"] for name in (
+            "flt-band", "flt-tier", "flt-k", "flt-cap", "flt-rebalance", "flt-move",
+            "flt-until", "flt-sell")} == {
+            "flt-band": "0", "flt-tier": "off", "flt-k": "0", "flt-cap": "2",
+            "flt-rebalance": "yes", "flt-move": "2", "flt-until": "2", "flt-sell": "none"}
+        # The band's options are named as the tier floors off name them
+        assert [o[1] for o in selects["flt-band"]["options"]] == \
+            [b["option"] for b in data["bands_off"]]
+        assert applied["menus"]["flt-cat"]["ticked"] == [cats.index("Other")]
+        assert applied["menus"]["flt-tag"]["ticked"] == [basketball]
+        # Drawn as a reader's choice is, and nothing told back
+        assert applied["reacts"] and applied["posted"] == [] and _note(applied) == ""
+        assert not applied["text"]["flt-summary"].startswith("Loading")
+        # The reader's next choice tells exactly the proposal back
+        snaps = TestUntilScript._run(tmp_path, page, [
+            ["wait"], *_apply(query), *_AGAIN, ["snap", "again"]], strict=True, framed=True)
+        [told] = _told(snaps["again"])
+        settings, _ = defaults_server._proposal(defaults_server._params(told), None)
+        assert settings == proposal
+
+    @pytest.mark.parametrize("origin, source, message", [
+        ("http://127.0.0.1:8767", "parent", None),
+        ("http://127.0.0.1:8765", "parent", None),
+        ("http://example.com", "parent", None),
+        (_ORIGINS[0], "self", None),
+        (_ORIGINS[1], "other", None),
+        (_ORIGINS[0], "parent", {"type": "kalshi-bar", "query": "k=0.6"}),
+        (_ORIGINS[0], "parent", {"type": "kalshi-apply", "query": 7}),
+        (_ORIGINS[0], "parent", {"type": "kalshi-apply"}),
+        (_ORIGINS[0], "parent", "kalshi-apply"),
+        (_ORIGINS[0], "parent", ["kalshi-apply"]),
+    ])
+    def test_a_proposal_from_any_other_window_origin_or_shape_is_ignored(
+            self, monkeypatch, tmp_path, origin, source, message):
+        page = self._kc(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        query = defaults_server._settings_query(_proposed(
+            tier_floors=True, spread_band=tuple(data["bands"][1]["value"]),
+            interval_discount=data["ks"][1]["value"], size_cap=data["caps"][0]["value"]))
+        if message is None:
+            message = {"type": "kalshi-apply", "query": query}
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["snap", "ready"], ["message", origin, source, message], ["settle"],
+            ["snap", "s"]], strict=True, framed=True)
+        snap = snaps["s"]
+        assert snap["reacts"] == [] and snap["posted"] == [] and _note(snap) == ""
+        assert {name: snap["selects"][name]["value"] for name in ("flt-band", "flt-cap")} \
+            == {"flt-band": "0", "flt-cap": "1"}
+        # The same proposal from the tab page, at either of its addresses, is shown
+        for address in _ORIGINS:
+            shown = _run_script(tmp_path, page, [["wait"], *_apply(query, address),
+                                                 ["snap", "s"]], strict=True, framed=True)["s"]
+            assert shown["selects"]["flt-band"]["value"] == "1", address
+            assert shown["selects"]["flt-cap"]["value"] == "0", address
+
+    def test_what_the_bar_cannot_show_is_named_and_the_rest_shown(self, monkeypatch, tmp_path):
+        # A page without the tier-floors-off, Rebalance or Sell views, and a
+        # proposal with a k off its grid, a category and a tag it does not
+        # list, the tier floors off, rebalancing with a minimum and a days
+        # limit, and a sell level with a minimum of days: each is named in
+        # the note, in the bar's order, and the band and cap it can show are
+        # shown
+        page = self._kc(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        assert data["grid_off"] is None and data["grid_rebalance"] is None
+        assert data["sell_blocks"] is None and "Weather" not in data["categories"]
+        proposal = _proposed(
+            tier_floors=False, spread_band=tuple(data["bands"][1]["value"]),
+            interval_discount=0.85, size_cap=data["caps"][0]["value"],
+            rebalance=True, min_price_move=0.1, rebalance_min_days_to_maturity=7,
+            sell_at=0.9, sell_min_days=5, exclude_categories=("Weather",),
+            exclude_tags=("Sports · Curling",))
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["snap", "ready"], *_apply(defaults_server._settings_query(proposal)),
+            ["snap", "s"]], strict=True, framed=True)["s"]
+        text, fields = data["text"], data["text"]["sync_fields"]
+
+        def item(template: str, field: str, value: str) -> str:
+            """One setting named as the note names it."""
+            return text[template].format(field=fields[field], value=value)
+
+        assert _note(snap) == text["sync_not_here"].format(items=text["sync_join"].join([
+            item("sync_no_view", "tier", text["sync_off"]),
+            item("sync_off_grid", "k", "0.85"),
+            item("sync_no_view", "rebalance", text["sync_on"]),
+            item("sync_no_view", "move", "0.1"),
+            item("sync_no_view", "until", "7"),
+            item("sync_no_view", "sell", "0.9"),
+            item("sync_no_view", "days", "5"),
+            item("sync_unlisted", "category", "Weather"),
+            item("sync_unlisted", "tag", "Sports · Curling")]))
+        # The rest is shown: the band and the cap; k stays as it was
+        assert snap["selects"]["flt-band"]["value"] == "1"
+        assert snap["selects"]["flt-cap"]["value"] == "0"
+        assert snap["selects"]["flt-k"]["value"] == "1"
+        assert snap["reacts"] and snap["posted"] == []
+        # A reader's choice of the cap then tells the cap shown and keeps every
+        # setting the bar cannot show as the Trading tab has it, the note
+        # naming them still; once k is chosen on the bar, the k shown is told
+        # and the note no longer names it
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], *_apply(defaults_server._settings_query(proposal)),
+            ["set", "flt-cap", "2"], ["fire", "flt-cap"], ["settle"], ["snap", "cap"],
+            ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "k"]],
+            strict=True, framed=True)
+        for name, k, shown_k in (("cap", 0.85, False), ("k", data["ks"][0]["value"], True)):
+            [raw] = _told(snaps[name])
+            read, _ = defaults_server._proposal(defaults_server._params(raw), None)
+            assert read == dataclasses.replace(
+                proposal, size_cap=data["caps"][2]["value"], interval_discount=k), name
+            items = [item("sync_no_view", "tier", text["sync_off"]),
+                     *([] if shown_k else [item("sync_off_grid", "k", "0.85")]),
+                     item("sync_no_view", "rebalance", text["sync_on"]),
+                     item("sync_no_view", "move", "0.1"),
+                     item("sync_no_view", "until", "7"),
+                     item("sync_no_view", "sell", "0.9"),
+                     item("sync_no_view", "days", "5"),
+                     item("sync_unlisted", "category", "Weather"),
+                     item("sync_unlisted", "tag", "Sports · Curling")]
+            assert _note(snaps[name]) == text["sync_not_here"].format(
+                items=text["sync_join"].join(items)), name
+
+    def test_rebalancing_with_a_sell_level_shows_the_rebalancing(self, monkeypatch, tmp_path):
+        # The bar never shows a sell level beside rebalancing: it shows
+        # Rebalance yes and names the level and its minimum of days. A sell
+        # level alone, with no minimum of days, is shown, its "any" minimum
+        # named; a level off the page's choices is named too
+        page = self._kc(monkeypatch, tmp_path, _kc_sweep_sell(_kc_sweep_rebalance()))
+        data = TestFilterPage._data(page)
+        text, fields = data["text"], data["text"]["sync_fields"]
+        level = data["sell_levels"][1]["value"]
+        both = _proposed(tier_floors=True, spread_band=tuple(data["bands"][0]["value"]),
+                         interval_discount=data["ks"][1]["value"],
+                         size_cap=data["caps"][1]["value"], rebalance=True,
+                         sell_at=level, sell_min_days=3)
+        alone = dataclasses.replace(both, rebalance=False, sell_min_days=None)
+        off_grid = dataclasses.replace(both, rebalance=False, sell_at=0.9)
+        snaps = TestSellScript._run(tmp_path, page, [
+            ["wait"], ["snap", "ready"], *_apply(defaults_server._settings_query(both)),
+            ["snap", "both"],
+            *_apply(defaults_server._settings_query(alone)), ["snap", "alone"],
+            *_apply(defaults_server._settings_query(off_grid)), ["snap", "off grid"]],
+            strict=True, js=TestRebalanceScript.WAIT, framed=True)
+        snap = snaps["both"]
+        assert snap["selects"]["flt-rebalance"]["value"] == "yes"
+        assert snap["selects"]["flt-sell"]["value"] == "none"
+        assert _note(snap) == text["sync_not_here"].format(items=text["sync_join"].join([
+            text["sync_not_with"].format(field=fields["sell"], value=repr(level)),
+            text["sync_not_with"].format(field=fields["days"], value="3")]))
+        snap = snaps["alone"]
+        assert snap["selects"]["flt-rebalance"]["value"] == "no"
+        assert snap["selects"]["flt-sell"]["value"] == "1"
+        assert _note(snap) == text["sync_not_here"].format(
+            items=text["sync_off_grid"].format(field=fields["days"], value=text["sync_any"]))
+        snap = snaps["off grid"]
+        assert _note(snap) == text["sync_not_here"].format(
+            items=text["sync_off_grid"].format(field=fields["sell"], value="0.9"))
+        for name in ("both", "alone", "off grid"):
+            assert snaps[name]["posted"] == [], name
+
+    def test_a_proposal_the_bar_already_shows_loads_and_draws_nothing(
+            self, monkeypatch, tmp_path):
+        # The primary scenario proposed while it is on screen: no chunk is
+        # loaded, nothing is drawn or told, and the note stays empty; another
+        # cap proposed then loads its chunk
+        page = self._kc(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        pb, pk, pc = data["primary"]
+        shown = defaults_server._settings_query(_proposed(
+            tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
+            interval_discount=data["ks"][pk]["value"], size_cap=data["caps"][pc]["value"],
+            rebalance=False))
+        other = defaults_server._settings_query(_proposed(
+            tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
+            interval_discount=data["ks"][pk]["value"], size_cap=data["caps"][0]["value"],
+            rebalance=False))
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["snap", "ready"], *_apply(shown), ["snap", "same"],
+            *_apply(other), ["snap", "other"], *_apply(other), ["snap", "same again"]],
+            strict=True, framed=True)
+        for name in ("same", "same again"):
+            snap = snaps[name]
+            assert snap["reacts"] == [] and snap["updates"] == [], name
+            assert snap["inflated"] == snaps["ready"]["inflated"] or name == "same again"
+            assert snap["posted"] == [] and _note(snap) == "", name
+        assert snaps["same"]["files"] == snaps["ready"]["files"]
+        assert snaps["same again"]["files"] == snaps["other"]["files"]
+        assert snaps["other"]["reacts"]
+        assert snaps["other"]["files"] == snaps["ready"]["files"] + [
+            _chunk_src(page, data["grid"][pb][pk][0])]
+
+    def test_a_proposal_while_the_reader_s_choice_loads_is_not_shown(
+            self, monkeypatch, tmp_path):
+        # The reader chose band 0.3-0.6, whose chunk is still loading: a
+        # proposal arriving meanwhile (a 5% cap) is not shown over it; once
+        # the chunk is in, the reader's choice is drawn and told on top of
+        # that proposal — the band the reader chose, the cap the Trading tab
+        # now has — and the bar then shows what it told
+        page = self._kc(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        src = _chunk_src(page, 4)
+        proposal = _proposed(
+            tier_floors=True, spread_band=tuple(data["bands"][0]["value"]),
+            interval_discount=data["ks"][1]["value"], size_cap=data["caps"][0]["value"],
+            rebalance=False)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["snap", "ready"], ["set", "flt-band", "1"], ["fire", "flt-band"],
+            ["settle"], *_apply(defaults_server._settings_query(proposal)), ["snap", "pending"],
+            ["resolve_file", src], ["settle"], ["snap", "drawn"]],
+            strict=True, files_deferred=(src,), framed=True)
+        pending = snaps["pending"]
+        assert pending["selects"]["flt-band"]["value"] == "1"
+        assert pending["selects"]["flt-cap"]["value"] == "1"
+        assert pending["posted"] == [] and pending["pendingFiles"] == [src]
+        drawn = snaps["drawn"]
+        [raw] = _told(drawn)
+        self._assert_sends(data, self._query(raw), 1, 1, 0)
+        read, _ = defaults_server._proposal(defaults_server._params(raw), None)
+        assert read == dataclasses.replace(proposal,
+                                           spread_band=tuple(data["bands"][1]["value"]))
+        assert {name: drawn["selects"][name]["value"] for name in ("flt-band", "flt-cap")} \
+            == {"flt-band": "1", "flt-cap": "0"}
+        assert _note(drawn) == "" and not drawn["text"]["flt-summary"].startswith("Loading")
+
+    def test_a_proposal_kept_while_a_choice_loads_is_shown_when_that_choice_fails(
+            self, monkeypatch, tmp_path):
+        # The reader's band could not be loaded: the bar goes back, tells
+        # nothing, and then shows the proposal that arrived meanwhile
+        page = self._kc(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        src = _chunk_src(page, 4)
+        proposal = defaults_server._settings_query(_proposed(
+            tier_floors=True, spread_band=tuple(data["bands"][0]["value"]),
+            interval_discount=data["ks"][1]["value"], size_cap=data["caps"][0]["value"]))
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"],
+            *_apply(proposal), ["reject_file", src], ["settle"], ["snap", "s"]],
+            strict=True, files_deferred=(src,), framed=True)["s"]
+        assert _told(snap) == []
+        assert {name: snap["selects"][name]["value"] for name in ("flt-band", "flt-cap")} \
+            == {"flt-band": "0", "flt-cap": "0"}
+        assert not snap["text"]["flt-summary"].startswith("Loading")
+
+    def test_a_proposal_before_the_bar_is_ready_is_not_heard(self, monkeypatch, tmp_path):
+        # The primary chunk still inflating: the proposal is not heard, and
+        # the page says it is ready only afterwards, so the tab page then
+        # tells it the proposal again
+        page = self._kc(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        proposal = defaults_server._settings_query(_proposed(
+            tier_floors=True, spread_band=tuple(data["bands"][1]["value"]),
+            interval_discount=data["ks"][1]["value"], size_cap=data["caps"][0]["value"]))
+        snaps = _run_script(tmp_path, page, [
+            *_apply(proposal), ["snap", "early"], ["resolve", "dash-chunk-0"], ["wait"],
+            ["snap", "ready"], *_apply(proposal), ["snap", "heard"]],
+            strict=True, deferred=("dash-chunk-0",), framed=True)
+        assert snaps["early"]["posted"] == []
+        assert _told(snaps["ready"], "kalshi-ready") == [{"type": "kalshi-ready"}]
+        assert snaps["ready"]["selects"]["flt-band"]["value"] == "0"
+        assert snaps["heard"]["selects"]["flt-band"]["value"] == "1"
+
+    @pytest.mark.parametrize("page_kind, fields", [
+        ("until", {"tier_floors": True, "spread_band": (0.3, 0.6), "interval_discount": 0.75,
+                   "size_cap": 0.05, "rebalance": False}),
+        ("until", {"tier_floors": False, "spread_band": (0.0, 1.0), "interval_discount": 0.6,
+                   "size_cap": 1.0, "rebalance": True, "min_price_move": 0.1,
+                   "rebalance_min_days_to_maturity": 7, "exclude_categories": ("Other",)}),
+        ("until", {"tier_floors": True, "spread_band": (0.0, 1.0), "interval_discount": 0.75,
+                   "size_cap": 0.2, "rebalance": True, "rebalance_min_days_to_maturity": 1,
+                   "exclude_tags": ("Sports · Basketball",)}),
+        ("sell", {"tier_floors": True, "spread_band": (0.0, 1.0), "interval_discount": 0.75,
+                  "size_cap": 0.2, "rebalance": False, "sell_at": 0.5, "sell_min_days": 14}),
+        ("sell", {"tier_floors": True, "spread_band": (0.3, 0.6), "interval_discount": 0.75,
+                  "size_cap": 1.0, "rebalance": True}),
+    ])
+    def test_a_proposal_on_the_page_s_grids_round_trips(self, monkeypatch, tmp_path,
+                                                       page_kind, fields):
+        # The trading page's own query for settings on the page's grids
+        # (defaults_server._settings_query), shown on the bar, is every one
+        # shown (no note); the bar's next choice tells a query the defaults
+        # server reads back as exactly those settings (a field this page has
+        # no view of keeps the seed's, as the settings do)
+        sweep = (_kc_sweep_until(_kc_sweep_tiers()) if page_kind == "until"
+                 else _kc_sweep_sell(_kc_sweep_rebalance()))
+        page = self._kc(monkeypatch, tmp_path, sweep)
+        settings = _proposed(**fields)
+        query = defaults_server._settings_query(settings)
+        runner = TestUntilScript._run if page_kind == "until" else TestSellScript._run
+        extra = {} if page_kind == "until" else {"js": TestRebalanceScript.WAIT}
+        snaps = runner(tmp_path, page, [
+            ["wait"], ["snap", "ready"], *_apply(query), ["snap", "applied"], *_AGAIN,
+            ["snap", "again"]], strict=True, framed=True, **extra)
+        assert _note(snaps["applied"]) == "" and snaps["applied"]["posted"] == []
+        [told] = _told(snaps["again"])
+        read, _ = defaults_server._proposal(defaults_server._params(told), None)
+        assert read == settings
+        for field in config.LIVE_TOGGLE_FIELDS:
+            assert getattr(read, field) == getattr(settings, field), field
+        # ... and shown again, it is the scenario on screen: nothing to do
+        snaps = runner(tmp_path, page, [
+            ["wait"], *_apply(query), ["snap", "applied"], *_apply(told), ["snap", "again"]],
+            strict=True, framed=True, **extra)
+        assert snaps["again"]["reacts"] == [] and snaps["again"]["posted"] == []
+
+    @pytest.mark.parametrize("page_kind", ["no views", "rebalance, no until", "sell"])
+    def test_a_choice_keeps_every_setting_the_bar_cannot_show(
+            self, monkeypatch, tmp_path, page_kind):
+        # Saved live defaults that differ from the Trading tab's proposal in
+        # every setting the page cannot show, or shows only in part: the
+        # reader's choice of a size cap tells that cap and every other setting
+        # as the Trading tab has it, which the defaults server reads back, over
+        # those saved defaults, as exactly the proposal with the new cap. A
+        # field left out would read back as the saved value instead
+        saved = dataclasses.replace(
+            config.live_settings(), tier_floors=True, rebalance=True, min_price_move=0.1,
+            rebalance_min_days_to_maturity=7, sell_at=0.9, sell_min_days=5,
+            exclude_categories=None, exclude_tags=None)
+        config.save_live_defaults(saved, source="")
+        current = config.read_saved_live_defaults()
+        assert current == saved
+        sweep = {"no views": _kc_sweep(), "rebalance, no until": _kc_sweep_rebalance(),
+                 "sell": _kc_sweep_sell(_kc_sweep_rebalance())}[page_kind]
+        page = self._kc(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        assert data["grid_off"] is None and data["grid_maturity"] is None
+        assert (data["grid_rebalance"] is None) is (page_kind == "no views")
+        assert (data["sell_blocks"] is None) is (page_kind != "sell")
+        common = {"spread_band": tuple(data["bands"][0]["value"]),
+                  "interval_discount": data["ks"][1]["value"],
+                  "size_cap": data["caps"][1]["value"]}
+        if page_kind == "no views":
+            # The tier floors off, rebalancing and selling off, and a category
+            # and a tag the page does not list
+            proposal = _proposed(tier_floors=False, rebalance=False, sell_at=None,
+                                 sell_min_days=None, exclude_categories=("Weather",),
+                                 exclude_tags=("Sports · Curling",), **common)
+        elif page_kind == "rebalance, no until":
+            # Rebalancing to maturity, which the page shows only as Rebalance yes
+            proposal = _proposed(tier_floors=True, rebalance=True, min_price_move=None,
+                                 rebalance_min_days_to_maturity=None, **common)
+        else:
+            # A sell level beside rebalancing, which the bar never shows together
+            proposal = _proposed(tier_floors=True, rebalance=True, min_price_move=None,
+                                 sell_at=data["sell_levels"][1]["value"], sell_min_days=3,
+                                 **common)
+        # Each runner waits for the selects its page enables
+        runner = {"no views": _run_script, "rebalance, no until": TestRebalanceScript._run,
+                  "sell": TestSellScript._run}[page_kind]
+        extra = {"js": TestRebalanceScript.WAIT} if page_kind == "sell" else {}
+        snaps = runner(tmp_path, page, [
+            ["wait"], *_apply(defaults_server._settings_query(proposal)), ["snap", "applied"],
+            ["set", "flt-cap", "2"], ["fire", "flt-cap"], ["settle"], ["snap", "cap"],
+            ["set", "flt-cap", "0"], ["fire", "flt-cap"], ["settle"], ["snap", "again"]],
+            strict=True, framed=True, **extra)
+        app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
+        for name, ci in (("cap", 2), ("again", 0)):
+            [raw] = _told(snaps[name])
+            response = app.handle(defaults_server._Request("GET", f"/confirm?{raw}",
+                                                           _SERVER_HOST))
+            assert response.status == 200, response.body
+            read, _ = defaults_server._proposal(defaults_server._params(raw), current)
+            expected = dataclasses.replace(proposal, size_cap=data["caps"][ci]["value"])
+            assert read == expected, name
+            for field in config.LIVE_TOGGLE_FIELDS:
+                assert getattr(read, field) == getattr(expected, field), (name, field)
+            # The note keeps naming what the bar cannot show
+            assert _note(snaps[name]) == _note(snaps["applied"]), name
+        # Nothing was written by showing the page
+        assert config.read_saved_live_defaults() == current
+
+    def test_a_choice_of_ticks_keeps_the_names_the_menus_do_not_list(
+            self, monkeypatch, tmp_path):
+        # The Trading tab excludes a category and a tag this page does not
+        # list: the reader's tick tells the menus' exclusions with those two
+        # beside them, and unticking every box keeps them still
+        page = self._page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        assert "Weather" not in data["categories"]
+        sports = data["categories"].index("Sports")
+        pb, pk, pc = data["primary"]
+        proposal = _proposed(
+            tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
+            interval_discount=data["ks"][pk]["value"], size_cap=data["caps"][pc]["value"],
+            rebalance=False, exclude_categories=("Weather",),
+            exclude_tags=("Sports · Curling",))
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], *_apply(defaults_server._settings_query(proposal)),
+            _tick_category(sports), ["settle"], ["snap", "ticked"],
+            _tick_category(sports), ["settle"], ["snap", "unticked"]],
+            strict=True, framed=True)
+        for name, cats in (("ticked", ("Sports", "Weather")), ("unticked", ("Weather",))):
+            [raw] = _told(snaps[name])
+            query = self._query(raw)
+            assert query["exclude_category"] == list(cats), name
+            assert query["exclude_tag"] == ["Sports · Curling"], name
+            read, _ = defaults_server._proposal(defaults_server._params(raw), None)
+            assert read == dataclasses.replace(proposal, exclude_categories=cats), name
+
+    def test_an_off_grid_value_is_kept_until_that_setting_is_chosen(
+            self, monkeypatch, tmp_path):
+        # A k off the page's choices: a choice of the band keeps it, and once
+        # the reader chooses a k on the bar, that k is told
+        page = self._kc(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        proposal = _proposed(
+            tier_floors=True, spread_band=tuple(data["bands"][0]["value"]),
+            interval_discount=0.85, size_cap=data["caps"][1]["value"], rebalance=False)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], *_apply(defaults_server._settings_query(proposal)),
+            ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"], ["snap", "band"],
+            ["set", "flt-k", "1"], ["fire", "flt-k"], ["settle"], ["snap", "k"]],
+            strict=True, framed=True)
+        for name, k in (("band", 0.85), ("k", data["ks"][1]["value"])):
+            [raw] = _told(snaps[name])
+            read, _ = defaults_server._proposal(defaults_server._params(raw), None)
+            assert read == dataclasses.replace(
+                proposal, spread_band=tuple(data["bands"][1]["value"]),
+                interval_discount=k), name
+        text = data["text"]
+        assert _note(snaps["band"]) == text["sync_not_here"].format(
+            items=text["sync_off_grid"].format(field=text["sync_fields"]["k"], value="0.85"))
+        assert _note(snaps["k"]) == ""
+
+    def test_a_proposal_back_to_the_scenario_on_screen_supersedes_one_loading(
+            self, monkeypatch, tmp_path):
+        # The Trading tab proposes a 5% cap, whose chunk is still loading, then
+        # the scenario on screen again: the bar shows the second at once, and
+        # the first, once loaded, is never drawn over it
+        page = self._kc(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        pb, pk, pc = data["primary"]
+        src = _chunk_src(page, data["grid"][pb][pk][0])
+
+        def query(ci: int) -> str:
+            """The trading page's query for the primary scenario at cap ci."""
+            return defaults_server._settings_query(_proposed(
+                tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
+                interval_discount=data["ks"][pk]["value"], size_cap=data["caps"][ci]["value"],
+                rebalance=False))
+
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["snap", "ready"], *_apply(query(0)), ["snap", "loading"],
+            *_apply(query(pc)), ["snap", "back"], ["resolve_file", src], ["settle"],
+            ["snap", "end"]], strict=True, files_deferred=(src,), framed=True)
+        assert snaps["loading"]["selects"]["flt-cap"]["value"] == "0"
+        assert snaps["loading"]["pendingFiles"] == [src]
+        back = snaps["back"]
+        assert back["selects"]["flt-cap"]["value"] == str(pc)
+        assert not back["text"]["flt-summary"].startswith("Loading")
+        end = snaps["end"]
+        assert end["selects"]["flt-cap"]["value"] == str(pc)
+        assert end["reacts"] == [] and end["text"]["flt-summary"] == back["text"]["flt-summary"]
+        for name in ("loading", "back", "end"):
+            assert snaps[name]["posted"] == [] and _note(snaps[name]) == "", name
+
+    def test_the_tab_page_s_reading_of_a_category_with_every_tag_ticked_is_shown_already(
+            self, monkeypatch, tmp_path):
+        # Every tag of Sports ticked is told as Sports excluded; the trading
+        # page's own query for that proposal, shown on the bar, is the
+        # scenario on screen: nothing is drawn, and the menus keep the
+        # reader's ticks
+        page = self._page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        sports = data["categories"].index("Sports")
+        own = [i for i, (ci, _) in enumerate(data["subcats"]) if ci == sports]
+        assert len(own) == 2
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], *(step for i in own for step in (_tick_tag(i), ["settle"])),
+            ["snap", "ticked"]], strict=True, framed=True)
+        raw = _told(snaps["ticked"])[-1]
+        assert self._query(raw)["exclude_category"] == ["Sports"]
+        settings, source = defaults_server._proposal(defaults_server._params(raw), None)
+        # Rebalancing off, as this page (which has no Rebalance view) shows it
+        echo = defaults_server._settings_query(dataclasses.replace(settings, rebalance=False),
+                                               source=source)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], *(step for i in own for step in (_tick_tag(i), ["settle"])),
+            ["snap", "ticked"], *_apply(echo), ["snap", "echo"]], strict=True, framed=True)
+        echo_snap = snaps["echo"]
+        assert echo_snap["reacts"] == [] and echo_snap["posted"] == []
+        assert echo_snap["menus"]["flt-cat"]["ticked"] == []
+        assert echo_snap["menus"]["flt-tag"]["ticked"] == own
+        assert _note(echo_snap) == ""
+
+    def test_a_proposal_that_cannot_be_drawn_is_named_and_the_bar_is_told_as_shown(
+            self, monkeypatch, tmp_path):
+        # The proposal's chunk is damaged: the bar goes back to the scenario
+        # before it and the note says so; the reader's next choice then tells
+        # the settings the bar shows, and the note is cleared
+        page = self._kc(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        pb, pk, pc = data["primary"]
+        src = _chunk_src(page, data["grid"][1][pk][pc])
+        proposal = defaults_server._settings_query(_proposed(
+            tier_floors=True, spread_band=tuple(data["bands"][1]["value"]),
+            interval_discount=data["ks"][pk]["value"], size_cap=data["caps"][pc]["value"],
+            rebalance=False))
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], *_apply(proposal), ["snap", "failed"], *_AGAIN, ["snap", "again"]],
+            strict=True, files_damaged=(src,), framed=True)
+        failed = snaps["failed"]
+        assert failed["selects"]["flt-band"]["value"] == str(pb)
+        assert _told(failed) == []
+        assert _note(failed) == data["text"]["sync_unshown"]
+        again = snaps["again"]
+        [raw] = _told(again)
+        self._assert_sends(data, self._query(raw), pb, pk, pc)
+        assert _note(again) == ""
 
 
-class TestTradeUsingDefaultsLink:
-    """The filter bar's "Trade using defaults…" link: a plain link to the
-    defaults server's /trade address (which sends the browser on to its
-    trading page), opened in a new tab, that needs no script; it stays on a
-    page whose filter bar could not be built; and its id sits once in the
-    page's opening part, within config.DASHBOARD_MARKER_SCAN_BYTES of the
-    start."""
+# ─── The names file the backtest page writes for the Trading tab ─────────────
+
+class TestFilterNamesFile:
+    """Each build whose filter bar was built writes, beside the page, the
+    names its two Exclude menus list (config.BACKTEST_FILTER_NAMES_FILENAME),
+    which the defaults server reads (defaults_server._filter_names) so the
+    Trading tab's own menus list the same names: every category, and every
+    tag as "Category · Tag", in the bar's order, none the server would
+    refuse. A page whose bar failed leaves no file."""
 
     @staticmethod
-    def _link(page: str) -> tuple[dict, str]:
-        """
-        Read the one Trade link on a page.
+    def _names(root: Path) -> dict:
+        """The names file in a folder, read strictly."""
+        text = (root / config.BACKTEST_FILTER_NAMES_FILENAME).read_text(encoding="utf-8")
+        return json.loads(text, parse_constant=lambda name: pytest.fail(name))
 
-        Args:
-            page (str): The page's HTML.
+    def test_it_lists_the_bar_s_names_and_the_server_reads_them(self, monkeypatch, tmp_path):
+        page = TestFilterPage()._page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        record = self._names(tmp_path)
+        cats = data["categories"]
+        tags = [f"{cats[ci]}{config.TAG_SCOPE_SEPARATOR}{tag}" for ci, tag in data["subcats"]]
+        assert record == {"format": config.BACKTEST_FILTER_NAMES_FORMAT,
+                          "categories": cats, "tags": tags}
+        # Each tag spelled as the bar proposes it, and nothing left beside it
+        assert "Sports · Basketball" in record["tags"]
+        assert sorted(p.name for p in tmp_path.iterdir()
+                      if "filter_names" in p.name) == [config.BACKTEST_FILTER_NAMES_FILENAME]
+        # The defaults server reads it back as the same names, with no note
+        monkeypatch.setattr(config, "PROJECT_ROOT", tmp_path)
+        names = defaults_server._filter_names()
+        assert (names.categories, names.tags, names.note) == (tuple(cats), tuple(tags), None)
 
-        Returns:
-            tuple[dict, str]: The link's attributes (unescaped) and its text.
+    def test_names_the_server_would_refuse_are_left_out(self, monkeypatch, tmp_path):
+        # A category whose name holds the tag separator (a live filter reads
+        # it as a category and a tag), and its tags, would make the server
+        # refuse the whole file: they are left out of it, as the bar never
+        # proposes them, and every other name is kept
+        series = {**_FLT_SERIES, "KXNHLHART": ("Ice · Hockey", ("Pro",)),
+                  "KXOTHER": ("Odd  Spacing", ("Two  Spaces",))}
+        page = TestFilterPage()._page(monkeypatch, tmp_path, series=series)
+        data = TestFilterPage._data(page)
+        assert "Ice · Hockey" in data["categories"]
+        assert data["sync_refused"]["categories"] and data["sync_refused"]["tags"]
+        record = self._names(tmp_path)
+        assert "Ice · Hockey" not in record["categories"]
+        assert "Odd  Spacing" not in record["categories"]
+        assert not [t for t in record["tags"] if t.startswith(("Ice · Hockey", "Odd  Spacing"))]
+        assert "Sports · Basketball" in record["tags"] and "Commodities" in record["categories"]
+        monkeypatch.setattr(config, "PROJECT_ROOT", tmp_path)
+        names = defaults_server._filter_names()
+        assert names.note is None
+        assert names.categories == tuple(record["categories"])
+        assert names.tags == tuple(record["tags"])
 
-        Raises:
-            AssertionError: If the page does not hold exactly one such link.
-        """
-        links = re.findall(r'<a id="flt-trade" ([^>]*)>(.*?)</a>', page)
-        assert len(links) == 1, links
-        attributes, text = links[0]
-        return ({name: html.unescape(value)
-                 for name, value in re.findall(r'(\w+)="([^"]*)"', attributes)},
-                html.unescape(text))
+    def test_more_names_than_a_proposal_takes_are_read_up_to_the_cap(
+            self, monkeypatch, tmp_path):
+        # Every name is written; the server lists the first ones up to its
+        # cap on one proposal, and says so
+        most = config.DEFAULTS_SERVER_MAX_FILTER_NAMES
+        payload = {"categories": [f"Cat{i:03d}" for i in range(most + 2)],
+                   "subcats": [[0, f"Tag{i:03d}"] for i in range(most + 1)],
+                   "sync_refused": {"categories": [], "tags": []}}
+        dashboard._write_filter_names(tmp_path / config.DASHBOARD_FILENAME, payload)
+        record = self._names(tmp_path)
+        assert len(record["categories"]) == most + 2 and len(record["tags"]) == most + 1
+        monkeypatch.setattr(config, "PROJECT_ROOT", tmp_path)
+        names = defaults_server._filter_names()
+        assert names.categories == tuple(record["categories"][:most])
+        assert names.tags == tuple(record["tags"][:most])
+        assert names.note is not None and str(most) in names.note
 
-    def test_it_opens_the_trade_page_in_a_new_tab(self, monkeypatch, tmp_path):
-        page = TestSaveLiveDefaultsButton._page(monkeypatch, tmp_path)
-        attributes, text = self._link(page)
-        assert attributes["href"] == _TRADE_URL == dashboard._trade_url()
-        assert attributes["target"] == "_blank" and attributes["rel"] == "noopener"
-        assert attributes["title"] == dashboard._TRADE_TITLE
-        assert attributes["style"] == dashboard._BUTTON_LINK_STYLE
-        assert text == dashboard._TRADE_LABEL == "Trade using defaults…"
-        # Right after the save button, before its note and the summary line
-        assert page.index('id="flt-save"') < page.index('id="flt-trade"') \
-            < page.index('id="flt-save-note"') < page.index('id="flt-summary"')
-        # A plain link: the script neither names it nor words it, and it is no button
-        assert "flt-trade" not in dashboard._FILTER_JS
-        for words in (dashboard._TRADE_LABEL, dashboard._TRADE_TITLE):
-            assert words not in dashboard._FILTER_JS
-        assert _page_elements(page)["buttons"] == {"flt-save": {"disabled": True}}
+    def test_a_record_longer_than_the_server_reads_is_not_written(
+            self, monkeypatch, tmp_path, caplog):
+        # The server would read none of it: no file (an older one removed),
+        # and a WARNING says why
+        path = tmp_path / config.BACKTEST_FILTER_NAMES_FILENAME
+        path.write_text("{}", encoding="utf-8")
+        payload = {"categories": ["Sports"], "subcats": [[0, "Basketball"]],
+                   "sync_refused": {"categories": [], "tags": []}}
+        monkeypatch.setattr(dashboard, "BACKTEST_FILTER_NAMES_MAX_BYTES", 40)
+        with caplog.at_level(logging.WARNING):
+            dashboard._write_filter_names(tmp_path / config.DASHBOARD_FILENAME, payload)
+        assert not path.exists()
+        assert any("more than 40 bytes" in r.getMessage() for r in caplog.records)
+        monkeypatch.setattr(dashboard, "BACKTEST_FILTER_NAMES_MAX_BYTES", 1_048_576)
+        dashboard._write_filter_names(tmp_path / config.DASHBOARD_FILENAME, payload)
+        assert self._names(tmp_path)["tags"] == ["Sports · Basketball"]
 
-    def test_its_address_is_read_from_config(self, monkeypatch):
-        monkeypatch.setattr(dashboard, "DEFAULTS_SERVER_HOST", "127.0.0.9")
-        monkeypatch.setattr(dashboard, "DEFAULTS_SERVER_PORT", 9123)
-        assert dashboard._trade_url() == "http://127.0.0.9:9123/trade"
-        assert 'href="http://127.0.0.9:9123/trade"' in dashboard._trade_link_html()
+    def test_a_page_whose_bar_failed_leaves_no_file(self, monkeypatch, tmp_path):
+        # A file an earlier page left is removed: it lists names of a page no
+        # longer there
+        TestFilterPage()._page(monkeypatch, tmp_path)
+        assert (tmp_path / config.BACKTEST_FILTER_NAMES_FILENAME).exists()
 
-    def test_it_stays_when_the_filter_bar_cannot_be_built(self, monkeypatch, tmp_path):
         def broken(*_a, **_k):
             """
             Stand in for _filter_payload: the filter's data cannot be built.
@@ -9292,57 +9941,44 @@ class TestTradeUsingDefaultsLink:
             """
             raise ValueError("boom")
         monkeypatch.setattr(dashboard, "_filter_payload", broken)
-        page = TestSaveLiveDefaultsButton._page(monkeypatch, tmp_path)
-        attributes, text = self._link(page)
-        assert attributes["href"] == _TRADE_URL and text == dashboard._TRADE_LABEL
-        # Under the notice that replaces the bar, in a paragraph of its own
-        notice = page.index(dashboard._FILTER_UNAVAILABLE_HTML)
-        paragraph = page.index('<p id="live-trade"')
-        assert notice + len(dashboard._FILTER_UNAVAILABLE_HTML) < paragraph \
-            < page.index('id="flt-trade"')
-        assert html.escape(dashboard._SAVE_NOTE) in page[paragraph:]
-        # Still no button: the save button needs the bar's data
-        assert 'id="flt-save"' not in page and "<button" not in page
+        page = TestFilterPage()._page(monkeypatch, tmp_path)
+        assert 'id="flt-unavailable"' in page
+        assert not (tmp_path / config.BACKTEST_FILTER_NAMES_FILENAME).exists()
 
-    def test_the_note_and_the_save_button_s_words(self):
-        assert dashboard._SAVE_NOTE == "(needs ./start_dashboard.sh running)"
-        # The confirmation page's buttons, named as that page names them
-        for words in ("Confirm and save saves it", "Confirm and trade saves it and then "
-                      "runs the live bot with it, placing real orders", "Dry run runs the "
-                      "live bot with it without placing orders and saves nothing"):
-            assert words in dashboard._SAVE_TITLE, words
-        assert "when Confirm is clicked" not in dashboard._SAVE_TITLE
-        assert dashboard._TRADE_TITLE == (
-            "Open a page, in a new tab, that shows the saved live defaults and runs the live "
-            "bot with them when you confirm there (real orders, or a dry run).")
+    def test_a_file_that_cannot_be_written_costs_only_the_file(
+            self, monkeypatch, tmp_path, caplog):
+        # The page is published first; a names file that cannot be renamed
+        # into place is a WARNING, never a failed build, and leaves no
+        # temporary file. An earlier page's names file is removed, so the
+        # Trading tab's menus never list another page's names
+        older = tmp_path / config.BACKTEST_FILTER_NAMES_FILENAME
+        older.write_text(json.dumps({"format": config.BACKTEST_FILTER_NAMES_FORMAT,
+                                     "categories": ["Older"], "tags": []}), encoding="utf-8")
+        real = os.replace
 
-    @pytest.mark.parametrize("bar", [True, False], ids=["bar", "no-bar"])
-    def test_the_trade_link_sits_early_in_the_page(self, monkeypatch, tmp_path, bar):
-        if not bar:
-            def broken(*_a, **_k):
-                """
-                Stand in for _filter_payload: the filter's data cannot be built.
+        def refuse(src, dst):
+            """
+            Refuse the names file's rename; pass every other rename through.
 
-                Args:
-                    *_a: Ignored.
-                    **_k: Ignored.
+            Args:
+                src: The source path.
+                dst: The destination path.
 
-                Raises:
-                    ValueError: Always.
-                """
-                raise ValueError("boom")
-            monkeypatch.setattr(dashboard, "_filter_payload", broken)
-        TestSaveLiveDefaultsButton._page(monkeypatch, tmp_path)
-        path = tmp_path / config.DASHBOARD_FILENAME
-        data = path.read_bytes()
-        # The Trade link's id, once, in the page's opening part: before the
-        # first section (and so before every data block), within
-        # config.DASHBOARD_MARKER_SCAN_BYTES of the start
-        marker = b'id="flt-trade"'
-        first_section = dashboard._SECTION_STYLE.format(title="Portfolio Performance")
-        assert data.count(marker) == 1
-        assert data.index(marker) < data.index(first_section.encode("utf-8"))
-        assert data.index(marker) + len(marker) <= config.DASHBOARD_MARKER_SCAN_BYTES
+            Raises:
+                OSError: For the names file.
+            """
+            if Path(dst).name == config.BACKTEST_FILTER_NAMES_FILENAME:
+                raise OSError("read-only")
+            return real(src, dst)
+        monkeypatch.setattr(dashboard.os, "replace", refuse)
+        with caplog.at_level(logging.WARNING):
+            page = TestFilterPage()._page(monkeypatch, tmp_path)
+        assert 'id="flt-bar"' in page
+        assert (tmp_path / config.DASHBOARD_FILENAME).exists()
+        assert not (tmp_path / config.BACKTEST_FILTER_NAMES_FILENAME).exists()
+        assert not [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+        assert any(config.BACKTEST_FILTER_NAMES_FILENAME in r.getMessage()
+                   for r in caplog.records)
 
 
 def _kpi_trades(snap: dict) -> list[tuple[str, str]]:
@@ -13981,17 +14617,18 @@ class TestRebalanceSelect:
         assert backtester.REBALANCE_MIN_DAYS_SINCE_TRADE == 7
         shipped = dashboard._rebalance_select_title(backtester.REBALANCE_MIN_DAYS_SINCE_TRADE)
         assert html.unescape(title) == shipped
-        # It says what yes does, what it shuts and why, and what Save saves
+        # It says what yes does, what it shuts and why, and what the Trading
+        # tab follows
         for words in ("topped up to its Kelly size when it has room, and sold down to it when "
                       "it has grown past it",
                       "with a Min. price movement, once its price has moved that far up or down",
                       "Each added purchase and each part sold counts as a trade of its own",
                       "While yes, Sell is set to no selling",
-                      "From a page that simulated rebalancing, Save as live defaults saves this "
+                      "From a page that simulated rebalancing, the Trading tab follows this "
                       "choice and the Min. price movement shown; from any other page it keeps "
                       "the saved ones.",
-                      "With yes, saving from a page that simulated selling turns live selling "
-                      "off."):
+                      "With yes, from a page that simulated selling, it proposes no live "
+                      "selling."):
             assert words in shipped
         assert shipped.startswith("no: a pair is bought once and held as it is. yes: ")
         # A page with the view has no note beside it
@@ -14113,11 +14750,13 @@ class TestRebalanceSelect:
                                 "trimmed pair shows as several smaller trades.")
         assert rebalanced == plain[:-len(text["unfiltered"])] + note + text["unfiltered"]
 
-    def test_the_save_button_names_the_choice(self):
-        assert ("Rebalance choice and Min. price movement (when this page simulated "
-                "rebalancing)") in dashboard._SAVE_TITLE
-        for old in ("Add to held pairs", "Trim to Kelly", "Min. price rise"):
-            assert old not in dashboard._SAVE_TITLE
+    def test_no_select_names_a_retired_choice_or_button(self):
+        titles = (dashboard._rebalance_select_title(7), dashboard._MOVE_TITLE,
+                  dashboard._UNTIL_TITLE, dashboard._sell_select_title(3),
+                  dashboard._SELL_SUMMARY_NOTE)
+        for old in ("Add to held pairs", "Trim to Kelly", "Min. price rise",
+                    "Save as live defaults", "Trade using defaults"):
+            assert not [t for t in titles if old in t], old
 
 
 class TestMoveSelect:
@@ -14171,12 +14810,12 @@ class TestMoveSelect:
                       "YES on the earlier market plus NO on the later one",
                       "10c is 10% of a $1 payout", "any: no minimum"):
             assert words in dashboard._MOVE_TITLE
-        # ... and ends with what Save saves, and which pairs a live run neither
-        # trims nor adds to, since it cannot measure their move
+        # ... and ends with what the Trading tab follows, and which pairs a
+        # live run neither trims nor adds to, since it cannot measure their move
         assert dashboard._MOVE_TITLE.endswith(
-            " From a page that simulated rebalancing, Save as live defaults saves the minimum "
-            "shown (any, or Rebalance no, saves none); from any other page it keeps the saved "
-            "one. A live run reads the price at the pair's last fill on Kalshi, so with a "
+            " From a page that simulated rebalancing, the Trading tab follows the minimum "
+            "shown (any, or Rebalance no, proposes none); from any other page it keeps the "
+            "saved one. A live run reads the price at the pair's last fill on Kalshi, so with a "
             "minimum set it neither trims nor adds to a pair whose last fill is older than "
             "Kalshi's list of the account's fills reaches.")
         # A page with the view has no note beside either select
@@ -14259,17 +14898,19 @@ class TestMoveSelect:
             r'id="flt-rebalance-note"[^>]*>\(not available on this page; see the log\)</span>',
             page)
 
-    def test_the_hover_texts_say_what_save_sends_on_every_page(self, monkeypatch, tmp_path):
+    def test_the_hover_texts_say_what_the_trading_tab_follows_on_every_page(
+            self, monkeypatch, tmp_path):
         # Each select has one hover text on every page, so what it says about
-        # Save must hold on pages with and without the Rebalance view (what
-        # Save sends: TestMoveScript.test_a_save_sends_the_minimum_shown,
-        # TestSaveLiveDefaultsButton.test_a_page_without_the_rebalance_view_sends_none_of_its_fields)
-        rebalance_save = ("From a page that simulated rebalancing, Save as live defaults saves "
+        # the Trading tab must hold on pages with and without the Rebalance
+        # view (what the bar tells it:
+        # TestMoveScript.test_the_trading_tab_is_told_the_minimum_shown,
+        # TestTradingSync.test_a_page_without_the_rebalance_view_sends_none_of_its_fields)
+        rebalance_save = ("From a page that simulated rebalancing, the Trading tab follows "
                           "this choice and the Min. price movement shown; from any other page "
                           "it keeps the saved ones.")
-        move_save = ("From a page that simulated rebalancing, Save as live defaults saves the "
-                     "minimum shown (any, or Rebalance no, saves none); from any other page it "
-                     "keeps the saved one.")
+        move_save = ("From a page that simulated rebalancing, the Trading tab follows the "
+                     "minimum shown (any, or Rebalance no, proposes none); from any other page "
+                     "it keeps the saved one.")
         for sweep, has_view in ((_kc_sweep(), False), (_kc_sweep_rebalance(), True),
                                 (_kc_sweep_move(), True)):
             page = _rb_page(monkeypatch, tmp_path, sweep)
@@ -14277,8 +14918,8 @@ class TestMoveSelect:
             for select_id, said in (("flt-rebalance", rebalance_save), ("flt-move", move_save)):
                 title = html.unescape(re.search(
                     rf'<select id="{select_id}"[^>]*title="([^"]*)"', page).group(1))
-                # Its one sentence on the save button names the pages it holds on
-                assert title.count("Save as live defaults") == 1, select_id
+                # Its one sentence on the Trading tab names the pages it holds on
+                assert title.count("the Trading tab") == 1, select_id
                 assert said in title, select_id
 
     def test_the_reach_sentence_names_both_selects_only_with_the_minimums(
@@ -14359,7 +15000,7 @@ class TestUntilSelect:
         title = re.search(r'title="([^"]*)"', select.group(1)).group(1)
         assert html.unescape(title) == dashboard._UNTIL_TITLE
         # The hover text says when it counts, what it holds back, how the
-        # days are counted and what Save as live defaults saves
+        # days are counted and what the Trading tab follows
         for words in ("Used only while Rebalance is yes",
                       "Holds back trims and add-ons when the position's later market matures "
                       "within that many days",
@@ -14367,9 +15008,9 @@ class TestUntilSelect:
                       "closes at least that many days after the run",
                       "counted in whole days on Kalshi's UTC dates",
                       "maturity: no days limit",
-                      "From a page with these choices, Save as live defaults saves the choice "
-                      "shown (maturity, or Rebalance no, saves no days limit)",
-                      "from any other page it keeps the saved one unless the save turns "
+                      "From a page with these choices, the Trading tab follows the choice "
+                      "shown (maturity, or Rebalance no, proposes no days limit)",
+                      "from any other page it keeps the saved one unless its proposal turns "
                       "rebalancing off"):
             assert words in dashboard._UNTIL_TITLE
         # A page with the view has no note beside it
@@ -14662,32 +15303,35 @@ class TestRebalanceScript:
             rebalance=True)
         assert _chunk_src(page, plain) in snaps["plain"]["files"]
 
-    def test_a_scenario_the_family_never_simulated_reads_missing_and_cannot_be_saved(
+    def test_a_scenario_the_family_never_simulated_reads_missing_and_is_told(
             self, monkeypatch, tmp_path):
         # The family holds no run with the tier floors off: rebalancing at a
-        # band the tiers bind at, with them off, was never simulated
+        # band the tiers bind at, with them off, was never simulated. The
+        # Trading tab follows the choice all the same
         sweep = _kc_sweep_rebalance(_kc_sweep_tiers())
         sweep.rebalance_sweep.off_bands = ()
-        page = TestSaveLiveDefaultsButton._kc(monkeypatch, tmp_path, sweep)
+        page = TestTradingSync._kc(monkeypatch, tmp_path, sweep)
         data = TestFilterPage._data(page)
         snap = self._run(tmp_path, page, [
             ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"], *self.ON,
-            ["snap", "missing"]], strict=True)["missing"]
+            ["snap", "missing"]], strict=True, framed=True)["missing"]
         scenario = _phrase_off(data, 0, 1, 1) + data["text"]["rebalance"]
         # Nothing is shown, so nothing is said about what an added purchase or
         # a part sold counts as
         assert snap["text"]["flt-summary"] == data["text"]["missing"].format(
             scenario=scenario) + data["text"]["unfiltered"]
-        assert snap["buttons"]["flt-save"] is True and snap["text"]["hdr-trades"] == "0"
+        assert snap["text"]["hdr-trades"] == "0"
+        query = TestTradingSync._query(_told(snap)[-1])
+        assert (query["tier_floors"], query["rebalance"]) == ("off", "on")
 
     def test_a_chunk_that_cannot_be_loaded_puts_the_choice_back(self, monkeypatch, tmp_path):
-        page = TestSaveLiveDefaultsButton._kc(monkeypatch, tmp_path, _kc_sweep_rebalance())
+        page = TestTradingSync._kc(monkeypatch, tmp_path, _kc_sweep_rebalance())
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
         cid = data["grid_rebalance"][0][1][1]
         snaps = self._run(tmp_path, page, [
-            ["wait"], *self.ON, ["snap", "bad"], ["click", "flt-save"], ["snap", "bad click"],
+            ["wait"], ["snap", "ready"], *self.ON, ["snap", "bad"], *_AGAIN, ["snap", "again"],
             ["repair_file", _chunk_src(page, cid)], *self.ON, ["snap", "good"]],
-            strict=True, files_damaged=(_chunk_src(page, cid),))
+            strict=True, files_damaged=(_chunk_src(page, cid),), framed=True)
         bad = snaps["bad"]
         assert bad["selects"]["flt-rebalance"]["value"] == "no" and bad["reacts"] == []
         # The line names the scenario that failed, in the phrase rebalancing
@@ -14695,24 +15339,25 @@ class TestRebalanceScript:
         assert bad["text"]["flt-summary"] == data["text"]["unavailable"].format(
             failed=_phrase(data, 0, 1, 1) + data["text"]["rebalance"],
             reason=f"Error: damaged block dash-chunk-{cid}", scenario=_phrase(data, 0, 1, 1))
-        # Save sends the scenario still shown (no rebalancing), not the one
-        # that failed to load
-        assert bad["buttons"]["flt-save"] is False
-        save = TestSaveLiveDefaultsButton()
-        [opened] = snaps["bad click"]["opened"]
-        query = save._query(data, opened)
-        save._assert_sends(data, query, 0, 1, 1)
+        # The choice put back is told to no one; the next choice tells the
+        # scenario still shown (no rebalancing), not the one that failed to load
+        assert _told(bad) == []
+        sync = TestTradingSync()
+        [raw] = _told(snaps["again"])
+        query = sync._query(raw)
+        sync._assert_sends(data, query, 0, 1, 1)
         assert [query[key] for key in ("rebalance", "min_price_move")] == ["off", "off"]
         # Repaired, choosing it again draws it
         good = snaps["good"]
         assert good["selects"]["flt-rebalance"]["value"] == "yes"
         assert good["text"]["hdr-trades"] == str(chunks[cid]["list"]["views"]["all"]["n"])
 
-    # ─── Save and Sell while rebalancing ──────────────────────────────────────
+    # ─── The Trading tab and Sell while rebalancing ───────────────────────────
 
     @pytest.mark.parametrize("sell_view", [False, True], ids=["no-sell-view", "sell-view"])
-    def test_a_save_sends_the_rebalance_choice(self, monkeypatch, tmp_path, sell_view):
-        # Save sends the Rebalance choice as the defaults server's rebalance
+    def test_the_trading_tab_is_told_the_rebalance_choice(self, monkeypatch, tmp_path,
+                                                         sell_view):
+        # The bar tells the Rebalance choice as the defaults server's rebalance
         # and the minimum price movement ("off": this page has no minimums),
         # and the server reads it back. Over saved defaults that sell, a page with
         # the Sell view also sends no selling (Sell is shut while rebalancing);
@@ -14721,35 +15366,34 @@ class TestRebalanceScript:
             dataclasses.replace(config.live_settings(), sell_at=0.9, sell_min_days=5),
             source="")
         current = config.read_saved_live_defaults()
-        save = TestSaveLiveDefaultsButton()
-        page = save._kc(monkeypatch, tmp_path,
+        sync = TestTradingSync()
+        page = sync._kc(monkeypatch, tmp_path,
                         _kc_sweep_rebalance(_kc_sweep_sell() if sell_view else None))
         data = TestFilterPage._data(page)
         assert (data["sell_blocks"] is not None) is sell_view
         assert data["grid_rebalance"] is not None and data["moves"] == []
         snaps = self._run(tmp_path, page, [
-            ["wait"], ["snap", "before"], *self.ON, ["click", "flt-save"], ["snap", "on"],
+            ["wait"], ["snap", "before"], *self.ON, ["snap", "on"],
             # ... also where rebalancing changed nothing (no cap: the same chunk)
-            ["set", "flt-cap", "2"], ["fire", "flt-cap"], ["settle"], ["click", "flt-save"],
-            ["snap", "same"], *self.OFF, ["click", "flt-save"], ["snap", "off"]],
+            ["set", "flt-cap", "2"], ["fire", "flt-cap"], ["settle"],
+            ["snap", "same"], *self.OFF, ["snap", "off"]],
             js="__BAR.push('flt-sell');" if sell_view else "", files_root=tmp_path,
-            strict=True)
-        assert snaps["before"]["buttons"]["flt-save"] is False
+            strict=True, framed=True)
+        assert _told(snaps["before"]) == []
         app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
         sold = {"sell_at": "off", "sell_min_days": "off"} if sell_view else {}
         for name, ci, yes in (("on", 1, True), ("same", 2, True), ("off", 2, False)):
             snap = snaps[name]
-            assert snap["buttons"]["flt-save"] is False, name
-            [opened] = snap["opened"]
-            query = save._query(data, opened)
-            save._assert_sends(data, query, 0, 1, ci)
+            assert _note(snap) == "", name
+            [raw] = _told(snap)
+            query = sync._query(raw)
+            sync._assert_sends(data, query, 0, 1, ci)
             assert query["rebalance"] == ("on" if yes else "off"), name
             assert query["min_price_move"] == "off", name
             assert {key: query[key] for key in ("sell_at", "sell_min_days")
                     if key in query} == sold, name
-            raw = opened["url"].partition("?")[2]
             response = app.handle(defaults_server._Request("GET", f"/confirm?{raw}",
-                                                           _SAVE_HOST))
+                                                           _SERVER_HOST))
             assert response.status == 200, response.body
             settings, source = defaults_server._proposal(defaults_server._params(raw), current)
             expected = config.LiveSettings(
@@ -14760,25 +15404,25 @@ class TestRebalanceScript:
             assert settings == expected, name
             for field in config.LIVE_TOGGLE_FIELDS:
                 assert getattr(settings, field) == getattr(expected, field), (name, field)
-            assert source == data["save"]["source"]
+            assert source == data["sync"]["source"]
         # Nothing was written by showing the page
         assert config.read_saved_live_defaults() == current
 
     @pytest.mark.parametrize("saved", [False, True])
-    def test_the_address_is_what_the_defaults_server_reads(self, monkeypatch, tmp_path, saved):
-        # The clicked address, handed to the server's own application and parser:
+    def test_the_query_is_what_the_defaults_server_reads(self, monkeypatch, tmp_path, saved):
+        # The told query, handed to the server's own application and parser:
         # the settings it read carry the choice on screen — no explicitly at
         # the page as rendered (so the seed's rebalancing does not leak in), yes when
         # chosen — whatever is saved, with the tier floors and the k too, and
-        # no category or tag, which the button never sends
-        save = TestSaveLiveDefaultsButton()
-        page = save._kc(monkeypatch, tmp_path, _kc_sweep_rebalance(_kc_sweep_tiers()))
+        # no category or tag, which the bar sends none of here
+        sync = TestTradingSync()
+        page = sync._kc(monkeypatch, tmp_path, _kc_sweep_rebalance(_kc_sweep_tiers()))
         data = TestFilterPage._data(page)
         snaps = self._run(tmp_path, page, [
-            ["wait"], ["click", "flt-save"], ["snap", "primary"],
+            ["wait"], *_AGAIN, ["snap", "primary"],
             ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"],
             ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], *self.ON,
-            ["click", "flt-save"], ["snap", "chosen"]], strict=True)
+            ["snap", "chosen"]], strict=True, framed=True)
         if saved:
             save_config_live_defaults()
         current = config.read_saved_live_defaults()
@@ -14795,18 +15439,17 @@ class TestRebalanceScript:
                 size_cap=data["caps"][pc]["value"], rebalance=True)),
         )
         for name, expected in cases:
-            [opened] = snaps[name]["opened"]
-            save._query(data, opened)
-            query = opened["url"].partition("?")[2]
+            query = _told(snaps[name])[-1]
+            sync._query(query)
             response = app.handle(defaults_server._Request("GET", f"/confirm?{query}",
-                                                           _SAVE_HOST))
+                                                           _SERVER_HOST))
             assert response.status == 200, response.body
             settings, source = defaults_server._proposal(defaults_server._params(query),
                                                          current)
             assert settings == expected, name
             for field in config.LIVE_TOGGLE_FIELDS:
                 assert getattr(settings, field) == getattr(expected, field), (name, field)
-            assert source == data["save"]["source"]
+            assert source == data["sync"]["source"]
 
     def test_a_page_without_the_sell_view_keeps_sell_shut_either_way(
             self, monkeypatch, tmp_path):
@@ -15100,17 +15743,17 @@ class TestMoveScript:
     # ─── A chunk that cannot be loaded, and a restored choice ────────────────
 
     def test_a_chunk_that_cannot_be_loaded_puts_the_choice_back(self, monkeypatch, tmp_path):
-        page = TestSaveLiveDefaultsButton._kc(monkeypatch, tmp_path, _kc_sweep_move())
+        page = TestTradingSync._kc(monkeypatch, tmp_path, _kc_sweep_move())
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
         cid = data["grid_move"][0][1][1][1]
         snaps = self._run(tmp_path, page, [
             ["wait"], *self.ON, ["snap", "rebalance"], *self._move(2), ["snap", "bad"],
-            ["click", "flt-save"], ["snap", "bad click"],
+            *_AGAIN, ["snap", "bad click"],
             # ... and from another minimum, back to that one
             *self._move(1), ["snap", "five"], *self._move(3), ["snap", "bad again"],
-            ["click", "flt-save"], ["snap", "again click"],
+            *_AGAIN, ["snap", "again click"],
             ["repair_file", _chunk_src(page, cid)], *self._move(2), ["snap", "good"]],
-            strict=True, files_damaged=(_chunk_src(page, cid),))
+            strict=True, files_damaged=(_chunk_src(page, cid),), framed=True)
         reason = f"Error: damaged block dash-chunk-{cid}"
         bad = snaps["bad"]
         # The select goes back to the minimum still shown (any), open, and
@@ -15121,13 +15764,14 @@ class TestMoveScript:
         assert bad["text"]["flt-summary"] == data["text"]["unavailable"].format(
             failed=self._scenario(data, 0, 1, 1, 1), reason=reason,
             scenario=self._scenario(data, 0, 1, 1))
-        # Save sends the scenario still shown (rebalancing, any minimum), not
-        # the 10c that failed to load
-        assert bad["buttons"]["flt-save"] is False
-        save = TestSaveLiveDefaultsButton()
-        [opened] = snaps["bad click"]["opened"]
-        query = save._query(data, opened)
-        save._assert_sends(data, query, 0, 1, 1)
+        # The choice put back is told to no one; the next choice tells the
+        # scenario still shown (rebalancing, any minimum), not the 10c that
+        # failed to load
+        assert _told(bad) == []
+        sync = TestTradingSync()
+        [raw] = _told(snaps["bad click"])
+        query = sync._query(raw)
+        sync._assert_sends(data, query, 0, 1, 1)
         assert (query["rebalance"], query["min_price_move"]) == ("on", "off")
         # 25c is that same chunk: the choice goes back to 5c, which was shown
         again = snaps["bad again"]
@@ -15136,11 +15780,11 @@ class TestMoveScript:
             failed=self._scenario(data, 0, 1, 1, 2), reason=reason,
             scenario=self._scenario(data, 0, 1, 1, 0))
         assert again["text"]["hdr-trades"] == snaps["five"]["text"]["hdr-trades"]
-        # ... and the address is 5c's, the minimum on screen, not 25c's
-        assert again["buttons"]["flt-save"] is False
-        [opened] = snaps["again click"]["opened"]
-        query = save._query(data, opened)
-        save._assert_sends(data, query, 0, 1, 1)
+        # ... and the query is 5c's, the minimum on screen, not 25c's
+        assert _told(again) == []
+        [raw] = _told(snaps["again click"])
+        query = sync._query(raw)
+        sync._assert_sends(data, query, 0, 1, 1)
         assert query["rebalance"] == "on" and float(query["min_price_move"]) == 0.05
         # Repaired, choosing it again works
         good = snaps["good"]
@@ -15199,24 +15843,24 @@ class TestMoveScript:
         assert ("rebalancing" in snaps["on"]["text"].get("flt-summary", "")) is (
             view == "rebalance without minimums")
 
-    # ─── Save and Sell at a minimum ──────────────────────────────────────────
+    # ─── The Trading tab and Sell at a minimum ────────────────────────────────
 
-    def test_a_save_sends_the_minimum_shown(self, monkeypatch, tmp_path):
+    def test_the_trading_tab_is_told_the_minimum_shown(self, monkeypatch, tmp_path):
         # min_price_move is "off" at any, else the minimum in dollars, which the
         # server reads back exactly (also at 5% cap, 25c, the plain run's
         # chunk). With Rebalance no, both fields are "off", though the shut
         # select still names a minimum
-        save = TestSaveLiveDefaultsButton()
-        page = save._kc(monkeypatch, tmp_path, _kc_sweep_move())
+        sync = TestTradingSync()
+        page = sync._kc(monkeypatch, tmp_path, _kc_sweep_move())
         data = TestFilterPage._data(page)
         assert [entry["value"] for entry in data["moves"]] == [0.05, 0.10, 0.25]
-        steps = [["wait"], ["snap", "before"], *self.ON, ["click", "flt-save"], ["snap", "0"]]
+        steps = [["wait"], ["snap", "before"], *self.ON, ["snap", "0"]]
         for value in (1, 2, 3):
-            steps += [*self._move(value), ["click", "flt-save"], ["snap", str(value)]]
-        steps += [["set", "flt-cap", "0"], ["fire", "flt-cap"], ["settle"], ["click", "flt-save"],
-                  ["snap", "plain chunk"], *self.OFF, ["click", "flt-save"], ["snap", "off"]]
-        snaps = self._run(tmp_path, page, steps, strict=True)
-        assert snaps["before"]["buttons"]["flt-save"] is False
+            steps += [*self._move(value), ["snap", str(value)]]
+        steps += [["set", "flt-cap", "0"], ["fire", "flt-cap"], ["settle"],
+                  ["snap", "plain chunk"], *self.OFF, ["snap", "off"]]
+        snaps = self._run(tmp_path, page, steps, strict=True, framed=True)
+        assert _told(snaps["before"]) == []
         # The 25c run at the 5% cap trades the list of the run without rebalancing
         assert data["grid_move"][0][1][0][2] == data["grid"][0][1][0]
         app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
@@ -15224,48 +15868,50 @@ class TestMoveScript:
                  ("3", 1, True, 0.25), ("plain chunk", 0, True, 0.25), ("off", 0, False, None))
         for name, ci, yes, move in cases:
             snap = snaps[name]
-            assert snap["buttons"]["flt-save"] is False, name
-            [opened] = snap["opened"]
-            query = save._query(data, opened)
-            save._assert_sends(data, query, 0, 1, ci)
+            assert _note(snap) == "", name
+            [raw] = _told(snap)
+            query = sync._query(raw)
+            sync._assert_sends(data, query, 0, 1, ci)
             assert query["rebalance"] == ("on" if yes else "off"), name
             if move is None:
                 assert query["min_price_move"] == "off", name
             else:
                 assert float(query["min_price_move"]) == move, name
-            raw = opened["url"].partition("?")[2]
             response = app.handle(defaults_server._Request("GET", f"/confirm?{raw}",
-                                                           _SAVE_HOST))
+                                                           _SERVER_HOST))
             assert response.status == 200, response.body
             settings, _ = defaults_server._proposal(defaults_server._params(raw), None)
             assert (settings.rebalance, settings.min_price_move) == (yes, move), name
-        # Rebalance no: the shut select still names 25c, and the address none
+        # Rebalance no: the shut select still names 25c, and the query none
         assert snaps["off"]["selects"]["flt-move"] == {
             **snaps["off"]["selects"]["flt-move"], "value": "3", "disabled": True}
 
-    def test_a_minimum_the_page_never_simulated_cannot_be_saved(self, monkeypatch, tmp_path):
+    def test_a_minimum_the_page_never_simulated_is_told_too(self, monkeypatch, tmp_path):
         # No rebalancing runs with the tier floors off: there, at a band the
-        # tiers bind at, Save stays shut; with the tiers on, the same minimum saves
+        # tiers bind at, the minimum reads as never simulated, and the Trading
+        # tab follows it all the same; with the tiers on, the same minimum is
+        # drawn and told
         sweep = _kc_sweep_move(_kc_sweep_tiers())
         sweep.rebalance_sweep.off_bands = ()
-        save = TestSaveLiveDefaultsButton()
-        page = save._kc(monkeypatch, tmp_path, sweep)
+        sync = TestTradingSync()
+        page = sync._kc(monkeypatch, tmp_path, sweep)
         data = TestFilterPage._data(page)
         snaps = self._run(tmp_path, page, [
             ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"], *self.ON,
-            *self._move(2), ["click", "flt-save"], ["snap", "missing"],
+            *self._move(2), ["snap", "missing"],
             ["set", "flt-tier", "on"], ["fire", "flt-tier"], ["settle"],
-            ["click", "flt-save"], ["snap", "back"]], strict=True)
+            ["snap", "back"]], strict=True, framed=True)
         missing = snaps["missing"]
         assert missing["text"]["flt-summary"].startswith(data["text"]["missing"].format(
             scenario=self._scenario(data, 0, 1, 1, 1, off=True)))
-        assert missing["buttons"]["flt-save"] is True and missing["opened"] == []
+        query = sync._query(_told(missing)[-1])
+        sync._assert_sends(data, query, 0, 1, 1, tier="off")
+        assert query["rebalance"] == "on" and float(query["min_price_move"]) == 0.10
         back = snaps["back"]
-        assert back["buttons"]["flt-save"] is False
         assert back["selects"]["flt-move"]["value"] == "2"
-        [opened] = back["opened"]
-        query = save._query(data, opened)
-        save._assert_sends(data, query, 0, 1, 1)
+        [raw] = _told(back)
+        query = sync._query(raw)
+        sync._assert_sends(data, query, 0, 1, 1)
         assert query["rebalance"] == "on" and float(query["min_price_move"]) == 0.10
 
     def test_sell_stays_shut_at_a_minimum(self, monkeypatch, tmp_path):
@@ -15595,21 +16241,21 @@ class TestUntilScript:
     # ─── A chunk that cannot be loaded, and a restored choice ────────────────
 
     def test_a_chunk_that_cannot_be_loaded_puts_the_choice_back(self, monkeypatch, tmp_path):
-        page = TestSaveLiveDefaultsButton._kc(monkeypatch, tmp_path, _kc_sweep_until())
+        page = TestTradingSync._kc(monkeypatch, tmp_path, _kc_sweep_until())
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
         # 7 days at the 20% cap, no minimum: a run of its own
         cid = data["grid_maturity"][0][1][1][1][0]
         assert cid not in _rb_ids(data["grid"]) | _rb_ids(data["grid_rebalance"])
         snaps = self._run(tmp_path, page, [
             ["wait"], *self.ON, ["snap", "rebalance"], *self._until(2), ["snap", "bad"],
-            ["click", "flt-save"], ["snap", "bad click"],
+            *_AGAIN, ["snap", "bad click"],
             # ... and from another choice, back to that one
             *self._until(1), ["snap", "one"], *self._until(2), ["snap", "bad again"],
-            ["click", "flt-save"], ["snap", "again click"],
+            *_AGAIN, ["snap", "again click"],
             ["repair_file", _chunk_src(page, cid)], *self._until(2), ["snap", "good"]],
-            strict=True, files_damaged=(_chunk_src(page, cid),))
+            strict=True, files_damaged=(_chunk_src(page, cid),), framed=True)
         reason = f"Error: damaged block dash-chunk-{cid}"
-        save = TestSaveLiveDefaultsButton()
+        sync = TestTradingSync()
         for name, click, shown, ui in (("bad", "bad click", "rebalance", None),
                                        ("bad again", "again click", "one", 0)):
             bad = snaps[name]
@@ -15623,11 +16269,12 @@ class TestUntilScript:
                 failed=self._scenario(data, 0, 1, 1, None, 1), reason=reason,
                 scenario=self._scenario(data, 0, 1, 1, None, ui)), name
             assert bad["text"]["hdr-trades"] == snaps[shown]["text"]["hdr-trades"], name
-            # Save sends the scenario still shown, not the 7 days that failed to load
-            assert bad["buttons"]["flt-save"] is False, name
-            [opened] = snaps[click]["opened"]
-            query = save._query(data, opened)
-            save._assert_sends(data, query, 0, 1, 1)
+            # Put back, nothing is told; the next choice tells the scenario
+            # still shown, not the 7 days that failed to load
+            assert _told(bad) == [], name
+            [raw] = _told(snaps[click])
+            query = sync._query(raw)
+            sync._assert_sends(data, query, 0, 1, 1)
             assert (query["rebalance"], query["min_price_move"]) == ("on", "off"), name
             assert query["rebalance_min_days_to_maturity"] == (
                 "0" if ui is None else str(data["maturity"][ui]["value"])), name
@@ -15670,41 +16317,39 @@ class TestUntilScript:
             data["text"], self._scenario(data, 0, 1, 1), False, None, n, n, note="other_run",
             rebalance=True)
 
-    # ─── Save ────────────────────────────────────────────────────────────────
+    # ─── The Trading tab ─────────────────────────────────────────────────────
 
-    def test_a_save_sends_the_days_shown_and_none_with_rebalance_no(self, monkeypatch, tmp_path):
+    def test_the_days_shown_are_told_and_none_with_rebalance_no(self, monkeypatch, tmp_path):
         # rebalance_min_days_to_maturity is 0 at maturity, else the choice's
         # days, which the server reads back exactly; with Rebalance no it is
         # 0, though the shut select still names 7 days
-        save = TestSaveLiveDefaultsButton()
-        page = save._kc(monkeypatch, tmp_path, _kc_sweep_until())
+        sync = TestTradingSync()
+        page = sync._kc(monkeypatch, tmp_path, _kc_sweep_until())
         data = TestFilterPage._data(page)
         assert [entry["value"] for entry in data["maturity"]] == [1, 7]
-        steps = [["wait"], *self.ON, ["click", "flt-save"], ["snap", "maturity"]]
+        steps = [["wait"], ["snap", "ready"], *self.ON, ["snap", "maturity"]]
         for value in (1, 2):
-            steps += [*self._until(value), ["click", "flt-save"], ["snap", str(value)]]
-        steps += [*TestMoveScript._move(2), ["click", "flt-save"], ["snap", "2 at 10c"],
-                  *self.OFF, ["click", "flt-save"], ["snap", "off"]]
-        snaps = self._run(tmp_path, page, steps, strict=True)
+            steps += [*self._until(value), ["snap", str(value)]]
+        steps += [*TestMoveScript._move(2), ["snap", "2 at 10c"], *self.OFF, ["snap", "off"]]
+        snaps = self._run(tmp_path, page, steps, strict=True, framed=True)
         app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
         for name, yes, move, days in (("maturity", True, None, None), ("1", True, None, 1),
                                       ("2", True, None, 7), ("2 at 10c", True, 0.10, 7),
                                       ("off", False, None, None)):
             snap = snaps[name]
-            assert snap["buttons"]["flt-save"] is False, name
-            [opened] = snap["opened"]
-            query = save._query(data, opened)
-            save._assert_sends(data, query, 0, 1, 1)
+            assert _note(snap) == "", name
+            [raw] = _told(snap)
+            query = sync._query(raw)
+            sync._assert_sends(data, query, 0, 1, 1)
             assert query["rebalance"] == ("on" if yes else "off"), name
             assert query["rebalance_min_days_to_maturity"] == str(days or 0), name
-            raw = opened["url"].partition("?")[2]
             response = app.handle(defaults_server._Request("GET", f"/confirm?{raw}",
-                                                           _SAVE_HOST))
+                                                           _SERVER_HOST))
             assert response.status == 200, response.body
             settings, _ = defaults_server._proposal(defaults_server._params(raw), None)
             assert (settings.rebalance, settings.min_price_move,
                     settings.rebalance_min_days_to_maturity) == (yes, move, days), name
-        # Rebalance no: the shut select still names 7 days, and the address none
+        # Rebalance no: the shut select still names 7 days, and the query none
         assert snaps["off"]["selects"]["flt-until"] == {
             **snaps["off"]["selects"]["flt-until"], "value": "2", "disabled": True}
 
@@ -15715,27 +16360,27 @@ class TestUntilScript:
         sweep = {"minimums without choices": _kc_sweep_move,
                  "rebalance without minimums": _kc_sweep_rebalance,
                  "no rebalance": _kc_sweep}[view]()
-        save = TestSaveLiveDefaultsButton()
-        page = save._kc(monkeypatch, tmp_path, sweep)
+        sync = TestTradingSync()
+        page = sync._kc(monkeypatch, tmp_path, sweep)
         data = TestFilterPage._data(page)
         assert data["grid_maturity"] is None and data["maturity"] == []
         # A page with no Rebalance view never opens flt-rebalance: not waited on
         run = _run_script if view == "no rebalance" else self._run
         snaps = run(tmp_path, page, [
             ["snap", "loaded"], ["wait"], *self.ON, ["snap", "on"], *self._until(0),
-            ["snap", "fired"], ["click", "flt-save"], ["snap", "saved"]], strict=True)
+            ["snap", "fired"], *_AGAIN, ["snap", "saved"]], strict=True, framed=True)
         for name in ("loaded", "on", "fired"):
             select = snaps[name]["selects"]["flt-until"]
             assert select["disabled"] is True and select["options"] == [["0", "maturity"]], name
-        # A change event on the shut select draws nothing
-        assert snaps["fired"]["reacts"] == []
+        # A change event on the shut select draws and tells nothing
+        assert snaps["fired"]["reacts"] == [] and snaps["fired"]["posted"] == []
         assert snaps["fired"]["inflated"] == snaps["on"]["inflated"]
         assert snaps["fired"]["files"] == snaps["on"]["files"]
         assert ", until" not in snaps["on"]["text"].get("flt-summary", "")
-        # ... and Save names no days: the server keeps the saved limit
-        [opened] = snaps["saved"]["opened"]
-        query = save._query(data, opened)
-        save._assert_sends(data, query, *data["primary"])
+        # ... and the query names no days: the server keeps the saved limit
+        [raw] = _told(snaps["saved"])
+        query = sync._query(raw)
+        sync._assert_sends(data, query, *data["primary"])
         assert "rebalance_min_days_to_maturity" not in query
         assert ("rebalance" in query) is (view != "no rebalance")
 
@@ -16092,9 +16737,10 @@ class TestUntilEndToEnd:
 
 class TestLiveRebalanceRule:
     """The page when the saved live defaults rebalance held pairs: a grey note
-    by the save button on a page with the Rebalance view (saving with
-    Rebalance no turns it off), another on a page with the "Rebalance until"
-    choices when they have a days limit (saving "maturity" turns it off), and
+    by the Exclude menus on a page with the Rebalance view (with Rebalance no
+    the Trading tab proposes turning it off), another on a page with the
+    "Rebalance until" choices when they have a days limit ("maturity"
+    proposes turning it off), and
     the header line naming the choices that show the rebalancing, or why the
     page cannot (no Rebalance view, a minimum or a "Rebalance until" choice it
     cannot show, or rebalancing with selling)."""
@@ -16167,82 +16813,73 @@ class TestLiveRebalanceRule:
         """The sweep with saved defaults that rebalance held pairs."""
         return dataclasses.replace(sweep, live_rebalance=True, **live)
 
-    # ─── The save button's note ───────────────────────────────────────────────
+    # ─── The notes on what the Trading tab proposes ──────────────────────────
 
-    def test_the_save_button_warns_that_saving_with_rebalance_no_turns_it_off(
+    def test_a_note_says_rebalance_no_proposes_turning_rebalancing_off(
             self, monkeypatch, tmp_path):
-        note = "The live defaults rebalance; saving with Rebalance no here turns that off."
-        assert dashboard._REBALANCE_SAVE_NOTE == note
-
-        def between(page):
-            bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
-            return bar[bar.index('id="flt-save"'):bar.index('id="flt-trade"')]
-
+        note = ("The live defaults rebalance; with Rebalance no here, the Trading tab "
+                "proposes turning that off.")
+        assert dashboard._REBALANCE_SYNC_NOTE == note
         with_view = _kc_sweep_rebalance()
         page = _rb_page(monkeypatch, tmp_path, self._both(with_view))
-        # Right after the button, before the trade link, in Python's words
-        assert re.search(r'</button>&nbsp;<span id="flt-rebalance-save-note"[^>]*>'
-                         + re.escape(html.escape(note)) + '</span>', between(page))
+        # Right after the Exclude tags menu, before the red note, in Python's words
+        assert re.search(r'</details>&nbsp;<span id="flt-rebalance-sync-note"[^>]*>'
+                         + re.escape(html.escape(note)) + '</span>', _sync_notes(page))
         assert note not in dashboard._FILTER_JS
         # ... with a saved minimum too
         page = _rb_page(monkeypatch, tmp_path, self._both(with_view, live_min_price_move=0.1))
-        assert 'id="flt-rebalance-save-note"' in page
+        assert 'id="flt-rebalance-sync-note"' in page
         # No note when the saved defaults do not rebalance (or the run recorded none) ...
         for saved in (False, None):
             page = _rb_page(monkeypatch, tmp_path, dataclasses.replace(
                 with_view, live_rebalance=saved))
-            assert 'id="flt-rebalance-save-note"' not in page
-        # ... nor on a page with no Rebalance view, whose Save sends no choice
+            assert 'id="flt-rebalance-sync-note"' not in page
+        # ... nor on a page with no Rebalance view, which proposes no choice
         page = _rb_page(monkeypatch, tmp_path, self._both(_kc_sweep()))
-        assert 'id="flt-rebalance-save-note"' not in page and 'id="flt-save"' in page
+        assert 'id="flt-rebalance-sync-note"' not in page and 'id="flt-sync-note"' in page
 
-    def test_the_save_button_notes_that_saving_maturity_turns_a_saved_limit_off(
+    def test_a_note_says_maturity_proposes_turning_a_saved_limit_off(
             self, monkeypatch, tmp_path):
-        note = ('The live defaults rebalance until 7 days before maturity; saving with '
-                'Rebalance until "maturity" here turns that limit off.')
-        assert dashboard._until_save_note(7) == note
+        note = ('The live defaults rebalance until 7 days before maturity; with Rebalance '
+                'until "maturity" here, the Trading tab proposes turning that limit off.')
+        assert dashboard._until_sync_note(7) == note
         # In the live "Live settings:" line's words for each choice
         for days in config.REBALANCE_MATURITY_DAYS[1:]:
-            assert dashboard._until_save_note(days).startswith(
+            assert dashboard._until_sync_note(days).startswith(
                 f"The live defaults rebalance until {config._rebalance_until_text(days)};")
-
-        def between(page):
-            bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
-            return bar[bar.index('id="flt-save"'):bar.index('id="flt-trade"')]
-
         with_view = self._both(_kc_sweep_until())
         page = _rb_page(monkeypatch, tmp_path, dataclasses.replace(
             with_view, live_rebalance_min_days_to_maturity=7))
         # Right after the Rebalance note, in Python's words
-        assert re.search(r'</span>&nbsp;<span id="flt-until-save-note"[^>]*>'
-                         + re.escape(html.escape(note)) + '</span>', between(page))
-        assert between(page).index('id="flt-rebalance-save-note"') < between(page).index(
-            'id="flt-until-save-note"')
-        assert "flt-until-save-note" not in dashboard._FILTER_JS
+        between = _sync_notes(page)
+        assert re.search(r'</span>&nbsp;<span id="flt-until-sync-note"[^>]*>'
+                         + re.escape(html.escape(note)) + '</span>', between)
+        assert between.index('id="flt-rebalance-sync-note"') < between.index(
+            'id="flt-until-sync-note"')
+        assert "flt-until-sync-note" not in dashboard._FILTER_JS
         # No note without a saved limit, with saved defaults that do not
         # rebalance (or the run recorded none) ...
         for live in ({"live_rebalance_min_days_to_maturity": None},
                      {"live_rebalance": False, "live_rebalance_min_days_to_maturity": 7},
                      {"live_rebalance": None, "live_rebalance_min_days_to_maturity": 7}):
             page = _rb_page(monkeypatch, tmp_path, dataclasses.replace(with_view, **live))
-            assert 'id="flt-until-save-note"' not in page, live
-        # ... nor on a page without the choices, whose Save sends no days
+            assert 'id="flt-until-sync-note"' not in page, live
+        # ... nor on a page without the choices, which proposes no days
         page = _rb_page(monkeypatch, tmp_path, self._both(
             _kc_sweep_move(), live_rebalance_min_days_to_maturity=7))
-        assert 'id="flt-until-save-note"' not in page
-        assert 'id="flt-rebalance-save-note"' in page
+        assert 'id="flt-until-sync-note"' not in page
+        assert 'id="flt-rebalance-sync-note"' in page
 
-    def test_the_notes_follow_the_button_in_the_order_of_their_selects(
+    def test_the_notes_follow_the_menus_in_the_order_of_their_selects(
             self, monkeypatch, tmp_path):
         sweep = self._both(_kc_sweep_until(_kc_sweep_sell()), live_sell_at=0.85,
                            live_rebalance_min_days_to_maturity=7)
         page = _sl_page(monkeypatch, tmp_path, sweep)
-        bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
-        between = bar[bar.index('id="flt-save"'):bar.index('id="flt-trade"')]
+        between = _sync_notes(page)
         # Rebalance, "Rebalance until", then Sell: the bar's own order
-        assert (between.index('id="flt-rebalance-save-note"')
-                < between.index('id="flt-until-save-note"')
-                < between.index('id="flt-sell-save-note"'))
+        assert (between.index('id="flt-rebalance-sync-note"')
+                < between.index('id="flt-until-sync-note"')
+                < between.index('id="flt-sell-sync-note"'))
 
     # ─── The page-header line ─────────────────────────────────────────────────
 
@@ -17075,28 +17712,28 @@ class TestSellPage:
         for title in (one, three):
             assert ("A position sold at a checkpoint is not bought again there. Sell is shut "
                     "(no selling) while Rebalance is yes: the two are not simulated "
-                    "together. Save as live defaults…") in title
+                    "together. The Trading tab follows") in title
         assert ("has stayed at or above that share of its potential profit (its contract "
                 "pairs at $1.00 each, less what it cost) for 3 days in a row: it is checked "
                 "once a day, 24 hours apart, the last check at the checkpoint") in three
-        # Saving a level makes live runs sell at it: the title says how, in the
-        # same days
+        # A level saved from the Trading tab makes live runs sell at it: the
+        # title says how, in the same days
         assert one.endswith(
-            "Save as live defaults… saves the level and minimum shown: a live run then "
-            "sells at them, on real order books, once a position reaches its level. The "
+            "The Trading tab follows the level and minimum shown: saved there, a live run "
+            "then sells at them, on real order books, once a position reaches its level. The "
             "Scenario Explorer and Interval Discount sections always show no selling.")
         assert three.endswith(
-            "Save as live defaults… saves the level and minimum shown: a live run then "
-            "sells at them, on real order books, once a position has held its level for 3 "
-            "days in a row (read on Kalshi's hourly candles for the days before the run). "
+            "The Trading tab follows the level and minimum shown: saved there, a live run "
+            "then sells at them, on real order books, once a position has held its level for "
+            "3 days in a row (read on Kalshi's hourly candles for the days before the run). "
             "The Scenario Explorer and Interval Discount sections always show no selling.")
         # Nothing on the page still says live trading never sells
         for words in (one, three, dashboard._SELL_SUMMARY_NOTE, dashboard._SELL_DAYS_TITLE,
-                      dashboard._SELL_REACH, dashboard._SAVE_TITLE, dashboard._FILTER_JS):
+                      dashboard._SELL_REACH, dashboard._SELL_SYNC_NOTE, dashboard._FILTER_JS):
             assert "never sells" not in words and "Live trading never" not in words
         assert dashboard._SELL_SUMMARY_NOTE.endswith(
-            " Save as live defaults… saves this level and minimum, so a live run sells at "
-            "them.")
+            " The Trading tab follows this level and minimum: saved there, a live run sells "
+            "at them.")
         # A live run reads each market's scheduled close for the minimum of days
         assert "a live run reads each market's scheduled close instead" in \
             dashboard._SELL_DAYS_TITLE
@@ -17189,8 +17826,9 @@ class TestSellPage:
 
 class TestLiveSellRule:
     """The backtest report and the filter bar when the saved live defaults sell:
-    a grey note beside the save button warning that saving with no selling
-    turns live selling off (only on a page with the Sell view), and the
+    a grey note beside the Exclude menus warning that with no selling the
+    Trading tab proposes turning live selling off (only on a page with the
+    Sell view), and the
     page-header line naming the Sell options that show the sale rule at the
     live rule's band — or that the page cannot show it."""
 
@@ -17208,45 +17846,39 @@ class TestLiveSellRule:
                 "sell_levels": [cls._LEVEL] if levels is None else levels,
                 "sell_days": cls._DAYS if days is None else days}
 
-    # ─── The save button's note ───────────────────────────────────────────────
+    # ─── The note on what the Trading tab proposes ───────────────────────────
 
-    def test_the_save_button_warns_that_saving_with_no_selling_turns_selling_off(
+    def test_a_note_says_no_selling_proposes_turning_selling_off(
             self, monkeypatch, tmp_path):
-        note = ('The live defaults sell; saving with Sell set to "no selling" turns live '
-                "selling off.")
-        assert dashboard._SELL_SAVE_NOTE == note
-
-        def between(page):
-            bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
-            return bar[bar.index('id="flt-save"'):bar.index('id="flt-trade"')]
-
+        note = ('The live defaults sell; with Sell set to "no selling" here, the Trading tab '
+                "proposes turning live selling off.")
+        assert dashboard._SELL_SYNC_NOTE == note
         with_view = _kc_sweep_sell()
         page = _sl_page(monkeypatch, tmp_path, dataclasses.replace(
             with_view, live_sell_at=0.85, live_sell_min_days=3))
-        # Right after the button, before the trade link, in Python's words
-        assert re.search(r'</button>&nbsp;<span id="flt-sell-save-note"[^>]*>'
-                         + re.escape(html.escape(note)) + '</span>', between(page))
+        # Right after the Exclude tags menu, before the red note, in Python's words
+        assert re.search(r'</details>&nbsp;<span id="flt-sell-sync-note"[^>]*>'
+                         + re.escape(html.escape(note)) + '</span>', _sync_notes(page))
         assert note not in dashboard._FILTER_JS
         # A level with no minimum is selling too
         page = _sl_page(monkeypatch, tmp_path, dataclasses.replace(
             with_view, live_sell_at=0.85, live_sell_min_days=None))
-        assert 'id="flt-sell-save-note"' in page
+        assert 'id="flt-sell-sync-note"' in page
         # No note when the saved defaults do not sell (or the run recorded none) ...
         page = _sl_page(monkeypatch, tmp_path, with_view)
-        assert 'id="flt-sell-save-note"' not in page
-        # ... nor on a page with no Sell view, whose Save sends no choice
+        assert 'id="flt-sell-sync-note"' not in page
+        # ... nor on a page with no Sell view, which proposes no choice
         page = _sl_page(monkeypatch, tmp_path, dataclasses.replace(
             _kc_sweep(), live_sell_at=0.85, live_sell_min_days=3))
-        assert 'id="flt-sell-save-note"' not in page and 'id="flt-save"' in page
+        assert 'id="flt-sell-sync-note"' not in page and 'id="flt-sync-note"' in page
 
-    def test_both_notes_follow_the_button_when_both_apply(self, monkeypatch, tmp_path):
+    def test_both_notes_follow_the_menus_when_both_apply(self, monkeypatch, tmp_path):
         sweep = dataclasses.replace(_kc_sweep_sell(_kc_sweep_rebalance()),
                                     live_rebalance=True, live_sell_at=0.85)
         page = _sl_page(monkeypatch, tmp_path, sweep)
-        bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
-        between = bar[bar.index('id="flt-save"'):bar.index('id="flt-trade"')]
-        assert (between.index('id="flt-rebalance-save-note"')
-                < between.index('id="flt-sell-save-note"'))
+        between = _sync_notes(page)
+        assert (between.index('id="flt-rebalance-sync-note"')
+                < between.index('id="flt-sell-sync-note"'))
 
     # ─── The page-header line ─────────────────────────────────────────────────
 
@@ -17862,21 +18494,21 @@ class TestSellScript:
     def test_sell_is_shut_at_no_selling_while_rebalancing(self, monkeypatch, tmp_path):
         # A sell run neither adds to held pairs nor trims, so Sell goes back to
         # no selling and shuts while Rebalance is yes, and opens again, at no
-        # selling, when it goes back to no. Save sends what is on screen: with
-        # Rebalance yes, no selling (the level shown before is gone), and with
-        # it no again, still none.
+        # selling, when it goes back to no. The Trading tab is told what is on
+        # screen: with Rebalance yes, no selling (the level shown before is
+        # gone), and with it no again, still none.
         rebalance = TestRebalanceScript
         page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell(_kc_sweep_rebalance()))
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
         cid = data["grid_rebalance"][0][1][1]
         snaps = self._run(tmp_path, page, [
             ["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
-            ["snap", "level"], *rebalance.ON, ["click", "flt-save"], ["snap", "on"],
-            *rebalance.OFF, ["click", "flt-save"], ["snap", "off"]],
-            strict=True, js=rebalance.WAIT)
+            ["snap", "level"], *rebalance.ON, ["snap", "on"],
+            *rebalance.OFF, ["snap", "off"]],
+            strict=True, js=rebalance.WAIT, framed=True)
         for name in ("on", "off"):
-            [opened] = snaps[name]["opened"]
-            query = TestSaveLiveDefaultsButton._query(data, opened)
+            [raw] = _told(snaps[name])
+            query = TestTradingSync._query(raw)
             assert (query["rebalance"], query["min_price_move"], query["sell_at"],
                     query["sell_min_days"]) == (name, "off", "off", "off"), name
         level = snaps["level"]["selects"]
@@ -17939,15 +18571,15 @@ class TestSellScript:
         assert cid == 7
         src = f"{data['sidecar_dir']}/chunk-{cid}.js"
         scenario = self._scenario(data, 0, 1, 1, 0, 0)
-        steps = [["wait"], ["click", "flt-save"], ["snap", "before"],
+        steps = [["wait"], ["snap", "before"],
                  ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["snap", "loading"],
-                 ["settle"], ["snap", "sold"], ["click", "flt-save"], ["snap", "clicked"],
+                 ["settle"], ["snap", "sold"],
                  ["set", "flt-sell", "none"], ["fire", "flt-sell"], ["settle"],
                  ["snap", "none"]]
         js = ("var __probe = document.getElementById('probe');"
               "window.dashScenarioSelect = function() {"
               " __probe.textContent = JSON.stringify(Array.prototype.slice.call(arguments)); };")
-        snaps = self._run(tmp_path, page, steps, js=js)
+        snaps = self._run(tmp_path, page, steps, js=js, framed=True)
         assert snaps["loading"]["text"]["flt-summary"] == data["text"]["loading"].format(
             scenario=scenario)
         snap = snaps["sold"]
@@ -17969,71 +18601,68 @@ class TestSellScript:
         assert snap["html"]["diag-best"] == "".join(
             best["heads"][h] + best["strings"][t] for h, t in view["best"])
         assert "sold on" in snap["html"]["diag-best"]
-        # While the band's block and the level's file load nothing can be saved;
-        # once the chunk is drawn the button is enabled, and its address
-        # carries the level and the minimum of days shown
-        assert snaps["loading"]["buttons"]["flt-save"] is True
-        assert snap["buttons"]["flt-save"] is False
-        [opened] = snaps["clicked"]["opened"]
-        query = TestSaveLiveDefaultsButton._query(data, opened)
+        # While the band's block and the level's file load nothing is told;
+        # once the chunk is drawn the Trading tab is told the level and the
+        # minimum of days shown
+        assert _told(snaps["loading"]) == []
+        [raw] = _told(snap)
+        query = TestTradingSync._query(raw)
         assert float(query["sell_at"]) == data["sell_levels"][0]["value"]
         assert query["sell_min_days"] == str(data["sell_days"][0]["value"])
         # The explorer is told the scenario with four labels, never the level
         assert len(json.loads(snap["text"]["probe"])) == 4
-        # Back to no selling: the page's own chunk, nothing loaded again, Save on
+        # Back to no selling: the page's own chunk, nothing loaded again, and
+        # told at once
         none = snaps["none"]
-        assert none["files"] == [src] and none["buttons"]["flt-save"] is False
+        assert none["files"] == [src] and len(_told(none)) == 1
         assert none["inflated"] == ["dash-data", "dash-chunk-0", "dash-sell-0"]
         assert dashboard._SELL_SUMMARY_NOTE not in none["text"]["flt-summary"]
 
-    def test_the_save_button_follows_the_level_and_minimum_on_screen(self, monkeypatch,
-                                                                       tmp_path):
+    def test_the_trading_tab_follows_the_level_and_minimum_on_screen(self, monkeypatch,
+                                                                     tmp_path):
         page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
         data = TestFilterPage._data(page)
         src = f"{data['sidecar_dir']}/chunk-7.js"
-        save = TestSaveLiveDefaultsButton()
-        steps = [["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
-                 ["click", "flt-save"], ["snap", "loading"],
-                 ["resolve_file", src], ["snap", "drawn"],
-                 ["click", "flt-save"], ["snap", "clicked"]]
-        snaps = self._run(tmp_path, page, steps, strict=True, files_deferred=(src,))
+        sync = TestTradingSync()
+        steps = [["wait"], ["snap", "ready"], ["set", "flt-sell", "0"], ["fire", "flt-sell"],
+                 ["settle"], ["snap", "loading"],
+                 ["resolve_file", src], ["snap", "drawn"]]
+        snaps = self._run(tmp_path, page, steps, strict=True, files_deferred=(src,),
+                          framed=True)
         loading = snaps["loading"]
         assert loading["pendingFiles"] == [src]
-        assert loading["buttons"]["flt-save"] is True and loading["opened"] == []
-        assert snaps["drawn"]["buttons"]["flt-save"] is False
-        [opened] = snaps["clicked"]["opened"]
-        query = save._query(data, opened)
-        save._assert_sends(data, query, *data["primary"])
+        assert _told(loading) == []
+        [raw] = _told(snaps["drawn"])
+        query = sync._query(raw)
+        sync._assert_sends(data, query, *data["primary"])
         assert (query["sell_at"], query["sell_min_days"]) == ("0.25", "1")
-        # A file that cannot be loaded puts the choice back: the scenario still
-        # shown is the one saved, with no selling
-        failed = self._run(tmp_path, page, steps[:4] + [
-            ["reject_file", src], ["snap", "failed"], ["click", "flt-save"],
-            ["snap", "clicked"]], strict=True, files_deferred=(src,))
-        assert failed["failed"]["buttons"]["flt-save"] is False
-        [opened] = failed["clicked"]["opened"]
-        query = save._query(data, opened)
+        # A file that cannot be loaded puts the choice back and tells nothing;
+        # the next choice tells the scenario still shown, with no selling
+        failed = self._run(tmp_path, page, steps[:6] + [
+            ["reject_file", src], ["snap", "failed"], *_AGAIN,
+            ["snap", "clicked"]], strict=True, files_deferred=(src,), framed=True)
+        assert _told(failed["failed"]) == []
+        [raw] = _told(failed["clicked"])
+        query = sync._query(raw)
         assert (query["sell_at"], query["sell_min_days"]) == ("off", "off")
 
-    def test_a_sell_scenario_the_run_never_simulated_cannot_be_saved(self, monkeypatch,
-                                                                       tmp_path):
-        # (0.3-0.6, k 0.60) was never simulated, so it holds no sale either; a
-        # simulated scenario at the same level can be saved again
+    def test_a_sell_scenario_the_run_never_simulated_is_told_too(self, monkeypatch, tmp_path):
+        # (0.3-0.6, k 0.60) was never simulated, so it holds no sale either;
+        # the Trading tab follows the level all the same, and a simulated
+        # scenario at the same level is told again
         page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
-        data = TestFilterPage._data(page)
         assert _KC_GRID[1][0] == [None, None, None]
-        steps = [["wait"], ["set", "flt-k", "0"], ["set", "flt-band", "1"],
+        steps = [["wait"], ["snap", "ready"], ["set", "flt-k", "0"], ["set", "flt-band", "1"],
                  ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
-                 ["click", "flt-save"], ["snap", "missing"],
+                 ["snap", "missing"],
                  ["set", "flt-k", "1"], ["fire", "flt-k"], ["settle"],
-                 ["click", "flt-save"], ["snap", "back"]]
-        snaps = self._run(tmp_path, page, steps, strict=True)
-        assert snaps["missing"]["buttons"]["flt-save"] is True
-        assert snaps["missing"]["opened"] == []
-        assert snaps["back"]["buttons"]["flt-save"] is False
-        [opened] = snaps["back"]["opened"]
-        query = TestSaveLiveDefaultsButton._query(data, opened)
-        assert (query["sell_at"], query["sell_min_days"]) == ("0.25", "1")
+                 ["snap", "back"]]
+        snaps = self._run(tmp_path, page, steps, strict=True, framed=True)
+        for name, k in (("missing", "0.6"), ("back", "0.75")):
+            [raw] = _told(snaps[name])
+            query = TestTradingSync._query(raw)
+            assert (query["sell_at"], query["sell_min_days"]) == ("0.25", "1"), name
+            assert (query["spread_min"], query["k"]) == ("0.3", k), name
 
     def test_changing_the_days_loads_another_chunk(self, monkeypatch, tmp_path):
         page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
@@ -18090,7 +18719,8 @@ class TestSellScript:
         steps = [["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
                  ["snap", "s"], ["repair", "dash-sell-0"], ["set", "flt-sell", "0"],
                  ["fire", "flt-sell"], ["settle"], ["snap", "retried"]]
-        snaps = self._run(tmp_path, page, steps, strict=True, damaged=("dash-sell-0",))
+        snaps = self._run(tmp_path, page, steps, strict=True, damaged=("dash-sell-0",),
+                          framed=True)
         snap = snaps["s"]
         assert snap["text"]["flt-summary"] == data["text"]["unavailable"].format(
             failed=self._scenario(data, 0, 1, 1, 0, 0),
@@ -18098,7 +18728,8 @@ class TestSellScript:
         assert snap["selects"]["flt-sell"]["value"] == "none"
         assert snap["selects"]["flt-days"]["value"] == "0"
         assert snap["selects"]["flt-days"]["disabled"] is True
-        assert snap["files"] == [] and snap["buttons"]["flt-save"] is False
+        # Put back, the choice is told to no one
+        assert snap["files"] == [] and _told(snap) == []
         # A failed block is not kept: the next choice inflates it again
         assert snaps["retried"]["inflated"].count("dash-sell-0") == 2
         assert snaps["retried"]["files"] == [f"{data['sidecar_dir']}/chunk-7.js"]
@@ -18113,14 +18744,14 @@ class TestSellScript:
         failed = self._scenario(data, 0, 1, 1, 0, 0)
         for kwargs, template in (({"files_missing": (src,)}, "sidecar_missing"),
                                  ({"files_empty": (src,)}, "sidecar_empty")):
-            snap = self._run(tmp_path, page, steps, strict=True, **kwargs)["s"]
+            snap = self._run(tmp_path, page, steps, strict=True, framed=True, **kwargs)["s"]
             reason = "Error: " + data["text"][template].format(file=src)
             assert snap["text"]["flt-summary"] == data["text"]["unavailable"].format(
                 failed=failed, reason=reason, scenario=_phrase(data, 0, 1, 1))
             assert snap["selects"]["flt-sell"]["value"] == "none"
             assert snap["selects"]["flt-days"]["disabled"] is True
             assert snap["files"] == [src]
-            assert snap["buttons"]["flt-save"] is False
+            assert _told(snap) == []
         # A days change whose file is missing puts the days back too, the level kept
         later = f"{folder}/chunk-10.js"
         steps = [["wait"], ["set", "flt-band", "1"], ["set", "flt-sell", "0"],
@@ -20455,15 +21086,15 @@ def _browser_form(pairs) -> str:
     return "&".join(f"{encode(name)}={encode(value)}" for name, value in pairs)
 
 
-def _save_lists(kept_cats: list[int], tags: list[int], series: dict = _MIX_SERIES
+def _sync_lists(kept_cats: list[int], tags: list[int], series: dict = _MIX_SERIES
                 ) -> tuple[list[str], list[str]]:
-    """What the save button sends for a set of ticks (the page's saveLists),
+    """What the bar tells the Trading tab for a set of ticks (the page's syncLists),
     worked out here on its own: every category not kept, and every kept
     category every one of whose tags is ticked (a tag's letter-case twins
     ticked with it) — but only with its letter-case twins, each not kept or
     with every tag ticked too — as excluded categories; every other tag
     ticked, as "Category · Tag", as an excluded tag. Both in the menus' order.
-    The button sends nothing while _save_split holds (saveLists' split).
+    The bar tells nothing while _sync_split holds (syncLists' split).
 
     Returns:
         tuple: (the categories' names, the tags as "Category · Tag").
@@ -20486,10 +21117,10 @@ def _save_lists(kept_cats: list[int], tags: list[int], series: dict = _MIX_SERIE
                    if subcats[t][0] not in names]
 
 
-def _save_split(kept_cats: list[int], tags: list[int], series: dict = _MIX_SERIES) -> bool:
-    """Whether the save button stays shut for a set of ticks because a kept
+def _sync_split(kept_cats: list[int], tags: list[int], series: dict = _MIX_SERIES) -> bool:
+    """Whether the bar tells the Trading tab nothing for a set of ticks because a kept
     category has every tag ticked (a tag's letter-case twins ticked with it)
-    while a letter-case twin of it still keeps a tag (the page's saveLists'
+    while a letter-case twin of it still keeps a tag (the page's syncLists'
     split): the page shows the first left out, but the live filter reads the
     two as one category and could not leave it out whole. Worked out here on
     its own."""
@@ -20508,12 +21139,12 @@ def _save_split(kept_cats: list[int], tags: list[int], series: dict = _MIX_SERIE
 
 def _mix_kept(kept_cats: list[int], tags: list[int], series: dict = _MIX_SERIES):
     """The live filter's own test for a set of ticks: config.trade_filter_for
-    excluding exactly what the save button sends (_save_lists: the categories
+    excluding exactly what the bar tells the Trading tab (_sync_lists: the categories
     not kept and those with every tag ticked, and the other tags ticked, as
     "Category · Tag", with their letter-case twins, as the page ticks them).
     The live filter lists the categories and the tags NOT to trade, so on
     every pair the page lists it keeps what the menus' ticks keep."""
-    excluded, ticked = _save_lists(kept_cats, tags, series)
+    excluded, ticked = _sync_lists(kept_cats, tags, series)
     # The live rule itself, on exactly these exclusions
     return config.trade_filter_for(tuple(excluded) or None, tuple(ticked) or None)
 
@@ -21387,7 +22018,7 @@ class TestMixedSelection:
             _tick_category(2), ["settle"], ["snap", "refused"],
             # One tag left is still Python's own view
             _tick_tag(cat1[0]), ["settle"], ["snap", "tag"]],
-            strict=True)
+            strict=True, framed=True)
         one, refused = snaps["one"], snaps["refused"]
         assert one["text"]["hdr-trades"] == str(views["c1"]["n"]) and one["reacts"]
         # Refused in Python's words: nothing drawn, the last tick taken back
@@ -21404,9 +22035,11 @@ class TestMixedSelection:
         assert refused["menus"]["flt-cat"]["ticked"] == [0, 2]
         assert refused["menus"]["flt-cat"]["label"] == "2 categories"
         assert refused["text"]["hdr-trades"] == str(views["c1"]["n"])
-        # Cat0 and Cat2 are still left out, which is what the button saves
-        assert not refused["buttons"]["flt-save"]
-        assert refused["titles"]["flt-save"] == dashboard._SAVE_TITLE
+        # Cat0 and Cat2 are still left out, as the Trading tab was told: the
+        # ticks put back tell it nothing
+        query = TestTradingSync._query(_told(one)[-1])
+        assert query["exclude_category"] == ["Cat0", "Cat2"]
+        assert _told(refused) == [] and _note(refused) == ""
         assert len(cat1) == 2
         assert snaps["tag"]["text"]["hdr-trades"] == str(views[f"s{cat1[1]}"]["n"])
         assert snaps["tag"]["menus"]["flt-tag"]["ticked"] == [cat1[0]]
@@ -21505,12 +22138,12 @@ class TestMixedSelection:
         # for seeded sets of ticks, the trades the page draws are exactly
         # those of the category · tag pairs a live filter keeps that excludes
         # the categories not kept and the tags ticked, each tied to its
-        # category, over every pair the page lists; and the save button sends
-        # those categories, each category with every tag ticked among them,
-        # and the other tags as exclusions, which the defaults server reads
-        # back as that filter — one under which a category the page shows
-        # left out trades no tag the backtest never saw either. Ticks that
-        # keep no trade shut it, saying why
+        # category, over every pair the page lists; and the Trading tab is
+        # told those categories, each category with every tag ticked among
+        # them, and the other tags as exclusions, which the defaults server
+        # reads back as that filter — one under which a category the page
+        # shows left out trades no tag the backtest never saw either. Ticks
+        # that keep no trade are not told, the note saying why
         trades = _mix_trades(51, n=44)
         page = _mix_page(monkeypatch, tmp_path, trades)
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
@@ -21520,9 +22153,9 @@ class TestMixedSelection:
         sets = _mix_tick_sets(51, 12)
         steps = [["wait"]]
         for i, (cats, tags) in enumerate(sets):
-            steps += _mix_tick_steps(cats, tags, f"drawn{i}")[:-1]
-            steps += [["click", "flt-save"], ["snap", f"set{i}"]]
-        snaps = _run_script(tmp_path, page, steps, strict=True)
+            steps += _mix_tick_steps(cats, tags, f"set{i}")
+        snaps = _run_script(tmp_path, page, steps, strict=True, framed=True)
+        told = _last_told(snaps, [f"set{i}" for i in range(len(sets))])
         less = saved = saved_tags = every_tag = 0
         for i, (cats, tags) in enumerate(sets):
             snap = snaps[f"set{i}"]
@@ -21537,19 +22170,17 @@ class TestMixedSelection:
                 sum(views[f"s{si}"]["n"] for si in kept if f"s{si}" in views))
             less += bool(tags) and len(kept) < len(pairs)
             if not sum(views[f"s{si}"]["n"] for si in kept if f"s{si}" in views):
-                # No trade kept: shut, saying why
-                assert snap["buttons"]["flt-save"] and snap["opened"] == []
-                assert snap["titles"]["flt-save"] == data["text"]["save_all_excluded"]
+                # No trade kept: not told, saying why
+                assert _note(snap) == data["text"]["sync_all_excluded"]
                 continue
             # The categories left out (those with every tag ticked among
-            # them) and the other tags ticked are what the button saves, in
-            # the menus' order
-            excluded, ticked = _save_lists(cats, tags)
+            # them) and the other tags ticked are what the Trading tab is
+            # told, in the menus' order
+            excluded, ticked = _sync_lists(cats, tags)
             saved += 1
             saved_tags += bool(ticked)
-            assert not snap["buttons"]["flt-save"]
-            [opened] = snap["opened"]
-            query = opened["url"].partition("?")[2]
+            assert _note(snap) == ""
+            query = told[f"set{i}"]
             sent = parse_qs(query, strict_parsing=True)
             assert sent.get("exclude_category", []) == excluded
             assert sent.get("exclude_tag", []) == ticked
@@ -21568,78 +22199,97 @@ class TestMixedSelection:
                                                       if c not in cats]
         assert less and saved and saved_tags and every_tag
 
-    def test_more_names_than_a_link_takes_shut_the_button(self, monkeypatch, tmp_path):
-        # More categories, or more tags, ticked than the confirmation page
-        # takes in one link (config.DEFAULTS_SERVER_MAX_FILTER_NAMES, here
-        # lowered to 3 for the page built), or an address longer than it
-        # reads (here lowered to fit three names but not four), keep the
-        # button shut, its hover text saying why in Python's words; at the
-        # limit it saves, and the defaults server takes the link
+    def test_more_names_than_a_proposal_takes_are_not_told(self, monkeypatch, tmp_path):
+        # More categories, or more tags, ticked than the trading page takes
+        # in one proposal (config.DEFAULTS_SERVER_MAX_FILTER_NAMES, here
+        # lowered to 3 for the page built), or a query longer than the
+        # Trading tab carries (here lowered to fit three names but not four),
+        # are not told, the note saying why in Python's words; at the limit
+        # they are told, and the defaults server takes the query
         monkeypatch.setattr(dashboard, "DEFAULTS_SERVER_MAX_FILTER_NAMES", 3)
         series = {f"KXN{i}{j}": (f"Area{i}", (tag,)) for i in range(6)
                   for j, tag in enumerate(("Main", "Side"))}
         page = _mix_page(monkeypatch, tmp_path, _counted_trades(series), series=series)
         data = TestFilterPage._data(page)
-        assert data["save"]["max_names"] == 3
+        assert data["sync"]["max_names"] == 3
         categories, pairs = _mix_axes(series)
         sides = [pairs.index((f"Area{i}", "Side")) for i in range(6)]
         steps = [["wait"], *(_tick_category(i) for i in range(3)), ["settle"],
-                 ["click", "flt-save"], ["snap", "three"],
-                 _tick_category(3), ["settle"], ["click", "flt-save"], ["snap", "four"],
+                 ["snap", "three"],
+                 _tick_category(3), ["settle"], ["snap", "four"],
                  *_clear_menus(), *(_tick_tag(t) for t in sides[:3]), ["settle"],
-                 ["click", "flt-save"], ["snap", "three_tags"],
-                 _tick_tag(sides[3]), ["settle"], ["click", "flt-save"],
-                 ["snap", "four_tags"]]
-        snaps = _run_script(tmp_path, page, steps, strict=True)
-        why = data["text"]["save_too_long"]
-        assert why == dashboard._save_too_long_text(data["save"])
+                 ["snap", "three_tags"],
+                 _tick_tag(sides[3]), ["settle"], ["snap", "four_tags"]]
+        snaps = _run_script(tmp_path, page, steps, strict=True, framed=True)
+        why = data["text"]["sync_too_long"]
+        assert why == dashboard._sync_too_long_text(data["sync"])
         for name in ("four", "four_tags"):
             snap = snaps[name]
             assert snap["reacts"], name
-            assert snap["buttons"]["flt-save"] and snap["opened"] == [], name
-            assert snap["titles"]["flt-save"] == why, name
+            assert _told(snap) == [] and _note(snap) == why, name
         for name in ("three", "three_tags"):
             snap = snaps[name]
-            assert not snap["buttons"]["flt-save"], name
-            assert snap["titles"]["flt-save"] == dashboard._SAVE_TITLE, name
-            [opened] = snap["opened"]
-            query = opened["url"].partition("?")[2]
+            assert _note(snap) == "", name
+            query = _told(snap)[-1]
             assert defaults_server._App(config.DEFAULTS_SERVER_PORT).handle(
-                defaults_server._Request("GET", f"/confirm?{query}", _SAVE_HOST)
+                defaults_server._Request("GET", f"/confirm?{query}", _SERVER_HOST)
             ).status == 200, name
-        # An address over the length the server reads is shut the same way:
-        # the page's limit set to fit the three tags but not a fourth
-        [opened] = snaps["three_tags"]["opened"]
-        three = len(opened["url"].partition("?")[2])
+        # A query over the length the Trading tab carries is not told either:
+        # the page's limit (its binding of config.TRADING_QUERY_MAX_BYTES) set
+        # to fit the three tags but not a fourth
+        three = len(_told(snaps["three_tags"])[-1])
         monkeypatch.setattr(dashboard, "DEFAULTS_SERVER_MAX_FILTER_NAMES", 400)
-        monkeypatch.setattr(dashboard, "_save_max_query_bytes", lambda: three)
+        monkeypatch.setattr(dashboard, "TRADING_QUERY_MAX_BYTES", three)
         page = _mix_page(monkeypatch, tmp_path, _counted_trades(series), series=series)
         snaps = _run_script(tmp_path, page, [
-            ["wait"], *(_tick_tag(t) for t in sides[:3]), ["settle"],
-            ["click", "flt-save"], ["snap", "fits"],
-            _tick_tag(sides[3]), ["settle"], ["click", "flt-save"], ["snap", "long"]],
-            strict=True)
-        assert not snaps["fits"]["buttons"]["flt-save"] and len(snaps["fits"]["opened"]) == 1
-        assert snaps["long"]["buttons"]["flt-save"] and snaps["long"]["opened"] == []
+            ["wait"], *(_tick_tag(t) for t in sides[:3]), ["settle"], ["snap", "fits"],
+            _tick_tag(sides[3]), ["settle"], ["snap", "long"]], strict=True, framed=True)
+        assert _note(snaps["fits"]) == "" and len(_told(snaps["fits"])[-1]) == three
+        assert _told(snaps["long"]) == []
         # Its words state this page's own limits
         data = TestFilterPage._data(page)
-        assert snaps["long"]["titles"]["flt-save"] == data["text"]["save_too_long"] \
-            == dashboard._save_too_long_text(data["save"])
-        assert f"at most {three:,} bytes" in data["text"]["save_too_long"]
+        assert _note(snaps["long"]) == data["text"]["sync_too_long"] \
+            == dashboard._sync_too_long_text(data["sync"])
+        assert f"at most {three:,} bytes" in data["text"]["sync_too_long"]
 
-    def test_the_server_s_limits_hold_the_page_s_longest_save(self):
+    def test_an_apostrophe_counts_three_bytes_as_the_tab_page_counts_it(
+            self, monkeypatch, tmp_path):
+        # The browser sends each ' of the query as %27, and the dashboard's
+        # tab page counts it so before it takes a query: the page's limit
+        # counts it the same way, so it never tells a query the tab page
+        # would drop without a word
+        series = {"KXQ0": ("Sports", ("Women's Golf",)), "KXQ1": ("Sports", ("Tennis",)),
+                  "KXQ2": ("Health", ("Flu",))}
+        _, pairs = _mix_axes(series)
+        golf = pairs.index(("Sports", "Women's Golf"))
+        page = _mix_page(monkeypatch, tmp_path, _counted_trades(series), series=series)
+        steps = [["wait"], _tick_tag(golf), ["settle"], ["snap", "s"]]
+        [query] = _told(_run_script(tmp_path, page, steps, strict=True, framed=True)["s"])
+        assert query.count("'") == 1
+        sent = len(query) + 2
+        for limit, told in ((sent, True), (sent - 1, False), (len(query), False)):
+            monkeypatch.setattr(dashboard, "TRADING_QUERY_MAX_BYTES", limit)
+            page = _mix_page(monkeypatch, tmp_path, _counted_trades(series), series=series)
+            snap = _run_script(tmp_path, page, steps, strict=True, framed=True)["s"]
+            assert (_told(snap) == [query]) is told, limit
+            assert (_note(snap) == "") is told, limit
+
+    def test_the_server_s_limits_hold_the_page_s_longest_proposal(self):
         # The page's two budgets fit the defaults server's limits, from the
-        # constants config.py names: the address opened with a GET fits the
-        # HTTP layer's request line and the server's request, and the posted
-        # form (the address's fields, at most max_form_bytes as a browser
-        # encodes a form, and the form's own fields) fits the server's
-        # request, each with the headroom left over
+        # constants config.py names: the query the Trading tab carries, at
+        # config.TRADING_QUERY_MAX_BYTES, fits the HTTP layer's request line
+        # and the server's request, the tighter exactly, and the posted form
+        # (the query's fields, at most max_form_bytes as a browser encodes a
+        # form, and the form's own fields) fits the server's request, with
+        # the headroom left over
         headroom = config.DASHBOARD_SAVE_HEADROOM_BYTES
-        query = dashboard._save_max_query_bytes()
-        assert (len(f"GET /confirm?{'x' * query} HTTP/1.1\r\n") + headroom
-                <= config.DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES)
-        assert len("/confirm?") + query + headroom <= config.DEFAULTS_SERVER_MAX_REQUEST_BYTES
-        form = dashboard._save_max_form_bytes()
+        query = config.TRADING_QUERY_MAX_BYTES
+        line = len(f"GET /confirm?{'x' * query} HTTP/1.1\r\n")
+        assert line <= config.DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES
+        assert len("/confirm?") + query <= config.DEFAULTS_SERVER_MAX_REQUEST_BYTES
+        assert (line == config.DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES
+                or len("/confirm?") + query == config.DEFAULTS_SERVER_MAX_REQUEST_BYTES)
+        form = dashboard._sync_max_form_bytes()
         assert (len("/confirm") + form + config.DEFAULTS_SERVER_CONFIRM_FORM_EXTRA_BYTES
                 + headroom == config.DEFAULTS_SERVER_MAX_REQUEST_BYTES)
         # The HTTP layer's own limit on a request line, which config states
@@ -21668,18 +22318,18 @@ class TestMixedSelection:
                       + 1 for action in defaults_server._CONFIRM_ACTIONS)
         assert longest == config.DEFAULTS_SERVER_CONFIRM_FORM_EXTRA_BYTES
 
-    def test_an_address_at_the_page_s_limit_can_still_be_saved(self):
-        # A save whose fields come to exactly max_form_bytes as a browser
+    def test_a_proposal_at_the_page_s_limit_can_still_be_saved(self):
+        # A proposal whose fields come to exactly max_form_bytes as a browser
         # posts them, with names full of the characters a form encodes
-        # longer than the address does (! ' ( ) ~) and spaces, which it
-        # encodes shorter: the address opened (encoded as the page encodes
-        # it, encodeURIComponent) fits its own budget and the request line,
-        # the confirmation page shows it, and the form it posts back, with its
+        # longer than the query does (! ' ( ) ~) and spaces, which it
+        # encodes shorter: the query (encoded as the page encodes it,
+        # encodeURIComponent) fits its own budget and the request line, the
+        # trading page shows it, and the form it posts back, with its
         # longest action and the attention box, fits the server's request
         # and saves every name
         from . import test_defaults_server as _tds
-        max_query = dashboard._save_max_query_bytes()
-        max_form = dashboard._save_max_form_bytes()
+        max_query = config.TRADING_QUERY_MAX_BYTES
+        max_form = dashboard._sync_max_form_bytes()
         base = [("tier_floors", "off"), ("spread_min", "0"), ("spread_max", "0.5"),
                 ("k", "0.8"), ("size_cap", "0.1")]
 
@@ -21693,8 +22343,10 @@ class TestMixedSelection:
         pairs = pairs_of(names)
         assert len(_browser_form(pairs)) == max_form
         query = "&".join(f"{name}={_uri_component(value)}" for name, value in pairs)
-        # The form, not the address, is what binds these names
-        assert len(query) < max_query and len(names) <= config.DEFAULTS_SERVER_MAX_FILTER_NAMES
+        # The form, not the query, is what binds these names (each ' of the
+        # query counted as the three bytes the browser sends)
+        assert len(query) + 2 * query.count("'") < max_query
+        assert len(names) <= config.DEFAULTS_SERVER_MAX_FILTER_NAMES
         target = f"/confirm?{query}"
         assert len(f"GET {target} HTTP/1.1\r\n") <= config.DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES
         assert len(target) <= config.DEFAULTS_SERVER_MAX_REQUEST_BYTES
@@ -21709,43 +22361,41 @@ class TestMixedSelection:
         assert _tds._post(app, form).status == 303
         assert config.read_saved_live_defaults().exclude_tags == tuple(names)
 
-    def test_a_posted_form_too_long_shuts_the_button(self, monkeypatch, tmp_path):
-        # The script counts a save's fields as a browser posts them back in
-        # the confirmation page's form — each ! ' ( ) ~ three bytes, a space
+    def test_a_posted_form_too_long_is_not_told(self, monkeypatch, tmp_path):
+        # The script counts a proposal's fields as a browser posts them back
+        # in the trading page's form — each ! ' ( ) ~ three bytes, a space
         # one — exactly: with the page's form budget set to that length the
-        # button opens the address, one byte less and it is shut, saying why,
-        # though the address itself fits its own budget
+        # Trading tab is told the query, one byte less and it is not, the
+        # note saying why, though the query itself fits its own budget
         series = {"KXQ0": ("Sports", ("Golf(!!)~(''~)!!(~)",)),
                   "KXQ1": ("Sports", ("Tennis",)), "KXQ2": ("Health", ("Flu",))}
         _, pairs = _mix_axes(series)
         golf = pairs.index(("Sports", "Golf(!!)~(''~)!!(~)"))
         page = _mix_page(monkeypatch, tmp_path, _counted_trades(series), series=series)
-        steps = [["wait"], _tick_tag(golf), ["settle"], ["click", "flt-save"], ["snap", "s"]]
-        [opened] = _run_script(tmp_path, page, steps, strict=True)["s"]["opened"]
-        query = opened["url"].partition("?")[2]
+        steps = [["wait"], _tick_tag(golf), ["settle"], ["snap", "s"]]
+        [query] = _told(_run_script(tmp_path, page, steps, strict=True, framed=True)["s"])
         length = len(_browser_form(parse_qsl(query, strict_parsing=True)))
         # More bytes posted than sent: the name's ! ' ( ) ~ outweigh the spaces
         assert length > len(query)
         for budget, opens in ((length, True), (length - 1, False)):
-            monkeypatch.setattr(dashboard, "_save_max_form_bytes", lambda b=budget: b)
-            monkeypatch.setattr(dashboard, "_save_max_query_bytes", lambda: len(query))
+            monkeypatch.setattr(dashboard, "_sync_max_form_bytes", lambda b=budget: b)
+            monkeypatch.setattr(dashboard, "TRADING_QUERY_MAX_BYTES",
+                                len(query) + 2 * query.count("'"))
             page = _mix_page(monkeypatch, tmp_path, _counted_trades(series), series=series)
             data = TestFilterPage._data(page)
-            snap = _run_script(tmp_path, page, steps, strict=True)["s"]
-            assert snap["buttons"]["flt-save"] is not opens, budget
-            assert len(snap["opened"]) == opens, budget
-            assert snap["titles"]["flt-save"] == (
-                dashboard._SAVE_TITLE if opens else data["text"]["save_too_long"]), budget
+            snap = _run_script(tmp_path, page, steps, strict=True, framed=True)["s"]
+            assert len(_told(snap)) == opens, budget
+            assert _note(snap) == ("" if opens else data["text"]["sync_too_long"]), budget
 
-    def test_every_tag_of_a_kept_category_ticked_saves_the_category(self, monkeypatch,
+    def test_every_tag_of_a_kept_category_ticked_tells_the_category(self, monkeypatch,
                                                                     tmp_path):
         # A kept category every one of whose tags is ticked is shown left out,
-        # so the button sends it as an excluded category, not its tags one by
+        # so the bar tells it as an excluded category, not its tags one by
         # one: a tag of it the backtest never saw must not trade live either.
         # With a namesake in other letter case it goes only when the namesake
-        # is out too, as the live filter reads the two as one (the button
-        # stays shut while the namesake keeps a tag: the next test). Part of
-        # a category's tags goes as tags
+        # is out too, as the live filter reads the two as one (nothing is
+        # told while the namesake keeps a tag: the next test). Part of a
+        # category's tags goes as tags
         series = {"KXH0": ("Health", ("Flu",)), "KXH1": ("health", ("Flu",)),
                   "KXH2": ("health", ("Cold",)), "KXS0": ("Sports", ("Golf",)),
                   "KXS1": ("Sports", ("Tennis",)), "KXE0": ("Economy", ("Jobs",))}
@@ -21762,34 +22412,34 @@ class TestMixedSelection:
         steps = [["wait"]]
         for name, (tags, _, _) in cases.items():
             steps += [*_clear_menus(), *(_tick_tag(t) for t in tags), ["settle"],
-                      ["click", "flt-save"], ["snap", name]]
-        snaps = _run_script(tmp_path, page, steps, strict=True)
+                      ["snap", name]]
+        snaps = _run_script(tmp_path, page, steps, strict=True, framed=True)
+        told = _last_told(snaps, list(cases))
         for name, (tags, want_cats, want_tags) in cases.items():
             snap = snaps[name]
-            assert not snap["buttons"]["flt-save"], name
-            [opened] = snap["opened"]
-            query = opened["url"].partition("?")[2]
+            assert _note(snap) == "", name
+            query = told[name]
             sent = parse_qs(query, strict_parsing=True)
             assert sent.get("exclude_category", []) == want_cats, name
             assert sent.get("exclude_tag", []) == want_tags, name
             # The tests' own reading of the rule agrees
-            assert _save_lists(list(range(len(categories))), tags, series) \
+            assert _sync_lists(list(range(len(categories))), tags, series) \
                 == (want_cats, want_tags), name
-            assert not _save_split(list(range(len(categories))), tags, series), name
+            assert not _sync_split(list(range(len(categories))), tags, series), name
             settings, _ = defaults_server._proposal(defaults_server._params(query), None)
             keeps = config.trade_filter(settings)
             for category in categories:
                 shown_out = category in want_cats
                 assert keeps(category, "A tag never seen") is not shown_out, (name, category)
 
-    def test_every_tag_ticked_while_a_case_twin_keeps_one_shuts_the_button(
+    def test_every_tag_ticked_while_a_case_twin_keeps_one_is_not_told(
             self, monkeypatch, tmp_path):
         # Ticking Flu ticks health's Flu with it, so Health has every tag
         # ticked and is shown left out, while health keeps its Cold. The live
         # filter reads Health and health as one category, so it cannot leave
-        # out Health without health: saving Health's tags one by one would
-        # let a Health tag the backtest never saw trade live. The button
-        # stays shut, saying why in Python's words, until the reader ticks
+        # out Health without health: proposing Health's tags one by one would
+        # let a Health tag the backtest never saw trade live. Nothing is
+        # told, the note saying why in Python's words, until the reader ticks
         # Cold too (both go whole) or ticks the category itself
         series = {"KXH0": ("Health", ("Flu",)), "KXH1": ("health", ("Flu",)),
                   "KXH2": ("health", ("Cold",)), "KXS0": ("Sports", ("Golf",)),
@@ -21800,8 +22450,8 @@ class TestMixedSelection:
         health = categories.index("Health")
         page = _mix_page(monkeypatch, tmp_path, _counted_trades(series), series=series)
         data = TestFilterPage._data(page)
-        why = data["text"]["save_twin_split"]
-        assert why == dashboard._SAVE_BLOCKED_TEXT["save_twin_split"]
+        why = data["text"]["sync_twin_split"]
+        assert why == dashboard._SYNC_BLOCKED_TEXT["sync_twin_split"]
         assert why not in dashboard._FILTER_JS
         everything = list(range(len(categories)))
         cases = {"flu": ([], [flu], False), "flu_cold": ([], [flu, cold], True),
@@ -21810,30 +22460,27 @@ class TestMixedSelection:
         steps = [["wait"]]
         for name, (cats, tags, _) in cases.items():
             steps += [*_clear_menus(), *(_tick_category(c) for c in cats),
-                      *(_tick_tag(t) for t in tags), ["settle"], ["click", "flt-save"],
-                      ["snap", name]]
-        snaps = _run_script(tmp_path, page, steps, strict=True)
+                      *(_tick_tag(t) for t in tags), ["settle"], ["snap", name]]
+        snaps = _run_script(tmp_path, page, steps, strict=True, framed=True)
+        told = _last_told(snaps, list(cases))
         for name, (cats, tags, opens) in cases.items():
             snap = snaps[name]
             kept = [c for c in everything if c not in cats]
             # The tests' own reading of the rule agrees
-            assert _save_split(kept, tags, series) is not opens, name
-            assert snap["buttons"]["flt-save"] is not opens, name
-            assert snap["titles"]["flt-save"] == (dashboard._SAVE_TITLE if opens else why), name
+            assert _sync_split(kept, tags, series) is not opens, name
+            assert _note(snap) == ("" if opens else why), name
             if not opens:
-                assert snap["opened"] == [], name
                 continue
-            [opened] = snap["opened"]
-            sent = parse_qs(opened["url"].partition("?")[2], strict_parsing=True)
+            sent = parse_qs(told[name], strict_parsing=True)
             assert sent.get("exclude_category", []) == ["Health", "health"], name
         # The page shows Health left out while it is shut
         assert "Health" in snaps["flu"]["text"]["flt-summary"]
 
-    def test_a_save_is_a_fixed_point_of_the_header(self, monkeypatch, tmp_path):
-        # Whatever a reader ticks, saving it and then doing what the page's
-        # live-rule line says for the saved filter (the boxes
-        # _live_filter_ticks names) and saving again saves the same filter:
-        # the button and the line read one rule
+    def test_a_proposal_is_a_fixed_point_of_the_header(self, monkeypatch, tmp_path):
+        # Whatever a reader ticks, the filter the Trading tab is told, once
+        # saved, and then doing what the page's live-rule line says for that
+        # saved filter (the boxes _live_filter_ticks names) tells the same
+        # filter again: the bar and the line read one rule
         trades = _counted_trades(_MIX_SERIES)
         page = _mix_page(monkeypatch, tmp_path, trades)
         data = TestFilterPage._data(page)
@@ -21845,13 +22492,13 @@ class TestMixedSelection:
             for i, (cats, tags) in enumerate(tick_sets):
                 steps += [*_clear_menus(), *(_tick_category(c) for c in range(3)
                                              if c not in cats),
-                          *(_tick_tag(t) for t in tags), ["settle"],
-                          ["click", "flt-save"], ["snap", f"s{i}"]]
-            snaps = _run_script(tmp_path, page, steps, strict=True)
+                          *(_tick_tag(t) for t in tags), ["settle"], ["snap", f"s{i}"]]
+            snaps = _run_script(tmp_path, page, steps, strict=True, framed=True)
+            told = _last_told(snaps, [f"s{i}" for i in range(len(tick_sets))])
             out = []
             for i in range(len(tick_sets)):
-                [opened] = snaps[f"s{i}"]["opened"]
-                sent = parse_qs(opened["url"].partition("?")[2], strict_parsing=True)
+                assert _note(snaps[f"s{i}"]) == "", i
+                sent = parse_qs(told[f"s{i}"], strict_parsing=True)
                 out.append((tuple(sent.get("exclude_category", [])) or None,
                             tuple(sent.get("exclude_tag", [])) or None))
             return out
@@ -21870,18 +22517,18 @@ class TestMixedSelection:
         first = saved(sets)
         second = saved([header_ticks(*f) for f in first])
         assert second == first
-        # The set that ticks every tag of Cat1 saves Cat1 as a category
+        # The set that ticks every tag of Cat1 tells Cat1 as a category
         assert first[-2][0] is not None and "Cat1" in first[-2][0]
 
-    def test_a_name_the_server_refuses_shuts_the_button(self, monkeypatch, tmp_path):
-        # A name the defaults server would refuse as a live exclusion keeps
-        # the button shut, saying why: a tag whose category's name holds the
+    def test_a_name_the_server_refuses_is_not_told(self, monkeypatch, tmp_path):
+        # A name the defaults server would refuse as a live exclusion is not
+        # told, the note saying why: a tag whose category's name holds the
         # mark that ties a tag to its category (the live filter would read
         # "Arts · Crafts · Glue" as category Arts and tag "Crafts · Glue"), a
         # tag named Any (a tie that names no tag) and a category named None.
         # A category every one of whose tags is ticked goes whole, so its
-        # refused tag is not sent and the save goes ahead. The page's list of
-        # refused names is the server's own verdict, name by name
+        # refused tag is not sent and the proposal goes ahead. The page's
+        # list of refused names is the server's own verdict, name by name
         series = {"KXR0": ("Arts · Crafts", ("Glue",)), "KXR1": ("Sports", ("Golf",)),
                   "KXR2": ("Sports", ("Any",)), "KXR3": ("None", ("Misc",)),
                   "KXR4": ("Economy", ("Jobs",))}
@@ -21899,13 +22546,13 @@ class TestMixedSelection:
                 return True
             return False
 
-        assert data["save_refused"] == {
+        assert data["sync_refused"] == {
             "categories": [c for c, name in enumerate(categories)
                            if server_refuses("exclude_category", name)],
             "tags": [t for t, (category, tag) in enumerate(pairs)
                      if server_refuses("exclude_tag", f"{category} · {tag}")
                      or config.split_tag(f"{category} · {tag}") != (category, tag)]}
-        assert data["save_refused"] == {
+        assert data["sync_refused"] == {
             "categories": [categories.index("Arts · Crafts"), categories.index("None")],
             "tags": [index[("Arts · Crafts", "Glue")], index[("Sports", "Any")]]}
         cases = {"glue": ([], [index[("Arts · Crafts", "Glue")]], False),
@@ -21918,23 +22565,19 @@ class TestMixedSelection:
         steps = [["wait"]]
         for name, (cats, tags, _) in cases.items():
             steps += [*_clear_menus(), *(_tick_category(c) for c in cats),
-                      *(_tick_tag(t) for t in tags), ["settle"], ["click", "flt-save"],
-                      ["snap", name]]
-        snaps = _run_script(tmp_path, page, steps, strict=True)
+                      *(_tick_tag(t) for t in tags), ["settle"], ["snap", name]]
+        snaps = _run_script(tmp_path, page, steps, strict=True, framed=True)
+        told = _last_told(snaps, list(cases))
         for name, (_, _, opens) in cases.items():
             snap = snaps[name]
-            assert snap["buttons"]["flt-save"] is not opens, name
-            assert snap["titles"]["flt-save"] == (
-                dashboard._SAVE_TITLE if opens else data["text"]["save_refused"]), name
+            assert _note(snap) == ("" if opens else data["text"]["sync_refused"]), name
             if not opens:
-                assert snap["opened"] == [], name
                 continue
-            [opened] = snap["opened"]
-            query = opened["url"].partition("?")[2]
+            query = told[name]
             assert defaults_server._App(config.DEFAULTS_SERVER_PORT).handle(
-                defaults_server._Request("GET", f"/confirm?{query}", _SAVE_HOST)
+                defaults_server._Request("GET", f"/confirm?{query}", _SERVER_HOST)
             ).status == 200, name
-        sent = parse_qs(snaps["sports_whole"]["opened"][0]["url"].partition("?")[2])
+        sent = parse_qs(told["sports_whole"])
         assert sent["exclude_category"] == ["Sports"] and "exclude_tag" not in sent
 
     def test_the_khat_figures_of_a_mix_are_its_groups_pooled(self, monkeypatch, tmp_path):
@@ -22041,9 +22684,10 @@ class TestMixedSelection:
                 ("tag", [_tick_tag(cat1[1])], [0, 2], [cat1[1]])]
         steps = [["wait"]]
         for name, clicks, _, _ in walk:
-            steps += [*clicks, ["settle"], ["click", "flt-save"], ["snap", name]]
+            steps += [*clicks, ["settle"], ["snap", name]]
         snaps = _run_script(tmp_path, page, steps, strict=True,
-                            setup_js=_FORCE_MIX if forced else "")
+                            setup_js=_FORCE_MIX if forced else "", framed=True)
+        told = _last_told(snaps, [name for name, *_ in walk])
         for name, _, excluded, tags in walk:
             snap = snaps[name]
             assert snap["menus"]["flt-cat"]["ticked"] == excluded, name
@@ -22056,15 +22700,15 @@ class TestMixedSelection:
             # Python's own
             assert snap["text"]["flt-summary"] == _mix_summary(
                 data, kept, tags, ref["view"]["n"], n_all, mix=forced or name == "one")
-            # The categories left out and the tags ticked are saved as
-            # exclusions; every category left out shuts the button, saying why
+            # The categories left out and the tags ticked are told as
+            # exclusions; every category left out is not told, the note
+            # saying why
             if not kept:
-                assert snap["buttons"]["flt-save"] and snap["opened"] == [], name
-                assert snap["titles"]["flt-save"] == data["text"]["save_all_excluded"], name
+                assert _told(snap) == [], name
+                assert _note(snap) == data["text"]["sync_all_excluded"], name
             else:
-                assert not snap["buttons"]["flt-save"], name
-                [opened] = snap["opened"]
-                sent = parse_qs(opened["url"].partition("?")[2], strict_parsing=True)
+                assert _note(snap) == "", name
+                sent = parse_qs(told[name], strict_parsing=True)
                 assert sent["exclude_category"] == [data["categories"][c]
                                                     for c in excluded], name
                 assert sent.get("exclude_tag", []) == [
@@ -22499,7 +23143,7 @@ class TestMixedSelection:
         snaps = _run_script(tmp_path, page, [
             ["wait"], _tick_category(0), ["settle"], ["snap", "mixed"],
             ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "refused"]],
-            strict=True)
+            strict=True, framed=True)
         mixed, refused = snaps["mixed"], snaps["refused"]
         assert mixed["reacts"] and refused["reacts"] == []
         assert refused["selects"]["flt-k"]["value"] == "1"
@@ -22511,20 +23155,21 @@ class TestMixedSelection:
             f"Not available: the run with Cat0 excluded at {tried} cannot be shown (the "
             f"page's build log says why). The page still shows the run with Cat0 excluded "
             f"at {still}.")
-        # The scenario still shown, with Cat0 left out, is what the button saves
-        assert not refused["buttons"]["flt-save"]
-        assert refused["titles"]["flt-save"] == dashboard._SAVE_TITLE
+        # The scenario still shown, with Cat0 left out, is what the Trading
+        # tab was told: the choice put back tells it nothing
+        [query] = _told(mixed)
+        assert TestTradingSync._query(query)["exclude_category"] == ["Cat0"]
+        assert _told(refused) == [] and _note(refused) == ""
 
-    def test_which_ticks_shut_the_save_button_and_what_it_sends(self, monkeypatch, tmp_path):
-        # The button sends the categories left out and the tags ticked: a
+    def test_which_ticks_are_told_and_what_is_sent(self, monkeypatch, tmp_path):
+        # The bar tells the categories left out and the tags ticked: a
         # category left out, a category with a namesake in other letter case
         # (both are left out and both sent), a tag ticked, and a category left
         # out beside a tag are sent as exclusions. A category whose name holds
         # the mark that ties a tag to its category, which the defaults server
-        # would refuse as a category written as a tied tag, keeps it shut, as
-        # does every category left out, its hover text saying why in Python's
-        # words, and a click opens nothing. Unticking every box saves the
-        # scenario, excluding nothing
+        # would refuse as a category written as a tied tag, is not told, nor
+        # is every category left out, the note saying why in Python's words.
+        # Unticking every box tells the scenario, excluding nothing
         series = {"KXD0": ("Health", ("Flu",)), "KXD1": ("health", ("Flu",)),
                   "KXD2": ("Arts · Crafts", ("Glue",)), "KXD3": ("Sports", ("Golf",)),
                   "KXD4": ("Sports", ("Tennis",))}
@@ -22540,27 +23185,25 @@ class TestMixedSelection:
         steps = [["snap", "loaded"], ["wait"], ["snap", "ready"]]
         for name, (excluded, tags) in cases.items():
             steps += [*_clear_menus(), *(_tick_category(c) for c in excluded),
-                      *(_tick_tag(t) for t in tags), ["settle"], ["click", "flt-save"],
-                      ["snap", name]]
-        steps += [*_clear_menus(), ["settle"], ["click", "flt-save"], ["snap", "cleared"]]
-        snaps = _run_script(tmp_path, page, steps, strict=True)
+                      *(_tick_tag(t) for t in tags), ["settle"], ["snap", name]]
+        steps += [*_clear_menus(), ["settle"], ["snap", "cleared"]]
+        snaps = _run_script(tmp_path, page, steps, strict=True, framed=True)
+        told = _last_told(snaps, [*cases, "cleared"])
         for name in ("loaded", "ready"):
-            assert snaps[name]["titles"]["flt-save"] == dashboard._SAVE_TITLE, name
-        assert not snaps["ready"]["buttons"]["flt-save"]
+            assert _note(snaps[name]) == "" and _told(snaps[name]) == [], name
         # A tag ticks no category; health is left out with Health, its
         # case twin as the page ships it
         assert data["category_twins"] == [[categories.index("Health"),
                                            categories.index("health")]]
         assert snaps["tag"]["menus"]["flt-cat"]["ticked"] == []
         assert snaps["twin"]["menus"]["flt-cat"]["ticked"] == [1, 3]
-        # Drawn, and shut through it
-        for name, why in (("every", "save_all_excluded"), ("separator", "save_refused")):
+        # Drawn, and not told
+        for name, why in (("every", "sync_all_excluded"), ("separator", "sync_refused")):
             snap = snaps[name]
             assert snap["reacts"], name
-            assert snap["buttons"]["flt-save"] and snap["opened"] == [], name
-            assert snap["titles"]["flt-save"] == data["text"][why], name
+            assert _note(snap) == data["text"][why], name
         # The server would indeed refuse that category
-        assert data["save_refused"] == {"categories": [0], "tags": [0]}
+        assert data["sync_refused"] == {"categories": [0], "tags": [0]}
         assert config.filter_name_refusal("exclude_categories", "Arts · Crafts")
         for name, sent_names, sent_tags in (
                 ("category", ["Sports"], []), ("twin", ["Health", "health"], []),
@@ -22568,25 +23211,24 @@ class TestMixedSelection:
                 ("mix", ["Health", "health"], ["Sports · Tennis"])):
             snap = snaps[name]
             assert snap["reacts"], name
-            assert not snap["buttons"]["flt-save"], name
-            assert snap["titles"]["flt-save"] == dashboard._SAVE_TITLE, name
-            [opened] = snap["opened"]
-            query = opened["url"].partition("?")[2]
+            assert _note(snap) == "", name
+            query = told[name]
             sent = parse_qs(query, strict_parsing=True)
             assert sent.get("exclude_category", []) == sent_names, name
             assert sent.get("exclude_tag", []) == sent_tags, name
             assert "tag" not in sent and "category" not in sent, name
             status = defaults_server._App(config.DEFAULTS_SERVER_PORT).handle(
-                defaults_server._Request("GET", f"/confirm?{query}", _SAVE_HOST)).status
+                defaults_server._Request("GET", f"/confirm?{query}", _SERVER_HOST)).status
             assert status == 200, name
-        # Every category left out shows nothing, and is still shut
+        # Every category left out shows nothing, and is not told: the last
+        # query told before it was the cleared menus' (its first step)
         assert snaps["every"]["menus"]["flt-cat"]["ticked"] == list(range(len(categories)))
         assert snaps["every"]["text"]["hdr-trades"] == "0"
+        assert "exclude_category" not in parse_qs(told["every"])
         snap = snaps["cleared"]
-        assert not snap["buttons"]["flt-save"]
-        assert snap["titles"]["flt-save"] == dashboard._SAVE_TITLE
-        [opened] = snap["opened"]
-        sent = parse_qs(opened["url"].partition("?")[2], strict_parsing=True)
+        assert _note(snap) == ""
+        [raw] = _told(snap)
+        sent = parse_qs(raw, strict_parsing=True)
         assert "category" not in sent and "tag" not in sent
         assert "exclude_category" not in sent and "exclude_tag" not in sent
 

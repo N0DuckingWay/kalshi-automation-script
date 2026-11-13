@@ -818,6 +818,17 @@ DEFAULTS_SERVER_MAX_FILTER_NAMES = 400
 # line break), whatever DEFAULTS_SERVER_MAX_REQUEST_BYTES says.
 DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES = 65_536
 
+# The longest proposal (the query after "/confirm?") the live dashboard's
+# Trading tab carries to the defaults server's trading page, counted as the
+# browser sends it (each apostrophe as %27, three bytes). The address must fit
+# both of the limits above: the server's own on a request's path, and its HTTP
+# layer's on the request line ("GET /confirm?<query> HTTP/1.1" and its line
+# break), the tighter of the two (65,512 bytes). The dashboard's tab page
+# refuses a longer proposal, and the backtest page's filter bar never sends one.
+TRADING_QUERY_MAX_BYTES = min(
+    DEFAULTS_SERVER_MAX_REQUEST_BYTES - len("/confirm?"),
+    DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES - len("GET /confirm? HTTP/1.1\r\n"))
+
 # Bytes the confirmation form adds when posted back: the fingerprint, nonce,
 # token, longest action and attention box fields. The Save button budgets with
 # it; a test checks the sum against a real form.
@@ -989,12 +1000,6 @@ BACKTEST_SWEEP_FORMAT = "backtest-sweep-v7"
 # JSON one): the real line is a few hundred bytes, so a file that runs past
 # this without a line break is not a saved sweep.
 BACKTEST_SWEEP_HEADER_MAX_BYTES = 65_536
-
-# How far from the dashboard file's start the filter bar's Trade link's id may
-# sit: the bar sits in the page's opening part, before every section and data
-# block, so the first MiB holds it on any page, however large
-# (tests/test_dashboard.py checks this). No code reads the file for it.
-DASHBOARD_MARKER_SCAN_BYTES = 1_048_576
 
 # When defaults_server finds its port taken, it asks the server already there
 # which checkout it serves (GET /checkout): how long it waits, in seconds, for

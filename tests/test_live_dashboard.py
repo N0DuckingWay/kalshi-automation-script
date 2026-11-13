@@ -695,13 +695,12 @@ class TestPageApp:
             section = page.split(f'<section id="panel-{panel}"', 1)[1].split("</section>", 1)[0]
             assert f'<iframe id="{frame}"' in section
         sandboxes = {i: sandbox.split() for i, _, sandbox in frames}
-        # The backtest page: scripts in its own origin, the defaults server's
-        # pages in windows of their own and a chart's picture saved; never the
-        # tab page navigated
-        assert sandboxes["backtest-frame"] == [
-            "allow-scripts", "allow-same-origin", "allow-popups",
-            "allow-popups-to-escape-sandbox", "allow-downloads"]
-        # The Data page opens no window: scripts, its own origin and a chart's
+        # The backtest page: scripts in its own origin and a chart's picture
+        # saved; it opens no window (it tells the tab page its bar's choice
+        # instead) and never navigates the tab page
+        assert sandboxes["backtest-frame"] == ["allow-scripts", "allow-same-origin",
+                                               "allow-downloads"]
+        # The Data page likewise: scripts, its own origin and a chart's
         # picture saved, nothing more
         assert sandboxes["data-frame"] == ["allow-scripts", "allow-same-origin",
                                            "allow-downloads"]
@@ -712,8 +711,10 @@ class TestPageApp:
                                               "allow-forms"]
         # A run page: its one script, in its own origin, and nothing more
         assert sandboxes["run-frame"] == ["allow-scripts", "allow-same-origin"]
-        for frame in ("trading-frame", "run-frame"):
+        # No frame may open a window
+        for frame in ("backtest-frame", "data-frame", "trading-frame", "run-frame"):
             assert not [s for s in sandboxes[frame] if "popups" in s], frame
+        assert "allow-popups" not in live_dashboard._FRAME_SANDBOX
         # The page lets any of its frames load the live-defaults server's pages (frame-src),
         # so the backtest page could point its own frame at the trading page: the Backtest
         # and Data frames may never send a form, so its buttons do nothing there
@@ -2187,14 +2188,17 @@ class TestTradingAndRunTabs:
         assert snap["posted"] == []
         assert snap["timers"] == []
 
-    def test_a_trading_page_loaded_out_of_sight_is_loaded_again_when_its_tab_is_chosen(
-            self, tmp_path):
+    def test_coming_to_the_trading_tab_always_loads_the_trading_page_again(self, tmp_path):
         # The trading page's buttons arm once it has been visible for a second, and a browser
-        # counts a page in a hidden frame as visible: a page that loaded while the Trading tab
-        # was hidden would arm out of sight, so choosing the tab loads it again
+        # counts a page in a hidden frame as visible: a page loaded or finished loading while
+        # the Trading tab was hidden would arm out of sight, so every time the reader comes to
+        # the tab the page is loaded again, its buttons drawn off until they arm in sight. Its
+        # tab clicked while it is shown loads nothing: a press of Dry run or Confirm and trade
+        # still on its way to the server is never cut off
         snaps = _relay(tmp_path, [
             _from_trading({"type": "kalshi-trading", "query": _Q}),
             ["click", "tab-trading"], ["snap", "first"],
+            ["click", "tab-trading"], ["snap", "clicked while shown"],
             ["click", "tab-live"], ["click", "tab-trading"], ["snap", "again"],
             # A page that finished loading after the reader left the tab
             ["click", "tab-live"], _from_trading({"type": "kalshi-trading", "query": _Q2}),
@@ -2208,14 +2212,23 @@ class TestTradingAndRunTabs:
         first = snaps["first"]
         assert first["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q}"
         assert (first["loads"], first["replaced"]) == ({"trading-frame": 2}, 1)
-        # A page loaded while the tab was shown is left as it is
-        assert (snaps["again"]["loads"], snaps["again"]["replaced"]) == ({"trading-frame": 2}, 1)
+        # The tab clicked again while shown: the same frame, nothing loaded
+        shown = snaps["clicked while shown"]
+        assert shown["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q}"
+        assert (shown["loads"], shown["replaced"]) == ({"trading-frame": 2}, 1)
+        # A page loaded while the tab was shown is loaded again too, when the reader comes
+        # back to the tab
+        again = snaps["again"]
+        assert again["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q}"
+        assert (again["loads"], again["replaced"]) == ({"trading-frame": 3}, 2)
         late = snaps["late"]
         assert late["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q2}"
-        assert (late["loads"], late["replaced"]) == ({"trading-frame": 3}, 2)
+        assert (late["loads"], late["replaced"]) == ({"trading-frame": 4}, 3)
+        # A page the tab page has since replaced is not heard: the proposal stays the last
+        # one the current page reported
         old = snaps["old"]
         assert old["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q2}"
-        assert (old["loads"], old["replaced"]) == ({"trading-frame": 3}, 2)
+        assert (old["loads"], old["replaced"]) == ({"trading-frame": 5}, 4)
         assert old["posted"] == []
 
     def test_a_bar_choice_or_a_run_loaded_out_of_sight_is_loaded_again(self, tmp_path):
@@ -2286,9 +2299,9 @@ class TestTradingAndRunTabs:
                                 [True, True, False, True, True])
         # (loaded at start, and again when the Trading tab was chosen)
         assert sent["loads"]["trading-frame"] == 2
-        # No proposal kept, and no page counted as loaded out of sight: leaving the tab and
-        # coming back loads nothing, and Reload shows the trading page as it opens on its own
-        assert after["loads"]["trading-frame"] == 3
+        # No proposal kept: coming back to the tab, and Reload, each load the trading page as
+        # it opens on its own
+        assert after["loads"]["trading-frame"] == 4
         assert after["el"]["trading-frame"]["src"] == _TRADING_URL
 
     @pytest.mark.parametrize("source, origin", [
@@ -2604,10 +2617,12 @@ class TestTradingAndRunTabs:
         # The Trading and Run frames keep their pages
         assert emptied["el"]["trading-frame"]["src"] == _TRADING_URL
         assert emptied["el"]["run-frame"]["src"] == _RUN_URL + _RUN
+        # Coming back loads the trading page again (as every time its tab is chosen) and
+        # leaves the Run frame's page as it was; no timer is started
         back = snaps["back"]
-        assert back["loads"] == {"trading-frame": 4, "run-frame": 1, "backtest-frame": 1,
+        assert back["loads"] == {"trading-frame": 5, "run-frame": 1, "backtest-frame": 1,
                                  "data-frame": 1}
-        assert (back["timers"], back["replaced"]) == ([], emptied["replaced"])
+        assert (back["timers"], back["replaced"]) == ([], emptied["replaced"] + 1)
 
     def test_the_script_points_frames_only_at_its_own_addresses(self):
         script = live_dashboard._SCRIPT

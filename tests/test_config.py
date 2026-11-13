@@ -581,6 +581,17 @@ class TestDefaultsServerTradingPage:
         ignored = (pathlib.Path(config.PROJECT_ROOT) / ".gitignore").read_text(encoding="utf-8")
         assert f"/{config.BACKTEST_FILTER_NAMES_FILENAME}" in ignored.splitlines()
 
+    def test_the_longest_query_the_trading_tab_carries(self):
+        # The tighter of the server's two limits on GET /confirm?<query>: its
+        # own on the path (65,536 bytes less "/confirm?") and its HTTP
+        # layer's on the request line (65,536 bytes less the rest of the line)
+        assert config.TRADING_QUERY_MAX_BYTES == min(
+            config.DEFAULTS_SERVER_MAX_REQUEST_BYTES - len("/confirm?"),
+            config.DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES - len("GET /confirm? HTTP/1.1\r\n"))
+        assert config.TRADING_QUERY_MAX_BYTES == 65_512
+        # The old marker's scan limit went with the dashboard's Trade link
+        assert not hasattr(config, "DASHBOARD_MARKER_SCAN_BYTES")
+
     def test_the_spread_bands_are_the_backtest_s_grid(self):
         bands = config.DEFAULTS_SERVER_SPREAD_BANDS
         assert bands == tuple((lo, hi) for lo in config.SPREAD_BAND_SWEEP_FLOORS

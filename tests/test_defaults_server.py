@@ -2359,6 +2359,27 @@ class TestTradingBar:
         body = _get(_app(), "/confirm").body
         assert "<summary>2 excluded</summary>" in body and "<summary>1 excluded</summary>" in body
 
+    def test_the_names_file_the_backtest_page_writes_is_listed(self):
+        # The backtest page's own writer (dashboard._write_filter_names), over
+        # menus holding a category whose name the server would refuse (it
+        # holds the mark that ties a tag to its category) and that category's
+        # tag: the file leaves both out, and the trading page lists every
+        # other name, each tag as "Category · Tag", with no note
+        from kalshi_betting import dashboard
+        categories = ["Ice · Hockey", "Politics", "Sports"]
+        subcats = [("Ice · Hockey", "Pro"), ("Sports", "Basketball"), ("Sports", "Soccer")]
+        payload = {"categories": categories,
+                   "subcats": [[categories.index(c), tag] for c, tag in subcats],
+                   "sync_refused": dashboard._sync_refused(categories, subcats)}
+        dashboard._write_filter_names(config.PROJECT_ROOT / config.DASHBOARD_FILENAME, payload)
+        assert defaults_server._filter_names() == defaults_server._FilterNames(
+            ("Politics", "Sports"), ("Sports · Basketball", "Sports · Soccer"), None)
+        page = self._page(_FULL_BASE)
+        assert {"Politics", "Sports"} <= {b["value"] for b in page.bar_boxes("exclude_category")}
+        assert {"Sports · Basketball", "Sports · Soccer"} <= {
+            b["value"] for b in page.bar_boxes("exclude_tag")}
+        assert page.bar_notes == []
+
     def test_the_names_file_is_read_again_for_every_page(self):
         app = _app()
         _names_file(categories=("Economics",))

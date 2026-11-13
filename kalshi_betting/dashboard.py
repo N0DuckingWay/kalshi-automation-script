@@ -57,8 +57,8 @@ Purpose:
     such categories, together, _case_twins. What is left is what the live
     filter's rule, config.trade_filter_for, keeps when it excludes the
     categories ticked and each "Category · Tag" ticked, which is what the
-    Save button sends; what a view shows is those trades' contribution to
-    the run, not a run of their own),
+    bar tells the live dashboard's Trading tab; what a view shows is those
+    trades' contribution to the run, not a run of their own),
     and moves the k-hat breakdown and the performance section's k-hat cards
     to the same band, tier setting and selection (the breakdown's reference
     line to the same k), the interval-discount section to the same k and
@@ -195,52 +195,71 @@ Purpose:
     writing). The two choices change the
     trade sections and the header's trade count; the k-hat figures do not
     depend on them, and the Scenario Explorer and the Interval Discount
-    section never follow them. Save as live defaults… saves the level and
-    minimum shown for live runs to sell at ("no selling" turns it off). A page whose sweep has
-    no Sell family, or whose family does not fit the grid or cannot be
-    built, keeps the select disabled with a short note.
+    section never follow them. The Trading tab follows the level and
+    minimum shown, for live runs to sell at ("no selling" turns it off). A
+    page whose sweep has no Sell family, or whose family does not fit the
+    grid or cannot be built, keeps the select disabled with a short note.
 
-    The filter bar also carries a "Save as live defaults…" button. It opens
-    the defaults server's confirmation page (kalshi_betting.defaults_server,
-    started by ./start_dashboard.sh, on config.DEFAULTS_SERVER_HOST and
-    DEFAULTS_SERVER_PORT) in a new tab, for the bar's scenario on screen —
-    its spread band, Tier floors choice, k, size cap, Rebalance choice and
-    Min. price movement (only on a page that simulated rebalancing, sent as
-    the defaults server's rebalance and min_price_move, always together, so
-    a minimum is never sent with Rebalance no), "Rebalance until" choice
-    (only on a page that carries the choices, beside those two as
-    rebalance_min_days_to_maturity: the choice's days, or 0, no days limit,
-    at maturity and with Rebalance no), Sell level and Min. days to
-    maturity (only on a page that simulated selling) — never for the
-    Scenario Explorer's own selects. The address names each category
-    ticked in the Exclude categories menu as a category live runs exclude,
-    and so each kept category every one of whose tags is ticked in the
-    Exclude tags menu (with its letter-case twins, each ticked or with every
-    tag ticked too), and each other "Category · Tag" ticked as a tag live runs exclude
-    in that category (letter-case twins included, as the page ticks them),
-    so every other category and tag trades live, one the backtest never saw
-    included, and a save replaces the saved excluded categories and tags.
-    While the ticks keep none of the scenario's trades, would send a name
-    the defaults server refuses, or would name more categories or tags, or
-    make a longer address or posted form, than it takes, the button stays
-    disabled and its hover text says why; a grey note beside it says when
-    saving replaces saved
-    exclusions, naming them. That page compares the
-    proposal with the live defaults in force and acts only when one of its
-    buttons is pressed: Confirm and save saves it, Confirm and trade saves
-    it and then runs the live bot with it, and Dry run runs the bot with it
-    without placing orders; this page writes nothing. The button is
-    rendered disabled; the script enables it only while the scenario on
-    screen can become live settings (it was simulated, its band was
-    recorded, its k and size cap were recorded and are above zero, and the
-    ticks keep some of its trades and make a link the defaults server takes),
-    and keeps it disabled while another scenario's chunk loads. Beside it, a plain
-    "Trade using defaults…" link opens the server's trade page (the saved
-    defaults, with Dry run and Confirm and trade) in a new tab; it needs no
-    script. A page whose filter bar could not be built has no save button,
-    but keeps the trade link under the notice that replaces the bar. The
-    link's id, flt-trade, is how the defaults server tells this page from
-    one built before these buttons.
+    Shown in the live dashboard (live_dashboard.py's Backtest tab, a frame
+    of its tab page), the filter bar and the dashboard's Trading tab (the
+    defaults server's trading page, kalshi_betting.defaults_server, where
+    the live defaults are saved and live runs are started) always show the
+    same settings, wherever this page can show them. The two pages talk
+    through the browser's postMessage, by way of the tab page
+    (config.LIVE_DASHBOARD_ORIGINS, the only senders this page listens to
+    and the only receivers it tells). After each choice a reader makes on
+    the bar has been drawn (or shown as a scenario the run never
+    simulated), the page tells the tab page the bar's settings as the
+    trading page's query (kalshi-bar): its spread band, Tier floors choice,
+    k and size cap, its Rebalance choice and Min. price movement (only from
+    a page that simulated rebalancing, always together, so a minimum is
+    never sent with Rebalance no), its "Rebalance until" choice (only from
+    a page that carries the choices: the choice's days, or 0, no days
+    limit, at maturity and with Rebalance no), its Sell level and Min. days
+    to maturity (only from a page that simulated selling), each category
+    ticked in the Exclude categories menu as a category live runs exclude
+    (and so each kept category every one of whose tags is ticked, with its
+    letter-case twins, each ticked or with every tag ticked too), and each
+    other "Category · Tag" ticked as a tag live runs exclude in that
+    category (letter-case twins included) — never the Scenario Explorer's
+    own selects. Only the settings the reader chose since the Trading tab's
+    proposal was last shown go as the bar shows them; every other goes as
+    the Trading tab has it, so a choice changes there only what the reader
+    changed, and never a setting the bar cannot show (a value off its
+    grids, a setting of a view it lacks, a category or tag it does not
+    list, a sell level beside rebalancing). The tab page points the Trading
+    tab at that proposal; the trading page compares it with the live
+    defaults in force and acts only when one of its buttons is pressed
+    (Confirm and save saves it, Confirm and trade saves it and runs the
+    live bot with it, Dry run runs the bot with it without placing
+    orders); this page writes nothing there. A
+    choice the Trading tab cannot take is not sent, and a red note on the
+    bar (flt-sync-note) says why, in Python's words: ticks that keep none
+    of the scenario's trades, a name the defaults server would refuse,
+    every tag of a category ticked while a letter-case twin of it still
+    keeps a tag, more names or a longer query than the trading page's
+    address may carry, or a band, k or size cap the run did not record (or
+    a k or cap not above zero). The other way, the tab page tells this
+    page the Trading tab's proposal (kalshi-apply), and the bar shows it:
+    every setting the page can show is chosen and drawn as a reader's
+    choice would be, but not sent back, and the note names each setting
+    it cannot show (a value off its grids, a category or tag it does not
+    list, rebalancing or selling on a page without that view, or
+    rebalancing together with a sell level). A proposal that arrives while
+    a reader's choice is still loading is shown once that choice settles,
+    and one the page cannot draw (a chunk file that cannot be loaded) leaves
+    the bar on the scenario before it, which the note says. The page tells
+    the tab page once, when its bar is first ready (kalshi-ready), so the
+    tab page answers with the proposal and both open on the live defaults
+    in force.
+    Opened on its own, outside the dashboard, the page sends nothing and
+    listens to nothing. Grey notes beside the menus say what the Trading
+    tab will propose instead of the saved live defaults from the bar's
+    first view (turning saved rebalancing, its days limit or selling off,
+    or replacing the saved exclusions the menus list). Each build whose bar
+    was built also writes, beside the page, the names its two Exclude menus
+    list (config.BACKTEST_FILTER_NAMES_FILENAME), so the Trading tab's own
+    Exclude menus list the same ones.
 
 Dependencies:
     Imports PAGE_BACKTEST, terms_link_html and terms_section_html from
@@ -290,10 +309,18 @@ Dependencies:
     live_dashboard serves as its Backtest tab), DASHBOARD_FILES_DIRNAME
     and DASHBOARD_BUILD_STALE_SECONDS (the folder of chunk files beside it,
     and when a build folder still marked as being written is abandoned),
-    CONTRACT_PAYOUT_DOLLARS (named in the Sell select's title), DEFAULTS_SERVER_HOST
-    and DEFAULTS_SERVER_PORT (the address the filter bar's save button and
-    trade link open), LIVE_DEFAULTS_SOURCE_PATTERN (the note shapes that server
-    accepts, which the button's note is checked against),
+    CONTRACT_PAYOUT_DOLLARS (named in the Sell select's title),
+    LIVE_DASHBOARD_ORIGINS (the tab page's two addresses, the only ones the
+    bar talks to), TRADING_QUERY_MAX_BYTES (the longest query the Trading
+    tab carries), DEFAULTS_SERVER_MAX_FILTER_NAMES,
+    DEFAULTS_SERVER_MAX_REQUEST_BYTES, DEFAULTS_SERVER_CONFIRM_FORM_EXTRA_BYTES
+    and DASHBOARD_SAVE_HEADROOM_BYTES (the defaults server's other limits on
+    one proposal), BACKTEST_FILTER_NAMES_FILENAME,
+    BACKTEST_FILTER_NAMES_FORMAT and BACKTEST_FILTER_NAMES_MAX_BYTES (the
+    names file written beside the page, and the most the defaults server
+    reads of it),
+    LIVE_DEFAULTS_SOURCE_PATTERN (the note shapes that server accepts, which
+    the bar's source note is checked against),
     CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR,
     RISK_FREE_BILL_TERM and RISK_FREE_RATE_FIELD (named in the header),
     MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS
@@ -630,6 +657,9 @@ from .backtester import (
     _value_steps,
 )
 from .config import (
+    BACKTEST_FILTER_NAMES_FILENAME,
+    BACKTEST_FILTER_NAMES_FORMAT,
+    BACKTEST_FILTER_NAMES_MAX_BYTES,
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
     CALENDAR_DAYS_PER_YEAR,
     CONTRACT_PAYOUT_DOLLARS,
@@ -638,13 +668,11 @@ from .config import (
     DASHBOARD_FILES_DIRNAME,
     DASHBOARD_SAVE_HEADROOM_BYTES,
     DEFAULTS_SERVER_CONFIRM_FORM_EXTRA_BYTES,
-    DEFAULTS_SERVER_HOST,
     DEFAULTS_SERVER_MAX_FILTER_NAMES,
     DEFAULTS_SERVER_MAX_REQUEST_BYTES,
-    DEFAULTS_SERVER_PORT,
-    DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES,
     FLAT_RETURN_TOLERANCE,
     KHAT_CONFIDENCE_LEVEL,
+    LIVE_DASHBOARD_ORIGINS,
     LIVE_DEFAULTS_SOURCE_PATTERN,
     MAX_DEADLINE_GAP_DAYS,
     MIN_PRICE_DIFF_LONG_GAP,
@@ -656,6 +684,7 @@ from .config import (
     SHORT_DEADLINE_GAP_DAYS,
     TAG_SCOPE_SEPARATOR,
     TRADING_DAYS_PER_YEAR,
+    TRADING_QUERY_MAX_BYTES,
     describe_time_series_rule,
     fee_per_pair_approx,
     filter_name_refusal,
@@ -6962,8 +6991,8 @@ def _rebalance_select_title(days) -> str:
             never holds anything back here) and, when there is one, how a
             live run counts it before an add-on or a trim; the Min. price
             movement it can also wait for; that Sell is shut while it is yes;
-            what Save as live defaults saves; and the sections that always
-            show it as no.
+            what the live dashboard's Trading tab follows; and the sections
+            that always show it as no.
     """
     try:
         # No wait, a one-day wait, and whether the week between runs covers it
@@ -6993,11 +7022,11 @@ def _rebalance_select_title(days) -> str:
             f"it has grown past it, {wait} and, with a Min. price movement, once its price "
             f"has moved that far up or down.{weekly} Each added purchase and each part sold "
             f"counts as a trade of its own. {live}While yes, Sell is set to no selling (the "
-            "two are not simulated together). From a page that simulated rebalancing, Save "
-            "as live defaults saves this choice and the Min. price movement shown; from any "
-            "other page it keeps the saved ones. With yes, saving from a page that simulated "
-            "selling turns live selling off. The Scenario Explorer and Interval Discount "
-            "sections always show it as no.")
+            "two are not simulated together). From a page that simulated rebalancing, the "
+            "Trading tab follows this choice and the Min. price movement shown; from any "
+            "other page it keeps the saved ones. With yes, from a page that simulated "
+            "selling, it proposes no live selling. The Scenario Explorer and Interval "
+            "Discount sections always show it as no.")
 
 
 # Beside the select when the page keeps it shut, by the payload's
@@ -7037,8 +7066,8 @@ _MOVE_TITLE = (
     "purchase, an add-on or a trim. The total price is the side held on each market, "
     "added: for a time-series pair, YES on the earlier market plus NO on the later one "
     "(for a held market whose partner has paid out, its own price). 10c is 10% of a $1 "
-    "payout. any: no minimum. From a page that simulated rebalancing, Save as live "
-    "defaults saves the minimum shown (any, or Rebalance no, saves none); from any other "
+    "payout. any: no minimum. From a page that simulated rebalancing, the Trading tab "
+    "follows the minimum shown (any, or Rebalance no, proposes none); from any other "
     "page it keeps the saved one. A live run reads the price at the pair's last fill on "
     "Kalshi, so with a minimum set it neither trims nor adds to a pair whose last fill is "
     "older than Kalshi's list of the account's fills reaches.")
@@ -7104,9 +7133,9 @@ _UNTIL_TITLE = (
     "market matures within that many days: a held pair is topped up or sold down only while "
     "its later market (for a held market whose partner has paid out, its own market) closes "
     "at least that many days after the run, counted in whole days on Kalshi's UTC dates. "
-    "maturity: no days limit. From a page with these choices, Save as live defaults saves "
-    "the choice shown (maturity, or Rebalance no, saves no days limit); from any other page "
-    "it keeps the saved one unless the save turns rebalancing off.")
+    "maturity: no days limit. From a page with these choices, the Trading tab follows the "
+    "choice shown (maturity, or Rebalance no, proposes no days limit); from any other page "
+    "it keeps the saved one unless its proposal turns rebalancing off.")
 _UNTIL_NOTES = {
     "not simulated": "(not simulated in this backtest)",
     "unavailable": "(not available on this page; see the log)",
@@ -7177,38 +7206,40 @@ def _until_reach(move_view: bool, explorer: bool) -> str:
             f"them, and {sections} no rebalancing.")
 
 
-# Beside the save button on a page with the Rebalance view, when the saved
-# live defaults rebalance (live_rebalance is on): saving from the bar sends the
-# choice shown, and Rebalance no turns it off in the defaults
-_REBALANCE_SAVE_NOTE = ("The live defaults rebalance; saving with Rebalance no here turns "
-                        "that off.")
+# Beside the Exclude menus on a page with the Rebalance view, when the saved
+# live defaults rebalance (live_rebalance is on): the Trading tab follows the
+# choice shown, and Rebalance no proposes turning it off
+_REBALANCE_SYNC_NOTE = ("The live defaults rebalance; with Rebalance no here, the Trading "
+                        "tab proposes turning that off.")
 
 
-def _until_save_note(days: int) -> str:
+def _until_sync_note(days: int) -> str:
     """
-    The grey note beside the save button when the saved live defaults have a "Rebalance until" days limit.
+    The grey note beside the Exclude menus when the saved live defaults have a "Rebalance until" days limit.
 
     Shown only on a page with the "Rebalance until" choices
-    (_filter_bar_html), whose save sends the choice shown: "maturity", the
-    select's first option, sends no days limit and so turns the saved one
-    off.
+    (_filter_bar_html), whose bar the Trading tab follows: "maturity", the
+    select's first option, proposes no days limit and so turning the saved
+    one off.
 
     Args:
         days (int): The saved limit (BacktestSweep.live_rebalance_min_days_to_maturity,
-            as _save_target's "live_rebalance_until" carries it), 1 or more.
+            as _sync_target's "live_rebalance_until" carries it), 1 or more.
 
     Returns:
         str: e.g. 'The live defaults rebalance until 7 days before maturity;
-            saving with Rebalance until "maturity" here turns that limit off.'
+            with Rebalance until "maturity" here, the Trading tab proposes
+            turning that limit off.'
     """
     # "7 days before maturity": the live "Live settings:" line's words
     # (_until_option's, and the word it leaves to the select's first option)
-    return (f"The live defaults rebalance until {_until_option(days)} maturity; saving with "
-            f'Rebalance until "{_UNTIL_OPTION_MATURITY}" here turns that limit off.')
+    return (f"The live defaults rebalance until {_until_option(days)} maturity; with "
+            f'Rebalance until "{_UNTIL_OPTION_MATURITY}" here, the Trading tab proposes '
+            "turning that limit off.")
 
-# Beside the save button on a page with the Sell view whose saved live defaults sell
-_SELL_SAVE_NOTE = ('The live defaults sell; saving with Sell set to "no selling" turns live '
-                   "selling off.")
+# Beside the Exclude menus on a page with the Sell view whose saved live defaults sell
+_SELL_SYNC_NOTE = ('The live defaults sell; with Sell set to "no selling" here, the Trading '
+                   "tab proposes turning live selling off.")
 
 # The filter bar's "Sell" choice: the runs as simulated ("no selling"), or the
 # same scenario with each position sold whole once it has held a share of its
@@ -7229,7 +7260,8 @@ def _sell_select_title(hold_days: int) -> str:
 
     Returns:
         str: The rule in plain words; with more than one day, how the days
-            are checked, and what saving a level as the live defaults does.
+            are checked, and what a level the Trading tab follows does once
+            saved as the live defaults.
     """
     if hold_days == 1:
         rule = ("reaches that share of its potential profit (its contract pairs at "
@@ -7250,9 +7282,9 @@ def _sell_select_title(hold_days: int) -> str:
             "only while at least the days the Min. days to maturity select names remain "
             "before its last market stops trading. A position sold at a checkpoint is not "
             "bought again there. Sell is shut (no selling) while Rebalance is yes: the two "
-            "are not simulated together. Save as live "
-            "defaults… saves the level and minimum shown: a live run then sells at them, "
-            "on real order books, once a "
+            "are not simulated together. The Trading tab follows the "
+            "level and minimum shown: saved there, a live run then sells at them, on real "
+            "order books, once a "
             f"position {live_rule}. The Scenario Explorer and Interval Discount sections "
             "always show no selling.")
 
@@ -7273,8 +7305,9 @@ _SELL_DAYS_TITLE = (
 # Added to the summary line while a sell level is chosen
 _SELL_SUMMARY_NOTE = (" A sale ends its trade on the sale day: its profit is what the sale "
                       "returned, after the sale's fees, less what it cost, and its slippage "
-                      "is how far that falls short of its profit had it won. Save as live "
-                      "defaults… saves this level and minimum, so a live run sells at them.")
+                      "is how far that falls short of its profit had it won. The Trading tab "
+                      "follows this level and minimum: saved there, a live run sells at "
+                      "them.")
 # Closes the summary line's reach sentence on a page that has the Sell view
 # (the Sell and Min. days to maturity selects reach the same sections); the
 # second is for a page with no Scenario Explorer grid
@@ -7565,51 +7598,22 @@ _FILTER_UNAVAILABLE_HTML = (
     "The page-wide filter could not be built for this run (the log names the error); "
     "every section shows the primary spread band's full run.</p>")
 
-# The filter bar's save button: its label, its hover text and the grey note
-# beside it. The button opens the defaults server's confirmation page for the
-# scenario the bar shows; the page script only enables it, disables it and
-# opens that page, so every word about it is here.
-_SAVE_LABEL = "Save as live defaults…"
-_SAVE_TITLE = ("Open a confirmation page, in a new tab, that compares the filter bar's "
-               "scenario on screen — its spread band, tier floors, k, size cap, its "
-               "Rebalance choice and Min. price movement (when this page simulated "
-               "rebalancing) and its Sell level and Min. days to maturity (when this page "
-               "simulated selling); not the Scenario Explorer's own selects — with the "
-               "live trading defaults. It names the categories ticked in the Exclude "
-               "categories menu, and each category every one of whose tags is ticked in "
-               "the Exclude tags menu, as the categories live runs exclude, and each other "
-               "Category · Tag ticked there as a tag live runs exclude in that category "
-               "(every other category and tag trades, one this backtest never saw "
-               "included), so saving it replaces the excluded categories and tags saved "
-               "before. "
-               "Nothing is saved until you press a button there: Confirm and save saves "
-               "it; Confirm and trade saves it and then runs the live bot with it, placing "
-               "real orders; Dry run runs the live bot with it without placing orders and "
-               "saves nothing. It stays unavailable while the categories and tags kept "
-               "hold no trade of the scenario shown (every category excluded, say), while "
-               "more categories or tags are ticked than one link may name or they make an "
-               "address longer than the defaults server reads, while a name ticked is one "
-               "the defaults server would refuse, while a scenario loads, and for a "
-               "scenario the run never "
-               "simulated, whose band, k or size cap the run did not record, or whose k or "
-               "size cap is not above zero.")
-_SAVE_NOTE = "(needs ./start_dashboard.sh running)"
-
-
-def _filter_save_note(exclusions: tuple[str, ...] | list[str] | None,
+def _filter_sync_note(exclusions: tuple[str, ...] | list[str] | None,
                       tag_exclusions: tuple[str, ...] | list[str] | None) -> str | None:
     """
-    The grey note beside the save button when a save replaces a saved filter.
+    The grey note beside the Exclude menus when the Trading tab's proposal replaces a saved filter.
 
-    The button sends the categories and the tags excluded on this page, which
-    replace the saved excluded categories and tags (none excluded here clears
-    them).
+    Once the reader ticks or unticks a box, the bar tells the Trading tab
+    the categories and the tags excluded here, which replace the saved
+    excluded categories and tags in its proposal (none excluded here
+    proposes none), but for any the menus do not list, which the Trading
+    tab keeps excluding.
 
     Args:
         exclusions (tuple[str, ...] | list[str] | None): The categories the
-            saved live defaults exclude (save["live_exclusions"]), or None.
+            saved live defaults exclude (sync["live_exclusions"]), or None.
         tag_exclusions (tuple[str, ...] | list[str] | None): The tags they
-            exclude (save["live_tag_exclusions"]), or None.
+            exclude (sync["live_tag_exclusions"]), or None.
 
     Returns:
         str | None: The note, or None when the saved defaults exclude no
@@ -7622,62 +7626,110 @@ def _filter_save_note(exclusions: tuple[str, ...] | list[str] | None,
         named.append(f"categories ({', '.join(exclusions)})")
     if tag_exclusions:
         named.append(f"tags ({', '.join(tag_exclusions)})")
-    return ("Saving from this page saves the categories and tags excluded here, which "
-            f"replace the saved excluded {' and '.join(named)}.")
+    return ("A box ticked or unticked here makes the Trading tab propose the categories "
+            f"and tags excluded here in place of the saved excluded {' and '.join(named)}; "
+            "one this page does not list stays excluded.")
 
 
-# The save button's hover text while it cannot save because of the menus (the
-# script shows it in place of _SAVE_TITLE and puts _SAVE_TITLE back once the
-# reason is gone): ticks that keep none of the scenario's trades (every
-# category, say), which shows no trade; or a name the defaults server would
-# refuse as a live exclusion (_save_refused); or every tag of a category
-# ticked while a category whose name differs from it only in letter case
-# still keeps a tag, which the page shows left out but a live filter, reading
-# the two as one category, cannot leave out whole (saveLists' split). The
-# fourth reason, more names or a longer address than the server takes in one
-# link, is worded from the page's own limits (_save_too_long_text)
-_SAVE_BLOCKED_TEXT = {
-    "save_all_excluded": ("Cannot save while the categories and tags kept hold no trade "
-                          "of this scenario: this view shows no trade, and live runs would "
+# Why the live dashboard's Trading tab is not following the bar's choice: the
+# red note (flt-sync-note) the script shows in place of telling the Trading
+# tab, until the reader's next choice. The bar's band, k or size cap was not
+# recorded by the run, or its k or cap is not above zero (no live settings
+# have one); the ticks keep none of the scenario's trades (every category,
+# say); a name the defaults server would refuse as a live exclusion
+# (_sync_refused); or every tag of a category ticked while a category whose
+# name differs from it only in letter case still keeps a tag, which the page
+# shows left out but a live filter, reading the two as one category, cannot
+# leave out whole (syncLists' split). The fifth reason, more names or a longer
+# query than the Trading tab carries, is worded from the page's own limits
+# (_sync_too_long_text)
+_SYNC_BLOCKED_TEXT = {
+    "sync_unrecorded": ("The Trading tab is not following this bar: the run did not record "
+                        "this scenario's spread band, k or size cap, or its k or size cap "
+                        "is not above zero, so it is not a live setting."),
+    "sync_all_excluded": ("The Trading tab is not following this bar: the categories and "
+                          "tags kept hold no trade of this scenario, so live runs would "
                           "trade only categories and tags this backtest gave no trade to. "
-                          "Untick at least one category or tag with trades to save."),
-    "save_refused": ("Cannot save these ticks: the defaults server would refuse a category "
-                     f"or tag ticked here as a live exclusion (a name reading any or none, a "
-                     f"category whose name holds “{TAG_SCOPE_SEPARATOR.strip()}”, which a "
-                     "live filter reads as a category and a tag, or a name it cannot show as "
-                     "typed). Untick it to save."),
-    "save_twin_split": ("Cannot save these ticks: every tag of a category is ticked while a "
-                        "category whose name differs from it only in letter case still "
-                        "keeps a tag. Live runs read the two names as one category, so they "
-                        "cannot leave out the first without the second, and a tag of it "
-                        "this backtest never saw would trade. Tick it in the "
-                        f"{_MENU_CAT_LABEL} menu, which leaves out both, or untick one of its "
-                        "tags, to save."),
+                          "Untick at least one category or tag with trades."),
+    "sync_refused": ("The Trading tab is not following this bar: the defaults server would "
+                     "refuse a category or tag ticked here as a live exclusion (a name "
+                     "reading any or none, a category whose name holds "
+                     f"“{TAG_SCOPE_SEPARATOR.strip()}”, which a live filter reads as a "
+                     "category and a tag, or a name it cannot show as typed). Untick it."),
+    "sync_twin_split": ("The Trading tab is not following this bar: every tag of a category "
+                        "is ticked while a category whose name differs from it only in "
+                        "letter case still keeps a tag. Live runs read the two names as one "
+                        "category, so they cannot leave out the first without the second, "
+                        "and a tag of it this backtest never saw would trade. Tick it in the "
+                        f"{_MENU_CAT_LABEL} menu, which leaves out both, or untick one of "
+                        "its tags."),
+}
+
+# The red note after the Trading tab's proposal is shown on the bar, naming
+# each of its settings this page cannot show ("sync_not_here", its {items}
+# joined by "sync_join"): one item per setting, worded by why — a value off
+# the page's choices ("sync_off_grid"), a choice this page has no view of
+# ("sync_no_view": the tier floors off, rebalancing or its minimum or days
+# limit, or selling, where the run simulated none), a category or tag its
+# menus do not list ("sync_unlisted"), or a sell level beside rebalancing,
+# which the bar never shows together ("sync_not_with"). {field} is the
+# setting's name on the bar ("sync_fields") and {value} its value as the
+# Trading tab's query spells it (dollars for a minimum price movement, a
+# share for a sell level, days for "Rebalance until" and Min. days to
+# maturity). A choice on the bar changes on the Trading tab only the
+# settings the reader chose, so it keeps these. "sync_unshown" goes first
+# when the proposal could not be drawn (a chunk file that cannot be
+# loaded): the bar still shows the scenario before it, and the reader's
+# next choice proposes the settings the bar shows
+_SYNC_APPLY_TEXT = {
+    "sync_not_here": ("The bar cannot show all of the Trading tab's proposal: {items}. A "
+                      "choice on the bar changes only the settings chosen, so the Trading "
+                      "tab keeps these."),
+    "sync_unshown": ("The bar could not show the Trading tab's proposal, so it still shows "
+                     "the scenario before it; a choice on the bar proposes the settings the "
+                     "bar shows."),
+    "sync_join": "; ",
+    "sync_off_grid": "{field} {value} (not among this page's choices)",
+    "sync_no_view": "{field} {value} (not shown on this page)",
+    "sync_unlisted": "{field}: {value} (not listed on this page)",
+    "sync_not_with": "{field} {value} (not shown together with Rebalance yes)",
+    "sync_fields": {"band": "Spread band", "tier": "Tier floors", "k": "k",
+                    "cap": "Size cap", "rebalance": "Rebalance",
+                    "move": "Min. price movement (dollars)",
+                    "until": "Rebalance until (days before maturity)",
+                    "sell": "Sell (share of the potential profit)",
+                    "days": "Min. days to maturity", "category": _MENU_CAT_LABEL,
+                    "tag": _MENU_TAG_LABEL},
+    "sync_band_value": "{low}-{high}",
+    "sync_on": _REBALANCE_OPTION_YES,
+    "sync_off": "off",
+    "sync_any": "any",
 }
 
 
-def _save_limits() -> dict:
+def _sync_limits() -> dict:
     """
-    The defaults server's limits on one confirmation link, as the save button reads them.
+    The defaults server's limits on one proposal, as the bar's script reads them.
 
     Returns:
         dict: "max_names" (config.DEFAULTS_SERVER_MAX_FILTER_NAMES: the most
-            excluded categories, and the most excluded tags, one link may
-            name), "max_query_bytes" (_save_max_query_bytes: the longest
-            query the address may carry) and "max_form_bytes"
-            (_save_max_form_bytes: the longest those fields may come to as
-            the confirmation page posts them back).
+            excluded categories, and the most excluded tags, one proposal
+            may name), "max_query_bytes" (config.TRADING_QUERY_MAX_BYTES:
+            the longest query the Trading tab carries, counted as the live
+            dashboard's tab page counts it) and "max_form_bytes"
+            (_sync_max_form_bytes: the longest those fields may come to as
+            the trading page posts them back).
     """
     return {"max_names": DEFAULTS_SERVER_MAX_FILTER_NAMES,
-            "max_query_bytes": _save_max_query_bytes(),
-            "max_form_bytes": _save_max_form_bytes()}
+            "max_query_bytes": TRADING_QUERY_MAX_BYTES,
+            "max_form_bytes": _sync_max_form_bytes()}
 
 
-def _save_too_long_text(limits: dict) -> str:
+def _sync_too_long_text(limits: dict) -> str:
     """
-    The save button's hover text while its ticks name more than one link takes.
+    The red note while the bar's ticks name more than one proposal takes.
 
-    Worded from the limits the page ships (_save_limits, in the save
+    Worded from the limits the page ships (_sync_limits, in the sync
     target), so the text states exactly what the script tests.
 
     Args:
@@ -7686,63 +7738,46 @@ def _save_too_long_text(limits: dict) -> str:
     Returns:
         str: The text.
     """
-    return ("Cannot save these ticks: the defaults server takes at most "
+    return ("The Trading tab is not following this bar: the defaults server takes at most "
             f"{limits['max_names']} excluded categories and {limits['max_names']} excluded "
-            "tags in one link, letter-case twins counted, and this page sends an address "
-            f"of at most {limits['max_query_bytes']:,} bytes after “/confirm?”, and at most "
-            f"{limits['max_form_bytes']:,} as the confirmation page posts it back (where "
-            "each ! ' ( ) ~ takes three bytes and a space one). Untick some boxes to save.")
+            "tags in one proposal, letter-case twins counted, and the Trading tab carries a "
+            f"query of at most {limits['max_query_bytes']:,} bytes after “/confirm?” (each ' "
+            f"taking three bytes), and at most {limits['max_form_bytes']:,} as the trading "
+            "page posts it back (where each ! ' ( ) ~ takes three bytes and a space one). "
+            "Untick some boxes.")
 
 
-def _save_max_query_bytes() -> int:
+def _sync_max_form_bytes() -> int:
     """
-    The longest query the save address may carry, after "/confirm?".
+    The longest the proposal's fields may come to as the trading page posts them back.
 
-    The defaults server reads a request of at most
-    config.DEFAULTS_SERVER_MAX_REQUEST_BYTES (its path plus its body), and its
-    HTTP layer a request line of at most
-    config.DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES; the address is opened with
-    a GET, so it must fit both, less config.DASHBOARD_SAVE_HEADROOM_BYTES.
-
-    Returns:
-        int: The most bytes of query (ASCII, as encodeURIComponent writes it).
-    """
-    path = "/confirm?"
-    return min(DEFAULTS_SERVER_MAX_REQUEST_BYTES - len(path),
-               DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES - len(f"GET {path} HTTP/1.1\r\n")
-               ) - DASHBOARD_SAVE_HEADROOM_BYTES
-
-
-def _save_max_form_bytes() -> int:
-    """
-    The longest the address's fields may come to as the confirmation page posts them back.
-
-    The confirmation page's form repeats the address's fields and adds its
-    own (config.DEFAULTS_SERVER_CONFIRM_FORM_EXTRA_BYTES), and is posted to
+    The trading page's form repeats the proposal's fields and adds its own
+    (config.DEFAULTS_SERVER_CONFIRM_FORM_EXTRA_BYTES), and is posted to
     "/confirm", whose path and body together the defaults server reads up to
     config.DEFAULTS_SERVER_MAX_REQUEST_BYTES. A browser encodes a posted form
     a little differently from encodeURIComponent (each ! ' ( ) ~ as three
     bytes, a space as "+"), which the script counts (formLength).
 
     Returns:
-        int: The most bytes the address's fields may take in the posted form,
-            less config.DASHBOARD_SAVE_HEADROOM_BYTES.
+        int: The most bytes the proposal's fields may take in the posted
+            form, less config.DASHBOARD_SAVE_HEADROOM_BYTES.
     """
     return (DEFAULTS_SERVER_MAX_REQUEST_BYTES - len("/confirm")
             - DEFAULTS_SERVER_CONFIRM_FORM_EXTRA_BYTES - DASHBOARD_SAVE_HEADROOM_BYTES)
 
 
-def _save_refused(categories: list[str], subcats: list[tuple[str, str]]) -> dict:
+def _sync_refused(categories: list[str], subcats: list[tuple[str, str]]) -> dict:
     """
-    The categories and tags the save button may not send: the server would refuse them.
+    The categories and tags the bar may not propose: the server would refuse them.
 
-    Each category is asked of config.filter_name_refusal as the button would
+    Each category is asked of config.filter_name_refusal as the bar would
     send it (exclude_category), and each tag as "Category · Tag"
     (exclude_tag); a tag is refused too when the live filter would not read
     it back as that category and tag (config.split_tag splits at the first
     separator, so a category whose name holds one is misread). The script
-    keeps the button disabled while it would send one of them, with
-    _SAVE_BLOCKED_TEXT["save_refused"].
+    tells the Trading tab nothing while it would send one of them, and says
+    so with _SYNC_BLOCKED_TEXT["sync_refused"]; the names file written beside
+    the page leaves them out (_filter_names_record).
 
     Args:
         categories (list[str]): The menus' categories, in the bar's order.
@@ -7766,76 +7801,21 @@ def _save_refused(categories: list[str], subcats: list[tuple[str, str]]) -> dict
                      if tag_refused(category, tag)]}
 
 
-# The bar's "Trade using defaults…" link: its label and its hover text. It
-# opens the defaults server's trade page, which shows the saved live defaults
-# and runs the live bot with them only when a button there is pressed.
-_TRADE_LABEL = "Trade using defaults…"
-_TRADE_TITLE = ("Open a page, in a new tab, that shows the saved live defaults and runs "
-                "the live bot with them when you confirm there (real orders, or a dry run).")
-# A plain link drawn to look like the bar's button, so it reads as a control;
-# being a link, it works whatever state the page script is in
-_BUTTON_LINK_STYLE = ("display:inline-block; padding:1px 6px; border:1px solid #767676; "
-                      "border-radius:3px; background:#EFEFEF; color:#000000; "
-                      "text-decoration:none; font-size:13px;")
-
-
-def _trade_url() -> str:
+def _sync_target(sweep: BacktestSweep | None, start_date: date, today: date) -> dict:
     """
-    The defaults server's trade page, on config.DEFAULTS_SERVER_HOST and DEFAULTS_SERVER_PORT.
+    What the filter bar tells the Trading tab besides the scenario on screen.
 
-    Returns:
-        str: The page's address.
-    """
-    return f"http://{DEFAULTS_SERVER_HOST}:{DEFAULTS_SERVER_PORT}/trade"
-
-
-def _trade_link_html() -> str:
-    """
-    The "Trade using defaults…" link, opening the defaults server's trade page in a new tab.
-
-    The link's id, flt-trade, is also how the defaults server tells a
-    dashboard that has these buttons from one built before them, so it must
-    stay in the page's opening part (the filter bar, or the notice that
-    replaces it).
-
-    Returns:
-        str: The link's HTML, every attribute escaped.
-    """
-    return (f'<a id="flt-trade" href="{html.escape(_trade_url())}" target="_blank" '
-            f'rel="noopener" title="{html.escape(_TRADE_TITLE)}" '
-            f'style="{_BUTTON_LINK_STYLE}">{html.escape(_TRADE_LABEL)}</a>')
-
-
-def _trade_paragraph_html() -> str:
-    """
-    The trade link on its own line, for a page whose filter bar could not be built.
-
-    The save button needs the bar's data, so it is lost with the bar; the
-    trade link needs nothing from the page, so it stays, with the note that
-    the defaults server must be running.
-
-    Returns:
-        str: A paragraph holding the link and its note.
-    """
-    return ('<p id="live-trade" style="font-family:sans-serif; font-size:14px;">'
-            f'{_trade_link_html()}<span style="color:#9E9E9E; font-size:13px;">'
-            f'&nbsp;{html.escape(_SAVE_NOTE)}</span></p>')
-
-
-def _save_target(sweep: BacktestSweep | None, start_date: date, today: date) -> dict:
-    """
-    What the filter bar's save button sends besides the scenario on screen.
-
-    The button opens the defaults server's confirmation page with the bar's
-    scenario in the address (its spread band, Tier floors choice, k, size
-    cap, Rebalance choice, Min. price movement, Sell level and Min. days to
-    maturity, each category ticked in the Exclude categories menu as a
-    category live runs must not trade, and each tag ticked in the Exclude
-    tags menu as a tag they must not trade); this is the rest of that
-    address, fixed when the page is built. The server accepts no source note but one
-    of the shapes config.LIVE_DEFAULTS_SOURCE_PATTERN allows, so the note is
-    checked against that pattern here, as the server checks it (whole, ASCII
-    digits only), and left out should it ever not match.
+    The bar tells the live dashboard's tab page its settings as the trading
+    page's query (its spread band, Tier floors choice, k, size cap,
+    Rebalance choice, Min. price movement, "Rebalance until" choice, Sell
+    level and Min. days to maturity, each category ticked in the Exclude
+    categories menu as a category live runs must not trade, and each tag
+    ticked in the Exclude tags menu as a tag they must not trade); this is
+    the rest, fixed when the page is built. The defaults server accepts no
+    source note but one of the shapes config.LIVE_DEFAULTS_SOURCE_PATTERN
+    allows, so the note is checked against that pattern here, as the server
+    checks it (whole, ASCII digits only), and left out should it ever not
+    match.
 
     Args:
         sweep (BacktestSweep | None): The run's sweep, read for its
@@ -7848,30 +7828,31 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date) -> 
         today (date): The Period line's last day (UTC).
 
     Returns:
-        dict: "url" (the confirmation page's address, on
-            config.DEFAULTS_SERVER_HOST and DEFAULTS_SERVER_PORT);
+        dict: "dashboard_origins" (config.LIVE_DASHBOARD_ORIGINS, as a list:
+            the tab page's two addresses, the only senders the bar listens
+            to and the only receivers it tells);
             "source" (the note the saved file keeps: "backtest dashboard for
             <start> to <today>", plus a note when the run's same-event ladder
             setting differed from config.py's, so its pairs are not the live
             bot's; None if it would not match the pattern);
             "live_rebalances" (whether the saved live defaults rebalance, as
-            the run recorded them: the note beside the save button on a page
-            with the Rebalance view shows only then, since saving with
-            Rebalance no turns it off);
+            the run recorded them: the note beside the Exclude menus on a
+            page with the Rebalance view shows only then, since Rebalance no
+            proposes turning it off);
             "live_rebalance_until" (their "Rebalance until" days limit, as the
             run recorded it, when they rebalance; None for no limit, for
             saved defaults that do not rebalance and for a run that recorded
-            neither: the note beside the save button on a page with the
-            "Rebalance until" choices shows only with a limit, since saving
-            "maturity" turns it off);
-            "live_sells" (whether they sell: the Sell view's save note shows only then);
+            neither: the note on a page with the "Rebalance until" choices
+            shows only with a limit, since "maturity" proposes turning it
+            off);
+            "live_sells" (whether they sell: the Sell view's note shows only then);
             "live_exclusions" (the categories they exclude, as a list, or None)
             and "live_tag_exclusions" (the tags they exclude, likewise): the
-            note that saving replaces them names them;
-            and the defaults server's limits on one link (_save_limits:
+            note that the Trading tab's proposal replaces them names them;
+            and the defaults server's limits on one proposal (_sync_limits:
             "max_names", "max_query_bytes" and "max_form_bytes"), past
-            which the script keeps the button disabled with the
-            save_too_long text (_save_too_long_text, worded from them).
+            which the script tells the Trading tab nothing and shows the
+            sync_too_long text (_sync_too_long_text, worded from them).
     """
 
     def day(value: date) -> str:
@@ -7898,7 +7879,7 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date) -> 
         source = None
     rebalances = getattr(sweep, "live_rebalance", None) is True
     return {
-        "url": f"http://{DEFAULTS_SERVER_HOST}:{DEFAULTS_SERVER_PORT}/confirm",
+        "dashboard_origins": list(LIVE_DASHBOARD_ORIGINS),
         "source": source,
         "live_rebalances": rebalances,
         # A days limit counts only with rebalancing on, as the live settings hold it
@@ -7907,7 +7888,7 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date) -> 
         "live_sells": getattr(sweep, "live_sell_at", None) is not None,
         "live_exclusions": _recorded_names(getattr(sweep, "live_exclude_categories", None)),
         "live_tag_exclusions": _recorded_names(getattr(sweep, "live_exclude_tags", None)),
-        **_save_limits(),
+        **_sync_limits(),
     }
 
 
@@ -12099,6 +12080,89 @@ def _publish_page(tmp_path: Path, out_path: Path, folder: Path | None) -> None:
             lock.__exit__(None, None, None)
 
 
+def _filter_names_record(payload: dict) -> dict:
+    """
+    The names file's record for a page's filter bar: the names its two Exclude menus list.
+
+    Every category the Exclude categories menu lists, and every tag the
+    Exclude tags menu lists, written "Category · Tag" as the bar's script
+    proposes it (subName with its category), in the bar's order. A name the
+    defaults server would refuse, or misread, as a live exclusion
+    (payload["sync_refused"], _sync_refused) is left out: the bar never
+    proposes one, and the server's reader refuses a whole file holding one.
+    Letter-case twins are all written; the server keeps the first of each.
+
+    Args:
+        payload (dict): _filter_payload's base block.
+
+    Returns:
+        dict: {"format": config.BACKTEST_FILTER_NAMES_FORMAT, "categories":
+            [...], "tags": [...]}.
+    """
+    refused = payload.get("sync_refused") or {"categories": [], "tags": []}
+    categories = payload["categories"]
+    return {
+        "format": BACKTEST_FILTER_NAMES_FORMAT,
+        "categories": [name for i, name in enumerate(categories)
+                       if i not in refused["categories"]],
+        "tags": [f"{categories[ci]}{TAG_SCOPE_SEPARATOR}{tag}"
+                 for i, (ci, tag) in enumerate(payload["subcats"])
+                 if i not in refused["tags"]],
+    }
+
+
+def _write_filter_names(out_path: Path, payload: dict | None) -> None:
+    """
+    Write, beside the published page, the names its filter bar's Exclude menus list; never raises.
+
+    The live-defaults server reads this file (config.BACKTEST_FILTER_NAMES_FILENAME
+    in the page's folder, PROJECT_ROOT) so the Trading tab's own Exclude
+    menus list the same categories and tags as this page's bar
+    (_filter_names_record). It is written to a temporary file beside it and
+    renamed over the old one, so a reader never meets half a file. A page
+    whose bar could not be built (payload None) lists no names, so the file
+    of an earlier page is removed rather than left to describe a page no
+    longer there; so is one whose record would be longer than the server
+    reads (config.BACKTEST_FILTER_NAMES_MAX_BYTES), with a WARNING. A file
+    that cannot be written costs only the Trading tab's menu lists, with a
+    WARNING: the page itself is already published. The earlier page's file
+    is then removed too where it can be, so the Trading tab's menus list
+    only the names it excludes and say to rebuild the dashboard, rather
+    than list another page's names.
+
+    Args:
+        out_path (Path): The published page; the file is written in its folder.
+        payload (dict | None): _filter_payload's base block, or None for a
+            page whose bar could not be built.
+    """
+    path = out_path.parent / BACKTEST_FILTER_NAMES_FILENAME
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        text = (None if payload is None else
+                json.dumps(_filter_names_record(payload), ensure_ascii=False,
+                           allow_nan=False))
+        if text is not None and len(text.encode("utf-8")) > BACKTEST_FILTER_NAMES_MAX_BYTES:
+            logging.warning("The filter bar's names come to more than %d bytes, more than the "
+                            "defaults server reads: %s is not written, so the Trading tab's "
+                            "Exclude menus list only the names it excludes",
+                            BACKTEST_FILTER_NAMES_MAX_BYTES, path.name)
+            text = None
+        if text is None:
+            path.unlink(missing_ok=True)
+            return
+        tmp.write_text(text, encoding="utf-8", newline="")
+        os.replace(tmp, path)
+    except (OSError, ValueError, TypeError):
+        logging.warning("Could not write %s beside the dashboard; the Trading tab's Exclude "
+                        "menus list only the names it excludes", path.name, exc_info=True)
+        # The earlier page's names must not stand in for this page's
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+
+
 def _unmark_build(folder: Path | None) -> None:
     """
     Remove a published build's mark (_BUILD_WRITING), never raising.
@@ -12985,7 +13049,7 @@ def _filter_payload(
     explorer: bool = False,
     explorer_caps: bool = True,
     explorer_tiers: bool = True,
-    save: dict | None = None,
+    sync: dict | None = None,
     rebalance_state: str = "not simulated",
     sell: _SellGrid | None = None,
     sell_state: str = "not simulated",
@@ -13047,12 +13111,13 @@ def _filter_payload(
         explorer_tiers (bool): Keyword-only. Whether the explorer follows the
             bar's Tier floors choice; False says it does not (_bar_reach).
             True (default).
-        save (dict | None): Keyword-only. What the bar's save button sends
-            besides the scenario on screen (_save_target): the confirmation
-            page's address, the source note and whether the saved defaults
-            rebalance, whether they sell and whether they filter by category
-            or tag. None (default) ships null, and the script then keeps the
-            button disabled.
+        sync (dict | None): Keyword-only. What the bar tells the live
+            dashboard's Trading tab besides the scenario on screen
+            (_sync_target): the tab page's addresses, the source note, the
+            defaults server's limits on one proposal and whether the saved
+            defaults rebalance, whether they sell and whether they filter by
+            category or tag. None (default) ships null, and the script then
+            tells the Trading tab nothing and listens to nothing.
         rebalance_state (str): Keyword-only. Why the page has no Rebalance
             view when it has none: "not simulated" (the run carried no such
             family: the note reads "(not simulated in this backtest)") or
@@ -13119,7 +13184,10 @@ def _filter_payload(
             _MOVE_REACH in its place when the page also shows the minimum
             price movements, or _until_reach's when it also shows the
             "Rebalance until" choices, then _SELL_REACH (each one's
-            _NO_EXPLORER twin without the explorer) — _KHAT_TEXT and
+            _NO_EXPLORER twin without the explorer) — _SYNC_BLOCKED_TEXT and
+            _SYNC_APPLY_TEXT, the notes on what the Trading tab cannot
+            follow or the bar cannot show, with "sync_too_long" worded from
+            the sync target's limits (_sync_too_long_text) — _KHAT_TEXT and
             _CALIBRATION_TEXT), "styles" (the trade-type
             lines' and the k-hat bars' drawing, the k-hat chart's height
             formula and reference line, the KPI cards' default colour and a
@@ -13129,8 +13197,9 @@ def _filter_payload(
             tier-off calibration, every other band's own), "khat_blank" (the
             table cells of a group with no k-hat), "khat_t" (_khat_t_table:
             the Student-t quantile of the k-hat interval by degrees of
-            freedom), "kd" and "save" (both
-            above), the Rebalance view's: "grid_rebalance" (null, or
+            freedom), "kd" and "sync" (both above), "sync_refused"
+            (_sync_refused: the categories and tags the bar never proposes),
+            the Rebalance view's: "grid_rebalance" (null, or
             [band][k][cap] -> chunk id or null: the scenario with held pairs
             topped up to and sold down to their Kelly size,
             chunks.rebalance_grid()), "grid_rebalance_off" (the same with the
@@ -13219,7 +13288,8 @@ def _filter_payload(
         "bands": [{"label": _band_option(band),
                    "option": _band_option(band) + (" (primary)" if i == pb else ""),
                    "where": _band_where(_band_option(band), i == pb, band is not None),
-                   # The band itself, for the save button's spread_min and spread_max
+                   # The band itself: the spread_min and spread_max the bar tells
+                   # the Trading tab, and the values a proposal is matched on
                    "value": None if band is None else [band[0], band[1]]}
                   for i, band in enumerate(source.bands)],
         # Each band as the Tier floors choice "off" names it: with the tiers
@@ -13254,8 +13324,9 @@ def _filter_payload(
         # when that section's data was built (kd), and the scenario explorer's
         # selects only when the page carries its grid (explorer) — its cap
         # select only when its cap axis is this grid's (explorer_caps)
-        "text": {**_SUMMARY_TEMPLATES, **_SAVE_BLOCKED_TEXT,
-                 "save_too_long": _save_too_long_text(save or _save_limits()),
+        "text": {**_SUMMARY_TEMPLATES, **_SYNC_BLOCKED_TEXT,
+                 **_SYNC_APPLY_TEXT,
+                 "sync_too_long": _sync_too_long_text(sync or _sync_limits()),
                  **_KHAT_TEXT,
                  **_CALIBRATION_TEXT,
                  "unfiltered": " " + _bar_reach(kd is not None, explorer,
@@ -13299,12 +13370,13 @@ def _filter_payload(
         # is "dates" above, so the section's own copy of it is not shipped)
         "kd": None if kd is None else {key: value for key, value in kd.items()
                                        if key != "dates"},
-        # The save button's fixed part of the confirmation page's address
-        "save": save,
+        # What the bar tells the Trading tab besides the scenario on screen,
+        # and where it talks
+        "sync": sync,
         # The categories and tags (indexes into "categories" and "subcats")
         # whose names the defaults server would refuse as live exclusions:
-        # the button never sends one
-        "save_refused": _save_refused(chunks.categories, chunks.subcats),
+        # the bar never proposes one
+        "sync_refused": _sync_refused(chunks.categories, chunks.subcats),
         # The Rebalance view: its grid, its tier-floors-off twin (null without
         # the tier-off view too) and why a page has none
         "grid_rebalance": grid_rebalance,
@@ -13654,7 +13726,7 @@ def _menu_html(menu_id: str, all_label: str, rows: list[str], *, button: str,
 
 def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     """
-    Render the sticky filter bar: eight <select>s, two check-box menus, the save button and a summary line.
+    Render the sticky filter bar: nine <select>s, two check-box menus, its notes and a summary line.
 
     Spread band, Tier floors, k, Size cap, Rebalance, Min. price movement,
     Sell and Min. days to maturity choose the scenario —
@@ -13718,34 +13790,23 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     choice on reload: the script enables them once it has inflated the base
     block AND the primary scenario's chunk, so without it (or without a
     browser that can inflate them) they cannot promise a view the page will
-    not show. After the Exclude tags menu comes the save button, rendered disabled
-    too: the script enables it whenever the scenario on screen can become
-    the live defaults, and a click opens the defaults server's confirmation
-    page for that scenario in a new tab, naming each category excluded
-    (one with every tag ticked included) and each other tag ticked. Its
-    hover text is _SAVE_TITLE on every page; while the categories and tags
-    kept hold no trade of the scenario shown, while every tag of a category
-    is ticked but a letter-case twin of it still keeps a tag (the live
-    filter reads the two as one category, so it could not leave out the
-    first whole), while a name it would send is one the defaults server
-    refuses (_save_refused), or while the ticks would name more, or make a
-    longer address, than the server takes in one link, the button stays
-    disabled and the script shows _SAVE_BLOCKED_TEXT["save_all_excluded"],
-    ["save_twin_split"] or ["save_refused"], or the save_too_long text
-    (_save_too_long_text), in its place. On a page with
-    the Rebalance view whose saved live defaults rebalance
-    (save["live_rebalances"]), a grey note (_REBALANCE_SAVE_NOTE) follows
-    the button: saving with Rebalance no turns that off. On a page with the
-    "Rebalance until" choices whose saved live defaults have a days limit
-    (save["live_rebalance_until"]), _until_save_note's follows it: saving
-    "maturity" turns that limit off. _SELL_SAVE_NOTE (save["live_sells"])
-    does the same for selling, after them, in the order of their selects,
-    and _filter_save_note's
-    (save["live_exclusions"], save["live_tag_exclusions"]) says that saving
-    replaces the saved excluded categories and tags, naming them. Then
-    the "Trade using defaults…" link
-    (_trade_link_html), which the script never touches, and the note that
-    both need the defaults server running.
+    not show. After the Exclude tags menu come the grey notes on what the
+    live dashboard's Trading tab, which follows the bar, proposes instead of
+    the saved live defaults from the bar's first view, each in the order of
+    its select: on a page with the Rebalance view whose saved live defaults
+    rebalance (sync["live_rebalances"]), _REBALANCE_SYNC_NOTE (Rebalance no
+    proposes turning that off); on a page with the "Rebalance until"
+    choices whose saved live defaults have a days limit
+    (sync["live_rebalance_until"]), _until_sync_note's ("maturity" proposes
+    turning that limit off); on a page with the Sell view whose saved live
+    defaults sell (sync["live_sells"]), _SELL_SYNC_NOTE; and
+    _filter_sync_note's (sync["live_exclusions"],
+    sync["live_tag_exclusions"]): once a box is ticked or unticked, the
+    categories and tags excluded here replace the saved excluded ones,
+    named, but for those the menus do not list. Then the red note the script
+    fills (flt-sync-note), rendered empty: why the Trading tab is not
+    following the bar's choice, or which settings of the Trading tab's
+    proposal the bar cannot show.
 
     Args:
         payload (dict): _filter_payload's base block.
@@ -13859,37 +13920,32 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
         f'{html.escape(entry["label"])}</option>'
         for i, entry in enumerate(payload.get("sell_days") or []))
     days_title = html.escape(_SELL_DAYS_TITLE)
-    # The save button's hover text, the same on every page: it saves no
-    # category or tag, so how the page files trades does not change it
-    save_title = html.escape(_SAVE_TITLE)
-    # Saving from a page with the Rebalance view sends the choice shown, so
-    # when the saved live defaults rebalance, leaving it at Rebalance no would
-    # turn that off; the grey note beside the button says so
-    save_rebalances = (rebalance_state == "shown"
-                       and (payload.get("save") or {}).get("live_rebalances") is True)
-    save_note = ('&nbsp;<span id="flt-rebalance-save-note" style="color:#9E9E9E; '
-                 f'font-size:13px;">{html.escape(_REBALANCE_SAVE_NOTE)}</span>'
-                 if save_rebalances else "")
+    # The Trading tab follows the bar's choice from a page with the Rebalance
+    # view, so when the saved live defaults rebalance, Rebalance no proposes
+    # turning that off; the grey note beside the menus says so
+    sync = payload.get("sync") or {}
+    sync_note = ('&nbsp;<span id="flt-rebalance-sync-note" style="color:#9E9E9E; '
+                 f'font-size:13px;">{html.escape(_REBALANCE_SYNC_NOTE)}</span>'
+                 if rebalance_state == "shown" and sync.get("live_rebalances") is True
+                 else "")
     # The same for a "Rebalance until" days limit: a page with the choices
-    # sends the one shown, so leaving it at maturity turns the saved limit off
-    until_days = (payload.get("save") or {}).get("live_rebalance_until")
-    save_until = (rebalance_state == "shown" and until_state == "shown"
+    # proposes the one shown, so maturity proposes turning the saved limit off
+    until_days = sync.get("live_rebalance_until")
+    sync_until = (rebalance_state == "shown" and until_state == "shown"
                   and type(until_days) is int and until_days > 0)
-    save_note += ('&nbsp;<span id="flt-until-save-note" style="color:#9E9E9E; '
-                  f'font-size:13px;">{html.escape(_until_save_note(until_days))}</span>'
-                  if save_until else "")
-    # The same for selling: saving with "no selling" shown turns it off
-    save_sells = (sell_state == "shown"
-                  and (payload.get("save") or {}).get("live_sells") is True)
-    save_note += ('&nbsp;<span id="flt-sell-save-note" style="color:#9E9E9E; font-size:13px;">'
-                  f"{html.escape(_SELL_SAVE_NOTE)}</span>" if save_sells else "")
-    # The button sends the categories and the tags excluded here, so when the
-    # saved live defaults exclude categories or tags, saving replaces those
-    # exclusions
-    save = payload.get("save") or {}
-    filter_note = _filter_save_note(save.get("live_exclusions"),
-                                    save.get("live_tag_exclusions"))
-    save_note += ('&nbsp;<span id="flt-filter-save-note" style="color:#9E9E9E; '
+    sync_note += ('&nbsp;<span id="flt-until-sync-note" style="color:#9E9E9E; '
+                  f'font-size:13px;">{html.escape(_until_sync_note(until_days))}</span>'
+                  if sync_until else "")
+    # The same for selling: "no selling" shown proposes turning it off
+    sync_note += ('&nbsp;<span id="flt-sell-sync-note" style="color:#9E9E9E; font-size:13px;">'
+                  f"{html.escape(_SELL_SYNC_NOTE)}</span>"
+                  if sell_state == "shown" and sync.get("live_sells") is True else "")
+    # Once a box is ticked or unticked, the categories and the tags excluded
+    # here replace, in the Trading tab's proposal, those the saved live
+    # defaults exclude that the menus list
+    filter_note = _filter_sync_note(sync.get("live_exclusions"),
+                                    sync.get("live_tag_exclusions"))
+    sync_note += ('&nbsp;<span id="flt-filter-sync-note" style="color:#9E9E9E; '
                   f'font-size:13px;">{html.escape(filter_note)}</span>'
                   if filter_note is not None else "")
 
@@ -13936,15 +13992,11 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
         # Not inside a <label>, which would hand a click on the menu to its
         # first box
         f'<span>{html.escape(_MENU_CAT_LABEL)}: </span>{cat_menu}&nbsp;&nbsp;'
-        f'<span>{html.escape(_MENU_TAG_LABEL)}: </span>{tag_menu}'
-        # The save button, disabled like the selects (autocomplete="off": a
-        # browser that restores a control's disabled state on reload must not)
-        f'&nbsp;&nbsp;<button id="flt-save" type="button" disabled autocomplete="off" '
-        f'title="{save_title}">{html.escape(_SAVE_LABEL)}</button>{save_note}'
-        # The trade link: a plain link, so it works whatever the script's state
-        f'&nbsp;&nbsp;{_trade_link_html()}'
-        '<span id="flt-save-note" style="color:#9E9E9E; font-size:13px;">'
-        f'&nbsp;{html.escape(_SAVE_NOTE)}</span>'
+        f'<span>{html.escape(_MENU_TAG_LABEL)}: </span>{tag_menu}{sync_note}'
+        # Filled by the script, in Python's words, only on a page shown in the
+        # live dashboard: why the Trading tab is not following the bar, or
+        # what of its proposal the bar cannot show
+        '&nbsp;<span id="flt-sync-note" style="color:#B71C1C; font-size:13px;"></span>'
         '<div id="flt-summary" style="color:#616161; font-size:13px; margin-top:6px;">'
         f'{summary}</div></div>'
     )
@@ -14082,8 +14134,8 @@ def _pack_text(raw: str) -> str:
 # choose() waits for it. Sell is enabled only when the base block names
 # those blocks; the level's and the minimum's phrases and the summary line's
 # note are Python's (D.sell_levels, D.sell_days, D.text.sell_note); the
-# level and the minimum shown go into the save button's address (saveHref),
-# and, like Rebalance, neither select reaches the k-hat figures, the
+# level and the minimum shown go into what the bar tells the Trading tab
+# (syncPairs), and, like Rebalance, neither select reaches the k-hat figures, the
 # interval-discount section nor the scenario explorer. A Sell block that
 # cannot be inflated puts every select back, as a chunk that cannot be
 # loaded does (putBack). The "Min. price movement" select (SHOWN[9]) picks
@@ -14097,8 +14149,8 @@ def _pack_text(raw: str) -> str:
 # off: moveGridAt), and where that cell is null — no minimum changes the run
 # — the rebalancing chunk itself (chunkAt). Its phrase is Python's
 # (D.moves[i - 1].phrase, after D.text.rebalance). Sell stays shut at any
-# minimum; the Rebalance choice and the minimum go into the save button's
-# address (saveHref: rebalance, from the Rebalance choice, and
+# minimum; the Rebalance choice and the minimum go into what the bar tells
+# the Trading tab (syncPairs: rebalance, from the Rebalance choice, and
 # min_price_move, "off" for any or with Rebalance no),
 # and like Rebalance it reaches neither the k-hat figures, the
 # interval-discount section nor the scenario explorer. The "Rebalance until"
@@ -14111,8 +14163,8 @@ def _pack_text(raw: str) -> str:
 # cell of D.grid_maturity (or of D.grid_maturity_off with the tier floors
 # off: untilGridAt), and where that cell is null — no choice changes the
 # run — the movement cell's chunk (chunkAt). Its phrase is Python's
-# (D.maturity[i - 1].phrase, after the minimum's); the choice goes into the
-# save button's address as rebalance_min_days_to_maturity (its days, or 0
+# (D.maturity[i - 1].phrase, after the minimum's); the choice goes into what
+# the bar tells the Trading tab as rebalance_min_days_to_maturity (its days, or 0
 # for maturity or with Rebalance no), only from a page with that view, and
 # like Rebalance it reaches neither the k-hat figures, the interval-discount
 # section nor the scenario explorer. Only the page's first
@@ -14136,8 +14188,8 @@ def _pack_text(raw: str) -> str:
 # (TAG_TWINS and CAT_TWINS, from the groups Python folds, D.tag_twins and
 # D.category_twins). What the page shows is then what that rule
 # (config.trade_filter_for) keeps when it excludes the categories left out
-# and the tags ticked, each tied to its category — what the save button
-# sends. Where the
+# and the tags ticked, each tied to its category — what the bar tells the
+# Trading tab. Where the
 # ticks cover exactly the trades of one of Python's views — everything, one
 # category, one tag — that view is drawn as it stands. Any other set of
 # ticks is a MIX, which has no view of its own (the combinations are far
@@ -14170,33 +14222,52 @@ def _pack_text(raw: str) -> str:
 # the explorer's own script, _SCENARIO_EXPLORER_JS, only on a page carrying
 # its grid, and called only when it is — with the Tier floors choice as a
 # fourth argument; the explorer moves only the axes whose label changed, and
-# again any axis it refused on an earlier call). It enables the bar's "Save as
-# live defaults…" button whenever the scenario on screen (SHOWN, never the
-# selects' choice while a chunk loads) can become the live defaults, and a
-# click opens the defaults server's confirmation page for that scenario in a
-# new tab (saveHref: D.save's address and the axes' values, plus each of the
-# Rebalance choice with its minimum price movement (and its "Rebalance
-# until" days, 0 for none, on a page with those choices) and the Sell level
-# and minimum ("off" for both under no selling), on a page with that view, and
-# each category excluded — a category with every tag ticked included — as
-# exclude_category and each other tag ticked as exclude_tag: saveLists). The
-# button stays disabled while the categories and tags kept hold no trade of
-# the scenario shown, while every tag of a category is ticked but a
-# letter-case twin of it still keeps a tag (saveLists' split), while it would
-# send a name the defaults server refuses (D.save_refused), or while the
-# ticks would name more, or make a longer address or posted form, than the
-# server takes in one link (saveBlockedByTicks); its words are Python's, its
-# hover text too, which reads as Python rendered it except while a tick is
-# what stops a save (D.text.save_all_excluded, D.text.save_twin_split,
-# D.text.save_refused, D.text.save_too_long). On
-# load it inflates the base
-# block and the primary
-# scenario's chunk, sets the bar back to the view Python rendered and enables
-# it — it redraws nothing until a <select> changes. A chunk is inflated when a
-# scenario needs it and kept while among the last KEEP drawn (the primary's
-# always); a choice made while a chunk is still inflating supersedes it (SEQ),
-# and a chunk that cannot be loaded puts every select back on the scenario
-# still shown (SHOWN).
+# again any axis it refused on an earlier call). Shown in the live
+# dashboard's Backtest frame (FRAMED: window.parent is the tab page), the bar
+# and the Trading tab show the same settings wherever the bar can show them.
+# After each choice the reader makes has been drawn, or shown as a scenario
+# the run never simulated (never after a choice is put back, and never after
+# a proposal is shown), the script tells the tab page the bar's choice as the
+# trading page's query, {type: 'kalshi-bar', query}, at each of
+# D.sync.dashboard_origins (refreshSync, syncQuery). Each setting the reader
+# picked since the Trading tab's proposal was last known goes as the bar
+# shows it: the axes' values, the Rebalance choice with its minimum price
+# movement and "Rebalance until" days on a page with those views, the Sell
+# level and minimum on a page with that view, each category excluded — a
+# category with every tag ticked included — as exclude_category and each
+# other tag ticked as exclude_tag (syncLists). Every other setting goes as
+# the Trading tab has it (TRADING: the last proposal shown, or the last
+# query told), so the Trading tab changes only what the reader changed and
+# keeps every setting the bar cannot show: a value off the page's choices, a
+# setting of a view the page lacks, a category or tag the menus do not list,
+# a sell level beside rebalancing (syncPairs). A choice it cannot tell is not
+# told, and the red note (flt-sync-note) says why in Python's words: a band,
+# k or cap the run did not record (D.text.sync_unrecorded), ticks that keep
+# none of the scenario's trades (sync_all_excluded), every tag of a category
+# ticked while a letter-case twin of it still keeps a tag (syncLists' split,
+# sync_twin_split), a name the defaults server refuses (D.sync_refused,
+# sync_refused), or more names or a longer query or posted form than the
+# Trading tab carries (syncBlockedByTicks, sync_too_long; the query counted
+# as the tab page counts it). The other way, the tab page sends the Trading
+# tab's proposal, {type: 'kalshi-apply', query}, taken only from the parent
+# window at one of those origins and only once the bar is ready: applyQuery
+# chooses every setting of it the bar can show, ticks every category and tag
+# it excludes, and draws that scenario as a reader's choice would, but tells
+# nothing back; the note names each setting the bar cannot show
+# (D.text.sync_not_here), and nothing more is done when the selects and ticks
+# already name that scenario. A proposal that arrives while a reader's own
+# choice is still loading (SETTLING) is kept and shown once that choice
+# settles (settled), and one that cannot be drawn leaves the bar on the
+# scenario before it, which the note says (D.text.sync_unshown, applyFailed).
+# Once the bar is first ready it tells the tab page {type: 'kalshi-ready'},
+# so the tab page answers with the proposal. Opened on its own, the page
+# tells and listens to nothing. On load it inflates the base block and the
+# primary scenario's chunk, sets the bar back to the view Python rendered and
+# enables it — it redraws nothing until a <select> changes. A chunk is
+# inflated when a scenario needs it and kept while among the last KEEP drawn
+# (the primary's always); a choice made while a chunk is still inflating
+# supersedes it (SEQ), and a chunk that cannot be loaded puts every select
+# back on the scenario still shown (SHOWN).
 _FILTER_JS = r"""
 <script>
 (function() {
@@ -14241,10 +14312,11 @@ _FILTER_JS = r"""
       || !untilSel || !sellSel || !daysSel || !catMenu || !tagMenu || !catAll || !tagAll) {
     return;
   }
-  // The bar's save button: a button, not a select, so never in SELECTS
-  // (whose reset reads .options); optional, since a page without it has
-  // nothing to save from
-  var saveBtn = document.getElementById('flt-save');
+  // FRAMED: the page is shown in the live dashboard's Backtest frame, so
+  // window.parent is the dashboard's tab page, which the bar tells each
+  // choice the reader makes and takes the Trading tab's proposal from. A page
+  // opened on its own is its own parent, and tells and takes nothing
+  var FRAMED = !!window.parent && window.parent !== window;
   var SELECTS = [bandSel, tierSel, kSel, capSel, rebalanceSel, moveSel, untilSel, sellSel,
                  daysSel];
   // The k-hat chart's own "Group by" select follows the bar's rules
@@ -14276,8 +14348,35 @@ _FILTER_JS = r"""
   // boxes are ticked and unticked together. CAT_TWINS: the same for a
   // category another one repeats in other letter case (D.category_twins),
   // so such categories are left out, or kept, together.
-  // SAVE_TITLE: the save button's hover text as Python rendered it.
-  var TAG_TWINS = {}, CAT_TWINS = {}, SAVE_TITLE = null;
+  var TAG_TWINS = {}, CAT_TWINS = {};
+  // READY: the bar is enabled (the base block and the primary scenario's
+  // chunk are in), so a proposal from the Trading tab can be shown.
+  // SETTLING: a choice the reader made is still loading its chunk or Sell
+  // block, so a proposal that arrives meanwhile is not shown over it: it is
+  // kept (DEFERRED) until that choice settles (settled)
+  var READY = false, SETTLING = false, DEFERRED = null;
+  // TRADING: the Trading tab's proposal as the bar last knew it, read into
+  // each field's values (parseQuery) — the last one the tab page sent
+  // (applyQuery), or the last query the bar told it (refreshSync), which the
+  // Trading tab then shows — or null before either. PICKED: the settings the
+  // reader has chosen on the bar since then, by name ("tier", "band", "k",
+  // "cap", "rebalance", "move", "until", "sell", "days", and "names" for the
+  // two menus); PENDING: those of a choice not drawn yet, added to PICKED
+  // once it is and dropped when it is put back. A choice tells each setting
+  // the reader picked as the bar shows it and every other one as the Trading
+  // tab has it (syncPairs), so the Trading tab changes only what the reader
+  // changed, never a setting the bar cannot show. UNSHOWN: the last proposal
+  // could not be drawn, so the bar still shows the scenario before it (the
+  // note says so, and every setting counts as picked: applyFailed)
+  var TRADING = null, PICKED = {}, PENDING = {}, UNSHOWN = false;
+  var SETTINGS = ['tier', 'band', 'k', 'cap', 'rebalance', 'move', 'until', 'sell', 'days',
+                  'names'];
+  // The trading page's single-valued fields in its query's order, each with
+  // the setting a reader picks it by
+  var SYNC_FIELDS = [['tier_floors', 'tier'], ['spread_min', 'band'], ['spread_max', 'band'],
+                     ['k', 'k'], ['size_cap', 'cap'], ['rebalance', 'rebalance'],
+                     ['min_price_move', 'move'], ['rebalance_min_days_to_maturity', 'until'],
+                     ['sell_at', 'sell'], ['sell_min_days', 'days']];
   // PICK: the menus' ticks as last asked for (pickKey), so a click that
   // leaves them as they were redraws nothing
   var PICK = '|';
@@ -14427,89 +14526,128 @@ _FILTER_JS = r"""
   // The page as rendered: the primary scenario with the tier floors on and
   // Rebalance no
   function primaryChunk() { var p = D.primary; return D.grid[p[0]][p[1]][p[2]]; }
-  // The filter bar's scenario ON SCREEN (SHOWN) as the defaults server's
-  // confirmation-page address, or null when it cannot become live settings:
-  // nothing drawn yet, no save target on the page (D.save), a scenario the
-  // run never simulated (a Rebalance choice, a minimum price movement, a
-  // "Rebalance until" choice or a Sell level the page holds no chunk for
-  // included), a band the run did
-  // not record, a k or size cap the run did not record or that is not above
-  // zero, or ticks that stop a save (saveBlockedByTicks: none of this
-  // scenario's trades kept, or an address the server would not take).
-  function saveHref() {
-    var q = saveQuery();
-    if (q === null || saveBlockedByTicks() !== null) { return null; }
-    return D.save.url + '?' + q;
-  }
-  // The address's query for the scenario on screen, whatever the menus'
-  // ticks (saveHref refuses those that stop a save), or null as saveHref.
-  function saveQuery() {
-    var pairs = savePairs();
+  // The bar's choice as the trading page's query (syncPairs), which the bar
+  // tells the Trading tab, whatever the menus' ticks (syncBlocked refuses
+  // those that stop it), or null as syncPairs.
+  function syncQuery() {
+    var pairs = syncPairs();
     return pairs === null ? null : pairs.map(function(p) {
       return encodeURIComponent(p[0]) + '=' + encodeURIComponent(String(p[1]));
     }).join('&');
   }
-  // The query's [field, value] pairs, or null as saveHref. It names the
-  // categories and the tags saveLists sends — each category ticked, by its
-  // name on the bar, as exclude_category, and each tag, as
-  // "Category · Tag", as exclude_tag: the categories and the tags live runs
-  // exclude, every other one trading. The server refuses, with its reason,
-  // any other value the live settings reject. Each number is written by
-  // String(), whose shortest form reads back as the same number.
-  function savePairs() {
-    if (!D || !D.save || !SHOWN || C === null) { return null; }
-    // null: never simulated; undefined: a sell level's block not inflated (a
-    // scenario on screen has always inflated its own)
-    var shownId = chunkAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[7], SHOWN[8],
-                          SHOWN[6], SHOWN[9], SHOWN[10]);
-    if (shownId === null || shownId === undefined) { return null; }
-    var band = D.bands[SHOWN[0]].value, k = D.ks[SHOWN[1]].value, cap = D.caps[SHOWN[2]].value;
-    if (!band || !(k > 0) || !(cap > 0)) { return null; }
-    var q =[['tier_floors', offAt(SHOWN[5]) ? 'off' : 'on'], ['spread_min', band[0]],
-             ['spread_max', band[1]], ['k', k], ['size_cap', cap]];
-    // Sent only by a page that simulated rebalancing: otherwise the server
-    // keeps the saved values (or the seed's when none are saved). The
-    // Rebalance choice goes as rebalance, and beside it, always, the
-    // minimum price movement shown as min_price_move — its dollars, or off
-    // for any and whenever Rebalance is no (a shut select can still name
-    // one), so the address never asks for a minimum without rebalancing,
-    // which the server refuses
+  // The bar's own settings for the scenario on screen (SHOWN), by the
+  // trading page's field names: the Tier floors choice, the band's two ends,
+  // k and the size cap; from a page that simulated rebalancing, the
+  // Rebalance choice and, beside it always, the minimum price movement shown
+  // (its dollars, or off for any, on a page with no minimums and whenever
+  // Rebalance is no — a shut select can still name one); from a page that
+  // also carries the "Rebalance until" choices, the days of the choice shown
+  // (0, no days limit, for maturity and whenever Rebalance is no); and from
+  // a page with the Sell view, the level and the minimum of days shown (off
+  // for both when Sell shows no level). A field of a view the page lacks is
+  // left out. Each number as the base block holds it.
+  function barValues(band, k, cap) {
+    var out = {tier_floors: offAt(SHOWN[5]) ? 'off' : 'on', spread_min: band[0],
+               spread_max: band[1], k: k, size_cap: cap};
     if (D.grid_rebalance) {
       var mi = moveAt(SHOWN[6], SHOWN[9]);
-      q.push(['rebalance', rebalanceOn(SHOWN[6]) ? 'on' : 'off'],
-             ['min_price_move', mi > 0 ? D.moves[mi - 1].value : 'off']);
-      // Beside them, only from a page that also carries the "Rebalance
-      // until" choices: the days of the choice shown as
-      // rebalance_min_days_to_maturity, or 0 (no days limit) for maturity
-      // and whenever Rebalance is no (a shut select can still name one), so
-      // the address never asks for a days limit without rebalancing, which
-      // the server refuses
+      out.rebalance = rebalanceOn(SHOWN[6]) ? 'on' : 'off';
+      out.min_price_move = mi > 0 ? D.moves[mi - 1].value : 'off';
       if (D.grid_maturity) {
         var ui = untilAt(SHOWN[6], SHOWN[10]);
-        q.push(['rebalance_min_days_to_maturity', ui > 0 ? D.maturity[ui - 1].value : 0]);
+        out.rebalance_min_days_to_maturity = ui > 0 ? D.maturity[ui - 1].value : 0;
       }
     }
-    // Likewise sent only by a page with the Sell view: the level shown and the
-    // minimum of days shown, or off for both when Sell shows no level (the
-    // server refuses a minimum without a level)
     if (D.sell_blocks) {
       var level = sellAt(SHOWN[7]);
-      q.push(['sell_at', level === null ? 'off' : D.sell_levels[level].value],
-             ['sell_min_days',
-              level === null ? 'off' : D.sell_days[parseInt(SHOWN[8], 10)].value]);
+      out.sell_at = level === null ? 'off' : D.sell_levels[level].value;
+      out.sell_min_days = level === null ? 'off' : D.sell_days[parseInt(SHOWN[8], 10)].value;
     }
-    // The categories and the tags left out, as the live runs' excluded
-    // categories and tags: every other category and tag trades live, one
-    // this backtest never saw included
-    var sent = saveLists(SHOWN[3], SHOWN[4]);
-    sent.cats.forEach(function(ci) { q.push(['exclude_category', D.categories[ci]]); });
-    sent.tags.forEach(function(si) { q.push(['exclude_tag', subName(si, true)]); });
-    if (typeof D.save.source === 'string' && D.save.source !== '') {
-      q.push(['source', D.save.source]);
+    return out;
+  }
+  // The names in a Trading tab field (exclude_category or exclude_tag) that
+  // the bar's menus do not list (nameAt, by nameOf over n names), in its order
+  function unlistedIn(field, n, nameOf) {
+    var names = TRADING === null ? [] : (TRADING[field] || []);
+    return names.filter(function(name) { return nameAt(n, nameOf, name) < 0; });
+  }
+  // The query's [field, value] pairs for the bar's choice, or null when the
+  // scenario on screen cannot become live settings: no sync target on the
+  // page (D.sync), nothing drawn yet, a band the run did not record, or a k
+  // or size cap the run did not record or that is not above zero. A field
+  // goes as the bar shows it (barValues) when the reader picked its setting
+  // since the Trading tab's proposal was last known (PICKED), or when no
+  // proposal is known (TRADING null) or it names no such field; else as the
+  // Trading tab has it. So a choice changes on the Trading tab only what the
+  // reader changed, and never a setting the bar cannot show: a value off the
+  // page's choices, a sell level beside rebalancing, or a setting of a view
+  // the page lacks, which goes as the Trading tab has it even when picked
+  // (a choice can open or shut its select without showing it) and is left
+  // out with no proposal known (the server then keeps the saved one). A
+  // minimum price movement on a page with no minimums is such a setting
+  // while Rebalance is yes. Then, as the trading page settles its own form,
+  // the minimum goes as off and the days limit as 0 with rebalancing off,
+  // and the minimum of days as off with no sell level: the server refuses
+  // either without its switch. The categories and the tags: those syncLists
+  // sends — each category ticked, by its name on the bar, as
+  // exclude_category, and each tag, as "Category · Tag", as exclude_tag —
+  // with every one the Trading tab excludes that the menus do not list, once
+  // the reader picked them (or with no proposal known); else exactly the
+  // Trading tab's. Live runs exclude them, every other category and tag
+  // trading, one this backtest never saw included. The server refuses, with
+  // its reason, any other value the live settings reject. Each number is
+  // written by String(), whose shortest form reads back as the same number.
+  function syncPairs() {
+    if (!D || !D.sync || !SHOWN) { return null; }
+    var band = D.bands[SHOWN[0]].value, k = D.ks[SHOWN[1]].value, cap = D.caps[SHOWN[2]].value;
+    if (!band || !(k > 0) || !(cap > 0)) { return null; }
+    var bar = barValues(band, k, cap);
+    // The fields of a view the page lacks, while picked
+    var unseen = {min_price_move: !D.grid_move && rebalanceOn(SHOWN[6])};
+    var out = {};
+    SYNC_FIELDS.forEach(function(f) {
+      var name = f[0], theirs = TRADING === null ? undefined : TRADING[name];
+      var mine = PICKED[f[1]] && !unseen[name] ? bar[name] : undefined;
+      if (theirs === undefined || mine !== undefined) {
+        if (bar[name] !== undefined) { out[name] = bar[name]; }
+      } else {
+        out[name] = theirs[0];
+      }
+    });
+    if (out.rebalance === 'off') {
+      if (out.min_price_move !== undefined) { out.min_price_move = 'off'; }
+      if (out.rebalance_min_days_to_maturity !== undefined) {
+        out.rebalance_min_days_to_maturity = 0;
+      }
+    }
+    if (out.sell_at === 'off' && out.sell_min_days !== undefined) { out.sell_min_days = 'off'; }
+    var q = [];
+    SYNC_FIELDS.forEach(function(f) {
+      if (out[f[0]] !== undefined) { q.push([f[0], out[f[0]]]); }
+    });
+    function categoryAt(i) { return D.categories[i]; }
+    function tagAt(i) { return subName(i, true); }
+    if (TRADING === null || PICKED.names) {
+      var sent = syncLists(SHOWN[3], SHOWN[4]);
+      sent.cats.forEach(function(ci) { q.push(['exclude_category', D.categories[ci]]); });
+      unlistedIn('exclude_category', D.categories.length, categoryAt).forEach(function(name) {
+        q.push(['exclude_category', name]);
+      });
+      sent.tags.forEach(function(si) { q.push(['exclude_tag', subName(si, true)]); });
+      unlistedIn('exclude_tag', D.subcats.length, tagAt).forEach(function(name) {
+        q.push(['exclude_tag', name]);
+      });
+    } else {
+      ['exclude_category', 'exclude_tag'].forEach(function(field) {
+        (TRADING[field] || []).forEach(function(name) { q.push([field, name]); });
+      });
+    }
+    if (typeof D.sync.source === 'string' && D.sync.source !== '') {
+      q.push(['source', D.sync.source]);
     }
     return q;
   }
-  // The categories and the tags the save button sends for a set of ticks, as
+  // The categories and the tags the bar tells the Trading tab for a set of ticks, as
   // indexes in the bar's order. Every category ticked in the Exclude
   // categories menu goes as a category, and so does a kept category every one
   // of whose tags is ticked — the page shows it left out, and a tag of it this
@@ -14519,9 +14657,9 @@ _FILTER_JS = r"""
   // split is true when a kept category has every tag ticked but a twin of it
   // still keeps a tag: the page shows it left out, yet the live filter, for
   // which the twins are one category, could not leave it out whole, so a tag
-  // of it this backtest never saw would trade (saveBlockedByTicks then stops
-  // the save). The page's twin of the tests' _save_lists and _save_split.
-  function saveLists(excluded, tags) {
+  // of it this backtest never saw would trade (syncBlockedByTicks then stops
+  // it). The page's twin of the tests' _sync_lists and _sync_split.
+  function syncLists(excluded, tags) {
     function whole(c) {
       if (excluded.indexOf(c) >= 0) { return true; }
       var own = 0, ticked = 0;
@@ -14546,7 +14684,7 @@ _FILTER_JS = r"""
     }).sort(ascending)};
   }
   // How many bytes these pairs take as a browser posts them back in a form
-  // (the confirmation page's): what encodeURIComponent writes, but each of
+  // (the trading page's): what encodeURIComponent writes, but each of
   // ! ' ( ) ~ as three bytes where it writes one, and a space as "+" where it
   // writes three
   function formLength(pairs) {
@@ -14561,50 +14699,143 @@ _FILTER_JS = r"""
     });
     return n;
   }
-  // The reason the save button gives while the menus stop a save, in
-  // Python's words, or null when they do not: ticks that keep none of the
-  // scenario's trades (D.text.save_all_excluded) — every category left out,
+  // How many bytes a query takes on the trading page's address as the
+  // browser sends it, which writes each apostrophe (left alone by
+  // encodeURIComponent) as %27: three bytes, as the live dashboard's tab page
+  // counts it before it takes the query
+  function queryLength(q) {
+    return q.length + 2 * (q.length - q.replace(/'/g, '').length);
+  }
+  // Why the Trading tab cannot follow the bar's choice for its ticks, in
+  // Python's words, or null when it can. Ticks that keep none of the
+  // scenario's trades (D.text.sync_all_excluded) — every category left out,
   // every tag of those kept ticked, or every category and tag with a trade
-  // here — a view with no trade at all, whose save would trade only
-  // categories and tags this backtest gave no trade to; every tag of a
-  // category ticked while a letter-case twin of it keeps a tag (saveLists'
-  // split, D.text.save_twin_split), which the page shows left out but the
-  // live filter could not leave out whole; a name the defaults
-  // server would refuse among those sent (D.save_refused,
-  // D.text.save_refused); or ticks it would not take in one link
-  // (D.text.save_too_long): too many categories, or too many tags, for it
-  // (D.save.max_names, each name and letter-case twin counted as sent), or an
-  // address longer than it reads, opened (D.save.max_query_bytes) or posted
-  // back by its form (D.save.max_form_bytes, formLength).
-  function saveBlockedByTicks() {
+  // here; for a scenario the run never simulated, which has no trades to
+  // count, only ticks that leave no category · tag at all — a view with no
+  // trade, whose proposal would trade only categories and tags this backtest
+  // gave no trade to. Two more only while the menus' ticks are what is told
+  // (the reader picked them, or no proposal is known): every tag of a
+  // category ticked while a letter-case twin of it keeps a tag (syncLists'
+  // split, D.text.sync_twin_split), which the page shows left out but the
+  // live filter could not leave out whole; a name the defaults server would
+  // refuse among those sent (D.sync_refused, D.text.sync_refused). And a
+  // query the Trading tab would not take in one proposal
+  // (D.text.sync_too_long): too many categories, or too many tags, for the
+  // server (D.sync.max_names, each name and letter-case twin counted as sent),
+  // or a query longer than the tab page carries (D.sync.max_query_bytes,
+  // queryLength) or than the trading page's form can post back
+  // (D.sync.max_form_bytes, formLength).
+  function syncBlockedByTicks() {
     var atoms = atomsOf(SHOWN[3], SHOWN[4]);
-    if (atoms !== null && atoms.every(function(i) { return count('s' + i) === 0; })) {
-      return D.text.save_all_excluded;
+    if (atoms !== null && (C === null ? !atoms.length
+                           : atoms.every(function(i) { return count('s' + i) === 0; }))) {
+      return D.text.sync_all_excluded;
     }
-    var sent = saveLists(SHOWN[3], SHOWN[4]), refused = D.save_refused;
-    if (sent.split) { return D.text.save_twin_split; }
-    if (refused && (sent.cats.some(function(c) { return refused.categories.indexOf(c) >= 0; })
-                    || sent.tags.some(function(t) { return refused.tags.indexOf(t) >= 0; }))) {
-      return D.text.save_refused;
+    if (TRADING === null || PICKED.names) {
+      var sent = syncLists(SHOWN[3], SHOWN[4]), refused = D.sync_refused;
+      if (sent.split) { return D.text.sync_twin_split; }
+      if (refused && (sent.cats.some(function(c) { return refused.categories.indexOf(c) >= 0; })
+                      || sent.tags.some(function(t) { return refused.tags.indexOf(t) >= 0; }))) {
+        return D.text.sync_refused;
+      }
     }
-    if (sent.cats.length > D.save.max_names || sent.tags.length > D.save.max_names) {
-      return D.text.save_too_long;
-    }
-    var pairs = savePairs();
-    if (pairs !== null && (saveQuery().length > D.save.max_query_bytes
-                           || formLength(pairs) > D.save.max_form_bytes)) {
-      return D.text.save_too_long;
+    var pairs = syncPairs();
+    if (pairs === null) { return null; }
+    var named = {exclude_category: 0, exclude_tag: 0};
+    pairs.forEach(function(p) { if (p[0] in named) { named[p[0]]++; } });
+    if (named.exclude_category > D.sync.max_names || named.exclude_tag > D.sync.max_names
+        || queryLength(syncQuery()) > D.sync.max_query_bytes
+        || formLength(pairs) > D.sync.max_form_bytes) {
+      return D.text.sync_too_long;
     }
     return null;
   }
-  // The button is enabled exactly when the scenario on screen can be saved;
-  // while a tick in either menu is what stops it, its hover text says why
-  // (saveBlockedByTicks), and otherwise it reads as Python rendered it
-  function refreshSave() {
-    if (!saveBtn) { return; }
-    saveBtn.disabled = saveHref() === null;
-    var why = (D && D.save && SHOWN) ? saveBlockedByTicks() : null;
-    if (SAVE_TITLE !== null) { saveBtn.title = why === null ? SAVE_TITLE : why; }
+  // Why the Trading tab cannot follow the scenario on screen, or null when
+  // it can: a scenario that cannot become live settings
+  // (D.text.sync_unrecorded), or ticks that stop it (syncBlockedByTicks)
+  function syncBlocked() {
+    return syncPairs() === null ? D.text.sync_unrecorded : syncBlockedByTicks();
+  }
+  // A message for the dashboard's tab page, sent to each of its two
+  // addresses (D.sync.dashboard_origins; the browser delivers it only to the
+  // one the tab page is at), and only on a page shown in its frame
+  function tell(message) {
+    if (!FRAMED || !D || !D.sync) { return; }
+    D.sync.dashboard_origins.forEach(function(origin) {
+      window.parent.postMessage(message, origin);
+    });
+  }
+  // The red note on the Trading tab's proposal (TRADING): that the bar
+  // could not draw it (UNSHOWN, D.text.sync_unshown), then each of its
+  // settings the bar cannot show (missing, as wanted words them, in
+  // D.text.sync_not_here); '' for neither
+  function proposalNote(missing) {
+    var out = [];
+    if (UNSHOWN) { out.push(D.text.sync_unshown); }
+    if (missing.length) {
+      out.push(fill(D.text.sync_not_here, {items: missing.join(D.text.sync_join)}));
+    }
+    return out.join(' ');
+  }
+  // After a choice the READER made has been drawn, or shown as a scenario
+  // the run never simulated: its settings count as picked (PENDING into
+  // PICKED), and on a page shown in the dashboard the Trading tab is told
+  // the bar's choice (kalshi-bar, with syncQuery), which it then shows
+  // (TRADING, with nothing picked since), or, when it cannot follow it, told
+  // nothing; the red note says why (syncBlocked), or else names what the bar
+  // cannot show of what the Trading tab now shows (proposalNote, empty when
+  // nothing). Then a proposal kept while the choice loaded is shown
+  // (settled). Nothing is told for a choice put back or for a proposal shown
+  // (reader false), and nothing on a page opened on its own.
+  function refreshSync(reader) {
+    if (!reader) { return; }
+    Object.keys(PENDING).forEach(function(s) { PICKED[s] = true; });
+    PENDING = {};
+    if (!FRAMED || !D || !D.sync) { return; }
+    var why = syncBlocked(), told = null;
+    if (why === null) {
+      told = syncQuery();
+      tell({type: 'kalshi-bar', query: told});
+      TRADING = parseQuery(told);
+      PICKED = {};
+      UNSHOWN = false;
+    }
+    setText('flt-sync-note', why === null ? proposalNote(wanted(TRADING).missing) : why);
+    settled(told);
+  }
+  // A reader's choice has settled: told (told, its query) or not (null,
+  // when it could not be told or was put back). A proposal kept while it
+  // loaded (DEFERRED) is shown now: the query told, which carries every
+  // setting of that proposal the reader did not pick, or else the proposal
+  // itself, as if it had come just after
+  function settled(told) {
+    var kept = DEFERRED;
+    DEFERRED = null;
+    if (kept !== null) { applyQuery(told !== null ? told : kept); }
+  }
+  // A choice put back (putBack, refuseMix): a reader's picks go with it and
+  // the choice has settled untold; a proposal's leaves the bar on the
+  // scenario before it (applyFailed)
+  function undone(reader) {
+    if (reader) {
+      PENDING = {};
+      settled(null);
+    } else {
+      applyFailed();
+    }
+  }
+  // The Trading tab's proposal could not be drawn (a chunk or Sell block
+  // that cannot be loaded, or ticks whose mix its list cannot give): the bar
+  // still shows the scenario before it, which the red note says, so the
+  // reader's next choice tells every setting as the bar shows it (each
+  // counts as picked), but those of a view the page lacks
+  function applyFailed() {
+    UNSHOWN = true;
+    PICKED = {};
+    SETTINGS.forEach(function(s) { PICKED[s] = true; });
+    if (FRAMED && TRADING !== null) {
+      setText('flt-sync-note', proposalNote(wanted(TRADING).missing));
+    }
   }
   function isPrimaryCell() {
     var p = D.primary;
@@ -14712,7 +14943,7 @@ _FILTER_JS = r"""
   // name) are ticked with it, so the live filter, which reads them as one
   // tag, leaves them out together too. The page's twin of
   // config.trade_filter_for excluding the categories left out and the tags
-  // ticked, each tied to its category — what the save button sends. null
+  // ticked, each tied to its category — what the bar tells the Trading tab. null
   // when nothing is ticked: everything; empty when nothing is left: every
   // category left out, or every tag of those kept ticked.
   function atomsOf(excluded, tags) {
@@ -15905,7 +16136,6 @@ _FILTER_JS = r"""
              rebalanceSel.value, sellSel.value, daysSel.value, moveSel.value, untilSel.value];
     render(v, excluded, tags);
     refreshSell();
-    refreshSave();
     return true;
   }
   // A scenario that could not be shown: a chunk or Sell block that could
@@ -15948,8 +16178,6 @@ _FILTER_JS = r"""
             : fill(D.text.mix_still, {selection: selectionName(SHOWN[3], SHOWN[4])}),
           at: tried === still ? '' : fill(D.text.mix_still_at, {scenario: still})})
       : fill(D.text.unavailable, {failed: tried, reason: String(err), scenario: still}));
-    // The scenario still shown can be saved again
-    refreshSave();
   }
   // A chunk whose list could not give the mix asked for was never drawn:
   // dropped unless it is the page's own or one drawn before (KEPT bounds
@@ -15960,39 +16188,62 @@ _FILTER_JS = r"""
   }
   // The selects or the ticks changed: draw their scenario — at once when its
   // chunk is loaded (or it has none), else once it is; a later choice
-  // supersedes it
-  function choose() {
+  // supersedes it. reader: the reader made the choice (a proposal shown from
+  // the Trading tab is not one), so once it is drawn the Trading tab is told
+  // (refreshSync), and while it loads SETTLING holds a proposal off. A
+  // choice that cannot be drawn puts every select back (putBack, refuseMix),
+  // then undone says what that means for the Trading tab
+  function choose(reader) {
     var seq = ++SEQ, id = cellChunk();
+    SETTLING = false;
     if (id === undefined) {
-      // A sell level at a band whose Sell block is not inflated yet: nothing
-      // can be saved meanwhile; once the block is in, the choice is made
-      // again, unless a later one came first
-      if (saveBtn) { saveBtn.disabled = true; }
+      // A sell level at a band whose Sell block is not inflated yet: once the
+      // block is in, the choice is made again, unless a later one came first
+      SETTLING = !!reader;
       setText('flt-summary', fill(D.text.loading, {scenario: scenario()}));
       loadSell(sellBlockId(tierSel.value, bandIndex())).then(function() {
-        if (seq === SEQ) { choose(); }
+        if (seq === SEQ) { choose(reader); }
       }, function(err) {
-        if (seq === SEQ) { putBack(err); }
+        if (seq === SEQ) { SETTLING = false; putBack(err); undone(reader); }
       });
       return;
     }
-    if (id === null) { draw(null); return; }
+    if (id === null) {
+      // A scenario the run never simulated: shown as such, and told as any
+      if (draw(null)) { refreshSync(reader); }
+      return;
+    }
     var entry = CHUNKS[id];
     if (entry && entry.data) {
-      if (draw(entry.data)) { touch(id); } else { refuseMix(id); }
+      if (draw(entry.data)) {
+        touch(id);
+        refreshSync(reader);
+      } else {
+        refuseMix(id);
+        undone(reader);
+      }
       return;
     }
     // While the chunk loads, the selects name a scenario the page does not
-    // show yet, so nothing can be saved until it is drawn (or the choice is
-    // put back)
-    if (saveBtn) { saveBtn.disabled = true; }
+    // show yet: the Trading tab is told it only once it is drawn (never when
+    // the choice is put back)
+    SETTLING = !!reader;
     setText('flt-summary', fill(D.text.loading, {scenario: scenario()}));
     load(id).then(function(chunk) {
       if (seq !== SEQ) { return; }
-      if (draw(chunk)) { touch(id); } else { refuseMix(id); }
+      SETTLING = false;
+      if (draw(chunk)) {
+        touch(id);
+        refreshSync(reader);
+      } else {
+        refuseMix(id);
+        undone(reader);
+      }
     }, function(err) {
       if (seq !== SEQ) { return; }
+      SETTLING = false;
       putBack(err);
+      undone(reader);
     });
   }
   // The bar cannot work: the base block, or the primary scenario's chunk,
@@ -16002,7 +16253,6 @@ _FILTER_JS = r"""
   function unavailable(reason) {
     SELECTS.forEach(function(s) { s.disabled = true; });
     menusDisabled(true);
-    if (saveBtn) { saveBtn.disabled = true; }
     if (D) {
       var p = D.primary;
       var here = scenarioAt(p[0], p[1], p[2], 'on', 'none', '0', 'no', '0', '0');
@@ -16047,7 +16297,6 @@ _FILTER_JS = r"""
     (D.category_twins || []).forEach(function(group) {
       group.forEach(function(c) { CAT_TWINS[c] = group; });
     });
-    if (saveBtn && typeof saveBtn.title === 'string') { SAVE_TITLE = saveBtn.title; }
     return load(primaryChunk());
   }).then(function(chunk) {
     if (SEQ === 0) {
@@ -16067,53 +16316,64 @@ _FILTER_JS = r"""
     });
     menusDisabled(false);
     refreshSell();
-    refreshSave();
+    // Ready: the tab page, on a page shown in its frame, is told so once, and
+    // answers with the Trading tab's proposal (applyQuery)
+    READY = true;
+    tell({type: 'kalshi-ready'});
   }, function(err) { unavailable(String(err)); });
 
-  [bandSel, kSel, capSel].forEach(function(sel) {
-    sel.addEventListener('change', function() {
+  // A reader's choice: the settings it picks (PENDING, see TRADING), then
+  // its scenario drawn
+  function readerChose(settings) {
+    settings.forEach(function(s) { PENDING[s] = true; });
+    choose(true);
+  }
+  [[bandSel, 'band'], [kSel, 'k'], [capSel, 'cap']].forEach(function(entry) {
+    entry[0].addEventListener('change', function() {
       if (!D) { return; }
-      choose();
+      readerChose([entry[1]]);
     });
   });
   tierSel.addEventListener('change', function() {
     // Nothing to switch to without a tier-off view (the select stays shut)
     if (!D || !D.grid_off) { return; }
     relabelBands();
-    choose();
+    readerChose(['tier']);
   });
   rebalanceSel.addEventListener('change', function() {
     // Nothing to switch to without the Rebalance view (the select stays shut)
     if (!D || !D.grid_rebalance) { return; }
     // Sell goes to no level and shuts while Rebalance is yes, and opens again
     // when it goes back to no; the Min. price movement and "Rebalance until"
-    // selects open with yes
+    // selects open with yes. Each of them counts as picked: the bar shows
+    // the values Rebalance opens or shuts them on
     refreshSell();
-    choose();
+    readerChose(['rebalance', 'move', 'until', 'sell', 'days']);
   });
   moveSel.addEventListener('change', function() {
     // The minimum counts only while Rebalance is yes, on a page that carries
     // the minimums (the select is shut otherwise)
     if (!D || !D.grid_move || !rebalanceOn(rebalanceSel.value)) { return; }
-    choose();
+    readerChose(['move']);
   });
   untilSel.addEventListener('change', function() {
     // The days count only while Rebalance is yes, on a page that carries the
     // choices (the select is shut otherwise)
     if (!D || !D.grid_maturity || !rebalanceOn(rebalanceSel.value)) { return; }
-    choose();
+    readerChose(['until']);
   });
   sellSel.addEventListener('change', function() {
     // Nothing to switch to without the Sell view (the select stays shut)
     if (!D || !D.sell_blocks) { return; }
     // The Min. days select opens with a level and shuts when Sell names none
+    // (picked with it: the bar shows the minimum the level opens it on)
     refreshDays();
-    choose();
+    readerChose(['sell', 'days']);
   });
   daysSel.addEventListener('change', function() {
     // The days count only while Sell names a level (the select is shut otherwise)
     if (!D || !D.sell_blocks || sellAt(sellSel.value) === null) { return; }
-    choose();
+    readerChose(['days']);
   });
   // A box of a menu was ticked or unticked (the event names the box). The
   // ticks are put in order first. The category "All" box leaves out every
@@ -16163,7 +16423,7 @@ _FILTER_JS = r"""
     var key = pickKey();
     if (key === PICK) { return; }
     PICK = key;
-    choose();
+    readerChose(['names']);
   }
   catMenu.addEventListener('change', function(ev) { onTick(catMenu, ev); });
   tagMenu.addEventListener('change', function(ev) { onTick(tagMenu, ev); });
@@ -16185,14 +16445,251 @@ _FILTER_JS = r"""
       renderKhat();
     });
   }
-  // The save button opens the confirmation page for the scenario on screen
-  // in a new tab; that page saves nothing until Confirm and save, or Confirm
-  // and trade, is clicked there
-  if (saveBtn) {
-    saveBtn.addEventListener('click', function() {
-      var href = saveHref();
-      if (saveBtn.disabled || href === null) { return; }
-      window.open(href, '_blank', 'noopener');
+  // ── The Trading tab's proposal, shown on the bar ─────────────────────────
+  // A query as the trading page writes it (Python's urlencode: each field as
+  // name=value, joined by &, a space as + and every other character outside
+  // a URL's own as %XX), read into each field's values in order, or null
+  // when it cannot be read. Read by hand: not every runtime the page's tests
+  // run under has URLSearchParams
+  function parseQuery(query) {
+    var out = Object.create(null);
+    function decode(text) { return decodeURIComponent(text.replace(/\+/g, ' ')); }
+    try {
+      query.split('&').forEach(function(part) {
+        if (part === '') { return; }
+        var at = part.indexOf('=');
+        var name = decode(at < 0 ? part : part.slice(0, at));
+        var value = at < 0 ? '' : decode(part.slice(at + 1));
+        (out[name] = out[name] || []).push(value);
+      });
+    } catch (err) {
+      return null;
+    }
+    return out;
+  }
+  // A number as the query writes it (Python's repr of the float, or a whole
+  // number of days), or null for anything else
+  function queryNumber(text) {
+    if (typeof text !== 'string' || !/^-?[0-9.]+(e[-+]?[0-9]+)?$/i.test(text)) { return null; }
+    var x = Number(text);
+    return isFinite(x) ? x : null;
+  }
+  // The place of the entry whose value is exactly x (for a band, whose value
+  // is its two ends, exactly x and y) in a list of the base block's entries,
+  // or -1. Exact, never within a tolerance: the query and the page both
+  // write Python's own floats, so a setting on the page's grid reads back as
+  // that very number, and the bar then tells back exactly the setting the
+  // Trading tab proposed
+  function placeOf(entries, x, y) {
+    for (var i = 0; i < entries.length; i++) {
+      var v = entries[i].value;
+      if (y === undefined ? v === x : (!!v && v[0] === x && v[1] === y)) { return i; }
+    }
+    return -1;
+  }
+  // The place of a name among n listed ones (nameOf(i)): exactly, else
+  // regardless of letter case (toLowerCase); -1 when none is. Two names
+  // alike in lower case are alike in Python's casefold too, which the live
+  // filter and the page's twin groups go by, so a name is never matched to
+  // one the live filter tells apart; a rarer spelling casefold alone joins
+  // (ß and ss) is not matched, and so is kept as the Trading tab has it and
+  // named as not listed (syncPairs, wanted)
+  function nameAt(n, nameOf, name) {
+    var folded = -1, lower = name.toLowerCase();
+    for (var i = 0; i < n; i++) {
+      var listed = nameOf(i);
+      if (listed === name) { return i; }
+      if (folded < 0 && listed.toLowerCase() === lower) { folded = i; }
+    }
+    return folded;
+  }
+  // What the bar shows for a proposal: each select's value and the menus'
+  // ticks (every category and tag it excludes, with their letter-case twins,
+  // a tag of a category excluded left out as the menus leave it out), each
+  // setting the proposal leaves out, or the bar cannot show, kept as it
+  // stands; and, in the bar's order, the words naming each setting the bar
+  // cannot show (missing): a value off the page's choices, a choice of a
+  // view the page lacks, a category or tag its menus do not list, or a sell
+  // level beside rebalancing, which the bar never shows together (it shows
+  // the rebalancing)
+  function wanted(q) {
+    var T = D.text, F = T.sync_fields, missing = [];
+    function one(name) { var v = q[name]; return v && v.length ? v[0] : null; }
+    function miss(template, field, value) {
+      missing.push(fill(template, {field: F[field], value: value}));
+    }
+    var w = {b: bandIndex(), k: kIndex(), c: capIndex(), t: tierSel.value,
+             r: rebalanceSel.value, m: moveSel.value, u: untilSel.value,
+             s: sellSel.value, d: daysSel.value, ex: [], tags: [], missing: missing};
+    var low = one('spread_min'), high = one('spread_max');
+    if (low !== null && high !== null) {
+      var b = placeOf(D.bands, queryNumber(low), queryNumber(high));
+      if (b >= 0) { w.b = b; }
+      else { miss(T.sync_off_grid, 'band', fill(T.sync_band_value, {low: low, high: high})); }
+    }
+    var tier = one('tier_floors');
+    if (tier === 'on') { w.t = 'on'; }
+    else if (tier === 'off') {
+      if (D.grid_off) { w.t = 'off'; } else { miss(T.sync_no_view, 'tier', T.sync_off); }
+    }
+    var k = one('k');
+    if (k !== null) {
+      var ki = placeOf(D.ks, queryNumber(k));
+      if (ki >= 0) { w.k = ki; } else { miss(T.sync_off_grid, 'k', k); }
+    }
+    var cap = one('size_cap');
+    if (cap !== null) {
+      var ci = placeOf(D.caps, queryNumber(cap));
+      if (ci >= 0) { w.c = ci; } else { miss(T.sync_off_grid, 'cap', cap); }
+    }
+    // Rebalance with its minimum price movement and "Rebalance until" days,
+    // each shown only on a page with its view; with Rebalance no both are
+    // shut and keep their values
+    var rebalance = one('rebalance'), move = one('min_price_move');
+    var until = one('rebalance_min_days_to_maturity');
+    var moving = move !== null && move !== 'off', limited = until !== null && until !== '0';
+    if (rebalance === 'off') {
+      w.r = 'no';
+    } else if (rebalance === 'on' && !D.grid_rebalance) {
+      miss(T.sync_no_view, 'rebalance', T.sync_on);
+      if (moving) { miss(T.sync_no_view, 'move', move); }
+      if (limited) { miss(T.sync_no_view, 'until', until); }
+    } else if (rebalance === 'on') {
+      w.r = 'yes';
+      if (!moving) { w.m = '0'; }
+      else {
+        var mi = D.grid_move ? placeOf(D.moves, queryNumber(move)) : -1;
+        if (mi >= 0) { w.m = String(mi + 1); }
+        else { miss(D.grid_move ? T.sync_off_grid : T.sync_no_view, 'move', move); }
+      }
+      if (!limited) { w.u = '0'; }
+      else {
+        var ui = D.grid_maturity ? placeOf(D.maturity, queryNumber(until)) : -1;
+        if (ui >= 0) { w.u = String(ui + 1); }
+        else { miss(D.grid_maturity ? T.sync_off_grid : T.sync_no_view, 'until', until); }
+      }
+    }
+    // Sell with its minimum of days, shown only on a page with the Sell view
+    // and only with Rebalance no; with no sell level the days are shut
+    var sell = one('sell_at'), days = one('sell_min_days');
+    var dated = days !== null && days !== 'off';
+    if (sell === 'off') {
+      w.s = 'none';
+    } else if (sell !== null) {
+      var why = null;
+      if (rebalanceOn(w.r)) { why = T.sync_not_with; }
+      else if (!D.sell_blocks) { why = T.sync_no_view; }
+      else {
+        var li = placeOf(D.sell_levels, queryNumber(sell));
+        if (li >= 0) { w.s = String(li); } else { why = T.sync_off_grid; }
+      }
+      if (why !== null) {
+        // Named with its minimum of days, unless only the level is off the
+        // page's choices
+        miss(why, 'sell', sell);
+        if (dated && why !== T.sync_off_grid) { miss(why, 'days', days); }
+      } else if (!dated) {
+        // No minimum of days is not among the page's choices (it starts at 1)
+        miss(T.sync_off_grid, 'days', T.sync_any);
+      } else {
+        var di = placeOf(D.sell_days, queryNumber(days));
+        if (di >= 0) { w.d = String(di); } else { miss(T.sync_off_grid, 'days', days); }
+      }
+    }
+    if (rebalanceOn(w.r)) { w.s = 'none'; }
+    var ex = [], tags = [];
+    (q.exclude_category || []).forEach(function(name) {
+      var c = nameAt(D.categories.length, function(i) { return D.categories[i]; }, name);
+      if (c < 0) { miss(T.sync_unlisted, 'category', name); }
+      else if (ex.indexOf(c) < 0) { ex.push(c); }
+    });
+    (q.exclude_tag || []).forEach(function(name) {
+      var t = nameAt(D.subcats.length, function(i) { return subName(i, true); }, name);
+      if (t < 0) { miss(T.sync_unlisted, 'tag', name); }
+      else if (tags.indexOf(t) < 0) { tags.push(t); }
+    });
+    w.ex = withTwins(ex, CAT_TWINS).sort(ascending);
+    w.tags = withTwins(tags, TAG_TWINS).filter(function(t) {
+      return w.ex.indexOf(D.subcats[t][0]) < 0;
+    }).sort(ascending);
+    return w;
+  }
+  // A bar state as one string, each choice read as it counts: a shut
+  // minimum, days limit or minimum of days, and the choice of a view the
+  // page lacks, count as nothing, and the ticks as what they exclude
+  // (syncLists: a kept category with every tag ticked is that category), so
+  // two states showing the same scenario read alike
+  function stateKey(b, k, c, ex, tags, t, r, s, d, m, u) {
+    var level = sellAt(s), lists = syncLists(ex, tags);
+    return [b, k, c, lists.cats.join(','), lists.tags.join(','), lists.split ? 'split' : '',
+            offAt(t) ? 'off' : 'on', rebalanceOn(r) ? 'yes' : 'no', moveAt(r, m),
+            untilAt(r, u), level === null ? '' : level, level === null ? '' : d].join('|');
+  }
+  // The bar's selects and ticks as they stand: the scenario on screen, or
+  // the one a proposal still loading will draw
+  function barKey() {
+    return stateKey(bandIndex(), kIndex(), capIndex(), excludedCats(), tagTicks(),
+                    tierSel.value, rebalanceSel.value, sellSel.value, daysSel.value,
+                    moveSel.value, untilSel.value);
+  }
+  // Show the Trading tab's proposal on the bar: every setting the bar can
+  // show is chosen, every category and tag it excludes ticked with its
+  // letter-case twins, and that scenario drawn as a reader's choice would
+  // be, but the Trading tab is told nothing back (choose with reader false).
+  // The proposal becomes what the bar keeps for every setting the reader
+  // has not picked since (TRADING, PICKED), and the red note names each
+  // setting the bar cannot show (D.text.sync_not_here), or is cleared.
+  // Nothing more is done when the selects and ticks already name that
+  // scenario (on screen, or a proposal's still loading). While a choice the
+  // reader made is still loading (SETTLING), the proposal is only kept
+  // (DEFERRED), and becomes what that choice keeps for the settings it did
+  // not pick: once it settles it is shown (settled)
+  function applyQuery(query) {
+    var q = parseQuery(query);
+    if (q === null) { return; }
+    if (SETTLING) {
+      DEFERRED = query;
+      TRADING = q;
+      return;
+    }
+    var w = wanted(q);
+    TRADING = q;
+    PICKED = {};
+    PENDING = {};
+    UNSHOWN = false;
+    setText('flt-sync-note', proposalNote(w.missing));
+    if (stateKey(w.b, w.k, w.c, w.ex, w.tags, w.t, w.r, w.s, w.d, w.m, w.u) === barKey()) {
+      return;
+    }
+    bandSel.value = String(w.b);
+    tierSel.value = w.t;
+    relabelBands();
+    kSel.value = String(w.k);
+    capSel.value = String(w.c);
+    rebalanceSel.value = w.r;
+    moveSel.value = w.m;
+    untilSel.value = w.u;
+    sellSel.value = w.s;
+    daysSel.value = w.d;
+    setTicks(w.ex, w.tags);
+    refreshMenus();
+    PICK = pickKey();
+    refreshSell();
+    choose(false);
+  }
+  // The Trading tab's proposal, from the dashboard's tab page: listened for
+  // only on a page shown in its frame, taken only from that window at one of
+  // its two addresses (the browser sets e.source and e.origin, so no other
+  // page can claim them), only as {type: 'kalshi-apply', query: '<query>'},
+  // and only once the bar is ready
+  if (FRAMED && window.addEventListener) {
+    window.addEventListener('message', function(e) {
+      var m = e.data;
+      if (!READY || !D || !D.sync || e.source !== window.parent
+          || D.sync.dashboard_origins.indexOf(e.origin) < 0) { return; }
+      if (!m || typeof m !== 'object' || m.type !== 'kalshi-apply'
+          || typeof m.query !== 'string') { return; }
+      applyQuery(m.query);
     });
   }
 })();
@@ -16222,8 +16719,8 @@ def generate_dashboard(
     Calls each _section_*() builder in order and streams the resulting HTML
     fragments into a full page with an embedded Plotly CDN script tag — plus
     the page-wide filter: the sticky bar under the header lines
-    (_filter_bar_html, with its "Save as live defaults…" button, whose
-    confirmation-page address and source note are _save_target's), one
+    (_filter_bar_html, which the live dashboard's Trading tab follows, with
+    the tab page's addresses and the source note of _sync_target), one
     packed chunk per distinct scenario trade list
     (tier-floors-off scenarios included, when the run carries that family),
     the first of them (the run's own scenario) written into the page after
@@ -16283,7 +16780,11 @@ def generate_dashboard(
     (_publish_page), so the page in place always has its folder, and a build
     still writing its own is never touched; a page that fails to be written
     deletes its own new folder and leaves the previous page and folder. The
-    page and its folder are kept, copied and moved together.
+    page and its folder are kept, copied and moved together. Once the page
+    is published, the names its filter bar's Exclude menus list are written
+    beside it (_write_filter_names, config.BACKTEST_FILTER_NAMES_FILENAME),
+    for the Trading tab's own menus; a page whose bar could not be built
+    leaves no such file.
 
     The two sweep-related parameters are keyword-only with defaults, so a
     four-argument positional call works. Omit both and
@@ -16379,7 +16880,7 @@ def generate_dashboard(
             not be read; or "set by --balance". None (default) shows the
             amount alone.
         period_end (date | None): The window's last day, for the Period line
-            and the save button's source note. backtest.py passes the UTC day
+            and the source note the bar proposes. backtest.py passes the UTC day
             its run finished the sweep on, which it also saves, so a page
             rebuilt from the saved sweep on a later day (--dashboard-only)
             still names the run's own last day. None (default) is today (UTC).
@@ -16586,10 +17087,10 @@ def generate_dashboard(
                 # (it has a tier-floors-off view): only then does the line
                 # say its selects follow the bar's Tier floors choice
                 explorer_tiers=explorer_grid and explorer_data.tier_select,
-                # The save button's fixed part of the defaults server's
-                # confirmation-page address (the source note), and what the
-                # saved live defaults do, for the notes beside the button
-                save=_save_target(sweep, start_date, today),
+                # Where the bar talks to the Trading tab, the source note and
+                # the defaults server's limits, and what the saved live
+                # defaults do, for the notes beside the menus
+                sync=_sync_target(sweep, start_date, today),
                 # Why the Rebalance select stays shut, should it: a run that
                 # carried the family but shows no view of it could not use or
                 # build it (the log says why); one that carried none has
@@ -16626,13 +17127,13 @@ def generate_dashboard(
         chunks = []
         sell_blocks = []
     if filter_bar is None:
-        # The notice in the bar's place, and the trade link, which needs no bar
+        # The notice in the bar's place
         filter_data, chunks, sell_blocks = None, [], []
         if build_folder is not None:
             # No script will load the Sell select's files
             shutil.rmtree(build_folder, ignore_errors=True)
             build_folder = None
-        filter_bar = _FILTER_UNAVAILABLE_HTML + "\n" + _trade_paragraph_html()
+        filter_bar = _FILTER_UNAVAILABLE_HTML
         # Without the bar the section cannot follow it, whatever was built
         kd, kd_failed = None, False
     if explores and explorer_data is None and not explorer_failed:
@@ -16797,5 +17298,8 @@ def generate_dashboard(
         if not published and build_folder is not None:
             # The previous page stays, and reads its own folder
             shutil.rmtree(build_folder, ignore_errors=True)
+    # The names the page's Exclude menus list, for the Trading tab's own menus
+    # (a page whose bar could not be built lists none, and leaves no file)
+    _write_filter_names(out_path, filter_data)
     logging.info("Dashboard written: %s", out_path)
     return out_path

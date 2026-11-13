@@ -43,9 +43,9 @@ Dependencies:
     DASHBOARD_FILES_DIRNAME, EDA_DASHBOARD_FILENAME, LIVE_DASHBOARD_PERIODS,
     LIVE_DASHBOARD_FRAME_UNLOAD_SECONDS, LIVE_CANDLE_DAY_ZONE,
     RISK_FREE_BILL_TERM, count_text, and DEFAULTS_SERVER_HOST,
-    DEFAULTS_SERVER_PORT, DEFAULTS_SERVER_MAX_REQUEST_BYTES and
-    DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES: where the live-defaults server's
-    pages are, and the longest address it takes); live_portfolio (build_live_view,
+    DEFAULTS_SERVER_PORT and TRADING_QUERY_MAX_BYTES: where the live-defaults
+    server's pages are, and the longest proposal its trading page's address
+    may carry); live_portfolio (build_live_view,
     append_snapshot, trade_log_paths, OTHER_BETS and the view's types);
     historical (build_prod_live_client, the production client, built on the
     first read; load_series_categories, the categories the bot's purchases
@@ -71,8 +71,8 @@ Notes:
     different web origin, so their scripts (and the chart library they load
     from the web) cannot read the account data; each may be framed only by
     the tab page, in a sandboxed frame that cannot navigate the tab page,
-    and no other web site may load them or the chunk files except by
-    navigating to them.
+    open a window or send a form, and no other web site may load them or
+    the chunk files except by navigating to them.
 
     The Trading and Run frames hold the live-defaults server's own pages,
     on that server's own origin: the tab page cannot read them or press
@@ -114,11 +114,14 @@ Notes:
     config.DEFAULTS_SERVER_CONFIRM_ARM_MS (one second) and the mouse moves
     or a key is pressed (the arming delay, the defaults server's guard
     against a click aimed elsewhere), and a browser counts a page in a
-    hidden frame as visible. So a trading page loaded, or finished loading,
-    while the Trading tab was hidden is loaded again when that tab is
-    chosen, and its arming delay runs while the reader can see it. Once the
-    reader is on the Trading tab, the tab page loads nothing into its frame
-    but what the Reload button asks for.
+    hidden frame as visible. So each time the reader comes to the Trading
+    tab from another, the trading page is loaded again in a fresh frame, for
+    the proposal last reported: its buttons are drawn off and its arming
+    delay runs while the reader can see it. While the reader is on the
+    Trading tab, the tab page loads nothing into its frame but what the
+    Reload button asks for (the tab's own button clicked again loads
+    nothing, so it never cuts off a press of Dry run or Confirm and trade on
+    its way to the server).
 
     Every number and sentence the page shows is formatted here (payload);
     the page's script only places them. One read of the account runs at a
@@ -1250,15 +1253,11 @@ TRADING_URL = f"{_DEFAULTS_ORIGIN}/confirm"
 RUN_URL = f"{_DEFAULTS_ORIGIN}/runs/"
 # The longest proposal (the query after "?") the tab page puts on the trading
 # page's address, counted as the browser sends it (the page's script counts
-# each apostrophe as three characters, since the browser writes it as %27).
-# The address must fit both of that server's limits: its own on a request's
-# path (config.DEFAULTS_SERVER_MAX_REQUEST_BYTES) and its HTTP layer's on the
-# request line, "GET <path> HTTP/1.1" and its line break
-# (config.DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES), the tighter of the two
-_TRADING_QUERY_MAX = min(
-    config.DEFAULTS_SERVER_MAX_REQUEST_BYTES - len(urllib.parse.urlsplit(TRADING_URL).path + "?"),
-    config.DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES
-    - len(f"GET {urllib.parse.urlsplit(TRADING_URL).path}? HTTP/1.1\r\n"))
+# each apostrophe as three characters, since the browser writes it as %27):
+# config's one limit, which fits both of that server's limits on a request and
+# which the backtest page's bar keeps to as well, so the bar never sends a
+# choice this page would refuse
+_TRADING_QUERY_MAX = config.TRADING_QUERY_MAX_BYTES
 
 # Every answer on the tab page's port that is not the page itself: never
 # stored, never sniffed, never framed, never loaded by another origin's page,
@@ -1707,12 +1706,9 @@ _SCRIPT_TEMPLATE = """
   // shows. A message is taken only from the frame and the origin expected,
   // and only a query made of characters a URL-encoded query holds, at most
   // MAX_QUERY of them as the browser sends it, or a run id of 16 hexadecimal
-  // digits, is ever put on an address. UNSEEN says the trading page in its
-  // frame was loaded, or finished loading, while the Trading tab was hidden:
-  // its buttons arm once it has been visible for a second, and the browser
-  // counts a page in a hidden frame as visible, so choosing the tab loads it
-  // again. FROM_BAR says the trading page now loading was asked for by a
-  // choice on the backtest bar and has not reported yet
+  // digits, is ever put on an address. FROM_BAR says the trading page now
+  // loading was asked for by a choice on the backtest bar and has not
+  // reported yet
   var DEFAULTS_ORIGIN = __DEFAULTS_ORIGIN__;
   var BACKTEST_ORIGIN = __BACKTEST_ORIGIN__;
   var TRADING_URL = __TRADING_URL__;
@@ -1722,7 +1718,6 @@ _SCRIPT_TEMPLATE = """
   var RUN_ID = /^[0-9a-f]{16}$/;
   var QUERY = null;
   var RUN = null;
-  var UNSEEN = false;
   var FROM_BAR = false;
 
   function byId(id) { return document.getElementById(id); }
@@ -1853,14 +1848,20 @@ _SCRIPT_TEMPLATE = """
   }
 
   function tab(name) {
+    var before = SHOWN;
     SHOWN = name;
     TABS.forEach(function (t) {
       byId('tab-' + t).setAttribute('aria-selected', t === name ? 'true' : 'false');
       byId('panel-' + t).hidden = t !== name;
     });
-    // A trading page that armed its buttons out of sight is loaded again,
-    // now that the reader can see it
-    if (name === 'trading' && UNSEEN) { loadTrading(false); }
+    // The trading page is loaded again, in a fresh frame, every time the
+    // reader comes to its tab: its buttons arm once it has been visible for
+    // a second, and a browser counts a page in a hidden frame as visible, so
+    // a page that armed out of sight is never the one the reader clicks.
+    // Its tab clicked while it is shown loads nothing, so a press of one of
+    // its buttons still on its way (whose answer opens the page of the run)
+    // is never cut off
+    if (name === 'trading' && before !== 'trading') { loadTrading(false); }
     Object.keys(FRAMES).forEach(function (t) {
       if (t === name) {
         // Back before the delay: the frame stays as it was left
@@ -1927,11 +1928,9 @@ _SCRIPT_TEMPLATE = """
   }
 
   // Load the trading page for the proposal kept, with fresh buttons, noting
-  // whether the reader can see it load and whether a choice on the backtest
-  // bar (fromBar) asked for it
+  // whether a choice on the backtest bar (fromBar) asked for it
   function loadTrading(fromBar) {
     point('trading-frame', tradingPage());
-    UNSEEN = SHOWN !== 'trading';
     FROM_BAR = fromBar;
   }
 
@@ -1953,7 +1952,6 @@ _SCRIPT_TEMPLATE = """
         var echo = FROM_BAR && SHOWN === 'backtest';
         FROM_BAR = false;
         QUERY = m.query;
-        if (SHOWN !== 'trading') { UNSEEN = true; }
         if (!echo) { toBacktest(); }
       } else if (m.type === 'kalshi-run' && typeof m.run === 'string' && RUN_ID.test(m.run)) {
         // A run started from the Trading tab: its page moves to the Run tab
@@ -1999,10 +1997,9 @@ _SCRIPT_TEMPLATE = """
   }
   // Loaded at once, so the trading page and the bar of the backtest page
   // both open on the live defaults in force (the first page a frame loads
-  // adds no step to the Back history). The Live trading tab is the one
-  // shown, so the page is loaded again when the Trading tab is first chosen
+  // adds no step to the Back history); it is loaded again when the Trading
+  // tab is chosen, as every time
   byId('trading-frame').src = TRADING_URL;
-  UNSEEN = true;
   load();
 })();
 """
@@ -2127,20 +2124,19 @@ summary {{ color: var(--ink-2); cursor: pointer; }}
 
 
 # What the backtest page may do in its frame: run its scripts in its own
-# origin (its chunk files), open the defaults server's pages in a window of
-# their own (their forms then work, outside the frame's limits) and save a
-# chart's picture; never navigate the tab page itself. It must never be
+# origin (its chunk files) and save a chart's picture; never navigate the tab
+# page itself, and never open a window (it tells the tab page its bar's
+# choice by a message, and the Trading tab shows it). It must never be
 # allowed to send a form (allow-forms): the tab page lets any of its frames
 # load the live-defaults server's pages (frame-src), so this page could point
 # its own frame at the trading page, whose buttons send a form and must do
 # nothing there
-_FRAME_SANDBOX = ("allow-scripts allow-same-origin allow-popups "
-                  "allow-popups-to-escape-sandbox allow-downloads")
+_FRAME_SANDBOX = "allow-scripts allow-same-origin allow-downloads"
 
 # What the Data page may do in its frame: only what its charts need (its
-# script and Plotly, in its own origin, and a chart's picture saved). It
-# opens no window, so it gets no pop-up permission, and it must never be
-# allowed to send a form, for the reason the backtest page's frame must not
+# script and Plotly, in its own origin, and a chart's picture saved). Like
+# the backtest page it opens no window, and it must never be allowed to send
+# a form, for the reason the backtest page's frame must not
 _DATA_FRAME_SANDBOX = "allow-scripts allow-same-origin allow-downloads"
 
 # What the trading page may do in its frame: run its scripts and send its own

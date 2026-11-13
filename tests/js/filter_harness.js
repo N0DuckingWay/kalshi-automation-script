@@ -24,6 +24,17 @@
 // window.open records each call — {url, target, features} — in __opened and
 // opens nothing (it returns null, as a "noopener" open does).
 //
+// Frames: the page runs on its own by default, its window.parent the window
+// itself, as a page opened outside any frame. __frame() (the tests'
+// framed=True) shows it in a frame instead: window.parent is then another
+// window, whose postMessage records each message and its target origin —
+// {message, origin} — in __posted (a snapshot's "posted": every message the
+// page sent since the last snapshot, in order). window.addEventListener
+// records listeners by event type, and a ["message", origin, source, data]
+// step hands {origin, source, data} to each "message" listener, as a
+// browser delivers a message: source "parent" is window.parent, "self" the
+// page's own window, anything else a window of some other page.
+//
 // Check-box menus (page.menus): the filter bar's Exclude categories and
 // Exclude tags menus, each a <details> element of check boxes (__menu below). A ["tick",
 // id] step is a reader clicking a box: it flips, and its change event runs
@@ -77,6 +88,11 @@ var __PENDING = {};
 var __inflated = [];
 // Every window.open call since the last snapshot, in order
 var __opened = [];
+// Every message the page posted to its parent window since the last
+// snapshot, in order ({message, origin}), and the listeners the page put on
+// its window, by event type
+var __posted = [];
+var __WINDOW_LISTENERS = {};
 // The sidecar files the page may load (src -> chunk), the ones that hand
 // nothing over, the ones that hand over a block that cannot be inflated, the
 // ones whose load waits for a step, the loads waiting, by src, and every src
@@ -393,7 +409,24 @@ var window = {Plotly: Plotly, DecompressionStream: function() {}, Response: func
               open: function(url, target, features) {
                 __opened.push({url: url, target: target, features: features});
                 return null;
+              },
+              addEventListener: function(type, fn) {
+                (__WINDOW_LISTENERS[type] = __WINDOW_LISTENERS[type] || []).push(fn);
               }};
+// A page opened on its own: its parent is its own window
+window.parent = window;
+// Another page's window, for a message that comes from neither the parent nor
+// the page itself
+var __STRANGER = {postMessage: function() {}};
+// Show the page in a frame: its parent becomes the frame's page (the live
+// dashboard's tab page), whose postMessage records what the page sends it
+function __frame() {
+  window.parent = {
+    postMessage: function(message, origin) {
+      __posted.push({message: JSON.parse(JSON.stringify(message)), origin: origin});
+    }
+  };
+}
 
 // The page scripts' inflate(el): the block of that element, already inflated
 // (a fresh copy each time, as a real inflate parses one). A missing element
@@ -460,7 +493,7 @@ function __setup(page) {
 // as it stands now, since a later step can still change it
 function __snapshot() {
   var snap = {reacts: __reacts, updates: __updates, inflated: __inflated.slice(),
-              opened: __opened, files: __files.slice(),
+              opened: __opened, posted: __posted, files: __files.slice(),
               text: {}, html: {}, display: {}, heights: {}, ownHeights: {},
               colors: {}, selects: {}, menus: {}, buttons: {}, titles: {}, rows: {},
               weights: {},
@@ -469,6 +502,7 @@ function __snapshot() {
   __reacts = [];
   __updates = [];
   __opened = [];
+  __posted = [];
   // Each check-box menu: its button's text, whether it is open, greyed
   // (className) and disabled, whether its "All" box is ticked, the row
   // indexes ticked, and every row as [text, ticked, hidden] — and, read as a
@@ -566,7 +600,8 @@ function __spin(ticks, next) {
 // (a damaged sidecar file reads again),
 // ["call", name, args] (a page script's window function, called as another
 // script would — the filter's window.dashScenarioSelect call, with any
-// labels), ["click", id] (a reader clicking that element: its click
+// labels), ["message", origin, source, data] (a message delivered to the
+// page's window, above), ["click", id] (a reader clicking that element: its click
 // listeners run unless it is disabled), ["tick", id] (a reader clicking a
 // check box of a menu), ["open", id] (a reader opening a menu), ["outside",
 // id] (a click elsewhere on the page), ["key", name] (a key pressed),
@@ -650,6 +685,11 @@ function __step(steps, i) {
     delete __SIDECAR_DAMAGED[s[1]];
   } else if (s[0] === 'call') {
     window[s[1]].apply(null, s[2]);
+  } else if (s[0] === 'message') {
+    var from = s[2] === 'parent' ? window.parent : (s[2] === 'self' ? window : __STRANGER);
+    (__WINDOW_LISTENERS.message || []).forEach(function(fn) {
+      fn({origin: s[1], source: from, data: s[3]});
+    });
   } else if (s[0] === 'click') {
     var clicked = document.getElementById(s[1]);
     if (!clicked.disabled) {
