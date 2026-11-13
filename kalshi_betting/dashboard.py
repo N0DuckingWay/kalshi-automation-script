@@ -16221,6 +16221,11 @@ _FILTER_JS = r"""
   // choice that cannot be drawn puts every select back (putBack, refuseMix),
   // then undone says what that means for the Trading tab
   function choose(reader) {
+    // Before the bar has a scenario on screen (its base block or its primary
+    // scenario's chunk could not be loaded, so its selects stay shut) there
+    // is nothing to draw from and nothing to put a choice back to: a change
+    // then does nothing, and the Trading tab is told nothing
+    if (SHOWN === null) { return; }
     var seq = ++SEQ, id = cellChunk();
     SETTLING = false;
     if (id === undefined) {
