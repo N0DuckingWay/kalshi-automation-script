@@ -1491,15 +1491,20 @@ _JSC = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Help
 
 # A stand-in for the few browser pieces the page script touches: its buttons
 # (those whose ids __PRESENT__ lists, each in the one form), a placeholder with
-# no id, the page's visibility, event listeners a step fires, and timers that
-# run only when a step says so. The script runs inside a function whose
-# parameters are these stand-ins, so neither runtime's own globals are
-# replaced. The steps follow: ["fire", event], ["show", "visible" | "hidden"]
+# no id, the page's visibility and its body's inert switch, event listeners a
+# step fires, timers that run only when a step says so, and the window (its
+# parent, the dashboard's tab page when __FRAMED__, else itself, which
+# records every message posted to it). The script runs inside a function
+# whose parameters are these stand-ins, so neither runtime's own globals are
+# replaced. The steps follow: ["fire", event] (an event with no target),
+# ["fire_in", event, "form" | "bar"] (the event of an element in the form
+# that posts, or in another one: the bar's), ["show", "visible" | "hidden"]
 # (sets the visibility and fires visibilitychange), ["submit"] (fires the
 # form's submit listeners, as a click on a button does), ["elapse"] (runs
 # every pending timer) and ["snap", label] (records each button's disabled
-# flag, the placeholder's, the pending timers' delays and the events the page
-# and the form listen for); the records are printed as one JSON line.
+# flag, the placeholder's, the pending timers' delays, the events the page
+# and the form listen for, whether the body is inert and the messages posted
+# so far); the records are printed as one JSON line.
 _CONFIRM_HARNESS = """
 var __emit = (typeof print === 'function') ? print : function(s) { console.log(s); };
 var __listeners = {};
@@ -1514,7 +1519,14 @@ var __form = {
 var __buttons = {};
 __PRESENT__.forEach(function(id) { __buttons[id] = {disabled: true, form: __form}; });
 var __placeholder = {disabled: true, form: __form};
+var __body = {inert: false};
+var __posted = [];
+var __window = {};
+__window.parent = __FRAMED__ ? {postMessage: function(message, origin) {
+  __posted.push({message: JSON.parse(JSON.stringify(message)), origin: origin});
+}} : __window;
 var __document = {
+  body: __body,
   visibilityState: __VISIBILITY__,
   getElementById: function(id) {
     return Object.prototype.hasOwnProperty.call(__buttons, id) ? __buttons[id] : null;
@@ -1528,13 +1540,16 @@ function __clearTimeout(id) { delete __timers[id]; }
 function __fire(table, type) {
   (table[type] || []).forEach(function(fn) { fn({type: type}); });
 }
-(function(document, setTimeout, clearTimeout) {
+(function(document, setTimeout, clearTimeout, window) {
 __SCRIPT__
-})(__document, __setTimeout, __clearTimeout);
+})(__document, __setTimeout, __clearTimeout, __window);
 var __out = {};
 __STEPS__.forEach(function(step) {
   if (step[0] === 'fire') {
     __fire(__listeners, step[1]);
+  } else if (step[0] === 'fire_in') {
+    var __target = {form: step[2] === 'form' ? __form : {}};
+    (__listeners[step[1]] || []).forEach(function(fn) { fn({type: step[1], target: __target}); });
   } else if (step[0] === 'show') {
     __document.visibilityState = step[1];
     __fire(__listeners, 'visibilitychange');
@@ -1554,7 +1569,9 @@ __STEPS__.forEach(function(step) {
       placeholder: __placeholder.disabled,
       timers: Object.keys(__timers).map(function(id) { return __timers[id].ms; }).sort(),
       listeners: Object.keys(__listeners).sort(),
-      form: Object.keys(__formListeners).sort()
+      form: Object.keys(__formListeners).sort(),
+      inert: __body.inert,
+      posted: __posted.slice()
     };
   }
 });
@@ -1579,7 +1596,7 @@ def _js_runtime() -> str | None:
 
 
 def _run_confirm_script(tmp_path, steps, *, visible: bool = True,
-                        present=defaults_server._ARMED_BUTTONS) -> dict:
+                        present=defaults_server._ARMED_BUTTONS, framed: bool = False) -> dict:
     """
     Run the pages' script, byte for byte, through a list of steps.
 
@@ -1590,6 +1607,8 @@ def _run_confirm_script(tmp_path, steps, *, visible: bool = True,
         steps (list[list[str]]): The steps (see _CONFIRM_HARNESS).
         visible (bool): Whether the page is visible when the script runs.
         present (tuple[str, ...]): The ids of the page's real buttons.
+        framed (bool): Whether the page is shown in a frame (of the
+            dashboard's tab page).
 
     Returns:
         dict: Each "snap" step's record, by its label.
@@ -1600,6 +1619,7 @@ def _run_confirm_script(tmp_path, steps, *, visible: bool = True,
     program = (_CONFIRM_HARNESS
                .replace("__PRESENT__", json.dumps(list(present)))
                .replace("__VISIBILITY__", json.dumps("visible" if visible else "hidden"))
+               .replace("__FRAMED__", json.dumps(framed))
                .replace("__STEPS__", json.dumps(steps))
                .replace("__SCRIPT__", defaults_server._CONFIRM_JS))
     path = tmp_path / "confirm_script.js"
@@ -1613,7 +1633,7 @@ class TestConfirmScript:
     """The page script itself, run under node or jsc with a stand-in page."""
 
     ARM = config.DEFAULTS_SERVER_CONFIRM_ARM_MS
-    EVENTS = ["keydown", "mousemove", "visibilitychange"]
+    EVENTS = ["change", "keydown", "mousemove", "visibilitychange"]
 
     @staticmethod
     def _all(snap, value):
@@ -1687,7 +1707,7 @@ class TestConfirmScript:
         out = _run_confirm_script(tmp_path, [["elapse"], ["fire", "mousemove"],
                                              ["snap", "load"]], present=())
         assert out["load"] == {"disabled": {}, "placeholder": True, "timers": [],
-                               "listeners": [], "form": []}
+                               "listeners": [], "form": [], "inert": False, "posted": []}
 
     def test_after_a_submit_the_buttons_stay_disabled(self, tmp_path):
         out = _run_confirm_script(tmp_path, [
@@ -1702,6 +1722,63 @@ class TestConfirmScript:
         for label in ("after", "moved", "again"):
             assert self._all(out[label], True), label
             assert out[label]["placeholder"] is True
+
+    def test_after_a_submit_the_page_goes_inert(self, tmp_path):
+        # Nothing on the page can be clicked once the form is on its way, so
+        # the bar cannot ask for another page in its place (which would drop
+        # the answer, the run's page); it goes inert with the buttons, after
+        # the submission has read which button was pressed
+        out = _run_confirm_script(tmp_path, [
+            ["elapse"], ["fire", "mousemove"], ["snap", "armed"], ["submit"], ["snap", "sent"],
+            ["elapse"], ["snap", "after"]])
+        assert out["armed"]["inert"] is False and out["sent"]["inert"] is False
+        assert out["after"]["inert"] is True and self._all(out["after"], True)
+        # Not shown in a frame: it tells no one
+        assert out["after"]["posted"] == []
+
+    def test_framed_a_submit_tells_the_tab_page_a_press_is_on_its_way(self, tmp_path):
+        # The dashboard's tab page then keeps the Trading frame as it is until
+        # the answer loads, so coming back to the Trading tab cannot cut the
+        # press off; it is told at each of its two origins, nothing more
+        out = _run_confirm_script(tmp_path, [
+            ["elapse"], ["fire", "mousemove"], ["snap", "armed"], ["submit"], ["snap", "sent"]],
+            framed=True)
+        assert out["armed"]["posted"] == []
+        assert out["sent"]["posted"] == [{"message": {"type": "kalshi-sending"}, "origin": origin}
+                                         for origin in config.LIVE_DASHBOARD_ORIGINS]
+        assert json.dumps(list(config.LIVE_DASHBOARD_ORIGINS)) in defaults_server._CONFIRM_JS
+        assert "__ORIGINS__" not in defaults_server._CONFIRM_JS
+
+    def test_a_tick_in_the_bar_s_menus_turns_the_buttons_off_until_apply(self, tmp_path):
+        # A box ticked in the Exclude categories or Exclude tags menu is in
+        # neither the table nor the form until Apply asks for the page again:
+        # the buttons go off at once and nothing arms them on this page, even
+        # with the box unticked again, so no press sends what the menu no
+        # longer shows
+        out = _run_confirm_script(tmp_path, [
+            ["elapse"], ["fire", "mousemove"], ["snap", "armed"],
+            ["fire_in", "change", "bar"], ["snap", "ticked"],
+            ["fire", "mousemove"], ["fire", "keydown"], ["fire_in", "change", "bar"],
+            ["show", "hidden"], ["show", "visible"], ["elapse"], ["fire", "mousemove"],
+            ["snap", "later"]])
+        assert self._all(out["armed"], False)
+        assert self._all(out["ticked"], True) and self._all(out["later"], True)
+        # A tick before the delay ends: the buttons never arm
+        out = _run_confirm_script(tmp_path, [
+            ["fire_in", "change", "bar"], ["elapse"], ["fire", "mousemove"], ["snap", "s"]])
+        assert self._all(out["s"], True)
+        # A change with no element named counts as one too
+        out = _run_confirm_script(tmp_path, [
+            ["elapse"], ["fire", "change"], ["fire", "mousemove"], ["snap", "s"]])
+        assert self._all(out["s"], True)
+
+    def test_the_acknowledgement_box_in_the_form_leaves_the_buttons_armed(self, tmp_path):
+        # The attention banner's box sits in the form that posts and is sent
+        # with it: ticking it changes nothing the page shows
+        out = _run_confirm_script(tmp_path, [
+            ["elapse"], ["fire_in", "change", "form"], ["fire", "mousemove"], ["snap", "s"],
+            ["fire_in", "change", "form"], ["snap", "again"]])
+        assert self._all(out["s"], False) and self._all(out["again"], False)
 
 
 class TestHome:
@@ -2223,6 +2300,14 @@ class TestTradingBar:
         # The bar's hidden fields are not the posting form's
         assert ("spread_min", "0.2") in page.hidden and len(
             [n for n, _ in page.hidden if n == "spread_min"]) == 1
+
+    def test_each_menu_says_its_ticks_wait_for_apply(self):
+        # A tick turns the buttons off until Apply (the arming script): a grey
+        # line under each menu's Apply button says so
+        body = _get(_app(), "/confirm").body
+        line = (f"<button type=\"submit\">{defaults_server._BAR_APPLY}</button>"
+                f"<p class=\"note\">{html.escape(defaults_server._BAR_APPLY_NOTE)}</p></div>")
+        assert body.count(line) == 2
 
     def test_each_dropdown_shows_the_proposal_in_the_table_s_words(self):
         page = self._page(_FULL_BASE)

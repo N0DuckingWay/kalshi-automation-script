@@ -1096,7 +1096,9 @@ values.
   until only "maturity"; with no sell level, Min. days to maturity only
   "any"). Choosing a value loads the page again, proposing it, and saves
   nothing; until the new page arrives, nothing on the old one can be clicked.
-  The two Exclude menus send their ticks with their Apply button. They list
+  The two Exclude menus send their ticks with their Apply button; a tick
+  turns the three buttons below off until Apply has loaded the page again,
+  since the table and the buttons show the ticks only then. They list
   every name the proposal excludes, then the categories and tags in
   `backtest_filter_names.json`, which each backtest build writes beside its
   page; without that file they list only the excluded names, and a grey note
@@ -1121,8 +1123,10 @@ values.
 Coming to the Trading tab from another tab loads its page again, so its
 buttons start disabled and become clickable only once you have seen the page
 for a second and moved the mouse (a browser counts a page in a hidden tab of
-the dashboard as shown). Clicking the tab while it is shown loads nothing, so
-a press on its way to the server is never cut off; Reload loads the page again.
+the dashboard as shown). Clicking the tab while it is shown loads nothing, and
+nor does coming back to it while a press of one of its buttons is on its way
+to the server (the pressed page can no longer be clicked), so the press is
+never cut off; Reload loads the page again.
 
 **The Backtest tab and the Trading tab follow each other.** The backtest
 dashboard's filter bar has no Save or Trade button. Shown in the Backtest tab,
@@ -1145,8 +1149,9 @@ outside the dashboard, the backtest page moves nothing):
   "Rebalance until" choice shown (sent as `rebalance_min_days_to_maturity`:
   its days, or `0`, no days limit, for "maturity" and with Rebalance no), each
   only from a page that shows it. A choice changes on the Trading tab only
-  the settings you chose (choosing Rebalance also sends the Sell level and
-  days it opens or shuts: Rebalance yes shuts Sell at no selling), and the
+  the settings you chose (choosing Rebalance yes also sends no selling, since
+  it shuts Sell; Rebalance no opens Sell again on the Trading tab's sell
+  level and minimum of days, which stay as they are), and the
   settings the bar cannot show stay as the Trading tab has them: a value off
   the page's menus, a setting of a view the page lacks (rebalancing on a page
   built without it, say), a category or tag the page does not list, and a

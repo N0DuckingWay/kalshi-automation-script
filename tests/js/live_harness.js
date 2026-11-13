@@ -35,7 +35,9 @@
 // an id: the window of the element last swapped out under that id, a page
 // that is no longer in the tab page). An element whose id is in __HIDDEN
 // starts hidden, as the page's markup has it. A snapshot's "loads" counts
-// the addresses set on each id's frame.
+// the addresses set on each id's frame. A ["load", id] step is the frame
+// with that id finishing loading its next page: its load listeners run
+// ("old:" and an id: the element last swapped out under that id).
 // ES5 plus Promise, which both runtimes have.
 
 var __emit = (typeof print === 'function') ? print : function(s) { console.log(s); };
@@ -62,10 +64,12 @@ var window = {
 // "old:" source) and counts the swap (a snapshot's "replaced")
 var __replaced = 0;
 var __retired = {};
+var __retiredElements = {};
 var __parent = {
   replaceChild: function(fresh, old) {
     __elements[old.id] = fresh;
     __retired[old.id] = old.contentWindow;
+    __retiredElements[old.id] = old;
     __replaced += 1;
     return old;
   }
@@ -217,8 +221,9 @@ function __spin(ticks, next) {
 // clicking that element: its click listeners run unless it is disabled),
 // ["timers"] (the time passing: every pending timer runs, oldest first, and
 // is cleared), ["message", {origin, source, data}] (a page sending the tab
-// page a message: see above), ["snap", name]. Emits every snapshot, as
-// JSON, once the steps are done.
+// page a message: see above), ["load", id] (a frame's next page loaded: see
+// above), ["snap", name]. Emits every snapshot, as JSON, once the steps are
+// done.
 function __step(steps, i) {
   if (i >= steps.length) {
     __emit(JSON.stringify(__snaps));
@@ -249,6 +254,10 @@ function __step(steps, i) {
       data: sent.data === undefined ? undefined : JSON.parse(JSON.stringify(sent.data))
     };
     (__windowListeners.message || []).forEach(function(fn) { fn(event); });
+  } else if (s[0] === 'load') {
+    var loaded = s[1].indexOf('old:') === 0 ? __retiredElements[s[1].slice(4)]
+      : document.getElementById(s[1]);
+    (loaded._listeners.load || []).forEach(function(fn) { fn({type: 'load'}); });
   } else if (s[0] === 'snap') {
     __snaps[s[1]] = __snapshot();
   }

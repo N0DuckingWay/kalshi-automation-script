@@ -109,7 +109,10 @@ Notes:
     backtest page's bar is taken only while the Backtest tab is the one
     shown; one that arrives after the reader has left that tab is not, and
     the backtest page is told the Trading tab's proposal again, so its bar
-    goes back to what the Trading tab shows. The trading page's buttons stay
+    goes back to what the Trading tab shows. Each proposal sent to the
+    backtest page carries the number of the last choice its bar told (the
+    bar numbers them), so the bar can set aside a proposal sent before its
+    latest choice arrived here. The trading page's buttons stay
     off until the page has been visible for
     config.DEFAULTS_SERVER_CONFIRM_ARM_MS (one second) and the mouse moves
     or a key is pressed (the arming delay, the defaults server's guard
@@ -121,7 +124,10 @@ Notes:
     Trading tab, the tab page loads nothing into its frame but what the
     Reload button asks for (the tab's own button clicked again loads
     nothing, so it never cuts off a press of Dry run or Confirm and trade on
-    its way to the server).
+    its way to the server). Nor does coming back to the Trading tab while
+    such a press is on its way: the trading page says so when its form is
+    sent (it can then be clicked no more), and the next page its frame
+    loads, the answer, ends the wait.
 
     Every number and sentence the page shows is formatted here (payload);
     the page's script only places them. One read of the account runs at a
@@ -1708,7 +1714,10 @@ _SCRIPT_TEMPLATE = """
   // MAX_QUERY of them as the browser sends it, or a run id of 16 hexadecimal
   // digits, is ever put on an address. FROM_BAR says the trading page now
   // loading was asked for by a choice on the backtest bar and has not
-  // reported yet
+  // reported yet. SENDING says the trading page has sent its form
+  // (kalshi-sending) and the next page of its frame, the answer, has not
+  // loaded yet. TOLD is the number of the last choice the backtest bar told
+  // (the seq of kalshi-bar; 0 before any), sent back with each proposal
   var DEFAULTS_ORIGIN = __DEFAULTS_ORIGIN__;
   var BACKTEST_ORIGIN = __BACKTEST_ORIGIN__;
   var TRADING_URL = __TRADING_URL__;
@@ -1719,6 +1728,8 @@ _SCRIPT_TEMPLATE = """
   var QUERY = null;
   var RUN = null;
   var FROM_BAR = false;
+  var SENDING = false;
+  var TOLD = 0;
 
   function byId(id) { return document.getElementById(id); }
   function charts() { return typeof Plotly === 'undefined' ? null : Plotly; }
@@ -1858,10 +1869,11 @@ _SCRIPT_TEMPLATE = """
     // reader comes to its tab: its buttons arm once it has been visible for
     // a second, and a browser counts a page in a hidden frame as visible, so
     // a page that armed out of sight is never the one the reader clicks.
-    // Its tab clicked while it is shown loads nothing, so a press of one of
-    // its buttons still on its way (whose answer opens the page of the run)
-    // is never cut off
-    if (name === 'trading' && before !== 'trading') { loadTrading(false); }
+    // Its tab clicked while it is shown loads nothing, and nor does coming
+    // back while a press of one of its buttons is on its way (SENDING: that
+    // page can be clicked no more), so the press (whose answer opens the
+    // page of the run) is never cut off
+    if (name === 'trading' && before !== 'trading' && !SENDING) { loadTrading(false); }
     Object.keys(FRAMES).forEach(function (t) {
       if (t === name) {
         // Back before the delay: the frame stays as it was left
@@ -1912,6 +1924,11 @@ _SCRIPT_TEMPLATE = """
       && q.length + 2 * (q.length - q.replace(/\\x27/g, '').length) <= MAX_QUERY;
   }
 
+  // The number of a choice as the backtest bar counts them: a whole number, 0 or more
+  function goodSeq(n) {
+    return typeof n === 'number' && isFinite(n) && n >= 0 && Math.floor(n) === n;
+  }
+
   // The trading page for the proposal last reported, or as it opens on its
   // own (on the live defaults in force) before any was
   function tradingPage() { return TRADING_URL + (QUERY === null ? '' : '?' + QUERY); }
@@ -1923,8 +1940,17 @@ _SCRIPT_TEMPLATE = """
   function point(id, url) {
     var old = byId(id);
     var fresh = old.cloneNode(false);
+    if (id === 'trading-frame') { watchTrading(fresh); }
     fresh.src = url;
     old.parentNode.replaceChild(fresh, old);
+  }
+
+  // The next page the Trading frame loads ends the wait of a press (SENDING):
+  // the answer to the form the trading page sent, whatever it is
+  function watchTrading(frame) {
+    frame.addEventListener('load', function () {
+      if (byId('trading-frame') === frame) { SENDING = false; }
+    });
   }
 
   // Load the trading page for the proposal kept, with fresh buttons, noting
@@ -1932,20 +1958,30 @@ _SCRIPT_TEMPLATE = """
   function loadTrading(fromBar) {
     point('trading-frame', tradingPage());
     FROM_BAR = fromBar;
+    SENDING = false;
   }
 
-  // Tell the backtest page the proposal, so its bar shows it too; only once
-  // its frame is open, and only to the backtest origin
+  // Tell the backtest page the proposal, with the number of the last choice
+  // its bar told (TOLD), so its bar shows it too; only once its frame is
+  // open, and only to the backtest origin
   function toBacktest() {
     var w = OPENED.backtest ? frameWindow('backtest-frame') : null;
-    if (w && QUERY !== null) { w.postMessage({type: 'kalshi-apply', query: QUERY}, BACKTEST_ORIGIN); }
+    if (w && QUERY !== null) {
+      w.postMessage({type: 'kalshi-apply', query: QUERY, seq: TOLD}, BACKTEST_ORIGIN);
+    }
   }
 
   window.addEventListener('message', function (e) {
     var m = e.data;
     if (!m || typeof m !== 'object') { return; }
     if (sentBy(e, 'trading-frame', DEFAULTS_ORIGIN)) {
-      if (m.type === 'kalshi-trading' && goodQuery(m.query)) {
+      if (m.type === 'kalshi-sending') {
+        // A press of one of its buttons is on its way: the frame is kept
+        // until the answer loads
+        SENDING = true;
+      } else if (m.type === 'kalshi-trading' && goodQuery(m.query)) {
+        // A page the frame has loaded since any press
+        SENDING = false;
         // The answer to a choice on the backtest bar is not told back to that
         // bar while the Backtest tab is shown: it shows that choice already,
         // or one the reader has made since
@@ -1968,8 +2004,12 @@ _SCRIPT_TEMPLATE = """
       }
     } else if (sentBy(e, 'backtest-frame', BACKTEST_ORIGIN)) {
       if (m.type === 'kalshi-ready') {
+        // A bar just loaded, which has told no choice yet
+        TOLD = 0;
         toBacktest();
       } else if (m.type === 'kalshi-bar' && goodQuery(m.query)) {
+        // Taken or not, the proposal sent back next answers this choice
+        TOLD = goodSeq(m.seq) ? m.seq : 0;
         if (SHOWN === 'backtest') {
           // The reader is choosing on that bar: the Trading tab follows
           QUERY = m.query;
@@ -1999,6 +2039,7 @@ _SCRIPT_TEMPLATE = """
   // both open on the live defaults in force (the first page a frame loads
   // adds no step to the Back history); it is loaded again when the Trading
   // tab is chosen, as every time
+  watchTrading(byId('trading-frame'));
   byId('trading-frame').src = TRADING_URL;
   load();
 })();

@@ -242,7 +242,8 @@ Purpose:
     a k or cap not above zero). The other way, the tab page tells this
     page the Trading tab's proposal (kalshi-apply), and the bar shows it:
     every setting the page can show is chosen and drawn as a reader's
-    choice would be, but not sent back, and the note names each setting
+    choice would be, but not sent back (one the tab page sent before the
+    bar's latest choice reached it, which its number says, is set aside), and the note names each setting
     it cannot show (a value off its grids, a category or tag it does not
     list, rebalancing or selling on a page without that view, or
     rebalancing together with a sell level). A proposal that arrives while
@@ -342,8 +343,10 @@ Dependencies:
     tab's ratios are this page's own.
 
 Notes:
-    The HTML file loads Plotly.js from the CDN (cdn.plot.ly), so an internet
-    connection is required to view the charts. If yfinance fails to fetch S&P 500
+    The HTML file loads Plotly.js from the CDN (cdn.plot.ly), pinned by its
+    hash (config.LIVE_DASHBOARD_PLOTLY_SRI, as the dashboard's tab page and
+    the Data page load it), so an internet connection is required to view
+    the charts. If yfinance fails to fetch S&P 500
     data (e.g. network unavailable), the benchmark section degrades gracefully
     and shows only the strategy equity curve.
 
@@ -673,6 +676,8 @@ from .config import (
     FLAT_RETURN_TOLERANCE,
     KHAT_CONFIDENCE_LEVEL,
     LIVE_DASHBOARD_ORIGINS,
+    LIVE_DASHBOARD_PLOTLY_SRI,
+    LIVE_DASHBOARD_PLOTLY_URL,
     LIVE_DEFAULTS_SOURCE_PATTERN,
     MAX_DEADLINE_GAP_DAYS,
     MIN_PRICE_DIFF_LONG_GAP,
@@ -14228,8 +14233,9 @@ def _pack_text(raw: str) -> str:
 # After each choice the reader makes has been drawn, or shown as a scenario
 # the run never simulated (never after a choice is put back, and never after
 # a proposal is shown), the script tells the tab page the bar's choice as the
-# trading page's query, {type: 'kalshi-bar', query}, at each of
-# D.sync.dashboard_origins (refreshSync, syncQuery). Each setting the reader
+# trading page's query, {type: 'kalshi-bar', query, seq}, at each of
+# D.sync.dashboard_origins (refreshSync, syncQuery; seq numbers the choices
+# told, from 1: TOLD). Each setting the reader
 # picked since the Trading tab's proposal was last known goes as the bar
 # shows it: the axes' values, the Rebalance choice with its minimum price
 # movement and "Rebalance until" days on a page with those views, the Sell
@@ -14249,8 +14255,9 @@ def _pack_text(raw: str) -> str:
 # sync_refused), or more names or a longer query or posted form than the
 # Trading tab carries (syncBlockedByTicks, sync_too_long; the query counted
 # as the tab page counts it). The other way, the tab page sends the Trading
-# tab's proposal, {type: 'kalshi-apply', query}, taken only from the parent
-# window at one of those origins and only once the bar is ready: applyQuery
+# tab's proposal, {type: 'kalshi-apply', query, seq}, taken only from the
+# parent window at one of those origins, only once the bar is ready and not
+# when its seq (the last choice the tab page had heard) is below TOLD: applyQuery
 # chooses every setting of it the bar can show, ticks every category and tag
 # it excludes, and draws that scenario as a reader's choice would, but tells
 # nothing back; the note names each setting the bar cannot show
@@ -14369,6 +14376,13 @@ _FILTER_JS = r"""
   // could not be drawn, so the bar still shows the scenario before it (the
   // note says so, and every setting counts as picked: applyFailed)
   var TRADING = null, PICKED = {}, PENDING = {}, UNSHOWN = false;
+  // TOLD: how many choices the bar has told the tab page (kalshi-bar's seq).
+  // The tab page sends each proposal back with the number of the last choice
+  // it had heard (kalshi-apply's seq), so one with a lower number was sent
+  // before the bar's latest choice arrived there, and is set aside: the tab
+  // page then takes that choice, or sends the Trading tab's proposal back
+  // with its number
+  var TOLD = 0;
   var SETTINGS = ['tier', 'band', 'k', 'cap', 'rebalance', 'move', 'until', 'sell', 'days',
                   'names'];
   // The trading page's single-valued fields in its query's order, each with
@@ -14795,7 +14809,8 @@ _FILTER_JS = r"""
     var why = syncBlocked(), told = null;
     if (why === null) {
       told = syncQuery();
-      tell({type: 'kalshi-bar', query: told});
+      TOLD += 1;
+      tell({type: 'kalshi-bar', query: told, seq: TOLD});
       TRADING = parseQuery(told);
       PICKED = {};
       UNSHOWN = false;
@@ -16340,15 +16355,35 @@ _FILTER_JS = r"""
     relabelBands();
     readerChose(['tier']);
   });
+  // Rebalance back to no on a page with the Sell view: Sell and Min. days
+  // go to the Trading tab's sell level and minimum of days (TRADING), as the
+  // bar shows them with rebalancing off (wanted), so a level the bar could
+  // not show beside rebalancing is shown again. One off the page's choices,
+  // or no proposal known, leaves them as they are
+  function sellBack() {
+    if (!D.sell_blocks || TRADING === null) { return; }
+    var q = Object.create(null);
+    Object.keys(TRADING).forEach(function(name) { q[name] = TRADING[name]; });
+    q.rebalance = ['off'];
+    var w = wanted(q);
+    sellSel.value = w.s;
+    daysSel.value = w.d;
+  }
   rebalanceSel.addEventListener('change', function() {
     // Nothing to switch to without the Rebalance view (the select stays shut)
     if (!D || !D.grid_rebalance) { return; }
     // Sell goes to no level and shuts while Rebalance is yes, and opens again
-    // when it goes back to no; the Min. price movement and "Rebalance until"
-    // selects open with yes. Each of them counts as picked: the bar shows
-    // the values Rebalance opens or shuts them on
+    // on the Trading tab's sell level when it goes back to no (sellBack); the
+    // Min. price movement and "Rebalance until" selects open with yes. Those
+    // two count as picked: the bar shows the values Rebalance opens or shuts
+    // them on. So do Sell and Min. days with yes, which shuts Sell at no
+    // level; with no they go as the Trading tab has them, which Sell now
+    // shows (the red note names a level it cannot)
+    var yes = rebalanceOn(rebalanceSel.value);
+    if (!yes) { sellBack(); }
     refreshSell();
-    readerChose(['rebalance', 'move', 'until', 'sell', 'days']);
+    readerChose(yes ? ['rebalance', 'move', 'until', 'sell', 'days']
+                    : ['rebalance', 'move', 'until']);
   });
   moveSel.addEventListener('change', function() {
     // The minimum counts only while Rebalance is yes, on a page that carries
@@ -16365,10 +16400,14 @@ _FILTER_JS = r"""
   sellSel.addEventListener('change', function() {
     // Nothing to switch to without the Sell view (the select stays shut)
     if (!D || !D.sell_blocks) { return; }
-    // The Min. days select opens with a level and shuts when Sell names none
-    // (picked with it: the bar shows the minimum the level opens it on)
+    // The Min. days select opens with a level and shuts when Sell names none.
+    // It counts as picked only when the level opens it (the bar shows the
+    // minimum the level opens it on); from one level to another it goes as
+    // the Trading tab has it, which the red note names when the bar cannot
+    // show it, and with no level it goes as none anyway
+    var opened = daysSel.disabled;
     refreshDays();
-    readerChose(['sell', 'days']);
+    readerChose(opened ? ['sell', 'days'] : ['sell']);
   });
   daysSel.addEventListener('change', function() {
     // The days count only while Sell names a level (the select is shut otherwise)
@@ -16681,7 +16720,7 @@ _FILTER_JS = r"""
   // only on a page shown in its frame, taken only from that window at one of
   // its two addresses (the browser sets e.source and e.origin, so no other
   // page can claim them), only as {type: 'kalshi-apply', query: '<query>'},
-  // and only once the bar is ready
+  // only once the bar is ready, and not when its seq is below TOLD
   if (FRAMED && window.addEventListener) {
     window.addEventListener('message', function(e) {
       var m = e.data;
@@ -16689,6 +16728,8 @@ _FILTER_JS = r"""
           || D.sync.dashboard_origins.indexOf(e.origin) < 0) { return; }
       if (!m || typeof m !== 'object' || m.type !== 'kalshi-apply'
           || typeof m.query !== 'string') { return; }
+      // Sent before the bar's latest choice reached the tab page
+      if (typeof m.seq === 'number' && m.seq < TOLD) { return; }
       applyQuery(m.query);
     });
   }
@@ -17187,7 +17228,7 @@ def generate_dashboard(
 <head>
   <meta charset="utf-8">
   <title>Kalshi Arbitrage Backtest — {start_date} to today</title>
-  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+  <script src="{LIVE_DASHBOARD_PLOTLY_URL}" integrity="{LIVE_DASHBOARD_PLOTLY_SRI}" crossorigin="anonymous"></script>
   <style>
     body {{ font-family: sans-serif; max-width: 1200px; margin: 0 auto; padding: 24px; }}
     h1 {{ color: #1A237E; }}

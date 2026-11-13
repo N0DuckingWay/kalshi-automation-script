@@ -137,7 +137,12 @@ Notes:
     arming script enables the buttons only after the page has been visible
     for DEFAULTS_SERVER_CONFIRM_ARM_MS and the mouse moves or a key is
     pressed, so a click aimed at another page cannot land on one, and
-    disables them for good once one is pressed; the bar script sends the
+    disables them for good once a box of the bar's menus is ticked (the
+    table and the form show the ticks only once Apply has asked for the
+    page again) and once one is pressed, when it also makes the page inert
+    and tells the framing tab page a press is on its way (kalshi-sending),
+    so neither the bar nor the tab page loads another page over the
+    press; the bar script sends the
     dropdown bar (a separate form that only asks for the trading page
     again, never posts) when a dropdown changes or a menu's Apply is
     pressed, and from that moment makes the whole page inert (nothing on
@@ -356,9 +361,16 @@ _FOLDER_TIME = "%Y%m%dT%H%M%SZ"
 #
 # The arming script, the trading page's: it enables the page's buttons (those
 # of _ARMED_BUTTONS present) only after the page has been visible for
-# DEFAULTS_SERVER_CONFIRM_ARM_MS and the mouse moves or a key is pressed,
-# disables them again whenever the page is hidden, and disables them for good
-# once the form is sent, so a second click sends nothing
+# DEFAULTS_SERVER_CONFIRM_ARM_MS and the mouse moves or a key is pressed, and
+# disables them again whenever the page is hidden. It disables them for good
+# once a box is ticked or unticked in one of the bar's menus (the table and
+# the form show the ticks only once Apply has asked for the page again), and
+# once the form is sent, so a second click sends nothing. Once the form is
+# sent it also makes the whole page inert (nothing on it can be clicked), so
+# the bar cannot ask for another page over the press on its way, and, on a
+# page shown in the dashboard, tells the tab page a press is on its way
+# (kalshi-sending, to each of its two origins), so the tab page does not
+# load the Trading frame again before the answer arrives
 _CONFIRM_JS = """
 (function() {
   var IDS = __IDS__;
@@ -368,6 +380,7 @@ _CONFIRM_JS = """
   var timer = null;
   var ready = false;
   var sent = false;
+  var ticked = false;
   function disableAll() {
     buttons.forEach(function(b) { b.disabled = true; });
   }
@@ -375,11 +388,27 @@ _CONFIRM_JS = """
   if (form) {
     form.addEventListener('submit', function() {
       sent = true;
+      if (window.parent !== window) {
+        __ORIGINS__.forEach(function(origin) {
+          window.parent.postMessage({type: 'kalshi-sending'}, origin);
+        });
+      }
       // Only after the submission has read which button was pressed: a
       // disabled button sends no value
-      setTimeout(disableAll, 0);
+      setTimeout(function() {
+        disableAll();
+        document.body.inert = true;
+      }, 0);
     });
   }
+  // A change outside this form: a box of the bar's menus, ticked or
+  // unticked, which neither the table nor this form carries until Apply
+  // asks for the page again (a dropdown's change asks for it at once)
+  document.addEventListener('change', function(e) {
+    if (e && e.target && form && e.target.form === form) { return; }
+    ticked = true;
+    disableAll();
+  });
   function watch() {
     if (document.visibilityState === 'visible') {
       if (timer === null && !ready) {
@@ -392,7 +421,7 @@ _CONFIRM_JS = """
     }
   }
   function arm() {
-    if (ready && !sent && document.visibilityState === 'visible') {
+    if (ready && !sent && !ticked && document.visibilityState === 'visible') {
       buttons.forEach(function(b) { b.disabled = false; });
     }
   }
@@ -402,6 +431,7 @@ _CONFIRM_JS = """
   watch();
 })();
 """.replace("__IDS__", json.dumps(list(_ARMED_BUTTONS))).replace(
+    "__ORIGINS__", json.dumps(list(LIVE_DASHBOARD_ORIGINS))).replace(
     "ARM_MS", str(DEFAULTS_SERVER_CONFIRM_ARM_MS))
 
 # The bar script, the trading page's too: it sends the dropdown bar (the form
@@ -562,6 +592,11 @@ _BAR_MENU_LABELS = (("exclude_category", "Exclude categories"),
 # The button that sends a menu's ticks (a menu is sent only when asked, since a
 # reader ticks several boxes at once)
 _BAR_APPLY = "Apply"
+# The grey line under each menu's Apply button: a tick counts only once Apply
+# loads the page again, and a tick turns the buttons off until then (the
+# arming script, _CONFIRM_JS, disables them for good on this page)
+_BAR_APPLY_NOTE = ("Ticks count once you press Apply. Until then Dry run, Confirm and save "
+                   "and Confirm and trade stay off.")
 # The grey note beside the menus when the backtest page's names file cannot be
 # used, after the reason ({why})
 _NAMES_NOTE = ("The Exclude menus list only the names excluded here: {why}. Build the "
@@ -2200,7 +2235,10 @@ def _bar_menu(label: str, name: str, listed: tuple[str, ...],
     Ticking a box sends nothing by itself: the ticks go with the rest of the
     bar when Apply (a submit button with no name, so it adds no field) is
     pressed, or when any dropdown of the bar changes, which sends the whole
-    bar as it stands. Each box sends the name as the query field name.
+    bar as it stands. Until then the table and the form below show the page's
+    own exclusions, so a tick turns the page's buttons off for good (the
+    arming script, _CONFIRM_JS), and a grey line under Apply says so. Each
+    box sends the name as the query field name.
 
     Args:
         label (str): The menu's label, as the backtest page's bar words it.
@@ -2224,7 +2262,8 @@ def _bar_menu(label: str, name: str, listed: tuple[str, ...],
     summary = "none" if not excluded else f"{len(excluded)} excluded"
     return (f"<span class=\"menu\">{html.escape(label)}: <details><summary>{summary}</summary>"
             f"<div class=\"names\">{boxes}<button type=\"submit\">{html.escape(_BAR_APPLY)}"
-            "</button></div></details></span>")
+            f"</button><p class=\"note\">{html.escape(_BAR_APPLY_NOTE)}</p></div></details>"
+            "</span>")
 
 
 def _listed(excluded: tuple[str, ...] | None, names: tuple[str, ...]) -> tuple[str, ...]:

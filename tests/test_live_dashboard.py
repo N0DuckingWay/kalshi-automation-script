@@ -1724,7 +1724,9 @@ def _run_live_script(tmp_path: Path, answers: list, steps: list, *,
         steps (list): The harness's steps (["settle"], ["click", id], ["timers"] (the time
             passing: every pending timer runs), ["message", {origin, source, data}] (a page
             sending the tab page a message; source is the id of the frame whose window sent
-            it, or None for a window no frame holds), ["snap", name]). A snapshot's
+            it, or None for a window no frame holds), ["load", id] (that frame finished
+            loading its next page; "old:" and an id for the frame last swapped out under that
+            id), ["snap", name]). A snapshot's
             "timers" are the delays, in milliseconds, of the timers still pending; its
             "posted" the messages the script sent to frames since the snapshot before; its
             "loads" the addresses set on each frame so far, by id.
@@ -2148,10 +2150,11 @@ def _from_backtest(data, *, source: str | None = "backtest-frame", origin: str =
     return _message(source, origin, data)
 
 
-def _apply(query: str) -> dict:
-    """The one message the tab page sends: the proposal, to the backtest page, for its origin."""
+def _apply(query: str, seq: int = 0) -> dict:
+    """The one message the tab page sends: the proposal, with the number of the last choice the
+    backtest bar told (seq; 0 before any), to the backtest page, for its origin."""
     return {"frame": "backtest-frame", "origin": _BACKTEST,
-            "message": {"type": "kalshi-apply", "query": query}}
+            "message": {"type": "kalshi-apply", "query": query, "seq": seq}}
 
 
 def _relay(tmp_path: Path, steps: list) -> dict:
@@ -2249,6 +2252,93 @@ class TestTradingAndRunTabs:
         back = snaps["back"]
         assert back["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q}"
         assert back["loads"] == {"trading-frame": 5, "backtest-frame": 1, "run-frame": 1}
+
+    def test_coming_back_while_a_press_is_on_its_way_loads_nothing(self, tmp_path):
+        # The trading page says when its form is sent (kalshi-sending). The answer to that
+        # press opens the run's page, so coming back to the Trading tab before the answer
+        # loads must not load the trading page over it; that page can be clicked no more (its
+        # buttons stay off and nothing on it reacts), so keeping it is safe. The next page
+        # the frame loads ends the wait, and Reload loads the trading page again regardless
+        snaps = _relay(tmp_path, [
+            ["click", "tab-trading"], ["snap", "shown"],
+            _from_trading({"type": "kalshi-sending"}),
+            ["click", "tab-live"], ["click", "tab-trading"], ["snap", "back"],
+            # A load in a frame the tab page has replaced ends nothing
+            ["load", "old:trading-frame"],
+            ["click", "tab-live"], ["click", "tab-trading"], ["snap", "old load"],
+            # The answer loads: coming back loads the trading page again, as always
+            ["load", "trading-frame"],
+            ["click", "tab-live"], ["click", "tab-trading"], ["snap", "answered"],
+            _from_trading({"type": "kalshi-sending"}), ["click", "trading-reload"],
+            ["click", "tab-live"], ["click", "tab-trading"], ["snap", "reloaded"]])
+        shown = snaps["shown"]["loads"]["trading-frame"]
+        assert shown == 2
+        for name in ("back", "old load"):
+            assert snaps[name]["loads"]["trading-frame"] == shown, name
+            assert snaps[name]["replaced"] == snaps["shown"]["replaced"], name
+        assert snaps["answered"]["loads"]["trading-frame"] == shown + 1
+        # Reload, then coming back once the wait has ended
+        assert snaps["reloaded"]["loads"]["trading-frame"] == shown + 3
+
+    @pytest.mark.parametrize("answer", [
+        {"type": "kalshi-trading", "query": _Q}, {"type": "kalshi-run", "run": _RUN}])
+    def test_the_answer_s_message_ends_the_wait_too(self, tmp_path, answer):
+        # A refusal answers with the trading page (kalshi-trading), a run with its page
+        # (kalshi-run): either is the next page of the frame
+        snaps = _relay(tmp_path, [
+            ["click", "tab-trading"], _from_trading({"type": "kalshi-sending"}),
+            ["click", "tab-live"], ["snap", "left"], _from_trading(answer), ["snap", "answered"],
+            ["click", "tab-trading"], ["snap", "back"]])
+        answered = snaps["answered"]["loads"]["trading-frame"]
+        assert snaps["back"]["loads"]["trading-frame"] == answered + 1
+
+    @pytest.mark.parametrize("source, origin", [
+        ("trading-frame", _BACKTEST), ("backtest-frame", _DEFAULTS), ("run-frame", _DEFAULTS),
+        (None, _DEFAULTS), ("old:trading-frame", _DEFAULTS)])
+    def test_a_press_is_on_its_way_only_when_the_trading_page_says_so(self, tmp_path, source,
+                                                                       origin):
+        snaps = _relay(tmp_path, [
+            ["click", "tab-trading"], ["click", "tab-live"], ["snap", "left"],
+            _message(source, origin, {"type": "kalshi-sending"}),
+            ["click", "tab-trading"], ["snap", "back"]])
+        assert (snaps["back"]["loads"]["trading-frame"]
+                == snaps["left"]["loads"]["trading-frame"] + 1)
+
+    def test_each_proposal_sent_back_carries_the_number_of_the_bar_s_last_choice(
+            self, tmp_path):
+        # The bar numbers its choices (kalshi-bar's seq). A proposal the tab page sends it
+        # carries the number of the last choice it heard, so a proposal sent before the
+        # bar's newer choice arrived here is set aside by the bar; a bar just loaded has
+        # told nothing yet (0)
+        snaps = _relay(tmp_path, [
+            _from_trading({"type": "kalshi-trading", "query": _Q2}),
+            ["click", "tab-backtest"], _from_backtest({"type": "kalshi-ready"}), ["snap", "ready"],
+            _from_backtest({"type": "kalshi-bar", "query": _Q, "seq": 3}),
+            # The answer to that choice, then a report the bar did not ask for
+            _from_trading({"type": "kalshi-trading", "query": _Q}),
+            _from_trading({"type": "kalshi-trading", "query": _Q2}), ["snap", "report"],
+            # A choice that arrives after the reader left the tab is answered with its number
+            ["click", "tab-live"], _from_backtest({"type": "kalshi-bar", "query": _Q, "seq": 4}),
+            ["snap", "late"],
+            # The backtest page loaded again: its bar has told nothing
+            _from_backtest({"type": "kalshi-ready"}), ["snap", "reloaded"]])
+        assert snaps["ready"]["posted"] == [_apply(_Q2, 0)]
+        assert snaps["report"]["posted"] == [_apply(_Q2, 3)]
+        assert snaps["late"]["posted"] == [_apply(_Q2, 4)]
+        assert snaps["reloaded"]["posted"] == [_apply(_Q2, 0)]
+
+    @pytest.mark.parametrize("seq", [None, "4", -1, 1.5, True, [4], 1e400])
+    def test_a_choice_number_that_is_not_a_whole_number_counts_as_none(self, tmp_path, seq):
+        bar = {"type": "kalshi-bar", "query": _Q}
+        if seq is not None:
+            bar["seq"] = seq
+        snaps = _relay(tmp_path, [
+            _from_trading({"type": "kalshi-trading", "query": _Q2}),
+            ["click", "tab-backtest"], _from_backtest({"type": "kalshi-ready"}),
+            _from_backtest({"type": "kalshi-bar", "query": _Q, "seq": 2}), ["snap", "ready"],
+            ["click", "tab-live"], _from_backtest(bar), ["snap", "late"]])
+        assert snaps["ready"]["posted"] == [_apply(_Q2, 0)]
+        assert snaps["late"]["posted"] == [_apply(_Q, 0)]
 
     def test_the_trading_page_s_proposal_is_kept_and_told_to_the_open_backtest_page(
             self, tmp_path):
@@ -2658,7 +2748,9 @@ class TestTradingAndRunTabs:
         assert "return w !== null && e.source === w && e.origin === origin;" in script
         # It sends one message, to the backtest page, addressed to the backtest origin
         assert re.findall(r"\.postMessage\(([^;]*)\);", script) == [
-            "{type: 'kalshi-apply', query: QUERY}, BACKTEST_ORIGIN"]
+            "{type: 'kalshi-apply', query: QUERY, seq: TOLD}, BACKTEST_ORIGIN"]
+        # The number it sends back is a choice's only once goodSeq passed it
+        assert re.findall(r"\bTOLD = ([^;]+);", script) == ["0", "0", "goodSeq(m.seq) ? m.seq : 0"]
         # It never reaches into a frame's page, opens a window or moves the tab page
         for word in ("contentDocument", "document.domain", "location", "window.open",
                      "window.top", "window.parent", "eval(", "innerHTML", "document.write",
@@ -2680,6 +2772,11 @@ class TestTheDefaultsServerAgrees:
         assert (f"{json.dumps(list(config.LIVE_DASHBOARD_ORIGINS))}.forEach(function (origin) "
                 "{ window.parent.postMessage(message, origin); });") in notify
         assert notify.count("postMessage") == 1
+        # The arming script sends one message, that a press is on its way, to those two
+        confirm = defaults_server._CONFIRM_JS
+        assert (f"{json.dumps(list(config.LIVE_DASHBOARD_ORIGINS))}.forEach(function(origin) "
+                "{\n          window.parent.postMessage({type: 'kalshi-sending'}, origin);") in confirm
+        assert confirm.count("postMessage") == 1
         # The backtest port's pages may be framed by those same two
         framed = dict(live_dashboard._FRAMED_HEADERS)["Content-Security-Policy"]
         assert framed == "frame-ancestors " + " ".join(config.LIVE_DASHBOARD_ORIGINS)

@@ -8192,7 +8192,8 @@ def _told(snap: dict, kind: str = "kalshi-bar") -> list:
 
     Each message must go to both of the tab page's addresses, in config's
     order, the same message to each, and hold no field but "type" and
-    "query".
+    "query" and, on a kalshi-bar, "seq": the choice's number, counting from
+    1 in the order told (_seqs reads them).
 
     Args:
         snap (dict): A snapshot of a framed run (_run_script(framed=True)).
@@ -8210,10 +8211,20 @@ def _told(snap: dict, kind: str = "kalshi-bar") -> list:
         assert [p["origin"] for p in group] == _ORIGINS, group
         assert all(p["message"] == group[0]["message"] for p in group), group
         message = group[0]["message"]
-        assert set(message) <= {"type", "query"}, message
+        if message["type"] == "kalshi-bar":
+            assert set(message) == {"type", "query", "seq"}, message
+            assert type(message["seq"]) is int and message["seq"] >= 1, message
+        else:
+            assert set(message) <= {"type", "query"}, message
         if message["type"] == kind:
             out.append(message["query"] if kind == "kalshi-bar" else message)
     return out
+
+
+def _seqs(snap: dict) -> list[int]:
+    """The numbers (seq) of the kalshi-bar messages the page told in a snapshot's window, in order."""
+    posted = snap["posted"][::len(_ORIGINS)]
+    return [p["message"]["seq"] for p in posted if p["message"]["type"] == "kalshi-bar"]
 
 
 def _sync_notes(page: str) -> str:
@@ -8252,10 +8263,15 @@ def _note(snap: dict) -> str:
     return snap["text"].get("flt-sync-note", "")
 
 
-def _apply(query: str, origin: str = _ORIGINS[0], source: str = "parent") -> list:
+def _apply(query: str, origin: str = _ORIGINS[0], source: str = "parent",
+           seq: int | None = None) -> list:
     """The steps of the tab page telling the page the Trading tab's proposal
-    (kalshi-apply), from that origin and window, then a settle."""
-    return [["message", origin, source, {"type": "kalshi-apply", "query": query}], ["settle"]]
+    (kalshi-apply), from that origin and window, with the number of the last
+    choice the tab page heard (seq; None sends none), then a settle."""
+    message = {"type": "kalshi-apply", "query": query}
+    if seq is not None:
+        message["seq"] = seq
+    return [["message", origin, source, message], ["settle"]]
 
 
 def _proposed(**fields) -> config.LiveSettings:
@@ -9482,6 +9498,114 @@ class TestTradingSync:
             items=text["sync_off_grid"].format(field=fields["sell"], value="0.9"))
         for name in ("both", "alone", "off grid"):
             assert snaps[name]["posted"] == [], name
+
+    def test_the_chart_library_is_pinned_by_its_hash(self, monkeypatch, tmp_path):
+        # Shown in the dashboard, the page moves the Trading tab with no click,
+        # so the one script it loads from the web runs only when it is the
+        # very file the tab page and the Data page pin too
+        page = self._kc(monkeypatch, tmp_path)
+        assert re.findall(r"<script src=[^>]*>", page) == [
+            f'<script src="{config.LIVE_DASHBOARD_PLOTLY_URL}" '
+            f'integrity="{config.LIVE_DASHBOARD_PLOTLY_SRI}" crossorigin="anonymous">']
+
+    def test_rebalance_no_puts_back_the_sell_level_the_trading_tab_keeps(
+            self, monkeypatch, tmp_path):
+        # A proposal that rebalances with a sell level shows Rebalance yes and
+        # names the level, which the Trading tab keeps. Rebalance no on the bar
+        # then shows that level and its minimum of days, and tells them as
+        # they are: the reader chose Rebalance, not Sell. A level off the
+        # page's choices goes as the Trading tab has it too, the note naming it
+        page = self._kc(monkeypatch, tmp_path, _kc_sweep_sell(_kc_sweep_rebalance()))
+        data = TestFilterPage._data(page)
+        text, fields = data["text"], data["text"]["sync_fields"]
+        level = data["sell_levels"][1]["value"]
+        both = _proposed(tier_floors=True, spread_band=tuple(data["bands"][0]["value"]),
+                         interval_discount=data["ks"][1]["value"],
+                         size_cap=data["caps"][1]["value"], rebalance=True,
+                         sell_at=level, sell_min_days=3)
+        off_grid = dataclasses.replace(both, sell_at=0.9)
+        for proposal, shown in ((both, "1"), (off_grid, "none")):
+            snaps = TestSellScript._run(tmp_path, page, [
+                ["wait"], *_apply(defaults_server._settings_query(proposal)), ["snap", "both"],
+                *TestRebalanceScript.OFF, ["snap", "off"]],
+                strict=True, js=TestRebalanceScript.WAIT, framed=True)
+            assert snaps["both"]["selects"]["flt-sell"]["value"] == "none"
+            off = snaps["off"]
+            assert off["selects"]["flt-rebalance"]["value"] == "no"
+            assert off["selects"]["flt-sell"]["value"] == shown
+            [raw] = _told(off)
+            read, _ = defaults_server._proposal(defaults_server._params(raw), None)
+            assert read == dataclasses.replace(proposal, rebalance=False, min_price_move=None)
+            if shown == "none":
+                assert _note(off) == text["sync_not_here"].format(
+                    items=text["sync_off_grid"].format(field=fields["sell"], value="0.9"))
+            else:
+                assert off["selects"]["flt-days"]["value"] == TestSellScript._di(3)
+                assert _note(off) == ""
+
+    @pytest.mark.parametrize("days", [None, 30])
+    def test_another_sell_level_keeps_a_minimum_of_days_the_bar_cannot_show(
+            self, monkeypatch, tmp_path, days):
+        # A minimum of days off the page's choices ("any", or 30) is named in
+        # the note and kept on the Trading tab: choosing another sell level
+        # changes the level alone. Choosing a level with Sell at none opens
+        # the Min. days select on the minimum shown, which is then told
+        page = self._kc(monkeypatch, tmp_path, _kc_sweep_sell(_kc_sweep_rebalance()))
+        data = TestFilterPage._data(page)
+        levels = data["sell_levels"]
+        proposal = _proposed(tier_floors=True, spread_band=tuple(data["bands"][0]["value"]),
+                             interval_discount=data["ks"][1]["value"],
+                             size_cap=data["caps"][1]["value"], rebalance=False,
+                             min_price_move=None, sell_at=levels[0]["value"],
+                             sell_min_days=days)
+        snaps = TestSellScript._run(tmp_path, page, [
+            ["wait"], *_apply(defaults_server._settings_query(proposal)), ["snap", "applied"],
+            ["set", "flt-sell", "1"], ["fire", "flt-sell"], ["settle"], ["snap", "level"],
+            ["set", "flt-sell", "none"], ["fire", "flt-sell"], ["settle"], ["snap", "none"],
+            ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"], ["snap", "again"]],
+            strict=True, js=TestRebalanceScript.WAIT, framed=True)
+        assert _note(snaps["applied"]) != ""
+        shown_days = data["sell_days"][int(snaps["applied"]["selects"]["flt-days"]["value"])]
+        for name, level, minimum in (("level", levels[1]["value"], days),
+                                     ("none", None, None),
+                                     ("again", levels[0]["value"], shown_days["value"])):
+            [raw] = _told(snaps[name])
+            read, _ = defaults_server._proposal(defaults_server._params(raw), None)
+            assert (read.sell_at, read.sell_min_days) == (level, minimum), name
+
+    def test_a_proposal_sent_before_the_bar_s_latest_choice_arrived_is_set_aside(
+            self, monkeypatch, tmp_path):
+        # The tab page sends each proposal with the number of the last choice
+        # it heard from the bar. One with a lower number than the bar's last
+        # choice crossed that choice on its way: drawing it would put the bar
+        # back while the Trading tab follows the choice, so it is set aside.
+        # One that carries the choice's number (the tab page's answer to it),
+        # or none, is shown
+        page = self._kc(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        pb, pk, pc = data["primary"]
+        p0 = defaults_server._settings_query(_proposed(
+            tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
+            interval_discount=data["ks"][pk]["value"], size_cap=data["caps"][pc]["value"],
+            rebalance=False))
+        other = "0" if pc != 0 else "1"
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], *_apply(p0, seq=0), ["snap", "applied"],
+            ["set", "flt-cap", other], ["fire", "flt-cap"], ["settle"], ["snap", "told"],
+            *_apply(p0, seq=0), ["snap", "stale"],
+            *_apply(p0, seq=1), ["snap", "answered"],
+            ["set", "flt-cap", other], ["fire", "flt-cap"], ["settle"], ["snap", "again"],
+            *_apply(p0), ["snap", "no number"]], strict=True, framed=True)
+        assert snaps["applied"]["selects"]["flt-cap"]["value"] == str(pc)
+        assert _seqs(snaps["told"]) == [1]
+        stale = snaps["stale"]
+        assert stale["selects"]["flt-cap"]["value"] == other
+        assert stale["posted"] == [] and stale["reacts"] == []
+        assert snaps["answered"]["selects"]["flt-cap"]["value"] == str(pc)
+        assert snaps["answered"]["posted"] == []
+        # The numbers go on counting, and a proposal with no number is shown
+        assert _seqs(snaps["again"]) == [2]
+        assert snaps["no number"]["selects"]["flt-cap"]["value"] == str(pc)
 
     def test_a_proposal_the_bar_already_shows_loads_and_draws_nothing(
             self, monkeypatch, tmp_path):
