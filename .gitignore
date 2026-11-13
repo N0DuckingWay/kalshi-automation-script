@@ -35,6 +35,10 @@ eda_dashboard.html
 # chunk but the run's own, and the Sell select's, one folder per build, kept
 # beside the page
 /backtest_dashboard_files/
+# The categories and tags the backtest page's filter bar lists
+# (config.BACKTEST_FILTER_NAMES_FILENAME), which the defaults server's trading
+# page reads for its Exclude menus: kept beside the page, specific to one build
+/backtest_filter_names.json
 # What a full backtest run saves for the dashboard (config.BACKTEST_SWEEP_FILENAME):
 # `python3 -m kalshi_betting.backtest --dashboard-only` rebuilds the page from it.
 # Large, specific to one run, and a pickle (loading one runs code), so never shared

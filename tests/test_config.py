@@ -559,6 +559,45 @@ class TestDefaultsServerCheckoutWait:
         assert config.DEFAULTS_SERVER_CHECKOUT_TIMEOUT_SECONDS <= 30
 
 
+class TestDefaultsServerTradingPage:
+    """The constants the defaults server's trading page reads: who may frame it, the backtest
+    page's names file, and the choices its Spread band and Size cap menus offer."""
+
+    def test_only_the_live_dashboard_s_tab_page_may_frame_it(self):
+        assert config.LIVE_DASHBOARD_ORIGINS == ("http://127.0.0.1:8766",
+                                                 "http://localhost:8766")
+        # The tab page's own port, under both of its names; never the backtest
+        # page's port, nor the defaults server's own
+        ports = {origin.rsplit(":", 1)[1] for origin in config.LIVE_DASHBOARD_ORIGINS}
+        assert ports == {str(config.LIVE_DASHBOARD_PORT)}
+        assert str(config.LIVE_BACKTEST_PORT) not in ports
+        assert str(config.DEFAULTS_SERVER_PORT) not in ports
+
+    def test_the_names_file(self):
+        assert config.BACKTEST_FILTER_NAMES_FILENAME == "backtest_filter_names.json"
+        assert config.BACKTEST_FILTER_NAMES_FORMAT == "backtest-filter-names-v1"
+        assert config.BACKTEST_FILTER_NAMES_MAX_BYTES == 1_048_576
+        # Ignored by git, as every file a backtest build writes beside its page
+        ignored = (pathlib.Path(config.PROJECT_ROOT) / ".gitignore").read_text(encoding="utf-8")
+        assert f"/{config.BACKTEST_FILTER_NAMES_FILENAME}" in ignored.splitlines()
+
+    def test_the_spread_bands_are_the_backtest_s_grid(self):
+        bands = config.DEFAULTS_SERVER_SPREAD_BANDS
+        assert bands == tuple((lo, hi) for lo in config.SPREAD_BAND_SWEEP_FLOORS
+                              for hi in config.SPREAD_BAND_SWEEP_CEILINGS if lo < hi)
+        assert len(bands) == len(set(bands)) == 36
+        # Each is a band LiveSettings takes, unchanged
+        for band in bands:
+            assert _settings(spread_band=band).spread_band == band
+
+    def test_the_size_caps_are_the_backtest_s_grid_as_live_settings_stores_them(self):
+        caps = config.DEFAULTS_SERVER_SIZE_CAPS
+        assert caps == backtester.SIZE_CAP_SWEEP
+        assert caps[0] == config.SIZE_CAP_STEP and caps[-1] == 1.0 and len(caps) == 20
+        for cap in caps:
+            assert _settings(size_cap=cap).size_cap == cap
+
+
 class TestMinPriceDiffForGap:
     def test_short_tier_from_zero_gap(self):
         # Same-day deadlines are the tightest correlation — short tier applies
@@ -6078,6 +6117,39 @@ class TestLiveSettingsChanges:
         # A file that leaves the toggle out reads it as off; the seed proposes on
         rows = config.live_settings_changes(_SEED_REBALANCE_OFF, config.LIVE_DEFAULTS_SEED)
         assert [row for row in rows if row[3]] == [("rebalance", "no", "yes", True)]
+
+
+class TestLiveSettingText:
+    """live_setting_text: one toggle's value in the words of the "Live settings:" line and the
+    confirmation table, which the defaults server's dropdowns use for their choices."""
+
+    def test_it_words_every_toggle_as_the_table_does(self):
+        reference = TestDescribeLiveSettings._REFERENCE
+        for name in config.LIVE_TOGGLE_FIELDS:
+            value, _ = TestDescribeLiveSettings._DEPARTURES[name]
+            for settings in (reference, dataclasses.replace(reference, **{name: value})):
+                rows = config.live_settings_changes(None, settings)
+                [new] = [row[2] for row, field in zip(rows, config.LIVE_TOGGLE_FIELDS,
+                                                      strict=True) if field == name]
+                assert config.live_setting_text(name, getattr(settings, name)) == new, name
+
+    @pytest.mark.parametrize("field, value, words", [
+        ("tier_floors", True, "on"), ("spread_band", (0.0, 1.0), "none"),
+        ("spread_band", (0.2, 0.8), "0.2-0.8"), ("interval_discount", 0.85, "0.85"),
+        ("size_cap", 1.0, "100% (no cap)"), ("size_cap", 0.05, "5%"),
+        ("exclude_categories", None, "none"), ("rebalance", False, "no"),
+        ("min_price_move", None, "any"), ("min_price_move", 0.15, "15c"),
+        ("rebalance_min_days_to_maturity", None, "maturity"),
+        ("rebalance_min_days_to_maturity", 1, "1 day before maturity"),
+        ("sell_at", None, "off"), ("sell_at", 0.8, "80% of potential profit"),
+        ("sell_min_days", None, "any"), ("sell_min_days", 14, "14")])
+    def test_its_words(self, field, value, words):
+        assert config.live_setting_text(field, value) == words
+
+    def test_a_name_that_is_not_a_toggle_is_a_key_error(self):
+        for name in ("origin", "k", "same_title_size_cap", ""):
+            with pytest.raises(KeyError):
+                config.live_setting_text(name, 0.8)
 
 
 class TestCountText:

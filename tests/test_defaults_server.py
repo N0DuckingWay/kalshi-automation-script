@@ -7,33 +7,41 @@ Purpose:
     Tests for defaults_server.py, the local web server whose pages save the
     live trading defaults and start live trading runs with them. Most tests
     call _App.handle directly with a _Request, so they need no socket: the
-    Host check, the index page, the confirmation page (every changed row
-    highlighted, warnings, escaping, the script and its Content-Security-
-    Policy hash, the buttons in their fixed order with placeholders for
-    those that do not apply), every refused proposal, the save and each
-    check in front of it (Origin, content type, fingerprint, nonce and
-    token, a stale page, a failed write), the trade page, the three actions
+    Host check, the index page, the trading page (every changed row
+    highlighted, warnings, escaping, its three scripts and their
+    Content-Security-Policy hashes, who may frame it, the buttons in their
+    fixed order with placeholders for those that do not apply, and its
+    dropdown bar: its eleven controls in the backtest page's order and
+    words, their choices, the names file its menus read, and a round trip of
+    every choice through the server), the page with no address fields (the
+    defaults in force, or no buttons when a link cannot carry them as they
+    are), every refused proposal, the save and each check in
+    front of it (Origin, content type, fingerprint, nonce and token, a stale
+    page, a failed write, a save that changes nothing and so writes
+    nothing), the redirect of the retired /trade address, the three actions
     (save, trade, dry run) and every check before a run starts (the run's
     blockers, the last real-money run's attention banner and its
     acknowledgement, a nonce used twice), the saved page, the run page (each
     rule of its outcome table, read from hand-written run folders and from
-    a stand-in process), /checkout, the seed, and a saved file an older
-    version wrote (never traded, offered in its new form for one save). A POST body is always built
-    from the hidden inputs and one button of the page the server rendered,
-    never by hand, except where a test signs or crafts a request itself to
-    reach a path no rendered page leads to. The process starter is a
-    stand-in that records each start and starts nothing (_Starter); no test
-    starts main.py. One class runs the page script itself under node or
-    macOS's jsc with a stand-in page, one runs the real handler over a
-    loopback socket (skipped only if the sandbox refuses to bind a port),
-    including one round trip whose stand-in starts a tiny Python child in
-    place of main.py, one runs main() with the server and the browser
-    replaced (which page a start opens, the dashboard's Save/Trade marker
-    check, and what a start does when its port is taken), one runs main()
-    against real loopback listeners holding its port (this checkout's
-    server, another checkout's, and listeners that are not a defaults
-    server) without ever binding it, and one checks what this module imports
-    and where it starts a process.
+    a stand-in process, and the message it sends a framing page), /checkout,
+    the seed, and a saved file an older version wrote (never traded,
+    offered in its new form for one save). A POST body is always built from
+    the hidden inputs and one button of the page the server rendered, never
+    by hand, except where a test signs or crafts a request itself to reach a
+    path no rendered page leads to; a dropdown bar request is built as a
+    browser builds a GET form from the rendered bar. The process starter is
+    a stand-in that records each start and starts nothing (_Starter); no
+    test starts main.py. Three classes run the page scripts themselves (the
+    arming script, the bar script and the notifier) under node or macOS's
+    jsc with a stand-in page, one runs the real handler over a loopback
+    socket (skipped only if the sandbox refuses to bind a port), including
+    one round trip whose stand-in starts a tiny Python child in place of
+    main.py, one runs main() with the server and the browser replaced (which
+    page a start opens, and what a start does when its port is taken), one
+    runs main() against real loopback listeners holding its port (this
+    checkout's server, another checkout's, and listeners that are not a
+    defaults server) without ever binding it, and one checks what this
+    module imports and where it starts a process.
 
 Dependencies:
     Imports kalshi_betting.config (the saved-defaults helpers and constants),
@@ -50,7 +58,7 @@ Notes:
     forbids local binding they skip, and CI runs them. No test asks the real
     port (DEFAULTS_SERVER_PORT) anything: the tests of a taken port either
     stand in for the /checkout question (run_main) or point the server's
-    port at a listener of their own (busy_port). The page script's tests
+    port at a listener of their own (busy_port). The page scripts' tests
     skip when neither node nor jsc is present.
 """
 import ast
@@ -115,17 +123,14 @@ _BASE_SETTINGS = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interva
 # The ASCII digits as Arabic-Indic and as full-width digits (str.translate tables)
 _ARABIC_INDIC = str.maketrans("0123456789", "".join(chr(0x0660 + i) for i in range(10)))
 _FULL_WIDTH = str.maketrans("0123456789", "".join(chr(0xFF10 + i) for i in range(10)))
-# The button labels of each page, in page order
+# The trading page's button labels, in page order
 _CONFIRM_LABELS = ["Dry run (no orders; defaults unchanged)", "Confirm and save",
                    "Confirm and trade"]
-_TRADE_LABELS = ["Dry run (no orders)", "Confirm and trade"]
 # Each armed button's id and the action it posts
 _ID_ACTION = {"confirm-dry-run": "dry_run", "confirm": "save", "confirm-trade": "trade"}
-# A dashboard page with the filter bar's Save and Trade buttons (the Trade
-# link's id is what the server looks for), and one built before them
-_DASHBOARD_WITH_BUTTONS = ('<html><body><div id="flt-bar"><button id="flt-save">Save</button>'
-                           '<a id="flt-trade" href="x">Trade</a></div></body></html>')
-_DASHBOARD_BEFORE_BUTTONS = '<html><body><div id="flt-bar"></div></body></html>'
+# The three scripts the trading page carries, in page order
+_TRADING_SCRIPTS = [defaults_server._CONFIRM_JS, defaults_server._BAR_JS,
+                    defaults_server._NOTIFY_JS]
 
 
 @pytest.fixture(autouse=True)
@@ -148,10 +153,13 @@ class _PageParser(HTMLParser):
     """
     Read what a test needs off a rendered page.
 
-    Collects the forms (method, action), the hidden inputs in page order,
-    the checkboxes, the buttons' attributes and labels in page order, the
-    links, each comparison row's class and cell texts by its data-setting
-    label, and the text of every script.
+    Collects the forms (method, action), the body's attributes, the text of
+    every script, the links, each comparison row's class and cell texts by
+    its data-setting label, and, for the form that posts, its hidden inputs
+    in page order, its checkboxes and its buttons' attributes and labels in
+    page order. The dropdown bar (the form tb-form, which only asks for the
+    page again) is read apart, into the bar_* lists, so the posting form's
+    fields are exactly what a click on one of its buttons sends.
     """
 
     def __init__(self) -> None:
@@ -163,6 +171,7 @@ class _PageParser(HTMLParser):
         """
         super().__init__(convert_charrefs=True)
         self.forms: list[tuple[str | None, str | None]] = []
+        self.body: dict[str, str | None] = {}
         self.hidden: list[tuple[str, str]] = []
         self.checkboxes: list[dict] = []
         self.buttons: list[dict] = []
@@ -171,13 +180,27 @@ class _PageParser(HTMLParser):
         self.rows: dict[str, str | None] = {}
         self.cells: dict[str, list[str]] = {}
         self.scripts: list[str] = []
+        # The bar: its form's attributes, its named controls in page order (each
+        # a dict: tag, the element's attributes, and a select's options as
+        # dicts of value, text and selected), the labels before its dropdowns
+        # and menus, and its buttons
+        self.bar_form: dict[str, str | None] | None = None
+        self.bar_controls: list[dict] = []
+        self.bar_labels: list[str] = []
+        self.bar_buttons: list[dict] = []
+        self.bar_notes: list[str] = []
         self._row: str | None = None
         self._in_script = False
         self._in_button = False
+        self._in_bar = False
+        self._option: dict | None = None
+        self._label: str | None = None
+        self._note: bool = False
+        self._in_names = False
 
     def handle_starttag(self, tag, attrs) -> None:
         """
-        Record a form, input, button, link, row, cell or script as it opens.
+        Record a form, input, select, option, button, link, row, cell or script as it opens.
 
         Args:
             tag (str): The tag's name, lower-cased.
@@ -190,6 +213,13 @@ class _PageParser(HTMLParser):
         attributes = dict(attrs)
         if tag == "form":
             self.forms.append((attributes.get("method"), attributes.get("action")))
+            self._in_bar = attributes.get("id") == "tb-form"
+            if self._in_bar:
+                self.bar_form = attributes
+        elif tag == "body":
+            self.body = attributes
+        elif self._in_bar:
+            self._bar_starttag(tag, attributes)
         elif tag == "input" and attributes.get("type") == "hidden":
             self.hidden.append((attributes["name"], attributes["value"]))
         elif tag == "input" and attributes.get("type") == "checkbox":
@@ -210,9 +240,44 @@ class _PageParser(HTMLParser):
             self._in_script = True
             self.scripts.append("")
 
+    def _bar_starttag(self, tag: str, attributes: dict) -> None:
+        """
+        Record one element of the dropdown bar as it opens.
+
+        Args:
+            tag (str): The tag's name, lower-cased.
+            attributes (dict): Its attributes, values unescaped.
+
+        Returns:
+            None
+        """
+        if tag in ("select", "input"):
+            self.bar_controls.append({"tag": tag, **attributes, "options": []})
+            if tag == "select" and self._label is not None:
+                self.bar_labels.append(self._label)
+                self._label = None
+        elif tag == "option":
+            self._option = {"value": attributes["value"], "text": "",
+                            "selected": "selected" in attributes}
+            self.bar_controls[-1]["options"].append(self._option)
+        elif tag == "label" and not self._in_names:
+            self._label = ""
+        elif tag == "span" and attributes.get("class") == "menu":
+            self._label = ""
+        elif tag == "span" and attributes.get("class") == "note":
+            self._note = True
+            self.bar_notes.append("")
+        elif tag == "details" and self._label is not None:
+            self.bar_labels.append(self._label)
+            self._label = None
+        elif tag == "div" and attributes.get("class") == "names":
+            self._in_names = True
+        elif tag == "button":
+            self.bar_buttons.append(attributes)
+
     def handle_endtag(self, tag) -> None:
         """
-        Close a row, a button or a script.
+        Close a form, row, button, option or script.
 
         Args:
             tag (str): The tag's name, lower-cased.
@@ -220,16 +285,24 @@ class _PageParser(HTMLParser):
         Returns:
             None
         """
-        if tag == "tr":
+        if tag == "form":
+            self._in_bar = False
+        elif tag == "div":
+            self._in_names = False
+        elif tag == "tr":
             self._row = None
         elif tag == "script":
             self._in_script = False
         elif tag == "button":
             self._in_button = False
+        elif tag == "option":
+            self._option = None
+        elif tag == "span":
+            self._note = False
 
     def handle_data(self, data) -> None:
         """
-        Add text to the open script, button or table cell.
+        Add text to the open script, button, table cell, or bar option, label or note.
 
         Args:
             data (str): The text.
@@ -239,10 +312,43 @@ class _PageParser(HTMLParser):
         """
         if self._in_script:
             self.scripts[-1] += data
+        elif self._option is not None:
+            self._option["text"] += data
+        elif self._in_bar and self._label is not None:
+            self._label += data
+        elif self._in_bar and self._note:
+            self.bar_notes[-1] += data
         elif self._in_button:
             self.labels[-1] += data
         elif self._row is not None and self.cells[self._row]:
             self.cells[self._row][-1] += data
+
+    def bar_select(self, name: str) -> dict:
+        """
+        Find one of the bar's dropdowns by its name (or, for the spread band, its id).
+
+        Args:
+            name (str): The select's name, or "tb-band".
+
+        Returns:
+            dict: The select: its attributes and its options.
+        """
+        [select] = [c for c in self.bar_controls if c["tag"] == "select"
+                    and (c.get("name") == name or c.get("id") == name)]
+        return select
+
+    def bar_boxes(self, name: str) -> list[dict]:
+        """
+        List the bar's check boxes of one menu, in page order.
+
+        Args:
+            name (str): "exclude_category" or "exclude_tag".
+
+        Returns:
+            list[dict]: Each box's attributes.
+        """
+        return [c for c in self.bar_controls
+                if c.get("type") == "checkbox" and c.get("name") == name]
 
 
 def _parse(body: str) -> _PageParser:
@@ -445,10 +551,10 @@ def _page_form(app, query: str, button_id: str = "confirm", *,
     return _click(response.body, button_id, ack=ack)
 
 
-def _trade_form(app, button_id: str = "confirm-trade", *,
-                ack: bool = False) -> list[tuple[str, str]]:
+def _home_form(app, button_id: str = "confirm-trade", *,
+               ack: bool = False) -> list[tuple[str, str]]:
     """
-    Open the trade page and click one of its buttons.
+    Open the trading page with no address fields (the defaults in force) and click one of its buttons.
 
     Args:
         app (defaults_server._App): The application.
@@ -456,9 +562,9 @@ def _trade_form(app, button_id: str = "confirm-trade", *,
         ack (bool): Whether the attention box is ticked.
 
     Returns:
-        list[tuple[str, str]]: The form the browser posts.
+        list[tuple[str, str]]: The form the browser posts (to /confirm).
     """
-    response = _get(app, "/trade")
+    response = _get(app, "/confirm")
     assert response.status == 200, response.body
     return _click(response.body, button_id, ack=ack)
 
@@ -673,55 +779,33 @@ class TestHostCheck:
 class TestIndexPage:
     """GET / says what the server is for and lists the newest runs, with no form and no script."""
 
-    def test_without_a_dashboard(self):
+    def test_it_names_where_to_trade(self):
         response = _get(_app(), "/")
         assert response.status == 200
         page = _parse(response.body)
         assert page.forms == [] and page.scripts == [] and page.buttons == []
-        assert ("No backtest dashboard yet: run <code>python3 -m kalshi_betting.backtest"
-                "</code> to build one") in response.body
+        assert ("Trade from the live dashboard's Trading tab (<code>./start_dashboard.sh"
+                "</code> starts both), or from this server's own trading page below: it opens "
+                "on the live defaults in force") in html.unescape(response.body)
         assert f"reads its defaults from <code>{config.LIVE_DEFAULTS_FILE.absolute()}</code>" \
             in response.body
         assert "This writes" not in response.body
         assert "No run has been started from this checkout's server." in response.body
+        # It never names the retired buttons, the backtest file or the /trade address
+        assert "Save as live defaults" not in response.body
+        assert "Trade using defaults" not in response.body and "/trade" not in page.links
 
-    def test_with_a_dashboard_and_its_links(self):
-        dashboard = config.PROJECT_ROOT / config.DASHBOARD_FILENAME
-        dashboard.write_text(_DASHBOARD_WITH_BUTTONS, encoding="utf-8")
+    def test_it_links_the_trading_page_and_the_seed(self):
+        # Whatever backtest page is in the checkout, which the server never reads
+        (config.PROJECT_ROOT / config.DASHBOARD_FILENAME).write_text("<html></html>",
+                                                                     encoding="utf-8")
         response = _get(_app(), "/")
         page = _parse(response.body)
-        assert str(dashboard.absolute()) in response.body
-        assert ("use its filter bar's Save as live defaults… button to save a scenario, or "
-                "its Trade using defaults… button to trade the saved ones") in response.body
-        assert page.links[:2] == [f"/confirm?{defaults_server._seed_query()}", "/trade"]
+        assert page.links[:2] == ["/confirm", f"/confirm?{defaults_server._seed_query()}"]
+        assert ">Trading page</a>" in response.body
         assert "Start from the seed values" in response.body
-        assert "Trade using defaults" in response.body
         # The page a save redirects to is never linked
         assert "/saved" not in page.links
-
-    def test_a_dashboard_built_before_the_buttons_says_to_rebuild_it(self):
-        dashboard = config.PROJECT_ROOT / config.DASHBOARD_FILENAME
-        dashboard.write_text(_DASHBOARD_BEFORE_BUTTONS, encoding="utf-8")
-        response = _get(_app(), "/")
-        assert response.status == 200
-        assert (f"The backtest dashboard at <code>{dashboard.absolute()}</code> was built "
-                "before its Save as live defaults… and Trade using defaults… buttons: rebuild "
-                "it with <code>python3 -m kalshi_betting.backtest</code> and the "
-                "<code>--start-date</code> you built it from. Until then, use the links "
-                "below.") in response.body
-        assert _parse(response.body).links[:2] == [
-            f"/confirm?{defaults_server._seed_query()}", "/trade"]
-
-    def test_a_dashboard_that_cannot_be_read_says_why(self):
-        # A folder where the file should be: it exists but cannot be read as one
-        dashboard = config.PROJECT_ROOT / config.DASHBOARD_FILENAME
-        dashboard.mkdir()
-        response = _get(_app(), "/")
-        assert response.status == 200
-        assert f"The backtest dashboard at <code>{dashboard.absolute()}</code> could not be " \
-               "read (IsADirectoryError" in response.body
-        assert _parse(response.body).links[:2] == [
-            f"/confirm?{defaults_server._seed_query()}", "/trade"]
 
     def test_the_newest_runs_are_listed_first_with_their_state(self):
         for day in range(1, 13):
@@ -759,7 +843,8 @@ class TestCheckout:
             "code": defaults_server._LOADED_CODE}
         headers = dict(defaults_server._response_headers(response))
         assert headers["Content-Type"] == "application/json; charset=utf-8"
-        assert headers["X-Frame-Options"] == "DENY"
+        assert "X-Frame-Options" not in headers
+        assert headers["Content-Security-Policy"] == defaults_server._CSP
 
 
 class TestPortsApart:
@@ -1254,9 +1339,10 @@ class TestConfirmPage:
         assert page.cells["exclude tags"][1:3] == ["Basketball", "none"]
 
     def test_confirm_is_there_and_disabled_when_something_changes(self):
-        # A server built without a process starter: only the save applies
+        # A server built without a process starter: only the save applies.
+        # The dropdown bar is a form of its own, which only asks for the page
         page = _parse(_get(_app(), "/confirm?" + _query()).body)
-        assert page.forms == [("post", "/confirm")]
+        assert page.forms == [("get", "/confirm"), ("post", "/confirm")]
         assert page.labels == _CONFIRM_LABELS
         dry, save, trade = page.buttons
         assert save == {"type": "submit", "name": "action", "value": "save", "id": "confirm",
@@ -1276,19 +1362,28 @@ class TestConfirmPage:
         page = _parse(body)
         assert [b.get("id") for b in page.buttons] == [None, "confirm", "confirm-trade"]
 
-    def test_nothing_to_change_leaves_the_save_a_placeholder(self):
+    def test_nothing_to_change_keeps_the_save_a_real_button(self):
+        # Confirm and save always works: with nothing changed it writes nothing
+        # and says so (TestSaveUnchanged)
         _save(_BASE_SETTINGS)
         response = _get(_app(start_process=_Starter()), "/confirm?" + _query())
         page = _parse(response.body)
         assert page.labels == _CONFIRM_LABELS
-        assert [b.get("id") for b in page.buttons] == ["confirm-dry-run", None, "confirm-trade"]
-        assert page.buttons[1] == {"type": "button", "disabled": None}
-        assert html.escape(defaults_server._NOTHING_TO_SAVE) in response.body
-        assert "These are already the live defaults — nothing to save." in response.body
+        assert [b.get("id") for b in page.buttons] == ["confirm-dry-run", "confirm",
+                                                       "confirm-trade"]
+        assert page.buttons[1] == {"type": "submit", "name": "action", "value": "save",
+                                   "id": "confirm", "disabled": None}
+        assert ("These are already the live defaults: Confirm and save writes nothing, and "
+                "Dry run and Confirm and trade run them as they are.") in response.body
+        assert "nothing to save" not in response.body.lower()
         assert "0 of 11 settings change." in response.body
-        # With nothing to save, the page does not say it writes
+        # With nothing to save, the page does not say it writes, and the red
+        # line says Confirm and trade runs the saved defaults as they are
         assert "This writes" not in response.body
         assert str(config.LIVE_DEFAULTS_FILE.absolute()) in response.body
+        assert ('<p class="money">Confirm and trade runs the live bot with these saved '
+                "defaults on the production account: it places real orders.</p>") \
+            in response.body
 
     def test_the_red_line_and_the_notes(self):
         body = _get(_app(start_process=_Starter()), "/confirm?" + _query()).body
@@ -1309,13 +1404,16 @@ class TestConfirmPage:
         assert first["token"] != second["token"]
         assert first["fingerprint"] == second["fingerprint"]
 
-    def test_the_csp_hash_is_the_one_script_on_the_page(self):
+    def test_the_csp_hashes_are_the_three_scripts_on_the_page(self):
         response = _get(_app(), "/confirm?" + _query())
-        [script] = _parse(response.body).scripts
-        assert script == defaults_server._CONFIRM_JS
-        digest = b64encode(hashlib.sha256(script.encode("utf-8")).digest()).decode("ascii")
+        scripts = _parse(response.body).scripts
+        assert scripts == _TRADING_SCRIPTS
+        digests = [b64encode(hashlib.sha256(script.encode("utf-8")).digest()).decode("ascii")
+                   for script in scripts]
         csp = dict(defaults_server._response_headers(response))["Content-Security-Policy"]
-        assert f"script-src 'sha256-{digest}'" in csp
+        # Exactly these three, in the scripts' order, and nothing else may run
+        [script_src] = [part for part in csp.split("; ") if part.startswith("script-src ")]
+        assert script_src == "script-src " + " ".join(f"'sha256-{digest}'" for digest in digests)
 
     def test_the_script_arms_after_the_configured_delay(self):
         js = defaults_server._CONFIRM_JS
@@ -1332,41 +1430,59 @@ class TestConfirmPage:
         assert "<script>alert" not in response.body
         assert "&lt;script&gt;alert(1)&lt;/script&gt;" in response.body
         page = _parse(response.body)
-        assert len(page.scripts) == 1
+        assert page.scripts == _TRADING_SCRIPTS
         assert ("exclude_category", hostile) in page.hidden
         assert ("exclude_tag", '"><b>x') in page.hidden
         assert page.cells["exclude categories"][2] == hostile
+        # The bar's menus list both names, escaped, ticked
+        assert [(box["value"], "checked" in box) for box in page.bar_boxes(
+            "exclude_category")] == [(hostile, True)]
+        assert [box["value"] for box in page.bar_boxes("exclude_tag")] == ['"><b>x']
+        # ... and the notifier's message carries them as data, escaped
+        message = json.loads(page.body["data-dashboard-message"])
+        assert "exclude_category=%3Cscript%3Ealert%281%29%3C%2Fscript%3E" in message["query"]
 
 
-class TestTradePage:
-    """GET /trade: the saved live defaults, and the buttons that run the bot with them."""
+class TestTradeAddress:
+    """/trade, an older version's address for trading the saved defaults: GET is sent to the
+    trading page (which opens on them), and POST is no route at all."""
 
-    def test_it_shows_the_saved_defaults(self):
-        saved = _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.4,
-                                   size_cap=1.0), source=DASHBOARD_NOTE)
-        response = _get(_app(start_process=_Starter()), "/trade")
-        assert response.status == 200
-        page = _parse(response.body)
-        assert "Trade with the saved live defaults?" in response.body
-        assert f"Saved defaults: {saved.origin}" in response.body
-        assert list(page.rows) == LABELS
-        assert page.cells["k"] == ["k", "0.4"]
-        for sentence in config.live_rule_warnings(saved):
-            assert f'<p class="warn">Warning: {sentence}.</p>' in response.body
-        assert page.forms == [("post", "/trade")]
-        assert page.labels == _TRADE_LABELS
-        assert [name for name, _ in page.hidden] == ["fingerprint", "nonce", "token"]
-        assert ('<p class="money">Confirm and trade runs the live bot with these saved '
-                "defaults on the production account: it places real orders.</p>") \
-            in response.body
-        assert str(config.LIVE_RUN_LOCK_FILE.absolute()) in response.body
-
-    def test_no_defaults_saved_is_404_naming_how_to_save_them(self):
-        response = _get(_app(), "/trade")
-        assert response.status == 404
-        assert "Save as live defaults…" in response.body
-        assert "./start_dashboard.sh --seed in this checkout" in response.body
+    def test_get_is_sent_to_the_trading_page(self):
+        _save(_BASE_SETTINGS)
+        starter = _Starter()
+        app = _app(start_process=starter)
+        response = _get(app, "/trade")
+        assert response.status == 303 and response.location == "/confirm"
         assert "<form" not in response.body
+        # Where it is sent, the saved defaults are proposed as they are
+        page = _get(app, response.location)
+        assert page.status == 200 and "0 of 11 settings change." in page.body
+        assert starter.calls == []
+
+    def test_get_is_sent_there_with_nothing_saved_too(self):
+        response = _get(_app(), "/trade")
+        assert response.status == 303 and response.location == "/confirm"
+
+    def test_a_post_is_not_found_and_starts_nothing(self):
+        # An older version's trade page, still open, posts here: no route,
+        # whatever it carries, and nothing is saved or started
+        _save(_BASE_SETTINGS)
+        before = config.LIVE_DEFAULTS_FILE.read_bytes()
+        starter = _Starter()
+        app = _app(start_process=starter)
+        saved = config.read_saved_live_defaults()
+        fingerprint, nonce = defaults_server._fingerprint(saved), "5" * 32
+        for action in ("trade", "dry_run"):
+            form = [("fingerprint", fingerprint), ("nonce", nonce),
+                    ("token", app._token("trade", fingerprint, nonce, {})), ("action", action)]
+            response = _post(app, form, target="/trade")
+            assert response.status == 404
+            assert "<form" not in response.body
+        assert starter.calls == [] and not config.LIVE_RUNS_DIR.exists()
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
+        # ... and its nonce stays unused here: a page of this server still works
+        _run_id(_post(app, _home_form(app, "confirm-dry-run")))
+        assert len(starter.calls) == 1
 
 
 # macOS's JavaScriptCore shell, the runtime used when node is not installed
@@ -1585,6 +1701,1265 @@ class TestConfirmScript:
         for label in ("after", "moved", "again"):
             assert self._all(out[label], True), label
             assert out[label]["placeholder"] is True
+
+
+class TestHome:
+    """GET /confirm with no address fields: the defaults in force proposed as they are, every
+    field named, so each button acts on them; an older version's file's values in their new
+    form; the seed values with none saved."""
+
+    @staticmethod
+    def _proposed(response) -> tuple[LiveSettings, str]:
+        """
+        Read what a trading page proposes, from the fields its form posts back.
+
+        Args:
+            response (defaults_server._Response): The page.
+
+        Returns:
+            tuple[LiveSettings, str]: The proposal and its source note, as the
+                server reads the form (with nothing saved to keep a field from).
+        """
+        fields = {}
+        for name, value in _parse(response.body).hidden:
+            if name in defaults_server._FIELDS:
+                fields.setdefault(name, []).append(value)
+        return defaults_server._proposal(fields, None)
+
+    def test_saved_defaults_are_proposed_as_they_are(self):
+        saved = _save(LiveSettings(tier_floors=True, spread_band=(0.2, 0.8),
+                                   interval_discount=0.85, size_cap=0.15,
+                                   exclude_categories=("Sports", "Economics"),
+                                   exclude_tags=("Health · Covid",), rebalance=True,
+                                   min_price_move=0.1, rebalance_min_days_to_maturity=7,
+                                   sell_at=0.85, sell_min_days=3), source=DASHBOARD_NOTE)
+        response = _get(_app(start_process=_Starter()), "/confirm")
+        assert response.status == 200
+        assert "Overwrite the live trading defaults?" in response.body
+        assert "0 of 11 settings change." in response.body
+        page = _parse(response.body)
+        assert set(page.rows.values()) == {"same"}
+        # Three real buttons, in their order
+        assert [b.get("id") for b in page.buttons] == ["confirm-dry-run", "confirm",
+                                                       "confirm-trade"]
+        # The form carries every field, exactly as the full link names them,
+        # and no source note (the saved note lives only in the origin)
+        query = defaults_server._settings_query(saved)
+        assert [(n, v) for n, v in page.hidden if n in defaults_server._FIELDS] == [
+            (name, value) for name, values in defaults_server._params(query).items()
+            for value in values]
+        assert self._proposed(response) == (saved, "")
+        assert "New defaults from: (no source note)" in response.body
+
+    def test_an_empty_query_is_the_same_page(self):
+        _save(_BASE_SETTINGS)
+        for target in ("/confirm", "/confirm?"):
+            response = _get(_app(), target)
+            assert response.status == 200, target
+            assert self._proposed(response) == (_BASE_SETTINGS, "")
+
+    def test_a_file_an_older_version_saved_is_proposed_in_its_new_form(self):
+        config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
+        response = _get(_app(start_process=_Starter()), "/confirm")
+        assert response.status == 200
+        assert "Save the live trading defaults again?" in response.body
+        assert f'<p class="banner">{_OUTDATED_CONFIRM_NOTICE}</p>' in response.body
+        assert "11 of 11 settings change." in response.body
+        assert self._proposed(response) == (_OLD_VERSION_READS_AS, "")
+        # Nothing is in force, so a dry run asks for the save first
+        assert [b.get("id") for b in _parse(response.body).buttons] == [
+            None, "confirm", "confirm-trade"]
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _OLD_VERSION_BYTES
+
+    def test_with_none_saved_the_seed_is_proposed(self):
+        response = _get(_app(start_process=_Starter()), "/confirm")
+        assert response.status == 200
+        assert "Save the first live trading defaults?" in response.body
+        assert self._proposed(response) == (config.LIVE_DEFAULTS_SEED,
+                                            config.LIVE_DEFAULTS_SEED_SOURCE)
+        assert f"New defaults from: {config.LIVE_DEFAULTS_SEED_SOURCE}" in response.body
+        assert html.escape(defaults_server._SAVE_FIRST) in response.body
+        assert config.read_saved_live_defaults() is None
+
+    def test_a_refused_file_is_409(self):
+        config.LIVE_DEFAULTS_FILE.write_bytes(b"not json")
+        response = _get(_app(), "/confirm")
+        assert response.status == 409
+        assert "<form" not in response.body
+
+    @staticmethod
+    def _uncarried(response) -> _PageParser:
+        """
+        Check a trading page with no address fields was refused because the saved values cannot be carried.
+
+        Args:
+            response (defaults_server._Response): The answer to GET /confirm.
+
+        Returns:
+            _PageParser: The refusal page, parsed.
+        """
+        assert response.status == 409, response.body
+        page = _parse(response.body)
+        # No form, no button, no script: nothing on it can save or start a run
+        assert page.forms == [] and page.buttons == [] and page.scripts == []
+        assert "data-dashboard-message" not in page.body
+        assert "<title>The saved live defaults cannot be shown here</title>" in response.body
+        # Its one way on is the seed values, where a save replaces the file
+        assert page.links == ["/confirm?" + defaults_server._seed_query()]
+        assert f"Fix or delete <code>{config.LIVE_DEFAULTS_FILE.absolute()}</code>" in (
+            response.body)
+        return page
+
+    @pytest.mark.parametrize("names, why", [
+        ({"exclude_categories": ("Climate  and Weather",)},
+         "exclude_category must not hold two spaces in a row"),
+        ({"exclude_categories": ("Sports", "Sports")}, "exclude_category 'Sports' is given twice"),
+        ({"exclude_tags": tuple(f"Tag {i:03d}"
+                                for i in range(config.DEFAULTS_SERVER_MAX_FILTER_NAMES + 5))},
+         f"exclude_tag is given {config.DEFAULTS_SERVER_MAX_FILTER_NAMES + 5} times, more than "
+         f"{config.DEFAULTS_SERVER_MAX_FILTER_NAMES}"),
+        ({"exclude_categories": ("Sports", "sports")},
+         "exclude categories would read Sports here, not Sports, sports"),
+    ], ids=["two-spaces", "same-name-twice", "too-many", "two-letter-cases"])
+    def test_saved_values_a_link_cannot_carry_get_no_buttons(self, names, why):
+        # LiveSettings, and so every live run, takes these names, but the page
+        # proposes the saved values as a link: one a link cannot carry would
+        # make a button act on other settings (or on nothing at all)
+        saved = _save(replace(_BASE_SETTINGS, **names))
+        before = config.LIVE_DEFAULTS_FILE.read_bytes()
+        starter = _Starter()
+        app = _app(start_process=starter)
+        response = _get(app, "/confirm")
+        self._uncarried(response)
+        assert why in html.unescape(response.body)
+        assert ("Every live run still uses them as saved, but this page cannot dry-run, save "
+                "or trade them unchanged.") in response.body
+        # /trade leads to the same page
+        assert _get(app, "/trade").location == "/confirm"
+        # Nothing was written or started, and a live run still reads them
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
+        assert config.read_saved_live_defaults() == saved
+        assert starter.calls == []
+        # The seed values it links to open a page whose Confirm and save replaces the file
+        seed = _get(app, "/confirm?" + defaults_server._seed_query())
+        assert seed.status == 200
+        assert [b.get("id") for b in _parse(seed.body).buttons] == [
+            "confirm-dry-run", "confirm", "confirm-trade"]
+
+    def test_an_older_version_s_file_a_link_cannot_carry_gets_no_buttons(self):
+        from .test_config import _SAME_TITLE_CAP_ERA_BYTES
+        config.LIVE_DEFAULTS_FILE.write_bytes(_SAME_TITLE_CAP_ERA_BYTES.replace(
+            b'"exclude_categories": null', b'"exclude_categories": ["Climate  and Weather"]'))
+        with pytest.raises(config.LiveDefaultsOutdated) as caught:
+            config.read_saved_live_defaults()
+        assert caught.value.proposal.exclude_categories == ("Climate  and Weather",)
+        response = _get(_app(start_process=_Starter()), "/confirm")
+        self._uncarried(response)
+        text = html.unescape(response.body)
+        assert ("The saved live defaults were saved before the same-title cap was removed, so "
+                "every live run refuses them, and their values in their new form hold "
+                "something this trading page cannot carry as it is: exclude_category must not "
+                "hold two spaces in a row") in text
+        assert "Every live run still uses them" not in text
+
+    def test_the_home_query_is_the_full_query_of_what_is_in_force(self):
+        saved = _save(replace(_BASE_SETTINGS, exclude_tags=("Sports · Soccer",)))
+        assert defaults_server._home_query(saved, None) == defaults_server._settings_query(saved)
+        outdated = config.LiveDefaultsOutdated("m", _OLD_VERSION_READS_AS, ("trim_to_kelly",))
+        assert defaults_server._home_query(None, outdated) == defaults_server._settings_query(
+            _OLD_VERSION_READS_AS)
+        unreadable = config.LiveDefaultsOutdated("m", None, ("trim_to_kelly",))
+        assert defaults_server._home_query(None, unreadable) == defaults_server._seed_query()
+        assert defaults_server._home_query(None, None) == defaults_server._seed_query()
+
+
+class TestSaveUnchanged:
+    """Confirm and save with nothing changed writes nothing and sends the browser to the saved
+    page, which says so; with a change it writes once, as always."""
+
+    @staticmethod
+    def _counting(monkeypatch) -> list:
+        """
+        Replace the server's save with one that counts each call, then saves.
+
+        Args:
+            monkeypatch (pytest.MonkeyPatch): Puts the real save back afterwards.
+
+        Returns:
+            list: The settings of each save, in order.
+        """
+        saves = []
+        real_save = defaults_server.save_live_defaults
+
+        def counting_save(settings, *, source):
+            """
+            Count one save, then make it.
+
+            Args:
+                settings (LiveSettings): The defaults saved.
+                source (str): Their source note.
+
+            Returns:
+                LiveSettings: What the real save returns.
+            """
+            saves.append(settings)
+            return real_save(settings, source=source)
+
+        monkeypatch.setattr(defaults_server, "save_live_defaults", counting_save)
+        return saves
+
+    @pytest.mark.parametrize("opened", ["home", "link"])
+    def test_it_writes_nothing_and_says_so(self, monkeypatch, opened):
+        _save(_BASE_SETTINGS, source=DASHBOARD_NOTE)
+        before = config.LIVE_DEFAULTS_FILE.read_bytes()
+        saves = self._counting(monkeypatch)
+        app = _app(start_process=_Starter())
+        form = (_home_form(app, "confirm") if opened == "home"
+                else _page_form(app, _query(source=DASHBOARD_NOTE)))
+        response = _post(app, form)
+        assert response.status == 303 and response.location == "/saved?unchanged=1"
+        assert saves == []
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
+        # A resubmit is sent to the same place, still writing nothing
+        again = _post(app, form)
+        assert again.status == 303 and again.location == "/saved?unchanged=1"
+        assert saves == [] and config.LIVE_DEFAULTS_FILE.read_bytes() == before
+        # The saved page says nothing changed, and leads back to the trading page
+        page = _get(app, response.location)
+        assert page.status == 200
+        assert ("Nothing changed: these are already the live defaults, so nothing was "
+                "written.") in page.body
+        assert "Saved and verified" not in page.body
+        assert "Live trading defaults unchanged" in page.body
+        assert _parse(page.body).links == ["/confirm"]
+        assert ">Back to the trading page</a>" in page.body
+        assert app._start_process.calls == []
+
+    def test_a_change_still_writes_once_and_goes_to_the_saved_page(self, monkeypatch):
+        _save(_BASE_SETTINGS)
+        saves = self._counting(monkeypatch)
+        app = _app()
+        response = _post(app, _page_form(app, _query(k="0.75")))
+        assert response.status == 303 and response.location == "/saved"
+        assert saves == [replace(_BASE_SETTINGS, interval_discount=0.75)]
+        page = _get(app, "/saved")
+        assert "Saved and verified" in page.body and "Nothing changed" not in page.body
+
+    @pytest.mark.parametrize("query", ["x=1", "unchanged=0", "unchanged=1&x=1", "unchanged",
+                                       "unchanged=1&unchanged=1", "UNCHANGED=1"])
+    def test_the_saved_page_takes_no_other_query(self, query):
+        _save(_BASE_SETTINGS)
+        response = _get(_app(), f"/saved?{query}")
+        assert response.status == 400
+        assert "<form" not in response.body
+
+    def test_trade_and_dry_run_with_nothing_changed_write_nothing(self, monkeypatch):
+        _save(_BASE_SETTINGS)
+        before = config.LIVE_DEFAULTS_FILE.read_bytes()
+        saves = self._counting(monkeypatch)
+        starter = _Starter()
+        app = _app(start_process=starter)
+        _run_id(_post(app, _home_form(app, "confirm-trade")))
+        app._runs.clear()
+        _run_id(_post(app, _home_form(app, "confirm-dry-run")))
+        assert saves == [] and len(starter.calls) == 2
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
+
+
+class TestFraming:
+    """Only the live dashboard's tab page may frame this server's pages, and only the three
+    hash-pinned scripts run; the pages that carry a message say what they show."""
+
+    _ORIGINS = ("http://127.0.0.1:8766", "http://localhost:8766")
+
+    def test_the_tab_page_s_two_origins_are_config_s(self):
+        assert config.LIVE_DASHBOARD_ORIGINS == self._ORIGINS
+        backtest = f"http://{config.LIVE_DASHBOARD_HOST}:{config.LIVE_BACKTEST_PORT}"
+        assert backtest not in config.LIVE_DASHBOARD_ORIGINS
+        assert all(str(config.DEFAULTS_SERVER_PORT) not in o for o in self._ORIGINS)
+
+    def test_every_route_allows_only_the_tab_page_to_frame_it(self):
+        _save(_BASE_SETTINGS)
+        _disk_run(result=_result())
+        app = _app(start_process=_Starter())
+        answers = [_get(app, target) for target in (
+            "/", "/confirm", "/confirm?" + _query(), "/confirm?k", "/saved", "/saved?x=1",
+            "/trade", "/runs/0123456789abcdef", "/runs/nope", "/checkout", "/nope")]
+        answers += [_get(app, "/", host="evil.test"), _post(app, []),
+                    _post(app, [], target="/trade"),
+                    _post(app, _page_form(app, _query(k="0.75")))]
+        expected_scripts = "script-src " + " ".join(
+            f"'{defaults_server._script_hash(s)}'" for s in _TRADING_SCRIPTS)
+        for response in answers:
+            headers = dict(defaults_server._response_headers(response))
+            assert "X-Frame-Options" not in headers
+            parts = headers["Content-Security-Policy"].split("; ")
+            assert [p for p in parts if p.startswith("frame-ancestors")] == [
+                "frame-ancestors " + " ".join(self._ORIGINS)]
+            assert [p for p in parts if p.startswith("script-src")] == [expected_scripts]
+            assert "form-action 'self'" in parts and "default-src 'none'" in parts
+
+    def test_each_hash_is_its_script_s(self):
+        for script in _TRADING_SCRIPTS:
+            digest = b64encode(hashlib.sha256(script.encode("utf-8")).digest()).decode("ascii")
+            assert defaults_server._script_hash(script) == f"sha256-{digest}"
+        assert defaults_server._CONFIRM_JS_HASH == defaults_server._script_hash(
+            defaults_server._CONFIRM_JS)
+
+    def test_the_trading_page_tells_its_proposal(self):
+        for query, source in ((_query(source=DASHBOARD_NOTE, k="0.75"), DASHBOARD_NOTE),
+                              (defaults_server._seed_query(), config.LIVE_DEFAULTS_SEED_SOURCE),
+                              (_query(), "")):
+            response = _get(_app(), f"/confirm?{query}")
+            settings, read = defaults_server._proposal(defaults_server._params(query), None)
+            assert read == source
+            message = json.loads(_parse(response.body).body["data-dashboard-message"])
+            assert message == {"type": "kalshi-trading",
+                               "query": defaults_server._settings_query(settings, source=source)}
+            # The message's query proposes exactly the page's proposal
+            assert defaults_server._proposal(defaults_server._params(message["query"]),
+                                             None) == (settings, source)
+
+    @pytest.mark.parametrize("running", [True, False])
+    def test_a_run_page_tells_its_run_and_carries_only_the_notifier(self, running):
+        app = _app()
+        run_id = _memory_run(app, returncode=None if running else 0, result=None if running
+                             else _result())
+        page = _parse(_get(app, f"/runs/{run_id}").body)
+        assert json.loads(page.body["data-dashboard-message"]) == {"type": "kalshi-run",
+                                                                   "run": run_id}
+        assert page.scripts == [defaults_server._NOTIFY_JS]
+        assert page.forms == [] and page.buttons == []
+
+
+def _names_file(categories=(), tags=(), **changes) -> Path:
+    """
+    Write the backtest page's names file into the test's checkout.
+
+    Args:
+        categories: Its categories, in order.
+        tags: Its tags ("Category · Tag"), in order.
+        **changes: Other keys to set (format, say), or with None remove.
+
+    Returns:
+        Path: The file.
+    """
+    record = {"format": config.BACKTEST_FILTER_NAMES_FORMAT, "categories": list(categories),
+              "tags": list(tags), **changes}
+    path = config.PROJECT_ROOT / config.BACKTEST_FILTER_NAMES_FILENAME
+    path.write_text(json.dumps({k: v for k, v in record.items() if v is not None}),
+                    encoding="utf-8")
+    return path
+
+
+def _bar_query(page: _PageParser, choose: dict | None = None,
+               ticks: dict | None = None) -> str:
+    """
+    Build the query a browser sends for the dropdown bar, after the bar script's settle().
+
+    One dropdown may be set first (choose), and a menu's boxes ticked anew
+    (ticks). Then settle()'s rules: the spread band's choice goes into
+    spread_min and spread_max, and Rebalance no turns Min. price movement to
+    "off" and Rebalance until to "0", Sell off turns Min. days to maturity to
+    "off" (each a value its dropdown must offer, or a browser would select
+    nothing). Then the form's named controls in page order, as a browser
+    serialises a GET form: each named dropdown's selected option, each
+    ticked box, each hidden field; the unnamed band dropdown and the
+    unnamed Apply buttons send nothing.
+
+    Args:
+        page (_PageParser): The parsed trading page.
+        choose (dict | None): Dropdown name (the band's id, tb-band) -> the
+            option value to select.
+        ticks (dict | None): Menu field name -> the box values to tick (all
+            others unticked); a menu left out keeps the page's ticks.
+
+    Returns:
+        str: The query string, encoded as a browser encodes a GET form.
+    """
+    choose, ticks = choose or {}, ticks or {}
+    values, offered = {}, {}
+    for control in page.bar_controls:
+        if control["tag"] == "select":
+            key = control.get("name") or control["id"]
+            offered[key] = [option["value"] for option in control["options"]]
+            selected = [option["value"] for option in control["options"] if option["selected"]]
+            values[key] = choose.get(key, selected[0] if selected else offered[key][0])
+            assert values[key] in offered[key], (key, values[key])
+    hidden = {c["name"]: c["value"] for c in page.bar_controls if c.get("type") == "hidden"}
+
+    def force(key: str, value: str) -> None:
+        """
+        Set a dropdown as settle() does, failing when it does not offer the value.
+
+        Args:
+            key (str): The dropdown's name.
+            value (str): The value settle() sets.
+        """
+        assert value in offered[key], (key, value, offered[key])
+        values[key] = value
+
+    hidden["spread_min"], hidden["spread_max"] = values["tb-band"].split("|")
+    if values["rebalance"] == "off":
+        force("min_price_move", "off")
+        force("rebalance_min_days_to_maturity", "0")
+    if values["sell_at"] == "off":
+        force("sell_min_days", "off")
+    pairs = []
+    for control in page.bar_controls:
+        name = control.get("name")
+        if control["tag"] == "select":
+            if name:
+                pairs.append((name, values[name]))
+        elif control.get("type") == "hidden":
+            pairs.append((name, hidden[name]))
+        elif control.get("type") == "checkbox":
+            ticked = (control["value"] in ticks[name] if name in ticks
+                      else "checked" in control)
+            if ticked:
+                pairs.append((name, control["value"]))
+    return urlencode(pairs)
+
+
+# Saved defaults with every dropdown's full choices: rebalancing and selling on
+_FULL_BASE = LiveSettings(tier_floors=True, spread_band=(0.2, 0.8), interval_discount=0.85,
+                          size_cap=0.15, exclude_categories=("Sports", "Economics"),
+                          exclude_tags=("Health · Covid",), rebalance=True, min_price_move=0.1,
+                          rebalance_min_days_to_maturity=7, sell_at=0.85, sell_min_days=3)
+# ... and with the narrowed ones: rebalancing and selling off
+_NARROW_BASE = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+                            size_cap=0.1)
+
+
+class TestTradingBar:
+    """The trading page's dropdown bar: the backtest page's eleven controls, its choices, the
+    names its menus list, and a form of its own that only asks for the page again."""
+
+    @staticmethod
+    def _page(settings: LiveSettings | None = None, query: str | None = None) -> _PageParser:
+        """
+        Open the trading page and parse it.
+
+        Args:
+            settings (LiveSettings | None): Defaults to save first; None saves none.
+            query (str | None): The page's query; None opens it with none.
+
+        Returns:
+            _PageParser: The parsed page.
+        """
+        if settings is not None:
+            _save(settings)
+        response = _get(_app(), "/confirm" + ("" if query is None else f"?{query}"))
+        assert response.status == 200, response.body[:500]
+        return _parse(response.body)
+
+    @staticmethod
+    def _offered(page: _PageParser, key: str) -> list[str]:
+        """
+        List one dropdown's option values.
+
+        Args:
+            page (_PageParser): The parsed page.
+            key (str): The dropdown's name (or tb-band).
+
+        Returns:
+            list[str]: Its option values, in order.
+        """
+        return [option["value"] for option in page.bar_select(key)["options"]]
+
+    @staticmethod
+    def _chosen(page: _PageParser, key: str) -> tuple[str, str]:
+        """
+        Read one dropdown's selected option.
+
+        Args:
+            page (_PageParser): The parsed page.
+            key (str): The dropdown's name (or tb-band).
+
+        Returns:
+            tuple[str, str]: The selected option's value and text.
+        """
+        [option] = [o for o in page.bar_select(key)["options"] if o["selected"]]
+        return option["value"], option["text"]
+
+    def test_eleven_controls_in_the_backtest_bar_s_order_and_words(self):
+        from kalshi_betting import dashboard
+
+        page = self._page()
+        labels = [label.strip().removesuffix(":") for label in page.bar_labels]
+        # The backtest page's bar, read from its own source: its dropdowns'
+        # labels in order, then its two menus' labels
+        source = inspect.getsource(dashboard._filter_bar_html)
+        expected = re.findall(r"<label>([^<:]+): <select id=\"flt-", source)
+        expected += [dashboard._MENU_CAT_LABEL, dashboard._MENU_TAG_LABEL]
+        assert len(expected) == 11
+        assert labels == expected == [
+            "Spread band", "Tier floors", "k", "Size cap", "Rebalance", "Min. price movement",
+            "Rebalance until", "Sell", "Min. days to maturity", "Exclude categories",
+            "Exclude tags"]
+        # The dropdowns in that order, the band by its id, the rest by the field they send
+        assert [c.get("name") or c.get("id") for c in page.bar_controls
+                if c["tag"] == "select"] == [
+            "tb-band", "tier_floors", "k", "size_cap", "rebalance", "min_price_move",
+            "rebalance_min_days_to_maturity", "sell_at", "sell_min_days"]
+
+    def test_it_is_a_form_of_its_own_that_only_asks_for_the_page(self):
+        page = self._page(_FULL_BASE)
+        assert page.bar_form["method"] == "get" and page.bar_form["action"] == "/confirm"
+        assert page.forms == [("get", "/confirm"), ("post", "/confirm")]
+        # Under the heading, above everything else on the page
+        body = _get(_app(), "/confirm").body
+        assert body.index("<h1>") < body.index('<form id="tb-form"') < body.index("<table>")
+        # Its buttons (each menu's Apply) name nothing, so add no field; no
+        # dropdown is ever disabled (a disabled one is not sent); none names
+        # a field the posting form signs but a proposal field
+        assert [b.get("type") for b in page.bar_buttons] == ["submit", "submit"]
+        assert all("name" not in b and "id" not in b for b in page.bar_buttons)
+        assert not any("disabled" in c for c in page.bar_controls)
+        names = {c.get("name") for c in page.bar_controls} - {None}
+        assert names <= set(defaults_server._FIELDS)
+        assert not names & {"action", "fingerprint", "nonce", "token", "ack_attention"}
+        # The bar's hidden fields are not the posting form's
+        assert ("spread_min", "0.2") in page.hidden and len(
+            [n for n, _ in page.hidden if n == "spread_min"]) == 1
+
+    def test_each_dropdown_shows_the_proposal_in_the_table_s_words(self):
+        page = self._page(_FULL_BASE)
+        query = defaults_server._params(defaults_server._settings_query(_FULL_BASE))
+        assert self._chosen(page, "tb-band") == ("0.2|0.8", "0.2-0.8")
+        for name, _ in defaults_server._BAR_SELECT_LABELS:
+            value, _ = self._chosen(page, name)
+            assert [value] == query[name], name
+        # Each chosen option reads as the table under the bar reads the value
+        words = {"tb-band": "spread band", "tier_floors": "tier floors", "k": "k",
+                 "size_cap": "per-trade cap", "rebalance": "rebalance",
+                 "min_price_move": "min price movement",
+                 "rebalance_min_days_to_maturity": "rebalance until", "sell_at": "sell at",
+                 "sell_min_days": "min days to maturity"}
+        for key, row in words.items():
+            assert self._chosen(page, key)[1] == page.cells[row][2], key
+        # The hidden band fields hold the proposal's band
+        hidden = {c["name"]: c["value"] for c in page.bar_controls if c.get("type") == "hidden"}
+        assert (hidden["spread_min"], hidden["spread_max"]) == ("0.2", "0.8")
+
+    @pytest.mark.parametrize("constant", ["DEFAULTS_SERVER_SPREAD_BANDS",
+                                          "DEFAULTS_SERVER_SIZE_CAPS"])
+    def test_config_s_lists_of_choices_feed_the_bar_alone(self, constant):
+        # The live path may not name the backtest's band grids (the AST pin in
+        # tests/test_strategy.py); config's copy is a list of dropdown choices,
+        # so it feeds this bar and nothing else, here or in any other module
+        tree = ast.parse(inspect.getsource(defaults_server))
+        uses = [node for node in ast.walk(tree)
+                if isinstance(node, ast.Name) and node.id == constant]
+        [bar] = [node for node in tree.body
+                 if isinstance(node, ast.FunctionDef) and node.name == "_bar_html"]
+        inside = {id(node) for node in ast.walk(bar)}
+        assert uses and all(id(node) in inside for node in uses)
+        for info in pkgutil.iter_modules(kalshi_betting.__path__):
+            if info.name in ("config", "defaults_server"):
+                continue
+            module = importlib.import_module(f"kalshi_betting.{info.name}")
+            assert constant not in inspect.getsource(module), info.name
+
+    def test_the_choices_are_config_s_grids(self):
+        page = self._page(_FULL_BASE)
+        assert self._offered(page, "tb-band") == [
+            f"{lo!r}|{hi!r}" for lo, hi in config.DEFAULTS_SERVER_SPREAD_BANDS]
+        assert len(config.DEFAULTS_SERVER_SPREAD_BANDS) == 36
+        assert self._offered(page, "tier_floors") == ["on", "off"]
+        assert self._offered(page, "k") == [repr(k) for k in config.INTERVAL_DISCOUNT_SWEEP]
+        assert self._offered(page, "size_cap") == [
+            repr(cap) for cap in config.DEFAULTS_SERVER_SIZE_CAPS]
+        assert self._offered(page, "rebalance") == ["off", "on"]
+        assert self._offered(page, "min_price_move") == ["off"] + [
+            repr(m) for m in config.MIN_PRICE_MOVES]
+        assert self._offered(page, "rebalance_min_days_to_maturity") == [
+            str(d) for d in config.REBALANCE_MATURITY_DAYS]
+        assert self._offered(page, "sell_at") == ["off"] + [
+            repr(level) for level in config.TAKE_PROFIT_LEVELS]
+        assert self._offered(page, "sell_min_days") == ["off"] + [
+            str(d) for d in config.TAKE_PROFIT_MIN_DAYS]
+        # Each option's words are config's words for that value
+        texts = {o["value"]: o["text"] for o in page.bar_select("min_price_move")["options"]}
+        assert texts["off"] == "any" and texts["0.15"] == "15c"
+        texts = {o["value"]: o["text"] for o in page.bar_select("size_cap")["options"]}
+        assert texts["1.0"] == "100% (no cap)" and texts["0.05"] == "5%"
+        texts = {o["value"]: o["text"] for o in page.bar_select(
+            "rebalance_min_days_to_maturity")["options"]}
+        assert texts == {"0": "maturity", "1": "1 day before maturity",
+                         "7": "7 days before maturity"}
+        texts = {o["value"]: o["text"] for o in page.bar_select("tb-band")["options"]}
+        assert texts["0.0|1.0"] == "none" and texts["0.0|0.5"] == "0-0.5"
+        texts = {o["value"]: o["text"] for o in page.bar_select("sell_at")["options"]}
+        assert texts["off"] == "off" and texts["0.8"] == "80% of potential profit"
+        texts = {o["value"]: o["text"] for o in page.bar_select("rebalance")["options"]}
+        assert texts == {"off": "no", "on": "yes"}
+
+    def test_a_value_off_the_grid_is_offered_once_in_its_place(self):
+        off_grid = LiveSettings(tier_floors=False, spread_band=(0.1, 0.45),
+                                interval_discount=1 / 3, size_cap=0.1, rebalance=True,
+                                min_price_move=1.0, sell_at=0.5, sell_min_days=10)
+        page = self._page(off_grid)
+        for key, value in (("tb-band", "0.1|0.45"), ("k", repr(1 / 3)),
+                           ("min_price_move", "1.0"), ("sell_at", "0.5"),
+                           ("sell_min_days", "10")):
+            offered = self._offered(page, key)
+            assert offered.count(value) == 1, key
+            assert self._chosen(page, key)[0] == value, key
+        # In order: smallest first, "off" or "any" ahead of every number
+        assert self._offered(page, "k")[0] == repr(1 / 3)
+        assert self._offered(page, "min_price_move")[-1] == "1.0"
+        assert self._offered(page, "sell_at")[:2] == ["off", "0.5"]
+        assert self._offered(page, "sell_min_days")[-3:] == ["10", "14", "21"]
+        assert self._offered(page, "tb-band").index("0.1|0.45") == 6
+        # On the grid it is offered once, never twice
+        page = self._page(_FULL_BASE)
+        for key in ("tb-band", "k", "size_cap", "min_price_move", "sell_at", "sell_min_days"):
+            offered = self._offered(page, key)
+            assert len(offered) == len(set(offered)), key
+
+    def test_choices_that_do_not_apply_are_not_offered(self):
+        page = self._page(_NARROW_BASE)
+        # Rebalance no: no minimum price movement, no days limit; Sell off: no minimum of days
+        assert self._offered(page, "min_price_move") == ["off"]
+        assert [o["text"] for o in page.bar_select("min_price_move")["options"]] == ["any"]
+        assert self._offered(page, "rebalance_min_days_to_maturity") == ["0"]
+        assert self._offered(page, "sell_min_days") == ["off"]
+        # ... and never by disabling a dropdown
+        assert not any("disabled" in c for c in page.bar_controls)
+        # Rebalance yes with selling off: the rebalance choices open, the days do not
+        page = self._page(replace(_NARROW_BASE, rebalance=True))
+        assert len(self._offered(page, "min_price_move")) == 1 + len(config.MIN_PRICE_MOVES)
+        assert self._offered(page, "sell_min_days") == ["off"]
+
+    @pytest.mark.parametrize("source, kept", [
+        (DASHBOARD_NOTE, True), (config.LIVE_DEFAULTS_SEED_SOURCE, False), (None, False)])
+    def test_the_source_note_is_kept_but_never_the_seed_s(self, source, kept):
+        query = (defaults_server._seed_query() if source == config.LIVE_DEFAULTS_SEED_SOURCE
+                 else _query(source=source))
+        page = self._page(query=query)
+        sources = [c["value"] for c in page.bar_controls
+                   if c.get("type") == "hidden" and c["name"] == "source"]
+        assert sources == ([source] if kept else [])
+
+    def test_the_menus_list_the_names_file_and_every_excluded_name(self):
+        _names_file(categories=("Economics", "Politics", "sports", "Crypto"),
+                    tags=("Sports · Soccer", "Health · COVID", "Sports · Basketball"))
+        page = self._page(_FULL_BASE)
+        # Each menu: the excluded names first, in the proposal's order, ticked;
+        # then the file's others, unticked; a second spelling of a listed name
+        # in another letter case is left out
+        boxes = [(b["value"], "checked" in b) for b in page.bar_boxes("exclude_category")]
+        assert boxes == [("Sports", True), ("Economics", True), ("Politics", False),
+                         ("Crypto", False)]
+        boxes = [(b["value"], "checked" in b) for b in page.bar_boxes("exclude_tag")]
+        assert boxes == [("Health · Covid", True), ("Sports · Soccer", False),
+                         ("Sports · Basketball", False)]
+        assert page.bar_notes == []
+        body = _get(_app(), "/confirm").body
+        assert "<summary>2 excluded</summary>" in body and "<summary>1 excluded</summary>" in body
+
+    def test_the_names_file_is_read_again_for_every_page(self):
+        app = _app()
+        _names_file(categories=("Economics",))
+        first = _parse(_get(app, "/confirm").body)
+        _names_file(categories=("Economics", "Politics"))
+        second = _parse(_get(app, "/confirm").body)
+        assert [b["value"] for b in first.bar_boxes("exclude_category")] == ["Economics"]
+        assert [b["value"] for b in second.bar_boxes("exclude_category")] == [
+            "Economics", "Politics"]
+
+    @pytest.mark.parametrize("contents, why", [
+        (None, "there is no backtest_filter_names.json beside the backtest dashboard"),
+        (b"not json", "cannot be used"),
+        (b'{"format": "backtest-filter-names-v1", "categories": [NaN], "tags": []}',
+         "which is not JSON"),
+        (b'{"format": "backtest-filter-names-v2", "categories": [], "tags": []}',
+         "it is not a backtest-filter-names-v1 file"),
+        (b'["Sports"]', "it is not a backtest-filter-names-v1 file"),
+        (b'{"format": "backtest-filter-names-v1", "categories": ["Sports"], "tags": [], '
+         b'"tags": ["X"]}', "it gives a key twice"),
+        (b'{"format": "backtest-filter-names-v1", "categories": "Sports", "tags": []}',
+         "its categories are not a list of names"),
+        (b'{"format": "backtest-filter-names-v1", "categories": [], "tags": [5]}',
+         "its tags are not a list of names"),
+        (b'{"format": "backtest-filter-names-v1", "categories": ["Sports"]}',
+         "its tags are not a list of names"),
+        (b'{"format": "backtest-filter-names-v1", "categories": ["any"], "tags": []}',
+         "cannot hold the name"),
+        ('{"format": "backtest-filter-names-v1", "categories": ["Sports · Soccer"], '
+         '"tags": []}'.encode(), "only a whole category can be excluded"),
+        (b'{"format": "backtest-filter-names-v1", "categories": [" Sports"], '
+         b'"tags": []}', "must be one printable name"),
+        ('{"format": "backtest-filter-names-v1", "categories": [], '
+         '"tags": ["Sports  · Soccer"]}'.encode(), "must not hold two spaces in a row"),
+        ('{"format": "backtest-filter-names-v1", "categories": [], '
+         '"tags": ["Sports ·"]}'.encode(), "Category · Tag"),
+        (b"\xff\xfe", "cannot be used"),
+        (b"[" * 5000, "cannot be used"),
+    ], ids=["missing", "not-json", "nan", "other-format", "not-an-object", "key-twice",
+            "categories-not-a-list", "tag-not-a-string", "no-tags", "any", "tied-category",
+            "spaces-around", "double-space", "half-tag", "not-utf8", "too-deep"])
+    def test_a_file_that_cannot_be_used_lists_only_the_excluded_names(self, contents, why):
+        path = config.PROJECT_ROOT / config.BACKTEST_FILTER_NAMES_FILENAME
+        if contents is not None:
+            path.write_bytes(contents)
+        names = defaults_server._filter_names()
+        assert names.categories == () and names.tags == ()
+        assert why in names.note, names.note
+        assert names.note.startswith("The Exclude menus list only the names excluded here: ")
+        page = self._page(_FULL_BASE)
+        assert [b["value"] for b in page.bar_boxes("exclude_category")] == ["Sports",
+                                                                            "Economics"]
+        assert [b["value"] for b in page.bar_boxes("exclude_tag")] == ["Health · Covid"]
+        [note] = page.bar_notes
+        assert note == names.note
+        assert "Build the backtest dashboard (python3 -m kalshi_betting.backtest)" in note
+
+    def test_a_file_longer_than_the_limit_is_not_read(self, monkeypatch):
+        path = _names_file(categories=("Economics",))
+        monkeypatch.setattr(defaults_server, "BACKTEST_FILTER_NAMES_MAX_BYTES",
+                            len(path.read_bytes()) - 1)
+        names = defaults_server._filter_names()
+        assert names.categories == () and f"is longer than {len(path.read_bytes()) - 1} bytes" \
+            in names.note
+        # At exactly the limit it is read
+        monkeypatch.setattr(defaults_server, "BACKTEST_FILTER_NAMES_MAX_BYTES",
+                            len(path.read_bytes()))
+        assert defaults_server._filter_names() == defaults_server._FilterNames(
+            ("Economics",), (), None)
+        assert config.BACKTEST_FILTER_NAMES_MAX_BYTES == 1_048_576
+
+    def test_a_file_that_cannot_be_opened_never_raises(self, monkeypatch):
+        path = _names_file(categories=("Economics",))
+        real_open = os.open
+
+        def refuse(file, flags, *args, **kwargs):
+            """
+            Stand in for os.open, refusing the names file as a file with no read permission would.
+
+            Args:
+                file: The path.
+                flags (int): The open flags.
+                *args: Passed on.
+                **kwargs: Passed on.
+
+            Returns:
+                int: The real descriptor, for any other file.
+
+            Raises:
+                PermissionError: For the names file.
+            """
+            if Path(file) == path:
+                raise PermissionError(errno.EACCES, "Permission denied", str(file))
+            return real_open(file, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", refuse)
+        names = defaults_server._filter_names()
+        assert names.categories == () and "could not be read (PermissionError)" in names.note
+        assert _get(_app(), "/confirm").status == 200
+
+    @staticmethod
+    def _read_names_quickly() -> defaults_server._FilterNames:
+        """
+        Read the names file on a thread of its own, failing if the read waits.
+
+        Returns:
+            defaults_server._FilterNames: What _filter_names returned.
+        """
+        done = []
+        reader = threading.Thread(target=lambda: done.append(defaults_server._filter_names()),
+                                  daemon=True)
+        reader.start()
+        reader.join(10)
+        assert done, "reading the names file waited"
+        return done[0]
+
+    @pytest.mark.parametrize("kind", ["folder", "fifo", "link-to-a-device"])
+    def test_a_names_file_that_is_not_a_plain_file_is_never_read(self, kind):
+        # A FIFO with no writer, or a terminal, would keep an ordinary read
+        # waiting, and the server answers one request at a time
+        path = config.PROJECT_ROOT / config.BACKTEST_FILTER_NAMES_FILENAME
+        if kind == "folder":
+            path.mkdir()
+        elif kind == "fifo":
+            os.mkfifo(path)
+        else:
+            path.symlink_to(os.devnull)
+        names = self._read_names_quickly()
+        assert names.categories == () and names.tags == ()
+        assert "backtest_filter_names.json is not a plain file" in names.note
+        assert _get(_app(), "/confirm").status == 200
+
+    def test_a_fifo_that_slips_past_the_check_is_never_waited_on(self, monkeypatch):
+        # Swapped in after the plain-file check: the open and the read return at once
+        path = config.PROJECT_ROOT / config.BACKTEST_FILTER_NAMES_FILENAME
+        os.mkfifo(path)
+        real_is_file = Path.is_file
+        monkeypatch.setattr(Path, "is_file", lambda self: self == path or real_is_file(self))
+        names = self._read_names_quickly()
+        assert names.categories == () and "cannot be used" in names.note
+
+    def test_each_list_keeps_at_most_the_names_a_link_may_name(self, monkeypatch):
+        monkeypatch.setattr(defaults_server, "DEFAULTS_SERVER_MAX_FILTER_NAMES", 2)
+        _names_file(categories=("A", "B", "C"), tags=("A · x", "B · y"))
+        names = defaults_server._filter_names()
+        assert names.categories == ("A", "B") and names.tags == ("A · x", "B · y")
+        assert "the first 2 categories and the first 2 tags" in names.note
+        page = self._page()
+        [note] = page.bar_notes
+        assert note == names.note
+
+    def test_a_hostile_name_in_the_file_is_escaped(self):
+        _names_file(categories=("<script>alert(1)</script>",), tags=('Sports · "><b>x',))
+        body = _get(_app(), "/confirm").body
+        assert "<script>alert" not in body
+        page = _parse(body)
+        assert page.scripts == _TRADING_SCRIPTS
+        assert [b["value"] for b in page.bar_boxes("exclude_category")] == [
+            "<script>alert(1)</script>"]
+        assert [b["value"] for b in page.bar_boxes("exclude_tag")] == ['Sports · "><b>x']
+
+
+class TestBarRoundTrip:
+    """Every choice of every dropdown, sent as a browser sends the bar after the bar script's
+    settle(), is a proposal the server takes and proposes exactly; so are the menus' ticks."""
+
+    @staticmethod
+    def _expected(base: LiveSettings, key: str, value: str) -> LiveSettings:
+        """
+        Work out what choosing one option should propose, from the option's value alone.
+
+        Args:
+            base (LiveSettings): The proposal the bar showed.
+            key (str): The dropdown's name (tb-band for the spread band).
+            value (str): The option's value.
+
+        Returns:
+            LiveSettings: The base with that one choice made, and what settle()
+                turns off with it.
+        """
+        off = value == "off"
+        if key == "tb-band":
+            lo, hi = value.split("|")
+            return replace(base, spread_band=(float(lo), float(hi)))
+        if key == "tier_floors":
+            return replace(base, tier_floors=value == "on")
+        if key == "k":
+            return replace(base, interval_discount=float(value))
+        if key == "size_cap":
+            return replace(base, size_cap=float(value))
+        if key == "rebalance":
+            return (replace(base, rebalance=True) if value == "on" else replace(
+                base, rebalance=False, min_price_move=None,
+                rebalance_min_days_to_maturity=None))
+        if key == "min_price_move":
+            return replace(base, min_price_move=None if off else float(value))
+        if key == "rebalance_min_days_to_maturity":
+            return replace(base, rebalance_min_days_to_maturity=int(value) or None)
+        if key == "sell_at":
+            return (replace(base, sell_at=None, sell_min_days=None) if off
+                    else replace(base, sell_at=float(value)))
+        assert key == "sell_min_days"
+        return replace(base, sell_min_days=None if off else int(value))
+
+    @pytest.mark.parametrize("base", [_FULL_BASE, _NARROW_BASE], ids=["full", "narrowed"])
+    def test_every_choice_is_proposed_exactly(self, base):
+        _save(base)
+        app = _app()
+        page = _parse(_get(app, "/confirm").body)
+        # Unchanged, the bar asks for exactly what it shows: nothing changes
+        response = _get(app, "/confirm?" + _bar_query(page))
+        assert response.status == 200 and "0 of 11 settings change." in response.body
+        tried = 0
+        for control in page.bar_controls:
+            if control["tag"] != "select":
+                continue
+            key = control.get("name") or control["id"]
+            for option in control["options"]:
+                query = _bar_query(page, {key: option["value"]})
+                response = _get(app, "/confirm?" + query)
+                assert response.status == 200, (key, option["value"], response.body[:400])
+                expected = self._expected(base, key, option["value"])
+                assert defaults_server._proposal(defaults_server._params(query), base) == (
+                    expected, ""), (key, option["value"])
+                # The page it opens proposes that, and its bar shows the choice made
+                again = _parse(response.body)
+                assert json.loads(again.body["data-dashboard-message"])["query"] == (
+                    defaults_server._settings_query(expected)), (key, option["value"])
+                assert [o["value"] for o in again.bar_select(key)["options"]
+                        if o["selected"]] == [option["value"]], (key, option["value"])
+                tried += 1
+        # Every option of the nine dropdowns was tried
+        assert tried == sum(len(c["options"]) for c in page.bar_controls if c["tag"] == "select")
+        assert tried > (100 if base is _FULL_BASE else 80)
+
+    def test_the_menus_ticks_are_proposed_in_their_order(self):
+        _names_file(categories=("Politics", "Crypto"), tags=("Sports · Soccer",))
+        _save(_FULL_BASE)
+        app = _app()
+        page = _parse(_get(app, "/confirm").body)
+        for ticks, categories, tags in (
+                ({"exclude_category": {"Sports", "Economics", "Crypto"}},
+                 ("Sports", "Economics", "Crypto"), ("Health · Covid",)),
+                ({"exclude_category": set(), "exclude_tag": set()}, None, None),
+                ({"exclude_tag": {"Health · Covid", "Sports · Soccer"}},
+                 ("Sports", "Economics"), ("Health · Covid", "Sports · Soccer"))):
+            query = _bar_query(page, ticks=ticks)
+            response = _get(app, "/confirm?" + query)
+            assert response.status == 200, ticks
+            settings, _ = defaults_server._proposal(defaults_server._params(query), None)
+            assert settings == replace(_FULL_BASE, exclude_categories=categories,
+                                       exclude_tags=tags), ticks
+
+    @staticmethod
+    def _each_choice(page: _PageParser):
+        """
+        List every option of every dropdown of a page's bar.
+
+        Args:
+            page (_PageParser): The parsed trading page.
+
+        Returns:
+            list[tuple[str, str]]: (the dropdown's name, the band's id for the
+                spread band; the option's value), in page order.
+        """
+        return [(control.get("name") or control["id"], option["value"])
+                for control in page.bar_controls if control["tag"] == "select"
+                for option in control["options"]]
+
+    @pytest.mark.parametrize("base", [_FULL_BASE, _NARROW_BASE], ids=["full", "narrowed"])
+    def test_a_kept_source_note_goes_with_every_choice(self, base):
+        app = _app()
+        query = defaults_server._settings_query(base, source=DASHBOARD_NOTE)
+        page = _parse(_get(app, f"/confirm?{query}").body)
+        choices = self._each_choice(page)
+        assert len(choices) > (100 if base is _FULL_BASE else 80)
+        for key, value in choices:
+            sent = _bar_query(page, {key: value})
+            assert defaults_server._proposal(defaults_server._params(sent), None) == (
+                self._expected(base, key, value), DASHBOARD_NOTE), (key, value)
+
+    def test_the_seed_s_note_goes_with_no_choice(self):
+        # The seed's note is dropped, so a changed seed is never refused for it
+        app = _app()
+        page = _parse(_get(app, "/confirm?" + defaults_server._seed_query()).body)
+        for key, value in self._each_choice(page):
+            sent = _bar_query(page, {key: value})
+            assert defaults_server._proposal(defaults_server._params(sent), None) == (
+                self._expected(config.LIVE_DEFAULTS_SEED, key, value), ""), (key, value)
+        assert _get(app, "/confirm?" + _bar_query(page, {"k": "0.9"})).status == 200
+
+    def test_the_bar_s_spelling_is_the_query_s(self):
+        # One spelling: _settings_query and every bar option use _query_value
+        for settings in (_FULL_BASE, _NARROW_BASE, config.LIVE_DEFAULTS_SEED):
+            query = defaults_server._params(defaults_server._settings_query(settings))
+            assert query["tier_floors"] == [defaults_server._query_value(
+                "tier_floors", settings.tier_floors)]
+            assert query["rebalance_min_days_to_maturity"] == [defaults_server._query_value(
+                "rebalance_min_days_to_maturity", settings.rebalance_min_days_to_maturity)]
+            assert query["sell_min_days"] == [defaults_server._query_value(
+                "sell_min_days", settings.sell_min_days)]
+        assert defaults_server._query_value("k", 1 / 3) == repr(1 / 3)
+        assert defaults_server._query_value("min_price_move", None) == "off"
+        assert defaults_server._query_value("rebalance_min_days_to_maturity", None) == "0"
+        assert defaults_server._query_value("sell_min_days", 7) == "7"
+
+
+# A stand-in for the few browser pieces the bar script touches: the bar form
+# (its elements by name or id, each with a value; its dropdowns, which take
+# listeners; its own listeners; and submit(), which records the elements'
+# values as a GET would send them, and whether the page was inert then) and the
+# body, whose inert switch starts off. The script runs inside a function whose
+# parameter is the stand-in document. The steps: ["set", key, value] sets an
+# element's value, ["change", key] fires that dropdown's change listeners,
+# ["submit"] fires the form's submit listeners (as an Apply button does, without
+# submit()), ["snap", label] records every value, each submit() made, whether
+# the page was inert at each, whether it is inert now, the form's listeners and
+# each dropdown's
+_BAR_HARNESS = """
+var __emit = (typeof print === 'function') ? print : function(s) { console.log(s); };
+var __formListeners = {};
+var __submitted = [];
+var __inertAtSubmit = [];
+var __body = {inert: false};
+var __elements = {};
+var __selects = [];
+__CONTROLS__.forEach(function(c) {
+  var el = {value: c.value, listeners: {}};
+  el.addEventListener = function(type, fn) {
+    (el.listeners[type] = el.listeners[type] || []).push(fn);
+  };
+  __elements[c.key] = el;
+  if (c.select) { __selects.push(el); }
+});
+function __values() {
+  var values = {};
+  Object.keys(__elements).forEach(function(k) { values[k] = __elements[k].value; });
+  return values;
+}
+var __form = {
+  elements: __elements,
+  addEventListener: function(type, fn) {
+    (__formListeners[type] = __formListeners[type] || []).push(fn);
+  },
+  getElementsByTagName: function(tag) { return tag === 'select' ? __selects : []; },
+  submit: function() { __submitted.push(__values()); __inertAtSubmit.push(__body.inert); }
+};
+var __document = {
+  body: __body,
+  getElementById: function(id) { return (__PRESENT__ && id === 'tb-form') ? __form : null; }
+};
+(function(document) {
+__SCRIPT__
+})(__document);
+var __out = {};
+__STEPS__.forEach(function(step) {
+  if (step[0] === 'set') {
+    __elements[step[1]].value = step[2];
+  } else if (step[0] === 'change') {
+    (__elements[step[1]].listeners.change || []).forEach(function(fn) { fn({type: 'change'}); });
+  } else if (step[0] === 'submit') {
+    (__formListeners.submit || []).forEach(function(fn) { fn({type: 'submit'}); });
+  } else if (step[0] === 'snap') {
+    __out[step[1]] = {
+      values: __values(),
+      submitted: __submitted.slice(),
+      inert_at_submit: __inertAtSubmit.slice(),
+      inert: __body.inert,
+      form: Object.keys(__formListeners).sort(),
+      selects: __selects.map(function(el) { return Object.keys(el.listeners).sort(); })
+    };
+  }
+});
+__emit(JSON.stringify(__out));
+"""
+
+# The stand-in's dropdowns, in the bar's order, and its two hidden band
+# fields, at a proposal that rebalances and sells
+_BAR_CONTROLS = [
+    {"key": "tb-band", "value": "0.2|0.8", "select": True},
+    {"key": "spread_min", "value": "0.2", "select": False},
+    {"key": "spread_max", "value": "0.8", "select": False},
+    {"key": "tier_floors", "value": "on", "select": True},
+    {"key": "k", "value": "0.85", "select": True},
+    {"key": "size_cap", "value": "0.15", "select": True},
+    {"key": "rebalance", "value": "on", "select": True},
+    {"key": "min_price_move", "value": "0.1", "select": True},
+    {"key": "rebalance_min_days_to_maturity", "value": "7", "select": True},
+    {"key": "sell_at", "value": "0.85", "select": True},
+    {"key": "sell_min_days", "value": "3", "select": True},
+]
+
+
+def _run_js(tmp_path, program: str, name: str) -> dict:
+    """
+    Run a stand-in program under node or jsc and read the one JSON line it prints.
+
+    Skips the test when no JavaScript runtime is present.
+
+    Args:
+        tmp_path (Path): Where to write the program.
+        program (str): The program's text.
+        name (str): The program file's name.
+
+    Returns:
+        dict: What it printed, parsed.
+    """
+    runtime = _js_runtime()
+    if runtime is None:
+        pytest.skip("neither node nor macOS's jsc is here to run the page script")
+    path = tmp_path / name
+    path.write_text(program, encoding="utf-8")
+    done = subprocess.run([runtime, str(path)], capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout.strip().splitlines()[-1])
+
+
+def _run_bar_script(tmp_path, steps, *, present: bool = True) -> dict:
+    """
+    Run the bar script, byte for byte, against the stand-in bar through a list of steps.
+
+    Args:
+        tmp_path (Path): Where to write the program.
+        steps (list[list[str]]): The steps (see _BAR_HARNESS).
+        present (bool): Whether the page has the bar.
+
+    Returns:
+        dict: Each "snap" step's record, by its label.
+    """
+    program = (_BAR_HARNESS
+               .replace("__CONTROLS__", json.dumps(_BAR_CONTROLS))
+               .replace("__PRESENT__", json.dumps(present))
+               .replace("__STEPS__", json.dumps(steps))
+               .replace("__SCRIPT__", defaults_server._BAR_JS))
+    return _run_js(tmp_path, program, "bar_script.js")
+
+
+class TestBarScript:
+    """The bar script itself, run under node or jsc with a stand-in bar."""
+
+    _START = {c["key"]: c["value"] for c in _BAR_CONTROLS}
+
+    def test_a_change_sends_the_bar_with_the_band_in_its_two_fields(self, tmp_path):
+        out = _run_bar_script(tmp_path, [
+            ["snap", "load"], ["set", "tb-band", "0.25|0.9"], ["change", "tb-band"],
+            ["snap", "sent"]])
+        # It listens for each dropdown's change and the form's own submit, nothing else
+        assert out["load"]["form"] == ["submit"]
+        assert out["load"]["selects"] == [["change"]] * 9
+        assert out["load"]["submitted"] == []
+        [sent] = out["sent"]["submitted"]
+        assert sent == {**self._START, "tb-band": "0.25|0.9", "spread_min": "0.25",
+                        "spread_max": "0.9"}
+
+    def test_a_change_elsewhere_keeps_the_rest_as_shown(self, tmp_path):
+        out = _run_bar_script(tmp_path, [["set", "k", "0.9"], ["change", "k"], ["snap", "s"]])
+        assert out["s"]["submitted"] == [{**self._START, "k": "0.9"}]
+
+    def test_rebalance_no_turns_its_minimum_and_limit_off(self, tmp_path):
+        out = _run_bar_script(tmp_path, [
+            ["set", "rebalance", "off"], ["change", "rebalance"], ["snap", "s"]])
+        assert out["s"]["submitted"] == [{**self._START, "rebalance": "off",
+                                          "min_price_move": "off",
+                                          "rebalance_min_days_to_maturity": "0"}]
+
+    def test_sell_off_turns_its_minimum_of_days_off(self, tmp_path):
+        out = _run_bar_script(tmp_path, [
+            ["set", "sell_at", "off"], ["change", "sell_at"], ["snap", "s"]])
+        assert out["s"]["submitted"] == [{**self._START, "sell_at": "off",
+                                          "sell_min_days": "off"}]
+
+    def test_apply_settles_the_fields_and_leaves_the_sending_to_the_browser(self, tmp_path):
+        # A menu's Apply button submits the form itself: the script only settles it
+        out = _run_bar_script(tmp_path, [
+            ["set", "tb-band", "0.3|1.0"], ["set", "rebalance", "off"], ["submit"],
+            ["snap", "s"]])
+        assert out["s"]["submitted"] == []
+        assert out["s"]["values"] == {**self._START, "tb-band": "0.3|1.0", "spread_min": "0.3",
+                                      "spread_max": "1.0", "rebalance": "off",
+                                      "min_price_move": "off",
+                                      "rebalance_min_days_to_maturity": "0"}
+
+    def test_once_the_bar_is_sent_the_whole_page_is_inert(self, tmp_path):
+        # Until the page for the new choice arrives, a button armed on this one
+        # would send this page's proposal: from the moment the bar goes, nothing
+        # on the page can be clicked or typed into
+        out = _run_bar_script(tmp_path, [
+            ["snap", "load"], ["set", "k", "0.9"], ["change", "k"], ["snap", "changed"]])
+        assert out["load"]["inert"] is False
+        # Inert before the bar is sent, not after
+        assert out["changed"]["inert_at_submit"] == [True] and out["changed"]["inert"] is True
+        # A menu's Apply sends the form itself: the page goes inert as it goes
+        out = _run_bar_script(tmp_path, [["snap", "load"], ["submit"], ["snap", "applied"]])
+        assert out["load"]["inert"] is False
+        assert out["applied"]["inert"] is True and out["applied"]["submitted"] == []
+
+    def test_a_page_without_the_bar_does_nothing(self, tmp_path):
+        out = _run_bar_script(tmp_path, [["snap", "s"]], present=False)
+        assert out["s"]["form"] == [] and out["s"]["selects"] == [[]] * 9
+        assert out["s"]["values"] == self._START
+        assert out["s"]["inert"] is False
+
+
+# A stand-in for the browser pieces the notifier touches: the window (its
+# parent, the framing page's window when __FRAMED__, else itself; any listener
+# added to it is recorded) and the body's data-dashboard-message attribute
+# (__MESSAGE__, or null). It prints every message posted with its target origin,
+# and every listener added
+_NOTIFY_HARNESS = """
+var __emit = (typeof print === 'function') ? print : function(s) { console.log(s); };
+var __posted = [];
+var __listeners = [];
+var __window = {addEventListener: function(type) { __listeners.push('window:' + type); }};
+__window.parent = __FRAMED__ ? {postMessage: function(message, origin) {
+  __posted.push({message: message, origin: origin});
+}} : __window;
+var __document = {
+  addEventListener: function(type) { __listeners.push('document:' + type); },
+  body: {getAttribute: function(name) {
+    return name === 'data-dashboard-message' ? __MESSAGE__ : null;
+  }}
+};
+(function(window, document) {
+__SCRIPT__
+})(__window, __document);
+__emit(JSON.stringify({posted: __posted, listeners: __listeners}));
+"""
+
+
+def _run_notifier(tmp_path, *, framed: bool, message: str | None) -> dict:
+    """
+    Run the notifier, byte for byte, in the stand-in window.
+
+    Args:
+        tmp_path (Path): Where to write the program.
+        framed (bool): Whether the page is shown in a frame.
+        message (str | None): The body's data-dashboard-message, as the
+            browser reads the attribute; None for none.
+
+    Returns:
+        dict: "posted" (each message and its target origin) and "listeners".
+    """
+    program = (_NOTIFY_HARNESS
+               .replace("__FRAMED__", json.dumps(framed))
+               .replace("__MESSAGE__", json.dumps(message))
+               .replace("__SCRIPT__", defaults_server._NOTIFY_JS))
+    return _run_js(tmp_path, program, "notify_script.js")
+
+
+class TestNotifyScript:
+    """The notifier itself, run under node or jsc: it posts only when framed, only to the live
+    dashboard's tab page's two origins, and never listens."""
+
+    def test_framed_it_posts_the_page_s_message_to_both_origins(self, tmp_path):
+        _save(_BASE_SETTINGS)
+        page = _parse(_get(_app(), "/confirm").body)
+        text = page.body["data-dashboard-message"]
+        out = _run_notifier(tmp_path, framed=True, message=text)
+        assert out["posted"] == [{"message": json.loads(text), "origin": origin}
+                                 for origin in config.LIVE_DASHBOARD_ORIGINS]
+        assert out["listeners"] == []
+
+    def test_a_run_page_s_message_too(self, tmp_path):
+        app = _app()
+        run_id = _memory_run(app, returncode=None)
+        text = _parse(_get(app, f"/runs/{run_id}").body).body["data-dashboard-message"]
+        out = _run_notifier(tmp_path, framed=True, message=text)
+        assert [p["message"] for p in out["posted"]] == [{"type": "kalshi-run", "run": run_id}] * 2
+
+    def test_not_framed_or_without_a_message_it_posts_nothing(self, tmp_path):
+        text = json.dumps({"type": "kalshi-run", "run": "0123456789abcdef"})
+        for framed, message in ((False, text), (True, None), (True, "")):
+            out = _run_notifier(tmp_path, framed=framed, message=message)
+            assert out == {"posted": [], "listeners": []}, (framed, message)
+
+    def test_neither_script_can_press_a_button_or_listen_for_messages(self):
+        # The arming script's buttons are named only by it: the bar script and
+        # the notifier name none of them, no action, and no way to press,
+        # submit the other form or hear another page
+        for script in (defaults_server._BAR_JS, defaults_server._NOTIFY_JS):
+            for word in ("confirm", "action", "click", "requestSubmit", "dispatchEvent",
+                         "addEventListener('message'", 'addEventListener("message"',
+                         "onmessage", "forms", "querySelector", "innerHTML", "eval", "fetch"):
+                assert word not in script, word
+            for button_id in defaults_server._ARMED_BUTTONS:
+                assert button_id not in script
+        assert "addEventListener" not in defaults_server._NOTIFY_JS
+        assert "location" not in defaults_server._NOTIFY_JS
+        assert set(re.findall(r"addEventListener\('(\w+)'", defaults_server._BAR_JS)) == {
+            "submit", "change"}
+        # The bar script reaches its own form only, by its id, and outside it
+        # only the body's inert switch, which it turns on and never off
+        assert re.findall(r"getElementById\('([\w-]+)'\)", defaults_server._BAR_JS) == [
+            "tb-form"]
+        assert re.findall(r"document\.([\w.]+)", defaults_server._BAR_JS) == [
+            "getElementById", "body.inert"]
+        assert "document.body.inert = true;" in defaults_server._BAR_JS
+        assert "inert = false" not in defaults_server._BAR_JS
+        # The notifier's origins are config's, written in as JSON
+        assert json.dumps(list(config.LIVE_DASHBOARD_ORIGINS)) in defaults_server._NOTIFY_JS
+        assert "__ORIGINS__" not in defaults_server._NOTIFY_JS
 
 
 class TestConfirmRefusals:
@@ -2243,11 +3618,11 @@ class TestSeveralCategoriesAndTags:
         assert config.read_saved_live_defaults() == (
             _BASE_SETTINGS if dry_run else self._SETTINGS)
 
-    def test_the_trade_page_runs_saved_names(self):
+    def test_the_page_with_no_address_fields_runs_saved_names(self):
         saved = _save(self._SETTINGS)
         starter = _Starter()
         app = _app(start_process=starter)
-        _run_id(_post(app, _trade_form(app, "confirm-dry-run"), target="/trade"))
+        _run_id(_post(app, _home_form(app, "confirm-dry-run")))
         [(argv, _)] = starter.calls
         assert argv[5:argv.index("--result-file")] == config.live_settings_argv(saved)
         assert "--exclude-tag=Sports · Basketball" in argv and "--exclude-category=Economics" in argv
@@ -2306,11 +3681,10 @@ class TestRefusedFile:
         _save(_BASE_SETTINGS)
         app = _app(start_process=_Starter())
         form = _page_form(app, _query(k="0.75"))
-        trade = _trade_form(app)
+        trade = _home_form(app)
         config.LIVE_DEFAULTS_FILE.write_bytes(b"not json")
         for response in (_get(app, "/confirm?" + _query()), _post(app, form),
-                         _get(app, "/saved"), _get(app, "/trade"),
-                         _post(app, trade, target="/trade")):
+                         _get(app, "/confirm"), _get(app, "/saved"), _post(app, trade)):
             assert response.status == 409
             assert str(config.LIVE_DEFAULTS_FILE.absolute()) in response.body
             assert "<form" not in response.body
@@ -2482,13 +3856,13 @@ class TestOutdatedFile:
         assert '"rebalance": true' in text and '"min_price_move": 0.1' in text
         # ... and every page reads it as the defaults in force
         assert _get(app, "/saved").status == 200
-        assert _get(app, "/trade").status == 200
+        home = _get(app, "/confirm")
+        assert home.status == 200 and "0 of 11 settings change." in home.body
         assert "saved before Rebalance" not in _get(app, "/").body
 
-    @pytest.mark.parametrize("target", ["/trade", "/saved"])
-    def test_the_trade_and_saved_pages_refuse_with_the_notice_and_the_link(self, target):
+    def test_the_saved_page_refuses_with_the_notice_and_the_link(self):
         config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
-        response = _get(_app(start_process=_Starter()), target)
+        response = _get(_app(start_process=_Starter()), "/saved")
         assert response.status == 409
         page = _parse(response.body)
         assert _outdated_link() in page.links
@@ -2515,20 +3889,22 @@ class TestOutdatedFile:
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == _OLD_VERSION_BYTES
         assert starter.calls == []
 
-    def test_the_trade_page_never_runs_the_old_file(self):
-        # A trade form signed as the trade page would sign one: refused with
-        # the notice, nothing started, the file as it was
+    def test_an_old_trade_page_s_form_never_runs_the_old_file(self):
+        # A trade form signed as an older version's trade page signed one: no
+        # route at /trade, and refused at /confirm (its token signs another
+        # purpose); nothing started, the file as it was
         config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
         starter = _Starter()
         app = _app(start_process=starter)
+        with pytest.raises(config.LiveDefaultsOutdated) as caught:
+            config.read_saved_live_defaults()
         for action in ("trade", "dry_run"):
-            fingerprint, nonce = defaults_server._fingerprint(None), "2" * 32
+            fingerprint, nonce = defaults_server._fingerprint(None, caught.value), "2" * 32
             form = [("fingerprint", fingerprint), ("nonce", nonce),
                     ("token", app._token("trade", fingerprint, nonce, {})),
                     ("action", action)]
-            response = _post(app, form, target="/trade")
-            assert response.status == 409
-            assert _outdated_link() in _parse(response.body).links
+            assert _post(app, form, target="/trade").status == 404
+            assert _post(app, form).status == 403
         assert starter.calls == []
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == _OLD_VERSION_BYTES
 
@@ -2613,25 +3989,20 @@ class TestOutdatedFile:
     def test_a_page_built_on_a_usable_file_is_stale_once_an_old_file_replaces_it(self):
         # Pages built on a usable file, posted after a file an older version
         # saved has replaced it (a server still running older code, say): each
-        # confirmation form is shown again against what is now saved, every
-        # trade form is refused with the old file's notice, and nothing is
-        # saved or started
+        # form, a proposal's or the saved defaults' own, is shown again against
+        # what is now saved, and nothing is saved or started
         saved = _save(_BASE_SETTINGS)
         starter = _Starter()
         app = _app(start_process=starter)
-        confirm_forms = [_page_form(app, _query(k="0.75"), button)
-                         for button in ("confirm", "confirm-trade", "confirm-dry-run")]
-        trade_forms = [_trade_form(app, button)
-                       for button in ("confirm-trade", "confirm-dry-run")]
+        forms = [_page_form(app, _query(k="0.75"), button)
+                 for button in ("confirm", "confirm-trade", "confirm-dry-run")]
+        forms += [_home_form(app, button)
+                  for button in ("confirm", "confirm-trade", "confirm-dry-run")]
         config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
-        for form in confirm_forms:
+        for form in forms:
             response = _post(app, form)
             assert response.status == 409
             assert html.escape(defaults_server._STALE_BANNER) in response.body
-        for form in trade_forms:
-            response = _post(app, form, target="/trade")
-            assert response.status == 409
-            assert _outdated_link() in _parse(response.body).links
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == _OLD_VERSION_BYTES
         assert starter.calls == []
         # The old file's fingerprint is neither a usable file's nor no file's
@@ -2728,10 +4099,16 @@ class TestOutdatedFile:
         config.LIVE_DEFAULTS_FILE.write_bytes(
             _OLD_VERSION_BYTES.replace(b'"trim_min_rise": 0.1', b'"trim_min_rise": 0.07'))
         app = _app()
-        trade = _get(app, "/trade")
-        assert trade.status == 409
-        assert "/confirm?" + defaults_server._seed_query() in _parse(trade.body).links
-        assert "its other settings are refused too" in html.unescape(trade.body)
+        saved = _get(app, "/saved")
+        assert saved.status == 409
+        assert "/confirm?" + defaults_server._seed_query() in _parse(saved.body).links
+        assert "its other settings are refused too" in html.unescape(saved.body)
+        # The trading page with no address fields proposes the seed values
+        home = _get(app, "/confirm")
+        assert home.status == 200
+        assert defaults_server._proposal(defaults_server._params(
+            json.loads(_parse(home.body).body["data-dashboard-message"])["query"]),
+            None) == (config.LIVE_DEFAULTS_SEED, config.LIVE_DEFAULTS_SEED_SOURCE)
         # The index shows the same notice, with the seed link
         index = _get(app, "/")
         assert index.status == 200
@@ -2811,7 +4188,7 @@ class TestOutdatedFile:
                    "in its Exclude categories menu.")
         index = _get(app, "/")
         assert index.status == 200
-        for response in (index, _get(app, "/trade"), _get(app, "/saved")):
+        for response in (index, _get(app, "/saved")):
             body = html.unescape(response.body)
             assert warning in body
             assert "before the category filter became a list of categories to exclude" \
@@ -2822,8 +4199,10 @@ class TestOutdatedFile:
             if response is not index:
                 assert ("/confirm?" + defaults_server._seed_query()
                         not in _parse(response.body).links)
-        assert _get(app, "/trade").status == 409
         assert _get(app, "/saved").status == 409
+        # The trading page with no address fields proposes those values, warning too
+        home = _get(app, "/confirm")
+        assert home.status == 200 and warning in html.unescape(home.body)
         # The confirmation page the link opens proposes the file's other values
         confirm = _get(app, link)
         assert confirm.status == 200
@@ -2834,12 +4213,14 @@ class TestOutdatedFile:
         # A page proposing other values over the file still warns
         other = _get(app, "/confirm?" + _query(exclude_category="Politics"))
         assert warning in html.unescape(other.body)
-        # A trade form is still refused, nothing started, the file as it was
+        # An older version's trade form is still refused, nothing started, the
+        # file as it was
         old = config.LIVE_DEFAULTS_FILE.read_bytes()
-        fingerprint, nonce = defaults_server._fingerprint(None), "3" * 32
+        fingerprint, nonce = defaults_server._fingerprint(None, caught.value), "3" * 32
         form = [("fingerprint", fingerprint), ("nonce", nonce),
                 ("token", app._token("trade", fingerprint, nonce, {})), ("action", "trade")]
-        assert _post(app, form, target="/trade").status == 409
+        assert _post(app, form, target="/trade").status == 404
+        assert _post(app, form).status == 403
         assert starter.calls == []
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == old
         # One Confirm and save writes exactly the file's other values
@@ -2936,13 +4317,13 @@ class TestOutdatedFile:
                    "save from the backtest dashboard's Save as live defaults… button with "
                    "those tags ticked in its Exclude tags menu.")
         app = _app()
-        for response in (_get(app, "/"), _get(app, "/trade"), _get(app, "/saved"),
+        for response in (_get(app, "/"), _get(app, "/confirm"), _get(app, "/saved"),
                          _get(app, link)):
             body = html.unescape(response.body)
             assert warning in body
             assert "before the tag filter became a list of tags to exclude" in body
             assert "traded only these categories" not in body
-        assert _get(app, "/trade").status == 409
+        assert _get(app, "/saved").status == 409
         # One Confirm and save writes the file's other values, no tag excluded
         assert _post(app, _click(_get(app, link).body, "confirm")).status == 303
         assert config.read_saved_live_defaults() == proposal
@@ -2972,12 +4353,12 @@ class TestOutdatedFile:
         with pytest.raises(config.LiveDefaultsOutdated) as caught:
             config.read_saved_live_defaults()
         assert caught.value.proposal is None and caught.value.old_tags is None
-        trade = _get(_app(), "/trade")
-        assert trade.status == 409
-        assert "/confirm?" + defaults_server._seed_query() in _parse(trade.body).links
+        saved = _get(_app(), "/saved")
+        assert saved.status == 409
+        assert "/confirm?" + defaults_server._seed_query() in _parse(saved.body).links
         assert "before the tag filter became a list of tags to exclude" in html.unescape(
-            trade.body)
-        assert "limited trading to these tags" not in html.unescape(trade.body)
+            saved.body)
+        assert "limited trading to these tags" not in html.unescape(saved.body)
 
     def test_a_start_logs_the_old_tags(self, run_main):
         self._tags_file(b'["Basketball"]')
@@ -2990,10 +4371,10 @@ class TestOutdatedFile:
         with pytest.raises(config.LiveDefaultsOutdated) as caught:
             config.read_saved_live_defaults()
         assert caught.value.proposal is None and caught.value.old_categories is None
-        trade = _get(_app(), "/trade")
-        assert trade.status == 409
-        assert "/confirm?" + defaults_server._seed_query() in _parse(trade.body).links
-        assert "traded only these categories" not in html.unescape(trade.body)
+        saved = _get(_app(), "/saved")
+        assert saved.status == 409
+        assert "/confirm?" + defaults_server._seed_query() in _parse(saved.body).links
+        assert "traded only these categories" not in html.unescape(saved.body)
 
 
 # Settings that differ from tests/test_config.py's _SAME_TITLE_CAP_ERA_PROPOSAL
@@ -3068,7 +4449,7 @@ class TestSameTitleCapFile:
         assert defaults_server._outdated_reading(outdated) == "no same-title cap"
         assert "Rebalance" not in defaults_server._outdated_reading(outdated)
 
-    @pytest.mark.parametrize("target, status", [("/", 200), ("/trade", 409), ("/saved", 409)])
+    @pytest.mark.parametrize("target, status", [("/", 200), ("/saved", 409)])
     def test_every_page_that_cannot_use_it_shows_the_notice_and_the_link(self, target, status):
         outdated, link = self._write()
         response = _get(_app(start_process=_Starter()), target)
@@ -3175,13 +4556,13 @@ class TestSameTitleCapFile:
         assert outdated.proposal is None and link == ""
         assert defaults_server._outdated_changes(outdated) == (False, False, False, True)
         assert defaults_server._outdated_when(outdated) == "before the same-title cap was removed"
-        trade = _get(_app(), "/trade")
-        assert trade.status == 409
-        body = html.unescape(trade.body)
+        saved = _get(_app(), "/saved")
+        assert saved.status == 409
+        body = html.unescape(saved.body)
         assert ("The saved live defaults were saved before the same-title cap was removed, and "
                 "every live run refuses them:") in body
         assert "its other settings are refused too" in body
-        assert "/confirm?" + defaults_server._seed_query() in _parse(trade.body).links
+        assert "/confirm?" + defaults_server._seed_query() in _parse(saved.body).links
         log = run_main["run"](["--no-browser"])
         assert ("WARNING  The saved live defaults were saved before the same-title cap was "
                 "removed, and every live run refuses them (") in log
@@ -3237,7 +4618,7 @@ class TestSameTitleCapFile:
         assert "same-title" not in line and "same_title" not in line
         assert "| exclude tags Climate and Weather · Ski Resorts, Entertainment · General |" in line
         # ... and every page reads it as the defaults in force
-        assert _get(app, "/saved").status == 200 and _get(app, "/trade").status == 200
+        assert _get(app, "/saved").status == 200 and _get(app, "/confirm").status == 200
         assert "same-title" not in _get(app, "/").body
 
     def test_confirm_and_trade_saves_it_then_runs_exactly_it(self):
@@ -3502,23 +4883,20 @@ class TestSave:
         assert saved.spread_band == (0.0, 0.5) and saved.exclude_tags == ("Fútbol",)
 
     def test_nothing_to_save_writes_nothing(self):
-        # No rendered page offers this (its save button is a placeholder when
-        # nothing changes), so the test signs the request itself
-        saved = _save(_BASE_SETTINGS)
+        # The page's own Confirm and save, with nothing changed: the file is
+        # left as it is, and the browser is sent to the saved page saying so
+        _save(_BASE_SETTINGS)
         before = config.LIVE_DEFAULTS_FILE.read_bytes()
         app = _app()
-        params = {name: [value] for name, value in _BASE.items()}
-        fingerprint, nonce = defaults_server._fingerprint(saved), "2" * 32
-        form = [(name, values[0]) for name, values in params.items()]
-        form += [("fingerprint", fingerprint), ("nonce", nonce),
-                 ("token", app._token("confirm", fingerprint, nonce, params)),
-                 ("action", "save")]
+        form = _page_form(app, _query())
         response = _post(app, form)
-        assert response.status == 200
+        assert response.status == 303 and response.location == "/saved?unchanged=1"
         assert "nothing was written" in response.body
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
-        # The nonce stays unused: the same form answers the same way
-        assert _post(app, form).status == 200
+        # The nonce is used: the same form is sent to the same place, still writing nothing
+        again = _post(app, form)
+        assert again.status == 303 and again.location == "/saved?unchanged=1"
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
 
     def test_the_save_is_logged_against_the_defaults_it_replaced(self, caplog):
         _save(LiveSettings(tier_floors=True, spread_band=(0.0, 0.5), interval_discount=0.8,
@@ -3558,7 +4936,8 @@ class TestSavedPage:
         assert page.cells["tier floors"] == ["tier floors", "off"]
         assert page.cells["per-trade cap"] == ["per-trade cap", "10%"]
         assert page.forms == [] and page.scripts == [] and page.buttons == []
-        assert "/trade" in page.links and "Trade with these defaults →" in response.body
+        assert "/confirm" in page.links and ">Back to the trading page</a>" in response.body
+        assert "/trade" not in page.links
         # The save is done: the page no longer speaks of writing
         assert "This writes" not in response.body and "click" not in response.body
         assert str(config.LIVE_DEFAULTS_FILE.absolute()) in response.body
@@ -3866,15 +5245,19 @@ class TestHelpers:
         assert "\r" not in record.getMessage() and "\n" not in record.getMessage()
         assert "\\x0d\\x0aInjected" in record.getMessage()
 
-    def test_every_response_carries_the_six_headers(self):
+    def test_every_response_carries_the_five_headers(self):
         headers = defaults_server._response_headers(defaults_server._Response(200, ""))
         assert [name for name, _ in headers] == [
-            "Content-Type", "Cache-Control", "X-Content-Type-Options", "X-Frame-Options",
+            "Content-Type", "Cache-Control", "X-Content-Type-Options",
             "Referrer-Policy", "Content-Security-Policy"]
         values = dict(headers)
         assert values["Content-Type"] == "text/html; charset=utf-8"
         assert values["Referrer-Policy"] == "same-origin"
-        assert "frame-ancestors 'none'" in values["Content-Security-Policy"]
+        # Only the live dashboard's tab page may frame a page: no X-Frame-Options,
+        # whose DENY would refuse it too
+        assert "X-Frame-Options" not in values
+        assert "frame-ancestors http://127.0.0.1:8766 http://localhost:8766" in (
+            values["Content-Security-Policy"])
         assert "form-action 'self'" in values["Content-Security-Policy"]
         redirect = dict(defaults_server._response_headers(
             defaults_server._Response(303, "", location="/saved")))
@@ -3923,7 +5306,7 @@ class TestHelpers:
         head, _, body = handler.wfile.getvalue().partition(b"\r\n\r\n")
         status_line, *header_lines = head.decode("latin-1").split("\r\n")
         headers = dict(line.split(": ", 1) for line in header_lines)
-        # A status line and the six headers, even on a request read as HTTP/0.9
+        # A status line and the five headers, even on a request read as HTTP/0.9
         assert status_line.startswith(f"HTTP/1.0 {code} ")
         for name, value in defaults_server._response_headers(defaults_server._Response(code, "")):
             assert headers[name] == value, name
@@ -3957,12 +5340,12 @@ def held_lock():
 
 
 class TestRenderStates:
-    """The buttons of every page, in every state: fixed order, the real-money one last, placeholders inert."""
+    """The trading page's buttons, in every state: fixed order, the real-money one last, placeholders inert."""
 
     @staticmethod
     def _check(body: str, labels: list[str], actions: tuple) -> _PageParser:
         """
-        Check a page's buttons: order, placeholders, real buttons, and its one script.
+        Check a page's buttons: order, placeholders, real buttons, its forms and its three scripts.
 
         Args:
             body (str): The page.
@@ -3989,8 +5372,12 @@ class TestRenderStates:
                 assert button["value"] == _ID_ACTION[button["id"]]
             else:
                 assert button == {"type": "button", "disabled": None}
-        assert page.scripts == [defaults_server._CONFIRM_JS]
-        assert len(page.forms) == 1
+        assert page.scripts == _TRADING_SCRIPTS
+        # Exactly one form that posts, beside the dropdown bar's, which only
+        # asks for the page again and has no button that names an action
+        assert page.forms == [("get", "/confirm"), ("post", "/confirm")]
+        assert page.bar_buttons and all("name" not in b and "id" not in b
+                                        for b in page.bar_buttons)
         return page
 
     @staticmethod
@@ -4028,8 +5415,9 @@ class TestRenderStates:
         # Dry run: needs saved defaults and no own run still going
         dry_applies = saved and state != "own"
         assert (ids[0] == "confirm-dry-run") is dry_applies
-        # Save: only when something changes; no run ever blocks it
-        assert (ids[1] == "confirm") is changes
+        # Save: always a real button (with nothing changed it writes nothing);
+        # no run ever blocks it
+        assert ids[1] == "confirm"
         # Trade: blocked by the lock and by an own run, never by the banner
         assert (ids[2] == "confirm-trade") is (state in ("free", "attention"))
         banner = "ended needing manual attention" in response.body
@@ -4043,53 +5431,67 @@ class TestRenderStates:
             assert "/runs/fedcba9876543210" in page.links
 
     @pytest.mark.parametrize("state", ["free", "lock", "own", "attention"])
-    def test_the_trade_page(self, monkeypatch, state):
+    def test_the_page_with_no_address_fields(self, monkeypatch, state):
+        # The saved defaults, proposed as they are: the same three buttons
         _save(_BASE_SETTINGS)
         app = _app(start_process=_Starter())
         self._state(app, state, monkeypatch)
-        response = _get(app, "/trade")
+        response = _get(app, "/confirm")
         assert response.status == 200
-        page = self._check(response.body, _TRADE_LABELS, defaults_server._TRADE_ACTIONS)
+        assert "0 of 11 settings change." in response.body
+        page = self._check(response.body, _CONFIRM_LABELS, defaults_server._CONFIRM_ACTIONS)
         ids = [b.get("id") for b in page.buttons]
         assert (ids[0] == "confirm-dry-run") is (state != "own")
-        assert (ids[1] == "confirm-trade") is (state in ("free", "attention"))
+        assert ids[1] == "confirm"
+        assert (ids[2] == "confirm-trade") is (state in ("free", "attention"))
         assert bool(page.checkboxes) is (state == "attention")
 
-    def test_a_page_with_no_real_button_still_has_its_one_script(self):
+    def test_a_page_whose_runs_are_refused_still_has_its_save_and_three_scripts(self):
+        # A server built without a process starter runs nothing: only the save is real
         _save(_BASE_SETTINGS)
         page = self._check(_get(_app(), "/confirm?" + _query()).body, _CONFIRM_LABELS,
                            defaults_server._CONFIRM_ACTIONS)
-        assert all("id" not in button for button in page.buttons)
+        assert [b.get("id") for b in page.buttons] == [None, "confirm", None]
 
     def test_every_other_page_has_no_form_button_or_script(self):
         _save(_BASE_SETTINGS)
         app = _app(start_process=_Starter())
         _disk_run(result=_result())
-        for target in ("/", "/saved", "/runs/0123456789abcdef", "/nope",
-                       "/confirm?" + _query(k="nan"), "/runs/0000000000000000"):
+        for target in ("/", "/saved", "/saved?unchanged=1", "/nope",
+                       "/confirm?" + _query(k="nan"), "/runs/0000000000000000", "/trade"):
             page = _parse(_get(app, target).body)
             assert page.forms == [] and page.buttons == [] and page.scripts == [], target
+            assert "data-dashboard-message" not in page.body, target
+        # A run page has no form or button, and only the notifier
+        page = _parse(_get(app, "/runs/0123456789abcdef").body)
+        assert page.forms == [] and page.buttons == []
+        assert page.scripts == [defaults_server._NOTIFY_JS]
 
 
 class TestTokenAndNonce:
     """Each page's token starts only its own page's actions, and each page's nonce works once."""
 
-    def test_a_confirm_token_fails_on_the_trade_page_and_the_reverse(self):
+    def test_a_token_signed_for_another_purpose_fails(self):
+        # The trading page's form is the one form signed: a token for any other
+        # purpose (an older version's trade page's) never starts anything, and
+        # /trade takes no POST at all
         _save(_BASE_SETTINGS)
         app = _app(start_process=_Starter())
         saved = config.read_saved_live_defaults()
         fingerprint, nonce = defaults_server._fingerprint(saved), "3" * 32
+        params = {name: [value] for name, value in _BASE.items()}
+        for purpose in ("trade", "save", ""):
+            token = app._token(purpose, fingerprint, nonce, params)
+            form = [(name, values[0]) for name, values in params.items()]
+            form += [("fingerprint", fingerprint), ("nonce", nonce), ("token", token),
+                     ("action", "dry_run")]
+            assert _post(app, form).status == 403, purpose
         confirm_token = app._token("confirm", fingerprint, nonce, {})
         form = [("fingerprint", fingerprint), ("nonce", nonce), ("token", confirm_token),
                 ("action", "dry_run")]
-        assert _post(app, form, target="/trade").status == 403
-        params = {name: [value] for name, value in _BASE.items()}
-        trade_token = app._token("trade", fingerprint, nonce, params)
-        form = [(name, values[0]) for name, values in params.items()]
-        form += [("fingerprint", fingerprint), ("nonce", nonce), ("token", trade_token),
-                 ("action", "dry_run")]
-        assert _post(app, form).status == 403
+        assert _post(app, form, target="/trade").status == 404
         assert app._start_process.calls == []
+        assert defaults_server._CONFIRM_PURPOSE == "confirm"
 
     def test_the_action_is_unsigned_so_save_can_become_trade_under_every_trade_check(
             self, monkeypatch):
@@ -4157,13 +5559,15 @@ class TestTokenAndNonce:
         assert len(saves) == (0 if button_id == "confirm-dry-run" else 1)
         assert len(starter.calls) == (0 if button_id == "confirm" else 1)
 
-    def test_the_trade_page_posted_twice_starts_one_run(self):
+    @pytest.mark.parametrize("button_id", ["confirm-dry-run", "confirm-trade"])
+    def test_the_page_with_no_address_fields_posted_twice_starts_one_run(self, button_id):
         _save(_BASE_SETTINGS)
         starter = _Starter()
         app = _app(start_process=starter)
-        form = _trade_form(app, "confirm-dry-run")
-        first = _post(app, form, target="/trade")
-        second = _post(app, form, target="/trade")
+        form = _home_form(app, button_id)
+        first = _post(app, form)
+        second = _post(app, form)
+        assert first.status == 303 and first.location.startswith("/runs/")
         assert second.status == 303 and second.location == first.location
         assert len(starter.calls) == 1
 
@@ -4263,14 +5667,14 @@ class TestActions:
         record = json.loads((_run_folder(run_id) / "run.json").read_text())
         assert "rebalance until 7 days before maturity" in record["settings"]
 
-    def test_the_trade_page_keeps_a_saved_rebalance_until(self):
-        # /trade runs the saved defaults, flags and all
+    def test_the_page_with_no_address_fields_keeps_a_saved_rebalance_until(self):
+        # It runs the saved defaults, flags and all
         saved = _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
                                    size_cap=0.1, rebalance=True,
                                    rebalance_min_days_to_maturity=1))
         starter = _Starter()
         app = _app(start_process=starter)
-        _run_id(_post(app, _trade_form(app, "confirm-dry-run"), target="/trade"))
+        _run_id(_post(app, _home_form(app, "confirm-dry-run")))
         [(argv, _)] = starter.calls
         assert argv[5:argv.index("--result-file")] == config.live_settings_argv(saved)
         assert "--rebalance-min-days-to-maturity=1" in argv
@@ -4344,25 +5748,41 @@ class TestActions:
         assert starter.run_json[0]["dry_run"] is True
         assert starter.run_json[0]["saved_note"] == defaults_server._DRY_RUN_SAVED_NOTE
 
-    def test_the_trade_page_starts_the_saved_defaults(self):
+    def test_the_page_with_no_address_fields_trades_the_saved_defaults(self):
+        # Confirm and trade on the saved defaults as they are: the exact argv a
+        # trade of them always had, and the file left as it is
         saved = _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                                   size_cap=0.15), source=DASHBOARD_NOTE)
+                                   size_cap=0.15, exclude_categories=("Sports",),
+                                   exclude_tags=("Health · Covid",)), source=DASHBOARD_NOTE)
         before = config.LIVE_DEFAULTS_FILE.read_bytes()
         starter = _Starter()
         app = _app(start_process=starter)
-        _run_id(_post(app, _trade_form(app), target="/trade"))
+        run_id = _run_id(_post(app, _home_form(app)))
         [(argv, _)] = starter.calls
-        assert argv[5:-2] == config.live_settings_argv(saved)
-        assert "--dry-run" not in argv
-        assert saved.origin in starter.run_json[0]["saved_note"]
+        assert argv == [sys.executable, "-m", "kalshi_betting.main", "--mode", "prod",
+                        *config.live_settings_argv(saved), "--result-file",
+                        str(_run_folder(run_id) / "result.json")]
+        assert starter.run_json[0]["saved_note"] == defaults_server._NOTHING_SAVED_NOTE
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
 
-    def test_the_trade_page_refuses_any_other_field(self):
+    def test_the_page_with_no_address_fields_dry_runs_the_saved_defaults(self):
+        saved = _save(replace(_BASE_SETTINGS, sell_at=0.85, sell_min_days=3))
+        before = config.LIVE_DEFAULTS_FILE.read_bytes()
+        starter = _Starter()
+        app = _app(start_process=starter)
+        _run_id(_post(app, _home_form(app, "confirm-dry-run")))
+        [(argv, _)] = starter.calls
+        assert argv[5:-3] == config.live_settings_argv(saved) and argv[-1] == "--dry-run"
+        assert starter.run_json[0]["saved_note"] == defaults_server._DRY_RUN_SAVED_NOTE
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
+
+    def test_the_page_with_no_address_fields_is_signed_like_any_other(self):
         _save(_BASE_SETTINGS)
         app = _app(start_process=_Starter())
-        form = _trade_form(app, "confirm-dry-run")
-        assert _post(app, form + [("k", "0.75")], target="/trade").status == 400
-        assert _post(app, form + [("action", "save")], target="/trade").status == 400
+        form = _home_form(app, "confirm-dry-run")
+        assert _post(app, form + [("foo", "1")]).status == 400
+        assert _post(app, [(n, "0.75" if n == "k" else v) for n, v in form]).status == 403
+        assert _post(app, [(n, v) for n, v in form if n != "sell_at"]).status == 403
         assert app._start_process.calls == []
 
     def test_a_failed_save_starts_nothing(self, monkeypatch):
@@ -4487,7 +5907,7 @@ class TestBlockers:
         app = _app(start_process=starter)
         with (folder / "output.log").open("rb") as held:
             fcntl.flock(held.fileno(), fcntl.LOCK_EX)
-            page = _get(app, "/trade").body
+            page = _get(app, "/confirm").body
             assert "A run started from this page is still going" in page
             assert "/runs/0123456789abcdef" in _parse(page).links
             trade = _click(_get(app, "/confirm?" + _query(k="0.75")).body, "confirm")
@@ -4500,7 +5920,7 @@ class TestBlockers:
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
         assert starter.calls == []
         # Once its process has ended (the lock is free), a fresh page runs
-        _run_id(_post(app, _trade_form(app, "confirm-dry-run"), target="/trade"))
+        _run_id(_post(app, _home_form(app, "confirm-dry-run")))
 
     def test_a_finished_or_unstarted_run_from_disk_blocks_nothing(self):
         # A result written, or a start that failed, is not a run still going,
@@ -4537,7 +5957,7 @@ class TestBlockers:
             seconds=config.SCHEDULER_JOB_TIMEOUT_SECONDS + 60)).strftime("%Y-%m-%dT%H:%M:%SZ")
         config.LIVE_RUN_LOCK_FILE.write_text(json.dumps(
             {"pid": 777, "checkout": "/elsewhere", "started_at": old}), encoding="utf-8")
-        body = html.unescape(_get(_app(start_process=_Starter()), "/trade").body)
+        body = html.unescape(_get(_app(start_process=_Starter()), "/confirm").body)
         assert "it may be hung; check Kalshi before stopping process 777" in body
 
     def test_a_server_without_a_process_starter_refuses_every_run(self):
@@ -4550,8 +5970,9 @@ class TestBlockers:
             response = _post(app, base + [("action", action)])
             assert response.status == 409
             assert defaults_server._NOT_STARTED_TO_TRADE in response.body
-        trade = list(_parse(_get(app, "/trade").body).hidden)
-        assert _post(app, trade + [("action", "trade")], target="/trade").status == 409
+        home = list(_parse(_get(app, "/confirm").body).hidden)
+        for action in ("trade", "dry_run"):
+            assert _post(app, home + [("action", action)]).status == 409
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
         assert not config.LIVE_RUNS_DIR.exists()
 
@@ -4563,28 +5984,33 @@ class TestBlockers:
         assert response.status == 409 and "save these first" in response.body
         assert starter.calls == [] and config.read_saved_live_defaults() is None
 
-    def test_a_stale_trade_page_is_shown_again(self):
+    def test_a_stale_page_with_no_address_fields_is_shown_again(self):
+        # The page proposed the defaults then in force; others were saved since.
+        # Shown again, it proposes what it showed (now a change), and nothing runs
         _save(_BASE_SETTINGS)
         starter = _Starter()
         app = _app(start_process=starter)
-        form = _trade_form(app)
+        form = _home_form(app)
         other = _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5),
                                    interval_discount=0.75, size_cap=0.1))
-        response = _post(app, form, target="/trade")
+        response = _post(app, form)
         assert response.status == 409
         assert defaults_server._STALE_BANNER in response.body
         assert other.origin in response.body
         assert starter.calls == []
-        _run_id(_post(app, _click(response.body, "confirm-trade"), target="/trade"))
+        _run_id(_post(app, _click(response.body, "confirm-trade")))
+        # That Confirm and trade saved the page's proposal before it ran
+        assert config.read_saved_live_defaults() == _BASE_SETTINGS
 
-    def test_the_trade_page_needs_saved_defaults(self):
+    def test_a_dry_run_with_none_saved_asks_for_a_save_first(self):
+        # With none saved, the page with no address fields proposes the seed,
+        # and a dry run (a placeholder there) asked for anyway saves nothing
         app = _app(start_process=_Starter())
-        fingerprint, nonce = defaults_server._fingerprint(None), "4" * 32
-        form = [("fingerprint", fingerprint), ("nonce", nonce),
-                ("token", app._token("trade", fingerprint, nonce, {})), ("action", "dry_run")]
-        response = _post(app, form, target="/trade")
-        assert response.status == 409 and "No live defaults are saved" in response.body
-        assert app._start_process.calls == []
+        page = _parse(_get(app, "/confirm").body)
+        assert [b.get("id") for b in page.buttons] == [None, "confirm", "confirm-trade"]
+        response = _post(app, list(page.hidden) + [("action", "dry_run")])
+        assert response.status == 409 and "save these first" in response.body
+        assert app._start_process.calls == [] and config.read_saved_live_defaults() is None
 
 
 class TestAttention:
@@ -4594,7 +6020,7 @@ class TestAttention:
         _save(_BASE_SETTINGS)
         _attention_result()
         app = _app(start_process=_Starter())
-        for target in ("/confirm?" + _query(), "/trade"):
+        for target in ("/confirm?" + _query(), "/confirm"):
             body = _get(app, target).body
             assert ("The last real-money run (<a href=\"/runs/aaaaaaaaaaaaaaaa\">run "
                     "aaaaaaaaaaaaaaaa</a> of 2026-09-29 16:05 UTC) ended needing manual "
@@ -4692,11 +6118,11 @@ class TestAttention:
         assert dict(again)["nonce"] != dict(form)["nonce"]
         _run_id(_post(app, again))
         assert config.read_saved_live_defaults().interval_discount == 0.75
-        # The trade page asks the same
+        # The page with no address fields (the defaults now in force) asks the same
         app._runs.clear()
-        trade = _trade_form(app)
-        assert _post(app, trade, target="/trade").status == 409
-        _run_id(_post(app, _trade_form(app, ack=True), target="/trade"))
+        trade = _home_form(app)
+        assert _post(app, trade).status == 409
+        _run_id(_post(app, _home_form(app, ack=True)))
 
     def test_a_dry_run_never_needs_it(self):
         _save(_BASE_SETTINGS)
@@ -4704,7 +6130,7 @@ class TestAttention:
         app = _app(start_process=_Starter())
         _run_id(_post(app, _page_form(app, _query(), "confirm-dry-run")))
         app._runs.clear()
-        _run_id(_post(app, _trade_form(app, "confirm-dry-run"), target="/trade"))
+        _run_id(_post(app, _home_form(app, "confirm-dry-run")))
 
     @staticmethod
     def _state(finished_at, exit_code) -> None:
@@ -4732,7 +6158,7 @@ class TestAttention:
         _save(_BASE_SETTINGS)
         app = _app(start_process=_Starter())
         assert app._attention() is None
-        response = _get(app, "/trade")
+        response = _get(app, "/confirm")
         assert response.status == 200 and "The last real-money run" not in response.body
 
     def test_a_state_file_that_cannot_be_read_keeps_a_server_run_s_banner(self):
@@ -4847,12 +6273,12 @@ class TestAttention:
         self._state("2026-09-28T09:03:00", None)
         starter = _Starter()
         app = _app(start_process=starter)
-        assert _post(app, _trade_form(app), target="/trade").status == 409
+        assert _post(app, _home_form(app)).status == 409
         assert starter.calls == []
         _disk_run("bbbbbbbbbbbbbbbb", started="20990101T160000Z",
                   result=_result(finished_at="2099-01-01T16:05:00Z"))
         assert app._attention() is None
-        _run_id(_post(app, _trade_form(app), target="/trade"))
+        _run_id(_post(app, _home_form(app)))
 
     def test_a_failure_to_read_the_records_fails_closed(self, monkeypatch, caplog):
         def broken():
@@ -5464,8 +6890,10 @@ class TestRunPage:
                 "ticker": "<script>", "market": "<i>m</i>", "side": "yes", "count": 1,
                 "price": 0.5})]), output="<script>alert(1)</script>\n")
         body = _get(_app(), "/runs/0123456789abcdef").body
+        # The page's one script is the notifier; nothing else opens a script
+        assert body.count(f"<script>{defaults_server._NOTIFY_JS}</script>") == 1
         assert "<script>" not in body.replace(
-            f"<script>{defaults_server._CONFIRM_JS}</script>", "")
+            f"<script>{defaults_server._NOTIFY_JS}</script>", "")
         for text in ("<script>alert(1)</script>", "<i>m</i>", "<b>error</b>",
                      "<u>message</u>", "<s>warning</s>"):
             assert text not in body and html.escape(text) in body, text
@@ -5733,12 +7161,16 @@ class TestOverASocket:
             return _REAL_POPEN([sys.executable, "-c", _CHILD, result], **kwargs)
 
         live_server.defaults_app = defaults_server._App(port, start_process=stand_in)
-        status, _, body = _request(port, "GET", "/trade")
+        # The retired /trade address sends the browser to the trading page,
+        # which opens on the saved defaults
+        status, headers, _ = _request(port, "GET", "/trade")
+        assert status == 303 and headers["Location"] == "/confirm"
+        status, _, body = _request(port, "GET", "/confirm")
         assert status == 200
         page = _parse(body)
         [button] = [b for b in page.buttons if b.get("id") == "confirm-dry-run"]
         form = urlencode(page.hidden + [(button["name"], button["value"])]).encode("ascii")
-        status, headers, _ = _request(port, "POST", "/trade", body=form, headers={
+        status, headers, _ = _request(port, "POST", "/confirm", body=form, headers={
             "Origin": f"http://127.0.0.1:{port}", "Content-Type": FORM})
         assert status == 303 and headers["Location"].startswith("/runs/")
         [argv] = built
@@ -5751,14 +7183,16 @@ class TestOverASocket:
         assert "<b>No trades to complete</b>" in body
         assert "No qualifying pairs" in body and "stand-in for main.py done" in body
 
-    def test_every_route_sends_the_six_headers(self, live_server):
+    def test_every_route_sends_the_five_headers(self, live_server):
         port = live_server.server_address[1]
         expected = dict(defaults_server._response_headers(defaults_server._Response(200, "")))
         answers = [
             _request(port, "GET", "/"),
             _request(port, "GET", "/confirm?" + _query()),
+            _request(port, "GET", "/confirm"),
             _request(port, "GET", "/confirm?k"),
             _request(port, "GET", "/saved"),
+            _request(port, "GET", "/saved?x=1"),
             _request(port, "GET", "/trade"),
             _request(port, "GET", "/runs/0123456789abcdef"),
             _request(port, "GET", "/nope"),
@@ -5766,13 +7200,15 @@ class TestOverASocket:
             _request(port, "POST", "/confirm", body=b"", headers={"Content-Type": FORM}),
             _request(port, "POST", "/trade", body=b"", headers={"Content-Type": FORM}),
         ]
-        assert [status for status, _, _ in answers] == [200, 200, 400, 404, 404, 404, 404,
-                                                        403, 403, 403]
+        assert [status for status, _, _ in answers] == [200, 200, 200, 400, 404, 400, 303,
+                                                        404, 404, 403, 403, 404]
         for _, headers, _ in answers:
+            # Framed only by the live dashboard's tab page: no X-Frame-Options
+            assert "X-Frame-Options" not in headers
             for name, value in expected.items():
                 assert headers[name] == value, name
 
-    def test_checkout_answers_json_with_the_other_five_headers(self, live_server):
+    def test_checkout_answers_json_with_the_other_four_headers(self, live_server):
         port = live_server.server_address[1]
         status, headers, body = _request(port, "GET", "/checkout")
         assert status == 200
@@ -5780,9 +7216,10 @@ class TestOverASocket:
                                     "code": defaults_server._LOADED_CODE}
         assert headers["Content-Type"] == "application/json; charset=utf-8"
         expected = dict(defaults_server._response_headers(defaults_server._Response(200, "")))
-        for name in ("Cache-Control", "X-Content-Type-Options", "X-Frame-Options",
-                     "Referrer-Policy", "Content-Security-Policy"):
+        for name in ("Cache-Control", "X-Content-Type-Options", "Referrer-Policy",
+                     "Content-Security-Policy"):
             assert headers[name] == expected[name]
+        assert "X-Frame-Options" not in headers
         assert _request(port, "GET", "/checkout", host="evil.test")[0] == 403
 
     @pytest.mark.parametrize("length, status", [
@@ -5798,7 +7235,8 @@ class TestOverASocket:
             headers["Content-Length"] = length
         got, answer_headers, _ = _request(port, "POST", "/confirm", headers=headers)
         assert got == status
-        assert answer_headers["X-Frame-Options"] == "DENY"
+        assert answer_headers["Content-Security-Policy"] == defaults_server._CSP
+        assert "X-Frame-Options" not in answer_headers
 
     def test_two_content_lengths_are_refused(self, live_server):
         headers = {"Content-Type": FORM, "Content-Length": "0"}
@@ -5817,7 +7255,7 @@ class TestOverASocket:
         assert _request(live_server.server_address[1], "GET", target)[0] == expected
 
     @pytest.mark.parametrize("method", ["PUT", "HEAD"])
-    def test_other_methods_get_501_with_the_six_headers(self, live_server, method):
+    def test_other_methods_get_501_with_the_five_headers(self, live_server, method):
         status, headers, body = _request(live_server.server_address[1], method, "/confirm")
         assert status == 501
         expected = dict(defaults_server._response_headers(defaults_server._Response(501, "")))
@@ -5830,7 +7268,7 @@ class TestOverASocket:
         (b"GET /" + b"a" * (65537 - 5), 414),           # over the base class's 65536 bytes
         (b"GET /\r\n\r\n", 403),                        # HTTP/0.9: no Host header
     ])
-    def test_a_request_the_http_layer_refuses_still_gets_the_six_headers(
+    def test_a_request_the_http_layer_refuses_still_gets_the_five_headers(
             self, live_server, data, status):
         got, headers, _ = _raw_request(live_server.server_address[1], data)
         assert got == status
@@ -6002,7 +7440,7 @@ class TestMain:
         assert server.defaults_app.port == PORT
         assert url in log
         assert "No live defaults are saved" in log
-        assert f"trades them at http://127.0.0.1:{PORT}/trade" in log
+        assert f"trades them at http://127.0.0.1:{PORT}/confirm" in log
         assert "Ctrl-C stops it; stop it when you are done." in log
         # A free port: nothing asked who holds it
         assert run_main["asked"] == []
@@ -6042,58 +7480,17 @@ class TestMain:
         assert run_main["opened"] == []
         assert defaults_server._seed_query() in log
 
-    def test_it_opens_the_dashboard_when_there_is_one(self, run_main, tmp_path):
-        index = f"http://127.0.0.1:{PORT}/"
+    def test_it_opens_the_trading_page(self, run_main, tmp_path):
+        url = f"http://127.0.0.1:{PORT}/confirm"
         log = run_main["run"]([])
-        # No dashboard: the server's own index
-        assert run_main["opened"] == [index]
-        dashboard = tmp_path / config.DASHBOARD_FILENAME
-        assert (f"No backtest dashboard at {dashboard}: run python3 -m "
-                "kalshi_betting.backtest to build one, or start from the seed values with "
-                f"--seed; opening {index}") in log
-        dashboard.write_text(_DASHBOARD_WITH_BUTTONS, encoding="utf-8")
+        assert run_main["opened"] == [url]
+        assert (f"Trading page: open {url} to review the live defaults and trade from "
+                "them") in log
+        # Whatever backtest page is in the checkout, which the server never reads
+        (tmp_path / config.DASHBOARD_FILENAME).write_text("<html></html>", encoding="utf-8")
         log = run_main["run"]([])
-        assert run_main["opened"] == [index, dashboard.as_uri()]
-        assert (f"Open {dashboard} and use its filter bar's Save as live defaults… or Trade "
-                "using defaults… button") in log
+        assert run_main["opened"] == [url, url]
         assert "WARNING" not in log
-
-    def test_a_dashboard_built_before_the_buttons_opens_the_index_with_a_warning(
-            self, run_main, tmp_path):
-        dashboard = tmp_path / config.DASHBOARD_FILENAME
-        dashboard.write_text(_DASHBOARD_BEFORE_BUTTONS, encoding="utf-8")
-        log = run_main["run"]([])
-        base = f"http://127.0.0.1:{PORT}"
-        assert run_main["opened"] == [f"{base}/"]
-        [line] = [line for line in log.splitlines() if "WARNING" in line]
-        assert line.endswith(
-            "This dashboard was built before the Save/Trade buttons: rebuild it with "
-            "python3 -m kalshi_betting.backtest and the --start-date you built it from; "
-            f"until then use {base}/trade (opening {base}/)")
-
-    def test_the_buttons_count_only_within_the_scanned_part(self, run_main, tmp_path,
-                                                             monkeypatch):
-        # Only the first DASHBOARD_MARKER_SCAN_BYTES are read: the Trade link's
-        # id past them reads as a page without the buttons
-        monkeypatch.setattr(defaults_server, "DASHBOARD_MARKER_SCAN_BYTES", 64)
-        dashboard = tmp_path / config.DASHBOARD_FILENAME
-        index = f"http://127.0.0.1:{PORT}/"
-        marker = defaults_server._DASHBOARD_MARKER
-        dashboard.write_bytes(b"x" * (64 - len(marker)) + marker)
-        run_main["run"]([])
-        dashboard.write_bytes(b"x" * (65 - len(marker)) + marker)
-        run_main["run"]([])
-        assert run_main["opened"] == [dashboard.as_uri(), index]
-
-    def test_a_dashboard_that_cannot_be_read_opens_the_index_with_a_warning(
-            self, run_main, tmp_path):
-        dashboard = tmp_path / config.DASHBOARD_FILENAME
-        dashboard.mkdir()
-        log = run_main["run"]([])
-        assert run_main["opened"] == [f"http://127.0.0.1:{PORT}/"]
-        [line] = [line for line in log.splitlines() if "WARNING" in line]
-        assert f"The backtest dashboard at {dashboard} could not be read (IsADirectoryError" \
-            in line
 
     def test_it_logs_the_defaults_in_force(self, run_main):
         saved = _save(config.LIVE_DEFAULTS_SEED)
@@ -6119,7 +7516,7 @@ class TestMain:
 
     @pytest.mark.parametrize("argv, opened", [
         (["--seed"], lambda base: [f"{base}/confirm?{defaults_server._seed_query()}"]),
-        ([], lambda base: [f"{base}/"]),
+        ([], lambda base: [f"{base}/confirm"]),
         (["--no-browser"], lambda base: []),
         (["--seed", "--no-browser"], lambda base: []),
     ])
@@ -6340,18 +7737,17 @@ class TestBusyPortOverASocket:
         assert not config.LIVE_RUNS_DIR.exists()
         assert not (config.PROJECT_ROOT / "kalshi_defaults_server.log").exists()
 
-    def test_without_seed_it_opens_the_dashboard_or_the_index(self, live_server, busy_port):
+    def test_without_seed_it_opens_the_trading_page(self, live_server, busy_port):
         port = live_server.server_address[1]
         live_server.defaults_app = defaults_server._App(port)
         busy_port["hold"](port)
         busy_port["run"]([])
-        dashboard = config.PROJECT_ROOT / config.DASHBOARD_FILENAME
-        dashboard.write_text(_DASHBOARD_WITH_BUTTONS, encoding="utf-8")
+        # Whatever backtest file is in the checkout
+        (config.PROJECT_ROOT / config.DASHBOARD_FILENAME).write_text("<html></html>",
+                                                                     encoding="utf-8")
         busy_port["run"]([])
-        dashboard.write_text(_DASHBOARD_BEFORE_BUTTONS, encoding="utf-8")
-        busy_port["run"]([])
-        index = f"http://127.0.0.1:{port}/"
-        assert busy_port["opened"] == [index, dashboard.as_uri(), index]
+        trading = f"http://127.0.0.1:{port}/confirm"
+        assert busy_port["opened"] == [trading, trading]
 
     def test_no_browser_opens_nothing(self, live_server, busy_port, capsys):
         port = live_server.server_address[1]

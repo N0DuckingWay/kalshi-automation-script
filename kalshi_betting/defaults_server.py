@@ -13,10 +13,9 @@ Purpose:
 
         python3 -m kalshi_betting.defaults_server [--seed] [--no-browser]
 
-    On start it opens one page: with --seed the confirmation page proposing
-    the seed values; otherwise the backtest dashboard, or its own index when
-    there is no dashboard, the dashboard was built before its Save and Trade
-    buttons, or it cannot be read. When its port is already taken by this
+    On start it opens one page: with --seed the trading page proposing the
+    seed values; otherwise the trading page as it opens on its own, on the
+    live defaults in force. When its port is already taken by this
     checkout's own server, running this checkout's current code, it opens
     that page from the running server and exits, starting nothing; when the
     port is held by that server running older code, by another checkout's
@@ -24,36 +23,54 @@ Purpose:
     opens no page; the launcher passes it when the live dashboard opens one.
 
     Its pages:
-      - /confirm, opened with the proposed settings in its address (by the
-        backtest dashboard's filter bar, or by --seed, which proposes
-        config.LIVE_DEFAULTS_SEED). It shows the live defaults in force
-        beside the proposed ones with every change highlighted, and offers
-        three buttons, always in this order: Dry run (runs the live bot with
-        the proposed settings but sends no orders, and saves nothing),
-        Confirm and save, and, last and set apart, Confirm and trade (saves
-        the proposed settings, then runs the live bot with them, placing real
-        orders). Closing the tab cancels; nothing is written on the way in.
+      - /confirm, the trading page. With no address fields it proposes the
+        live defaults in force, exactly as they are (or, for a file an older
+        version saved, that file's values in their new form; with none saved,
+        the seed values, config.LIVE_DEFAULTS_SEED); with fields in its
+        address (from a link, --seed, or its own dropdown bar) it proposes
+        those. At its top, a bar of dropdowns (the backtest page's filter
+        bar's eleven controls, in that bar's order and words) shows the
+        proposal; choosing another value shows the page again proposing it,
+        and nothing is written on the way. Under the bar it shows the live
+        defaults in force beside the proposed ones with every change
+        highlighted, and offers three buttons, always in this order: Dry run
+        (runs the live bot with the proposed settings but sends no orders,
+        and saves nothing), Confirm and save (writes the proposal, or, when
+        nothing changes, writes nothing), and, last and set apart, Confirm
+        and trade (saves the proposal when it changes anything, then runs
+        the live bot with it, placing real orders). Closing the tab cancels.
         With no live defaults saved, every live run refuses to start, so this
         is also how the first file is made. A file an older version saved
         (one holding a setting this version replaced or no longer has, such
         as add_to_held_pairs, trim_to_kelly and trim_min_rise, which
         rebalance and min_price_move replaced, or the same-title cap, which
-        nothing replaced) is refused by every live run too: this page
-        then counts nothing as in force, says so above the table, and one
-        Confirm and save replaces the file. The other pages (/, /trade,
-        /saved) show a notice with a link to this page holding the old
-        file's values in their new form.
-      - /trade shows the saved defaults and offers Dry run and Confirm and
-        trade with them.
+        nothing replaced) is refused by every live run too: this page then
+        counts nothing as in force, says so above the table, and one Confirm
+        and save replaces the file. The other pages (/ and /saved) show a
+        notice with a link to this page holding the old file's values in
+        their new form. Saved values this page cannot carry as they are (a
+        name LiveSettings takes but a link may not hold, such as one with two
+        spaces in a row) are not proposed with no address fields: /confirm
+        answers instead with a page (409) that says why, has no buttons and
+        links to the seed values. GET /trade answers with a redirect here.
       - /runs/<id> shows one run: while it runs, its progress and the end of
         its output; once it ends, its outcome, read from the result file the
         run wrote (main.py --result-file) and the exit code, with each pair
         and the Kalshi category and tag it is filed under.
       - / lists what the server is for and the newest runs; /saved shows the
-        defaults just saved; /checkout answers which checkout this server
-        serves and a fingerprint of the code it loaded, as JSON (a second
-        start in the same checkout reads it to find its own server on the
-        port).
+        defaults in force after Confirm and save (with ?unchanged=1, after a
+        Confirm and save that changed nothing); /checkout answers which
+        checkout this server serves and a fingerprint of the code it loaded,
+        as JSON (a second start in the same checkout reads it to find its own
+        server on the port).
+
+    The live dashboard's tab page shows the trading page as its Trading tab
+    and the latest run's page as its Run tab, each in a frame: those two
+    pages tell the tab page, through the browser's postMessage, what they
+    show (the trading page its proposal, as its address's query; a run page
+    its run's id), and nothing else. No page of this server listens for
+    messages, so nothing another page sends can change what a page proposes
+    or press its buttons.
 
     Each run is its own `python -m kalshi_betting.main --mode prod` process,
     started with all eleven toggles as explicit flags (config.live_settings_argv)
@@ -73,11 +90,18 @@ Dependencies:
     (read_saved_live_defaults, save_live_defaults, live_settings_changes,
     describe_live_settings, live_rule_warnings, rebalance_change_warnings,
     live_defaults_source), live_settings_argv (a run's
-    flags), the seed values and their source note, the source-note pattern,
-    the exit codes, the run result's format tag, the DEFAULTS_SERVER_*,
-    DASHBOARD_FILENAME, DASHBOARD_MARKER_SCAN_BYTES and SCHEDULER_*
-    constants, count_text (a run page writes an add-on's held count exactly)
-    and SALE_KIND_KELLY_TRIM (a run page marks a Kelly trim). From run_lock:
+    flags), live_setting_text (the dropdown bar words each choice as the
+    table does), check_filter_name and filter_name_refusal (the names a
+    link may exclude, and the names the bar may list), the seed values and
+    their source note, the source-note pattern, the exit codes, the run
+    result's format tag, the DEFAULTS_SERVER_* and SCHEDULER_* constants,
+    the dropdown bar's choices (DEFAULTS_SERVER_SPREAD_BANDS,
+    DEFAULTS_SERVER_SIZE_CAPS, INTERVAL_DISCOUNT_SWEEP, MIN_PRICE_MOVES,
+    REBALANCE_MATURITY_DAYS, TAKE_PROFIT_LEVELS, TAKE_PROFIT_MIN_DAYS), the
+    backtest page's names file (BACKTEST_FILTER_NAMES_*),
+    LIVE_DASHBOARD_ORIGINS (the only pages that may frame this server's),
+    count_text (a run page writes an add-on's held count exactly) and
+    SALE_KIND_KELLY_TRIM (a run page marks a Kelly trim). From run_lock:
     held() and holder(), to refuse a real-money run while another live
     trading run holds the machine's lock.
     It reads config.LIVE_DEFAULTS_FILE, config.PROJECT_ROOT,
@@ -96,23 +120,37 @@ Notes:
     line, say) gets only a refusal page. A POST must also come from this
     server's own page (its Origin header), carry the token that page was
     built with (an HMAC, keyed by this process, over the page's purpose —
-    "confirm" or "trade" — the fingerprint of the defaults in force, a
-    one-time nonce and the proposed fields) and find the same defaults still
-    in force; otherwise it is refused, or the page is shown again against the
-    defaults now in force. A page's nonce works once: a second POST of the
-    same page (a double click, a resubmit) is sent to what the first one
-    produced, and nothing is done twice. Which button was pressed (the
-    action) is not signed, since one form carries several buttons; every
-    action's own checks are made again. Every response, a refusal included,
-    is sent as HTTP/1.0 with the same six headers: it forbids framing and
-    lets a browser run only the one script whose hash its
-    Content-Security-Policy names. That script enables the buttons only after
-    the page has been visible for DEFAULTS_SERVER_CONFIRM_ARM_MS and the
-    mouse moves or a key is pressed, so a click aimed at another page cannot
-    land on one, and disables them for good once one is pressed. A button
-    that does not apply is still shown, disabled, in its place, with the
-    reason beside it, so the real-money button is always last and never
-    moves under a habitual click. The source note a page proposes must be
+    "confirm", the one form this server signs — the fingerprint of the
+    defaults in force, a one-time nonce and the proposed fields) and find
+    the same defaults still in force; otherwise it is refused, or the page
+    is shown again against the defaults now in force. A page's nonce works
+    once: a second POST of the same page (a double click, a resubmit) is
+    sent to what the first one produced, and nothing is done twice. Which
+    button was pressed (the action) is not signed, since one form carries
+    several buttons; every action's own checks are made again. Every
+    response, a refusal included, is sent as HTTP/1.0 with the same five
+    headers. Its Content-Security-Policy lets a browser run only the three
+    scripts whose hashes it names, and lets only the live dashboard's tab
+    page (config.LIVE_DASHBOARD_ORIGINS, never the backtest page, nor any
+    other web page) show this server's pages in a frame; it sends no
+    X-Frame-Options, which that policy replaces. The three scripts: the
+    arming script enables the buttons only after the page has been visible
+    for DEFAULTS_SERVER_CONFIRM_ARM_MS and the mouse moves or a key is
+    pressed, so a click aimed at another page cannot land on one, and
+    disables them for good once one is pressed; the bar script sends the
+    dropdown bar (a separate form that only asks for the trading page
+    again, never posts) when a dropdown changes or a menu's Apply is
+    pressed, and from that moment makes the whole page inert (nothing on
+    it can be clicked, focused or typed into) until the page for the new
+    choice replaces it, so a button armed here can never send this page's
+    proposal while the bar shows another; and the notifier tells the
+    framing tab page what the page shows. None of them changes the buttons'
+    form but the arming script, and none listens for messages. Every
+    proposal change is a whole new page, whose buttons start disabled and
+    wait out the arming delay again. A button that does not apply is still
+    shown, disabled, in its place, with the reason beside it, so the
+    real-money button is always last and never moves under a habitual
+    click. The source note a page proposes must be
     one of the two shapes config.LIVE_DEFAULTS_SOURCE_PATTERN allows, or be
     left out, and the seed's note may label only the seed values, so a
     crafted link cannot choose the note's words. A link may name several
@@ -157,7 +195,15 @@ Notes:
     across a code change is restarted rather than trusted with a run;
     anything else gets a refusal. That answer is a claim, not proof: a local
     program listening on the port could make it, as it could already serve
-    look-alike pages at the addresses the dashboard's buttons open.
+    look-alike pages at the addresses the dashboard opens.
+
+    The trading page's Exclude menus list every name the proposal excludes,
+    then the names in the backtest page's names file
+    (config.BACKTEST_FILTER_NAMES_FILENAME in PROJECT_ROOT, of which at most
+    config.BACKTEST_FILTER_NAMES_MAX_BYTES is read), each name held to the
+    rules a link's names are. Without a usable file the menus list only the
+    excluded names, and a grey note says why; the page works the same
+    either way.
 """
 import argparse
 import errno
@@ -190,8 +236,9 @@ from urllib.parse import parse_qs, urlencode
 from . import config, run_lock
 from .config import (
     _RETIREMENTS,
-    DASHBOARD_FILENAME,
-    DASHBOARD_MARKER_SCAN_BYTES,
+    BACKTEST_FILTER_NAMES_FILENAME,
+    BACKTEST_FILTER_NAMES_FORMAT,
+    BACKTEST_FILTER_NAMES_MAX_BYTES,
     DEFAULTS_SERVER_CHECKOUT_MAX_BYTES,
     DEFAULTS_SERVER_CHECKOUT_TIMEOUT_SECONDS,
     DEFAULTS_SERVER_CONFIRM_ARM_MS,
@@ -203,30 +250,40 @@ from .config import (
     DEFAULTS_SERVER_RUN_LOG_TAIL_BYTES,
     DEFAULTS_SERVER_RUN_LOG_TAIL_LINES,
     DEFAULTS_SERVER_RUN_REFRESH_SECONDS,
+    DEFAULTS_SERVER_SIZE_CAPS,
     DEFAULTS_SERVER_SOCKET_TIMEOUT_SECONDS,
+    DEFAULTS_SERVER_SPREAD_BANDS,
     EXIT_NO_TRADEABLE_SHARDS,
     EXIT_OK,
     EXIT_RUN_IN_PROGRESS,
     EXIT_SKIPPED_LOW_BALANCE,
     EXIT_TIME_SERIES_SKIPPED,
     EXIT_TRADES_NEED_ATTENTION,
+    INTERVAL_DISCOUNT_SWEEP,
+    LIVE_DASHBOARD_ORIGINS,
     LIVE_DEFAULTS_SEED,
     LIVE_DEFAULTS_SEED_SOURCE,
     LIVE_DEFAULTS_SOURCE_PATTERN,
     LIVE_RUN_RESULT_FORMAT,
     LIVE_TOGGLE_FIELDS,
+    MIN_PRICE_MOVES,
+    REBALANCE_MATURITY_DAYS,
     SALE_KIND_KELLY_TRIM,
     SCHEDULER_JOB_TIMEOUT_SECONDS,
     SCHEDULER_STATE_FILENAME,
     TAG_SCOPE_SEPARATOR,
+    TAKE_PROFIT_LEVELS,
+    TAKE_PROFIT_MIN_DAYS,
     LiveDefaultsError,
     LiveDefaultsOutdated,
     LiveSettings,
     check_filter_name,
     count_text,
     describe_live_settings,
+    filter_name_refusal,
     live_defaults_source,
     live_rule_warnings,
+    live_setting_text,
     live_settings_argv,
     live_settings_changes,
     read_saved_live_defaults,
@@ -275,23 +332,30 @@ _DIGITS = re.compile(r"\d+", re.ASCII)
 _FORM_TYPE = "application/x-www-form-urlencoded"
 # The rotating log file's name in PROJECT_ROOT
 _LOG_NAME = "kalshi_defaults_server.log"
-# What /confirm's buttons post as "action", and what /trade's post
+# What the trading page's buttons post as "action"
 _CONFIRM_ACTIONS = ("save", "trade", "dry_run")
-_TRADE_ACTIONS = ("trade", "dry_run")
+# The purpose every token this server issues signs: the trading page's form,
+# the one form it signs
+_CONFIRM_PURPOSE = "confirm"
+# The query the page a Confirm and save that changed nothing is sent to:
+# /saved, saying nothing was written
+_UNCHANGED_QUERY = "unchanged=1"
 # The files of a run's folder: the result main.py --result-file writes, what
 # the run printed, and what the run is (written before it starts)
 _RESULT_NAME, _OUTPUT_NAME, _RUN_NAME = "result.json", "output.log", "run.json"
-# The ids of the buttons the page script arms, in page order: Dry run, Confirm
-# and save, Confirm and trade. A placeholder for a button that does not apply
-# has no id, so it is never armed
+# The ids of the buttons the arming script (_CONFIRM_JS) arms, in page order:
+# Dry run, Confirm and save, Confirm and trade. A placeholder for a button that
+# does not apply has no id, so it is never armed
 _ARMED_BUTTONS = ("confirm-dry-run", "confirm", "confirm-trade")
 # UTC times as a run's folder records them (run_lock and the run result write
 # the same format), and the start time at the head of a run folder's name
 _TIME = "%Y-%m-%dT%H:%M:%SZ"
 _FOLDER_TIME = "%Y%m%dT%H%M%SZ"
 
-# The one script any page runs: it enables the page's buttons (those of
-# _ARMED_BUTTONS present) only after the page has been visible for
+# The scripts the pages run, each allowed by its hash and nothing else.
+#
+# The arming script, the trading page's: it enables the page's buttons (those
+# of _ARMED_BUTTONS present) only after the page has been visible for
 # DEFAULTS_SERVER_CONFIRM_ARM_MS and the mouse moves or a key is pressed,
 # disables them again whenever the page is hidden, and disables them for good
 # once the form is sent, so a second click sends nothing
@@ -340,16 +404,94 @@ _CONFIRM_JS = """
 """.replace("__IDS__", json.dumps(list(_ARMED_BUTTONS))).replace(
     "ARM_MS", str(DEFAULTS_SERVER_CONFIRM_ARM_MS))
 
-# The Content-Security-Policy hash of that script, so the browser runs it and
-# nothing else
-_CONFIRM_JS_HASH = "sha256-" + b64encode(
-    hashlib.sha256(_CONFIRM_JS.encode("utf-8")).digest()).decode("ascii")
+# The bar script, the trading page's too: it sends the dropdown bar (the form
+# tb-form, which asks for the trading page again by GET and never posts) as
+# soon as one of its dropdowns changes; a menu's Apply button sends it too.
+# Either way the whole bar goes, every menu's ticks included. Before the bar is
+# sent it copies the spread band choice into the two fields the server reads,
+# and turns off a minimum or limit the other choices do not allow (any minimum
+# price movement or days limit with Rebalance no, any minimum of days with no
+# sell level), so the bar never asks for a proposal the server refuses. Then it
+# makes the whole page inert (the body's inert switch: nothing on it can be
+# clicked, focused or typed into) until the page for the new choice replaces
+# it. While that page is on its way, a button armed on this one would still
+# send this page's proposal, which the bar no longer shows. If no page
+# arrives, this one stays inert until it is reloaded. It reads and writes the
+# bar's own fields and the body's inert switch, nothing else
+_BAR_JS = """
+(function () {
+  var form = document.getElementById('tb-form');
+  if (!form) { return; }
+  var f = form.elements;
+  function settle() {
+    var band = f['tb-band'].value.split('|');
+    f['spread_min'].value = band[0];
+    f['spread_max'].value = band[1];
+    if (f['rebalance'].value === 'off') {
+      f['min_price_move'].value = 'off';
+      f['rebalance_min_days_to_maturity'].value = '0';
+    }
+    if (f['sell_at'].value === 'off') { f['sell_min_days'].value = 'off'; }
+  }
+  function send() {
+    settle();
+    document.body.inert = true;
+  }
+  form.addEventListener('submit', send);
+  var selects = form.getElementsByTagName('select');
+  for (var i = 0; i < selects.length; i++) {
+    selects[i].addEventListener('change', function () { send(); form.submit(); });
+  }
+})();
+"""
+
+# The notifier, the trading page's and every run page's: when the page is
+# shown in a frame, it sends the page's message (its body's
+# data-dashboard-message attribute, JSON) to the frame's parent, addressed to
+# each of the live dashboard's tab page's two origins in turn, so the browser
+# delivers it only to that tab page. It only sends: no page of this server
+# listens for messages
+_NOTIFY_JS = """
+(function () {
+  if (window.parent === window) { return; }
+  var text = document.body.getAttribute('data-dashboard-message');
+  if (!text) { return; }
+  var message = JSON.parse(text);
+  __ORIGINS__.forEach(function (origin) { window.parent.postMessage(message, origin); });
+})();
+""".replace("__ORIGINS__", json.dumps(list(LIVE_DASHBOARD_ORIGINS)))
+
+
+def _script_hash(script: str) -> str:
+    """
+    Name one script as the Content-Security-Policy allows it: by the hash of its text.
+
+    Args:
+        script (str): The script's text, exactly as a page carries it inside
+            its <script> element.
+
+    Returns:
+        str: "sha256-" and the base64 SHA-256 of the script's UTF-8 bytes.
+    """
+    return "sha256-" + b64encode(hashlib.sha256(script.encode("utf-8")).digest()).decode("ascii")
+
+
+# The Content-Security-Policy hashes of the three scripts, so the browser runs
+# them and nothing else
+_CONFIRM_JS_HASH = _script_hash(_CONFIRM_JS)
+_BAR_JS_HASH = _script_hash(_BAR_JS)
+_NOTIFY_JS_HASH = _script_hash(_NOTIFY_JS)
 
 # The policy every response carries: nothing loads but inline styles and the
-# one script above, no page may frame this one, and a form may post only here
+# three scripts above, a form may post (or ask for a page) only here, and only
+# the live dashboard's tab page, under either of its two addresses, may show a
+# page of this server in a frame. That page runs only scripts it pins itself;
+# the backtest page, which loads a chart library from the web, may not frame
+# one, nor may any other page
 _CSP = ("default-src 'none'; style-src 'unsafe-inline'; "
-        f"script-src '{_CONFIRM_JS_HASH}'; form-action 'self'; base-uri 'none'; "
-        "frame-ancestors 'none'")
+        f"script-src '{_CONFIRM_JS_HASH}' '{_BAR_JS_HASH}' '{_NOTIFY_JS_HASH}'; "
+        "form-action 'self'; base-uri 'none'; "
+        f"frame-ancestors {' '.join(LIVE_DASHBOARD_ORIGINS)}")
 
 # The type of every page; /checkout alone answers JSON
 _HTML_TYPE = "text/html; charset=utf-8"
@@ -373,6 +515,16 @@ tr.changed td { background: #FFF8E1; }
 pre { background: #FAFAFA; border: 1px solid #E0E0E0; padding: 8px; font-size: 12px;
       white-space: pre-wrap; overflow-x: auto; }
 button { font-size: 15px; padding: 8px 16px; }
+#tb-form { position: sticky; top: 0; z-index: 1; background: #FFFFFF; font-size: 14px;
+           border-bottom: 1px solid #E0E0E0; padding: 8px 0; line-height: 2.2; }
+#tb-form label, #tb-form .menu { margin-right: 12px; white-space: nowrap; }
+#tb-form details { display: inline-block; vertical-align: top; }
+#tb-form summary { cursor: pointer; }
+#tb-form .names { position: absolute; z-index: 2; background: #FFFFFF; max-height: 320px;
+                  overflow-y: auto; border: 1px solid #E0E0E0; padding: 6px 10px;
+                  line-height: 1.6; }
+#tb-form .names label { display: block; }
+#tb-form button { font-size: 13px; padding: 2px 10px; }
 """
 
 # The banner shown when a POST finds different defaults in force than the page was built on
@@ -393,18 +545,28 @@ _ACK_LABEL = "I have read the last run's result and want to place real orders an
 _NOT_STARTED_TO_TRADE = ("This server was not started to run trades — start it with "
                          "./start_dashboard.sh")
 
-# What a dashboard file holds when it has the filter bar's Save and Trade
-# buttons: the Trade link's id, which dashboard.py writes in the page's
-# opening part (in the filter bar, or under the notice that replaces it)
-_DASHBOARD_MARKER = b'id="flt-trade"'
-
-# What _dashboard_state finds at the dashboard's path
-_DASHBOARD_MISSING, _DASHBOARD_UNREADABLE, _DASHBOARD_OLD, _DASHBOARD_READY = (
-    "missing", "unreadable", "old", "ready")
-
-# The reasons shown beside a button that does not apply
+# The reason shown beside Dry run when it does not apply for want of saved
+# defaults (main.py refuses to run with none saved)
 _SAVE_FIRST = "A dry run needs saved defaults — save these first"
-_NOTHING_TO_SAVE = "Nothing to save — these are already the live defaults"
+
+# The dropdown bar's words: each dropdown's label, in the backtest page's
+# filter bar's order and words (dashboard._filter_bar_html), then the two
+# check-box menus' labels (dashboard._MENU_CAT_LABEL and _MENU_TAG_LABEL)
+_BAR_BAND_LABEL = "Spread band"
+_BAR_SELECT_LABELS = (("tier_floors", "Tier floors"), ("k", "k"), ("size_cap", "Size cap"),
+                      ("rebalance", "Rebalance"), ("min_price_move", "Min. price movement"),
+                      ("rebalance_min_days_to_maturity", "Rebalance until"),
+                      ("sell_at", "Sell"), ("sell_min_days", "Min. days to maturity"))
+_BAR_MENU_LABELS = (("exclude_category", "Exclude categories"),
+                    ("exclude_tag", "Exclude tags"))
+# The button that sends a menu's ticks (a menu is sent only when asked, since a
+# reader ticks several boxes at once)
+_BAR_APPLY = "Apply"
+# The grey note beside the menus when the backtest page's names file cannot be
+# used, after the reason ({why})
+_NAMES_NOTE = ("The Exclude menus list only the names excluded here: {why}. Build the "
+               "backtest dashboard (python3 -m kalshi_betting.backtest) to list every "
+               "category and tag it shows.")
 
 # The notes that follow the buttons
 _DRY_RUN_NOTE = ("Dry run runs the same search and sizing but sends no orders and leaves "
@@ -680,14 +842,34 @@ class _LastRun:
     where_html: str
 
 
+@dataclass(frozen=True)
+class _FilterNames:
+    """
+    The categories and tags the backtest page's names file lists, for the trading page's menus.
+
+    Attributes:
+        categories (tuple[str, ...]): Every category, in the file's order,
+            each once in any letter case; () when the file cannot be used.
+        tags (tuple[str, ...]): Every tag ("Category · Tag"), the same way.
+        note (str | None): Why the file could not be used (or what of it
+            was left out), as plain text for the grey note beside the menus;
+            None when every name was read.
+    """
+    categories: tuple[str, ...]
+    tags: tuple[str, ...]
+    note: str | None
+
+
 def _response_headers(response: _Response) -> list[tuple[str, str]]:
     """
     List the headers a response is sent with (Content-Length aside).
 
-    Every response carries the same six: its type, no caching, no type
-    sniffing, no framing, the same-origin referrer policy (under which a
-    browser still sends a POST's real Origin) and the Content-Security-
-    Policy. A redirect adds its Location.
+    Every response carries the same five: its type, no caching, no type
+    sniffing, the same-origin referrer policy (under which a browser still
+    sends a POST's real Origin) and the Content-Security-Policy, which also
+    says who may frame the page (only the live dashboard's tab page, so no
+    X-Frame-Options is sent: a browser that read its DENY would refuse that
+    tab page too). A redirect adds its Location.
 
     Args:
         response (_Response): The response.
@@ -699,7 +881,6 @@ def _response_headers(response: _Response) -> list[tuple[str, str]]:
         ("Content-Type", response.content_type),
         ("Cache-Control", "no-store"),
         ("X-Content-Type-Options", "nosniff"),
-        ("X-Frame-Options", "DENY"),
         ("Referrer-Policy", "same-origin"),
         ("Content-Security-Policy", _CSP),
     ]
@@ -792,8 +973,8 @@ def _name(text: str, name: str) -> str:
     Read a category or tag field as one name.
 
     A name with two spaces in a row is refused, for categories and tags
-    alike: a browser shows a run of spaces as one, so on the confirmation
-    page such a name would look exactly like the name spelled with single
+    alike: a browser shows a run of spaces as one, so on the trading page
+    such a name would look exactly like the name spelled with single
     spaces while being a different name to the filter. That also refuses a
     tied tag written with a doubled space ("Sports ·  Basketball").
 
@@ -1089,9 +1270,40 @@ def _proposal(params: dict[str, list[str]],
     return settings, source
 
 
+def _query_value(name: str, value: object) -> str:
+    """
+    Spell one proposal field's value as a confirmation query names it.
+
+    The one spelling, which _settings_query and the dropdown bar's choices
+    share, and which _proposal reads back as the same value: a switch as on or
+    off, a days-to-maturity limit as its days with "maturity" (None) as 0, an
+    unset minimum price movement, sell level or minimum of days as off, a
+    minimum of days as its digits and every other number as its repr (the
+    exact float).
+
+    Args:
+        name (str): A proposal field's name (one of _FIELDS, but for
+            exclude_category, exclude_tag and source).
+        value (object): Its value, as LiveSettings holds it (spread_min and
+            spread_max are the band's two ends, k is interval_discount).
+
+    Returns:
+        str: The field's value in the query.
+    """
+    if name in ("tier_floors", "rebalance"):
+        return "on" if value else "off"
+    if name == "rebalance_min_days_to_maturity":
+        return str(value or 0)
+    if value is None:
+        return "off"
+    if name == "sell_min_days":
+        return str(value)
+    return repr(value)
+
+
 def _settings_query(values: LiveSettings, *, source: str = "") -> str:
     """
-    Build a confirmation page's query that proposes exactly these settings.
+    Build a trading page's query that proposes exactly these settings.
 
     The fields come in _FIELDS order. Numbers are written as their repr (the
     exact float, which _proposal reads back as the same number), switches as
@@ -1108,20 +1320,19 @@ def _settings_query(values: LiveSettings, *, source: str = "") -> str:
     Returns:
         str: The query string, without the "?".
     """
-    pairs = [
-        ("tier_floors", "on" if values.tier_floors else "off"),
-        ("spread_min", repr(values.spread_band[0])),
-        ("spread_max", repr(values.spread_band[1])),
-        ("k", repr(values.interval_discount)),
-        ("size_cap", repr(values.size_cap)),
-        ("rebalance", "on" if values.rebalance else "off"),
-        ("min_price_move",
-         "off" if values.min_price_move is None else repr(values.min_price_move)),
-        ("rebalance_min_days_to_maturity", str(values.rebalance_min_days_to_maturity or 0)),
-        ("sell_at", "off" if values.sell_at is None else repr(values.sell_at)),
-        ("sell_min_days",
-         "off" if values.sell_min_days is None else str(values.sell_min_days)),
-    ]
+    # Each field's value as the dropdown bar's choices spell it too
+    pairs = [(name, _query_value(name, value)) for name, value in (
+        ("tier_floors", values.tier_floors),
+        ("spread_min", values.spread_band[0]),
+        ("spread_max", values.spread_band[1]),
+        ("k", values.interval_discount),
+        ("size_cap", values.size_cap),
+        ("rebalance", values.rebalance),
+        ("min_price_move", values.min_price_move),
+        ("rebalance_min_days_to_maturity", values.rebalance_min_days_to_maturity),
+        ("sell_at", values.sell_at),
+        ("sell_min_days", values.sell_min_days),
+    )]
     pairs += [("exclude_category", name) for name in values.exclude_categories or ()]
     pairs += [("exclude_tag", name) for name in values.exclude_tags or ()]
     if source:
@@ -1131,7 +1342,7 @@ def _settings_query(values: LiveSettings, *, source: str = "") -> str:
 
 def _seed_query() -> str:
     """
-    Build the confirmation page's query that proposes LIVE_DEFAULTS_SEED.
+    Build the trading page's query that proposes LIVE_DEFAULTS_SEED.
 
     The seed's settings as _settings_query spells them (it excludes no
     category or tag), with LIVE_DEFAULTS_SEED_SOURCE as the
@@ -1141,6 +1352,45 @@ def _seed_query() -> str:
         str: The query string, without the "?".
     """
     return _settings_query(LIVE_DEFAULTS_SEED, source=LIVE_DEFAULTS_SEED_SOURCE)
+
+
+def _home_query(current: LiveSettings | None,
+                outdated: LiveDefaultsOutdated | None) -> str:
+    """
+    Build the query the trading page proposes when its address names no field.
+
+    The page then proposes the defaults in force exactly as they are: every
+    field named (_settings_query), since _proposal reads a missing excluded
+    category or tag as "none excluded", never as "keep the saved ones". Its
+    form then carries every field as hidden inputs, exactly as a link naming
+    them would, so each button acts on these settings. For a file an older
+    version saved, its values in their new form (with "Save the live
+    trading defaults again?" over them); with none saved, or an outdated
+    file with no reading in the new form, the seed values with the seed's
+    note. Saved values that a link's rules refuse, or read as other
+    settings, get no page with buttons: _App._get_confirm checks that this
+    query reads back as exactly them.
+
+    The saved defaults' own source note is not carried: LiveSettings keeps it
+    only inside its origin text, so the page proposes them with no note.
+    That changes nothing a button does with them unchanged (Confirm and save
+    then writes nothing), and a save of a change made in the dropdown bar is
+    one nobody's note describes.
+
+    Args:
+        current (LiveSettings | None): The live defaults in force, or None.
+        outdated (LiveDefaultsOutdated | None): The refusal of a file an
+            older version saved, when that is at the path (current is then
+            None); None otherwise.
+
+    Returns:
+        str: The query string, without the "?".
+    """
+    if current is not None:
+        return _settings_query(current)
+    if outdated is not None and outdated.proposal is not None:
+        return _settings_query(outdated.proposal)
+    return _seed_query()
 
 
 def _current_defaults() -> LiveSettings | None:
@@ -1208,16 +1458,17 @@ def _signed_text(purpose: str, fingerprint: str, nonce: str,
     """
     Build the text a page's token signs.
 
-    The page's purpose ("confirm" or "trade", so one page's token cannot
-    start the other page's action), the fingerprint of the defaults in force,
-    the page's nonce, each on its own line, then every proposal field as the
-    request gave it, sorted by field name and URL-encoded (none for /trade); a
-    field given more than once (a category or tag) keeps its values in the
-    order given. The raw strings are signed, never values re-rendered from
-    LiveSettings, so the POST must repeat exactly what the page showed.
+    The page's purpose (_CONFIRM_PURPOSE, the trading page's form, the one
+    form this server signs), the fingerprint of the defaults in force, the
+    page's nonce, each on its own line, then every
+    proposal field as the request gave it, sorted by field name and
+    URL-encoded; a field given more than once (a category or tag) keeps its
+    values in the order given. The raw strings are signed, never values
+    re-rendered from LiveSettings, so the POST must repeat exactly what the
+    page showed.
 
     Args:
-        purpose (str): "confirm" or "trade".
+        purpose (str): The page's purpose (_CONFIRM_PURPOSE).
         fingerprint (str): _fingerprint of the defaults the page was built on.
         nonce (str): The page's one-time nonce.
         params (dict[str, list[str]]): The request's fields; any other than
@@ -1230,16 +1481,23 @@ def _signed_text(purpose: str, fingerprint: str, nonce: str,
     return "\n".join((purpose, fingerprint, nonce, urlencode(pairs)))
 
 
-def _page(title: str, body: str, *, script: bool = False, refresh: int | None = None) -> str:
+def _page(title: str, body: str, *, scripts: tuple[str, ...] = (), refresh: int | None = None,
+          message: dict | None = None) -> str:
     """
     Wrap a page's body in the HTML document every page shares.
 
     Args:
         title (str): The page title and heading (escaped here).
         body (str): The body's HTML, every dynamic string in it already escaped.
-        script (bool): Whether to add the page script (the pages with buttons).
+        scripts (tuple[str, ...]): The scripts to add at the end, in order,
+            each one of the three _CSP allows by its hash (_CONFIRM_JS,
+            _BAR_JS, _NOTIFY_JS); () (default) adds none.
         refresh (int | None): Reload the page after this many seconds (a run
             still going); None (default) never.
+        message (dict | None): What the notifier (_NOTIFY_JS) tells the live
+            dashboard's tab page this page shows, kept as JSON in the body's
+            data-dashboard-message attribute (escaped here); None (default)
+            gives the body no such attribute.
 
     Returns:
         str: The whole HTML document.
@@ -1247,11 +1505,14 @@ def _page(title: str, body: str, *, script: bool = False, refresh: int | None = 
     escaped = html.escape(title)
     head = (f"<meta http-equiv=\"refresh\" content=\"{int(refresh)}\">\n"
             if refresh is not None else "")
+    body_tag = ("<body>\n" if message is None else
+                f"<body data-dashboard-message=\"{html.escape(json.dumps(message))}\">\n")
     return ("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
             + head
-            + f"<title>{escaped}</title>\n<style>{_STYLE}</style>\n</head>\n<body>\n"
-            f"<h1>{escaped}</h1>\n{body}\n"
-            + (f"<script>{_CONFIRM_JS}</script>\n" if script else "")
+            + f"<title>{escaped}</title>\n<style>{_STYLE}</style>\n</head>\n"
+            + body_tag
+            + f"<h1>{escaped}</h1>\n{body}\n"
+            + "".join(f"<script>{script}</script>\n" for script in scripts)
             + "</body>\n</html>\n")
 
 
@@ -1319,10 +1580,10 @@ def _slot_html(slot: _Slot) -> str:
     """
     Render one button in its place: the real button, or a disabled placeholder and its reason.
 
-    A real button is a submit button rendered disabled (the page script arms
-    it), with its id and its action as the name "action". A placeholder has
-    the same label but no id, name or value, is never armed, and is followed
-    by the reason it does not apply.
+    A real button is a submit button rendered disabled (the arming script,
+    _CONFIRM_JS, arms it), with its id and its action as the name "action".
+    A placeholder has the same label but no id, name or value, is never
+    armed, and is followed by the reason it does not apply.
 
     Args:
         slot (_Slot): The button.
@@ -1341,18 +1602,20 @@ def _slot_html(slot: _Slot) -> str:
 def _form_html(target: str, params: dict[str, list[str]], controls: _Controls,
                money_line: str) -> str:
     """
-    Build a page's one form: the hidden fields, then the buttons in their fixed order.
+    Build the trading page's form that posts: the hidden fields, then the buttons in their fixed order.
 
     The buttons before the last come first; after a visible gap, the red line
     saying the last button places real orders, the acknowledgement box when
     the attention banner shows and that button applies, and the last button.
     So Tab, or a habitual click, never lands on the real-money button because
-    another button went missing.
+    another button went missing. The dropdown bar above it is a form of its
+    own (_bar_html), which only asks for the page again.
 
     Args:
-        target (str): Where the form posts ("/confirm" or "/trade").
+        target (str): Where the form posts ("/confirm").
         params (dict[str, list[str]]): The proposal fields to carry, as the
-            request gave them (none for /trade).
+            request gave them (for the page opened with no fields, as
+            _home_query names them).
         controls (_Controls): The signed fields and the buttons.
         money_line (str): The red line above the real-money button (plain text).
 
@@ -1628,8 +1891,8 @@ def _outdated_notice_html(outdated: LiveDefaultsOutdated) -> str:
     """
     Say, as HTML, that the saved file was saved by an older version, with a link to save it again.
 
-    The pages that cannot use such a file (/, /trade, /saved) show it. With a
-    proposal, the link opens the confirmation page holding the file's values
+    The pages that cannot use such a file (/ and /saved) show it. With a
+    proposal, the link opens the trading page holding the file's values
     in their new form (every field named, no source note), where one Confirm
     and save replaces the file; when the file listed categories to trade, a
     second red paragraph says those values trade every category
@@ -1660,7 +1923,7 @@ def _outdated_notice_html(outdated: LiveDefaultsOutdated) -> str:
 
 def _outdated_confirm_html(outdated: LiveDefaultsOutdated, proposed: LiveSettings) -> str:
     """
-    Say, as HTML, above the confirmation table, that the saved file was saved by an older version.
+    Say, as HTML, above the trading page's table, that the saved file was saved by an older version.
 
     When the page proposes exactly the file's values in their new form, it
     says so; otherwise it says the save replaces the file with the settings
@@ -1695,26 +1958,405 @@ def _outdated_confirm_html(outdated: LiveDefaultsOutdated, proposed: LiveSetting
             "the file with the settings below.</p>")
 
 
+def _strict_constant(text: str) -> object:
+    """
+    Refuse NaN, Infinity and -Infinity in the names file, which strict JSON does not have.
+
+    Args:
+        text (str): The constant json met.
+
+    Raises:
+        ValueError: Always.
+    """
+    raise ValueError(f"it holds {text}, which is not JSON")
+
+
+def _strict_object(pairs: list[tuple[str, object]]) -> dict:
+    """
+    Build one JSON object of the names file, refusing a key given twice.
+
+    Args:
+        pairs (list[tuple[str, object]]): The object's keys and values, in order.
+
+    Returns:
+        dict: The object.
+
+    Raises:
+        ValueError: When a key is given twice (strict JSON readers disagree on
+            which one wins).
+    """
+    record = dict(pairs)
+    if len(record) != len(pairs):
+        raise ValueError("it gives a key twice")
+    return record
+
+
+def _file_names(record: dict, key: str, field: str, link_field: str) -> tuple[str, ...]:
+    """
+    Read one list of the backtest page's names file, holding each name to a link's rules.
+
+    Each name must pass the check a link's name passes (check_filter_name) and
+    the rules LiveSettings applies to an excluded name (filter_name_refusal: no
+    "any" or "none", a category never written as a tied tag, a tied tag with
+    both halves), so ticking any listed name asks for a proposal the server
+    takes. A name repeating an earlier one in another letter case is left
+    out, as the live filter reads the two as one.
+
+    Args:
+        record (dict): The file's JSON object.
+        key (str): "categories" or "tags".
+        field (str): The LiveSettings field the names would be excluded in
+            ("exclude_categories" or "exclude_tags").
+        link_field (str): The query field a tick sends ("exclude_category" or
+            "exclude_tag").
+
+    Returns:
+        tuple[str, ...]: The names in the file's order, each once in any letter case.
+
+    Raises:
+        ValueError: When the list is missing or not a list of strings, or a
+            name breaks a rule.
+    """
+    names = record.get(key)
+    if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+        raise ValueError(f"its {key} are not a list of names")
+    kept: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        # Cross-module: the one check a link's names get, then LiveSettings' own rules
+        check_filter_name(name, link_field)
+        refusal = filter_name_refusal(field, name)
+        if refusal is not None:
+            raise ValueError(refusal)
+        if name.casefold() not in seen:
+            seen.add(name.casefold())
+            kept.append(name)
+    return tuple(kept)
+
+
+def _filter_names() -> _FilterNames:
+    """
+    Read the backtest page's names file, for the trading page's Exclude menus; never raises.
+
+    The file (config.BACKTEST_FILTER_NAMES_FILENAME in config.PROJECT_ROOT,
+    read at call time) lists every category and every tied tag the backtest
+    page's filter bar offers. Only a plain file is read (a link to one is
+    followed): a FIFO, a terminal or another device could keep a read
+    waiting, and this server answers one request at a time. At most
+    BACKTEST_FILTER_NAMES_MAX_BYTES are read, as strict JSON (no NaN or
+    Infinity, no key twice); its "format" must be
+    BACKTEST_FILTER_NAMES_FORMAT, and every name must be one a link may
+    exclude (_file_names). Each list keeps at most
+    DEFAULTS_SERVER_MAX_FILTER_NAMES names, the most a link may exclude, and
+    the note says when more were left out. It is small, so it is read again
+    for every trading page shown.
+
+    Returns:
+        _FilterNames: The names, or, when the file is missing, not a plain
+            file, longer than the limit, unreadable or damaged in any way, no
+            names and a note saying why.
+    """
+    path = config.PROJECT_ROOT / BACKTEST_FILTER_NAMES_FILENAME
+    try:
+        if path.exists() and not path.is_file():
+            return _FilterNames((), (), _NAMES_NOTE.format(
+                why=f"{BACKTEST_FILTER_NAMES_FILENAME} is not a plain file"))
+        # Opened without waiting: should a FIFO or a device take the file's
+        # place after that check, the open and every read return at once
+        # (with nothing, or an error) instead of holding the server
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            data = b""
+            while len(data) <= BACKTEST_FILTER_NAMES_MAX_BYTES:
+                chunk = os.read(descriptor, BACKTEST_FILTER_NAMES_MAX_BYTES + 1 - len(data))
+                if not chunk:
+                    break
+                data += chunk
+        finally:
+            os.close(descriptor)
+    except FileNotFoundError:
+        return _FilterNames((), (), _NAMES_NOTE.format(
+            why=f"there is no {BACKTEST_FILTER_NAMES_FILENAME} beside the backtest dashboard"))
+    except OSError as exc:
+        return _FilterNames((), (), _NAMES_NOTE.format(
+            why=f"{BACKTEST_FILTER_NAMES_FILENAME} could not be read ({type(exc).__name__})"))
+    if len(data) > BACKTEST_FILTER_NAMES_MAX_BYTES:
+        return _FilterNames((), (), _NAMES_NOTE.format(
+            why=f"{BACKTEST_FILTER_NAMES_FILENAME} is longer than "
+                f"{BACKTEST_FILTER_NAMES_MAX_BYTES} bytes"))
+    try:
+        record = json.loads(data.decode("utf-8"), parse_constant=_strict_constant,
+                            object_pairs_hook=_strict_object)
+        if not isinstance(record, dict) or record.get("format") != BACKTEST_FILTER_NAMES_FORMAT:
+            raise ValueError(f"it is not a {BACKTEST_FILTER_NAMES_FORMAT} file")
+        categories = _file_names(record, "categories", "exclude_categories", "exclude_category")
+        tags = _file_names(record, "tags", "exclude_tags", "exclude_tag")
+    except (ValueError, RecursionError) as exc:
+        # A UnicodeDecodeError or a JSON syntax error is a ValueError too
+        return _FilterNames((), (), _NAMES_NOTE.format(
+            why=f"{BACKTEST_FILTER_NAMES_FILENAME} cannot be used: "
+                f"{_log_safe(str(exc) or type(exc).__name__)}"))
+    note = None
+    if max(len(categories), len(tags)) > DEFAULTS_SERVER_MAX_FILTER_NAMES:
+        note = (f"The Exclude menus list the first {DEFAULTS_SERVER_MAX_FILTER_NAMES} categories "
+                f"and the first {DEFAULTS_SERVER_MAX_FILTER_NAMES} tags of "
+                f"{BACKTEST_FILTER_NAMES_FILENAME}, the most one page may exclude.")
+    return _FilterNames(categories[:DEFAULTS_SERVER_MAX_FILTER_NAMES],
+                        tags[:DEFAULTS_SERVER_MAX_FILTER_NAMES], note)
+
+
+def _bar_choices(grid: tuple, shown: object, *, ordered: bool = True) -> list:
+    """
+    List one dropdown's values: its grid's, with the value the page shows added when off it.
+
+    Args:
+        grid (tuple): The grid's values, as LiveSettings holds them (None for
+            "off", "any" or "maturity").
+        shown (object): The value the page proposes.
+        ordered (bool): Whether to sort the values, None first and then
+            from the smallest (True, default), or keep the grid's order with
+            an added value last (a switch's on/off order).
+
+    Returns:
+        list: Each value once, compared as numbers (so 0.5 on the grid and a
+            shown 0.5 are one value).
+    """
+    values = list(grid)
+    if shown not in values:
+        values.append(shown)
+    if ordered:
+        values.sort(key=lambda value: (value is not None, value if value is not None else 0))
+    return values
+
+
+def _bar_select(label: str, name: str, values: list, shown: object, field: str,
+                select_id: str | None = None) -> str:
+    """
+    Render one dropdown of the bar: its label, then a <select> with one option per value.
+
+    Each option's value is the field's value as a confirmation query spells
+    it (_query_value), and its text is the setting's words in the table below
+    (config.live_setting_text). The option whose spelling is the shown
+    value's is selected. A select is never rendered disabled (a browser
+    leaves a disabled select out of the form it sends); a choice that does
+    not apply is left out of its values instead.
+
+    Args:
+        label (str): The dropdown's label, as the backtest page's bar words it.
+        name (str): The query field it sends; "" for the spread band, whose
+            choice the bar script copies into spread_min and spread_max.
+        values (list): Its values (_bar_choices), as LiveSettings holds them.
+        shown (object): The value the page proposes.
+        field (str): The LiveSettings field whose words the options use.
+        select_id (str | None): The select's id (the spread band's,
+            tb-band); None gives it none.
+
+    Returns:
+        str: The label and its select, every text escaped.
+    """
+    def spelling(value: object) -> str:
+        """
+        Spell one value as the option's value: the query's spelling, or a band's two ends.
+
+        Args:
+            value (object): The value.
+
+        Returns:
+            str: Its spelling.
+        """
+        if field == "spread_band":
+            return f"{_query_value('spread_min', value[0])}|{_query_value('spread_max', value[1])}"
+        return _query_value(name, value)
+
+    chosen = spelling(shown)
+    options = "".join(
+        f"<option value=\"{html.escape(spelling(value))}\""
+        f"{' selected' if spelling(value) == chosen else ''}>"
+        # Cross-module: the words the table under the bar uses for this value
+        f"{html.escape(live_setting_text(field, value))}</option>"
+        for value in values)
+    attributes = (f" id=\"{select_id}\"" if select_id else "") + (
+        f" name=\"{name}\"" if name else "")
+    return (f"<label>{html.escape(label)}: <select{attributes} autocomplete=\"off\">"
+            f"{options}</select></label>")
+
+
+def _bar_menu(label: str, name: str, listed: tuple[str, ...],
+              excluded: tuple[str, ...] | None) -> str:
+    """
+    Render one check-box menu of the bar: a box per name, the excluded ones ticked, and Apply.
+
+    The menu is a <details> element, so it opens on a click and closes again.
+    Ticking a box sends nothing by itself: the ticks go with the rest of the
+    bar when Apply (a submit button with no name, so it adds no field) is
+    pressed, or when any dropdown of the bar changes, which sends the whole
+    bar as it stands. Each box sends the name as the query field name.
+
+    Args:
+        label (str): The menu's label, as the backtest page's bar words it.
+        name (str): The query field each ticked box sends ("exclude_category"
+            or "exclude_tag").
+        listed (tuple[str, ...]): The names to list, the excluded ones first
+            in the proposal's order (so the ticks are sent in that order).
+        excluded (tuple[str, ...] | None): The names the proposal excludes.
+
+    Returns:
+        str: The menu, every name escaped.
+    """
+    ticked = set(excluded or ())
+    boxes = "".join(
+        f"<label><input type=\"checkbox\" name=\"{name}\" value=\"{html.escape(entry)}\""
+        f"{' checked' if entry in ticked else ''} autocomplete=\"off\"> "
+        f"{html.escape(entry)}</label>"
+        for entry in listed)
+    if not boxes:
+        boxes = "<span class=\"note empty\">No names to list.</span>"
+    summary = "none" if not excluded else f"{len(excluded)} excluded"
+    return (f"<span class=\"menu\">{html.escape(label)}: <details><summary>{summary}</summary>"
+            f"<div class=\"names\">{boxes}<button type=\"submit\">{html.escape(_BAR_APPLY)}"
+            "</button></div></details></span>")
+
+
+def _listed(excluded: tuple[str, ...] | None, names: tuple[str, ...]) -> tuple[str, ...]:
+    """
+    List a menu's names: every one the proposal excludes, in its order, then the file's others.
+
+    The excluded names come first so their ticks are sent in the proposal's
+    order, and an unchanged menu proposes the very same list. A file name
+    that repeats an excluded one (or an earlier one) in any letter case is
+    left out, as the live filter reads the two as one.
+
+    Args:
+        excluded (tuple[str, ...] | None): The names the proposal excludes.
+        names (tuple[str, ...]): The names file's names (_filter_names).
+
+    Returns:
+        tuple[str, ...]: The names to list, each once in any letter case.
+    """
+    listed: list[str] = []
+    seen: set[str] = set()
+    for entry in (*(excluded or ()), *names):
+        if entry.casefold() not in seen:
+            seen.add(entry.casefold())
+            listed.append(entry)
+    return tuple(listed)
+
+
+def _bar_html(settings: LiveSettings, source: str, names: _FilterNames) -> str:
+    """
+    Build the trading page's dropdown bar: a GET form back to /confirm showing the proposal.
+
+    The eleven controls, in the backtest page's filter bar's order and words:
+    Spread band, Tier floors, k, Size cap, Rebalance, Min. price movement,
+    Rebalance until, Sell, Min. days to maturity, then the Exclude categories
+    and Exclude tags menus. Each dropdown offers config's grid
+    (DEFAULTS_SERVER_SPREAD_BANDS, INTERVAL_DISCOUNT_SWEEP,
+    DEFAULTS_SERVER_SIZE_CAPS, MIN_PRICE_MOVES, REBALANCE_MATURITY_DAYS,
+    TAKE_PROFIT_LEVELS, TAKE_PROFIT_MIN_DAYS) plus the proposal's own value
+    when it is off the grid, that value selected. Choices that do not apply
+    are not offered: with Rebalance no, Min. price movement offers only "any"
+    and Rebalance until only "maturity"; with Sell off, Min. days to
+    maturity offers only "any". The spread band dropdown has no name: two
+    hidden fields, spread_min and spread_max, carry it (the bar script
+    copies a choice into them). Each menu lists the names the proposal
+    excludes, ticked, then the names file's others (_listed), and a grey note
+    says when that file could not be used. A hidden source field keeps the
+    page's source note, but never the seed's, which may label only the seed
+    values. So the form, sent as a browser sends a GET form, names every
+    field, and asks for exactly the proposal the bar shows when it is sent
+    (the page's own, with the choices made on the bar since).
+
+    It is a form of its own, outside the form that posts: it only asks for
+    the page again, never saves or runs anything, and has no button named
+    action. Once it is sent, the bar script makes the page inert until the
+    page it asked for arrives.
+
+    Args:
+        settings (LiveSettings): The proposal the page shows.
+        source (str): The page's source note ("" for none).
+        names (_FilterNames): The names file's categories and tags.
+
+    Returns:
+        str: The bar's HTML, every name escaped.
+    """
+    band = settings.spread_band
+    until = settings.rebalance_min_days_to_maturity
+    parts = ["<form id=\"tb-form\" method=\"get\" action=\"/confirm\" autocomplete=\"off\">",
+             _bar_select(_BAR_BAND_LABEL, "", _bar_choices(DEFAULTS_SERVER_SPREAD_BANDS, band),
+                         band, "spread_band", select_id="tb-band"),
+             f"<input type=\"hidden\" name=\"spread_min\" "
+             f"value=\"{_query_value('spread_min', band[0])}\">"
+             f"<input type=\"hidden\" name=\"spread_max\" "
+             f"value=\"{_query_value('spread_max', band[1])}\">"]
+    # Each dropdown's values, as LiveSettings holds them; "maturity" (0 days)
+    # is None there, and a choice that does not apply is not offered
+    values = {
+        "tier_floors": (_bar_choices((True, False), settings.tier_floors, ordered=False),
+                        settings.tier_floors, "tier_floors"),
+        "k": (_bar_choices(INTERVAL_DISCOUNT_SWEEP, settings.interval_discount),
+              settings.interval_discount, "interval_discount"),
+        "size_cap": (_bar_choices(DEFAULTS_SERVER_SIZE_CAPS, settings.size_cap),
+                     settings.size_cap, "size_cap"),
+        "rebalance": (_bar_choices((False, True), settings.rebalance, ordered=False),
+                      settings.rebalance, "rebalance"),
+        "min_price_move": (_bar_choices((None, *MIN_PRICE_MOVES) if settings.rebalance
+                                        else (None,), settings.min_price_move),
+                           settings.min_price_move, "min_price_move"),
+        "rebalance_min_days_to_maturity": (
+            _bar_choices(tuple(days or None for days in REBALANCE_MATURITY_DAYS)
+                         if settings.rebalance else (None,), until),
+            until, "rebalance_min_days_to_maturity"),
+        "sell_at": (_bar_choices((None, *TAKE_PROFIT_LEVELS), settings.sell_at),
+                    settings.sell_at, "sell_at"),
+        "sell_min_days": (_bar_choices((None, *TAKE_PROFIT_MIN_DAYS)
+                                       if settings.sell_at is not None else (None,),
+                                       settings.sell_min_days),
+                          settings.sell_min_days, "sell_min_days"),
+    }
+    for name, label in _BAR_SELECT_LABELS:
+        choices, shown, field = values[name]
+        parts.append(_bar_select(label, name, choices, shown, field))
+    excluded = {"exclude_category": settings.exclude_categories,
+                "exclude_tag": settings.exclude_tags}
+    listed = {"exclude_category": _listed(settings.exclude_categories, names.categories),
+              "exclude_tag": _listed(settings.exclude_tags, names.tags)}
+    for name, label in _BAR_MENU_LABELS:
+        parts.append(_bar_menu(label, name, listed[name], excluded[name]))
+    if source and source != LIVE_DEFAULTS_SEED_SOURCE:
+        parts.append(f"<input type=\"hidden\" name=\"source\" value=\"{html.escape(source)}\">")
+    if names.note is not None:
+        parts.append(f"<span class=\"note\">{html.escape(names.note)}</span>")
+    parts.append("</form>")
+    return "\n".join(parts)
+
+
 def _confirm_html(current: LiveSettings | None, settings: LiveSettings, source: str,
                   params: dict[str, list[str]], controls: _Controls,
-                  banner: str | None, outdated: LiveDefaultsOutdated | None = None) -> str:
+                  banner: str | None, outdated: LiveDefaultsOutdated | None = None,
+                  names: _FilterNames | None = None) -> str:
     """
-    Build the confirmation page: the defaults in force beside the proposed ones.
+    Build the trading page: the dropdown bar, then the defaults in force beside the proposed ones.
 
-    Every changed row is highlighted, the new value in bold with a "changed"
-    tag. In red: any live_rule_warnings sentence, and rebalance_change_warnings'
-    against the settings a save replaces (with rebalancing on, a lower size
-    cap or a higher k sells more of the held pairs at the next run): the
-    defaults in force or, for a file an older version saved, that file's
-    values in their new form (outdated.proposal); with neither, none. With a
-    file an older version saved at the path (outdated), nothing counts as in
-    force, so every row is compared with nothing, and a red notice above the
-    table says so (_outdated_confirm_html). The form posts back every
-    proposal field as the request gave it, with the fingerprint, nonce and
-    token, through three buttons rendered disabled (the page script arms
-    them): Dry run, Confirm and save, and, set apart below a red line,
-    Confirm and trade. A button that does not apply is a placeholder with its
-    reason.
+    At the top, the dropdown bar (_bar_html), a GET form of its own showing
+    the proposal, whose choices ask for this page again proposing another
+    value. Under it: every changed row is highlighted, the new value in bold
+    with a "changed" tag. In red: any live_rule_warnings sentence, and
+    rebalance_change_warnings' against the settings a save replaces (with
+    rebalancing on, a lower size cap or a higher k sells more of the held
+    pairs at the next run): the defaults in force or, for a file an older
+    version saved, that file's values in their new form (outdated.proposal);
+    with neither, none. With a file an older version saved at the path
+    (outdated), nothing counts as in force, so every row is compared with
+    nothing, and a red notice above the table says so
+    (_outdated_confirm_html). With nothing changed, a sentence says the
+    buttons act on the defaults in force as they are. The form that posts
+    carries back every proposal field as the request gave it, with the
+    fingerprint, nonce and token, through three buttons rendered disabled
+    (the arming script arms them): Dry run, Confirm and save, and, set apart
+    below a red line, Confirm and trade. A button that does not apply is a
+    placeholder with its reason. The body carries the notifier's message, so
+    the live dashboard's tab page, when it frames the page, learns the
+    proposal (as _settings_query spells it, with the page's source note).
 
     Args:
         current (LiveSettings | None): The live defaults in force, or None when none are saved.
@@ -1726,6 +2368,9 @@ def _confirm_html(current: LiveSettings | None, settings: LiveSettings, source: 
         outdated (LiveDefaultsOutdated | None): The refusal of a file an older
             version saved, when that is at the path (current is then None);
             None (default) otherwise.
+        names (_FilterNames | None): The names the bar's Exclude menus list;
+            None (default) reads the backtest page's names file
+            (_filter_names).
 
     Returns:
         str: The HTML page.
@@ -1739,7 +2384,8 @@ def _confirm_html(current: LiveSettings | None, settings: LiveSettings, source: 
         title = "Save the live trading defaults again?"
     else:
         title = "Save the first live trading defaults?"
-    parts = []
+    # The dropdown bar: a choice shows this page again proposing it
+    parts = [_bar_html(settings, source, names if names is not None else _filter_names())]
     if banner is not None:
         parts.append(f"<p class=\"banner\">{html.escape(banner)}</p>")
     if controls.attention is not None:
@@ -1781,78 +2427,60 @@ def _confirm_html(current: LiveSettings | None, settings: LiveSettings, source: 
         for warning in rebalance_change_warnings(replaced, settings):
             parts.append(f"<p class=\"warn\">Warning: {html.escape(warning)}.</p>")
     if not changes:
-        parts.append("<p>These are already the live defaults — nothing to save.</p>")
+        parts.append("<p>These are already the live defaults: Confirm and save writes "
+                     "nothing, and Dry run and Confirm and trade run them as they are.</p>")
     parts.append(_notes_html(confirming=True))
-    parts.append(_form_html(
-        "/confirm", params, controls,
-        "Confirm and trade saves these settings as the live defaults, then runs the live "
-        "bot with them on the production account: it places real orders."))
+    # Confirm and trade saves first only when something changes
+    money_line = ("Confirm and trade saves these settings as the live defaults, then runs the "
+                  "live bot with them on the production account: it places real orders."
+                  if changes else
+                  "Confirm and trade runs the live bot with these saved defaults on the "
+                  "production account: it places real orders.")
+    parts.append(_form_html("/confirm", params, controls, money_line))
     parts.append(_buttons_notes_html())
-    return _page(title, "\n".join(parts), script=True)
+    # The live dashboard's tab page, when it frames this page, is told the proposal
+    return _page(title, "\n".join(parts), scripts=(_CONFIRM_JS, _BAR_JS, _NOTIFY_JS),
+                 message={"type": "kalshi-trading",
+                          "query": _settings_query(settings, source=source)})
 
 
-def _trade_html(current: LiveSettings, controls: _Controls, banner: str | None) -> str:
+def _saved_html(settings: LiveSettings, *, unchanged: bool = False) -> str:
     """
-    Build the trade page: the saved live defaults, and the buttons that run the bot with them.
-
-    Args:
-        current (LiveSettings): The saved live defaults.
-        controls (_Controls): The signed fields, the buttons and any attention warning.
-        banner (str | None): A notice to show above everything else, or None.
-
-    Returns:
-        str: The HTML page.
-    """
-    settings = current
-    parts = []
-    if banner is not None:
-        parts.append(f"<p class=\"banner\">{html.escape(banner)}</p>")
-    if controls.attention is not None:
-        parts.append(f"<p class=\"banner\">{controls.attention.html}</p>")
-    parts.append(_where_html(saving=False, trading=True))
-    parts.append(f"<p>Saved defaults: {html.escape(settings.origin)}</p>")
-    parts.append(_settings_table(settings))
-    # The same warnings a live run on these settings logs
-    for warning in live_rule_warnings(settings):
-        parts.append(f"<p class=\"warn\">Warning: {html.escape(warning)}.</p>")
-    parts.append(_form_html(
-        "/trade", {}, controls,
-        "Confirm and trade runs the live bot with these saved defaults on the production "
-        "account: it places real orders."))
-    parts.append(_buttons_notes_html())
-    return _page("Trade with the saved live defaults?", "\n".join(parts), script=True)
-
-
-def _saved_html(settings: LiveSettings) -> str:
-    """
-    Build the page shown after a save: the live defaults now in force.
+    Build the page shown after Confirm and save: the live defaults now in force.
 
     Args:
         settings (LiveSettings): The saved defaults, as read back from the file.
+        unchanged (bool): Whether the Confirm and save changed nothing, so
+            wrote nothing; the first line then says so. False (default) says
+            the file was saved and verified.
 
     Returns:
-        str: The HTML page.
+        str: The HTML page, linking back to the trading page.
     """
-    parts = [
-        f"<p class=\"ok\">Saved and verified: {html.escape(settings.origin)}. The file was "
-        "read back and every setting matched what was confirmed.</p>",
-        _settings_table(settings),
-    ]
+    if unchanged:
+        first = ("<p class=\"ok\">Nothing changed: these are already the live defaults, so "
+                 "nothing was written.</p>\n"
+                 f"<p>Live defaults in force: {html.escape(settings.origin)}</p>")
+    else:
+        first = (f"<p class=\"ok\">Saved and verified: {html.escape(settings.origin)}. The file "
+                 "was read back and every setting matched what was confirmed.</p>")
+    parts = [first, _settings_table(settings)]
     # What a live run on these settings will log as a warning
     for warning in live_rule_warnings(settings):
         parts.append(f"<p class=\"warn\">Saved (valid), but note: {html.escape(warning)}.</p>")
     parts += [
-        "<p><a href=\"/trade\">Trade with these defaults →</a></p>",
+        "<p><a href=\"/confirm\">Back to the trading page</a></p>",
         _where_html(saving=False),
         _notes_html(confirming=False),
         "<p>You can close this tab.</p>",
     ]
-    return _page("Live trading defaults saved", "\n".join(parts))
+    return _page("Live trading defaults unchanged" if unchanged else "Live trading defaults saved",
+                 "\n".join(parts))
 
 
 def _message_html(status: int, title: str, text: str) -> str:
     """
-    Build a page that reports one outcome: a refusal, an error or "nothing to save".
+    Build a page that reports one outcome: a refusal, an error, or where a redirect goes.
 
     Args:
         status (int): The HTTP status the page is sent with.
@@ -2725,6 +3353,10 @@ def _run_html(run: _Run) -> str:
     """
     Build a run's page: its progress while it runs, its outcome once it has ended.
 
+    Its one script is the notifier, which tells the live dashboard's tab page,
+    when that page frames this one, the run's id (as {"type": "kalshi-run",
+    "run": <id>}), so its Run tab can show the run.
+
     Args:
         run (_Run): The run.
 
@@ -2771,8 +3403,10 @@ def _run_html(run: _Run) -> str:
                      "stop the run. Keep this Mac awake until it finishes." + restarted
                      + "</p>")
         parts.append(tail)
+        # The live dashboard's tab page, when it frames this page, is told the run's id
         return _page("Live trading run", "\n".join(parts),
-                     refresh=DEFAULTS_SERVER_RUN_REFRESH_SECONDS)
+                     refresh=DEFAULTS_SERVER_RUN_REFRESH_SECONDS, scripts=(_NOTIFY_JS,),
+                     message={"type": "kalshi-run", "run": run.run_id})
     outcome = _outcome(run, exit_code, result, lines)
     css = f" class=\"{outcome.css}\"" if outcome.css else ""
     parts = [f"<p{css}><b>{html.escape(outcome.headline)}</b></p>", outcome.detail, *about]
@@ -2807,42 +3441,19 @@ def _run_html(run: _Run) -> str:
             parts.append(f"<p class=\"note\">{record['warnings_dropped']} more warning lines "
                          "were not kept.</p>")
     parts.append(tail)
-    return _page("Live trading run", "\n".join(parts))
-
-
-def _dashboard_state(dashboard: Path) -> tuple[str, str | None]:
-    """
-    Tell whether the backtest dashboard exists and carries the filter bar's Save and Trade buttons.
-
-    The buttons sit in the page's opening part, so only the first
-    DASHBOARD_MARKER_SCAN_BYTES are read, looking for the Trade link's id
-    (_DASHBOARD_MARKER). A page built before the buttons existed lacks it.
-
-    Args:
-        dashboard (Path): The dashboard file.
-
-    Returns:
-        tuple[str, str | None]: The state — _DASHBOARD_MISSING,
-            _DASHBOARD_UNREADABLE, _DASHBOARD_OLD or _DASHBOARD_READY — and,
-            for an unreadable file only, why it could not be read (else None).
-    """
-    if not dashboard.exists():
-        return _DASHBOARD_MISSING, None
-    try:
-        with dashboard.open("rb") as page:
-            head = page.read(DASHBOARD_MARKER_SCAN_BYTES)
-    except OSError as exc:
-        return _DASHBOARD_UNREADABLE, f"{type(exc).__name__}: {exc}"
-    return (_DASHBOARD_READY if _DASHBOARD_MARKER in head else _DASHBOARD_OLD), None
+    return _page("Live trading run", "\n".join(parts), scripts=(_NOTIFY_JS,),
+                 message={"type": "kalshi-run", "run": run.run_id})
 
 
 def _index_html() -> str:
     """
     Build the page at "/": what this server is for and the newest runs, with no form and no script.
 
-    When the saved file was saved by an older version, a red notice at the
-    top links to the confirmation page that saves it again
-    (_outdated_notice_html); any other refusal of the file is left to the
+    It says where to trade (the live dashboard's Trading tab, or this
+    server's own trading page) and links the trading page and the seed
+    values. When the saved file was saved by an older version, a red notice
+    at the top links to the trading page holding its values in their new
+    form (_outdated_notice_html); any other refusal of the file is left to the
     pages that read it.
 
     Returns:
@@ -2855,28 +3466,13 @@ def _index_html() -> str:
         notice = _outdated_notice_html(exc)
     except LiveDefaultsError:
         notice = ""
-    dashboard = config.PROJECT_ROOT / DASHBOARD_FILENAME
-    state, why = _dashboard_state(dashboard)
-    shown = html.escape(str(dashboard.absolute()))
-    if state == _DASHBOARD_READY:
-        intro = ("<p>This server saves the live trading defaults and runs the live bot with "
-                 f"them. Open <code>{shown}</code> and use its filter bar's Save as live "
-                 "defaults… button to save a scenario, or its Trade using defaults… button to "
-                 "trade the saved ones.</p>")
-    elif state == _DASHBOARD_MISSING:
-        intro = ("<p>No backtest dashboard yet: run <code>python3 -m kalshi_betting.backtest"
-                 "</code> to build one.</p>")
-    elif state == _DASHBOARD_OLD:
-        intro = (f"<p>The backtest dashboard at <code>{shown}</code> was built before its "
-                 "Save as live defaults… and Trade using defaults… buttons: rebuild it with "
-                 "<code>python3 -m kalshi_betting.backtest</code> and the "
-                 "<code>--start-date</code> you built it from. Until then, use the links "
-                 "below.</p>")
-    else:
-        intro = (f"<p>The backtest dashboard at <code>{shown}</code> could not be read "
-                 f"({html.escape(why or 'no reason given')}). Use the links below.</p>")
-    links = (f"<p><a href=\"{html.escape('/confirm?' + _seed_query())}\">Start from the seed "
-             "values</a> · <a href=\"/trade\">Trade using defaults</a></p>")
+    intro = ("<p>This server saves the live trading defaults and runs the live bot with "
+             "them. Trade from the live dashboard's Trading tab (<code>./start_dashboard.sh"
+             "</code> starts both), or from this server's own trading page below: it opens "
+             "on the live defaults in force, its dropdowns propose other values, and its "
+             "buttons dry-run, save or trade the settings it shows.</p>")
+    links = (f"<p><a href=\"/confirm\">Trading page</a> · <a href=\""
+             f"{html.escape('/confirm?' + _seed_query())}\">Start from the seed values</a></p>")
     rows = []
     for folder in _runs_on_disk()[:DEFAULTS_SERVER_INDEX_RUNS]:
         run = _load_run(folder)
@@ -2941,11 +3537,13 @@ class _App:
 
         Every request must name this server in its Host header. GET "/" says
         what the server is for and lists the newest runs; GET "/confirm" shows
-        the confirmation page and POST "/confirm" saves, trades or dry-runs;
-        GET "/saved" shows the defaults in force; GET "/trade" shows the saved
-        defaults and POST "/trade" trades or dry-runs them; GET "/runs/<id>"
-        shows a run; GET "/checkout" answers which checkout this is and the
-        fingerprint of the code this process loaded. Anything else is 404.
+        the trading page (with no query, proposing the defaults in force) and
+        POST "/confirm" saves, trades or dry-runs; GET "/saved" shows the
+        defaults in force after a save; GET "/trade" is sent to "/confirm",
+        whose first view trades the saved defaults; GET "/runs/<id>" shows a
+        run; GET "/checkout" answers
+        which checkout this is and the fingerprint of the code this process
+        loaded. Anything else, POST "/trade" included, is 404.
 
         Args:
             request (_Request): The request.
@@ -2963,9 +3561,11 @@ class _App:
             if path == "/confirm":
                 return self._get_confirm(query)
             if path == "/saved":
-                return self._get_saved()
+                return self._get_saved(query)
             if path == "/trade":
-                return self._get_trade()
+                # Trading the saved defaults is the trading page's own first view
+                return _Response(303, _message_html(303, "Moved", "The trading page is "
+                                                    "/confirm."), location="/confirm")
             if path == "/checkout":
                 return _Response(200, json.dumps(
                     {"project_root": str(config.PROJECT_ROOT.resolve()), "code": _LOADED_CODE}),
@@ -2975,8 +3575,6 @@ class _App:
         elif request.method == "POST":
             if path == "/confirm":
                 return self._post_confirm(request)
-            if path == "/trade":
-                return self._post_trade(request)
         return self._refuse(404, "Not found", "This server has no such page.")
 
     def _token(self, purpose: str, fingerprint: str, nonce: str,
@@ -2985,7 +3583,8 @@ class _App:
         Sign a page's purpose, the fingerprint it was built on, its nonce and its proposal fields.
 
         Args:
-            purpose (str): "confirm" or "trade".
+            purpose (str): The page's purpose; _CONFIRM_PURPOSE, the trading
+                page's form, the one form this server signs.
             fingerprint (str): _fingerprint of the defaults the page was built on.
             nonce (str): The page's one-time nonce.
             params (dict[str, list[str]]): The proposal's fields.
@@ -3032,7 +3631,7 @@ class _App:
         Refuse a page or a run because the saved file was saved by an older version.
 
         Nothing runs from such a file. The page says so and links to the
-        confirmation page that saves its values again (_outdated_notice_html),
+        trading page that saves its values again (_outdated_notice_html),
         where one Confirm and save replaces it.
 
         Args:
@@ -3047,6 +3646,46 @@ class _App:
         body = "\n".join((_outdated_notice_html(exc), _where_html(saving=False),
                           "<p class=\"note\">HTTP 409 Conflict</p>"))
         return _Response(409, _page("The saved live defaults must be saved again", body))
+
+    def _uncarried_file(self, outdated: LiveDefaultsOutdated | None, why: str) -> _Response:
+        """
+        Refuse the trading page with no address fields: the saved values cannot be carried as they are.
+
+        That page proposes the saved values by naming each field, as a link
+        would, so its buttons act on exactly them. When a link's rules read
+        the saved values differently, or refuse them, those buttons would
+        dry-run, save or trade something else, so no form is shown. The page
+        says why, says whether live runs use the file, and links to the seed
+        values, where one Confirm and save replaces the file.
+
+        Args:
+            outdated (LiveDefaultsOutdated | None): The refusal of a file an
+                older version saved, when that is at the path; None when the
+                file holds the live defaults in force.
+            why (str): What a link's rules refuse in the saved values, or how
+                they would read them differently (plain text).
+
+        Returns:
+            _Response: A 409 page with no form.
+        """
+        logging.warning("Refused (409 Conflict): the saved live defaults cannot be carried by "
+                        "the trading page: %s", _log_safe(why))
+        path = html.escape(str(config.LIVE_DEFAULTS_FILE.absolute()))
+        seed = html.escape("/confirm?" + _seed_query())
+        if outdated is None:
+            state = ("The live defaults in force hold something this trading page cannot carry "
+                     f"as it is: {html.escape(why)}. Every live run still uses them as saved, "
+                     "but this page cannot dry-run, save or trade them unchanged.")
+        else:
+            state = (f"The saved live defaults were saved {html.escape(_outdated_when(outdated))}, "
+                     "so every live run refuses them, and their values in their new form hold "
+                     f"something this trading page cannot carry as it is: {html.escape(why)}.")
+        body = "\n".join((
+            f"<p class=\"banner\">{state} Fix or delete <code>{path}</code> by hand, or open "
+            f"<a href=\"{seed}\">the seed values</a>, where one Confirm and save replaces the "
+            "file with them.</p>",
+            _where_html(saving=False), "<p class=\"note\">HTTP 409 Conflict</p>"))
+        return _Response(409, _page("The saved live defaults cannot be shown here", body))
 
     def _own_run(self) -> _Run | None:
         """
@@ -3165,23 +3804,21 @@ class _App:
         return _Notice(f"The last real-money run ({newest.where}){tail}",
                        f"The last real-money run ({newest.where_html}){html.escape(tail)}")
 
-    def _controls(self, *, purpose: str, fingerprint: str, params: dict[str, list[str]],
-                  current: LiveSettings | None, changes: bool) -> _Controls:
+    def _controls(self, *, fingerprint: str, params: dict[str, list[str]],
+                  current: LiveSettings | None) -> _Controls:
         """
-        Build a page's form: a fresh nonce, its token and its buttons in their fixed order.
+        Build the trading page's form: a fresh nonce, its token and its buttons in their fixed order.
 
-        Every render issues a fresh nonce. On /confirm the buttons are Dry run
-        (a placeholder when a run is blocked or no defaults are saved), Confirm
-        and save (a placeholder when nothing would change) and Confirm and
-        trade (a placeholder when a real-money run is blocked); on /trade, Dry
-        run and Confirm and trade.
+        Every render issues a fresh nonce. The buttons are Dry run (a
+        placeholder when a run is blocked, or when no defaults are saved,
+        since main.py runs nothing then), Confirm and save (always a real
+        button: with nothing changed it writes nothing and says so) and
+        Confirm and trade (a placeholder when a real-money run is blocked).
 
         Args:
-            purpose (str): "confirm" or "trade".
             fingerprint (str): _fingerprint of the defaults the page is built on.
-            params (dict[str, list[str]]): The proposal fields ({} for /trade).
+            params (dict[str, list[str]]): The proposal fields the form carries.
             current (LiveSettings | None): The live defaults in force.
-            changes (bool): Whether saving the proposal would change anything.
 
         Returns:
             _Controls: The page's form.
@@ -3195,25 +3832,21 @@ class _App:
             dry_reason = html.escape(_SAVE_FIRST)
         else:
             dry_reason = None
-        trade = _Slot("Confirm and trade", "confirm-trade", "trade",
-                      None if trade_block is None else trade_block.html)
-        if purpose == "confirm":
-            slots = (_Slot("Dry run (no orders; defaults unchanged)", "confirm-dry-run",
-                           "dry_run", dry_reason),
-                     _Slot("Confirm and save", "confirm", "save",
-                           None if changes else html.escape(_NOTHING_TO_SAVE)),
-                     trade)
-        else:
-            slots = (_Slot("Dry run (no orders)", "confirm-dry-run", "dry_run", dry_reason),
-                     trade)
-        return _Controls(fingerprint, nonce, self._token(purpose, fingerprint, nonce, params),
+        slots = (_Slot("Dry run (no orders; defaults unchanged)", "confirm-dry-run",
+                       "dry_run", dry_reason),
+                 # With nothing changed it writes nothing and shows the defaults in force
+                 _Slot("Confirm and save", "confirm", "save", None),
+                 _Slot("Confirm and trade", "confirm-trade", "trade",
+                       None if trade_block is None else trade_block.html))
+        return _Controls(fingerprint, nonce,
+                         self._token(_CONFIRM_PURPOSE, fingerprint, nonce, params),
                          slots, self._attention())
 
     def _render_confirm(self, current: LiveSettings | None, *, settings: LiveSettings,
                         source: str, params: dict[str, list[str]], banner: str | None,
                         outdated: LiveDefaultsOutdated | None) -> str:
         """
-        Build the confirmation page for a proposal, against the defaults in force.
+        Build the trading page for a proposal, against the defaults in force.
 
         Args:
             current (LiveSettings | None): The live defaults in force.
@@ -3228,39 +3861,35 @@ class _App:
         Returns:
             str: The HTML page.
         """
-        changes = any(changed for *_, changed in live_settings_changes(current, settings))
-        controls = self._controls(purpose="confirm",
-                                  fingerprint=_fingerprint(current, outdated),
-                                  params=params, current=current, changes=changes)
+        controls = self._controls(fingerprint=_fingerprint(current, outdated),
+                                  params=params, current=current)
         return _confirm_html(current, settings, source, params, controls, banner, outdated)
-
-    def _render_trade(self, current: LiveSettings, banner: str | None) -> str:
-        """
-        Build the trade page for the saved live defaults.
-
-        Args:
-            current (LiveSettings): The saved live defaults.
-            banner (str | None): A notice to show above everything else.
-
-        Returns:
-            str: The HTML page.
-        """
-        controls = self._controls(purpose="trade", fingerprint=_fingerprint(current), params={},
-                                  current=current, changes=False)
-        return _trade_html(current, controls, banner)
 
     def _get_confirm(self, query: str) -> _Response:
         """
-        Show the confirmation page for the proposal in a query string.
+        Show the trading page for the proposal in a query string, or for the defaults in force.
+
+        With no query, the page proposes the defaults in force exactly as
+        they are (_home_query: every field named, so the form carries them
+        all), or, for a file an older version saved, its values in their new
+        form, or, with none saved, the seed values. The saved values are read
+        back through the rules a link's fields are held to (_proposal), and
+        must come back exactly as saved: LiveSettings, and so every live run,
+        takes a few names a link cannot carry (two spaces in a row, a
+        character that does not print, the same name twice or in two letter
+        cases, more than DEFAULTS_SERVER_MAX_FILTER_NAMES of them), and a page
+        whose buttons would act on anything but the saved values is not
+        shown (_uncarried_file says why instead).
 
         Args:
-            query (str): The query string (after "?").
+            query (str): The query string (after "?"); "" for none.
 
         Returns:
-            _Response: 200 with the page, 400 when the proposal is refused,
-                409 when the saved file is refused. A file an older version
-                saved counts as nothing in force, so the page can be shown
-                and a save replaces it.
+            _Response: 200 with the page; 400 when the query's proposal is
+                refused; 409 when the saved file is refused, or, with no
+                query, when its values cannot be carried as they are. A file
+                an older version saved counts as nothing in force, so the
+                page can be shown and a save replaces it.
         """
         outdated = None
         try:
@@ -3270,25 +3899,47 @@ class _App:
             current, outdated = None, exc
         except LiveDefaultsError as exc:
             return self._refused_file(exc)
+        # What a left-out field keeps: the defaults in force, an outdated
+        # file's values in their new form, or None (the seed's)
+        base = _kept_base(current, outdated)
         try:
-            params = _params(query)
-            # A left-out field keeps the saved value, an outdated file's included
-            settings, source = _proposal(params, _kept_base(current, outdated))
+            # No query: the defaults in force proposed as they are (an older
+            # file's values in their new form, or the seed's with none saved),
+            # so every button acts on them
+            params = _params(query if query else _home_query(current, outdated))
+            settings, source = _proposal(params, base)
         except ValueError as exc:
+            if not query and base is not None:
+                # The saved values themselves hold something a link cannot carry
+                return self._uncarried_file(outdated, str(exc))
             return self._refuse(400, "These settings cannot be saved", str(exc))
+        if not query and base is not None and settings != base:
+            # Read through a link's rules, the saved values come back different,
+            # so the page's buttons would act on other settings
+            differ = "; ".join(f"{label} would read {new} here, not {old}" for label, old, new,
+                               changed in live_settings_changes(base, settings) if changed)
+            return self._uncarried_file(outdated, differ)
         return _Response(200, self._render_confirm(current, settings=settings, source=source,
                                                    params=params, banner=None,
                                                    outdated=outdated))
 
-    def _get_saved(self) -> _Response:
+    def _get_saved(self, query: str) -> _Response:
         """
-        Show the live defaults in force (the page a save redirects to).
+        Show the live defaults in force: the page Confirm and save sends a browser to.
+
+        Args:
+            query (str): The query string (after "?"): "" after a save that
+                wrote the file, or _UNCHANGED_QUERY after one that changed
+                nothing, so wrote nothing (the page then says so).
 
         Returns:
-            _Response: 200 with the page, 404 when none are saved, 409 when
-                the saved file is refused (an outdated one with a link to
-                save it again).
+            _Response: 200 with the page, 400 for any other query, 404 when
+                none are saved, 409 when the saved file is refused (an
+                outdated one with a link to save it again).
         """
+        if query not in ("", _UNCHANGED_QUERY):
+            return self._refuse(400, "Refused", f"This page takes no query but "
+                                f"{_UNCHANGED_QUERY}.")
         try:
             settings = _current_defaults()
         except LiveDefaultsOutdated as exc:
@@ -3298,42 +3949,7 @@ class _App:
         if settings is None:
             return self._refuse(404, "No live defaults are saved",
                                 "No live defaults are saved yet.")
-        return _Response(200, _saved_html(settings))
-
-    def _no_defaults(self, status: int) -> _Response:
-        """
-        Refuse the trade page because no live defaults are saved.
-
-        Args:
-            status (int): 404 for the page, 409 for a POST.
-
-        Returns:
-            _Response: The refusal, naming how to save defaults.
-        """
-        return self._refuse(
-            status, "No live defaults are saved",
-            "No live defaults are saved, so there is nothing to trade. Save them first: "
-            "the backtest dashboard's Save as live defaults… button, or run "
-            "./start_dashboard.sh --seed in this checkout for the seed values.")
-
-    def _get_trade(self) -> _Response:
-        """
-        Show the trade page for the saved live defaults.
-
-        Returns:
-            _Response: 200 with the page, 404 when none are saved, 409 when
-                the saved file is refused (an outdated one with a link to
-                save it again).
-        """
-        try:
-            current = _current_defaults()
-        except LiveDefaultsOutdated as exc:
-            return self._outdated_file(exc)
-        except LiveDefaultsError as exc:
-            return self._refused_file(exc)
-        if current is None:
-            return self._no_defaults(404)
-        return _Response(200, self._render_trade(current, None))
+        return _Response(200, _saved_html(settings, unchanged=query == _UNCHANGED_QUERY))
 
     def _get_run(self, run_id: str) -> _Response:
         """
@@ -3379,23 +3995,20 @@ class _App:
         except ValueError as exc:
             return self._refuse(400, "Refused", f"The form cannot be read: {exc}")
 
-    def _signed_fields(self, form: dict[str, list[str]], purpose: str,
-                       actions: tuple) -> tuple[str, str, str, bool] | _Response:
+    def _signed_fields(self, form: dict[str, list[str]]) -> tuple[str, str, str, bool] | _Response:
         """
         Take a form's signed fields and action out of it, check them, and check its token.
 
         Pops fingerprint, nonce, token, action and ack_attention, so what is
         left is the proposal. Each of the first three must be given once, as
         64, 32 and 64 hex digits (else 403); the action once, as one of
-        actions (else 400); ack_attention at most once, as "1" (else 400).
-        The trade page carries no proposal, so any other field on its form is
-        400. Then the token must sign this purpose, fingerprint, nonce and
-        the proposal for this server (else 403).
+        _CONFIRM_ACTIONS (else 400); ack_attention at most once, as "1" (else
+        400). Then the token must sign the trading page's purpose
+        (_CONFIRM_PURPOSE), this fingerprint, nonce and proposal for this
+        server (else 403).
 
         Args:
             form (dict[str, list[str]]): The form's fields; changed in place.
-            purpose (str): "confirm" or "trade" (whose form has no proposal).
-            actions (tuple): The actions the page's buttons post.
 
         Returns:
             tuple[str, str, str, bool] | _Response: (fingerprint, nonce,
@@ -3409,16 +4022,13 @@ class _App:
                 and _HEX64.fullmatch(tokens[0])):
             return self._refuse(403, "Refused", "The form does not carry this server's "
                                 "fingerprint, nonce and token.")
-        if len(chosen) != 1 or chosen[0] not in actions:
+        if len(chosen) != 1 or chosen[0] not in _CONFIRM_ACTIONS:
             return self._refuse(400, "Refused", "The form must name one action of "
-                                f"{', '.join(actions)}; it named {chosen!r}.")
+                                f"{', '.join(_CONFIRM_ACTIONS)}; it named {chosen!r}.")
         if acks not in ([], ["1"]):
             return self._refuse(400, "Refused", "The acknowledgement box's value cannot be read.")
-        if purpose == "trade" and form:
-            return self._refuse(400, "Refused", "The trade page's form carries no other "
-                                f"field; this one carried {sorted(form)[0]!r}.")
         fingerprint, nonce, token = fingerprints[0], nonces[0], tokens[0]
-        expected = self._token(purpose, fingerprint, nonce, form)
+        expected = self._token(_CONFIRM_PURPOSE, fingerprint, nonce, form)
         if not hmac.compare_digest(token.encode("ascii"), expected.encode("ascii")):
             return self._refuse(
                 403, "Refused", "This page was issued by another server session or for "
@@ -3451,38 +4061,40 @@ class _App:
 
     def _post_confirm(self, request: _Request) -> _Response:
         """
-        Save, trade or dry-run the proposal a confirmation page posted, after every check.
+        Save, trade or dry-run the proposal a trading page posted, after every check.
 
         In order: the Origin must be this server; the body must be a form;
         its fingerprint, nonce, token and action must be readable and the
-        token must sign exactly these fields for this server's confirmation
-        page; a nonce already used is sent to what it produced; the saved
-        file must be usable (a file an older version saved counts as nothing
-        in force, so a save replaces it); the proposal must be valid (a field
-        it leaves out keeps the saved value, _kept_base); the defaults in
-        force must still be the ones the page was built on (else the page is
-        shown again against them). Then, by action: "save" with nothing to change
-        writes nothing; "trade" and "dry_run" are refused while a run is
+        token must sign exactly these fields for this server's trading page;
+        a nonce already used is sent to what it produced; the saved file must
+        be usable (a file an older version saved counts as nothing in force,
+        so a save replaces it); the proposal must be valid (a field it leaves
+        out keeps the saved value, _kept_base); the defaults in force must
+        still be the ones the page was built on (else the page is shown again
+        against them). Then, for "trade" and "dry_run": refused while a run is
         blocked, "dry_run" while no defaults are saved, and "trade" while the
         last real-money run needs attention and its box is not ticked — every
         one of these before anything is saved. Only then is the nonce marked
-        used: "save", and "trade" with a change, save the proposal (the one
-        write of the saved file); "save" is sent to /saved, and "trade" and
-        "dry_run" start the run with the proposal's settings and are sent to
-        its page.
+        used. The saved file is written (the one write of it) only when the
+        proposal changes something and the action is "save" or "trade": a
+        save or a trade of unchanged settings keeps the file, its save time
+        and source note as they are, and a dry run never writes. "save" is
+        sent to /saved (to /saved?unchanged=1 when it wrote nothing), and
+        "trade" and "dry_run" start the run with the proposal's settings and
+        are sent to its page.
 
         Args:
             request (_Request): The POST.
 
         Returns:
-            _Response: 303 to /saved or /runs/<id>; 200 when there is nothing
-                to save; 400, 403, 409 or 500 when refused or when the save or
-                the start fails.
+            _Response: 303 to /saved, /saved?unchanged=1 or /runs/<id>; 400,
+                403, 409 or 500 when refused or when the save or the start
+                fails.
         """
         form = self._read_form(request)
         if isinstance(form, _Response):
             return form
-        signed = self._signed_fields(form, "confirm", _CONFIRM_ACTIONS)
+        signed = self._signed_fields(form)
         if isinstance(signed, _Response):
             return signed
         posted_fingerprint, nonce, action, acked = signed
@@ -3510,12 +4122,9 @@ class _App:
             return _Response(409, self._render_confirm(current, settings=settings, source=source,
                                                        params=form, banner=_STALE_BANNER,
                                                        outdated=outdated))
-        # Nothing is written when every toggle already has the proposed value
+        # Whether any toggle differs from the defaults in force (with none in
+        # force, every one does)
         changes = any(changed for *_, changed in live_settings_changes(current, settings))
-        if action == "save" and not changes:
-            return _Response(200, _message_html(
-                200, "Nothing to save",
-                "These are already the live defaults, so nothing was written."))
         dry_run = action == "dry_run"
         if action != "save":
             blocker = self._run_blocker(dry_run=dry_run)
@@ -3536,7 +4145,10 @@ class _App:
         use = _NonceUse(None, "the request did not finish")
         self._used_nonces[nonce] = use
         saved = False
-        if action == "save" or (action == "trade" and changes):
+        # Written only when something changes: a save or a trade of unchanged
+        # settings keeps the file (its save time and source note) as it is,
+        # and a dry run never writes
+        if changes and not dry_run:
             try:
                 # The one write of the saved file: config parses the text as a
                 # live run will before writing it, then reads it back
@@ -3554,9 +4166,11 @@ class _App:
             logging.info("Saved live defaults to %s: %s", config.LIVE_DEFAULTS_FILE,
                          _log_safe(describe_live_settings(settings, current or settings)))
         if action == "save":
-            use.path = "/saved"
-            return _Response(303, _message_html(303, "Saved", "The live defaults were saved; "
-                                                "see /saved."), location="/saved")
+            use.path = "/saved" if saved else f"/saved?{_UNCHANGED_QUERY}"
+            title, text = (("Saved", "The live defaults were saved") if saved
+                           else ("Nothing changed", "Nothing changed, so nothing was written"))
+            return _Response(303, _message_html(303, title, f"{text}; see {use.path}."),
+                             location=use.path)
         if saved:
             note = _SAVED_NOTE
         elif dry_run:
@@ -3565,64 +4179,6 @@ class _App:
             note = _NOTHING_SAVED_NOTE
         return self._launch(use, settings=settings, dry_run=dry_run, saved_note=note,
                             saved=saved)
-
-    def _post_trade(self, request: _Request) -> _Response:
-        """
-        Trade or dry-run the saved live defaults the trade page showed, after every check.
-
-        In order: the Origin, the form, exactly the fingerprint, nonce, token
-        and action (plus an optional acknowledgement) and nothing else, the
-        token signed for the trade page, a nonce already used, the saved file
-        usable (never one an older version saved, which is refused with a
-        link to save it again) and something saved, the same defaults still
-        in force (else the page is shown again), then the run's blockers and,
-        for "trade", the attention acknowledgement. Only then is the nonce marked used and the
-        run started with the saved defaults.
-
-        Args:
-            request (_Request): The POST.
-
-        Returns:
-            _Response: 303 to /runs/<id>; 400, 403, 409 or 500 when refused or
-                when the start fails.
-        """
-        form = self._read_form(request)
-        if isinstance(form, _Response):
-            return form
-        signed = self._signed_fields(form, "trade", _TRADE_ACTIONS)
-        if isinstance(signed, _Response):
-            return signed
-        posted_fingerprint, nonce, action, acked = signed
-        used = self._used(nonce)
-        if used is not None:
-            return used
-        try:
-            current = _current_defaults()
-        except LiveDefaultsOutdated as exc:
-            # Nothing runs from a file an older version saved
-            return self._outdated_file(exc)
-        except LiveDefaultsError as exc:
-            return self._refused_file(exc)
-        if current is None:
-            return self._no_defaults(409)
-        if _fingerprint(current) != posted_fingerprint:
-            logging.warning("Refused a trade from a page built on other live defaults; "
-                            "showing it again against the defaults in force")
-            return _Response(409, self._render_trade(current, _STALE_BANNER))
-        dry_run = action == "dry_run"
-        blocker = self._run_blocker(dry_run=dry_run)
-        if blocker is not None:
-            return self._refuse(409, "Not started", f"{blocker.text}. Nothing was traded.")
-        if not dry_run and not acked and self._attention() is not None:
-            logging.warning("Refused Confirm and trade: the last real-money run needs "
-                            "attention and its box was not ticked")
-            return _Response(409, self._render_trade(current, _ACK_BANNER))
-        use = _NonceUse(None, "the request did not finish")
-        self._used_nonces[nonce] = use
-        settings = current
-        return self._launch(use, settings=settings, dry_run=dry_run,
-                            saved_note=f"The saved live defaults ({current.origin}); nothing "
-                            "was saved.", saved=False)
 
     def _launch(self, use: _NonceUse, *, settings: LiveSettings, dry_run: bool,
                 saved_note: str, saved: bool) -> _Response:
@@ -3885,7 +4441,7 @@ class _Handler(BaseHTTPRequestHandler):
         The base class sends no status line or headers to a request it reads
         as HTTP/0.9 (a request line with no version, or one it could not
         read); every answer here is sent as this server's HTTP/1.0 instead, so
-        each carries the six headers. A HEAD answer has no body.
+        each carries the five headers. A HEAD answer has no body.
 
         Args:
             response (_Response): The response.
@@ -3912,7 +4468,7 @@ class _Handler(BaseHTTPRequestHandler):
         The base class calls this for a method with no do_ method here (501),
         a malformed or over-long request line (400, 414), headers it cannot
         read (400, 431) and an HTTP version it does not speak (505). The answer
-        is this server's refusal page, sent through _send with the same six
+        is this server's refusal page, sent through _send with the same five
         headers as every other, and the connection is then closed.
 
         Args:
@@ -4090,11 +4646,9 @@ def _start_page(base: str, *, seed: bool) -> tuple[str, int, str]:
     """
     Choose the page a start opens, and what it logs about that page.
 
-    With seed, the confirmation page proposing LIVE_DEFAULTS_SEED. Otherwise
-    the backtest dashboard when it exists and has the Save and Trade buttons,
-    and this server's index when there is no dashboard, when it was built
-    before those buttons (a WARNING, naming the rebuild and the trade page)
-    or when it cannot be read (a WARNING with the reason).
+    With seed, the trading page proposing LIVE_DEFAULTS_SEED. Otherwise the
+    trading page with no address fields, which proposes the live defaults in
+    force (_home_query).
 
     Args:
         base (str): The server's address, "http://host:port".
@@ -4107,24 +4661,9 @@ def _start_page(base: str, *, seed: bool) -> tuple[str, int, str]:
     if seed:
         url = f"{base}/confirm?{_seed_query()}"
         return url, logging.INFO, f"Seed values: open {url} to review and confirm them"
-    index = f"{base}/"
-    dashboard = config.PROJECT_ROOT / DASHBOARD_FILENAME
-    state, why = _dashboard_state(dashboard)
-    if state == _DASHBOARD_READY:
-        return (dashboard.as_uri(), logging.INFO,
-                f"Open {dashboard} and use its filter bar's Save as live defaults… or Trade "
-                "using defaults… button")
-    if state == _DASHBOARD_MISSING:
-        return (index, logging.INFO,
-                f"No backtest dashboard at {dashboard}: run python3 -m kalshi_betting.backtest "
-                f"to build one, or start from the seed values with --seed; opening {index}")
-    if state == _DASHBOARD_OLD:
-        return (index, logging.WARNING,
-                "This dashboard was built before the Save/Trade buttons: rebuild it with "
-                "python3 -m kalshi_betting.backtest and the --start-date you built it from; "
-                f"until then use {base}/trade (opening {index})")
-    return (index, logging.WARNING,
-            f"The backtest dashboard at {dashboard} could not be read ({why}); opening {index}")
+    url = f"{base}/confirm"
+    return (url, logging.INFO,
+            f"Trading page: open {url} to review the live defaults and trade from them")
 
 
 def _open_start_page(base: str, *, seed: bool, no_browser: bool) -> None:
@@ -4154,8 +4693,8 @@ def _reuse_running_server(parser: argparse.ArgumentParser, base: str, *, seed: b
     listener answers GET /checkout with this checkout's resolved root and
     the fingerprint of this checkout's code now (_code_fingerprint), it
     logs that this checkout's server is already running and opens the page
-    this start asked for (the seed page with seed; else the dashboard, or the
-    server's index), unless no_browser. When the listener names another
+    this start asked for (the seed page with seed; else the trading page),
+    unless no_browser. When the listener names another
     checkout, names this one with other code (a server left running across
     a code change, whose pages would check and start runs with that older
     code) or gives no such answer, the start is refused.
@@ -4207,11 +4746,9 @@ def main(argv: list[str] | None = None) -> None:
     server, it exits 2 before anything is logged. Otherwise it logs where it
     saves and the live defaults in force. Its _App is built with
     subprocess.Popen as its process starter, the one place that is given, so
-    its pages can start runs. With --seed it opens the confirmation page
-    proposing LIVE_DEFAULTS_SEED; otherwise it opens the backtest dashboard,
-    or its own index when there is no dashboard, the dashboard was built
-    before its Save and Trade buttons, or it cannot be read. --no-browser
-    only logs the address. When it stops, each run it started that is still
+    its pages can start runs. With --seed it opens the trading page
+    proposing LIVE_DEFAULTS_SEED; otherwise it opens the trading page on the
+    live defaults in force. --no-browser only logs the address. When it stops, each run it started that is still
     going gets a WARNING: the run keeps going on its own.
 
     Args:
@@ -4236,7 +4773,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--seed", action="store_true",
-        help="Open the confirmation page proposing the seed values "
+        help="Open the trading page proposing the seed values "
              "(config.LIVE_DEFAULTS_SEED) for a first save",
     )
     parser.add_argument(
@@ -4262,7 +4799,7 @@ def main(argv: list[str] | None = None) -> None:
     server.defaults_app = app
     _setup_logging(config.PROJECT_ROOT / _LOG_NAME)
     logging.info("Defaults server at %s/ — it saves the live defaults to %s and trades them "
-                 "at %s/trade. Ctrl-C stops it; stop it when you are done.", base,
+                 "at %s/confirm. Ctrl-C stops it; stop it when you are done.", base,
                  config.LIVE_DEFAULTS_FILE, base)
     try:
         settings = _current_defaults()

@@ -7,7 +7,7 @@ subtracts (the TestRiskFree* classes and TestCapitalDeployedParity), and the
 filter bar's "Save as live defaults…" button (TestSaveLiveDefaultsButton), whose
 clicked address is read back through defaults_server's own request handler and
 proposal parser, and its "Trade using defaults…" link (TestTradeUsingDefaultsLink),
-whose id defaults_server's own scan must find near the top of the page.
+whose id sits near the top of the page.
 
 generate_dashboard() pulls in yfinance (network) and Plotly's full HTML
 serialization; the escaping and drawdown fixes are exercised directly against
@@ -9228,10 +9228,11 @@ _TRADE_URL = f"http://{config.DEFAULTS_SERVER_HOST}:{config.DEFAULTS_SERVER_PORT
 
 class TestTradeUsingDefaultsLink:
     """The filter bar's "Trade using defaults…" link: a plain link to the
-    defaults server's trade page, opened in a new tab, that needs no script;
-    it stays on a page whose filter bar could not be built; and its id is
-    what the defaults server looks for, early enough in the page for the
-    server's scan to find it."""
+    defaults server's /trade address (which sends the browser on to its
+    trading page), opened in a new tab, that needs no script; it stays on a
+    page whose filter bar could not be built; and its id sits once in the
+    page's opening part, within config.DASHBOARD_MARKER_SCAN_BYTES of the
+    start."""
 
     @staticmethod
     def _link(page: str) -> tuple[dict, str]:
@@ -9316,8 +9317,7 @@ class TestTradeUsingDefaultsLink:
             "bot with them when you confirm there (real orders, or a dry run).")
 
     @pytest.mark.parametrize("bar", [True, False], ids=["bar", "no-bar"])
-    def test_the_defaults_server_finds_the_buttons_early_in_the_page(
-            self, monkeypatch, tmp_path, bar):
+    def test_the_trade_link_sits_early_in_the_page(self, monkeypatch, tmp_path, bar):
         if not bar:
             def broken(*_a, **_k):
                 """
@@ -9335,15 +9335,14 @@ class TestTradeUsingDefaultsLink:
         TestSaveLiveDefaultsButton._page(monkeypatch, tmp_path)
         path = tmp_path / config.DASHBOARD_FILENAME
         data = path.read_bytes()
-        marker = defaults_server._DASHBOARD_MARKER
-        # In the page's opening part, before the first section (and so before
-        # every data block), well inside what the server reads
+        # The Trade link's id, once, in the page's opening part: before the
+        # first section (and so before every data block), within
+        # config.DASHBOARD_MARKER_SCAN_BYTES of the start
+        marker = b'id="flt-trade"'
         first_section = dashboard._SECTION_STYLE.format(title="Portfolio Performance")
         assert data.count(marker) == 1
         assert data.index(marker) < data.index(first_section.encode("utf-8"))
         assert data.index(marker) + len(marker) <= config.DASHBOARD_MARKER_SCAN_BYTES
-        assert defaults_server._dashboard_state(path) == (defaults_server._DASHBOARD_READY,
-                                                          None)
 
 
 def _kpi_trades(snap: dict) -> list[tuple[str, str]]:
