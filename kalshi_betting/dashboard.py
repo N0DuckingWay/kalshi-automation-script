@@ -693,6 +693,7 @@ from .config import (
     describe_time_series_rule,
     fee_per_pair_approx,
     filter_name_refusal,
+    live_setting_text,
     split_tag,
     time_series_mid_spread,
     time_series_profit_prob,
@@ -7678,10 +7679,14 @@ _SYNC_BLOCKED_TEXT = {
 # limit, or selling, where the run simulated none), a category or tag its
 # menus do not list ("sync_unlisted"), or a sell level beside rebalancing,
 # which the bar never shows together ("sync_not_with"). {field} is the
-# setting's name on the bar ("sync_fields") and {value} its value as the
-# Trading tab's query spells it (dollars for a minimum price movement, a
-# share for a sell level, days for "Rebalance until" and Min. days to
-# maturity). A choice on the bar changes on the Trading tab only the
+# setting's name on the bar ("sync_fields") and {value} its value in the
+# words of the table on the Trading tab (config.live_setting_text): a size
+# cap as a percentage ("sync_percent", "sync_cap_full" for no cap), a
+# minimum price movement in cents ("sync_cents"), a "Rebalance until" limit
+# as days before maturity ("sync_until_one", "sync_until_many"), a sell
+# level as its share of the potential profit ("sync_sell_value"); k, the
+# band and Min. days to maturity as the query spells them, which are the
+# table's words too. A choice on the bar changes on the Trading tab only the
 # settings the reader chose, so it keeps these. "sync_unshown" goes first
 # when the proposal could not be drawn (a chunk file that cannot be
 # loaded): the bar still shows the scenario before it, and the reader's
@@ -7700,12 +7705,16 @@ _SYNC_APPLY_TEXT = {
     "sync_not_with": "{field} {value} (not shown together with Rebalance yes)",
     "sync_fields": {"band": "Spread band", "tier": "Tier floors", "k": "k",
                     "cap": "Size cap", "rebalance": "Rebalance",
-                    "move": "Min. price movement (dollars)",
-                    "until": "Rebalance until (days before maturity)",
-                    "sell": "Sell (share of the potential profit)",
-                    "days": "Min. days to maturity", "category": _MENU_CAT_LABEL,
-                    "tag": _MENU_TAG_LABEL},
+                    "move": "Min. price movement", "until": "Rebalance until",
+                    "sell": "Sell", "days": "Min. days to maturity",
+                    "category": _MENU_CAT_LABEL, "tag": _MENU_TAG_LABEL},
     "sync_band_value": "{low}-{high}",
+    "sync_percent": "{n}%",
+    "sync_cap_full": live_setting_text("size_cap", 1.0),
+    "sync_cents": "{n}c",
+    "sync_until_one": live_setting_text("rebalance_min_days_to_maturity", 1),
+    "sync_until_many": "{n} days before maturity",
+    "sync_sell_value": "{n}% of potential profit",
     "sync_on": _REBALANCE_OPTION_YES,
     "sync_off": "off",
     "sync_any": "any",
@@ -16508,6 +16517,24 @@ _FILTER_JS = r"""
   }
   // A number as the query writes it (Python's repr of the float, or a whole
   // number of days), or null for anything else
+  // A setting's value from the Trading tab's query in the words of the
+  // table on the Trading tab (config.live_setting_text): a share or a dollar
+  // amount in hundredths (0.1 as 10: a 10% size cap, a 10c minimum price
+  // movement; 0.85 as 85: an 85% sell level), a size cap of 1 as no cap, and
+  // a "Rebalance until" limit as days before maturity; a value that is not a
+  // number goes as the query spells it
+  function hundredths(text) {
+    var x = queryNumber(text);
+    return x === null ? text : String(Math.round(x * 10000) / 100);
+  }
+  function capText(text) {
+    var x = queryNumber(text);
+    return x !== null && x >= 1 ? D.text.sync_cap_full
+                                : fill(D.text.sync_percent, {n: hundredths(text)});
+  }
+  function untilText(text) {
+    return text === '1' ? D.text.sync_until_one : fill(D.text.sync_until_many, {n: text});
+  }
   function queryNumber(text) {
     if (typeof text !== 'string' || !/^-?[0-9.]+(e[-+]?[0-9]+)?$/i.test(text)) { return null; }
     var x = Number(text);
@@ -16579,7 +16606,7 @@ _FILTER_JS = r"""
     var cap = one('size_cap');
     if (cap !== null) {
       var ci = placeOf(D.caps, queryNumber(cap));
-      if (ci >= 0) { w.c = ci; } else { miss(T.sync_off_grid, 'cap', cap); }
+      if (ci >= 0) { w.c = ci; } else { miss(T.sync_off_grid, 'cap', capText(cap)); }
     }
     // Rebalance with its minimum price movement and "Rebalance until" days,
     // each shown only on a page with its view; with Rebalance no both are
@@ -16591,21 +16618,27 @@ _FILTER_JS = r"""
       w.r = 'no';
     } else if (rebalance === 'on' && !D.grid_rebalance) {
       miss(T.sync_no_view, 'rebalance', T.sync_on);
-      if (moving) { miss(T.sync_no_view, 'move', move); }
-      if (limited) { miss(T.sync_no_view, 'until', until); }
+      if (moving) { miss(T.sync_no_view, 'move', fill(T.sync_cents, {n: hundredths(move)})); }
+      if (limited) { miss(T.sync_no_view, 'until', untilText(until)); }
     } else if (rebalance === 'on') {
       w.r = 'yes';
       if (!moving) { w.m = '0'; }
       else {
         var mi = D.grid_move ? placeOf(D.moves, queryNumber(move)) : -1;
         if (mi >= 0) { w.m = String(mi + 1); }
-        else { miss(D.grid_move ? T.sync_off_grid : T.sync_no_view, 'move', move); }
+        else {
+          miss(D.grid_move ? T.sync_off_grid : T.sync_no_view, 'move',
+               fill(T.sync_cents, {n: hundredths(move)}));
+        }
       }
       if (!limited) { w.u = '0'; }
       else {
         var ui = D.grid_maturity ? placeOf(D.maturity, queryNumber(until)) : -1;
         if (ui >= 0) { w.u = String(ui + 1); }
-        else { miss(D.grid_maturity ? T.sync_off_grid : T.sync_no_view, 'until', until); }
+        else {
+          miss(D.grid_maturity ? T.sync_off_grid : T.sync_no_view, 'until',
+               untilText(until));
+        }
       }
     }
     // Sell with its minimum of days, shown only on a page with the Sell view
@@ -16625,7 +16658,7 @@ _FILTER_JS = r"""
       if (why !== null) {
         // Named with its minimum of days, unless only the level is off the
         // page's choices
-        miss(why, 'sell', sell);
+        miss(why, 'sell', fill(T.sync_sell_value, {n: hundredths(sell)}));
         if (dated && why !== T.sync_off_grid) { miss(why, 'days', days); }
       } else if (!dated) {
         // No minimum of days is not among the page's choices (it starts at 1)

@@ -6628,7 +6628,9 @@ class TestFilterSummary:
                          "D.text.sync_join", "T.sync_off_grid", "T.sync_no_view",
                          "T.sync_unlisted", "T.sync_not_with", "T.sync_fields",
                          "T.sync_band_value", "T.sync_on", "T.sync_off", "T.sync_any",
-                         "T.none_kept",
+                         "D.text.sync_percent", "D.text.sync_cap_full", "T.sync_cents",
+                         "D.text.sync_until_one", "D.text.sync_until_many",
+                         "T.sync_sell_value", "T.none_kept",
                          "T.mix_note", "D.text.mix_unavailable", "D.text.mix_still_all",
                          "D.text.mix_still", "D.text.mix_still_at", "T.names_join",
                          "T.names_more", "T.sel_none", "T.sel_only", "T.sel_excluded",
@@ -9424,9 +9426,10 @@ class TestTradingSync:
             item("sync_no_view", "tier", text["sync_off"]),
             item("sync_off_grid", "k", "0.85"),
             item("sync_no_view", "rebalance", text["sync_on"]),
-            item("sync_no_view", "move", "0.1"),
-            item("sync_no_view", "until", "7"),
-            item("sync_no_view", "sell", "0.9"),
+            item("sync_no_view", "move", config.live_setting_text("min_price_move", 0.1)),
+            item("sync_no_view", "until",
+                 config.live_setting_text("rebalance_min_days_to_maturity", 7)),
+            item("sync_no_view", "sell", config.live_setting_text("sell_at", 0.9)),
             item("sync_no_view", "days", "5"),
             item("sync_unlisted", "category", "Weather"),
             item("sync_unlisted", "tag", "Sports · Curling")]))
@@ -9452,14 +9455,54 @@ class TestTradingSync:
             items = [item("sync_no_view", "tier", text["sync_off"]),
                      *([] if shown_k else [item("sync_off_grid", "k", "0.85")]),
                      item("sync_no_view", "rebalance", text["sync_on"]),
-                     item("sync_no_view", "move", "0.1"),
-                     item("sync_no_view", "until", "7"),
-                     item("sync_no_view", "sell", "0.9"),
+                     item("sync_no_view", "move", config.live_setting_text("min_price_move", 0.1)),
+                     item("sync_no_view", "until",
+                 config.live_setting_text("rebalance_min_days_to_maturity", 7)),
+                     item("sync_no_view", "sell", config.live_setting_text("sell_at", 0.9)),
                      item("sync_no_view", "days", "5"),
                      item("sync_unlisted", "category", "Weather"),
                      item("sync_unlisted", "tag", "Sports · Curling")]
             assert _note(snaps[name]) == text["sync_not_here"].format(
                 items=text["sync_join"].join(items)), name
+
+    def test_the_note_words_each_value_as_the_trading_tab_s_table(self, monkeypatch, tmp_path):
+        # Each value the bar cannot show is named in the words of the table on
+        # the Trading tab (config.live_setting_text): a size cap as a
+        # percentage, a minimum price movement in cents, a days limit as days
+        # before maturity and a sell level as its share of the potential
+        # profit. The page's caps here include 100%, so "no cap" is pinned
+        # through its template
+        page = self._kc(monkeypatch, tmp_path, _kc_sweep_move())
+        data = TestFilterPage._data(page)
+        assert data["grid_move"] and not data.get("grid_maturity")
+        assert data["sell_blocks"] is None
+        text, fields = data["text"], data["text"]["sync_fields"]
+        assert text["sync_cap_full"] == config.live_setting_text("size_cap", 1.0)
+        assert text["sync_until_one"] == config.live_setting_text(
+            "rebalance_min_days_to_maturity", 1)
+        caps = [entry["value"] for entry in data["caps"]]
+        moves = [entry["value"] for entry in data["moves"]]
+        for cap, move, until in ((0.15, 0.15, 1), (0.35, 0.35, 7)):
+            assert cap not in caps and move not in moves
+            proposal = _proposed(tier_floors=True, spread_band=tuple(data["bands"][0]["value"]),
+                                 interval_discount=data["ks"][0]["value"], size_cap=cap,
+                                 rebalance=True, min_price_move=move,
+                                 rebalance_min_days_to_maturity=until, sell_at=0.85)
+            snap = _run_script(tmp_path, page, [
+                ["wait"], *_apply(defaults_server._settings_query(proposal)), ["snap", "s"]],
+                strict=True, framed=True)["s"]
+            items = [
+                text["sync_off_grid"].format(
+                    field=fields["cap"], value=config.live_setting_text("size_cap", cap)),
+                text["sync_off_grid"].format(
+                    field=fields["move"], value=config.live_setting_text("min_price_move", move)),
+                text["sync_no_view"].format(
+                    field=fields["until"],
+                    value=config.live_setting_text("rebalance_min_days_to_maturity", until)),
+                text["sync_not_with"].format(
+                    field=fields["sell"], value=config.live_setting_text("sell_at", 0.85))]
+            assert _note(snap) == text["sync_not_here"].format(
+                items=text["sync_join"].join(items)), cap
 
     def test_rebalancing_with_a_sell_level_shows_the_rebalancing(self, monkeypatch, tmp_path):
         # The bar never shows a sell level beside rebalancing: it shows
@@ -9486,7 +9529,8 @@ class TestTradingSync:
         assert snap["selects"]["flt-rebalance"]["value"] == "yes"
         assert snap["selects"]["flt-sell"]["value"] == "none"
         assert _note(snap) == text["sync_not_here"].format(items=text["sync_join"].join([
-            text["sync_not_with"].format(field=fields["sell"], value=repr(level)),
+            text["sync_not_with"].format(field=fields["sell"],
+                                         value=config.live_setting_text("sell_at", level)),
             text["sync_not_with"].format(field=fields["days"], value="3")]))
         snap = snaps["alone"]
         assert snap["selects"]["flt-rebalance"]["value"] == "no"
@@ -9495,7 +9539,8 @@ class TestTradingSync:
             items=text["sync_off_grid"].format(field=fields["days"], value=text["sync_any"]))
         snap = snaps["off grid"]
         assert _note(snap) == text["sync_not_here"].format(
-            items=text["sync_off_grid"].format(field=fields["sell"], value="0.9"))
+            items=text["sync_off_grid"].format(
+                field=fields["sell"], value=config.live_setting_text("sell_at", 0.9)))
         for name in ("both", "alone", "off grid"):
             assert snaps[name]["posted"] == [], name
 
@@ -9538,7 +9583,8 @@ class TestTradingSync:
             assert read == dataclasses.replace(proposal, rebalance=False, min_price_move=None)
             if shown == "none":
                 assert _note(off) == text["sync_not_here"].format(
-                    items=text["sync_off_grid"].format(field=fields["sell"], value="0.9"))
+                    items=text["sync_off_grid"].format(
+                field=fields["sell"], value=config.live_setting_text("sell_at", 0.9)))
             else:
                 assert off["selects"]["flt-days"]["value"] == TestSellScript._di(3)
                 assert _note(off) == ""
