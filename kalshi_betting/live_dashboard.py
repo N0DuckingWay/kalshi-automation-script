@@ -4,7 +4,9 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Serves the dashboard's three tabs on this computer. 127.0.0.1:8766
+    Serves the dashboard on this computer: one tab page with the Live
+    trading, Backtest, Trading and Data tabs, and a Run tab that appears
+    after the first run started from the Trading tab. 127.0.0.1:8766
     (config.LIVE_DASHBOARD_PORT) serves the tab page and the Live trading
     tab's data: GET /api/live reads the account from Kalshi through
     live_portfolio on every load and answers everything the tab shows, as
@@ -15,7 +17,15 @@ Purpose:
     tabs each load their page in a frame the first time the tab is chosen,
     and a frame whose tab stays hidden for
     config.LIVE_DASHBOARD_FRAME_UNLOAD_SECONDS is emptied, so the browser
-    frees the page, and loads again when its tab is chosen. Run it with
+    frees the page, and loads again when its tab is chosen. The Trading and
+    Run tabs show pages of the live-defaults server (defaults_server.py, on
+    config.DEFAULTS_SERVER_HOST:DEFAULTS_SERVER_PORT, 127.0.0.1:8765, which
+    ./start_dashboard.sh starts beside this one), each in a frame: the
+    Trading tab its trading page (/confirm, where the live defaults are
+    saved and live runs are started), loaded as soon as the tab page opens,
+    so it shows the live defaults in force; the Run tab the page of the
+    latest run started there (/runs/<id>). This server serves neither page
+    and never empties either frame. Run it with
 
         python3 -m kalshi_betting.live_dashboard [--no-browser]
 
@@ -32,7 +42,10 @@ Dependencies:
     build and its hash, PROJECT_ROOT, DASHBOARD_FILENAME,
     DASHBOARD_FILES_DIRNAME, EDA_DASHBOARD_FILENAME, LIVE_DASHBOARD_PERIODS,
     LIVE_DASHBOARD_FRAME_UNLOAD_SECONDS, LIVE_CANDLE_DAY_ZONE,
-    RISK_FREE_BILL_TERM, count_text); live_portfolio (build_live_view,
+    RISK_FREE_BILL_TERM, count_text, and DEFAULTS_SERVER_HOST,
+    DEFAULTS_SERVER_PORT and TRADING_QUERY_MAX_BYTES: where the live-defaults
+    server's pages are, and the longest proposal its trading page's address
+    may carry); live_portfolio (build_live_view,
     append_snapshot, trade_log_paths, OTHER_BETS and the view's types);
     historical (build_prod_live_client, the production client, built on the
     first read; load_series_categories, the categories the bot's purchases
@@ -41,7 +54,8 @@ Dependencies:
     _http (api_error_summary, the one-line description of a failed read).
     Nothing imports this module: a person runs it, or start_dashboard.sh
     starts it as a process of its own. It does not import eda: it only
-    serves the file eda writes.
+    serves the file eda writes. Nor does it import defaults_server: it only
+    points two frames at that server's addresses.
 
 Notes:
     Read-only: it sends Kalshi read-only requests only (through
@@ -57,8 +71,64 @@ Notes:
     different web origin, so their scripts (and the chart library they load
     from the web) cannot read the account data; each may be framed only by
     the tab page, in a sandboxed frame that cannot navigate the tab page,
-    and no other web site may load them or the chunk files except by
-    navigating to them.
+    open a window or send a form, and no other web site may load them or
+    the chunk files except by navigating to them.
+
+    The Trading and Run frames hold the live-defaults server's own pages,
+    on that server's own origin: the tab page cannot read them or press
+    their buttons, and every save and every run still goes through that
+    server's own form, with every check it makes. Each sits in a sandboxed
+    frame that cannot navigate the tab page or open a window; the trading
+    page's frame may send its own form (and keeps its origin, which that
+    server requires of a form it is sent). The page's frame-src lets any of
+    its frames load that server's pages, so the backtest page could point
+    its own frame at the trading page; its buttons do nothing there, since
+    the Backtest and Data frames may send no form, and neither may ever be
+    allowed to. Those pages tell the tab page what they show through the
+    browser's postMessage: the trading page the proposal it shows, as the
+    query that server builds for it, and a run page its run's id. The tab
+    page takes a message only when both its origin and the window it came
+    from are those of the frame it expects, and the only addresses it
+    builds from one are the trading page's address with a checked query
+    (made only of the characters a URL-encoded query uses, and short
+    enough, as the browser sends it, for both of that server's limits on a
+    request) and a run page's address with a run id of 16 hexadecimal
+    digits. It points the Trading or Run frame at an address by putting a
+    fresh copy of the frame, with that address, in its place: its loads
+    add no step to the browser's Back history, and the page a copy replaced
+    is no longer heard.
+
+    A run reported by the page in the Trading frame (a run's page first
+    opens there, after Dry run or Confirm and trade) is shown in the Run
+    tab, which is chosen when the Trading tab is the one shown, and the
+    Trading frame goes back to the trading page for the same proposal. The
+    proposal is passed on to the backtest page's frame, once that is open,
+    so its bar can show it too, except the trading page's answer to a choice
+    made on that bar while the Backtest tab is shown: the bar shows that
+    choice already, or one the reader has made since. A choice on the
+    backtest page's bar is taken only while the Backtest tab is the one
+    shown and no press of the trading page's buttons is on its way (see
+    below); one that arrives after the reader has left that tab, or during
+    such a press, is not, and the backtest page is told the Trading tab's
+    proposal again, so its bar goes back to what the Trading tab shows.
+    Each proposal sent to the backtest page carries the number of the last
+    choice its bar told (the bar numbers them), so the bar can set aside a
+    proposal sent before its latest choice arrived here. The trading page's
+    buttons stay off until the page has been visible for
+    config.DEFAULTS_SERVER_CONFIRM_ARM_MS (one second) and the mouse moves
+    or a key is pressed (the arming delay, the defaults server's guard
+    against a click aimed elsewhere), and a browser counts a page in a
+    hidden frame as visible. So each time the reader comes to the Trading
+    tab from another, the trading page is loaded again in a fresh frame, for
+    the proposal last reported: its buttons are drawn off and its arming
+    delay runs while the reader can see it. While the reader is on the
+    Trading tab, the tab page loads nothing into its frame but what the
+    Reload button asks for (the tab's own button clicked again loads
+    nothing, so it never cuts off a press of Dry run or Confirm and trade on
+    its way to the server). Nor does coming back to the Trading tab, or a
+    choice on the backtest page's bar, while such a press is on its way: the
+    trading page says so when its form is sent (it can then be clicked no
+    more), and the next page its frame loads, the answer, ends the wait.
 
     Every number and sentence the page shows is formatted here (payload);
     the page's script only places them. One read of the account runs at a
@@ -1180,6 +1250,22 @@ BACKTEST_URL = f"{_BACKTEST_ORIGIN}/backtest/"
 # The Data tab's page, on the backtest page's port (the same origin and rules)
 DATA_URL = f"{_BACKTEST_ORIGIN}/eda/"
 
+# The live-defaults server's pages, which the Trading tab (its trading page)
+# and the Run tab (the latest run's page) show in frames. They are on that
+# server's own origin, so nothing on the tab page can read them or press
+# their buttons: the tab page only points the two frames at addresses. The
+# Run tab's address is RUN_URL followed by the run's id
+_DEFAULTS_ORIGIN = f"http://{config.DEFAULTS_SERVER_HOST}:{config.DEFAULTS_SERVER_PORT}"
+TRADING_URL = f"{_DEFAULTS_ORIGIN}/confirm"
+RUN_URL = f"{_DEFAULTS_ORIGIN}/runs/"
+# The longest proposal (the query after "?") the tab page puts on the trading
+# page's address, counted as the browser sends it (the page's script counts
+# each apostrophe as three characters, since the browser writes it as %27):
+# config's one limit, which fits both of that server's limits on a request and
+# which the backtest page's bar keeps to as well, so the bar never sends a
+# choice this page would refuse
+_TRADING_QUERY_MAX = config.TRADING_QUERY_MAX_BYTES
+
 # Every answer on the tab page's port that is not the page itself: never
 # stored, never sniffed, never framed, never loaded by another origin's page,
 # and allowed to load nothing
@@ -1605,6 +1691,9 @@ _SCRIPT_TEMPLATE = """
   var CHART_CONFIG = __CHART_CONFIG__;
   var DATA = null;
   var CHOSEN = 0;
+  // The tabs in page order, and the one shown
+  var TABS = ['live', 'backtest', 'trading', 'data', 'run'];
+  var SHOWN = 'live';
   var FRAMES = {backtest: ['backtest-frame', BACKTEST_URL], data: ['data-frame', DATA_URL]};
   var OPENED = {};
   // A frame whose tab stays hidden for UNLOAD_MS is emptied: a copy of it
@@ -1612,10 +1701,36 @@ _SCRIPT_TEMPLATE = """
   // one held, and choosing its tab loads the page into the copy. Swapping
   // the frame, rather than pointing it at another address, adds no step to
   // the Back history of the browser, so Back never blanks a tab or reloads a
-  // hidden page. HIDING holds the timer of each frame now hidden.
+  // hidden page. HIDING holds the timer of each frame now hidden. Only the
+  // Backtest and Data frames are emptied this way.
   var UNLOAD_MS = __UNLOAD_MS__;
   var HIDING = {};
   var LOADING = false;
+  // The Trading and Run frames show pages of the live-defaults server, which
+  // tell this page what they show. QUERY is the proposal the trading page
+  // last reported (as the query that server builds for it), which the bar of
+  // the backtest page is told too; RUN is the id of the run the Run tab
+  // shows. A message is taken only from the frame and the origin expected,
+  // and only a query made of characters a URL-encoded query holds, at most
+  // MAX_QUERY of them as the browser sends it, or a run id of 16 hexadecimal
+  // digits, is ever put on an address. FROM_BAR says the trading page now
+  // loading was asked for by a choice on the backtest bar and has not
+  // reported yet. SENDING says the trading page has sent its form
+  // (kalshi-sending) and the next page of its frame, the answer, has not
+  // loaded yet. TOLD is the number of the last choice the backtest bar told
+  // (the seq of kalshi-bar; 0 before any), sent back with each proposal
+  var DEFAULTS_ORIGIN = __DEFAULTS_ORIGIN__;
+  var BACKTEST_ORIGIN = __BACKTEST_ORIGIN__;
+  var TRADING_URL = __TRADING_URL__;
+  var RUN_URL = __RUN_URL__;
+  var MAX_QUERY = __MAX_QUERY__;
+  var QUERY_TEXT = /^[A-Za-z0-9_.!~*\\x27()%&=+-]*$/;
+  var RUN_ID = /^[0-9a-f]{16}$/;
+  var QUERY = null;
+  var RUN = null;
+  var FROM_BAR = false;
+  var SENDING = false;
+  var TOLD = 0;
 
   function byId(id) { return document.getElementById(id); }
   function charts() { return typeof Plotly === 'undefined' ? null : Plotly; }
@@ -1745,10 +1860,21 @@ _SCRIPT_TEMPLATE = """
   }
 
   function tab(name) {
-    ['live', 'backtest', 'data'].forEach(function (t) {
+    var before = SHOWN;
+    SHOWN = name;
+    TABS.forEach(function (t) {
       byId('tab-' + t).setAttribute('aria-selected', t === name ? 'true' : 'false');
       byId('panel-' + t).hidden = t !== name;
     });
+    // The trading page is loaded again, in a fresh frame, every time the
+    // reader comes to its tab: its buttons arm once it has been visible for
+    // a second, and a browser counts a page in a hidden frame as visible, so
+    // a page that armed out of sight is never the one the reader clicks.
+    // Its tab clicked while it is shown loads nothing, and nor does coming
+    // back while a press of one of its buttons is on its way (SENDING: that
+    // page can be clicked no more), so the press (whose answer opens the
+    // page of the run) is never cut off
+    if (name === 'trading' && before !== 'trading' && !SENDING) { loadTrading(false); }
     Object.keys(FRAMES).forEach(function (t) {
       if (t === name) {
         // Back before the delay: the frame stays as it was left
@@ -1778,15 +1904,147 @@ _SCRIPT_TEMPLATE = """
     }
   }
 
-  byId('tab-live').addEventListener('click', function () { tab('live'); });
-  byId('tab-backtest').addEventListener('click', function () { tab('backtest'); });
-  byId('tab-data').addEventListener('click', function () { tab('data'); });
+  // The window of the page a frame holds now, or null
+  function frameWindow(id) {
+    var frame = byId(id);
+    return frame && frame.contentWindow ? frame.contentWindow : null;
+  }
+
+  // Whether a message came from the page in this frame, at the origin that
+  // page must have: the browser sets both, so no other page can claim them
+  function sentBy(e, id, origin) {
+    var w = frameWindow(id);
+    return w !== null && e.source === w && e.origin === origin;
+  }
+
+  // A query the trading page address may carry: only characters a
+  // URL-encoded query holds, and at most MAX_QUERY of them as the browser
+  // sends it, which writes each apostrophe as %27, three characters
+  function goodQuery(q) {
+    return typeof q === 'string' && QUERY_TEXT.test(q)
+      && q.length + 2 * (q.length - q.replace(/\\x27/g, '').length) <= MAX_QUERY;
+  }
+
+  // The number of a choice as the backtest bar counts them: a whole number, 0 or more
+  function goodSeq(n) {
+    return typeof n === 'number' && isFinite(n) && n >= 0 && Math.floor(n) === n;
+  }
+
+  // The trading page for the proposal last reported, or as it opens on its
+  // own (on the live defaults in force) before any was
+  function tradingPage() { return TRADING_URL + (QUERY === null ? '' : '?' + QUERY); }
+
+  // Point a frame at an address by putting a fresh copy of it, with that
+  // address, in its place, as the unload timer empties one: the load adds no
+  // step to the Back history of the browser, and a message the page it held
+  // sends later comes from a window no frame holds, so it is ignored
+  function point(id, url) {
+    var old = byId(id);
+    var fresh = old.cloneNode(false);
+    if (id === 'trading-frame') { watchTrading(fresh); }
+    fresh.src = url;
+    old.parentNode.replaceChild(fresh, old);
+  }
+
+  // The next page the Trading frame loads ends the wait of a press (SENDING):
+  // the answer to the form the trading page sent, whatever it is
+  function watchTrading(frame) {
+    frame.addEventListener('load', function () {
+      if (byId('trading-frame') === frame) { SENDING = false; }
+    });
+  }
+
+  // Load the trading page for the proposal kept, with fresh buttons, noting
+  // whether a choice on the backtest bar (fromBar) asked for it
+  function loadTrading(fromBar) {
+    point('trading-frame', tradingPage());
+    FROM_BAR = fromBar;
+    SENDING = false;
+  }
+
+  // Tell the backtest page the proposal, with the number of the last choice
+  // its bar told (TOLD), so its bar shows it too; only once its frame is
+  // open, and only to the backtest origin
+  function toBacktest() {
+    var w = OPENED.backtest ? frameWindow('backtest-frame') : null;
+    if (w && QUERY !== null) {
+      w.postMessage({type: 'kalshi-apply', query: QUERY, seq: TOLD}, BACKTEST_ORIGIN);
+    }
+  }
+
+  window.addEventListener('message', function (e) {
+    var m = e.data;
+    if (!m || typeof m !== 'object') { return; }
+    if (sentBy(e, 'trading-frame', DEFAULTS_ORIGIN)) {
+      if (m.type === 'kalshi-sending') {
+        // A press of one of its buttons is on its way: the frame is kept
+        // until the answer loads
+        SENDING = true;
+      } else if (m.type === 'kalshi-trading' && goodQuery(m.query)) {
+        // A page the frame has loaded since any press
+        SENDING = false;
+        // The answer to a choice on the backtest bar is not told back to that
+        // bar while the Backtest tab is shown: it shows that choice already,
+        // or one the reader has made since
+        var echo = FROM_BAR && SHOWN === 'backtest';
+        FROM_BAR = false;
+        QUERY = m.query;
+        if (!echo) { toBacktest(); }
+      } else if (m.type === 'kalshi-run' && typeof m.run === 'string' && RUN_ID.test(m.run)) {
+        // A run started from the Trading tab: its page moves to the Run tab
+        // (loaded again only for another run), the Run tab is chosen when the
+        // Trading tab was the one shown, and the Trading frame shows the
+        // trading page again for the same proposal
+        if (RUN !== m.run) {
+          RUN = m.run;
+          point('run-frame', RUN_URL + m.run);
+        }
+        byId('tab-run').hidden = false;
+        if (SHOWN === 'trading') { tab('run'); }
+        loadTrading(false);
+      }
+    } else if (sentBy(e, 'backtest-frame', BACKTEST_ORIGIN)) {
+      if (m.type === 'kalshi-ready') {
+        // A bar just loaded, which has told no choice yet
+        TOLD = 0;
+        toBacktest();
+      } else if (m.type === 'kalshi-bar' && goodQuery(m.query)) {
+        // Taken or not, the proposal sent back next answers this choice
+        TOLD = goodSeq(m.seq) ? m.seq : 0;
+        if (SHOWN === 'backtest' && !SENDING) {
+          // The reader is choosing on that bar: the Trading tab follows
+          QUERY = m.query;
+          loadTrading(true);
+        } else {
+          // A choice that arrives after the reader has left the Backtest tab
+          // is not taken, so the Trading tab never changes under the cursor,
+          // nor one that arrives while a press of the trading page's buttons
+          // is on its way (SENDING: a page loaded over it would cut the press
+          // off, and its answer, which opens the run's page, would go
+          // unheard); the backtest bar is put back to the proposal the
+          // Trading tab shows
+          toBacktest();
+        }
+      }
+    }
+  });
+
+  TABS.forEach(function (t) {
+    byId('tab-' + t).addEventListener('click', function () { tab(t); });
+  });
   byId('live-refresh').addEventListener('click', load);
+  byId('trading-reload').addEventListener('click', function () { loadTrading(false); });
   for (var k = 0; k < PERIODS; k++) {
     (function (i) {
       byId('period-' + i).addEventListener('click', function () { choose(i); });
     })(k);
   }
+  // Loaded at once, so the trading page and the bar of the backtest page
+  // both open on the live defaults in force (the first page a frame loads
+  // adds no step to the Back history); it is loaded again when the Trading
+  // tab is chosen, as every time
+  watchTrading(byId('trading-frame'));
+  byId('trading-frame').src = TRADING_URL;
   load();
 })();
 """
@@ -1803,6 +2061,11 @@ def _script() -> str:
     values = {
         "__BACKTEST_URL__": json.dumps(BACKTEST_URL),
         "__DATA_URL__": json.dumps(DATA_URL),
+        "__DEFAULTS_ORIGIN__": json.dumps(_DEFAULTS_ORIGIN),
+        "__BACKTEST_ORIGIN__": json.dumps(_BACKTEST_ORIGIN),
+        "__TRADING_URL__": json.dumps(TRADING_URL),
+        "__RUN_URL__": json.dumps(RUN_URL),
+        "__MAX_QUERY__": str(_TRADING_QUERY_MAX),
         "__UNLOAD_MS__": str(config.LIVE_DASHBOARD_FRAME_UNLOAD_SECONDS * 1000),
         "__TEXT__": json.dumps(_SCRIPT_TEXT, ensure_ascii=False),
         "__HEADERS__": json.dumps({config.LIVE_DASHBOARD_REQUEST_HEADER: "1"}),
@@ -1820,13 +2083,14 @@ _SCRIPT = _script()
 _SCRIPT_HASH = "sha256-" + b64encode(hashlib.sha256(_SCRIPT.encode("utf-8")).digest()).decode()
 
 # The page's Content-Security-Policy: its own script (by hash) and the one
-# Plotly file, no other script; its own data only; the backtest port's pages
-# (the backtest page and the Data page) as its only frames; Plotly's PNG
-# download (data: and blob: images)
+# Plotly file, no other script; its own data only; as its only frames, the
+# backtest port's pages (the backtest page and the Data page) and the
+# live-defaults server's (the trading page and the run pages); Plotly's PNG
+# download (data: and blob: images); no form of its own, and never framed
 _PAGE_CSP = (f"default-src 'none'; script-src {config.LIVE_DASHBOARD_PLOTLY_URL} "
              f"'{_SCRIPT_HASH}'; style-src 'unsafe-inline'; connect-src 'self'; "
-             f"frame-src {_BACKTEST_ORIGIN}; img-src data: blob:; base-uri 'none'; "
-             "form-action 'none'; frame-ancestors 'none'")
+             f"frame-src {_BACKTEST_ORIGIN} {_DEFAULTS_ORIGIN}; img-src data: blob:; "
+             "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
 _PAGE_HEADERS = (
     ("Cache-Control", "no-store"),
@@ -1894,31 +2158,56 @@ summary {{ color: var(--ink-2); cursor: pointer; }}
 .notes li {{ color: var(--ink-2); margin: 4px 0; }}
 .warnings li {{ color: var(--down); margin: 4px 0; }}
 .empty {{ color: var(--ink-2); font-size: 15px; }}
-#panel-backtest iframe, #panel-data iframe {{ display: block; width: 100%; height: calc(100vh - 48px); border: 0;
-  background: var(--surface); }}
+#panel-backtest iframe, #panel-data iframe, #panel-run iframe, #panel-trading iframe {{
+  display: block; width: 100%; height: calc(100vh - 48px); border: 0; background: var(--surface); }}
+.frame-note {{ display: flex; align-items: center; gap: 12px; height: 40px; margin: 0;
+  padding: 0 16px; color: var(--ink-2); font-size: 14px; }}
+.frame-note span {{ min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+.frame-note button {{ flex: none; }}
+#panel-trading iframe {{ height: calc(100vh - 88px); }}
 """
 
 
 # What the backtest page may do in its frame: run its scripts in its own
-# origin (its chunk files), open the defaults server's pages in a window of
-# their own (their forms then work, outside the frame's limits) and save a
-# chart's picture; never navigate the tab page itself
-_FRAME_SANDBOX = ("allow-scripts allow-same-origin allow-popups "
-                  "allow-popups-to-escape-sandbox allow-downloads")
+# origin (its chunk files) and save a chart's picture; never navigate the tab
+# page itself, and never open a window (it tells the tab page its bar's
+# choice by a message, and the Trading tab shows it). It must never be
+# allowed to send a form (allow-forms): the tab page lets any of its frames
+# load the live-defaults server's pages (frame-src), so this page could point
+# its own frame at the trading page, whose buttons send a form and must do
+# nothing there
+_FRAME_SANDBOX = "allow-scripts allow-same-origin allow-downloads"
 
 # What the Data page may do in its frame: only what its charts need (its
-# script and Plotly, in its own origin, and a chart's picture saved). It
-# opens no window, so it gets no pop-up permission
+# script and Plotly, in its own origin, and a chart's picture saved). Like
+# the backtest page it opens no window, and it must never be allowed to send
+# a form, for the reason the backtest page's frame must not
 _DATA_FRAME_SANDBOX = "allow-scripts allow-same-origin allow-downloads"
+
+# What the trading page may do in its frame: run its scripts and send its own
+# forms, in its own origin. Without that origin the browser would send the
+# form's Origin as "null", which the live-defaults server refuses. It opens no
+# window and never navigates the tab page
+_TRADING_FRAME_SANDBOX = "allow-scripts allow-same-origin allow-forms"
+# What a run page may do in its frame: run its one script (which tells the tab
+# page the run's id, a message the tab page ignores from this frame) and
+# reload itself while the run goes on, in its own origin; it has no form,
+# opens no window and never navigates the tab page
+_RUN_FRAME_SANDBOX = "allow-scripts allow-same-origin"
 
 
 def _shell() -> str:
     """
-    The tab page: the three tabs, the Live trading panel's places, the backtest and Data frames and the script.
+    The tab page: its five tabs, the Live trading panel's places, the four frames and the script.
 
-    Built once, from config: the period buttons from
-    config.LIVE_DASHBOARD_PERIODS, the cards from CARD_LABELS, the Plotly
-    file with its integrity hash.
+    The tabs are Live trading, Backtest, Trading, Data and Run; the Run tab
+    starts hidden and the script shows it once the first run is reported.
+    The frames are the Backtest, Trading, Data and Run tabs' (the Trading
+    frame under a one-line note with a Reload button); none is given an
+    address here, the script sets each. Built once, from config: the period
+    buttons from config.LIVE_DASHBOARD_PERIODS, the cards from CARD_LABELS,
+    the Plotly file with its integrity hash, the live-defaults server's
+    address in the Trading tab's note.
 
     Returns:
         str: The page's HTML.
@@ -1934,6 +2223,9 @@ def _shell() -> str:
     holdings_head = "".join(f"<th>{name}</th>" for name in (
         "Market", "Side", "Contracts", "Price", "Value", "Cost", "Category"))
     group_head = "".join(f"<th>{name}</th>" for name in ("Category", "Return", "Profit", "Put in"))
+    # The Trading tab's one line: whose page it shows, and what starts that server
+    trading_note = (f"Trading uses the live-defaults server ({config.DEFAULTS_SERVER_HOST}:"
+                    f"{config.DEFAULTS_SERVER_PORT}), which ./start_dashboard.sh starts.")
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1947,7 +2239,9 @@ def _shell() -> str:
 <div class="tabs" role="tablist">
 <button type="button" id="tab-live" role="tab" aria-selected="true" aria-controls="panel-live">Live trading</button>
 <button type="button" id="tab-backtest" role="tab" aria-selected="false" aria-controls="panel-backtest">Backtest</button>
+<button type="button" id="tab-trading" role="tab" aria-selected="false" aria-controls="panel-trading">Trading</button>
 <button type="button" id="tab-data" role="tab" aria-selected="false" aria-controls="panel-data">Data</button>
+<button type="button" id="tab-run" role="tab" aria-selected="false" aria-controls="panel-run" hidden>Run</button>
 </div>
 <section id="panel-live" role="tabpanel" aria-labelledby="tab-live">
 <div class="head"><h1>Live trading</h1><span id="live-status" class="status">{escape(_SCRIPT_TEXT["loading"])}</span>
@@ -1975,8 +2269,16 @@ def _shell() -> str:
 <section id="panel-backtest" role="tabpanel" aria-labelledby="tab-backtest" hidden>
 <iframe id="backtest-frame" title="Backtest dashboard" sandbox="{_FRAME_SANDBOX}"></iframe>
 </section>
+<section id="panel-trading" role="tabpanel" aria-labelledby="tab-trading" hidden>
+<p class="frame-note"><span>{escape(trading_note)}</span>
+<button type="button" class="action" id="trading-reload">Reload</button></p>
+<iframe id="trading-frame" title="Trading" sandbox="{_TRADING_FRAME_SANDBOX}"></iframe>
+</section>
 <section id="panel-data" role="tabpanel" aria-labelledby="tab-data" hidden>
 <iframe id="data-frame" title="Data" sandbox="{_DATA_FRAME_SANDBOX}"></iframe>
+</section>
+<section id="panel-run" role="tabpanel" aria-labelledby="tab-run" hidden>
+<iframe id="run-frame" title="Latest run" sandbox="{_RUN_FRAME_SANDBOX}"></iframe>
 </section>
 <script>{_SCRIPT}</script>
 </body>
@@ -2501,7 +2803,7 @@ def _open_page(base: str, *, no_browser: bool) -> None:
         base (str): The tab page's address, "http://host:port".
         no_browser (bool): Whether to open nothing.
     """
-    logging.info("Open %s/ for the Live trading, Backtest and Data tabs", base)
+    logging.info("Open %s/ for the Live trading, Backtest, Trading and Data tabs", base)
     if not no_browser:
         webbrowser.open(f"{base}/")
 
@@ -2546,7 +2848,7 @@ def _reuse_running_dashboard(parser: argparse.ArgumentParser, base: str, *,
 
 def main(argv: list[str] | None = None) -> None:
     """
-    Serve the three tabs until Ctrl-C, or reopen this checkout's running dashboard's page.
+    Serve the tab page, the backtest page and the Data page until Ctrl-C, or reopen this checkout's running dashboard's page.
 
     It binds config.LIVE_DASHBOARD_PORT, then config.LIVE_BACKTEST_PORT, on
     config.LIVE_DASHBOARD_HOST. A port is taken when a program already
@@ -2571,9 +2873,11 @@ def main(argv: list[str] | None = None) -> None:
     """
     parser = argparse.ArgumentParser(
         prog="python3 -m kalshi_betting.live_dashboard",
-        description="Serve the dashboard's Live trading tab (the account read from Kalshi on "
-                    "every load, read-only), its Backtest tab and its Data tab. When this "
-                    "checkout's dashboard is already running, open its page again instead.")
+        description="Serve the dashboard's tab page: its Live trading tab (the account read "
+                    "from Kalshi on every load, read-only), its Backtest and Data tabs, and its "
+                    "Trading and Run tabs, which show the live-defaults server's pages "
+                    "(./start_dashboard.sh starts that server too). When this checkout's "
+                    "dashboard is already running, open its page again instead.")
     parser.add_argument("--no-browser", action="store_true",
                         help="Open nothing; only log the address to open")
     args = parser.parse_args(argv)

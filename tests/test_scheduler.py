@@ -785,7 +785,7 @@ class TestCheckLiveDefaults:
                                 "exit 2")
         assert "python3 -m kalshi_betting.defaults_server --seed" in error
         assert "./start_dashboard.sh --seed" in error
-        assert "Save as live defaults…" in error
+        assert "or in the dashboard's Trading tab (./start_dashboard.sh)" in error
 
     def test_a_refused_file_logs_the_refused_file_error(self, caplog):
         config.LIVE_DEFAULTS_FILE.write_text("not json", encoding="utf-8")

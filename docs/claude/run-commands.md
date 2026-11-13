@@ -111,9 +111,9 @@ python3 -m kalshi_betting.main --mode prod --dry-run --rebalance --min-price-mov
 # the other choice; 0 or --no-rebalance-min-days-to-maturity rebalances however near maturity (the
 # default unless saved otherwise). The "Live settings:" line reads `rebalance until 7 days before
 # maturity`. The backtest's walk applies the same rule (_simulate_at_discount's
-# rebalance_min_days_to_maturity), and its Rebalance family carries the runs, but the dashboard
-# does not offer it yet: its Save button leaves it as saved (a link naming rebalance=off clears
-# it), so a dashboard scenario shows none of its effect
+# rebalance_min_days_to_maturity), and its Rebalance family carries the runs, which the
+# backtest page's "Rebalance until" menu shows; the dashboard's Trading tab offers the
+# choice too (a link naming rebalance=off clears it)
 python3 -m kalshi_betting.main --mode prod --dry-run --rebalance --rebalance-min-days-to-maturity 7
 python3 -m kalshi_betting.main --mode prod --dry-run --no-rebalance
 
@@ -255,9 +255,9 @@ python3 -m kalshi_betting.backtest --no-move-sweep
 # config.REBALANCE_MATURITY_DAYS less "maturity", 1 and 7 days, where a held position is added
 # to or trimmed only while its later market closes at least that many days away; each is
 # simulated only when a report reads it, at every minimum price movement, and only where it
-# changes a run). Skipping them skips the dashboard's "Rebalance until" select (and its Save
-# then keeps the saved days limit unless it turns rebalancing off); Rebalance itself is still
-# built, and --no-rebalance-sweep skips them too. Backtest only
+# changes a run). Skipping them skips the dashboard's "Rebalance until" select (its bar then
+# leaves the Trading tab's days limit as it is, unless a choice turns rebalancing off);
+# Rebalance itself is still built, and --no-rebalance-sweep skips them too. Backtest only
 python3 -m kalshi_betting.backtest --no-maturity-sweep
 
 # Backtest without the dashboard's "Sell" family (ON by default in the CLI, and lazy like the
@@ -337,42 +337,46 @@ python3 -m kalshi_betting.scheduler
 
 # The dashboard, the live defaults and trading from a browser. ./start_dashboard.sh starts two
 # servers from this checkout and opens http://127.0.0.1:8766/ on the Live trading tab. The
-# live dashboard (127.0.0.1:8766 and :8767, read-only) serves the page's three tabs: Live
-# trading, the account read from Kalshi on every load (value by category over time, returns
+# live dashboard (127.0.0.1:8766 and :8767, read-only) serves the tab page: Live trading,
+# the account read from Kalshi on every load (value by category over time, returns
 # by category, Total return, Profit, Sharpe, Sortino, Mean and Median trade for All, 1Y, 6M,
 # 3M and 1M, and the holdings now; see "The Live trading tab" under Key Patterns),
-# Backtest, backtest_dashboard.html as it is, and Data, eda_dashboard.html (what
-# backtest_cache/ holds, rebuilt at the end of each backtest). The defaults server (127.0.0.1:8765) serves the
-# pages the Backtest tab's "Save as live defaults…" button (the filter bar's scenario on
-# screen) and "Trade using defaults…" link (/trade, the saved defaults) open. The launcher
-# takes only --seed, --no-browser and -h/--help, spelled in full (anything else exits 2
-# before anything starts), runs from its own folder (so from any directory), checks that its
-# Python (KALSHI_PYTHON, else python3) can import the live bot and the live dashboard from
-# that folder (it refuses a link to the script, or PYTHONSAFEPATH, which would import
-# another checkout's copy), then starts the live dashboard and, 2 s later, the defaults
-# server, both in the background. --seed opens the defaults server's confirmation page for
-# the seed values instead of the Live trading tab; --no-browser opens nothing and only logs
+# Backtest, backtest_dashboard.html as it is, Trading, the defaults server's trading page
+# (127.0.0.1:8765/confirm, where the live defaults are saved and live runs are started),
+# Data, eda_dashboard.html (what backtest_cache/ holds, rebuilt at the end of each
+# backtest), and Run, the latest run's page, shown once a run starts. The Trading tab opens
+# on the live defaults in force (an outdated file's values in their new form; with none
+# saved, the seed values); its dropdowns, the backtest bar's eleven settings, propose other
+# values, and the Backtest tab's filter bar and the Trading tab follow each other. The
+# launcher takes only --seed, --no-browser and -h/--help, spelled in full (anything else
+# exits 2 before anything starts), runs from its own folder (so from any directory), checks
+# that its Python (KALSHI_PYTHON, else python3) can import the live bot and the live
+# dashboard from that folder (it refuses a link to the script, or PYTHONSAFEPATH, which
+# would import another checkout's copy), then starts the live dashboard and, 2 s later,
+# the defaults server, both in the background. --seed opens the trading page proposing the
+# seed values instead of the Live trading tab; --no-browser opens nothing and only logs
 # the addresses. When the live dashboard cannot start (its port held by another program, or
-# by this checkout's dashboard running older code) and stops within those 2 s, a warning says
-# so and the defaults server opens the backtest dashboard itself (or its own index when there
-# is no dashboard, or one built before its Save and Trade buttons); when it stops later (a
-# port holder that never answers, say), a warning names its exit status and the defaults
-# server keeps running, opening nothing. Run
+# by this checkout's dashboard running older code) and stops within those 2 s, a warning
+# says so and the defaults server opens its own trading page (on the seed values with
+# --seed); when it stops later (a port holder that never answers, say), a warning names its
+# exit status and the defaults server keeps running, opening nothing. Run
 # it in the scheduler's checkout before the first live run, in the first-run order of the
 # saved-live-defaults paragraph under Key Patterns (--seed proposes Rebalance yes): with no
 # saved file, or one an older version saved (every file saved before the same-title cap was
-# removed), every live run exits 2. Confirm and trade (on /confirm it saves
-# first; on /trade it trades the saved defaults) and Dry run (no orders, nothing saved) start
-# `python -m kalshi_betting.main --mode prod` with all eleven toggles as flags, in its own
-# session; each run's folder is under live_runs/, and its page is /runs/<id>. Run it again
+# removed), every live run exits 2. Confirm and trade (it saves first when the settings
+# change anything; with nothing changed it trades the saved defaults) and Dry run (no
+# orders, nothing saved) start `python -m kalshi_betting.main --mode prod` with all eleven
+# toggles as flags, in its own session; each run's folder is under live_runs/, and its page,
+# /runs/<id>, opens in the Run tab. Confirm and save with nothing changed writes nothing
+# (/saved?unchanged=1), and /trade answers with a redirect to /confirm. Run it again
 # while this checkout's servers run and it only opens the page again (nothing started); a
 # defaults-server port held by that server running code from before a change to the
 # checkout (stop it and start it again), by another checkout's server, or by anything else,
 # exits 2 and stops the live dashboard just started. Ctrl-C stops both servers, and so does a
 # SIGTERM or SIGHUP sent to the script alone
 ./start_dashboard.sh [--seed] [--no-browser]
-python3 -m kalshi_betting.live_dashboard [--no-browser]             # the live dashboard alone (its three tabs, read-only), without the launcher's import check
-python3 -m kalshi_betting.defaults_server [--seed] [--no-browser]   # the defaults server alone (it opens the backtest page itself), without the import check
+python3 -m kalshi_betting.live_dashboard [--no-browser]             # the live dashboard alone (read-only; its Trading and Run tabs need the defaults server), without the import check
+python3 -m kalshi_betting.defaults_server [--seed] [--no-browser]   # the defaults server alone (it opens its own trading page), without the import check
 
 # Live verification of the V2 order mapping + transfer unit (~1c of real money, prod account)
 python3 -m kalshi_betting.v2_probe --ticker <TICKER> [--step no-mapping|unfillable-ask|yes-close|transfer] [--dest-shard N] [--yes]

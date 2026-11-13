@@ -1672,7 +1672,7 @@ class TestLiveDefaultsRequired:
         assert "settings" not in seen
         err = " ".join(capsys.readouterr().err.split())
         assert f"no live defaults are saved at {config.LIVE_DEFAULTS_FILE}" in err
-        assert "\"Save as live defaults…\" button" in err
+        assert "save them in the dashboard's Trading tab (start ./start_dashboard.sh)" in err
         assert "python3 -m kalshi_betting.defaults_server --seed" in err
         assert "./start_dashboard.sh --seed" in err
         assert "live runs never fall back to config.py's toggles" in err
@@ -1709,6 +1709,8 @@ class TestLiveDefaultsRequired:
         # The server will not save over a refused file, so the stderr says to
         # fix it, or delete it first
         assert "fix the file, or delete it and then save new ones" in err
+        # ... from the seed values or in the dashboard's Trading tab
+        assert "its --seed, or the dashboard's Trading tab" in err
         assert "the server will not save over a file it refuses" in err
 
     @pytest.mark.parametrize("mode", ["dev", "prod"])
@@ -9040,9 +9042,10 @@ class TestLiveRebalanceTextsSayWhatARunDoes:
         assert "from its step 2: the probe's `yes-close` step must PASS" in section
 
     def test_each_save_step_says_what_the_button_does_to_the_other_setting(self):
-        # On a page showing both, the Save button saves the other setting off
-        # (Rebalance yes shuts Sell, and Sell needs Rebalance no); a /confirm
-        # link that leaves it out keeps it. Each save step says so
+        # On a backtest page showing both, a choice on the filter bar passes the
+        # dashboard's Trading tab the other setting off (Rebalance yes shuts
+        # Sell, and Sell needs Rebalance no); a /confirm link that leaves it out
+        # keeps it. Each save step says so
         claude = self._lines("CLAUDE.md")
         [sell] = [x for x in claude
                   if x.startswith("**Measured and first-run order for selling.**")]
@@ -9062,13 +9065,14 @@ class TestLiveRebalanceTextsSayWhatARunDoes:
             assert "also sends rebalancing off" in step
             assert "names no rebalance setting" in step
 
-    def test_the_save_button_is_said_to_send_the_rebalance_choices(self):
-        # From a page that simulated rebalancing the button sends the Rebalance
-        # choice and the Min. price movement, as the two live settings, so saving
-        # a scenario with Rebalance no turns a saved live rebalance off
-        section = self._readme_section("### Dashboard buttons")
-        bullet = " ".join(section.split("- **Save as live defaults…**", 1)[1]
-                          .split("- **Trade using defaults…**", 1)[0].split())
+    def test_the_trading_tab_is_said_to_follow_the_rebalance_choices(self):
+        # From a backtest page that simulated rebalancing, a choice on its filter
+        # bar passes the dashboard's Trading tab the Rebalance choice and the Min.
+        # price movement together, as the two live settings, so a scenario with
+        # Rebalance no, saved there, turns a saved live rebalance off
+        section = self._readme_section("### The Trading tab")
+        bullet = " ".join(section.split("- **A choice on the Backtest tab's bar**", 1)[1]
+                          .split("- **A change on the Trading tab**", 1)[0].split())
         assert "rebalance and Min. price movement, Sell level" in bullet
         assert "the Rebalance choice with the Min. price movement shown" in bullet
         assert "sent as `rebalance` and `min_price_move`" in bullet

@@ -1466,8 +1466,8 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
         parser.error(f"the saved live defaults are refused ({exc}): fix the file, or delete "
                      f"it and then save new ones through the defaults server, "
                      f"./start_dashboard.sh (or python3 -m kalshi_betting.defaults_server): "
-                     f"its --seed, or the backtest dashboard's \"Save as live defaults…\" "
-                     f"button — the server will not save over a file it refuses")
+                     f"its --seed, or the dashboard's Trading tab "
+                     f"— the server will not save over a file it refuses")
     overrides: dict = {}
     if getattr(args, "tier_floors", None) is not None:
         overrides["tier_floors"] = args.tier_floors

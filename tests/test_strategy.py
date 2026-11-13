@@ -3254,6 +3254,15 @@ class TestTimeSeriesKellyParity:
         modules = [kalshi_betting] + [importlib.import_module(f"kalshi_betting.{n}") for n in walked]
         no_import = band_readers - {"config"}
 
+        # The backtest's band grids are forbidden here; config's
+        # DEFAULTS_SERVER_SPREAD_BANDS and DEFAULTS_SERVER_SIZE_CAPS are not.
+        # defaults_server's _bar_html (the trading page's dropdown bar) reads
+        # those two lists of choices only to offer them to a person, never as
+        # a live setting: a run trades the LiveSettings a save or a run was
+        # confirmed with. tests/test_defaults_server.py's
+        # test_config_s_lists_of_choices_feed_the_bar_alone pins that
+        # defaults_server names them only inside that bar and that no other
+        # module but config names them
         forbidden = {
             "min_price_diff_for_gap",
             "time_series_spread_band",

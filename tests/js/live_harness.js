@@ -2,8 +2,9 @@
 // tab page script (live_dashboard._SCRIPT) under a plain JavaScript runtime:
 // node (CI) or JavaScriptCore's jsc (macOS). Driven by
 // tests/test_live_dashboard.py's _run_live_script, which appends the ids the
-// page holds (__IDS), the answers its requests get (__ANSWERS), whether the
-// chart library loaded (__NO_PLOTLY), the script itself and a list of steps.
+// page holds (__IDS) and those its markup hides (__HIDDEN), the answers its
+// requests get (__ANSWERS), whether the chart library loaded (__NO_PLOTLY),
+// the script itself and a list of steps.
 // It checks the script's own logic — what it asks for, writes and draws for
 // each answer and click — not a browser's rendering or layout.
 //
@@ -21,10 +22,27 @@
 // cancelled. An element can be copied (cloneNode, its id, title,
 // attributes and address) and swapped for its copy (its parentNode's
 // replaceChild); a snapshot counts the swaps ("replaced").
+//
+// Frames and messages: every element has a contentWindow, as a frame has,
+// whose postMessage records each message sent to the page it holds
+// ({frame, message, origin}; a snapshot's "posted" lists those since the
+// snapshot before). A copy made by cloneNode gets a window of its own, as a
+// new frame does; setting an address keeps the window, as navigating a frame
+// does. window.addEventListener('message', fn) keeps fn, and a ["message",
+// {origin, source, data}] step calls each kept listener with an event of that
+// origin, a copy of that data and, as its source, the contentWindow of the
+// element whose id source names (null: a window no element holds; "old:" and
+// an id: the window of the element last swapped out under that id, a page
+// that is no longer in the tab page). An element whose id is in __HIDDEN
+// starts hidden, as the page's markup has it. A snapshot's "loads" counts
+// the addresses set on each id's frame. A ["load", id] step is the frame
+// with that id finishing loading its next page: its load listeners run
+// ("old:" and an id: the element last swapped out under that id).
 // ES5 plus Promise, which both runtimes have.
 
 var __emit = (typeof print === 'function') ? print : function(s) { console.log(s); };
 var __IDS = {};
+var __HIDDEN = {};
 var __ANSWERS = [];
 var __NO_PLOTLY = false;
 var __elements = {};
@@ -32,12 +50,26 @@ var __fetches = [];
 var __plots = [];
 var __snaps = {};
 var __srcSets = 0;
+var __loads = {};
+var __posted = [];
+// The page's own window: only its message listeners are needed
+var __windowListeners = {};
+var window = {
+  addEventListener: function(type, fn) {
+    (__windowListeners[type] = __windowListeners[type] || []).push(fn);
+  }
+};
 // Every element's parent: replacing a child puts the new element where
-// getElementById finds it, and counts the swap (a snapshot's "replaced")
+// getElementById finds it, keeps the old one's window (a message step's
+// "old:" source) and counts the swap (a snapshot's "replaced")
 var __replaced = 0;
+var __retired = {};
+var __retiredElements = {};
 var __parent = {
   replaceChild: function(fresh, old) {
     __elements[old.id] = fresh;
+    __retired[old.id] = old.contentWindow;
+    __retiredElements[old.id] = old;
     __replaced += 1;
     return old;
   }
@@ -54,13 +86,24 @@ function __element(id, tag) {
     // As a browser's: setting the text replaces the children
     set: function(v) { el._text = String(v); el.children = []; }
   });
-  // A frame's address: setting it is a navigation (counted in __srcSets);
-  // copying it into a clone, or removing it, is not
+  // A frame's address: setting it is a navigation (counted in __srcSets, and
+  // per id in __loads); copying it into a clone, or removing it, is not
   el._src = '';
   Object.defineProperty(el, 'src', {
     get: function() { return el._src; },
-    set: function(v) { el._src = String(v); __srcSets += 1; }
+    set: function(v) {
+      el._src = String(v);
+      __srcSets += 1;
+      __loads[el.id] = (__loads[el.id] || 0) + 1;
+    }
   });
+  // The window of the page a frame holds: kept across navigations, new for a copy
+  el.contentWindow = {
+    postMessage: function(message, origin) {
+      __posted.push({frame: el.id, message: JSON.parse(JSON.stringify(message)),
+                     origin: origin});
+    }
+  };
   el.setAttribute = function(name, value) { el._attrs[name] = String(value); };
   el.getAttribute = function(name) { return name in el._attrs ? el._attrs[name] : null; };
   el.removeAttribute = function(name) {
@@ -86,7 +129,10 @@ function __element(id, tag) {
 var document = {
   getElementById: function(id) {
     if (!__IDS[id]) { return null; }
-    if (!__elements[id]) { __elements[id] = __element(id); }
+    if (!__elements[id]) {
+      __elements[id] = __element(id);
+      __elements[id].hidden = !!__HIDDEN[id];
+    }
     return __elements[id];
   },
   createElement: function(tag) { return __element('', tag); }
@@ -134,15 +180,18 @@ function __install() {
 
 // Each element the script has touched: its text, class, hidden state,
 // tooltip, attributes, frame address and disabled state, and a table body's
-// or list's rows (each cell's text, tooltip and left border); every request
-// and chart call since the last snapshot; and the delays of the timers still
+// or list's rows (each cell's text, tooltip and left border); every request,
+// chart call and message posted to a frame since the last snapshot; the
+// addresses set on each frame so far; and the delays of the timers still
 // pending
 function __snapshot() {
-  var snap = {fetches: __fetches, plots: __plots, srcSets: __srcSets, el: {},
+  var snap = {fetches: __fetches, plots: __plots, posted: __posted, srcSets: __srcSets,
+              loads: JSON.parse(JSON.stringify(__loads)), el: {},
               timers: __timers.map(function(timer) { return timer.ms; }),
               replaced: __replaced};
   __fetches = [];
   __plots = [];
+  __posted = [];
   Object.keys(__elements).forEach(function(id) {
     var el = __elements[id];
     snap.el[id] = {
@@ -171,8 +220,10 @@ function __spin(ticks, next) {
 // Steps: ["settle"] (let every pending promise run), ["click", id] (a reader
 // clicking that element: its click listeners run unless it is disabled),
 // ["timers"] (the time passing: every pending timer runs, oldest first, and
-// is cleared), ["snap", name]. Emits every snapshot, as JSON, once the steps
-// are done.
+// is cleared), ["message", {origin, source, data}] (a page sending the tab
+// page a message: see above), ["load", id] (a frame's next page loaded: see
+// above), ["snap", name]. Emits every snapshot, as JSON, once the steps are
+// done.
 function __step(steps, i) {
   if (i >= steps.length) {
     __emit(JSON.stringify(__snaps));
@@ -192,6 +243,21 @@ function __step(steps, i) {
     var due = __timers;
     __timers = [];
     due.forEach(function(timer) { timer.fn(); });
+  } else if (s[0] === 'message') {
+    var sent = s[1];
+    var from = sent.source;
+    var event = {
+      origin: sent.origin,
+      source: from === null ? {} :
+        from.indexOf('old:') === 0 ? __retired[from.slice(4)] || {} :
+        document.getElementById(from).contentWindow,
+      data: sent.data === undefined ? undefined : JSON.parse(JSON.stringify(sent.data))
+    };
+    (__windowListeners.message || []).forEach(function(fn) { fn(event); });
+  } else if (s[0] === 'load') {
+    var loaded = s[1].indexOf('old:') === 0 ? __retiredElements[s[1].slice(4)]
+      : document.getElementById(s[1]);
+    (loaded._listeners.load || []).forEach(function(fn) { fn({type: 'load'}); });
   } else if (s[0] === 'snap') {
     __snaps[s[1]] = __snapshot();
   }

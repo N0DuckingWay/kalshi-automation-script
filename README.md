@@ -24,7 +24,7 @@ Two markets on two events of one **event series** are never paired when they are
 
 **At most one open time-series trade per ladder.** A *ladder* here is one question asked at several deadlines: two markets are on one ladder when they share an event ticker, or ask the same question once the dates are removed (the time-series grouping key — event title, market title and outcome label — at any deadline, across events, compared without letter case, articles, quote marks or stray punctuation, so one question listed twice with slightly different wording is still one ladder). A live run never trades a market it holds (bar adding to an exact held pair, below), but nothing stopped a later run opening a *different* pair on the *same* ladder while the first trade was still open, and a week-by-week replay of the live rules found exactly that: 18 trades entered while their group was still open, and $3,990 lost when stacked rungs of two ladders lost together — the second trade's in-between window sat inside the first's, so one outcome sank both. A production run now first finds the ladders its open positions are on — from the run's own market list, or by looking the market up when the list lacks it (one that has closed but not yet paid out, say) — and the time-series finder refuses any candidate with a market on one of them (except the exact held pair a run may add to, below), before it chooses each group's best pair, so a runner-up off those ladders can still trade. The portfolio step then takes at most one time-series trade per ladder, counting the ladders of every trade picked earlier in the same run. A refused pair spends no cash, so a lower-ranked pair may then fit in its place. If a held market cannot be identified, the run buys no pair at all (an ERROR says so, and so does the closing "no qualifying pairs" line), and the run exits with code `40` so the scheduler's own log says no pair was bought (see the exit codes under [Scheduler daemon](#scheduler-daemon)). A ladder is free again once the account no longer holds a position on it. Dev runs hold nothing, so only the within-run rule applies there. The backtester applies the same rule as it walks the simulated Mondays — its own runs never sell (only the dashboard's Sell and Rebalance selects do), so on each Monday it enters a time-series pair only if no trade it still holds has a market on that pair's ladders, and a ladder frees up on the day its market pays out. A time-series pair it skips on one Monday (its ladder busy, or too little cash left for even one contract pair — a trade the cash left can buy only in part is shrunk to it instead) is tried again on its next Monday that passes the Kelly gate, as a live run would try it again at its next run; the backtest checks once a week, while live runs come twice a day. Every backtest time-series figure recorded before this rule is therefore not comparable (DR-76 in `CLAUDE.md`).
 
-**Adding to a pair the account already holds.** With the live toggle `rebalance` on (see [Live trading toggles](#live-trading-toggles); it turns this on together with trimming, below), a production run may buy more of a pair the account already holds: exactly the same two markets, the same side on each. It first reads every held position with its side and cost, and only when that listing was read to its end, every held market was identified and Kalshi's value of the open positions was read and kept by its check does it look for *exact* held pairs — two held markets alone on one ladder, one held YES and one held NO, of equal size, with both costs reported. When one market of a held pair has paid out and the other is still open, the open one is still a held market (it keeps blocking its ladder) and, with the setting on, a *lone leg* the run may add to: a new pair that buys that market on the side held there, beside a market the account does not hold that sits on no other held ladder, staked at that one market's worth today plus its own fees (the paid-out market's payout is already cash). The log names it as `Held market to add to (its partner has paid out): …`. Anything else (unequal counts after a partial unwind, a third held market on the ladder, a cost the listing does not report) is never added to and stays blocked as any held market is, and a listing cut short, a held market that cannot be identified, or, while anything is held, Kalshi's value of the open positions unread or refused (the portfolio value would then count only the cash) means no add-on that run, with a WARNING saying which. The time-series finder lets an exact held pair through, and only as that same pair buying the same sides; every other candidate touching one of its markets is refused. The add-on is judged by every rule any other trade is, and Kelly sizes the **whole position**: the held pair, valued at today's prices (each market's contracts at the ask of the side held there, or at what they cost when a market has no usable ask) plus the fees paid for it, and the new contracts with their fees together stake at most `min(f*, cap)` of the portfolio value, and like every trade the add-on spends at most the cash — so no add-on stakes more than a new pair would, and the whole position stays within that share of the portfolio value. The fees count because the portfolio value has already lost them: at the prices it was bought at, a pair bought at its full share adds nothing. A held pair that has gained value gets a smaller add-on, one that has lost value a larger one. A held pair with no room left even at the per-trade cap is left out, so its markets stay blocked. Just before the order is sent the trader checks again that both markets still hold exactly that pair, and sends nothing if not; any rollback unwinds only the new contracts, and every alert about such a market names what it held before the pair. The log names each held pair it may add to, with its cost, the fees in that cost and its worth at today's prices, and marks every add-on "adds to N held". Like a trim (below), an add-on is held back first while the position's later market closes in fewer than `rebalance_min_days_to_maturity` days (1 or 7; no limit at the default, "maturity"; the log reads `Not adding to …: its later market closes in 5 day(s), and rebalancing stops 7 day(s) before maturity`), then waits until 7 days have passed since the last fill on the pair's markets and, with a minimum price movement, until the pair's price has moved that far, up or down, since that fill; a pair held back stays blocked that run. For a lone leg the wait also counts a fill on any market of its ladder still listed: a partner sold by hand leaves the positions listing just as a paid-out one does, and this keeps the bot from buying it back within the wait. A saved file without the setting reads it as **off**, though `config.py` and the seed ship it on. To turn it on for every run, follow the order under [Turn on live rebalancing](#turn-on-live-rebalancing), which checks a dry run with `--rebalance` against the fills in the Kalshi UI first; the dashboard's save button sends the choice only from a page that shows it, and otherwise keeps what is saved.
+**Adding to a pair the account already holds.** With the live toggle `rebalance` on (see [Live trading toggles](#live-trading-toggles); it turns this on together with trimming, below), a production run may buy more of a pair the account already holds: exactly the same two markets, the same side on each. It first reads every held position with its side and cost, and only when that listing was read to its end, every held market was identified and Kalshi's value of the open positions was read and kept by its check does it look for *exact* held pairs — two held markets alone on one ladder, one held YES and one held NO, of equal size, with both costs reported. When one market of a held pair has paid out and the other is still open, the open one is still a held market (it keeps blocking its ladder) and, with the setting on, a *lone leg* the run may add to: a new pair that buys that market on the side held there, beside a market the account does not hold that sits on no other held ladder, staked at that one market's worth today plus its own fees (the paid-out market's payout is already cash). The log names it as `Held market to add to (its partner has paid out): …`. Anything else (unequal counts after a partial unwind, a third held market on the ladder, a cost the listing does not report) is never added to and stays blocked as any held market is, and a listing cut short, a held market that cannot be identified, or, while anything is held, Kalshi's value of the open positions unread or refused (the portfolio value would then count only the cash) means no add-on that run, with a WARNING saying which. The time-series finder lets an exact held pair through, and only as that same pair buying the same sides; every other candidate touching one of its markets is refused. The add-on is judged by every rule any other trade is, and Kelly sizes the **whole position**: the held pair, valued at today's prices (each market's contracts at the ask of the side held there, or at what they cost when a market has no usable ask) plus the fees paid for it, and the new contracts with their fees together stake at most `min(f*, cap)` of the portfolio value, and like every trade the add-on spends at most the cash — so no add-on stakes more than a new pair would, and the whole position stays within that share of the portfolio value. The fees count because the portfolio value has already lost them: at the prices it was bought at, a pair bought at its full share adds nothing. A held pair that has gained value gets a smaller add-on, one that has lost value a larger one. A held pair with no room left even at the per-trade cap is left out, so its markets stay blocked. Just before the order is sent the trader checks again that both markets still hold exactly that pair, and sends nothing if not; any rollback unwinds only the new contracts, and every alert about such a market names what it held before the pair. The log names each held pair it may add to, with its cost, the fees in that cost and its worth at today's prices, and marks every add-on "adds to N held". Like a trim (below), an add-on is held back first while the position's later market closes in fewer than `rebalance_min_days_to_maturity` days (1 or 7; no limit at the default, "maturity"; the log reads `Not adding to …: its later market closes in 5 day(s), and rebalancing stops 7 day(s) before maturity`), then waits until 7 days have passed since the last fill on the pair's markets and, with a minimum price movement, until the pair's price has moved that far, up or down, since that fill; a pair held back stays blocked that run. For a lone leg the wait also counts a fill on any market of its ladder still listed: a partner sold by hand leaves the positions listing just as a paid-out one does, and this keeps the bot from buying it back within the wait. A saved file without the setting reads it as **off**, though `config.py` and the seed ship it on. To turn it on for every run, follow the order under [Turn on live rebalancing](#turn-on-live-rebalancing), which checks a dry run with `--rebalance` against the fills in the Kalshi UI first; the dashboard's Trading tab offers the choice, and the backtest page's filter bar passes it to the Trading tab only from a page that shows it.
 
 **Selling a held position at a share of its potential profit.** With the live toggle `sell_at` set (off unless saved; see [Live trading toggles](#live-trading-toggles)), a production run first sells every held position that has stayed at or above that share of its potential profit at each of three daily checks, and only then looks for pairs to buy. It is the rule the backtest's Sell select simulates (see [Selling at a share of potential profit](#selling-at-a-share-of-potential-profit)), applied by `seller.py` to the real account. A position is an exact held pair, or one held market whose partner has already paid out (found among the account's settlements: a market the account no longer holds, held on the other side when it paid out (Kalshi lists a sale before the payout as a purchase of the other side, so what was held is the contracts listed on that side less those on the other, and a market listed with both sides counts only when its payout matches that) and asking the same question, that paid out within the last 60 days, in the same count or, failing that, at least as many, its cost and payout then counted for the contracts still held). Anything else (three or more markets on one ladder, unequal counts, a missing or ambiguous partner, a cost or ladder the bot cannot read) is never sold, and the log says why. Realized profit is what selling the held markets at the bids would return after the sale's fees (plus the partner's payout) less what the whole position cost; potential profit is what it pays if it wins less that cost. The check at the run's moment walks each market's real order book for its count; each of the two earlier days reads the market's last hourly candle bid in the 24 hours before that check, in any size. With `sell_min_days` set, a position with fewer days left before its last market stops trading is not sold. Each held market is sold by one reduce-only, immediate-or-cancel order for the contracts held there (a held YES by an ask, a held NO by a YES bid), priced no worse than the walk reached; a pair is two orders, the thinner book first and then exactly as many contracts of the other as the first sold (at most one tick below its walked price), so what is left is still an exact pair. When an order's reply does not say how many it sold, the account's position decides, read again after pauses of 1, 2 and 4 seconds while it shows less than the whole order, and the run then checks its positions listing, read again after the same pauses while such a count came up short: a listing that shows more sold than the run recorded is a CRITICAL. The listing reads the same ledger, so one that still trails after the last pause leaves the short count standing, unflagged (a recorded residual; see `CLAUDE.md`). A sale the bot cannot account for, that leaves a pair uneven, or that it recorded short, logs a CRITICAL and makes the run exit `20`. The sales go into `trade_log.xlsx` before anything is bought (a live run writes them once it has read its positions and cash back); the cash they free funds the same run's buys, the markets sold are not bought back in it, and no position picked for sale is added to in it, sold or not. The dashboard's Live trading tab reads those rows as the run's sales, never as purchases, and the sale orders as sales by hand (see [Live trading tab](#live-trading-tab)). A dry run sends no order: it adds each sale's estimated proceeds to the cash its buys are sized on (the portfolio value never below that cash) and says what it would have sold. The rule differs from the backtest's in a few recorded ways (the earlier days' checks read one candle bid in any size, the days rule reads each market's scheduled close, the fee is charged once per market, and a ladder with three or more held markets is never sold; see the live-selling paragraph in `CLAUDE.md`). **Before turning it on, run `python3 -m kalshi_betting.v2_probe --ticker <TICKER> --step yes-close` and see it PASS**, then follow the order under [Turn on live selling](#turn-on-live-selling).
 
@@ -195,7 +195,8 @@ config.py (constants), _http.py (retry + raw-response fetch + one-line error tex
     start_dashboard.sh at the repo root, beside live_dashboard.py); imports
     config.py and run_lock.py only, imported by NOTHING (the local pages that
     save live_defaults.json and start live trading runs — main.py, each as
-    its own process)
+    its own process; the live dashboard's Trading and Run tabs show its
+    trading page and run pages in frames)
 
     live_portfolio.py — reporting only, for the Live trading tab: reads the
     account with read-only GETs (through historical.py's _historical_get) and
@@ -205,11 +206,14 @@ config.py (constants), _http.py (retry + raw-response fetch + one-line error tex
     (trader, main, scheduler, run_lock, defaults_server, v2_probe)
 
     live_dashboard.py — standalone, human-run, read-only (started by
-    start_dashboard.sh): serves the dashboard's three tabs, the Live trading
+    start_dashboard.sh): serves the dashboard's tab page and its Live trading
     tab on 127.0.0.1:8766 and the backtest page and the Data page
-    (eda_dashboard.html, at /eda/) on 127.0.0.1:8767; imports config.py,
-    live_portfolio.py, historical.py, treasury.py and _http.py (never eda.py:
-    it only serves the file eda.py writes), imported by NOTHING
+    (eda_dashboard.html, at /eda/) on 127.0.0.1:8767, and shows
+    defaults_server.py's pages (127.0.0.1:8765) in frames as its Trading and
+    Run tabs; imports config.py, live_portfolio.py, historical.py,
+    treasury.py and _http.py (never eda.py: it only serves the file eda.py
+    writes; never defaults_server.py: it only points two frames at its
+    addresses), imported by NOTHING
 ```
 
 ### Live Trading Data Flow
@@ -584,11 +588,12 @@ backtest.py (CLI)
                                                 beside the page, and each band's chunk
                                                 ids under each Tier floors setting as
                                                 one block in the page, loaded by the
-                                                page's script when chosen; the bar's "Save as live
-                                                defaults…" button opens the defaults
-                                                server's confirmation page for the
-                                                scenario on screen (the page itself
-                                                writes nothing)
+                                                page's script when chosen; in the live
+                                                dashboard the bar and its Trading tab
+                                                follow each other (the page itself
+                                                writes nothing; the build writes
+                                                backtest_filter_names.json beside it,
+                                                the names the bar's menus list)
   └─ eda.build_eda_page()                    — unless --no-eda: rebuild the Data page
                                                 (eda_dashboard.html, the live dashboard's Data
                                                 tab) from backtest_cache/ and the run's sweep
@@ -625,11 +630,11 @@ backtest.py (CLI)
 | `depth_model.py` | The backtest's model of order-book depth. Backtest only: no live module imports it; `backtester.py` and `backtest.py` do. Kalshi keeps no historical order books, so this saves snapshots of live books, fits a table of how many contracts typically rest near the best bid (the median over every saved ladder, by 24-hour volume and best-bid price; a cell with too few ladders reads its volume row, then the whole table), and builds a synthetic book from it for any market and moment (`book()`), whose top levels reproduce the quoted prices and which the backtest sizes each trade over; a backtest sale walks one side of it (`bid_ladder()`, for a bid from 1c to 99c). `volume_24h()` is the one definition of a market's trailing volume, read from the candles at every checkpoint and at each daily check before a sale. `python3 -m kalshi_betting.depth_model snapshot [--markets N]` saves a snapshot (read-only requests, no orders; about 2,000 open non-combo markets, under `backtest_cache/depth_snapshots/`); `load_depth_model()` fits every saved snapshot and returns `None`, with a WARNING, when none is usable; `backtest.py` calls it before the fetch. |
 | `market_details.py` | The backtest's side data about markets, and the checks that it agrees with itself. Backtest only: no live module imports it; `backtester.py` does. It reads each pair market's full record (timing fields, numbers, strikes and rules text) from `/markets` and `/historical/markets`, 100 tickers a request, and every trade of each pair market from `/historical/trades` or `/markets/trades`, and caches them under `backtest_cache/` (details one record per line in `market_details.jsonl.gz`, settled and finalized markets only, appended to and never rewritten; a market's trades only when the walk reached its end and the trades add up to the market's own volume). The groupable markets that form no pair are not loaded: there are a million of them on a 365-day window. It checks that a market's candle volumes, its trades and its own `volume_fp` agree, that each hourly candle's open, high, low and close are in order, that trade prices and ids are sound, and that its settlement value and timing fields agree with its result and each other. `capture_scheduled_closes()` saves every open market's live close time, and `learn_close_rules()` learns from those captures, per series, which timing field (with a fixed offset) gives the close a live run saw; with `config.BACKTEST_SCHEDULED_CLOSE` on (the default) the backtest reads that scheduled close for days to maturity, the ranking and a cross-event pair's order, gap and horizon, and a series with no proven rule keeps the realized close. Nothing else in this data decides a trade. Two read-only commands: `python3 -m kalshi_betting.market_details capture-closes` and `check`. |
 | `backtester.py` | Replays the strategy on settled markets: groups them into candidate pairs (including, behind `TIME_SERIES_SAME_EVENT_LADDERS`, two dated rungs of one event's deadline ladder — formed by a separate, deliberately unwindowed per-event sub-pass and ordered and gapped on their stated deadlines through the same `scanner.stated_deadline()` / `same_event_ladder()` the live finder uses), scans weekly snapshots at its own entry checkpoint — `config.SCHEDULED_RUN`, Monday 09:00 America/Los_Angeles (16:00 UTC under daylight time, 17:00 UTC under standard time), while live runs come twice a day — for every Monday each pair was tradeable, refusing before any fetch a schedule whose run time falls on another date in UTC or on a clock change — at a BACKTEST time-series spread band (`_entries_for_band()`, `_find_entry()`) that never reaches live trading, which reads its own band, the saved live defaults' (or `main.py`'s own `--spread-min` / `--spread-max` for one run) — the two apply the same spread tests, pinned to one verdict by `tests/test_backtester.py::TestLiveBacktestSpreadParity` — enters each time-series pair on the earliest of those Mondays whose Kelly fraction is positive at the simulated `k` and on which it can be taken (it simulates time-series pairs only, and refuses any other entry with one WARNING before scoring it), holding at most one open time-series pair per ladder — a pair skipped one Monday for a busy ladder or for cash that cannot buy one contract pair is tried again on its next such Monday (as a live run would try it again at its next run; the backtest checks once a week, live runs twice a day) — applies Kelly sizing on each Monday's portfolio value (the cash plus every open trade at market: each leg at the latest usable ask of the side it holds at the checkpoint, at its payout once its market has paid out, and the whole trade at cost when it has no quotes) and on the cash left, through the live sizing code (`scanner._enrich_pair` walks a modeled order book built from the depth model and each market's 24-hour volume, then `strategy.compute_trade` picks the count; with no depth model, or no volume data for a market that Monday, the trade is sized at the candle prices, the top of the book, and counted), never spending more than the cash left, so a trade the cash left cannot buy in full is shrunk to what it can buy (as a live run sizes on its cash plus Kalshi's value of its positions; the two valuations of open positions can differ either way), records the average price each trade paid on each leg (`BacktestTrade.fill_price_a`/`_b`) and its actual P&L from settlement outcomes, and builds a daily equity curve that opens one day before the start date at the untouched initial balance, so a trade entering on the first day of the window shows its day-0 charges as a real daily return and a real drawdown. The curve is a portfolio value, not a cash balance: an open position is valued at market at the end of each day it is held (each leg at the latest usable ask of the side it holds, from the backtest's own hourly candles — an empty book, an unreadable candle or a NO ask at the fetch's 0.99 clamp keeps the last usable one — the price it paid before its side has had a usable ask, its payout once its market has paid out; the whole trade at cost when it has no quotes), so committing capital does not move the curve, a swing while a trade is open does, and every curve still ends at the starting balance plus every trade's profit. The quotes are sampled once per market from the candles already fetched (`_attach_leg_quotes`) and carried on each trade as `BacktestTrade.marks`; open trades were valued at cost until 2026-09-30, so results recorded before then are not comparable. The work is split at the band and the interval discount `k`: `_prepare_candidates()` (fetch through candlesticks) depends on neither, `_entries_for_band()` depends only on the band, and `_simulate_at_discount()` — the Kelly gate, P&L, equity curve — depends on `k`; `_sweep_from_candidates()` composes all three into the band x `k` x population scenario grid (`SweepPoint`, `HalfSplit`, `BacktestSweep`) the dashboard's scenario explorer renders — and, with `tier_off_sweep` (which the CLI turns on with the band sweep), re-runs every band a deadline-gap tier floor binds at with the tier floors off, so that band's floor alone gates the spread (`BacktestSweep.tier_off_scenarios`, backtest only; every tier-on figure unchanged). Pair extraction looks for time-series pairs only and accounts for every pair of every group's members, each on its own silent-at-zero line — the three wording reasons, the one-series rule, the same-event skip, each ladder reason, the pairs its close-date window never visits and the members with no readable close time — and the size of the grouping is logged on every run, zero included, so a run that forms no pairs still logs why (M10). The per-trade Kelly size cap is a simulation parameter too (`_simulate_at_discount(size_cap=)`, default `config.BUDGET_FRACTION`, applied through `config.pair_size_cap`, as live sizing caps it), and `run_backtest_sweep(cap_sweep=True)` — on by default in the CLI — adds a lazy `CapSweep` over every other cap of `SIZE_CAP_SWEEP` (5% to 95%, and 1.0, shown as off) for the tier-on grid, and a second one over the tier-floors-off runs (`BacktestSweep.tier_off_cap_sweep`, seeded from their own points) when those ran too, each simulated one (band, `k`) cell at a time when a report reads it. `run_backtest_sweep(rebalance_sweep=True)` — on by default in the CLI too — adds the dashboard's "Rebalance" family, `BacktestSweep.rebalance_sweep` (a `RebalanceSweep`), whose every simulation both adds to a pair it still holds (`_simulate_at_discount(add_to_held=True)`, an add-on sized on the same portfolio value, the pair's stake its open trades at market plus the fees paid for them) and sells a held pair down to its Kelly size (`trim_to_kelly=True`; a lone leg too, the later market of a time-series pair once the earlier one paid out $0) at each weekly run, once at least `REBALANCE_MIN_DAYS_SINCE_TRADE` (7) calendar days have passed since the last trade on that pair (`_last_trade_day` gives that day and `config.rebalance_rested` the test; see [Rebalancing held pairs](#rebalancing-held-pairs)), never one without the other, over the tier-on grid and the tier-floors-off runs, for the "all" population only, nothing of it simulated during the run; without it a pair trades at most once. With `move_sweep=True` as well (also the CLI's default) that family carries every minimum price movement of `config.MIN_PRICE_MOVES` (`RebalanceSweep.min_moves`), and `RebalanceSweep.move_grid` reads a scenario at every minimum while simulating only the ones that change it (a minimum that changes nothing is a `SameMove`, naming the run it repeats). With `maturity_sweep=True` too (also the CLI's default) it carries the "Rebalance until" choices besides "maturity" (`RebalanceSweep.maturity_days`, 1 and 7 days), and `RebalanceSweep.maturity_grid` reads a scenario at every choice and minimum from the runs at "maturity" a report already read, simulating only the ones that change it (a cell that changes nothing is a `SameMaturity`, naming the run it repeats); the dashboard reads them as it is built, its "Rebalance until" select shut for now. |
-| `dashboard.py` | Generates an HTML performance report from backtest results, self-contained but for its chunk files (`backtest_dashboard_files/` beside it: every scenario but the run's own, and the Sell select's) — nine sections: cumulative return lines (total plus one each for ladder and cross-event pairs) / Sharpe/Sortino/drawdown KPIs plus mean and median return per trade and the median monthly return, returns decomposition (P&L by Kalshi's official category and by category · tag, with a per-group table), time-series spread calibration (each traded pair's entry mid spread — the later market's midpoint minus the earlier one's, a midpoint being halfway between a market's YES ask and its YES bid: the market-implied probability that the event lands between the two deadlines, and the input the forecast reads — against the rate the pairs settled A = NO, B = YES, with Brier score and log loss), an interval-discount (`k`) calibration section (the pooled empirical `k̂`, one equity curve and a per-`k` table at the primary spread band with the tier floors on, which the filter bar's `k` and size cap move), two Portfolio Performance cards with the selection's empirical `k̂` and `k̂ − k` (the `k̂ − k` red when positive, i.e. the sizer sized too big; under the `k̂` its 95% confidence interval, counting each event once), an empirical `k̂` breakdown (a bar chart and table of `k̂` by Kalshi category, by tag or by spread band, each bar naming its entries and distinct events, with a Group-by `<select>` of its own and a dashed line at the page's `k` — the run's own as rendered, the filter bar's once one is chosen), a scenario-explorer section over every spread band x `k` x per-trade size cap of the band sweep (a fragility banner for the cap shown, a spread-band x `k` heatmap whose metric menu offers mean, median and total return, Sharpe ratio (blank on a cell with no trade), H1/H2 returns, trade count, each band's empirical `k̂` and `k̂ − k` — both red where `k̂` exceeds `k`, as on the cards — a one-row-per-band `k̂` table, and a per-population KPI table, with band, `k` and size-cap `<select>`s of its own — and a Tier floors `<select>` when the run carries the band sweep's tier-floors-off runs — that the filter bar also moves; its data comes from the same one walk as the bar's and ships as one gzip-packed block per size cap, plus a tier-floors-off block per size cap, each unpacked only when chosen), trade diagnostics (best and worst five trades with each leg's side, price, close date and settlement), risk metrics, and an S&P 500 benchmark comparison whose download window opens on the same date as the equity curve's leading initial-balance row. The page header names the run's primary spread band, same-event-ladder setting and per-trade size cap (and whether the size-cap sweep ran), and, on the lines under them, the entry checkpoint every trade was entered at — the backtest's weekly entry time, `config.SCHEDULED_RUN` (the live runs are at other times) — and how the primary scenario's trades filled: how many walked a modeled order book (and from which depth snapshots) and how many filled at the top of the book, or, in red, that no depth snapshot was usable so every trade did. An Extra data line under it names the scheduled close (and how many pair markets used one), the stale-quote check's hours, the volume cap and the fee multipliers charged as listed, each `off` when the run turned it off, then whether every integrity check over the pair markets passed (in red, naming each failing check, when one did not) and Kalshi's crossed candles, which are its own data and never a failure. The trade rows show the average price each leg paid and, when known, a leg's scheduled close where it differs from the realized one, its quote's age at entry and the share of the next day's volume the trade took, and the Kelly scatter prices the legs at it, with a time-series trade's chance of profit read from the mid spread of its entry quotes, as the live sizer reads it. A sticky filter bar at the top — Spread band, Tier floors, k, Size cap, Rebalance, Min. price movement, Sell, Min. days to maturity, Exclude categories, Exclude tags — re-scopes every trade-derived section (performance, decomposition, calibration, diagnostics, risk, the benchmark's strategy row) to another scenario's own run — a spread band at a `k` and a per-trade size cap (5% to 95%, or off, when the size-cap sweep ran; the run's own cap otherwise), each a standalone simulation, the caps other than the run's own simulated as the page is built — and/or to the trades left after leaving out some of its Kalshi categories and some category · tags of others (the series' first tag, so breakdowns partition; Exclude categories and Exclude tags are check-box menus: ticking a category removes its trades, ticking a tag removes that tag's trades in its category, every other tag counting in full, and nothing ticked in either shows the whole run — what the live filter's rule keeps when it excludes the categories and tags ticked, which is what the Save button sends; ticking every tag of a category leaves nothing of it; two tags of one category that differ only in letter case, which Kalshi lists a few of and the live filter reads as one tag, are ticked and unticked together, and categories that differ only in case are excluded together) of that run, whose return, drawdown, Sharpe, Sortino, median monthly return and benchmark row are then its contribution — the starting balance plus its trades' P&L as the run booked them — not a standalone simulation. A selection that leaves everything, one category or one tag (every other tag of its category ticked and every other category excluded) shows figures computed when the page was built; any other (excluding one category of three or more that hold trades, say) is combined by the page itself from each tag's own figures, and the summary line says so (Python adds each group's P&L and mean return with its own compensated sum, which the page's script repeats, since pandas 3.1 adds a sorted group with numpy's `reduceat` and could differ in the last bit). Its Tier floors choice switches every band between the run as simulated, with the 0.15/0.30 deadline-gap tier floors applied, and the band's run with them off — its own floor alone, from the tier-floors-off runs the CLI's band sweep also simulates (backtest only, at every size cap: the run's own cap from those runs themselves, every other from the lazy tier-floors-off size-cap sweep, simulated as the page is built — a run or a page without that sweep has a band the tiers bind at with the tier floors off at the run's own cap only, and the bar says so at any other); a band whose floor sits at or above both tiers was never simulated again, because the tiers never bind there, so its off view is its tier-on run, at every size cap, and says so, and a run without those runs (`--no-band-sweep`) keeps the select disabled with a "(not simulated for this run)" note. The header's trade count follows the selection too, the `k̂` breakdown and the two `k̂` cards move to the same band, tier setting and selection (the breakdown's dashed reference line, and the `k̂ − k` card, to the chosen `k`), and the Interval Discount (k) section to the chosen `k` and size cap (still at the primary spread band, with the tier floors on — it never follows the Tier floors choice) — that chart regroups the band's own `k̂` population (every time-series candidate entry, measured before the Kelly gate), not the run's trades. Every view is computed in Python by the helpers the sections render with and shipped gzip-packed — one small base block, and one chunk per distinct scenario trade list (scenarios that traded equal lists at one `k` share it), which the page unpacks only when that scenario is chosen, so a large grid does not slow the page's load; the page is streamed to disk piece by piece, never joined into one string (each packed chunk is held until it is written). The bar's band, Tier floors choice, `k` and size cap also move the Scenario Explorer's own selects to the same scenario — each only when the bar's choice on it changes, so a choice made in the explorer survives a category or tag change (they stay usable on their own), and a move the explorer has to refuse (a size cap it holds no tier-floors-off data for — none when the tier-floors-off size-cap sweep could be read; otherwise every cap but the run's own, whatever the band, unlike the bar — or a block it cannot unpack) is named on its status line and applied again on the bar's next change; category and tag reach neither it nor the Interval Discount (k) section. Set to off, the explorer's banner, heatmap and `k̂`-by-band table switch to the tier-floors-off grid and its KPI table, calibration table and equity curve read the tier-off cells — a band the tiers never bind at shows its one run — and its equity curve re-autoranges on every redraw, so a zoom never carries into another band, `k`, cap or setting; the bar's summary line says what it reaches on that page. Its Rebalance choice — no, the run as simulated, or yes — shows the same scenario re-simulated so that, at each weekly run, a held pair with room below its Kelly size is topped up and one that has grown past it, or past the size cap, is sold down to it (so a pair the run still holds can be bought again on a later Monday, sized so old and new together, with the fees paid, stay within the size cap's share of the portfolio value), its hover text naming how many days a pair must go without a trade first (7, which the week between runs already covers). Like the size cap it re-scopes the trade sections, the header's trade count and a category or tag slice, and the button below then sends the choice (as the live defaults' `rebalance`) for it (when the saved live defaults rebalance, a grey note beside the button says that saving with Rebalance no turns that off); the `k̂` figures do not depend on it, and the Scenario Explorer and the Interval Discount (k) section never follow it and always show no rebalancing, which the summary line says. While Rebalance is yes the summary line also says that each purchase that adds to a held pair, and each part a trim sells, counts as a trade of its own and, in the Risk section's Kelly chart, shows only what it added; Sell is also set to "no selling" and shut. Its Min. price movement choice, right after it — any, or 5c to 95c in 5c steps — makes an add-on or a trim wait until the pair's total price (the price of the sides held, added) has moved at least that far, up or down, since the last trade on the pair (for a held market whose partner has paid out, its own price); it is open only while Rebalance is yes, a minimum that changes nothing shows the Rebalance result itself, and the button sends the minimum shown (`off` for "any"). The selects stay disabled with a short note where the page cannot show them: "(not simulated in this backtest)" for a run without the family (`--no-rebalance-sweep`) or without the minimums (`--no-move-sweep`), "(not available on this page; see the log)" for one the page could not use. With the tier floors off, Rebalance is shown at a band the tiers never bind at (off and on are one run there) and at each band the run's tier-floors-off Rebalance runs cover; at any other band it reads as not simulated. Its Sell choice — no selling, or sell at 80% to 100% of potential profit — shows the same scenario with each position sold whole once it has held that share of its potential profit for 3 days in a row, and its Min. days to maturity choice (1 to 7, 14 or 21 days; shut under no selling) holds a sale back unless at least that many days remain before the position's last market stops trading (see [Selling at a share of potential profit](#selling-at-a-share-of-potential-profit)); every level and minimum of every scenario with Rebalance no is read after the walk, in worker processes, simulating only the settings that differ, each new trade list is a file in `backtest_dashboard_files/<build>/` beside the page, and each band's chunk ids under each Tier floors setting are one block in the page (a band the tier floors never bind at uses its tier-on block for both), unpacked the first time a level is chosen there — both loaded only when chosen. Like Rebalance, Sell re-scopes the trade sections only, and Save as live defaults… sends the level and minimum shown as the live sell level and minimum of days (or `off` for both under no selling), so a live run then sells at them. The `k̂` cards are computed from the primary calibration itself, so they render even when the bar cannot be built. The bar's selects start disabled and are enabled once the page has unpacked its base block and the run's own scenario (the Tier floors select only when the run carries its tier-floors-off runs, the Rebalance select only when it carries the Rebalance family, the Min. price movement select only while Rebalance is yes and the run carries the minimum price movements, the Sell select only when it carries the sell family, and the Min. days to maturity select only while Sell names a level), and each chart is redrawn from its layout as first drawn, so a zoom never carries into another selection; a later choice supersedes one still loading, and a scenario the run never simulated says so. If the filter's data cannot be built, the page is still written, without the bar and with a notice in its place; if the size-cap sweep cannot be simulated, the bar offers the run's own cap only and the header says the sweep could not be used; if only its tier-floors-off half cannot be, the bar keeps every cap with the tier floors on, offers the run's own cap with them off, and the header says so. After the Exclude tags menu the bar carries a "Save as live defaults…" button, rendered disabled and enabled once the page has loaded the scenario on screen, whenever that scenario can become the live settings (simulated, its band recorded, its `k` and size cap recorded and above zero, and ticks that keep a trade of the scenario shown, name nothing the defaults server refuses and make a link it takes: at most 400 categories and 400 tags, an address of at most 65,448 bytes and at most 65,246 bytes as the confirmation page posts it back); it sends the categories ticked in the Exclude categories menu, and each category with every tag ticked in the Exclude tags menu, as excluded categories and the other tags ticked as excluded tags, which replace the saved ones (a grey note beside the button names the saved exclusions a save replaces); a click opens the defaults server's confirmation page (started by `./start_dashboard.sh`, on `127.0.0.1:8765`) in a new tab for the bar's scenario on screen — never the Scenario Explorer's own selects — and that page saves it only on its own Confirm and save (or Confirm and trade, which saves before it runs). Beside it a plain "Trade using defaults…" link, which needs no script, opens the server's trade page (the saved defaults, with Dry run and Confirm and trade) in a new tab. A page whose filter bar could not be built has no save button, but keeps the trade link under the notice in the bar's place; the link's id is how the server tells a new page from one built before these buttons. Every run overwrites the one `backtest_dashboard.html` in the repo root and replaces its `backtest_dashboard_files/` folder. |
+| `dashboard.py` | Generates an HTML performance report from backtest results, self-contained but for its chunk files (`backtest_dashboard_files/` beside it: every scenario but the run's own, and the Sell select's) — nine sections: cumulative return lines (total plus one each for ladder and cross-event pairs) / Sharpe/Sortino/drawdown KPIs plus mean and median return per trade and the median monthly return, returns decomposition (P&L by Kalshi's official category and by category · tag, with a per-group table), time-series spread calibration (each traded pair's entry mid spread — the later market's midpoint minus the earlier one's, a midpoint being halfway between a market's YES ask and its YES bid: the market-implied probability that the event lands between the two deadlines, and the input the forecast reads — against the rate the pairs settled A = NO, B = YES, with Brier score and log loss), an interval-discount (`k`) calibration section (the pooled empirical `k̂`, one equity curve and a per-`k` table at the primary spread band with the tier floors on, which the filter bar's `k` and size cap move), two Portfolio Performance cards with the selection's empirical `k̂` and `k̂ − k` (the `k̂ − k` red when positive, i.e. the sizer sized too big; under the `k̂` its 95% confidence interval, counting each event once), an empirical `k̂` breakdown (a bar chart and table of `k̂` by Kalshi category, by tag or by spread band, each bar naming its entries and distinct events, with a Group-by `<select>` of its own and a dashed line at the page's `k` — the run's own as rendered, the filter bar's once one is chosen), a scenario-explorer section over every spread band x `k` x per-trade size cap of the band sweep (a fragility banner for the cap shown, a spread-band x `k` heatmap whose metric menu offers mean, median and total return, Sharpe ratio (blank on a cell with no trade), H1/H2 returns, trade count, each band's empirical `k̂` and `k̂ − k` — both red where `k̂` exceeds `k`, as on the cards — a one-row-per-band `k̂` table, and a per-population KPI table, with band, `k` and size-cap `<select>`s of its own — and a Tier floors `<select>` when the run carries the band sweep's tier-floors-off runs — that the filter bar also moves; its data comes from the same one walk as the bar's and ships as one gzip-packed block per size cap, plus a tier-floors-off block per size cap, each unpacked only when chosen), trade diagnostics (best and worst five trades with each leg's side, price, close date and settlement), risk metrics, and an S&P 500 benchmark comparison whose download window opens on the same date as the equity curve's leading initial-balance row. The page header names the run's primary spread band, same-event-ladder setting and per-trade size cap (and whether the size-cap sweep ran), and, on the lines under them, the entry checkpoint every trade was entered at — the backtest's weekly entry time, `config.SCHEDULED_RUN` (the live runs are at other times) — and how the primary scenario's trades filled: how many walked a modeled order book (and from which depth snapshots) and how many filled at the top of the book, or, in red, that no depth snapshot was usable so every trade did. An Extra data line under it names the scheduled close (and how many pair markets used one), the stale-quote check's hours, the volume cap and the fee multipliers charged as listed, each `off` when the run turned it off, then whether every integrity check over the pair markets passed (in red, naming each failing check, when one did not) and Kalshi's crossed candles, which are its own data and never a failure. The trade rows show the average price each leg paid and, when known, a leg's scheduled close where it differs from the realized one, its quote's age at entry and the share of the next day's volume the trade took, and the Kelly scatter prices the legs at it, with a time-series trade's chance of profit read from the mid spread of its entry quotes, as the live sizer reads it. A sticky filter bar at the top — Spread band, Tier floors, k, Size cap, Rebalance, Min. price movement, Sell, Min. days to maturity, Exclude categories, Exclude tags — re-scopes every trade-derived section (performance, decomposition, calibration, diagnostics, risk, the benchmark's strategy row) to another scenario's own run — a spread band at a `k` and a per-trade size cap (5% to 95%, or off, when the size-cap sweep ran; the run's own cap otherwise), each a standalone simulation, the caps other than the run's own simulated as the page is built — and/or to the trades left after leaving out some of its Kalshi categories and some category · tags of others (the series' first tag, so breakdowns partition; Exclude categories and Exclude tags are check-box menus: ticking a category removes its trades, ticking a tag removes that tag's trades in its category, every other tag counting in full, and nothing ticked in either shows the whole run — what the live filter's rule keeps when it excludes the categories and tags ticked, which is what the bar passes the dashboard's Trading tab; ticking every tag of a category leaves nothing of it; two tags of one category that differ only in letter case, which Kalshi lists a few of and the live filter reads as one tag, are ticked and unticked together, and categories that differ only in case are excluded together) of that run, whose return, drawdown, Sharpe, Sortino, median monthly return and benchmark row are then its contribution — the starting balance plus its trades' P&L as the run booked them — not a standalone simulation. A selection that leaves everything, one category or one tag (every other tag of its category ticked and every other category excluded) shows figures computed when the page was built; any other (excluding one category of three or more that hold trades, say) is combined by the page itself from each tag's own figures, and the summary line says so (Python adds each group's P&L and mean return with its own compensated sum, which the page's script repeats, since pandas 3.1 adds a sorted group with numpy's `reduceat` and could differ in the last bit). Its Tier floors choice switches every band between the run as simulated, with the 0.15/0.30 deadline-gap tier floors applied, and the band's run with them off — its own floor alone, from the tier-floors-off runs the CLI's band sweep also simulates (backtest only, at every size cap: the run's own cap from those runs themselves, every other from the lazy tier-floors-off size-cap sweep, simulated as the page is built — a run or a page without that sweep has a band the tiers bind at with the tier floors off at the run's own cap only, and the bar says so at any other); a band whose floor sits at or above both tiers was never simulated again, because the tiers never bind there, so its off view is its tier-on run, at every size cap, and says so, and a run without those runs (`--no-band-sweep`) keeps the select disabled with a "(not simulated for this run)" note. The header's trade count follows the selection too, the `k̂` breakdown and the two `k̂` cards move to the same band, tier setting and selection (the breakdown's dashed reference line, and the `k̂ − k` card, to the chosen `k`), and the Interval Discount (k) section to the chosen `k` and size cap (still at the primary spread band, with the tier floors on — it never follows the Tier floors choice) — that chart regroups the band's own `k̂` population (every time-series candidate entry, measured before the Kelly gate), not the run's trades. Every view is computed in Python by the helpers the sections render with and shipped gzip-packed — one small base block, and one chunk per distinct scenario trade list (scenarios that traded equal lists at one `k` share it), which the page unpacks only when that scenario is chosen, so a large grid does not slow the page's load; the page is streamed to disk piece by piece, never joined into one string (each packed chunk is held until it is written). The bar's band, Tier floors choice, `k` and size cap also move the Scenario Explorer's own selects to the same scenario — each only when the bar's choice on it changes, so a choice made in the explorer survives a category or tag change (they stay usable on their own), and a move the explorer has to refuse (a size cap it holds no tier-floors-off data for — none when the tier-floors-off size-cap sweep could be read; otherwise every cap but the run's own, whatever the band, unlike the bar — or a block it cannot unpack) is named on its status line and applied again on the bar's next change; category and tag reach neither it nor the Interval Discount (k) section. Set to off, the explorer's banner, heatmap and `k̂`-by-band table switch to the tier-floors-off grid and its KPI table, calibration table and equity curve read the tier-off cells — a band the tiers never bind at shows its one run — and its equity curve re-autoranges on every redraw, so a zoom never carries into another band, `k`, cap or setting; the bar's summary line says what it reaches on that page. Its Rebalance choice — no, the run as simulated, or yes — shows the same scenario re-simulated so that, at each weekly run, a held pair with room below its Kelly size is topped up and one that has grown past it, or past the size cap, is sold down to it (so a pair the run still holds can be bought again on a later Monday, sized so old and new together, with the fees paid, stay within the size cap's share of the portfolio value), its hover text naming how many days a pair must go without a trade first (7, which the week between runs already covers). Like the size cap it re-scopes the trade sections, the header's trade count and a category or tag slice, and the dashboard's Trading tab follows the choice (as the live defaults' `rebalance`; when the saved live defaults rebalance, a grey note after the Exclude menus says that Rebalance no proposes turning that off); the `k̂` figures do not depend on it, and the Scenario Explorer and the Interval Discount (k) section never follow it and always show no rebalancing, which the summary line says. While Rebalance is yes the summary line also says that each purchase that adds to a held pair, and each part a trim sells, counts as a trade of its own and, in the Risk section's Kelly chart, shows only what it added; Sell is also set to "no selling" and shut. Its Min. price movement choice, right after it — any, or 5c to 95c in 5c steps — makes an add-on or a trim wait until the pair's total price (the price of the sides held, added) has moved at least that far, up or down, since the last trade on the pair (for a held market whose partner has paid out, its own price); it is open only while Rebalance is yes, a minimum that changes nothing shows the Rebalance result itself, and the Trading tab follows the minimum shown (`off` for "any"). The selects stay disabled with a short note where the page cannot show them: "(not simulated in this backtest)" for a run without the family (`--no-rebalance-sweep`) or without the minimums (`--no-move-sweep`), "(not available on this page; see the log)" for one the page could not use. With the tier floors off, Rebalance is shown at a band the tiers never bind at (off and on are one run there) and at each band the run's tier-floors-off Rebalance runs cover; at any other band it reads as not simulated. Its Sell choice — no selling, or sell at 80% to 100% of potential profit — shows the same scenario with each position sold whole once it has held that share of its potential profit for 3 days in a row, and its Min. days to maturity choice (1 to 7, 14 or 21 days; shut under no selling) holds a sale back unless at least that many days remain before the position's last market stops trading (see [Selling at a share of potential profit](#selling-at-a-share-of-potential-profit)); every level and minimum of every scenario with Rebalance no is read after the walk, in worker processes, simulating only the settings that differ, each new trade list is a file in `backtest_dashboard_files/<build>/` beside the page, and each band's chunk ids under each Tier floors setting are one block in the page (a band the tier floors never bind at uses its tier-on block for both), unpacked the first time a level is chosen there — both loaded only when chosen. Like Rebalance, Sell re-scopes the trade sections only, and the Trading tab follows the level and minimum shown as the live sell level and minimum of days (or `off` for both under no selling), so a live run sells at them once they are saved there. The `k̂` cards are computed from the primary calibration itself, so they render even when the bar cannot be built. The bar's selects start disabled and are enabled once the page has unpacked its base block and the run's own scenario (the Tier floors select only when the run carries its tier-floors-off runs, the Rebalance select only when it carries the Rebalance family, the Min. price movement select only while Rebalance is yes and the run carries the minimum price movements, the Sell select only when it carries the sell family, and the Min. days to maturity select only while Sell names a level), and each chart is redrawn from its layout as first drawn, so a zoom never carries into another selection; a later choice supersedes one still loading, and a scenario the run never simulated says so. If the filter's data cannot be built, the page is still written, without the bar and with a notice in its place; if the size-cap sweep cannot be simulated, the bar offers the run's own cap only and the header says the sweep could not be used; if only its tier-floors-off half cannot be, the bar keeps every cap with the tier floors on, offers the run's own cap with them off, and the header says so. The bar has no button: shown in the dashboard's Backtest tab, it and the dashboard's Trading tab (the defaults server's trading page) show the same settings, each following the other through the dashboard's tab page (see [The Trading tab](#the-trading-tab)). Both open on the Trading tab's first proposal (the live defaults in force, or, with none in force, what the Trading tab proposes instead); a choice on the bar (never one in the Scenario Explorer's own selects), simulated or not, moves the Trading tab, changing there only the settings chosen (a value off the page's menus, a setting of a view the page lacks, a category or tag it does not list and a sell level beside rebalancing stay as the Trading tab has them), and a change on the Trading tab redraws the bar for that scenario, which moves the explorer's selects as any bar change does. A red note on the bar names each setting of the Trading tab's proposal the bar cannot show, and says why a choice is not passed on: a scenario whose band, `k` or size cap the run did not record, ticks that keep no trade of the scenario shown, a name the defaults server refuses, or more than one proposal carries (more than 400 categories or 400 tags, a query over 65,512 bytes after `/confirm?`, or over 65,246 bytes as the trading page posts it back). Once a box is ticked or unticked, the ticks go as excluded categories (each category ticked in the Exclude categories menu, and each with every tag ticked in the Exclude tags menu) and excluded tags (the other tags ticked), which replace the Trading tab's but for names the page does not list; grey notes after the Exclude tags menu say what the Trading tab will propose in place of the saved defaults. Nothing on the page saves or trades: only the Trading tab's own Confirm and save (or Confirm and trade, which saves first when anything changes) does. Opened on its own, outside the dashboard, the page talks to nothing. Every run overwrites the one `backtest_dashboard.html` in the repo root, replaces its `backtest_dashboard_files/` folder, and writes `backtest_filter_names.json` beside it, the categories and tags the bar's menus list, which the Trading tab's own Exclude menus list (a page whose bar could not be built writes none, and removes an older one). |
 | `backtest.py` | CLI entry point for the backtest pipeline. Parses arguments (including `--interval-discount`, `--no-sweep`, `--same-event-ladders` / `--no-same-event-ladders`, the backtest-only `--spread-min` / `--spread-max` / `--no-band-sweep`, `--no-cap-sweep`, `--no-rebalance-sweep`, `--no-move-sweep`, `--no-maturity-sweep`, `--no-sell-sweep`, `--sell-workers`, `--no-eda`, `--dashboard-only` and `--accept-changed-simulator`), builds the historical API clients, takes the starting balance from `--balance` or else reads what the Kalshi account is worth now (`auth.read_account_balance`: its cash plus Kalshi's value of its open positions), fits the depth model from the saved order-book snapshots before the fetch (`depth_model.load_depth_model()`; its config echo ends with `fills=walked book (...)` or `fills=top of book (no usable depth snapshot)`), reads Kalshi's /series listing once (`historical.load_series_categories()`), calls `backtester.run_backtest_sweep()` then `dashboard.generate_dashboard()` (handed that listing) (whose header says where the starting balance came from), and logs a summary of the primary result. Between the two it saves what the dashboard is handed to `backtest_sweep.pkl.gz`, stamped with a fingerprint of the simulator's code; `--dashboard-only` rebuilds the page from that file without running the backtest (no fetch, no Kalshi request), refusing a file whose fingerprint differs from the code's unless `--accept-changed-simulator` is given, and a file saved in an earlier format (before the one Rebalance family, or before the live category filter became a list of categories to exclude) always. Both paths end by rebuilding the Data page (`eda.build_eda_page`, the live dashboard's Data tab) with the run's sweep and listing, unless `--no-eda`; a failure there is one WARNING and changes neither the exit code nor the backtest page. |
-| `defaults_server.py` | Human-run local web server (`./start_dashboard.sh [--seed]`, which runs `python3 -m kalshi_betting.defaults_server [--seed] [--no-browser]` from its own checkout, in the background beside the live dashboard, on `127.0.0.1:8765`) whose pages save the live defaults, `live_defaults.json`, and start live trading runs with them (see [Trade from the browser](#trade-from-the-browser)). Its confirmation page is opened with the proposed settings in its address (by `--seed`, which proposes the seed values, or by the backtest dashboard) and shows the defaults in force beside the proposed ones with every change highlighted and, in red, every warning a live run would log about the proposed settings; its trade page (`/trade`) shows the saved defaults. Their buttons, always in one order — Dry run, Confirm and save (the confirmation page only), then, set apart below a red line, Confirm and trade — save the file (through `config.save_live_defaults`) or start `python -m kalshi_betting.main --mode prod` with every toggle as a flag, in its own session, its folder under `live_runs/`, and send the browser to the run's page (`/runs/<id>`), which follows the run and then sums up its outcome from the result file the run writes (with a Sales table when the run sold or trimmed). Closing a tab cancels; a button that does not apply is shown disabled with its reason. A saved file an older version wrote (holding `add_to_held_pairs`, `trim_to_kelly` or `trim_min_rise`, which `rebalance` and `min_price_move` replaced, `categories`, the old list of categories to trade, which `exclude_categories` replaced, `tags`, the old list of tags to trade, which `exclude_tags` replaced, or `same_title_size_cap`, an extra per-trade cap on same-title pairs, which nothing replaced, since the bot trades time-series pairs only) is never traded: the confirmation page counts nothing as in force and offers the file's values in their new form (no category or tag excluded, no same-title cap), which one Confirm and save writes over it; when the old `categories` or `tags` listed names, every page that offers those values says in red that they trade every category, or every tag, and how to keep the old filter (an `exclude_category` or `exclude_tag` field for each one to leave out); the index, the trade page and the saved page link to that page, and a link that still names one of the older settings (`category`, `tag` and `same_title_size_cap` among them) is refused, saying to rebuild the dashboard or open the server's start page. A confirmation link names the categories to exclude as `exclude_category` and the tags to exclude as `exclude_tag`, each repeatable, at most 400 of each. It never serves the dashboard, listens on loopback only, answers one request at a time, and refuses a save or a run unless the request names this server (Host), comes from its own page (Origin), carries the token and the one-time nonce that page was built with, and finds the same defaults still in force (a page gone stale is shown again against the defaults now in force); a page posted twice does its work once. A run is refused while one it started is still going, a real-money run while another live trading run holds the machine's lock, and a real-money run after one that needed attention until a box is ticked. Its buttons are enabled only after the page has been visible for a second and the mouse moves or a key is pressed, and disabled once one is clicked. It never places an order itself and never stops a run. On start it opens the page asked for (the launcher passes it `--no-browser` unless `--seed`, since the live dashboard opens the page): with `--seed` the seed values' confirmation page; otherwise the backtest dashboard, or its own index when there is none, the dashboard was built before its Save and Trade buttons, or it cannot be read (it reads the first 1 MiB of the file for the Trade link's id, and logs a WARNING naming the rebuild, or the reason it could not read it). When its port is already taken, it binds nothing and starts nothing: if the listener's `/checkout` names this checkout and the code this checkout has now, it opens that page from the running server and exits 0; if it names another checkout, or this one with code from before a change (a pull or an edit since that server started — stop it and start it again), or the listener is not a defaults server, it exits 2. Logs to `kalshi_defaults_server.log` (a start that finds its own server running logs to the terminal only). Imports `config.py` and `run_lock.py` only; nothing imports it. |
+| `defaults_server.py` | Human-run local web server (`./start_dashboard.sh [--seed]`, which runs `python3 -m kalshi_betting.defaults_server [--seed] [--no-browser]` from its own checkout, in the background beside the live dashboard, on `127.0.0.1:8765`) whose pages save the live defaults, `live_defaults.json`, and start live trading runs with them (see [The Trading tab](#the-trading-tab) and [Trade from the browser](#trade-from-the-browser)). Its trading page (`/confirm`), which the dashboard shows as its Trading tab, opens on the live defaults in force exactly as saved (for a file an older version saved, its values in their new form; with none saved, the seed values), or on the settings its address names (`--seed` proposes the seed values); a dropdown bar at its top, the backtest page's eleven filter-bar settings in their order and words, proposes other values, each choice loading the page again, and under it the page shows the defaults in force beside the proposed ones with every change highlighted and, in red, every warning a live run would log about the proposed settings. Its buttons, always in one order — Dry run, Confirm and save, then, set apart below a red line, Confirm and trade — save the file (through `config.save_live_defaults`; with nothing changed, Confirm and save writes nothing and says so) or start `python -m kalshi_betting.main --mode prod` with every toggle as a flag, in its own session, its folder under `live_runs/` (Confirm and trade saves first when anything changes, and with nothing changed runs the saved defaults), and send the browser to the run's page (`/runs/<id>`, which the dashboard shows as its Run tab), which follows the run and then sums up its outcome from the result file the run writes (with a Sales table when the run sold or trimmed). `/trade`, the address of the separate trade page the trading page replaced, sends the browser to `/confirm`. Closing a tab cancels; a button that does not apply is shown disabled with its reason. A saved file an older version wrote (holding `add_to_held_pairs`, `trim_to_kelly` or `trim_min_rise`, which `rebalance` and `min_price_move` replaced, `categories`, the old list of categories to trade, which `exclude_categories` replaced, `tags`, the old list of tags to trade, which `exclude_tags` replaced, or `same_title_size_cap`, an extra per-trade cap on same-title pairs, which nothing replaced, since the bot trades time-series pairs only) is never traded: the trading page counts nothing as in force and offers the file's values in their new form (no category or tag excluded, no same-title cap), which one Confirm and save writes over it; when the old `categories` or `tags` listed names, every page that offers those values says in red that they trade every category, or every tag, and how to keep the old filter (an `exclude_category` or `exclude_tag` field for each one to leave out); the index and the saved page link to that page, and a link that still names one of the older settings (`category`, `tag` and `same_title_size_cap` among them) is refused, saying to open the trading page again from the dashboard's Trading tab or from the server's home page. A confirmation link names the categories to exclude as `exclude_category` and the tags to exclude as `exclude_tag`, each repeatable, at most 400 of each. It never serves the dashboard, listens on loopback only, answers one request at a time, and refuses a save or a run unless the request names this server (Host), comes from its own page (Origin), carries the token and the one-time nonce that page was built with, and finds the same defaults still in force (a page gone stale is shown again against the defaults now in force); a page posted twice does its work once. Its pages may be shown in a frame only by the dashboard's tab page (`127.0.0.1:8766` or `localhost:8766`), never by the backtest page; they only tell that page what they show (the trading page its proposal, a run page its run's id) and take no message from any page. A run is refused while one it started is still going, a real-money run while another live trading run holds the machine's lock, and a real-money run after one that needed attention until a box is ticked. Its buttons are enabled only after the page has been visible for a second and the mouse moves or a key is pressed, and disabled once one is clicked; a choice in the dropdown bar leaves nothing on the page clickable until the page for it arrives. It never places an order itself and never stops a run. On start it opens the page asked for (the launcher passes it `--no-browser` unless `--seed`, since the live dashboard opens the page): with `--seed` the trading page proposing the seed values; otherwise its trading page, on the live defaults in force. When its port is already taken, it binds nothing and starts nothing: if the listener's `/checkout` names this checkout and the code this checkout has now, it opens that page from the running server and exits 0; if it names another checkout, or this one with code from before a change (a pull or an edit since that server started — stop it and start it again), or the listener is not a defaults server, it exits 2. Logs to `kalshi_defaults_server.log` (a start that finds its own server running logs to the terminal only). Imports `config.py` and `run_lock.py` only; nothing imports it. |
 | `live_portfolio.py` | Works out how the live account is doing, for the Live trading tab (reporting only: nothing trades, sizes or saves on it). Reads the account from Kalshi with read-only GETs — every fill, settlement, deposit, withdrawal and credit (the interest and rewards Kalshi pays in), then the balance and the positions — and the bot's trade log; matches each of the bot's purchases to the Kalshi order that made it (every other fill is "Other bets", the bot's sale orders included, which are read as sales by hand; a sale row in the log, a Kelly trim's included, is never a purchase); replays every fill and payout, oldest first, into a ledger of each owner's contracts and cash (a fill's direction from its `book_side` alone); values the account over time (each holding at its midpoint) just before the bot's first trade, at each of Kalshi's daily closes, at each deposit or withdrawal and now, by category; and works out each period's statistics (total return, profit, Sharpe and Sortino, mean and median trade, each category's return), the holdings now and whether the cash each run logged (above its sales, when it sold, and above its purchases) matches Kalshi's records. Each read adds one JSON line to `live_portfolio_log.jsonl`. See [Live trading tab](#live-trading-tab). |
-| `live_dashboard.py` | Human-run, read-only local web server for the dashboard's three tabs (`python3 -m kalshi_betting.live_dashboard [--no-browser]`, or started by `./start_dashboard.sh`): the Live trading tab and its data on `127.0.0.1:8766` (the account read from Kalshi through `live_portfolio.py` on every page load), and the backtest page with its chunk files and the Data page (`eda_dashboard.html`, at `/eda/`) on `127.0.0.1:8767`, which the Backtest and Data tabs each show in a sandboxed frame, loaded the first time the tab is chosen and emptied again if the tab stays hidden for `LIVE_DASHBOARD_FRAME_UNLOAD_SECONDS` (5 minutes), so the browser frees the page. Two ports are two web origins, so nothing on the backtest or Data page can read the account. It formats every number and sentence the page shows, reads one account at a time, sends Kalshi GET requests only, never loads the order path, and refuses requests from other web sites. A second start reuses this checkout's running dashboard (it opens the page and exits); a port held by anything else is refused (exit 2). Logs to `kalshi_live_dashboard.log`. Imports `config.py`, `live_portfolio.py`, `historical.py`, `treasury.py` and `_http.py`; nothing imports it. |
+| `live_dashboard.py` | Human-run, read-only local web server for the dashboard's tab page (`python3 -m kalshi_betting.live_dashboard [--no-browser]`, or started by `./start_dashboard.sh`): the tab page (the Live trading, Backtest, Trading and Data tabs, and a Run tab once a run starts) and the Live trading tab's data on `127.0.0.1:8766` (the account read from Kalshi through `live_portfolio.py` on every page load), and the backtest page with its chunk files and the Data page (`eda_dashboard.html`, at `/eda/`) on `127.0.0.1:8767`, which the Backtest and Data tabs each show in a sandboxed frame, loaded the first time the tab is chosen and emptied again if the tab stays hidden for `LIVE_DASHBOARD_FRAME_UNLOAD_SECONDS` (5 minutes), so the browser frees the page. The Trading and Run tabs show the defaults server's trading page and the latest run's page (`127.0.0.1:8765`) in frames of their own: the tab page only points those frames at addresses, passes the Trading tab's proposal to the backtest page and a choice on the backtest page's bar (while the Backtest tab is shown) to the Trading tab, and loads the trading page again each time its tab is chosen from another, so its buttons arm in sight. Two ports are two web origins, so nothing on the backtest or Data page can read the account. It formats every number and sentence the page shows, reads one account at a time, sends Kalshi GET requests only, never loads the order path, and refuses requests from other web sites. A second start reuses this checkout's running dashboard (it opens the page and exits); a port held by anything else is refused (exit 2). Logs to `kalshi_live_dashboard.log`. Imports `config.py`, `live_portfolio.py`, `historical.py`, `treasury.py` and `_http.py`; nothing imports it. |
 | `v2_probe.py` | Human-run CLI that verifies the V2 order path's NO-leg mapping, fill-or-kill kill semantics, and the inter-shard transfer's centicent unit against the production account for roughly one cent of exposure. Its `--step yes-close` also verifies the one order shape live selling and live trimming send that no other step does, a reduce-only ask that sells a held YES: it buys 0.01 YES, sells it back, and PASSes only when the account reads flat and the sale's reply reports the 0.01 sold. Its closing reduce-only bid is priced at the top of the market's own grid (0.99 / 0.999 / 0.9999 by tick regime), not at the rollback builder's loss floor, so that floor can no longer cause a FAIL unrelated to the mapping (a book with no reachable resting YES ask still can); `reduce_only` is what bounds that bid. A 2xx order body that is not a JSON object, in either step that reads one (DR-58), and — in the NO-buy step only — an object whose fill counts are unreadable (DR-60), are a clean FAIL that still reads the position, re-reads it once when that first read is `None` or `0`, and reports lookup-failed, position-open and genuinely-flat as three distinct outcomes, never a traceback out of the fill readers. Two of the unfillable-ask step's branches are recorded residuals — its unreadable-fill-counts branch and its `not killed` branch both FAIL without re-reading the account. The NO-buy step classifies readable fill counts into three outcomes, not two — a complete fill, a true kill, and a fill-or-kill invariant violation — so a partial fill FAILs naming the counts and re-reading the account rather than being reported as a clean kill with the account "still flat" (DR-20); the unfillable-ask step always read a partial that way. Both steps judge a 2xx on `fill_count` AND `remaining_count`, which is deliberately stricter than the live `trader._v2_fill_status`, whose contract is `fill_count` alone. The exchange's HTTP 409 kill response to a fill-or-kill (`trader._is_fok_kill`) is read as a kill — PASS on the unfillable ask, NEUTRAL on the NO buy, when the account reads flat — and the close's verdict is judged on one re-read when the read after it is not exactly 0. `--dest-shard` equal to the source shard is refused with a NEUTRAL at the top of the transfer step, before any transfer I/O, so it can no longer POST a net-zero self-transfer and then report a false in-flight FAIL (DR-22). It refuses to start (exit 2) on any `config.ORDER_API_VERSION` but `"v2"`. The FAIL lines that doubt the V2 path after a submission on an account the probe checked was flat tell the operator to stop trading and flatten any position on the probed ticker by hand in the Kalshi UI. The closing line depends on the result: after a FAIL it says to stop trading — and, for an order step, to act only on the position warnings printed above, never by itself to flatten, since a FAIL before anything was submitted opened nothing and the ticker may carry the bot's own position; for the transfer step, to check each shard's balance — and after a NEUTRAL it says nothing needs doing. Its informational fee check compares the exchange's `average_fee_paid` — per contract, by Kalshi's API reference, and including Kalshi's rounding of the order's total fee up to the account's balance precision — with the fee model per contract at the fill price: before rounding, as `config.fee_leg_exact(1, p)` for one whole contract, and rounded as Kalshi rounds the probe's order, which is the figure a 0.01-contract charge should match. Never imported by the pipeline. |
 
 ### Order API version
@@ -709,14 +714,16 @@ falls back to `kalshi_private_key.pem` when it's absent.
   kalshi_backtest.log             ← Backtest log file (auto-created)
   scheduler_state.json            ← Scheduler's claimed-slot record (auto-created)
   start_dashboard.sh              ← Starts the live dashboard and the defaults server and opens the
-                                    page on its Live trading tab (./start_dashboard.sh [--seed]
+                                    page on its Live trading tab; its Trading tab saves the live
+                                    defaults and starts live runs (./start_dashboard.sh [--seed]
                                     [--no-browser]; KALSHI_PYTHON picks the Python)
   kalshi_live_dashboard.log       ← The live dashboard's log (auto-created; rotates 5 MB x 3)
   live_portfolio_log.jsonl        ← One line per load of the Live trading tab: the cash and every
                                     holding with its value (gitignored)
   live_defaults.json              ← The saved live defaults every live run starts from (gitignored;
-                                    written only by defaults_server's Confirm and save or Confirm
-                                    and trade; no file, no live run — see Live trading toggles)
+                                    written only by Confirm and save or Confirm and trade on the
+                                    defaults server's trading page, the dashboard's Trading tab;
+                                    no file, no live run — see Live trading toggles)
   kalshi_defaults_server.log      ← The defaults server's log (auto-created; rotates 5 MB x 3)
   live_runs/                      ← One folder per run the defaults server starts (gitignored):
                                     run.json (what the run is), output.log (everything it
@@ -725,6 +732,9 @@ falls back to `kalshi_private_key.pem` when it's absent.
   backtest_dashboard_files/       ← The chunks the dashboard loads when a scenario or a Sell level
                                     is chosen, one folder per build (keep it beside the page; each
                                     build deletes the last's)
+  backtest_filter_names.json      ← The categories and tags the backtest page's filter bar lists,
+                                    which the Trading tab's Exclude menus list too (gitignored;
+                                    rewritten by every build of the page)
   backtest_sweep.pkl.gz           ← What the last full backtest run handed the dashboard
                                     (gitignored; replaced by every run): `--dashboard-only`
                                     rebuilds the page from it
@@ -792,7 +802,7 @@ that file, not in the terminal that launched it.
 ### Save the live defaults (do this first after upgrading)
 
 ```bash
-./start_dashboard.sh     # step 1, then open http://127.0.0.1:8765/ (or, with no file yet, step 1 of "Turn on live rebalancing")
+./start_dashboard.sh     # step 1, then open the dashboard's Trading tab (or, with no file yet, step 1 of "Turn on live rebalancing")
 ```
 
 Every live run starts from the saved live defaults, `live_defaults.json`, and
@@ -801,8 +811,8 @@ cannot be used — the scheduled runs included, and hand runs (dry runs,
 and runs with toggle flags) too. Every file saved before the same-title cap
 was removed holds the old `same_title_size_cap` key, which every older
 version required, and is refused, so after pulling this change every live
-run exits `2` until the defaults are saved again through the defaults
-server, which offers the old file's values with no same-title cap (see the
+run exits `2` until the defaults are saved again in the dashboard's Trading
+tab, which opens on the old file's values with no same-title cap (see the
 fourth bullet of step 1). A file older still also holds the old `tags` key
 (saved before the tag filter became a list of tags to exclude) or the old
 `categories` key (saved before the category filter became a list of
@@ -816,16 +826,17 @@ into the checkout the scheduler runs from, in that checkout:
    - **A file saved before Rebalance** — one holding `add_to_held_pairs`,
      `trim_to_kelly` or `trim_min_rise`, the three settings `rebalance` and
      `min_price_move` replaced — is refused by every live run until it is
-     saved again: nothing trades from it. Open `http://127.0.0.1:8765/` and
-     follow its red notice to the confirmation page. It shows the file's
-     values in their new form: Rebalance yes when both old switches were on,
+     saved again: nothing trades from it. Open the dashboard's Trading tab:
+     under a red notice it shows the file's values in their new form
+     (`http://127.0.0.1:8765/` links to the same page): Rebalance yes when
+     both old switches were on,
      with the old minimum price rise as its Min. price movement; otherwise
      Rebalance no, with no minimum; every other setting as saved. Check the
      table and click Confirm and save, which replaces the file. The new file
      carries no source note, so its origin names only when it was saved. Do not
      delete the file: the server offers its values only while it is there.
-     While it is there, a confirmation link that names only some fields (the
-     dashboard's Save button, say) keeps the rest as the file had them. A file
+     While it is there, a confirmation link that names only some fields (a
+     link made by hand, say) keeps the rest as the file had them. A file
      that both added to held pairs and trimmed reads as Rebalance yes, so its
      runs go on doing both. A file that did only one of the two reads as
      Rebalance no, so its runs stop doing either. Save it that way: Rebalance
@@ -840,26 +851,29 @@ into the checkout the scheduler runs from, in that checkout:
      trade, `null` for any),
      which `exclude_categories` (a list of categories not to trade)
      replaced — is refused by every live run until it is saved again, the
-     same way. Open `http://127.0.0.1:8765/` and follow its red notice: the
-     confirmation page offers the file's values with no category excluded and
-     every other setting as saved (a file saved before Rebalance as well gets
+     same way. Open the dashboard's Trading tab (or `http://127.0.0.1:8765/`
+     and its red notice): it offers the file's values with no category
+     excluded and every other setting as saved (a file saved before Rebalance as well gets
      both changes at once, as above). A file whose `categories` was `null`
      traded every category and still does. A file that listed categories to
      trade has no exact reading as a list to exclude, so its values as offered
      trade **every** category: a second red paragraph names the categories
      the old file traded and says how to keep that filter — add
      `&exclude_category=<name>` to the page's address for each category to
-     leave out (or save from the rebuilt dashboard with those categories
-     ticked in its Exclude categories menu). Then click Confirm and save,
+     leave out (or do step 2 first, then tick those categories in the
+     Trading tab's Exclude categories menu, which lists every category only
+     once this version has rebuilt the backtest dashboard). Then click
+     Confirm and save,
      which replaces the file; do not delete it. A file whose old
      `categories` the older version would itself have refused (not `null` or
      a list of names, or with a tag tied to a category it did not list) gets
-     no offer: save new defaults from the seed values or the dashboard.
+     no offer: the Trading tab opens on the seed values instead, and one
+     Confirm and save there replaces the file with them.
    - **A file saved before the tag filter became a list of tags to
      exclude** — every file saved before that change, since each holds
      `tags` (the old list of tags to trade, `null` for any), which
      `exclude_tags` (a list of tags not to trade) replaced — is refused the
-     same way. The confirmation page offers its values with no tag excluded
+     same way. The Trading tab offers its values with no tag excluded
      and every other setting as saved (a file older still gets every change
      at once). A file whose `tags` was `null` traded every tag and still
      does. A file that listed tags to trade (a plain tag limited every
@@ -867,23 +881,26 @@ into the checkout the scheduler runs from, in that checkout:
      trading **every** tag: a red paragraph names the tags it limited trading
      to and says how to keep that filter — add `&exclude_tag=<name>` to the
      page's address for each tag to leave out, "Category · Tag" for a tag of
-     one category (or save from the rebuilt dashboard with those tags ticked
-     in its Exclude tags menu). Then click Confirm and save, which replaces the
+     one category (or do step 2 first, then tick those tags in the Trading
+     tab's Exclude tags menu, which lists every tag only once this version
+     has rebuilt the backtest dashboard). Then click Confirm and save, which
+     replaces the
      file; do not delete it. A file whose old `tags` the older version would
      itself have refused gets no offer.
    - **A file saved before the same-title cap was removed** — every file
      saved before this change, since each holds `same_title_size_cap` (an
      extra per-trade cap on same-title pairs, which every older version
      required), which nothing replaced, since the bot now trades time-series
-     pairs only — is refused the same way. Open `http://127.0.0.1:8765/`:
-     its red notice says the saved live defaults "were saved before the
-     same-title cap was removed", and its link opens the confirmation page,
-     which offers the file's values with no same-title cap and every other
-     setting as saved (a file older still gets every change at once). Check
+     pairs only — is refused the same way. Open the dashboard's Trading tab:
+     it opens on the file's values with no same-title cap and every other
+     setting as saved (a file older still gets every change at once), under a
+     red notice saying the saved live defaults were saved before the
+     same-title cap was removed (`http://127.0.0.1:8765/` says the same and
+     links there). Check
      the table and click Confirm and save, which replaces the file; do not
      delete it. A file whose old cap the older version would itself have
-     refused (not a multiple of 5% from 5% to 100%) gets no offer: save new
-     defaults from the seed values or the dashboard. Code from before this
+     refused (not a multiple of 5% from 5% to 100%) gets no offer: the
+     Trading tab opens on the seed values instead. Code from before this
      change refuses a file this change saves (it requires
      `same_title_size_cap`), so pull in every checkout that trades and
      restart its servers and scheduler daemon together: a defaults server
@@ -905,18 +922,19 @@ into the checkout the scheduler runs from, in that checkout:
    backtest runs from 2024-01-01, a far longer fetch. It is a full run:
    `--dashboard-only` refuses a saved sweep from before this change
    (`backtest-sweep-v6` or earlier).
-   Until the dashboard is rebuilt, the old page cannot save: a page built
-   before this change sends its backtest's same-title cap
-   (`same_title_size_cap`), which the defaults server refuses ("this link
-   names same_title_size_cap, which is no longer used …"); on a page that shows adding to held
-   pairs, trimming or Rebalance, its "Save as live defaults…" button sends the
-   settings Rebalance replaced, which the defaults server refuses ("this link
-   was built before Rebalance …"); a page built before the Save and Trade
-   buttons has neither, and the defaults server says so in its log (run on
-   its own it opens its own index instead; through `./start_dashboard.sh` it
-   opens nothing, and the Backtest tab shows the old page). Meanwhile
-   `http://127.0.0.1:8765/trade` trades the saved defaults, and the server's
-   index links the seed values.
+   Until the dashboard is rebuilt, the Backtest tab shows the old page, which
+   neither follows the Trading tab nor writes `backtest_filter_names.json`, so
+   the Trading tab's Exclude menus list only the names it excludes. The old
+   page's "Save as live defaults…" button and "Trade using defaults…" link
+   open nothing inside the dashboard, whose Backtest tab may not open a
+   window, and opened on its own the old page cannot save: it sends its
+   backtest's same-title cap (`same_title_size_cap`), which the defaults
+   server refuses ("this link names same_title_size_cap, which is no longer
+   used …"), and, on a page that shows adding to held pairs, trimming or
+   Rebalance, the settings Rebalance replaced ("this link was built before
+   Rebalance …"). The Trading tab works fully without it: its dropdowns offer
+   config's choices, and it saves and trades as [The Trading
+   tab](#the-trading-tab) describes.
 3. If the scheduler daemon is running, restart it after the pull, so it runs
    the new code and names a run stopped by the live-run lock (exit `50`).
    Do step 1 before you start it: on start it can run a missed slot at
@@ -930,13 +948,14 @@ can be started from anywhere) checks that its Python — `python3`, or the one
 `KALSHI_PYTHON` names — can import the live bot and the live dashboard from this checkout (run it by
 its own path, not through a link, and without `PYTHONSAFEPATH` set; it
 refuses otherwise, since the server would run another checkout's code), then
-starts the live dashboard (the page with the Live trading, Backtest and Data tabs,
-on `127.0.0.1:8766`; see [Live trading tab](#live-trading-tab)) and the
-defaults server, which listens on `127.0.0.1:8765` and, with
-`--seed`, opens a confirmation page proposing the seed values (tier floors
-off, spread band 0–0.5, `k` 0.80, a 10% per-trade cap,
-no category or tag excluded, Rebalance yes with no minimum price movement, selling off). Click
-Confirm and save to save them; closing the tab saves nothing. On a first save, follow the order above.
+starts the live dashboard (the page with the Live trading, Backtest, Trading
+and Data tabs, and a Run tab once a run starts, on `127.0.0.1:8766`; see [Live
+trading tab](#live-trading-tab)) and the defaults server, which listens on
+`127.0.0.1:8765` and serves the pages the Trading and Run tabs show. With
+`--seed` it opens the defaults server's trading page proposing the seed values
+(tier floors off, spread band 0–0.5, `k` 0.80, a 10% per-trade cap,
+no category or tag excluded, Rebalance yes with no minimum price movement, selling off) instead of the
+Live trading tab. Click Confirm and save to save them; closing the tab saves nothing. On a first save, follow the order above.
 Ctrl-C stops both servers (so does a SIGTERM or SIGHUP sent to the script);
 stop them when you are done. Running the script
 again while this checkout's servers run starts nothing: it opens the page
@@ -948,57 +967,36 @@ is refused too — stop it first. The script takes only `--seed`,
 `--no-browser` and `--help`, spelled in full, and refuses anything else before
 it starts anything; it passes the two flags to
 `python3 -m kalshi_betting.defaults_server`, which can also be run directly
-(it then opens the backtest dashboard itself, or its own index,
-`http://127.0.0.1:8765/`, when there is none or it was built before the Save
-and Trade buttons). The script lets the defaults server do that too when the
-live dashboard stops with an error within 2 s of starting, and says so; if
+(it then opens its own trading page, `http://127.0.0.1:8765/confirm`, on the
+live defaults in force). The script lets the defaults server do that too when
+the live dashboard stops with an error within 2 s of starting, and says so; if
 the live dashboard stops later, the script says so and the defaults server
-keeps running without opening anything. Without `--seed` the page opens on its Live trading tab;
-its Backtest tab shows the backtest dashboard: choose a scenario in its
-filter bar (spread band, tier floors, `k`, size cap, Rebalance, Min. price movement and
-Rebalance until, Sell level and Min. days to maturity) and click the bar's
-"Save as live defaults…" button, which opens
-the same confirmation page for that scenario in a new tab (the Scenario
-Explorer's own selects are not what it saves; the Rebalance choice with its Min. price movement (sent as
-`rebalance` and `min_price_move`) and its "Rebalance until" choice (sent as
-`rebalance_min_days_to_maturity`), and the Sell level with its minimum
-of days, are each sent only from a page that shows them — there "no selling"
-turns live selling off, and Rebalance no turns live rebalancing off — and
-otherwise the saved choice is kept). It also sends each category ticked in
-its Exclude categories menu, and each category every one of whose tags is
-ticked in its Exclude tags menu, as a category for live runs to exclude
-(`exclude_category`), and each other "Category · Tag" ticked as a tag for live
-runs to exclude in that category (`exclude_tag`), which replace the saved
-exclusions (a grey note beside the button says so, naming the saved
-exclusions, when the saved defaults exclude a category or a tag). The button
-stays disabled until the page has loaded the scenario on screen, for a
-scenario the run never simulated, while the ticks keep no trade of the
-scenario shown (every category excluded, say), while they would send a name
-the server refuses (a name reading any or none, or a tag of a category whose
-name holds " · "), and while they would make a link the server does not take
-(more than 400 categories or 400 tags, an address over 65,448 bytes, or over
-65,246 bytes as the confirmation page posts it back), its hover text then
-saying why. The dashboard
-itself writes nothing, and
-the server must be running for the button's page to open. `--no-browser` only
-logs the addresses to open. The page shows the defaults in force beside the proposed ones with every
-change highlighted, and shows in red each warning a live run would log about
-the proposed settings (for example, a deadline-gap range in which no pair can
-trade, or one pair staking more than 20% of the portfolio value). See
-[Live trading toggles](#live-trading-toggles).
+keeps running without opening anything. `--no-browser` only logs the
+addresses to open. Without `--seed` the page opens on its Live trading tab;
+its Trading tab opens on the live defaults in force, and is where they are
+saved and live runs are started (see [The Trading tab](#the-trading-tab)); its
+Backtest tab shows the backtest dashboard, whose filter bar and the Trading
+tab follow each other. The trading page shows the defaults in force beside
+the proposed ones with every change highlighted, and shows in red each warning
+a live run would log about the proposed settings (for example, a deadline-gap
+range in which no pair can trade, or one pair staking more than 20% of the
+portfolio value). See [Live trading toggles](#live-trading-toggles).
 
 ### Live trading tab
 
 ```bash
 ./start_dashboard.sh                                      # opens http://127.0.0.1:8766/ on the Live trading tab
-python3 -m kalshi_betting.live_dashboard [--no-browser]   # the live dashboard alone (its three tabs, read-only)
+python3 -m kalshi_betting.live_dashboard [--no-browser]   # the live dashboard alone (read-only; the Trading and Run tabs need the defaults server)
 ```
 
-The page has three tabs. **Backtest** is `backtest_dashboard.html` as it is
-(loaded the first time the tab is clicked). **Data** is `eda_dashboard.html`,
+The page has five tabs. **Backtest** is `backtest_dashboard.html` as it is
+(loaded the first time the tab is clicked). **Trading** is the defaults
+server's trading page, where the live defaults are saved and live runs are
+started (see [The Trading tab](#the-trading-tab)). **Data** is `eda_dashboard.html`,
 what `backtest_cache/` holds (see [Data page](#data-page)), loaded the same
 way; each backtest rebuilds it, and until one has, the tab says how to build
-it. A Backtest or Data tab left hidden for 5 minutes
+it. **Run**, shown once a run starts from the Trading tab, is that run's page.
+A Backtest or Data tab left hidden for 5 minutes
 (`LIVE_DASHBOARD_FRAME_UNLOAD_SECONDS`) is emptied so the browser frees its
 page; clicking it again loads the page again, at the backtest's own scenario
 (going back sooner finds the page as you left it). **Live trading** reads the account
@@ -1053,7 +1051,10 @@ How the figures are worked out:
 It is read-only: it sends Kalshi GET requests only and never loads the order
 path. The tab page and its data are on `127.0.0.1:8766` and the backtest page
 on `127.0.0.1:8767`, two separate web origins, so nothing on the backtest page
-can read the account. Each load adds one line to `live_portfolio_log.jsonl`.
+can read the account. The Trading and Run tabs show the defaults server's own
+pages (`127.0.0.1:8765`), which the tab page can neither read nor press: every
+save and every run goes through that server's buttons and checks. Each load
+adds one line to `live_portfolio_log.jsonl`.
 Known limits: how deposit and withdrawal fees are charged is assumed, not checked;
 a run whose trade-log write failed counts as Other bets; the trade log's times
 are this computer's local time;
@@ -1061,98 +1062,182 @@ a sale of a bot pair, your own or the bot's, is recognised only when both
 markets are sold within 10 minutes; a read has no overall time limit; and with a short history
 Sharpe and Sortino are noisy.
 
-### Dashboard buttons
+### The Trading tab
 
 ```bash
-./start_dashboard.sh           # starts both servers; the Backtest tab shows backtest_dashboard.html
+./start_dashboard.sh           # starts both servers; the Trading tab shows http://127.0.0.1:8765/confirm
 ```
 
-The backtest dashboard's filter bar (on the Backtest tab, or the page opened
-on its own) carries two buttons, and both open a page of the
-defaults server in a new tab, so the server must be running
-(`./start_dashboard.sh`); the dashboard itself writes nothing and starts
-nothing.
+The dashboard's **Trading** tab is where the live defaults are saved and live
+runs are started. It shows the defaults server's trading page
+(`http://127.0.0.1:8765/confirm`) in a frame, under a one-line note naming
+that server and a Reload button, so the server must be running
+(`./start_dashboard.sh` starts it). The dashboard only points the frame at
+the page's address: every save and every run still goes through that page's
+own buttons and every check its server makes.
 
-- **Save as live defaults…** opens the confirmation page for the scenario the
-  filter bar shows (spread band, tier floors, `k`, size cap, rebalance and
-  Min. price movement, Sell level and minimum days, the categories ticked in the
-  Exclude categories menu as the categories to exclude and the tags ticked in the
-  Exclude tags menu as the tags to exclude: it stays disabled while the ticks keep no
-  trade of the scenario or would make a link the server does not take, and a save
-  replaces the saved excluded categories and tags), beside the
-  live defaults in force with every change
-  highlighted. It sends the Sell level and Min. days to maturity shown (or `off` for
-  both), and the Rebalance choice with the Min. price movement shown (sent as `rebalance`
-  and `min_price_move`: `off` for "any", and for the minimum with Rebalance no) and,
-  beside them, the "Rebalance until" choice shown (sent as
-  `rebalance_min_days_to_maturity`: its days, or `0`, no days limit, for "maturity" and
-  with Rebalance no), so a live run sells and rebalances by them once they are saved;
-  each is sent only from a page that shows it, and otherwise the saved choice is kept
-  (a page without the "Rebalance until" choices that sends Rebalance no clears a saved
-  days limit with it).
-  There:
+The page opens on the live defaults in force, exactly as saved, so it reads
+"0 of 11 settings change" and its three buttons act on the saved defaults.
+With none in force it proposes something else: for a file an older version
+saved, that file's values in their new form; with none saved, the seed
+values. Then every one of the 11 settings reads as a change, Dry run waits
+for a save, and Confirm and save writes the file. Saved values the page
+cannot carry as they are (a name with two spaces in a row, the same name
+twice or in two letter cases, more than 400 names: only a hand-edited file
+holds one) get a page with no buttons that says why and links to the seed
+values.
+
+- **The dropdown bar** at its top carries the backtest bar's eleven settings,
+  in its order and words: Spread band, Tier floors, k, Size cap, Rebalance,
+  Min. price movement, Rebalance until, Sell, Min. days to maturity, Exclude
+  categories and Exclude tags. Each dropdown offers the backtest's grid for
+  that setting, plus the value shown; a choice that cannot apply is left out
+  (with Rebalance no, Min. price movement offers only "any" and Rebalance
+  until only "maturity"; with no sell level, Min. days to maturity only
+  "any"). Choosing a value loads the page again, proposing it, and saves
+  nothing; until the new page arrives, nothing on the old one can be clicked.
+  The two Exclude menus send their ticks with their Apply button; a tick
+  turns the three buttons below off until Apply has loaded the page again,
+  since the table and the buttons show the ticks only then. They list
+  every name the proposal excludes, then the categories and tags in
+  `backtest_filter_names.json`, which each backtest build writes beside its
+  page; without that file they list only the excluded names, and a grey note
+  says why.
+- **Under the bar**, the defaults in force beside the proposed ones with every
+  change highlighted, each warning a live run would log about the proposed
+  settings in red, and three buttons:
   - **Dry run** runs the live bot with the proposed settings on the
     production account but sends no orders and saves nothing — a preview of
     what they would trade. It needs some defaults saved first.
-  - **Confirm and save** saves the proposal as the live defaults.
+  - **Confirm and save** saves the proposal as the live defaults. With
+    nothing changed it writes nothing and shows the saved defaults, saying
+    nothing changed.
   - **Confirm and trade**, last and set apart below a red line, saves the
-    proposal and then runs the live bot with it, placing real orders.
-- **Trade using defaults…** opens the trade page, which shows the saved live
-  defaults. There:
-  - **Dry run** runs the live bot with them but sends no orders.
-  - **Confirm and trade** runs the live bot with them, placing real orders.
+    proposal when it changes anything, then runs the live bot with it,
+    placing real orders; with nothing changed it runs the saved defaults.
+- **The Run tab** appears once Dry run or Confirm and trade starts a run, and
+  shows that run's page (see [Trade from the browser](#trade-from-the-browser)).
+  It is chosen when the run starts, and the Trading tab goes back to the same
+  proposal, with fresh buttons.
 
-Either run lands on its own page, which follows the run and then says what
-it did (see below). A dashboard built before these buttons existed has
-neither; the defaults server says so when it starts (run on its own, it opens
-its own index, which links the seed values and the trade page) — rebuild the dashboard with
-`python3 -m kalshi_betting.backtest` and the `--start-date` it was built from.
-A page built before Rebalance replaced the live settings for adding to held
-pairs and trimming sends those older settings from a page that shows them,
-and the server refuses such a link ("this link was built before Rebalance …"):
-rebuild the dashboard, or start from the server's own index.
-A page built before the same-title cap was removed sends that cap
-(`same_title_size_cap`), and the server refuses such a link too ("this link
-names same_title_size_cap, which is no longer used …"), with the same remedy.
-A page whose filter bar could not be built keeps the Trade using defaults…
-link, under the notice that replaces the bar.
+Coming to the Trading tab from another tab loads its page again, so its
+buttons start disabled and become clickable only once you have seen the page
+for a second and moved the mouse (a browser counts a page in a hidden tab of
+the dashboard as shown). Clicking the tab while it is shown loads nothing, and
+nor does coming back to it, or a choice on the Backtest tab's bar (the bar
+goes back to the pressed proposal), while a press of one of its buttons is on
+its way to the server (the pressed page can no longer be clicked), so the
+press is never cut off; Reload loads the page again.
+
+**The Backtest tab and the Trading tab follow each other.** The backtest
+dashboard's filter bar has no Save or Trade button. Shown in the Backtest tab,
+it and the Trading tab show the same settings wherever the backtest page can
+show them, each moving the other through the dashboard (opened on its own,
+outside the dashboard, the backtest page moves nothing):
+
+- **Both open on the Trading tab's first proposal**: the live defaults in
+  force, or, with none in force, what the Trading tab proposes instead.
+- **A choice on the Backtest tab's bar** moves the Trading tab to the bar's
+  scenario (spread band, tier floors, `k`, size cap, rebalance and Min. price
+  movement, Sell level and minimum days, and the categories ticked in the
+  Exclude categories menu and the tags ticked in the Exclude tags menu as the
+  ones to exclude), whether or not the backtest simulated that exact
+  scenario, but only while the Backtest tab is shown, and never from the
+  Scenario Explorer's own selects. It sends the Sell level and Min. days to
+  maturity shown (or `off` for both), and the Rebalance choice with the Min.
+  price movement shown (sent as `rebalance` and `min_price_move`: `off` for
+  "any", and for the minimum with Rebalance no) and, beside them, the
+  "Rebalance until" choice shown (sent as `rebalance_min_days_to_maturity`:
+  its days, or `0`, no days limit, for "maturity" and with Rebalance no), each
+  only from a page that shows it. A choice changes on the Trading tab only
+  the settings you chose (choosing Rebalance yes also sends no selling, since
+  it shuts Sell; Rebalance no opens Sell again on the Trading tab's sell
+  level and minimum of days, which stay as they are), and the
+  settings the bar cannot show stay as the Trading tab has them: a value off
+  the page's menus, a setting of a view the page lacks (rebalancing on a page
+  built without it, say), a category or tag the page does not list, and a
+  sell level next to rebalancing. Ticking or unticking a box sends each
+  category ticked in the Exclude categories menu, and each category every one
+  of whose tags is ticked in the Exclude tags menu, as a category for live
+  runs to exclude (`exclude_category`), and each other "Category · Tag" ticked
+  as a tag to exclude in that category (`exclude_tag`); they replace the
+  Trading tab's exclusions, except names the page does not list, which stay
+  excluded. Grey notes beside the menus say what the Trading tab will propose
+  in place of the saved defaults (turning saved rebalancing, its days limit or
+  selling off, or replacing the saved exclusions they name).
+- **A change on the Trading tab** moves the Backtest tab's bar and redraws
+  that scenario. A red note on the bar names each setting it cannot show.
+- **A choice the Trading tab cannot take is not sent**, and the red note says
+  why: a scenario whose band, `k` or size cap the run did not record, ticks
+  that keep no trade of the scenario shown (every category excluded, say),
+  every tag of a category ticked while a category whose name differs from it
+  only in letter case still keeps a tag (a live filter reads the two as one
+  category, so it could not leave out the first whole), a name the server
+  refuses (a name reading any or none, or a tag of a category whose name holds
+  " · "), or more than one proposal carries (more than 400 categories or 400
+  tags, a query over 65,512 bytes after `/confirm?`, each apostrophe counted
+  as three bytes, or over 65,246 bytes as the trading page posts it back).
+
+A backtest page built before the Trading tab keeps its old "Save as live
+defaults…" button and "Trade using defaults…" link, but inside the dashboard
+they open nothing, since the Backtest tab's frame may not open a window. Such a
+page neither follows the Trading tab nor writes `backtest_filter_names.json`
+until it is rebuilt: `python3 -m kalshi_betting.backtest --dashboard-only` from
+a sweep saved in this version's format, or a full backtest with the
+`--start-date` it was built from (`--dashboard-only` refuses an older saved
+sweep). The Trading tab works fully without it, with config's choices in its
+dropdowns and only the excluded names in its Exclude menus. Opened on its own,
+a page built before Rebalance replaced the live settings for adding to held
+pairs and trimming sends those older settings from its Save button, and the
+server refuses such a link ("this link was built before Rebalance …"); one
+built before the same-title cap was removed sends that cap
+(`same_title_size_cap`), refused too ("this link names same_title_size_cap,
+which is no longer used …"). Each refusal says to open the trading page again
+from the dashboard's Trading tab.
 
 ### Trade from the browser
 
 ```bash
-./start_dashboard.sh           # then use the Backtest tab's "Trade using defaults…", or open http://127.0.0.1:8765/trade
+./start_dashboard.sh           # then use the dashboard's Trading tab (on its own: http://127.0.0.1:8765/confirm)
 ```
 
-The defaults server also runs the live bot. Its confirmation page (from the
-dashboard's "Save as live defaults…" button, or `--seed`) and its trade page,
-`http://127.0.0.1:8765/trade` (the saved defaults), each end with the same
-buttons, in one fixed order:
+The defaults server also runs the live bot. Its trading page (the dashboard's
+Trading tab; `http://127.0.0.1:8765/confirm` on its own; the seed values with
+`--seed`) ends with three buttons, in one fixed order:
 
-- **Dry run** runs the same search and sizing but sends no orders and saves
-  nothing (on the confirmation page it runs the proposed settings). It adds
-  "simulated" rows to `trade_log.xlsx`, and needs saved defaults to exist.
-- **Confirm and save** (confirmation page only) saves the proposed settings.
+- **Dry run** runs the same search and sizing on the proposed settings but
+  sends no orders and saves nothing. It adds "simulated" rows to
+  `trade_log.xlsx`, and needs saved defaults to exist.
+- **Confirm and save** saves the proposed settings; with nothing changed it
+  writes nothing and says so.
 - **Confirm and trade**, last and set apart below a red line, places real
-  orders: on the confirmation page it first saves the proposed settings, and
-  starts the run only once the file has been written and read back.
+  orders: when the proposed settings change anything it first saves them, and
+  starts the run only once the file has been written and read back; with
+  nothing changed it runs the saved defaults as they are, and the run's page
+  names the saved file it traded.
 
-Neither page runs from a saved file an older version wrote (see [Save the live
-defaults](#save-the-live-defaults-do-this-first-after-upgrading)): the trade page
-refuses it and links to the confirmation page that saves its values again, and
-there Dry run waits for that save while Confirm and trade saves first.
+`http://127.0.0.1:8765/trade`, the address of the separate trade page the
+trading page replaced, now sends the browser to the trading page, which opens
+on the saved defaults.
+
+Nothing runs from a saved file an older version wrote (see [Save the live
+defaults](#save-the-live-defaults-do-this-first-after-upgrading)): the trading
+page counts nothing as in force and offers the file's values in their new
+form, and there Dry run waits for that save while Confirm and trade saves
+first.
 
 ```
-./start_dashboard.sh ─► the live dashboard on 127.0.0.1:8766 (Live trading, Backtest and Data tabs;
-                         it opens the page) and the defaults server on 127.0.0.1:8765
+./start_dashboard.sh ─► the live dashboard on 127.0.0.1:8766 (Live trading, Backtest, Trading and Data
+                         tabs, and Run once a run starts; it opens the page) and the defaults server
+                         on 127.0.0.1:8765, whose trading page and run pages those tabs show
 
-Backtest tab's filter bar (each button opens a new tab):
-  ├─ [Save as live defaults…] ─► /confirm?<scenario>
-  │     [Dry run] ────────────────────────────────────────────┐
-  │     [Confirm and save] ─► save ─► /saved                  │
-  │     [Confirm and trade] ─► save, read back ───────────────┤
-  └─ [Trade using defaults…] ─► /trade (the saved defaults)   │
-        [Dry run] ────────────────────────────────────────────┤
-        [Confirm and trade] ──────────────────────────────────┴─► start the run ─► /runs/<id>
+Backtest tab's filter bar ◄── the same settings, both ways ──► Trading tab = /confirm
+                                                                (opens on the saved defaults)
+Trading tab:
+  [dropdown bar] ─► /confirm?<proposal> (the page again; nothing saved)
+  [Dry run] ─────────────────────────────────────────────┐
+  [Confirm and save] ─► save if changed ─► /saved        │
+  [Confirm and trade] ─► save if changed, read back ─────┴─► start the run ─► Run tab = /runs/<id>
 
 start the run = python -m kalshi_betting.main --mode prod <all eleven toggles as flags>
                 --result-file live_runs/<id>/result.json [--dry-run]
@@ -1164,15 +1249,15 @@ start the run = python -m kalshi_betting.main --mode prod <all eleven toggles as
 ```
 
 A button that does not apply is shown disabled, in its place, with the reason
-beside it: nothing to save, no saved defaults for a dry run, a run started from
+beside it: no saved defaults for a dry run, a run started from
 this server still going (one started before a restart of the server included),
 or — for Confirm and trade only — another live trading run in progress on this
 machine (the lock described under [Production (real
 money)](#production-real-money)). When the last finished real-money run (one
 started here, or the scheduler's) ended needing attention (exit `20`), or ended
 without a clean result (it wrote no result, was stopped by a signal or at the
-scheduler's time limit, or hit an error after it began sending orders), both
-pages show a red warning and Confirm and trade needs a box ticked first; read
+scheduler's time limit, or hit an error after it began sending orders), the
+trading page shows a red warning and Confirm and trade needs a box ticked first; read
 that run's result (a scheduled run has no run page: the warning names
 `kalshi_arb.log`, where its result is), check your positions in the Kalshi UI,
 and if it reports a V2 order-mapping disproof, stop trading (stop the
@@ -1197,9 +1282,12 @@ its page says so and, for real money, says to check your positions. The pages
 check that a request comes from their own page; they cannot tell one local
 program from another, so anything on this machine that can reach
 `127.0.0.1:8765` could start a run while the server runs — stop it when you are
-done. A link can also open the confirmation page with settings someone else
+done. A link can also open the trading page with settings someone else
 chose (valid ones, each change highlighted), and one press of Confirm and trade
 would save and trade them, so read the highlighted changes before you press it.
+Only the dashboard's tab page (`127.0.0.1:8766` or `localhost:8766`) may show
+these pages in a frame; they tell it what they show and take no message from it
+or from any other page.
 
 ### Live V2 order-mapping probe (~1 cent of real money)
 
@@ -1311,7 +1399,7 @@ A live run sells at a take-profit level only when a sell level is saved (or `--s
 
 1. **Verify the sale order.** Run the probe's `yes-close` step on a liquid, cheap market the account holds nothing on. It buys 0.01 YES, sells it with the reduce-only ask live selling sends, and PASSes only when the account reads flat and the sale's reply reports the 0.01 sold. A held NO is sold by the same closing bid the `no-mapping` step already verified; no other step has sent the ask that sells a held YES.
 2. **Dry-run the rule.** `python3 -m kalshi_betting.main --mode prod --dry-run --sell-at 80` sends no orders and saves nothing (add `--sell-min-days 7` to leave out positions near maturity). In `kalshi_arb.log` it logs one `Take-profit check (sell at 80%): …` line per held position (`-> sell`, or `-> keep` with the share of potential profit it reached at each check read, which stops at the first one below the level), a `Not selling …` line for each position it cannot judge, with the reason, `Positions to sell this run: N of M` and, for each sale, `[DRY RUN] Would sell …` with the orders. When something would sell, the estimated proceeds go onto the cash the buys are sized on (`Dry run: sizing as if the sales filled — cash $X (+$Y)`). Check a sale against the Kalshi UI: the walked prices against the book, the cash against the position's cost. A low level such as `--sell-at 5` is likelier to show a sale. `--no-sell` sells nothing this run, whatever is saved.
-3. **Save the level.** In the dashboard's filter bar choose a Sell level (and a Min. days to maturity) and click "Save as live defaults…"; the confirmation page shows the change, and Confirm and save saves it. From a page with the Rebalance view the button also sends rebalancing off (Sell shows a level only while Rebalance is no), which turns saved rebalancing off; to keep it, use the link instead. The button sends the categories ticked in the Exclude categories menu and the tags ticked in the Exclude tags menu as the live exclusions, replacing the saved ones. Or open `/confirm?tier_floors=…&spread_min=…&spread_max=…&k=…&size_cap=…&sell_at=0.85` (add `&sell_min_days=7`), keeping the five required fields at the values you want (and `exclude_category` and `exclude_tag` when a filter is saved: a link without them proposes nothing excluded; each may be given more than once, one name per field and at most 400 of each, and a tag may be written `Category · Tag` to exclude it in that one category); it names no rebalance setting, so the saved ones are kept. Check that the next run's `Live settings:` line reads `sell at 85% of potential profit`.
+3. **Save the level.** In the dashboard's Trading tab choose a Sell level (and a Min. days to maturity) in its dropdown bar; the page shows the change, and Confirm and save saves it. That bar sends every setting as it shows it, so the rest, rebalancing included, stay as they are. Or choose the level on the Backtest tab's filter bar, which the Trading tab follows: from a page with the Rebalance view, Sell names a level only while Rebalance is no, so with rebalancing on the bar shows Rebalance yes and Sell shut, and choosing Rebalance no first also sends rebalancing off, which turns saved rebalancing off; to keep it, choose on the Trading tab or use the link instead. The Trading tab keeps its excluded categories and tags unless a box of the bar's Exclude menus is ticked or unticked. Or open `/confirm?tier_floors=…&spread_min=…&spread_max=…&k=…&size_cap=…&sell_at=0.85` (add `&sell_min_days=7`), keeping the five required fields at the values you want (and `exclude_category` and `exclude_tag` when a filter is saved: a link without them proposes nothing excluded; each may be given more than once, one name per field and at most 400 of each, and a tag may be written `Category · Tag` to exclude it in that one category); it names no rebalance setting, so the saved ones are kept. Check that the next run's `Live settings:` line reads `sell at 85% of potential profit`.
 
 The dry runs made on the live account before selling was turned on are recorded in `CLAUDE.md` (the live-selling paragraph under Key Patterns).
 
@@ -1324,15 +1412,15 @@ python3 -m kalshi_betting.main --mode prod --dry-run --rebalance --min-price-mov
 ./start_dashboard.sh --seed                                                           # step 4, once step 3 checks out
 ```
 
-A live run rebalances the pairs the account holds only when `rebalance` is saved on (or `--rebalance` is given for one run): before it buys, it sells part of each exact held time-series pair, and of each lone leg whose partner paid out $0, that has outgrown its Kelly size (a Kelly trim), and it may add to a pair it holds. `config.py` and the seed ship it on, but a saved file that leaves the key out reads it as off. Once it is saved on, every run rebalances, the scheduled runs included (a dev run holds nothing and does neither). How an add-on and a trim are judged and sent is described under [Adding to a pair the account already holds](#how-it-profits) and [Trimming a held pair to its Kelly size](#how-it-profits). "Rebalance until" (`rebalance_min_days_to_maturity`, off at the default, "maturity"), the 7-day wait and the minimum price movement (`min_price_move`) hold back add-ons and trims alike. While rebalancing is on, a lower per-trade cap or a higher `k` also sells: each exact held time-series pair, and each such lone leg, now worth more than its new Kelly size is trimmed at the next run (once its wait has passed), before anything is bought, whether the change comes from a flag for one run, a saved setting or Confirm and trade. A real-money run logs it as a `Live settings: with Rebalance yes, these settings can sell more of the held pairs: …` WARNING, and the confirmation page shows the same line in red; dry-run new settings with `--dry-run` first. Turn it on in this order:
+A live run rebalances the pairs the account holds only when `rebalance` is saved on (or `--rebalance` is given for one run): before it buys, it sells part of each exact held time-series pair, and of each lone leg whose partner paid out $0, that has outgrown its Kelly size (a Kelly trim), and it may add to a pair it holds. `config.py` and the seed ship it on, but a saved file that leaves the key out reads it as off. Once it is saved on, every run rebalances, the scheduled runs included (a dev run holds nothing and does neither). How an add-on and a trim are judged and sent is described under [Adding to a pair the account already holds](#how-it-profits) and [Trimming a held pair to its Kelly size](#how-it-profits). "Rebalance until" (`rebalance_min_days_to_maturity`, off at the default, "maturity"), the 7-day wait and the minimum price movement (`min_price_move`) hold back add-ons and trims alike. While rebalancing is on, a lower per-trade cap or a higher `k` also sells: each exact held time-series pair, and each such lone leg, now worth more than its new Kelly size is trimmed at the next run (once its wait has passed), before anything is bought, whether the change comes from a flag for one run, a saved setting or Confirm and trade. A real-money run logs it as a `Live settings: with Rebalance yes, these settings can sell more of the held pairs: …` WARNING, and the trading page shows the same line in red; dry-run new settings with `--dry-run` first. Turn it on in this order:
 
-1. **Save the live defaults with rebalancing off.** The seed values turn Rebalance yes, so do not start with `./start_dashboard.sh --seed`. Start the defaults server (`./start_dashboard.sh`) and open `http://127.0.0.1:8765/confirm?tier_floors=off&spread_min=0.0&spread_max=0.5&k=0.8&size_cap=0.1&rebalance=off`. Review the table, click Confirm and save, and check that the page it lands on (`/saved`) names that checkout's `live_defaults.json`. The link carries no `source` note on purpose: the seed's note may label only the seed values themselves, and the server refuses it on any others. From then on every live run, the scheduled ones included, trades these values and neither adds to nor trims a held pair. The seed caps each trade at 10% of the portfolio value; a `main.py` flag still overrides any toggle for one run. A checkout whose saved defaults already read rebalancing as off (a file that leaves the key out) starts at step 2; one whose file an older version saved (every file saved before the same-title cap was removed) saves it again first (see [Save the live defaults](#save-the-live-defaults-do-this-first-after-upgrading)).
+1. **Save the live defaults with rebalancing off.** The seed values turn Rebalance yes, so do not start with `./start_dashboard.sh --seed`. Start the defaults server (`./start_dashboard.sh`) and open `http://127.0.0.1:8765/confirm?tier_floors=off&spread_min=0.0&spread_max=0.5&k=0.8&size_cap=0.1&rebalance=off` (with no file saved, the dashboard's Trading tab opens on the seed values, and choosing Rebalance no in its dropdown bar proposes the same). Review the table, click Confirm and save, and check that the page it lands on (`/saved`) names that checkout's `live_defaults.json`. The link carries no `source` note on purpose: the seed's note may label only the seed values themselves, and the server refuses it on any others. From then on every live run, the scheduled ones included, trades these values and neither adds to nor trims a held pair. The seed caps each trade at 10% of the portfolio value; a `main.py` flag still overrides any toggle for one run. A checkout whose saved defaults already read rebalancing as off (a file that leaves the key out) starts at step 2; one whose file an older version saved (every file saved before the same-title cap was removed) saves it again first (see [Save the live defaults](#save-the-live-defaults-do-this-first-after-upgrading)).
 2. **Verify the sale orders.** Run the probe's `yes-close` step on a liquid, cheap market the account holds nothing on, exactly as for [live selling](#turn-on-live-selling): a trim sends the same two order shapes (the reduce-only ask that sells a held YES and the reduce-only YES bid that sells a held NO), and `yes-close` is the step that sends the first of them.
 3. **Dry-run the rule.** `python3 -m kalshi_betting.main --mode prod --dry-run --rebalance` sends no orders and saves nothing (add `--min-price-move 10` to also ask for a 10c price move, up or down, since the pair last traded, before an add-on or a trim). This is the first time a trading run reads Kalshi's lists of the account's fills and of the orders resting on it. In `kalshi_arb.log` check: the `Sizing on portfolio value $X = cash $Y + open positions $Z` line, which must show the open positions as a dollar figure (not `not read`), with no `Kalshi's value of the open positions (…) is not used` WARNING after it (either means the run adds to no held pair and trims nothing, and says so: `Not adding to held pairs this run: …`, `Not trimming this run: …`); each `Held pair to add to: …` line (and each `Held market to add to (its partner has paid out): …` line, the same way, for its one market): its `cost $C (fees $F)` against that pair's fills in the Kalshi UI (count × price plus fees for the cost, the fees alone for `$F`, both legs together), and its `worth $W at today's prices` against the asks the Kalshi UI shows (count × the ask of the side held, both legs together); each `Add-on check: … -> may add` line (the day the pair last traded and, with a minimum, its price then and now, against the Kalshi UI) and each `Not adding to …: <reason>` line, which holds that pair back this run, then `Held pairs that may be added to this run: N of M`; the `Resting orders on the account: N` line (a run trims nothing while N is above 0, since Kalshi holds the cash of a resting order outside both its balance and its value of the open positions, so cancel a resting order of your own before a run that should trim; a `Not trimming this run: the account's resting orders could not be read, …` WARNING on every run means `GET /portfolio/orders` no longer answers, and trimming stays off); the `Fills read: N on M market(s), <oldest day> to <newest day> (UTC)` line (it can appear twice, read once for the trims and once for the add-ons; does the list reach back as far as the account's history? it must reach back the 7 days of the wait, or nothing is trimmed or added to; and with a minimum set, a pair whose last fill is older than the list's first day is neither trimmed nor added to until it trades again, since its price then cannot be read: if the list starts after many of your purchases, a minimum leaves those pairs as they are); the `Kelly trim sizes on …` line (how far apart are Kalshi's value of the open positions and what the held markets fetch at this run's bids?); and each `Kelly trim check: …` line against the Kalshi UI (the pair's kind; the day it last traded; `$V a pair at the best bids`, what one contract pair fetches after the fee, which is the two held sides' best bids added, less the fee, so it is below the bids the Kalshi UI shows; and, with a minimum, its price then and now; a pair with no fill listed says so instead; a lone leg's line names its paid-out partner, `(alone: YES <ticker> paid out $0)`, priced `a contract` (its one bid less the fee), so check that market's settlement, side and count in the Kalshi UI), then `Pairs to trim this run: N of M` (and `Lone legs to trim this run (partner paid out): N of M` when a lone leg was looked at) and a `[DRY RUN] Would sell …` line per trim. A `-> sell` verdict stands only when `Pairs to trim this run` counts it: a `Not trimming any held pair this run, including any marked '-> sell' above: …` WARNING cancels every trim of the run. If the value is missing or refused, a cost or its fees are wrong, a pair's kind, last-trade day or prices are wrong, or the trims would sell more at once than you want (the `+$Y` on the `Dry run: sizing as if the sales filled — cash $X (+$Y)` line), stop here and leave rebalancing off.
-4. **Save the setting.** Run `./start_dashboard.sh --seed` and click Confirm and save (after step 1 the page shows 1 of 11 settings change; it also sets every other toggle to the seed's), or open the step 1 link with `rebalance=on` in place of `rebalance=off` (add `&min_price_move=0.1` for a 10c minimum). Or save a scenario from the dashboard: rebuild it first (`python3 -m kalshi_betting.backtest --start-date <its start>`), since a page built before this change cannot save it (from a page that shows adding to held pairs, trimming or Rebalance its button sends the settings Rebalance replaced, which the server refuses, and from any other it sends none). In the dashboard's filter bar choose Rebalance yes and the Min. price movement you want (and, on a page that shows it, the "Rebalance until" choice) and click "Save as live defaults…"; the button sends `rebalance` and `min_price_move` together (from a page with the "Rebalance until" choices, with `rebalance_min_days_to_maturity` beside them: `0`, no days limit, at "maturity"), the confirmation page shows the change, and Confirm and save saves it. From a page with the Sell view the button also sends no selling (Rebalance yes shuts Sell), which turns a saved sell level off; to keep one, use the link instead. The button sends the categories ticked in the Exclude categories menu and the tags ticked in the Exclude tags menu as the live exclusions, replacing the saved ones. Or open `/confirm?tier_floors=…&spread_min=…&spread_max=…&k=…&size_cap=…&rebalance=on` (and `&min_price_move=0.1`) with the five required fields set to the values you want kept (and `exclude_category` and `exclude_tag` when a filter is saved: a link without them proposes nothing excluded); it names no sell level, so the saved one is kept. Check that the next run's `Live settings:` line reads `rebalance yes | min price movement any` (or the minimum chosen, `min price movement 10c`).
+4. **Save the setting.** Run `./start_dashboard.sh --seed` and click Confirm and save (after step 1 the page shows 1 of 11 settings change; it also sets every other toggle to the seed's), or open the step 1 link with `rebalance=on` in place of `rebalance=off` (add `&min_price_move=0.1` for a 10c minimum). Or, in the dashboard's Trading tab, choose Rebalance yes and then the Min. price movement you want (and the "Rebalance until" choice) in its dropdown bar; the page shows the change, and Confirm and save saves it. That bar sends every setting as it shows it, so a saved sell level and the rest stay as they are. Or choose them on the Backtest tab's filter bar of a page built with the Rebalance view (a page built before the Trading tab does not follow it: rebuild it with `python3 -m kalshi_betting.backtest --start-date <its start>`), which the Trading tab follows: the bar sends `rebalance` and `min_price_move` together (from a page with the "Rebalance until" choices, with `rebalance_min_days_to_maturity` beside them: `0`, no days limit, at "maturity"), and from a page with the Sell view it also sends no selling (Rebalance yes shuts Sell), which turns a saved sell level off; to keep one, choose on the Trading tab or use the link instead. The Trading tab keeps its excluded categories and tags unless a box of the bar's Exclude menus is ticked or unticked. Or open `/confirm?tier_floors=…&spread_min=…&spread_max=…&k=…&size_cap=…&rebalance=on` (and `&min_price_move=0.1`) with the five required fields set to the values you want kept (and `exclude_category` and `exclude_tag` when a filter is saved: a link without them proposes nothing excluded); it names no sell level, so the saved one is kept. Check that the next run's `Live settings:` line reads `rebalance yes | min price movement any` (or the minimum chosen, `min price movement 10c`).
 5. **Watch the first live trim.** Read its orders' lines in `kalshi_arb.log` (a pair's two; a lone leg's one). For a pair, a refused NO close shows as `Sale order on <ticker> raised…` on the NO market, then either `Not sold '…': … nothing sent on …` (the NO went first, and nothing was sold) or a `SALE LEFT A PAIR UNBALANCED` CRITICAL (the NO went second; the trade log and the run page call it `unbalanced`). A lone leg's refused order logs `Not sold '…': …` alone (it has one order, so it can never end `unbalanced`). Either way, save rebalancing off until it is understood. A `Kalshi's value of the open positions (…) is not used: this run's sales sold, or may have sold, contracts, yet it is not below …` WARNING after a small trim is expected: that run sizes its buys on the cash alone and adds to nothing. Then run a dry run with `--rebalance` and compare the trimmed pair's `Held pair to add to: … cost $C (fees $F)` line with the Kalshi UI, to learn how Kalshi restates a pair's cost and fees after a part sale.
 
-**To turn it off**, choose Rebalance no in the filter bar of a dashboard that shows it and click "Save as live defaults…", or open `/confirm?tier_floors=…&spread_min=…&spread_max=…&k=…&size_cap=…&rebalance=off&min_price_move=off` with the five required fields set to the values you want kept (and `exclude_category` and `exclude_tag` when a filter is saved): both fields, since a saved minimum kept with rebalancing off is refused (`--no-rebalance` turns rebalancing off for one run and clears the minimum too). Do this before going back to code from before Rebalance: that code refuses a saved file holding `rebalance` (one saved with Rebalance yes), so every live run, the scheduled ones included, would exit 2 until the defaults were saved again there.
+**To turn it off**, choose Rebalance no in the dashboard's Trading tab (or on the Backtest tab's filter bar of a page that shows it) and click Confirm and save, or open `/confirm?tier_floors=…&spread_min=…&spread_max=…&k=…&size_cap=…&rebalance=off&min_price_move=off` with the five required fields set to the values you want kept (and `exclude_category` and `exclude_tag` when a filter is saved): both fields, since a saved minimum kept with rebalancing off is refused (`--no-rebalance` turns rebalancing off for one run and clears the minimum too). Do this before going back to code from before Rebalance: that code refuses a saved file holding `rebalance` (one saved with Rebalance yes), so every live run, the scheduled ones included, would exit 2 until the defaults were saved again there.
 
 ### Run result file
 
@@ -1411,9 +1499,8 @@ python3 -m kalshi_betting.main --mode prod --dry-run --rebalance --min-price-mov
 # choice; 0 or --no-rebalance-min-days-to-maturity rebalances however near maturity (the default
 # unless saved otherwise). The "Live settings:" line reads `rebalance until 7 days before maturity`.
 # The backtest's walk applies the same rule (_simulate_at_discount's rebalance_min_days_to_maturity),
-# and its Rebalance family carries the runs, but the dashboard does not offer it yet: its Save
-# button leaves it as saved (a link naming rebalance=off clears it), so a dashboard scenario shows
-# none of its effect
+# and its Rebalance family carries the runs, which the backtest page's "Rebalance until" menu
+# shows; the dashboard's Trading tab offers the choice too (a link naming rebalance=off clears it)
 python3 -m kalshi_betting.main --mode prod --dry-run --rebalance --rebalance-min-days-to-maturity 7
 
 # Neither add to nor trim a held pair this run, whatever the saved defaults say (also clears the
@@ -1455,9 +1542,9 @@ steps from 5c to $1, `null` for none; only with rebalancing on), how close to
 maturity a held position may still be rebalanced (`rebalance_min_days_to_maturity`,
 "Rebalance until": `null` for always, 1 or 7 days; only with rebalancing on; a trim
 or an add-on is held back, first, for a position whose later market closes in fewer
-than that many days; the backtest's walk can apply the same rule, but the dashboard
-and its Save button do not use it yet: the button leaves it as saved, and Rebalance
-no clears it), the share of
+than that many days; the backtest's walk applies the same rule, the backtest page's
+filter bar shows it, and the dashboard's Trading tab offers it; Rebalance no
+clears it), the share of
 potential profit at which it sells a held position (`sell_at`, `null` for
 never; see [Selling a held position](#how-it-profits) above) and the fewest
 days before maturity it may sell at (`sell_min_days`, `null` for no minimum). **A
@@ -1465,8 +1552,8 @@ live run reads them only from the saved live defaults, `live_defaults.json` in
 the repo root** (gitignored operator state, like `scheduler_state.json`, in the
 checkout the scheduler runs from). With no file saved, every live run, prod and
 dev, scheduled or by hand, exits `2` before it logs, connects or requests
-anything, and says how to save one: from the backtest dashboard's
-"Save as live defaults…" button, or from the seed values with
+anything, and says how to save one: in the dashboard's Trading tab
+(`./start_dashboard.sh`), or from the seed values with
 `./start_dashboard.sh --seed` (tier floors off, spread band
 0–0.5, `k` 0.80, a 10% per-trade cap, no category
 or tag excluded, Rebalance yes with no minimum price movement, selling off). A saved file
@@ -1474,8 +1561,9 @@ that leaves `rebalance` out reads it as **off**: a file saved before the
 setting existed (nobody confirmed a value for it), or one saved with it off,
 which the writer leaves out. To turn it on for every run, follow the order under
 [Turn on live rebalancing](#turn-on-live-rebalancing), which checks a dry run
-first; the dashboard's save button sends the choice only from a page that shows
-it. `min_price_move`, `rebalance_min_days_to_maturity`, `sell_at` and
+first; the dashboard's Trading tab offers the choice, and the backtest page's
+filter bar passes it to the Trading tab only from a page that shows it.
+`min_price_move`, `rebalance_min_days_to_maturity`, `sell_at` and
 `sell_min_days` are left out the same way while they are off (no minimum,
 always, never selling, no minimum of days), so a file
 with all five off holds only the other six toggles (code from before the
@@ -1630,19 +1718,20 @@ out that tag's trades in its own category and does not tick the category; every
 other tag counts in full). The page's Live rule line names these boxes for a
 saved filter. The page now shows every category but Politics and every Sports
 tag but Hockey — what the flags `--exclude-category Politics --exclude-tag
-"Sports · Hockey"` above trade — and "Save as live defaults…" sends exactly
-those ticks as the live exclusions (`exclude_category=Politics&exclude_tag=Sports
-· Hockey`). It stays disabled while the ticks keep no trade of the scenario
+"Sports · Hockey"` above trade — and the dashboard's Trading tab follows
+exactly those ticks as the live exclusions (`exclude_category=Politics&exclude_tag=Sports
+· Hockey`). The bar passes the Trading tab nothing, and says why in red, while
+the ticks keep no trade of the scenario
 shown, would tick every tag of a category while a category whose name
 differs from it only in letter case still keeps a tag (a live filter reads the
 two as one category, so it could not leave out the first whole), would send a
 name the server refuses (a name reading any or none, or a
 tag of a category whose name holds " · ", which a live filter would read as
-another category and tag), or would make a link the server does not take
+another category and tag), or would make a proposal the server does not take
 (more than 400 excluded categories or 400 excluded tags, letter-case twins
-counted, an address over 65,448 bytes, or over 65,246 bytes as the
-confirmation page posts it back with its own fields, where each ! ' ( ) ~
-takes three bytes). The menus offer only the tags this backtest saw, so a
+counted, a query over 65,512 bytes after `/confirm?`, each ' taking three
+bytes, or over 65,246 bytes as the trading page posts it back with its own
+fields, where each ! ' ( ) ~ takes three bytes). The menus offer only the tags this backtest saw, so a
 category with every tag ticked is sent as the category itself (a tag of it the
 backtest never saw does not trade either), while one with only some ticked is
 sent as those tags, and a tag of it the backtest never saw trades live. A confirmation link may name up to
@@ -1654,9 +1743,10 @@ checked for form only, so a hand-made link can name a look-alike of a real
 category (say with a Cyrillic letter) in place of the real one, which then is
 not excluded: read the page's table before you confirm. The page's own "Live
 rule" line says what to tick in each menu to see the filter your saved defaults
-hold. The menus live on the dashboard's filter bar only: the confirmation and
-trade pages show every category and tag of the filter but have no menus, and
-`backtest.py` has no category flag (it simulates everything once and the page
+hold. The dashboard's Trading tab has the same two menus, listing every name
+it excludes and then every name the backtest page's menus list
+(`backtest_filter_names.json`, which each backtest build writes beside the
+page), and `backtest.py` has no category flag (it simulates everything once and the page
 shows the share the menus leave).
 
 Code from before the same-title cap was removed refuses a saved file this
@@ -1724,7 +1814,7 @@ and is printed to the second. Nothing is logged when the flag is absent.
 python3 -m kalshi_betting.backtest
 ```
 
-Runs from 2024-01-01, starting from what your Kalshi account is worth now, pairing same-event ladders at the configured switch (on by the 2026-09-26 decision). The starting balance is the account's portfolio value — its cash on every shard plus what Kalshi says its open positions are worth, the figure live runs size their trades on — read once from the production account before anything is fetched; the simulation holds it all as cash. When Kalshi's reply has no readable positions value the cash alone is used, with a WARNING. If the balance cannot be read (no network, bad credentials), or what it reads comes to nothing (an account worth $0, or no cash beside a positions value that could not be read), the run stops before the fetch with the reason on the terminal (exit 1); `--balance DOLLARS` starts from an amount of your choosing and makes no balance read. A starting balance below the $50 a live run needs before it trades (`config.MIN_BALANCE_CENTS`) draws a WARNING, since the backtest trades from it anyway. The log's `Starting balance` line and the dashboard's header say where the amount came from, e.g. `Starting balance: $211.42 (the account's value at 2026-10-02 21:30 UTC: cash $116.15 + open positions $95.27)`. Unlike a live run, the backtest does not check the positions value against the contracts held: it risks no money, and both parts are shown. Results are cached in `backtest_cache/`. The run ends by pointing at `backtest_dashboard.html` and at how a scenario on it becomes the live defaults, or is traded: run `./start_dashboard.sh` (it starts the live dashboard, whose Backtest tab is the page, and the defaults server), then use the filter bar's "Save as live defaults…" or "Trade using defaults…" button (see [Dashboard buttons](#dashboard-buttons)).
+Runs from 2024-01-01, starting from what your Kalshi account is worth now, pairing same-event ladders at the configured switch (on by the 2026-09-26 decision). The starting balance is the account's portfolio value — its cash on every shard plus what Kalshi says its open positions are worth, the figure live runs size their trades on — read once from the production account before anything is fetched; the simulation holds it all as cash. When Kalshi's reply has no readable positions value the cash alone is used, with a WARNING. If the balance cannot be read (no network, bad credentials), or what it reads comes to nothing (an account worth $0, or no cash beside a positions value that could not be read), the run stops before the fetch with the reason on the terminal (exit 1); `--balance DOLLARS` starts from an amount of your choosing and makes no balance read. A starting balance below the $50 a live run needs before it trades (`config.MIN_BALANCE_CENTS`) draws a WARNING, since the backtest trades from it anyway. The log's `Starting balance` line and the dashboard's header say where the amount came from, e.g. `Starting balance: $211.42 (the account's value at 2026-10-02 21:30 UTC: cash $116.15 + open positions $95.27)`. Unlike a live run, the backtest does not check the positions value against the contracts held: it risks no money, and both parts are shown. Results are cached in `backtest_cache/`. The run ends by pointing at `backtest_dashboard.html` and at how a scenario on it becomes the live defaults, or is traded: run `./start_dashboard.sh` (it starts the live dashboard, whose Backtest tab is the page, and the defaults server), then choose the scenario on the Backtest tab's filter bar, which the Trading tab follows, and use the Trading tab's Confirm and save or Confirm and trade button (see [The Trading tab](#the-trading-tab)).
 
 Options:
 
@@ -1972,9 +2062,9 @@ own toggles — the tier floors and the spread band, `k` and the two per-trade
 caps, and the category/tag filter — from the saved live defaults
 (`live_defaults.json`), and the ladder switch from `config.py`, never from a
 backtest run, so applying a chosen scenario live is saving it as the live
-defaults (the filter bar's "Save as live defaults…" button, with
-`./start_dashboard.sh` running, then Confirm and save on
-the page it opens), or, for one run, `main.py`'s matching flags (see
+defaults (with `./start_dashboard.sh` running, choose it on the Backtest
+tab's filter bar, which the dashboard's Trading tab follows, then click
+the Trading tab's Confirm and save), or, for one run, `main.py`'s matching flags (see
 [Live trading toggles](#live-trading-toggles); leaving out Politics and Sports'
 Hockey is `--exclude-category Politics --exclude-tag "Sports · Hockey"`,
 which the filter bar's menus show as Politics ticked in the Exclude categories menu
@@ -2133,9 +2223,9 @@ bind at uses its tier-on block for both), which the page unpacks the first time
 a level is chosen there. Each build deletes the folders of earlier builds once it
 has replaced the page (never one another backtest is still writing). The
 Scenario Explorer and the Interval Discount (k) section never follow either
-select, the `k̂` figures do not depend on them, and Save as live defaults… sends
-the level and minimum shown as the live sell level and minimum of days (or `off`
-for both under no selling). `--no-sell-sweep` skips the family and leaves
+select, the `k̂` figures do not depend on them, and the dashboard's Trading tab
+follows the level and minimum shown as the live sell level and minimum of days
+(or `off` for both under no selling). `--no-sell-sweep` skips the family and leaves
 both selects disabled.
 
 **Cost of the selects.** With 21 levels and 9 minimums the selects cover 189
@@ -2179,10 +2269,10 @@ paid-out market (a time-series pair whose later market paid out first, or
 one whose earlier side won) is left alone. Each added purchase
 and each part sold is a trade of its own in the trade counts and tables. While
 Rebalance is yes, the Sell select is set to "no selling" and shut (the two are
-not simulated together). "Save as live defaults…" sends the Rebalance choice,
-with the Min. price movement shown beside it, as the live defaults'
-`rebalance` and `min_price_move` (from a page without the Rebalance view it
-sends neither, and the saved values stay). The Scenario Explorer, the Interval
+not simulated together). The dashboard's Trading tab follows the Rebalance
+choice, with the Min. price movement shown beside it, as the live defaults'
+`rebalance` and `min_price_move` (from a page without the Rebalance view the
+bar passes neither, and the Trading tab's stay). The Scenario Explorer, the Interval
 Discount (k) section and the k̂ figures do not follow the choice. A live run
 trims by the same rule, lone legs included, when its saved `rebalance` is on,
 but never a same-title pair (two identically worded markets are no pair
@@ -2232,8 +2322,8 @@ every 5c step from "5c" to "95c" (10c is 10% of a $1 payout). The menu is open
 only while Rebalance is yes; with it no the menu is shut and the page shows the
 run without rebalancing. A minimum that changes nothing for a scenario shows the
 same result as "any", or as the lower minimum it repeats. While Rebalance is
-yes, at any minimum, Sell stays shut at "no selling", and "Save as live
-defaults…" saves the minimum shown ("any", or Rebalance no, saves none). The
+yes, at any minimum, Sell stays shut at "no selling", and the dashboard's
+Trading tab follows the minimum shown ("any", or Rebalance no, proposes none). The
 Scenario Explorer, the Interval Discount (k) section and the k̂ figures do not
 follow the menu. `--no-move-sweep` skips these simulations and leaves the menu
 shut, with a note saying so; Rebalance itself is still built.
@@ -2256,10 +2346,11 @@ rebalances in its last week. The filter bar's **Rebalance until** menu, right
 after Min. price movement, picks one: "maturity" (no days limit: the run the
 minimum shows), "1 day before" or "7 days before". Like Min. price movement it
 is open only while Rebalance is yes, and a choice that changes nothing for a
-scenario shows the same result as "maturity". "Save as live defaults…" saves
-the choice shown as `rebalance_min_days_to_maturity` ("maturity", or Rebalance
-no, saves no days limit), and when the saved live defaults have a limit, a grey
-note beside the button says that saving "maturity" turns it off. The Scenario
+scenario shows the same result as "maturity". The dashboard's Trading tab
+follows the choice shown as `rebalance_min_days_to_maturity` ("maturity", or
+Rebalance no, proposes no days limit), and when the saved live defaults have a
+limit, a grey note after the Exclude menus says that "maturity" proposes
+turning it off. The Scenario
 Explorer, the Interval Discount (k) section and the k̂ figures do not follow
 the menu. `--no-maturity-sweep` leaves the choices out and the menu shut;
 `--no-rebalance-sweep` does too.
@@ -2478,7 +2569,7 @@ python3 -m pytest tests/ -v      # run the test suite
 python3 -m ruff check kalshi_betting/   # lint check
 ```
 
-Tests run fully offline against `unittest.mock.MagicMock` clients — no real Kalshi API calls. The defaults server's socket tests (`tests/test_defaults_server.py::TestOverASocket` and `::TestBusyPortOverASocket`, which points the server's port at a listener of its own and never asks the real port anything) bind a loopback port and skip where a sandbox refuses that; CI binds. One of them starts a tiny Python child through the real `subprocess.Popen` in place of `main.py` (a dry run's round trip); every other test that starts a run hands the server a stand-in that starts nothing, and no test starts `main.py`. Its page-script tests (`::TestConfirmScript`) run the page's script under node or macOS's `jsc`, and skip when neither is present. `tests/test_launcher.py` runs `start_dashboard.sh` with a stand-in for Python that records each call and starts neither server (each server it plays either exits, or keeps running and, like the real ones, stops cleanly on Ctrl-C), checking the flags it refuses before starting anything, which arguments each server gets, the warnings when the live dashboard stops early or late, the exit code, that Ctrl-C, SIGTERM or SIGHUP to the script or its process group, or a failing defaults server, stops both servers, and that a server that has already ended is never signalled (and runs the script's own import check once under the real Python, which imports the live bot and the live dashboard and starts nothing); it skips where there is no bash. The Live trading tab's tests (`tests/test_live_portfolio.py`, `tests/test_live_dashboard.py`) read stand-ins for Kalshi's replies, never the network; the live dashboard's socket tests skip where a sandbox refuses binding a port, and its page-script tests run under node or `jsc` and skip when neither is present. `.github/workflows/ci.yml` runs both commands on every push to `main` and on EVERY pull request, whatever its base branch — the `pull_request:` trigger carries no branch filter. Both must pass before merging.
+Tests run fully offline against `unittest.mock.MagicMock` clients — no real Kalshi API calls. The defaults server's socket tests (`tests/test_defaults_server.py::TestOverASocket` and `::TestBusyPortOverASocket`, which points the server's port at a listener of its own and never asks the real port anything) bind a loopback port and skip where a sandbox refuses that; CI binds. One of them starts a tiny Python child through the real `subprocess.Popen` in place of `main.py` (a dry run's round trip); every other test that starts a run hands the server a stand-in that starts nothing, and no test starts `main.py`. Its page-script tests (`::TestConfirmScript`, `::TestBarScript` and `::TestNotifyScript`) run the trading page's scripts under node or macOS's `jsc`, and skip when neither is present. `tests/test_launcher.py` runs `start_dashboard.sh` with a stand-in for Python that records each call and starts neither server (each server it plays either exits, or keeps running and, like the real ones, stops cleanly on Ctrl-C), checking the flags it refuses before starting anything, which arguments each server gets, the warnings when the live dashboard stops early or late, the exit code, that Ctrl-C, SIGTERM or SIGHUP to the script or its process group, or a failing defaults server, stops both servers, and that a server that has already ended is never signalled (and runs the script's own import check once under the real Python, which imports the live bot and the live dashboard and starts nothing); it skips where there is no bash. The Live trading tab's tests (`tests/test_live_portfolio.py`, `tests/test_live_dashboard.py`) read stand-ins for Kalshi's replies, never the network; the live dashboard's socket tests skip where a sandbox refuses binding a port, and its page-script tests run under node or `jsc` and skip when neither is present. `.github/workflows/ci.yml` runs both commands on every push to `main` and on EVERY pull request, whatever its base branch — the `pull_request:` trigger carries no branch filter. Both must pass before merging.
 
 ---
 

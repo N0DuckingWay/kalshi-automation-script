@@ -225,7 +225,7 @@ Notes:
     --no-sell-sweep skips it, leaving both selects disabled. Nothing here
     reaches live trading by itself: a live run sells at its saved sell_at
     level (main.py --sell-at overrides it for one run), which the dashboard's
-    Save as live defaults… can set.
+    Trading tab can set.
 
     The "Rebalance" family is ON by default too (rebalance_sweep=True): the
     result carries a lazy RebalanceSweep (BacktestSweep.rebalance_sweep)
@@ -236,7 +236,7 @@ Notes:
     simulates nothing during the run; --no-rebalance-sweep skips it,
     leaving the select disabled. A live run adds to and trims held pairs
     only by its own saved settings (main.py's flags for one run), which the
-    dashboard's Save as live defaults… can set.
+    dashboard's Trading tab can set.
 
     The family's minimum price movements are ON by default with it
     (move_sweep=True): the RebalanceSweep also carries every minimum of
@@ -297,12 +297,13 @@ Notes:
     time-series rule and, when one is set, their category/tag filter (never
     main.py's per-run overrides), from a read of its own, failing soft;
     run_backtest_sweep reads them again and logs where THIS run's grid holds
-    that rule. Only the dashboard's "Save as live defaults…" button (or
-    ./start_dashboard.sh --seed), confirmed through defaults_server, sets the
-    live defaults; nothing else chosen here reaches live trading. The run's
-    last line says how: run ./start_dashboard.sh (it starts the defaults
-    server and the live dashboard, whose Backtest tab is the page), then use
-    the filter bar's Save as live defaults… or Trade using defaults… button.
+    that rule. Only the dashboard's Trading tab (or ./start_dashboard.sh
+    --seed), confirmed through defaults_server, sets the live defaults;
+    nothing chosen here reaches live trading by itself. The run's last line
+    says how: run ./start_dashboard.sh (it starts the defaults server and
+    the live dashboard, whose Backtest tab is the page), choose the scenario
+    on the Backtest tab's filter bar, which the Trading tab follows, then
+    use the Trading tab's Confirm and save or Confirm and trade button.
 """
 import argparse
 import ast
@@ -1202,16 +1203,18 @@ def _sell_workers(requested: int | None) -> int:
 
 
 def _log_how_to_open() -> None:
-    """Close a run, or a rebuild, by saying how to view the page and use its buttons."""
+    """Close a run, or a rebuild, by saying how to view the page and trade what it shows."""
     logging.info("Open the HTML file in a browser to view the interactive charts.")
     # How a scenario on the page becomes the live defaults, or is traded: the
-    # page cannot write files or start runs, so its buttons open the defaults
-    # server's pages (started by ./start_dashboard.sh, beside the live
-    # dashboard, whose Backtest tab shows this page)
+    # page cannot write files or start runs. Shown as the live dashboard's
+    # Backtest tab (./start_dashboard.sh starts it beside the defaults
+    # server), its filter bar moves the Trading tab, the defaults server's
+    # trading page, whose buttons save and trade
     logging.info("To save the filter bar's scenario as the live defaults, or to trade: run "
                  "./start_dashboard.sh (it starts the defaults server and the live dashboard, "
-                 "whose Backtest tab is this page), then use the filter bar's Save as live "
-                 "defaults… or Trade using defaults… button.")
+                 "whose Backtest tab is this page), choose the scenario on the Backtest tab's "
+                 "filter bar, which the Trading tab follows, then use the Trading tab's "
+                 "Confirm and save or Confirm and trade button.")
 
 
 def _rebuild_dashboard(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -1459,7 +1462,7 @@ def _build_parser() -> argparse.ArgumentParser:
              "their simulations run only while the dashboard is built, so skipping "
              "them makes that step much faster and leaves both selects disabled. "
              "Backtest only — a live run sells only at its saved sell_at level, "
-             "which the dashboard's Save as live defaults… can set to a level "
+             "which the dashboard's Trading tab can set to a level "
              "shown here",
     )
     parser.add_argument(
@@ -1471,7 +1474,7 @@ def _build_parser() -> argparse.ArgumentParser:
              "them makes that step faster and leaves both selects disabled. It skips the "
              "family's \"Rebalance until\" choices too. Backtest "
              "only — a live run adds to and trims held pairs by its own saved settings, "
-             "which the dashboard's Save as live defaults… can set to the choice shown "
+             "which the dashboard's Trading tab can set to the choice shown "
              "here",
     )
     parser.add_argument(

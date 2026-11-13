@@ -19,7 +19,9 @@ Dependencies:
     outside the pipeline's import graph: the verification CLI (see
     CLAUDE.md's pipeline-isolation rule), defaults_server.py, the local pages
     that save the live defaults and start live trading runs with them, and
-    live_dashboard.py, the read-only local server of the dashboard's three tabs.
+    live_dashboard.py, the read-only local server of the dashboard's tab page
+    (its Live trading, Backtest, Trading and Data tabs, and a Run tab once a
+    run starts; the Trading and Run tabs frame defaults_server.py's pages).
 
 Notes:
     PROJECT_ROOT is derived from __file__ so the package works correctly on any
@@ -469,11 +471,12 @@ INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
 # or above this share of its potential profit (its contract pairs at
 # CONTRACT_PAYOUT_DOLLARS less what it cost) for TAKE_PROFIT_HOLD_DAYS days in a
 # row. Every 1% from 80% to 100%, 21 levels, each the float nearest its percent
-# over 100 (so 81% is exactly the float 0.81). BACKTEST-ONLY: live trading
-# sells at its saved sell_at (no live module reads this). Distinct shares in
-# (0, 1]. Read by backtester.run_backtest_sweep(sell_sweep=True), which checks
-# them before its fetch, and whose lazy SellSweep simulates each level when the
-# dashboard reads it.
+# over 100 (so 81% is exactly the float 0.81). Distinct shares in (0, 1]. No
+# live trading module reads them: a live run sells at its saved sell_at. Read by
+# backtester.run_backtest_sweep(sell_sweep=True), which checks them before its
+# fetch, and whose lazy SellSweep simulates each level when the dashboard reads
+# it. The defaults server's trading page lists them as its Sell choices, for a
+# person to pick from; a run trades the LiveSettings it was confirmed with.
 TAKE_PROFIT_LEVELS = tuple(percent / 100 for percent in range(80, 101))
 
 # The minimum-days options the backtest dashboard offers beside each sell level:
@@ -484,9 +487,11 @@ TAKE_PROFIT_LEVELS = tuple(percent / 100 for percent in range(80, 101))
 # checkpoint's date to that date, so 1 holds back only a position whose last
 # market closes on or before the checkpoint's own date, and 21 sells only one
 # with three weeks or more to go. Whole numbers of at least 1, none repeated.
-# BACKTEST-ONLY, like TAKE_PROFIT_LEVELS: read by
-# backtester.run_backtest_sweep(sell_sweep=True), which checks them before its
-# fetch, and by the SellSweep it returns (_simulate_at_discount's sell_min_days).
+# Like TAKE_PROFIT_LEVELS, no live trading module reads them (a live run uses
+# its saved sell_min_days): read by backtester.run_backtest_sweep(sell_sweep=True),
+# which checks them before its fetch, and by the SellSweep it returns
+# (_simulate_at_discount's sell_min_days). The defaults server's trading page
+# lists them as its "Min. days to maturity" choices, for a person to pick from.
 TAKE_PROFIT_MIN_DAYS = (1, 2, 3, 4, 5, 6, 7, 14, 21)
 
 # How many days in a row a position must stay at or above its sell level
@@ -508,11 +513,13 @@ TAKE_PROFIT_HOLD_DAYS_MAX = 7
 # where it stood at the last trade on the pair (its purchase, an add-on or a
 # trim): a move up and a move down count alike. Every 5c from 5c to 95c, 19
 # values, each the float nearest its cents over 100 (so 15c is exactly the
-# float 0.15), all distinct and in (0, 1]. Backtest only: read by
-# backtester.run_backtest_sweep(move_sweep=True), which checks them
+# float 0.15), all distinct and in (0, 1]. No live trading module reads them:
+# backtester.run_backtest_sweep(move_sweep=True) reads them, and checks them
 # before its fetch. A live run uses its own saved minimum
 # (LiveSettings.min_price_move), which _step_move holds to the same step,
-# PRICE_MOVE_STEP_CENTS, from 5c to $1.
+# PRICE_MOVE_STEP_CENTS, from 5c to $1; the defaults server's trading page
+# lists these values as its "Min. price movement" choices, for a person to
+# pick from.
 PRICE_MOVE_STEP_CENTS = 5
 MIN_PRICE_MOVES = tuple(
     cents / 100 for cents in range(PRICE_MOVE_STEP_CENTS, 100, PRICE_MOVE_STEP_CENTS))
@@ -794,15 +801,17 @@ LIVE_DEFAULTS_SOURCE_PATTERN = (
 # ── Defaults server ───────────────────────────────────────────────────────────
 
 # Where defaults_server.py listens: the pages that save the live defaults and
-# start live runs with them. Loopback only. Changing the port needs a new
-# dashboard, since the page's save and trade addresses are written into it when
-# it is built.
+# start live runs with them, which the live dashboard's Trading and Run tabs
+# show in frames. Loopback only. The live dashboard builds those frames'
+# addresses from these when it starts, so after a change both servers must be
+# started again (./start_dashboard.sh); the backtest page names neither.
 DEFAULTS_SERVER_HOST = "127.0.0.1"
 DEFAULTS_SERVER_PORT = 8765
 
-# The longest request (path plus body) the server reads. The dashboard's Save
-# button can name hundreds of excluded tags (16 to 32 KB for 400) and keeps
-# itself disabled for an address that would not fit.
+# The longest request (path plus body) the server reads. A proposal can name
+# hundreds of excluded tags (16 to 32 KB for 400); the backtest page's filter
+# bar passes the Trading tab none that would not fit, as a query or as the
+# trading page's posted form.
 DEFAULTS_SERVER_MAX_REQUEST_BYTES = 65_536
 
 # The most excluded categories, and the most excluded tags, one confirmation
@@ -813,14 +822,27 @@ DEFAULTS_SERVER_MAX_FILTER_NAMES = 400
 # line break), whatever DEFAULTS_SERVER_MAX_REQUEST_BYTES says.
 DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES = 65_536
 
+# The longest proposal (the query after "/confirm?") the live dashboard's
+# Trading tab carries to the defaults server's trading page, counted as the
+# browser sends it (each apostrophe as %27, three bytes). The address must fit
+# both of the limits above: the server's own on a request's path, and its HTTP
+# layer's on the request line ("GET /confirm?<query> HTTP/1.1" and its line
+# break), the tighter of the two (65,512 bytes). The dashboard's tab page
+# refuses a longer proposal, and the backtest page's filter bar never sends one.
+TRADING_QUERY_MAX_BYTES = min(
+    DEFAULTS_SERVER_MAX_REQUEST_BYTES - len("/confirm?"),
+    DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES - len("GET /confirm? HTTP/1.1\r\n"))
+
 # Bytes the confirmation form adds when posted back: the fingerprint, nonce,
-# token, longest action and attention box fields. The Save button budgets with
-# it; a test checks the sum against a real form.
+# token, longest action and attention box fields. The backtest page's filter
+# bar budgets with it (dashboard._sync_max_form_bytes), so a proposal it
+# passes the Trading tab still fits DEFAULTS_SERVER_MAX_REQUEST_BYTES when the
+# trading page posts it back; a test checks the sum against a real form.
 DEFAULTS_SERVER_CONFIRM_FORM_EXTRA_BYTES = 218
 
-# Bytes the dashboard's Save button leaves unused under both of the defaults
-# server's limits (the request line and the request), in case its form grows
-# by a field
+# Bytes the backtest page's filter bar leaves unused under the defaults
+# server's request limit (DEFAULTS_SERVER_MAX_REQUEST_BYTES) when it budgets
+# the trading page's posted form, in case that form grows by a field
 DASHBOARD_SAVE_HEADROOM_BYTES = 64
 
 # Seconds the server waits on a silent connection before dropping it: it
@@ -833,9 +855,31 @@ DEFAULTS_SERVER_SOCKET_TIMEOUT_SECONDS = 5
 # cannot land on one (the DoubleClickjacking defence).
 DEFAULTS_SERVER_CONFIRM_ARM_MS = 1000
 
+# The spread bands and size caps the defaults server's trading page offers in
+# its Spread band and Size cap menus: every band of the backtest's grid
+# (SPREAD_BAND_SWEEP_FLOORS x SPREAD_BAND_SWEEP_CEILINGS, the floor below the
+# ceiling), and every cap on the SIZE_CAP_STEP grid from one step to 100%,
+# each rounded to two places as LiveSettings stores a cap (_step_cap, and
+# backtester.SIZE_CAP_SWEEP). Its other menus offer INTERVAL_DISCOUNT_SWEEP,
+# MIN_PRICE_MOVES, REBALANCE_MATURITY_DAYS, TAKE_PROFIT_LEVELS and
+# TAKE_PROFIT_MIN_DAYS, and every menu adds the value the page shows when it is
+# off these grids. They are choices for a person only: a run trades the
+# LiveSettings a save or a run was confirmed with, never these. The band list
+# is its own constant because the live path may not name the backtest's band
+# grids (the AST pin in tests/test_strategy.py forbids SPREAD_BAND_SWEEP_FLOORS
+# and SPREAD_BAND_SWEEP_CEILINGS in every live module, defaults_server
+# included); that pin's rule is about trading, and this copy only lists
+# choices: defaults_server names it in its dropdown bar alone and no other
+# module names it (tests/test_defaults_server.py checks both)
+DEFAULTS_SERVER_SPREAD_BANDS = tuple(
+    (floor, ceiling) for floor in SPREAD_BAND_SWEEP_FLOORS
+    for ceiling in SPREAD_BAND_SWEEP_CEILINGS if floor < ceiling)
+DEFAULTS_SERVER_SIZE_CAPS = tuple(
+    round(SIZE_CAP_STEP * steps, 2) for steps in range(1, round(1 / SIZE_CAP_STEP) + 1))
+
 # The one dashboard file every backtest run writes (and overwrites) in
-# PROJECT_ROOT; defaults_server opens it when run on its own, and
-# live_dashboard serves it on LIVE_BACKTEST_PORT as the Backtest tab.
+# PROJECT_ROOT; live_dashboard serves it on LIVE_BACKTEST_PORT as the
+# Backtest tab.
 DASHBOARD_FILENAME = "backtest_dashboard.html"
 
 # The folder beside the dashboard file that holds the data the page loads when
@@ -962,12 +1006,6 @@ BACKTEST_SWEEP_FORMAT = "backtest-sweep-v7"
 # JSON one): the real line is a few hundred bytes, so a file that runs past
 # this without a line break is not a saved sweep.
 BACKTEST_SWEEP_HEADER_MAX_BYTES = 65_536
-
-# How much of the dashboard file, from its start, defaults_server reads to tell
-# whether the page has the filter bar's Save and Trade buttons (it looks for
-# the Trade link's id). The bar sits in the page's opening part, before every
-# section and data block, so the first MiB holds it on any page, however large.
-DASHBOARD_MARKER_SCAN_BYTES = 1_048_576
 
 # When defaults_server finds its port taken, it asks the server already there
 # which checkout it serves (GET /checkout): how long it waits, in seconds, for
@@ -1107,6 +1145,25 @@ LIVE_CASH_SHOWN_STEP_DOLLARS = "0.0001"
 LIVE_DASHBOARD_HOST = "127.0.0.1"
 LIVE_DASHBOARD_PORT = 8766
 LIVE_BACKTEST_PORT = 8767
+
+# The live dashboard's tab page under its two addresses: 127.0.0.1 and localhost
+# name one machine but are two web origins. They are the only pages that may
+# show the defaults server's pages (its trading page and its run pages) in a
+# frame, and the only pages those pages tell, when framed, what they show.
+# The backtest page (LIVE_BACKTEST_PORT) is neither
+LIVE_DASHBOARD_ORIGINS = (f"http://{LIVE_DASHBOARD_HOST}:{LIVE_DASHBOARD_PORT}",
+                          f"http://localhost:{LIVE_DASHBOARD_PORT}")
+
+# The file that lists, beside the backtest page in PROJECT_ROOT, every
+# category and every tied tag ("Category · Tag") the backtest page's filter
+# bar offers: one JSON object, {"format": BACKTEST_FILTER_NAMES_FORMAT,
+# "categories": [...], "tags": [...]}. The defaults server reads it, when it is
+# there, so its trading page's Exclude menus list the same names; it reads at
+# most BACKTEST_FILTER_NAMES_MAX_BYTES (1 MiB) and uses nothing of a file that
+# is longer, damaged or of another format
+BACKTEST_FILTER_NAMES_FILENAME = "backtest_filter_names.json"
+BACKTEST_FILTER_NAMES_FORMAT = "backtest-filter-names-v1"
+BACKTEST_FILTER_NAMES_MAX_BYTES = 1_048_576
 
 # Seconds the live dashboard waits on a silent connection before dropping it.
 # A file being sent (the backtest page can be hundreds of MB) is sent with no
@@ -3278,8 +3335,9 @@ def check_filter_name(text: str, field: str) -> str:
     spaces while being a different name to the filter. That also refuses a
     tied tag written with a doubled space ("Sports ·  Basketball").
     defaults_server._name reads every exclude_category and exclude_tag field
-    through it, and filter_name_refusal asks it for the dashboard's Save
-    button, so the two never disagree.
+    through it, and filter_name_refusal asks it for the backtest page, whose
+    filter bar passes the Trading tab only names the server takes, so the two
+    never disagree.
 
     Args:
         text (str): The name.
@@ -3309,8 +3367,10 @@ def filter_name_refusal(field: str, name: str) -> str | None:
     and then LiveSettings, which holds it to _names (no "any" or "none") and
     to _check_category_names or _check_tied_tags. Each of those judges a name
     on its own, so one name's verdict is the verdict of any list holding it.
-    The dashboard asks this of every category and tag its menus offer, so its
-    Save button never opens a link the server refuses.
+    The backtest page asks this of every category and tag its menus offer
+    (dashboard._sync_refused), so its filter bar never passes the Trading tab
+    a name the server refuses, and the names file written beside the page
+    (which the trading page's Exclude menus list) leaves such names out.
 
     Args:
         field (str): "exclude_categories" or "exclude_tags".
@@ -4216,11 +4276,11 @@ def _retired_message(retired: list[str], proposal: LiveSettings | None,
             traded only 'Economics', and this version saves what NOT to trade
             instead. Saved again as offered (no category excluded), they trade
             everything: exclude each category not to trade before saving
-            (start ./start_dashboard.sh, or the backtest dashboard's "Save as
-            live defaults…" button)'. A file that listed tags to trade says
-            "limited trading to the tags 'Basketball' (a 'Category · Tag'
-            limited that category alone)" and "exclude each tag not to
-            trade", and one that listed both names both. A file whose only
+            (in the dashboard's Trading tab: start ./start_dashboard.sh)'. A
+            file that listed tags to trade says "limited trading to the tags
+            'Basketball' (a 'Category · Tag' limited that category alone)"
+            and "exclude each tag not to trade", and one that listed both
+            names both. A file whose only
             retired setting is the same-title cap says '"settings" holds
             same_title_size_cap, which is no longer used (the bot trades
             time-series pairs only): save the live defaults again (start
@@ -4242,8 +4302,8 @@ def _retired_message(retired: list[str], proposal: LiveSettings | None,
     head = '"settings" holds ' + ", and ".join(parts)
     if proposal is None:
         return (f"{head}, and its other settings are refused too ({refused}): save the "
-                "live defaults again (start ./start_dashboard.sh and save new ones from "
-                "its pages, from the seed values or the backtest dashboard)")
+                "live defaults again (start ./start_dashboard.sh and save new ones in "
+                "its Trading tab, which offers the seed values)")
     offered = []
     if any(name in _RETIREMENTS[0][0] for name in retired):
         offered.append("rebalance yes, min price movement " + _move_text(proposal.min_price_move)
@@ -4273,9 +4333,8 @@ def _retired_message(retired: list[str], proposal: LiveSettings | None,
         return (f"{head}: these defaults {' and '.join(widened)}, and this "
                 f"version saves what NOT to trade instead. Saved again as offered "
                 f"({', '.join(offered)}), they trade everything: exclude each "
-                f"{' and '.join(kinds)} not to trade before saving (start "
-                "./start_dashboard.sh, or the backtest dashboard's \"Save as live "
-                "defaults…\" button)")
+                f"{' and '.join(kinds)} not to trade before saving (in the dashboard's "
+                "Trading tab: start ./start_dashboard.sh)")
     # The cap alone leaves every other setting as saved, which the list alone
     # would not say
     as_offered = ("saved, with no same-title cap" if offered == ["no same-title cap"]
@@ -4476,9 +4535,9 @@ def live_defaults() -> LiveSettings:
     saved = read_saved_live_defaults()
     if saved is None:
         raise LiveDefaultsMissing(
-            f"no live defaults are saved at {LIVE_DEFAULTS_FILE}: save them from the backtest "
-            "dashboard's \"Save as live defaults…\" button (with ./start_dashboard.sh "
-            "running), or start from the seed values with ./start_dashboard.sh --seed (or "
+            f"no live defaults are saved at {LIVE_DEFAULTS_FILE}: save them in the "
+            "dashboard's Trading tab (start ./start_dashboard.sh), or start from the seed "
+            "values with ./start_dashboard.sh --seed (or "
             "python3 -m kalshi_betting.defaults_server --seed) (live runs never fall back to "
             "config.py's toggles)")
     return saved
@@ -5724,6 +5783,31 @@ def live_settings_changes(current: LiveSettings | None,
             old = getattr(current, name)
             rows.append((label, render(old), render(new), old != new))
     return rows
+
+
+def live_setting_text(field: str, value: object) -> str:
+    """
+    Word one live toggle's value as the "Live settings:" line and the confirmation table do.
+
+    The defaults server's trading page words its menus' choices with it, so a
+    choice reads exactly as the table under the menus shows it once chosen.
+
+    Args:
+        field (str): A LiveSettings toggle's name (one of LIVE_TOGGLE_FIELDS).
+        value (object): A value of that toggle, as LiveSettings holds it (None
+            for an unset minimum, sell level or days limit).
+
+    Returns:
+        str: The words, e.g. "0-0.5" for a spread band, "10%" for a size cap
+            or "any" for no minimum price movement.
+
+    Raises:
+        KeyError: When field is not a toggle's name.
+    """
+    for _, name, render in _LIVE_SETTING_FIELDS:
+        if name == field:
+            return render(value)
+    raise KeyError(field)
 
 
 def live_settings_argv(settings: LiveSettings) -> list[str]:

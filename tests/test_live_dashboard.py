@@ -3,8 +3,12 @@ tab page's server (one read of the account at a time, refusals of every
 request not from its own page), the backtest page's server (the page and its
 chunk files, and nothing outside them, and the Data page at /eda/), the socket side, main()'s start and
 its reuse of a running dashboard, the page's script (run under
-tests/js/live_harness.js with node or jsc, skipping without either), and the
-rules that keep the dashboard read-only and away from the order path.
+tests/js/live_harness.js with node or jsc, skipping without either), including
+the Trading and Run tabs (the frames that show the live-defaults server's pages
+and the messages those pages and the backtest page send), the checks that the
+tab page and the live-defaults server name each other alike (the one place
+these tests read defaults_server), and the rules that keep the dashboard
+read-only and away from the order path.
 
 All offline: the Kalshi client is never built for real (historical's builder
 and live_portfolio's view are replaced), servers bind loopback ports the
@@ -14,9 +18,11 @@ import ast
 import dataclasses
 import errno
 import hashlib
+import html
 import http.client
 import importlib
 import inspect
+import io
 import json
 import logging
 import os
@@ -30,6 +36,7 @@ import sys
 import threading
 import time
 from base64 import b64encode
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from email.utils import formatdate
@@ -42,7 +49,14 @@ import pytest
 from kalshi_python_sync.exceptions import ApiException
 
 import kalshi_betting
-from kalshi_betting import config, historical, live_dashboard, live_portfolio, treasury
+from kalshi_betting import (
+    config,
+    defaults_server,
+    historical,
+    live_dashboard,
+    live_portfolio,
+    treasury,
+)
 from kalshi_betting.live_dashboard import (
     CASH,
     MORE_CATEGORIES,
@@ -618,25 +632,51 @@ class TestPageApp:
         assert f"'sha256-{digest}'" in csp
         assert f"script-src {config.LIVE_DASHBOARD_PLOTLY_URL} 'sha256-{digest}';" in csp
         assert "frame-ancestors 'none'" in csp and "connect-src 'self'" in csp
-        assert f"frame-src http://127.0.0.1:{config.LIVE_BACKTEST_PORT};" in csp
-        # The backtest and Data addresses and the request header are written
-        # into the script; both pages are on the one origin frame-src allows
+        # The page has no form of its own: the trading page's form is that page's
+        assert "form-action 'none'" in csp.split("; ")
+        # Its frames: the backtest port's pages and the live-defaults server's, nothing else
+        [frame_src] = [p for p in csp.split("; ") if p.startswith("frame-src ")]
+        assert frame_src == (f"frame-src http://127.0.0.1:{config.LIVE_BACKTEST_PORT} "
+                             f"http://127.0.0.1:{config.DEFAULTS_SERVER_PORT}")
+        # The backtest and Data addresses, the trading and run pages' addresses
+        # and the request header are written into the script; every page it
+        # frames is on an origin frame-src allows
         assert json.dumps(live_dashboard.BACKTEST_URL) in script
         assert json.dumps(live_dashboard.DATA_URL) in script
         assert live_dashboard.DATA_URL == f"http://127.0.0.1:{config.LIVE_BACKTEST_PORT}/eda/"
         assert json.dumps(config.LIVE_DASHBOARD_REQUEST_HEADER) in script
+        for url, value in (("TRADING_URL", live_dashboard.TRADING_URL),
+                           ("RUN_URL", live_dashboard.RUN_URL),
+                           ("DEFAULTS_ORIGIN", live_dashboard._DEFAULTS_ORIGIN),
+                           ("BACKTEST_ORIGIN", live_dashboard._BACKTEST_ORIGIN)):
+            assert f"var {url} = {json.dumps(value)};" in script
+        assert f"var MAX_QUERY = {live_dashboard._TRADING_QUERY_MAX};" in script
+        # Every placeholder was written in
+        assert "__" not in script
 
     def test_the_page_has_its_tabs_buttons_and_frame(self):
         page = live_dashboard._SHELL
         assert re.search(r'id="tab-live" role="tab" aria-selected="true"', page)
         assert re.search(r'id="tab-backtest" role="tab" aria-selected="false"', page)
+        assert re.search(r'id="tab-trading" role="tab" aria-selected="false" '
+                         r'aria-controls="panel-trading">Trading</button>', page)
         assert re.search(r'id="tab-data" role="tab" aria-selected="false" '
                          r'aria-controls="panel-data">Data</button>', page)
-        # Three tab buttons, in order, and nothing else in the tab list
+        # The Run tab is hidden until the first run is reported
+        assert re.search(r'id="tab-run" role="tab" aria-selected="false" '
+                         r'aria-controls="panel-run" hidden>Run</button>', page)
+        # Five tab buttons, in order, and nothing else in the tab list
         assert re.findall(r'role="tab"[^>]*>([^<]+)</button>', page) == [
-            "Live trading", "Backtest", "Data"]
-        assert re.search(r'<section id="panel-data" role="tabpanel" aria-labelledby="tab-data" '
-                         r'hidden>', page)
+            "Live trading", "Backtest", "Trading", "Data", "Run"]
+        tablist = page.split('<div class="tabs" role="tablist">', 1)[1].split("</div>", 1)[0]
+        assert re.findall(r"<(\w+)", tablist) == ["button"] * 5
+        for name in ("backtest", "trading", "data", "run"):
+            assert re.search(rf'<section id="panel-{name}" role="tabpanel" '
+                             rf'aria-labelledby="tab-{name}" hidden>', page)
+        # Only the Run tab button starts hidden; the page opens on Live trading
+        assert _hidden_at_start() == ["tab-run", "live-warnings", "live-empty",
+                                      "live-holdings-empty", "panel-backtest", "panel-trading",
+                                      "panel-data", "panel-run"]
         for i, (label, _) in enumerate(config.LIVE_DASHBOARD_PERIODS):
             pressed = "true" if i == 0 else "false"
             assert f'id="period-{i}" aria-pressed="{pressed}">{label}</button>' in page
@@ -645,22 +685,55 @@ class TestPageApp:
         frames = re.findall(r'<iframe id="([^"]+)" title="([^"]+)" sandbox="([^"]+)"></iframe>',
                             page)
         assert [(i, t) for i, t, _ in frames] == [("backtest-frame", "Backtest dashboard"),
-                                                 ("data-frame", "Data")]
+                                                 ("trading-frame", "Trading"),
+                                                 ("data-frame", "Data"),
+                                                 ("run-frame", "Latest run")]
+        # Four frames in all, each in its tab's panel
+        assert page.count("<iframe") == 4
+        for frame, panel in (("backtest-frame", "backtest"), ("trading-frame", "trading"),
+                             ("data-frame", "data"), ("run-frame", "run")):
+            section = page.split(f'<section id="panel-{panel}"', 1)[1].split("</section>", 1)[0]
+            assert f'<iframe id="{frame}"' in section
         sandboxes = {i: sandbox.split() for i, _, sandbox in frames}
-        # The backtest page: scripts in its own origin, the defaults server's
-        # pages in windows of their own and a chart's picture saved; never the
-        # tab page navigated
-        assert sandboxes["backtest-frame"] == [
-            "allow-scripts", "allow-same-origin", "allow-popups",
-            "allow-popups-to-escape-sandbox", "allow-downloads"]
-        # The Data page opens no window: scripts, its own origin and a chart's
+        # The backtest page: scripts in its own origin and a chart's picture
+        # saved; it opens no window (it tells the tab page its bar's choice
+        # instead) and never navigates the tab page
+        assert sandboxes["backtest-frame"] == ["allow-scripts", "allow-same-origin",
+                                               "allow-downloads"]
+        # The Data page likewise: scripts, its own origin and a chart's
         # picture saved, nothing more
         assert sandboxes["data-frame"] == ["allow-scripts", "allow-same-origin",
                                            "allow-downloads"]
-        # Neither frame is given an address until its tab is chosen
+        # The trading page: its scripts and its own form, in its own origin
+        # (without it the browser sends the form's Origin as "null", which the
+        # live-defaults server refuses); no window, no download
+        assert sandboxes["trading-frame"] == ["allow-scripts", "allow-same-origin",
+                                              "allow-forms"]
+        # A run page: its one script, in its own origin, and nothing more
+        assert sandboxes["run-frame"] == ["allow-scripts", "allow-same-origin"]
+        # No frame may open a window
+        for frame in ("backtest-frame", "data-frame", "trading-frame", "run-frame"):
+            assert not [s for s in sandboxes[frame] if "popups" in s], frame
+        assert "allow-popups" not in live_dashboard._FRAME_SANDBOX
+        # The page lets any of its frames load the live-defaults server's pages (frame-src),
+        # so the backtest page could point its own frame at the trading page: the Backtest
+        # and Data frames may never send a form, so its buttons do nothing there
+        for frame in ("backtest-frame", "data-frame"):
+            assert "allow-forms" not in sandboxes[frame], frame
+        # No frame is given an address in the markup: the script sets each
         assert ' src="' not in page.split('<section id="panel-backtest"', 1)[1].split(
             "<script>", 1)[0]
         assert "allow-top-navigation" not in page
+        # The Trading tab's note names the live-defaults server and what starts
+        # it, with a Reload button, above the frame
+        trading = page.split('<section id="panel-trading"', 1)[1].split("</section>", 1)[0]
+        assert ('<p class="frame-note"><span>Trading uses the live-defaults server '
+                f'(127.0.0.1:{config.DEFAULTS_SERVER_PORT}), which ./start_dashboard.sh '
+                'starts.</span>\n<button type="button" class="action" id="trading-reload">'
+                "Reload</button></p>") in trading
+        assert trading.index('id="trading-reload"') < trading.index('id="trading-frame"')
+        # The page has no form of its own
+        assert "<form" not in page
         # The warnings come before every figure they may qualify
         assert page.index('id="live-warnings"') < page.index('id="live-stats"')
         assert ('<details id="live-area-details"><summary>The chart\'s figures</summary>'
@@ -1619,6 +1692,9 @@ class TestBusyPortOverASocket:
 
 _HARNESS = Path(__file__).parent / "js" / "live_harness.js"
 _JSC = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc")
+# The addresses set as the page starts, which every snapshot's srcSets counts:
+# the Trading frame's, loaded at once so it opens on the live defaults in force
+_AT_START = 1
 
 
 def _js_runtime() -> str | None:
@@ -1627,6 +1703,14 @@ def _js_runtime() -> str | None:
     if node:
         return node
     return str(_JSC) if _JSC.exists() else None
+
+
+def _hidden_at_start() -> list[str]:
+    """The ids of the elements the tab page's markup hides (its hidden attribute), in page order."""
+    markup = live_dashboard._SHELL.split("<body>", 1)[1].split("<script>", 1)[0]
+    return [re.search(r'\bid="([^"]+)"', tag).group(1)
+            for tag in re.findall(r"<[a-z]+\s[^>]*>", markup)
+            if re.search(r"\shidden(?=[\s>])", tag) and re.search(r'\bid="', tag)]
 
 
 def _run_live_script(tmp_path: Path, answers: list, steps: list, *,
@@ -1638,8 +1722,14 @@ def _run_live_script(tmp_path: Path, answers: list, steps: list, *,
         tmp_path (Path): Where the assembled program is written.
         answers (list): The answers its requests get, in order (see the harness).
         steps (list): The harness's steps (["settle"], ["click", id], ["timers"] (the time
-            passing: every pending timer runs), ["snap", name]). A snapshot's "timers" are the
-            delays, in milliseconds, of the timers still pending.
+            passing: every pending timer runs), ["message", {origin, source, data}] (a page
+            sending the tab page a message; source is the id of the frame whose window sent
+            it, or None for a window no frame holds), ["load", id] (that frame finished
+            loading its next page; "old:" and an id for the frame last swapped out under that
+            id), ["snap", name]). A snapshot's
+            "timers" are the delays, in milliseconds, of the timers still pending; its
+            "posted" the messages the script sent to frames since the snapshot before; its
+            "loads" the addresses set on each frame so far, by id.
         plotly (bool): Keyword-only. Whether the chart library loaded.
 
     Returns:
@@ -1652,6 +1742,7 @@ def _run_live_script(tmp_path: Path, answers: list, steps: list, *,
     program = "\n".join([
         _HARNESS.read_text(encoding="utf-8"),
         *(f"__IDS[{json.dumps(i)}] = true;" for i in ids),
+        *(f"__HIDDEN[{json.dumps(i)}] = true;" for i in _hidden_at_start()),
         f"__ANSWERS = {json.dumps(answers)};",
         f"__NO_PLOTLY = {json.dumps(not plotly)};",
         "__install();",
@@ -1724,6 +1815,24 @@ class TestPageScript:
         assert el["live-warnings"]["hidden"] is True
         assert el["live-stats"]["hidden"] is False
 
+    def test_a_refresh_hides_what_the_read_before_showed(self, tmp_path):
+        # A read before the bot's first trade, with no holdings and a warning, shows the
+        # warnings, the empty note and the no-holdings note; a later read with none of them
+        # hides all three again (the page's markup hides them only until the first read)
+        before = payload(_view({OTHER_BETS: 5.0}, history=False, holdings=(),
+                               warnings=("A1: Kalshi holds 12 YES",)))
+        after = payload(_view())
+        assert before["warnings"] and before["empty"] and before["holdings"]["empty"]
+        assert not (after["warnings"] or after["empty"] or after["holdings"]["empty"])
+        snaps = _run_live_script(tmp_path, [{"status": 200, "body": before},
+                                            {"status": 200, "body": after}],
+                                 [["settle"], ["snap", "before"], ["click", "live-refresh"],
+                                  ["settle"], ["snap", "after"]])
+        ids = ("live-warnings", "live-empty", "live-holdings-empty")
+        assert [snaps["before"]["el"][i]["hidden"] for i in ids] == [False, False, False]
+        assert [snaps["after"]["el"][i]["hidden"] for i in ids] == [True, True, True]
+        assert snaps["after"]["el"]["live-warnings"]["rows"] == []
+
     def test_a_period_click(self, tmp_path):
         view = _view()
         view = dataclasses.replace(view, periods=(
@@ -1749,8 +1858,10 @@ class TestPageScript:
             ["settle"], ["snap", "shown"], ["click", "tab-backtest"], ["snap", "backtest"],
             ["click", "tab-live"], ["snap", "live"], ["click", "tab-backtest"],
             ["snap", "again"]])
-        # Nothing loads the backtest page until its tab is chosen
-        assert snaps["shown"]["srcSets"] == 0
+        # Nothing loads the backtest page until its tab is chosen (the one address set
+        # so far is the Trading frame's, at start)
+        assert snaps["shown"]["srcSets"] == _AT_START
+        assert snaps["shown"]["loads"] == {"trading-frame": 1}
         backtest = snaps["backtest"]
         assert backtest["el"]["backtest-frame"]["src"] == live_dashboard.BACKTEST_URL
         assert backtest["el"]["panel-live"]["hidden"] is True
@@ -1762,14 +1873,14 @@ class TestPageScript:
         assert backtest["el"]["panel-data"]["hidden"] is True
         # (an element the script never touched is not in the snapshot)
         assert backtest["el"].get("data-frame", {"src": ""})["src"] == ""
-        assert backtest["srcSets"] == 1
+        assert backtest["srcSets"] == _AT_START + 1
         live = snaps["live"]
         assert [(p["call"], p["id"]) for p in live["plots"]] == [
             ("resize", "live-area"), ("resize", "live-groups")]
         assert live["el"]["panel-live"]["hidden"] is False
         assert live["el"]["panel-backtest"]["hidden"] is True
         assert live["el"]["panel-data"]["hidden"] is True
-        assert snaps["again"]["srcSets"] == 1
+        assert snaps["again"]["srcSets"] == _AT_START + 1
 
     def test_the_data_tab_loads_its_page_once(self, tmp_path):
         data = payload(_view())
@@ -1778,34 +1889,42 @@ class TestPageScript:
             ["click", "tab-backtest"], ["snap", "backtest"], ["click", "tab-data"],
             ["snap", "data-again"], ["click", "tab-live"], ["snap", "live"],
             ["click", "tab-backtest"], ["click", "tab-data"], ["snap", "again"]])
-        assert snaps["shown"]["srcSets"] == 0
+        assert snaps["shown"]["srcSets"] == _AT_START
 
         def tabs(snap):
             el = snap["el"]
-            return ([el[f"tab-{t}"]["attrs"]["aria-selected"] for t in ("live", "backtest", "data")],
-                    [el[f"panel-{t}"]["hidden"] for t in ("live", "backtest", "data")])
+            names = ("live", "backtest", "trading", "data", "run")
+            return ([el[f"tab-{t}"]["attrs"]["aria-selected"] for t in names],
+                    [el[f"panel-{t}"]["hidden"] for t in names])
 
         first = snaps["data"]
-        assert tabs(first) == (["false", "false", "true"], [True, True, False])
+        assert tabs(first) == (["false", "false", "false", "true", "false"],
+                               [True, True, True, False, True])
         assert first["el"]["data-frame"]["src"] == live_dashboard.DATA_URL
         assert first["el"].get("backtest-frame", {"src": ""})["src"] == ""
-        assert first["srcSets"] == 1
+        assert first["srcSets"] == _AT_START + 1
         # Choosing the Data tab draws and resizes no Live chart (a snapshot's
         # plots are the calls since the one before it)
         assert first["plots"] == []
         backtest = snaps["backtest"]
-        assert tabs(backtest) == (["false", "true", "false"], [True, False, True])
+        assert tabs(backtest) == (["false", "true", "false", "false", "false"],
+                                  [True, False, True, True, True])
         assert backtest["el"]["backtest-frame"]["src"] == live_dashboard.BACKTEST_URL
-        assert backtest["srcSets"] == 2
-        assert tabs(snaps["data-again"]) == (["false", "false", "true"], [True, True, False])
-        assert snaps["data-again"]["srcSets"] == 2
+        assert backtest["srcSets"] == _AT_START + 2
+        assert tabs(snaps["data-again"]) == (["false", "false", "false", "true", "false"],
+                                             [True, True, True, False, True])
+        assert snaps["data-again"]["srcSets"] == _AT_START + 2
         live = snaps["live"]
-        assert tabs(live) == (["true", "false", "false"], [False, True, True])
+        assert tabs(live) == (["true", "false", "false", "false", "false"],
+                              [False, True, True, True, True])
         assert [(p["call"], p["id"]) for p in live["plots"]] == [
             ("resize", "live-area"), ("resize", "live-groups")]
         # Each frame loaded once, however often its tab was chosen
-        assert snaps["again"]["srcSets"] == 2
-        assert tabs(snaps["again"]) == (["false", "false", "true"], [True, True, False])
+        assert snaps["again"]["srcSets"] == _AT_START + 2
+        assert snaps["again"]["loads"] == {"trading-frame": 1, "data-frame": 1,
+                                           "backtest-frame": 1}
+        assert tabs(snaps["again"]) == (["false", "false", "false", "true", "false"],
+                                        [True, True, True, False, True])
 
     def test_a_frame_hidden_past_the_delay_is_emptied_and_loads_again(self, tmp_path):
         data = payload(_view())
@@ -1817,22 +1936,24 @@ class TestPageScript:
         # The frame is loaded and its tab hidden: one timer, with the configured delay
         hidden = snaps["hidden"]
         assert hidden["el"]["backtest-frame"]["src"] == live_dashboard.BACKTEST_URL
-        assert (hidden["srcSets"], hidden["timers"]) == (1, [delay])
+        assert (hidden["srcSets"], hidden["timers"]) == (_AT_START + 1, [delay])
         # Once the delay passes the frame is swapped for a copy with no
         # address: nothing is navigated, so the browser's Back history is
         # left as it was
         emptied = snaps["emptied"]
         assert emptied["el"]["backtest-frame"]["src"] == ""
-        assert (emptied["srcSets"], emptied["timers"], emptied["replaced"]) == (1, [], 1)
+        assert (emptied["srcSets"], emptied["timers"], emptied["replaced"]) == (
+            _AT_START + 1, [], 1)
         # Choosing the tab again loads the page into the copy
         again = snaps["again"]
         assert again["el"]["backtest-frame"]["src"] == live_dashboard.BACKTEST_URL
-        assert (again["srcSets"], again["timers"], again["replaced"]) == (2, [], 1)
+        assert (again["srcSets"], again["timers"], again["replaced"]) == (_AT_START + 2, [], 1)
         assert again["el"]["panel-backtest"]["hidden"] is False
         # Hiding it a second time starts a new timer, which empties it again
         assert snaps["hidden-again"]["timers"] == [delay]
         assert snaps["emptied-again"]["el"]["backtest-frame"]["src"] == ""
-        assert (snaps["emptied-again"]["srcSets"], snaps["emptied-again"]["replaced"]) == (2, 2)
+        assert (snaps["emptied-again"]["srcSets"], snaps["emptied-again"]["replaced"]) == (
+            _AT_START + 2, 2)
 
     def test_going_back_before_the_delay_leaves_the_frame_as_it_was(self, tmp_path):
         data = payload(_view())
@@ -1844,11 +1965,11 @@ class TestPageScript:
         assert snaps["hidden"]["timers"] == [delay]
         # Choosing the tab again cancels the timer and sets no address
         back = snaps["back"]
-        assert (back["srcSets"], back["timers"]) == (1, [])
+        assert (back["srcSets"], back["timers"]) == (_AT_START + 1, [])
         assert back["el"]["backtest-frame"]["src"] == live_dashboard.BACKTEST_URL
         # So nothing is emptied when the time passes
         later = snaps["later"]
-        assert (later["srcSets"], later["timers"], later["replaced"]) == (1, [], 0)
+        assert (later["srcSets"], later["timers"], later["replaced"]) == (_AT_START + 1, [], 0)
         assert later["el"]["backtest-frame"]["src"] == live_dashboard.BACKTEST_URL
         # The cancelled timer is forgotten: hiding the tab again starts a new
         # one, which empties the frame
@@ -1865,18 +1986,19 @@ class TestPageScript:
             ["snap", "emptied"], ["click", "tab-data"], ["snap", "again"]])
         hidden = snaps["hidden"]
         assert hidden["el"]["data-frame"]["src"] == live_dashboard.DATA_URL
-        assert (hidden["srcSets"], hidden["timers"]) == (1, [delay])
+        assert (hidden["srcSets"], hidden["timers"]) == (_AT_START + 1, [delay])
         # Back before the delay: the timer is cancelled and nothing is set
-        assert (snaps["back"]["srcSets"], snaps["back"]["timers"]) == (1, [])
+        assert (snaps["back"]["srcSets"], snaps["back"]["timers"]) == (_AT_START + 1, [])
         # Hidden again and left past the delay: emptied
         emptied = snaps["emptied"]
         assert emptied["el"]["data-frame"]["src"] == ""
-        assert (emptied["srcSets"], emptied["timers"], emptied["replaced"]) == (1, [], 1)
+        assert (emptied["srcSets"], emptied["timers"], emptied["replaced"]) == (
+            _AT_START + 1, [], 1)
         # The Backtest frame was never opened, so it was never touched
         assert emptied["el"].get("backtest-frame", {"src": ""})["src"] == ""
         again = snaps["again"]
         assert again["el"]["data-frame"]["src"] == live_dashboard.DATA_URL
-        assert again["srcSets"] == 2
+        assert again["srcSets"] == _AT_START + 2
 
     def test_each_hidden_frame_has_a_timer_of_its_own(self, tmp_path):
         data = payload(_view())
@@ -1894,7 +2016,8 @@ class TestPageScript:
         emptied = snaps["emptied"]
         assert emptied["el"]["backtest-frame"]["src"] == ""
         assert emptied["el"]["data-frame"]["src"] == ""
-        assert (emptied["srcSets"], emptied["timers"], emptied["replaced"]) == (2, [], 2)
+        assert (emptied["srcSets"], emptied["timers"], emptied["replaced"]) == (
+            _AT_START + 2, [], 2)
 
     def test_a_frame_never_opened_has_no_timer(self, tmp_path):
         data = payload(_view())
@@ -1907,7 +2030,7 @@ class TestPageScript:
         emptied = snaps["emptied"]
         assert emptied["el"]["backtest-frame"]["src"] == ""
         assert emptied["el"].get("data-frame", {"src": ""})["src"] == ""
-        assert (emptied["srcSets"], emptied["replaced"]) == (1, 1)
+        assert (emptied["srcSets"], emptied["replaced"]) == (_AT_START + 1, 1)
 
     def test_the_delay_in_the_script_is_the_configured_one(self, monkeypatch):
         delay = config.LIVE_DASHBOARD_FRAME_UNLOAD_SECONDS * 1000
@@ -1985,6 +2108,792 @@ class TestPageScript:
         body = live_dashboard._SCRIPT_TEMPLATE
         strings = re.findall(r"'([^']*)'", body)
         assert all(not re.search(r"[A-Z][a-z]+ [a-z]+ ", s) for s in strings), strings
+        # The quotes pair up (no stray apostrophe hides a string from the check above)
+        assert body.count("'") % 2 == 0
+
+
+# ---- the Trading and Run tabs: the frames of the live-defaults server's pages -----------
+
+_TABS = ("live", "backtest", "trading", "data", "run")
+_DEFAULTS = live_dashboard._DEFAULTS_ORIGIN
+_BACKTEST = live_dashboard._BACKTEST_ORIGIN
+_TRADING_URL = live_dashboard.TRADING_URL
+_RUN_URL = live_dashboard.RUN_URL
+_LONGEST = live_dashboard._TRADING_QUERY_MAX
+# Two proposals, as the trading page reports them (the query the live-defaults server
+# builds for the proposal it shows)
+_Q = ("tier_floors=off&spread_min=0.0&spread_max=0.5&k=0.8&size_cap=0.1"
+      "&exclude_tag=Sports+%C2%B7+Basketball")
+_Q2 = "tier_floors=on&spread_min=0.0&spread_max=0.5&k=0.75&size_cap=0.05"
+# A run's id, as the live-defaults server makes one, and another
+_RUN = "0123456789abcdef"
+_RUN2 = "fedcba9876543210"
+
+
+def _message(source: str | None, origin: str, data) -> list:
+    """
+    A harness step: the page in the frame with id source sends data.
+
+    source None is a window no frame holds; "old:" and a frame's id is the page that frame
+    held before the tab page put a fresh copy of the frame in its place.
+    """
+    return ["message", {"source": source, "origin": origin, "data": data}]
+
+
+def _from_trading(data, *, source: str | None = "trading-frame", origin: str = _DEFAULTS) -> list:
+    """A harness step: the page in the Trading frame (by default) sends data."""
+    return _message(source, origin, data)
+
+
+def _from_backtest(data, *, source: str | None = "backtest-frame", origin: str = _BACKTEST) -> list:
+    """A harness step: the backtest page in its frame (by default) sends data."""
+    return _message(source, origin, data)
+
+
+def _apply(query: str, seq: int = 0) -> dict:
+    """The one message the tab page sends: the proposal, with the number of the last choice the
+    backtest bar told (seq; 0 before any), to the backtest page, for its origin."""
+    return {"frame": "backtest-frame", "origin": _BACKTEST,
+            "message": {"type": "kalshi-apply", "query": query, "seq": seq}}
+
+
+def _relay(tmp_path: Path, steps: list) -> dict:
+    """Run the tab page's script with one good read of the account, then these steps."""
+    return _run_live_script(tmp_path, [{"status": 200, "body": payload(_view())}],
+                            [["settle"], *steps])
+
+
+def _shown(snap: dict) -> tuple[list[str], list[bool]]:
+    """Each tab's aria-selected and each panel's hidden state, in tab order."""
+    el = snap["el"]
+    return ([el[f"tab-{t}"]["attrs"]["aria-selected"] for t in _TABS],
+            [el[f"panel-{t}"]["hidden"] for t in _TABS])
+
+
+class TestTradingAndRunTabs:
+    """The Trading and Run tabs: frames that show the live-defaults server's trading page and
+    the latest run's page, and the messages those pages and the backtest page send the tab
+    page. Run under tests/js/live_harness.js; each message carries the origin the browser
+    reports and the window it came from. The tab page points the Trading and Run frames at
+    an address by putting a fresh copy of the frame in its place (a snapshot's "replaced"
+    counts those swaps; its "loads" counts the addresses set under each frame's id)."""
+
+    def test_the_trading_frame_loads_at_start(self, tmp_path):
+        snap = _relay(tmp_path, [["snap", "start"]])["start"]
+        el = snap["el"]
+        # Loaded at once, with no proposal: the trading page opens on the live defaults
+        assert el["trading-frame"]["src"] == _TRADING_URL
+        assert snap["loads"] == {"trading-frame": 1}
+        assert snap["replaced"] == 0
+        # The Run tab stays hidden, and its frame empty, until a run is reported
+        assert el["tab-run"]["hidden"] is True
+        assert "run-frame" not in el
+        assert snap["posted"] == []
+        assert snap["timers"] == []
+
+    def test_coming_to_the_trading_tab_always_loads_the_trading_page_again(self, tmp_path):
+        # The trading page's buttons arm once it has been visible for a second, and a browser
+        # counts a page in a hidden frame as visible: a page loaded or finished loading while
+        # the Trading tab was hidden would arm out of sight, so every time the reader comes to
+        # the tab the page is loaded again, its buttons drawn off until they arm in sight. Its
+        # tab clicked while it is shown loads nothing: a press of Dry run or Confirm and trade
+        # still on its way to the server is never cut off
+        snaps = _relay(tmp_path, [
+            _from_trading({"type": "kalshi-trading", "query": _Q}),
+            ["click", "tab-trading"], ["snap", "first"],
+            ["click", "tab-trading"], ["snap", "clicked while shown"],
+            ["click", "tab-live"], ["click", "tab-trading"], ["snap", "again"],
+            # A page that finished loading after the reader left the tab
+            ["click", "tab-live"], _from_trading({"type": "kalshi-trading", "query": _Q2}),
+            ["click", "tab-trading"], ["snap", "late"],
+            # A page the tab page has since replaced is no longer heard
+            ["click", "tab-live"],
+            _message("old:trading-frame", _DEFAULTS, {"type": "kalshi-trading", "query": _Q}),
+            ["click", "tab-trading"], ["snap", "old"]])
+        # The page loaded at start, while the Live trading tab was shown: loaded again, for
+        # the proposal it reported, in a fresh copy of the frame
+        first = snaps["first"]
+        assert first["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q}"
+        assert (first["loads"], first["replaced"]) == ({"trading-frame": 2}, 1)
+        # The tab clicked again while shown: the same frame, nothing loaded
+        shown = snaps["clicked while shown"]
+        assert shown["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q}"
+        assert (shown["loads"], shown["replaced"]) == ({"trading-frame": 2}, 1)
+        # A page loaded while the tab was shown is loaded again too, when the reader comes
+        # back to the tab
+        again = snaps["again"]
+        assert again["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q}"
+        assert (again["loads"], again["replaced"]) == ({"trading-frame": 3}, 2)
+        late = snaps["late"]
+        assert late["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q2}"
+        assert (late["loads"], late["replaced"]) == ({"trading-frame": 4}, 3)
+        # A page the tab page has since replaced is not heard: the proposal stays the last
+        # one the current page reported
+        old = snaps["old"]
+        assert old["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q2}"
+        assert (old["loads"], old["replaced"]) == ({"trading-frame": 5}, 4)
+        assert old["posted"] == []
+
+    def test_a_bar_choice_or_a_run_loaded_out_of_sight_is_loaded_again(self, tmp_path):
+        snaps = _relay(tmp_path, [
+            ["click", "tab-backtest"], _from_backtest({"type": "kalshi-bar", "query": _Q}),
+            ["snap", "chosen"], ["click", "tab-trading"], ["snap", "bar"],
+            _from_trading({"type": "kalshi-run", "run": _RUN}), ["snap", "run"],
+            ["click", "tab-trading"], ["snap", "back"]])
+        # The page for a choice on the backtest bar loads while the Backtest tab is shown,
+        # and again once the Trading tab is chosen
+        assert snaps["chosen"]["loads"]["trading-frame"] == 2
+        bar = snaps["bar"]
+        assert bar["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q}"
+        assert (bar["loads"]["trading-frame"], bar["replaced"]) == (3, 2)
+        # After a run the Trading frame shows the trading page again while the Run tab is
+        # shown, and again once the Trading tab is chosen
+        assert snaps["run"]["loads"] == {"trading-frame": 4, "backtest-frame": 1, "run-frame": 1}
+        back = snaps["back"]
+        assert back["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q}"
+        assert back["loads"] == {"trading-frame": 5, "backtest-frame": 1, "run-frame": 1}
+
+    def test_coming_back_while_a_press_is_on_its_way_loads_nothing(self, tmp_path):
+        # The trading page says when its form is sent (kalshi-sending). The answer to that
+        # press opens the run's page, so coming back to the Trading tab before the answer
+        # loads must not load the trading page over it; that page can be clicked no more (its
+        # buttons stay off and nothing on it reacts), so keeping it is safe. The next page
+        # the frame loads ends the wait, and Reload loads the trading page again regardless
+        snaps = _relay(tmp_path, [
+            ["click", "tab-trading"], ["snap", "shown"],
+            _from_trading({"type": "kalshi-sending"}),
+            ["click", "tab-live"], ["click", "tab-trading"], ["snap", "back"],
+            # A load in a frame the tab page has replaced ends nothing
+            ["load", "old:trading-frame"],
+            ["click", "tab-live"], ["click", "tab-trading"], ["snap", "old load"],
+            # The answer loads: coming back loads the trading page again, as always
+            ["load", "trading-frame"],
+            ["click", "tab-live"], ["click", "tab-trading"], ["snap", "answered"],
+            _from_trading({"type": "kalshi-sending"}), ["click", "trading-reload"],
+            ["click", "tab-live"], ["click", "tab-trading"], ["snap", "reloaded"]])
+        shown = snaps["shown"]["loads"]["trading-frame"]
+        assert shown == 2
+        for name in ("back", "old load"):
+            assert snaps[name]["loads"]["trading-frame"] == shown, name
+            assert snaps[name]["replaced"] == snaps["shown"]["replaced"], name
+        assert snaps["answered"]["loads"]["trading-frame"] == shown + 1
+        # Reload, then coming back once the wait has ended
+        assert snaps["reloaded"]["loads"]["trading-frame"] == shown + 3
+
+    def test_a_choice_on_the_backtest_bar_while_a_press_is_on_its_way_loads_nothing(
+            self, tmp_path):
+        # A press of Confirm and trade on its way, then the reader goes to the Backtest tab
+        # and chooses there (or a choice made before the press finishes drawing): loading the
+        # trading page for that choice would cut the press off, so its answer, the run's page,
+        # would never be heard. The choice is not taken, and the bar is put back to the
+        # proposal the Trading tab shows; the answer still opens the Run tab, and the
+        # Trading frame then shows that proposal again
+        snaps = _relay(tmp_path, [
+            _from_trading({"type": "kalshi-trading", "query": _Q2}),
+            ["click", "tab-backtest"], _from_backtest({"type": "kalshi-ready"}),
+            ["click", "tab-trading"], _from_trading({"type": "kalshi-sending"}),
+            ["click", "tab-backtest"], ["snap", "before"],
+            _from_backtest({"type": "kalshi-bar", "query": _Q, "seq": 1}), ["snap", "chosen"],
+            _from_trading({"type": "kalshi-run", "run": _RUN}), ["snap", "answered"],
+            # The wait over, a choice on the bar moves the Trading tab again
+            _from_backtest({"type": "kalshi-bar", "query": _Q, "seq": 2}), ["snap", "after"]])
+        before, chosen = snaps["before"], snaps["chosen"]
+        assert chosen["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q2}"
+        assert (chosen["loads"], chosen["replaced"]) == (before["loads"], before["replaced"])
+        assert chosen["posted"] == [_apply(_Q2, 1)]
+        answered = snaps["answered"]
+        assert answered["el"]["tab-run"]["hidden"] is False
+        assert answered["el"]["run-frame"]["src"] == _RUN_URL + _RUN
+        assert answered["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q2}"
+        assert answered["loads"]["trading-frame"] == before["loads"]["trading-frame"] + 1
+        after = snaps["after"]
+        assert after["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q}"
+        assert after["loads"]["trading-frame"] == answered["loads"]["trading-frame"] + 1
+
+    @pytest.mark.parametrize("answer", [
+        {"type": "kalshi-trading", "query": _Q}, {"type": "kalshi-run", "run": _RUN}])
+    def test_the_answer_s_message_ends_the_wait_too(self, tmp_path, answer):
+        # A refusal answers with the trading page (kalshi-trading), a run with its page
+        # (kalshi-run): either is the next page of the frame
+        snaps = _relay(tmp_path, [
+            ["click", "tab-trading"], _from_trading({"type": "kalshi-sending"}),
+            ["click", "tab-live"], ["snap", "left"], _from_trading(answer), ["snap", "answered"],
+            ["click", "tab-trading"], ["snap", "back"]])
+        answered = snaps["answered"]["loads"]["trading-frame"]
+        assert snaps["back"]["loads"]["trading-frame"] == answered + 1
+
+    @pytest.mark.parametrize("source, origin", [
+        ("trading-frame", _BACKTEST), ("backtest-frame", _DEFAULTS), ("run-frame", _DEFAULTS),
+        (None, _DEFAULTS), ("old:trading-frame", _DEFAULTS)])
+    def test_a_press_is_on_its_way_only_when_the_trading_page_says_so(self, tmp_path, source,
+                                                                       origin):
+        snaps = _relay(tmp_path, [
+            ["click", "tab-trading"], ["click", "tab-live"], ["snap", "left"],
+            _message(source, origin, {"type": "kalshi-sending"}),
+            ["click", "tab-trading"], ["snap", "back"]])
+        assert (snaps["back"]["loads"]["trading-frame"]
+                == snaps["left"]["loads"]["trading-frame"] + 1)
+
+    def test_each_proposal_sent_back_carries_the_number_of_the_bar_s_last_choice(
+            self, tmp_path):
+        # The bar numbers its choices (kalshi-bar's seq). A proposal the tab page sends it
+        # carries the number of the last choice it heard, so a proposal sent before the
+        # bar's newer choice arrived here is set aside by the bar; a bar just loaded has
+        # told nothing yet (0)
+        snaps = _relay(tmp_path, [
+            _from_trading({"type": "kalshi-trading", "query": _Q2}),
+            ["click", "tab-backtest"], _from_backtest({"type": "kalshi-ready"}), ["snap", "ready"],
+            _from_backtest({"type": "kalshi-bar", "query": _Q, "seq": 3}),
+            # The answer to that choice, then a report the bar did not ask for
+            _from_trading({"type": "kalshi-trading", "query": _Q}),
+            _from_trading({"type": "kalshi-trading", "query": _Q2}), ["snap", "report"],
+            # A choice that arrives after the reader left the tab is answered with its number
+            ["click", "tab-live"], _from_backtest({"type": "kalshi-bar", "query": _Q, "seq": 4}),
+            ["snap", "late"],
+            # The backtest page loaded again: its bar has told nothing
+            _from_backtest({"type": "kalshi-ready"}), ["snap", "reloaded"]])
+        assert snaps["ready"]["posted"] == [_apply(_Q2, 0)]
+        assert snaps["report"]["posted"] == [_apply(_Q2, 3)]
+        assert snaps["late"]["posted"] == [_apply(_Q2, 4)]
+        assert snaps["reloaded"]["posted"] == [_apply(_Q2, 0)]
+
+    @pytest.mark.parametrize("seq", [None, "4", -1, 1.5, True, [4], 1e400])
+    def test_a_choice_number_that_is_not_a_whole_number_counts_as_none(self, tmp_path, seq):
+        bar = {"type": "kalshi-bar", "query": _Q}
+        if seq is not None:
+            bar["seq"] = seq
+        snaps = _relay(tmp_path, [
+            _from_trading({"type": "kalshi-trading", "query": _Q2}),
+            ["click", "tab-backtest"], _from_backtest({"type": "kalshi-ready"}),
+            _from_backtest({"type": "kalshi-bar", "query": _Q, "seq": 2}), ["snap", "ready"],
+            ["click", "tab-live"], _from_backtest(bar), ["snap", "late"]])
+        assert snaps["ready"]["posted"] == [_apply(_Q2, 0)]
+        assert snaps["late"]["posted"] == [_apply(_Q, 0)]
+
+    def test_the_trading_page_s_proposal_is_kept_and_told_to_the_open_backtest_page(
+            self, tmp_path):
+        snaps = _relay(tmp_path, [
+            _from_trading({"type": "kalshi-trading", "query": _Q}), ["snap", "unopened"],
+            ["click", "trading-reload"], ["snap", "reloaded"],
+            ["click", "tab-backtest"], ["snap", "opened"],
+            _from_trading({"type": "kalshi-trading", "query": _Q2}), ["snap", "told"]])
+        # The backtest frame is not open yet: nothing is sent to it
+        assert snaps["unopened"]["posted"] == []
+        # A reported proposal never moves the Trading frame by itself
+        assert snaps["unopened"]["loads"] == {"trading-frame": 1}
+        # It is kept: Reload shows the trading page for it
+        assert snaps["reloaded"]["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q}"
+        # Opening the Backtest tab sends nothing: the backtest page asks once its bar is ready
+        assert snaps["opened"]["posted"] == []
+        # Once it is open, each proposal is sent to it, addressed to the backtest origin only
+        told = snaps["told"]
+        assert told["posted"] == [_apply(_Q2)]
+        assert told["loads"] == {"trading-frame": 2, "backtest-frame": 1}
+
+    @pytest.mark.parametrize("source, origin", [
+        # The Trading frame's window, but another origin
+        ("trading-frame", _BACKTEST), ("trading-frame", f"http://localhost:{config.DEFAULTS_SERVER_PORT}"),
+        ("trading-frame", "null"), ("trading-frame", "https://evil.test"),
+        # The live-defaults server's origin, but another window
+        ("run-frame", _DEFAULTS), ("backtest-frame", _DEFAULTS), ("data-frame", _DEFAULTS),
+        (None, _DEFAULTS),
+        # The page the Trading frame held before the tab page replaced the frame
+        ("old:trading-frame", _DEFAULTS),
+    ])
+    def test_a_trading_message_from_another_origin_or_window_is_ignored(self, tmp_path, source,
+                                                                        origin):
+        snaps = _relay(tmp_path, [
+            ["click", "tab-backtest"], ["click", "tab-trading"],
+            _from_trading({"type": "kalshi-trading", "query": _Q}, source=source, origin=origin),
+            _from_trading({"type": "kalshi-run", "run": _RUN}, source=source, origin=origin),
+            ["snap", "sent"], _from_backtest({"type": "kalshi-ready"}),
+            ["click", "tab-live"], ["click", "tab-trading"], ["click", "trading-reload"],
+            ["snap", "after"]])
+        sent, after = snaps["sent"], snaps["after"]
+        # Nothing told to the backtest page, no run shown, the Trading tab left as it was
+        assert sent["posted"] == after["posted"] == []
+        assert sent["el"].get("run-frame", {"src": ""})["src"] == ""
+        assert "run-frame" not in sent["loads"]
+        assert sent["el"]["tab-run"]["hidden"] is True
+        assert _shown(sent) == (["false", "false", "true", "false", "false"],
+                                [True, True, False, True, True])
+        # (loaded at start, and again when the Trading tab was chosen)
+        assert sent["loads"]["trading-frame"] == 2
+        # No proposal kept: coming back to the tab, and Reload, each load the trading page as
+        # it opens on its own
+        assert after["loads"]["trading-frame"] == 4
+        assert after["el"]["trading-frame"]["src"] == _TRADING_URL
+
+    @pytest.mark.parametrize("source, origin", [
+        # The backtest frame's window, but another origin
+        ("backtest-frame", _DEFAULTS), ("backtest-frame", f"http://localhost:{config.LIVE_BACKTEST_PORT}"),
+        ("backtest-frame", "null"),
+        # The backtest origin, but another window: the Data page shares that origin
+        ("data-frame", _BACKTEST), ("trading-frame", _BACKTEST), ("run-frame", _BACKTEST),
+        (None, _BACKTEST),
+    ])
+    def test_a_backtest_message_from_another_origin_or_window_is_ignored(self, tmp_path, source,
+                                                                         origin):
+        snaps = _relay(tmp_path, [
+            _from_trading({"type": "kalshi-trading", "query": _Q2}),
+            ["click", "tab-backtest"], ["snap", "opened"],
+            _from_backtest({"type": "kalshi-bar", "query": _Q}, source=source, origin=origin),
+            _from_backtest({"type": "kalshi-ready"}, source=source, origin=origin),
+            ["snap", "sent"]])
+        sent = snaps["sent"]
+        assert sent["posted"] == []
+        assert sent["el"]["trading-frame"]["src"] == _TRADING_URL
+        assert sent["loads"]["trading-frame"] == snaps["opened"]["loads"]["trading-frame"] == 1
+
+    def test_a_choice_on_the_backtest_bar_moves_the_trading_page_while_backtest_is_shown(
+            self, tmp_path):
+        snaps = _relay(tmp_path, [
+            ["click", "tab-backtest"], _from_backtest({"type": "kalshi-bar", "query": _Q}),
+            ["snap", "taken"], ["click", "tab-trading"],
+            _from_trading({"type": "kalshi-trading", "query": _Q}), ["snap", "reported"]])
+        taken = snaps["taken"]
+        assert taken["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q}"
+        assert (taken["loads"]["trading-frame"], taken["replaced"]) == (2, 1)
+        # It is not echoed back to the backtest page
+        assert taken["posted"] == []
+        # The trading page the reader then sees reports the proposal it shows, which the
+        # backtest page is told (it does nothing when its bar shows it already)
+        reported = snaps["reported"]
+        assert reported["posted"] == [_apply(_Q)]
+        assert reported["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q}"
+
+    def test_the_answer_to_a_bar_choice_is_not_told_back_while_backtest_is_shown(
+            self, tmp_path):
+        # The reader may choose again on the backtest bar before the trading page for the
+        # last choice answers: that answer must not put the older choice back on the bar
+        snaps = _relay(tmp_path, [
+            _from_trading({"type": "kalshi-trading", "query": _Q2}),
+            ["click", "tab-backtest"], _from_backtest({"type": "kalshi-ready"}), ["snap", "ready"],
+            _from_backtest({"type": "kalshi-bar", "query": _Q}),
+            _from_backtest({"type": "kalshi-bar", "query": _Q2}),
+            # The page asked for by the first choice answers late, from a frame the tab page
+            # has replaced: it is not heard (or it would use up the next page's answer)
+            _message("old:trading-frame", _DEFAULTS, {"type": "kalshi-trading", "query": _Q}),
+            # The page for the second choice answers: the bar shows that choice already
+            _from_trading({"type": "kalshi-trading", "query": _Q2}), ["snap", "answered"],
+            # A later report of that page, once it has moved on its own, is told
+            _from_trading({"type": "kalshi-trading", "query": _Q}), ["snap", "later"],
+            # An answer that arrives after the reader has left the Backtest tab is told
+            _from_backtest({"type": "kalshi-bar", "query": _Q2}), ["click", "tab-live"],
+            _from_trading({"type": "kalshi-trading", "query": _Q2}), ["snap", "left"]])
+        assert snaps["ready"]["posted"] == [_apply(_Q2)]
+        answered = snaps["answered"]
+        assert answered["posted"] == []
+        assert answered["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q2}"
+        assert answered["loads"]["trading-frame"] == 3
+        assert snaps["later"]["posted"] == [_apply(_Q)]
+        assert snaps["left"]["posted"] == [_apply(_Q2)]
+
+    @pytest.mark.parametrize("shown", ["live", "trading", "data", "run"])
+    def test_a_late_choice_on_the_backtest_bar_puts_that_bar_back(self, tmp_path, shown):
+        # The proposal on the Trading tab must never change while the reader is on another
+        # tab, and the two bars must not disagree: a choice that arrives after the reader
+        # left the Backtest tab is not taken, and the backtest page is told the proposal
+        # the Trading tab shows
+        steps = [_from_trading({"type": "kalshi-trading", "query": _Q2}),
+                 ["click", "tab-backtest"], _from_backtest({"type": "kalshi-ready"})]
+        if shown == "run":
+            steps.append(_from_trading({"type": "kalshi-run", "run": _RUN}))
+        steps += [["click", f"tab-{shown}"], ["snap", "before"],
+                  _from_backtest({"type": "kalshi-bar", "query": _Q}), ["snap", "after"],
+                  ["click", "trading-reload"], ["snap", "reloaded"]]
+        snaps = _relay(tmp_path, steps)
+        before, after = snaps["before"], snaps["after"]
+        assert after["posted"] == [_apply(_Q2)]
+        assert after["el"]["trading-frame"]["src"] == before["el"]["trading-frame"]["src"]
+        assert (after["loads"], after["replaced"]) == (before["loads"], before["replaced"])
+        assert after["el"][f"tab-{shown}"]["attrs"]["aria-selected"] == "true"
+        # Nor is it kept for later
+        assert snaps["reloaded"]["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q2}"
+
+    def test_a_late_choice_before_any_proposal_sends_nothing(self, tmp_path):
+        snaps = _relay(tmp_path, [
+            ["click", "tab-backtest"], ["click", "tab-live"],
+            _from_backtest({"type": "kalshi-bar", "query": _Q}), ["snap", "after"],
+            ["click", "trading-reload"], ["snap", "reloaded"]])
+        assert snaps["after"]["posted"] == []
+        assert snaps["after"]["loads"]["trading-frame"] == 1
+        assert snaps["reloaded"]["el"]["trading-frame"]["src"] == _TRADING_URL
+
+    @pytest.mark.parametrize("query", [
+        "a" * (_LONGEST + 1), "k=0.8#top", "k=0.8 x", "k=0.8/x",
+        "k=0.8?x=1", "k=0.8;x", "k=<b>", 'k="x"', "k=0.8\n", "k=0.8\\x", "k=café",
+        "a:b@c", "k=0.8 ", 12, None, True, ["k=0.8"], {"k": "0.8"},
+        # One character too long as the browser sends it, which writes the apostrophe as %27
+        "'" + "a" * (_LONGEST - 2)])
+    def test_an_odd_or_over_long_query_is_refused(self, tmp_path, query):
+        snaps = _relay(tmp_path, [
+            _from_trading({"type": "kalshi-trading", "query": query}),
+            ["click", "trading-reload"], ["snap", "trading"],
+            ["click", "tab-backtest"], _from_backtest({"type": "kalshi-ready"}),
+            _from_backtest({"type": "kalshi-bar", "query": query}), ["snap", "bar"]])
+        assert snaps["trading"]["el"]["trading-frame"]["src"] == _TRADING_URL
+        bar = snaps["bar"]
+        assert bar["posted"] == []
+        assert bar["el"]["trading-frame"]["src"] == _TRADING_URL
+        assert bar["loads"]["trading-frame"] == 2
+
+    @pytest.mark.parametrize("query", [
+        "a" * _LONGEST,
+        # The longest with an apostrophe, which the browser sends as %27
+        "'" + "a" * (_LONGEST - 3),
+        # Every character a URL-encoded query holds
+        "exclude_category=Kids%27+Shows&x=AZaz09-_.!~*'()%25&y=+"])
+    def test_the_longest_query_and_every_query_character_are_taken(self, tmp_path, query):
+        snaps = _relay(tmp_path, [
+            _from_trading({"type": "kalshi-trading", "query": query}),
+            ["click", "trading-reload"], ["snap", "trading"]])
+        assert snaps["trading"]["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{query}"
+
+    def test_a_run_from_the_trading_tab_opens_the_run_tab(self, tmp_path):
+        snaps = _relay(tmp_path, [
+            ["click", "tab-trading"], _from_trading({"type": "kalshi-trading", "query": _Q}),
+            ["snap", "trading"], _from_trading({"type": "kalshi-run", "run": _RUN}),
+            ["snap", "run"]])
+        assert snaps["trading"]["el"]["tab-run"]["hidden"] is True
+        run = snaps["run"]
+        el = run["el"]
+        # The run's page in the Run frame, its tab shown and chosen
+        assert el["run-frame"]["src"] == _RUN_URL + _RUN
+        assert el["tab-run"]["hidden"] is False
+        assert _shown(run) == (["false", "false", "false", "false", "true"],
+                               [True, True, True, True, False])
+        # The Trading frame back on the trading page for the same proposal (loaded at start,
+        # when its tab was chosen and after the run), each frame a fresh copy
+        assert el["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q}"
+        assert run["loads"] == {"trading-frame": 3, "run-frame": 1}
+        assert run["replaced"] == 3
+        assert run["posted"] == [] and run["timers"] == []
+
+    @pytest.mark.parametrize("shown", ["live", "backtest", "data"])
+    def test_a_run_reported_while_another_tab_is_shown_leaves_that_tab(self, tmp_path, shown):
+        snap = _relay(tmp_path, [
+            ["click", f"tab-{shown}"], _from_trading({"type": "kalshi-run", "run": _RUN}),
+            ["snap", "run"]])["run"]
+        el = snap["el"]
+        assert el["run-frame"]["src"] == _RUN_URL + _RUN
+        assert el["tab-run"]["hidden"] is False
+        assert el[f"tab-{shown}"]["attrs"]["aria-selected"] == "true"
+        assert el["tab-run"]["attrs"]["aria-selected"] == "false"
+        assert el["panel-run"]["hidden"] is True
+        # No proposal reported yet: the trading page as it opens on its own
+        assert el["trading-frame"]["src"] == _TRADING_URL
+        assert snap["loads"]["trading-frame"] == 2
+
+    def test_the_same_run_twice_does_not_load_its_page_again(self, tmp_path):
+        snaps = _relay(tmp_path, [
+            ["click", "tab-trading"], _from_trading({"type": "kalshi-run", "run": _RUN}),
+            ["snap", "first"], ["click", "tab-trading"],
+            _from_trading({"type": "kalshi-run", "run": _RUN}), ["snap", "again"],
+            ["click", "tab-trading"], _from_trading({"type": "kalshi-run", "run": _RUN2}),
+            ["snap", "another"]])
+        # (the Trading frame loads at start, after each run and each time its tab is chosen
+        # after one)
+        assert snaps["first"]["loads"] == {"trading-frame": 3, "run-frame": 1}
+        # The same run: the Run tab is chosen again, but its frame is left as it is
+        again = snaps["again"]
+        assert again["el"]["run-frame"]["src"] == _RUN_URL + _RUN
+        assert again["loads"] == {"trading-frame": 5, "run-frame": 1}
+        assert again["el"]["tab-run"]["attrs"]["aria-selected"] == "true"
+        # Another run replaces it
+        another = snaps["another"]
+        assert another["el"]["run-frame"]["src"] == _RUN_URL + _RUN2
+        assert another["loads"] == {"trading-frame": 7, "run-frame": 2}
+
+    @pytest.mark.parametrize("source, origin", [
+        ("run-frame", _DEFAULTS), ("backtest-frame", _BACKTEST), ("backtest-frame", _DEFAULTS),
+        ("data-frame", _BACKTEST), (None, _DEFAULTS),
+        # The pages the Trading and Run frames held before the tab page replaced them
+        ("old:trading-frame", _DEFAULTS), ("old:run-frame", _DEFAULTS)])
+    def test_a_run_reported_by_any_other_frame_is_ignored(self, tmp_path, source, origin):
+        # The run page in the Run frame reloads itself while the run goes on and reports
+        # its id each time; only a run page that opened in the Trading frame is a new run
+        snaps = _relay(tmp_path, [
+            ["click", "tab-trading"], _from_trading({"type": "kalshi-run", "run": _RUN}),
+            ["click", "tab-trading"], ["snap", "before"],
+            _message(source, origin, {"type": "kalshi-run", "run": _RUN2}), ["snap", "after"]])
+        before, after = snaps["before"], snaps["after"]
+        assert after["el"]["run-frame"]["src"] == _RUN_URL + _RUN
+        assert after["loads"] == before["loads"] == {"trading-frame": 4, "run-frame": 1}
+        assert _shown(after) == _shown(before) == (["false", "false", "true", "false", "false"],
+                                                   [True, True, False, True, True])
+
+    def test_a_run_reported_by_another_frame_before_any_run_shows_nothing(self, tmp_path):
+        snap = _relay(tmp_path, [
+            ["click", "tab-trading"], _message("run-frame", _DEFAULTS, {"type": "kalshi-run",
+                                                                        "run": _RUN}),
+            ["snap", "after"]])["after"]
+        assert snap["el"]["tab-run"]["hidden"] is True
+        assert snap["el"]["run-frame"]["src"] == ""
+        assert snap["loads"] == {"trading-frame": 2}
+
+    @pytest.mark.parametrize("run", [
+        "0123456789ABCDEF", "0123456789abcde", "0123456789abcdef0", "0123456789abcdeg",
+        "../../saved", "0123456789abcdef\n", " 0123456789abcdef", "0123456789abcdef/x",
+        "", 1234567890123456, None, ["0123456789abcdef"]])
+    def test_a_malformed_run_id_is_ignored(self, tmp_path, run):
+        snap = _relay(tmp_path, [
+            ["click", "tab-trading"], _from_trading({"type": "kalshi-run", "run": run}),
+            ["snap", "after"]])["after"]
+        assert "run-frame" not in snap["el"]
+        assert snap["el"]["tab-run"]["hidden"] is True
+        assert snap["loads"] == {"trading-frame": 2}
+        assert snap["el"]["tab-trading"]["attrs"]["aria-selected"] == "true"
+
+    @pytest.mark.parametrize("data", [
+        "kalshi-run", None, 5, [], ["kalshi-run", _RUN], {"type": "kalshi-trading"},
+        {"type": "kalshi-apply", "query": _Q}, {"type": "kalshi-bar", "query": _Q},
+        {"query": _Q}, {"run": _RUN}])
+    def test_a_message_of_another_shape_is_ignored(self, tmp_path, data):
+        snaps = _relay(tmp_path, [
+            ["click", "tab-backtest"], ["click", "tab-trading"], _from_trading(data),
+            ["click", "tab-backtest"], _from_backtest({"type": "kalshi-ready"}),
+            ["click", "trading-reload"], ["snap", "after"]])
+        after = snaps["after"]
+        assert after["posted"] == []
+        assert after["el"]["trading-frame"]["src"] == _TRADING_URL
+        assert after["el"]["tab-run"]["hidden"] is True
+        assert "run-frame" not in after["loads"]
+
+    def test_a_ready_backtest_page_is_told_the_proposal(self, tmp_path):
+        snaps = _relay(tmp_path, [
+            ["click", "tab-backtest"], _from_backtest({"type": "kalshi-ready"}), ["snap", "none"],
+            _from_trading({"type": "kalshi-trading", "query": _Q}), ["snap", "told"],
+            _from_backtest({"type": "kalshi-ready"}), ["snap", "again"],
+            ["click", "tab-trading"], ["snap", "trading"],
+            _from_backtest({"type": "kalshi-ready"}), ["snap", "other-tab"]])
+        # With no proposal reported yet there is nothing to tell
+        assert snaps["none"]["posted"] == []
+        assert snaps["told"]["posted"] == [_apply(_Q)]
+        # Each time it says its bar is ready, it is told the proposal again, on any tab
+        assert snaps["again"]["posted"] == [_apply(_Q)]
+        assert snaps["other-tab"]["posted"] == [_apply(_Q)]
+        # Telling it never moves the Trading frame
+        assert snaps["told"]["loads"]["trading-frame"] == 1
+        assert snaps["other-tab"]["loads"] == snaps["trading"]["loads"]
+
+    def test_an_emptied_backtest_frame_is_told_nothing_until_it_opens_again(self, tmp_path):
+        snaps = _relay(tmp_path, [
+            ["click", "tab-backtest"], ["click", "tab-live"], ["timers"], ["snap", "emptied"],
+            # The frame holds no page now: nothing is sent to it
+            _from_trading({"type": "kalshi-trading", "query": _Q}),
+            _from_backtest({"type": "kalshi-ready"}), ["snap", "closed"],
+            ["click", "tab-backtest"], ["snap", "reopened"],
+            # The page the emptied frame held is no longer heard
+            _message("old:backtest-frame", _BACKTEST, {"type": "kalshi-ready"}),
+            _message("old:backtest-frame", _BACKTEST, {"type": "kalshi-bar", "query": _Q2}),
+            ["snap", "old"],
+            # The page loaded again says its bar is ready: it is told the proposal, once
+            _from_backtest({"type": "kalshi-ready"}), ["snap", "open"]])
+        emptied = snaps["emptied"]
+        assert emptied["el"]["backtest-frame"]["src"] == ""
+        assert emptied["replaced"] == 1
+        assert snaps["closed"]["posted"] == []
+        reopened = snaps["reopened"]
+        assert reopened["el"]["backtest-frame"]["src"] == live_dashboard.BACKTEST_URL
+        assert reopened["posted"] == []
+        old = snaps["old"]
+        assert old["posted"] == []
+        assert old["el"]["trading-frame"]["src"] == _TRADING_URL
+        assert old["loads"]["trading-frame"] == 1
+        assert snaps["open"]["posted"] == [_apply(_Q)]
+
+    def test_reload_shows_the_trading_page_again(self, tmp_path):
+        snaps = _relay(tmp_path, [
+            ["click", "tab-trading"], ["click", "trading-reload"], ["snap", "plain"],
+            _from_trading({"type": "kalshi-trading", "query": _Q}),
+            ["click", "trading-reload"], ["snap", "proposal"]])
+        # Before any proposal: the trading page as it opens on its own (loaded at start,
+        # again when the tab was chosen, then by Reload), each time in a fresh copy of the frame
+        plain = snaps["plain"]
+        assert plain["el"]["trading-frame"]["src"] == _TRADING_URL
+        assert (plain["loads"], plain["replaced"]) == ({"trading-frame": 3}, 2)
+        # After one: the trading page for it
+        proposal = snaps["proposal"]
+        assert proposal["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q}"
+        assert (proposal["loads"], proposal["replaced"]) == ({"trading-frame": 4}, 3)
+
+    def test_only_the_backtest_and_data_frames_are_emptied(self, tmp_path):
+        delay = config.LIVE_DASHBOARD_FRAME_UNLOAD_SECONDS * 1000
+        snaps = _relay(tmp_path, [
+            ["click", "tab-trading"], _from_trading({"type": "kalshi-run", "run": _RUN}),
+            ["snap", "run"], ["click", "tab-backtest"], ["click", "tab-data"],
+            ["click", "tab-trading"], ["click", "tab-run"], ["click", "tab-live"],
+            ["snap", "hidden"], ["timers"], ["snap", "emptied"], ["click", "tab-trading"],
+            ["click", "tab-run"], ["snap", "back"]])
+        # Choosing the Trading or Run tab, or leaving one, starts no timer
+        assert snaps["run"]["timers"] == []
+        # Only the two frames the tab page loads on demand get one each
+        assert snaps["hidden"]["timers"] == [delay, delay]
+        emptied = snaps["emptied"]
+        assert emptied["replaced"] - snaps["hidden"]["replaced"] == 2
+        assert emptied["el"]["backtest-frame"]["src"] == ""
+        assert emptied["el"]["data-frame"]["src"] == ""
+        # The Trading and Run frames keep their pages
+        assert emptied["el"]["trading-frame"]["src"] == _TRADING_URL
+        assert emptied["el"]["run-frame"]["src"] == _RUN_URL + _RUN
+        # Coming back loads the trading page again (as every time its tab is chosen) and
+        # leaves the Run frame's page as it was; no timer is started
+        back = snaps["back"]
+        assert back["loads"] == {"trading-frame": 5, "run-frame": 1, "backtest-frame": 1,
+                                 "data-frame": 1}
+        assert (back["timers"], back["replaced"]) == ([], emptied["replaced"] + 1)
+
+    def test_the_script_points_frames_only_at_its_own_addresses(self):
+        script = live_dashboard._SCRIPT
+        # Every address it sets on a frame: the backtest and Data pages' (FRAMES), the
+        # trading page's at start, and the one point() puts on a fresh copy of a frame
+        assert Counter(re.findall(r"\.src = ([^;]+);", script)) == Counter({
+            "FRAMES[name][1]": 1, "TRADING_URL": 1, "url": 1})
+        # point() is given only the trading page's address (with a checked query, through
+        # tradingPage) and a run page's (with a checked id); nothing else from a message
+        # reaches an address
+        assert re.findall(r"\bpoint\('([\w-]+)', ([^;]+)\);", script) == [
+            ("trading-frame", "tradingPage()"), ("run-frame", "RUN_URL + m.run")]
+        assert ("function tradingPage() { return TRADING_URL + (QUERY === null ? '' : '?' + "
+                "QUERY); }") in script
+        # QUERY is set only from a query goodQuery passed, RUN only from an id RUN_ID passed
+        assert re.findall(r"\bQUERY = ([^;]+);", script) == ["null", "m.query", "m.query"]
+        assert script.count("goodQuery(m.query)") == 2
+        assert "m.type === 'kalshi-trading' && goodQuery(m.query)" in script
+        assert "m.type === 'kalshi-bar' && goodQuery(m.query)" in script
+        # A choice on the backtest bar is taken only while the Backtest tab is shown and no
+        # press of the trading page's buttons is on its way
+        assert re.search(r"if \(SHOWN === 'backtest' && !SENDING\) \{\n(\s*//[^\n]*\n)*"
+                         r"\s*QUERY = m\.query;"
+                         r"\n\s*loadTrading\(true\);\n\s*\} else \{", script)
+        assert ("m.type === 'kalshi-run' && typeof m.run === 'string' && RUN_ID.test(m.run)"
+                in script)
+        assert "var QUERY_TEXT = /^[A-Za-z0-9_.!~*\\x27()%&=+-]*$/;" in script
+        assert ("q.length + 2 * (q.length - q.replace(/\\x27/g, '').length) <= MAX_QUERY"
+                in script)
+        assert "var RUN_ID = /^[0-9a-f]{16}$/;" in script
+        # One message listener, taking each frame's messages only from its window and origin
+        assert script.count("addEventListener('message'") == 1
+        assert re.findall(r"sentBy\(e, '([\w-]+)', (\w+)\)", script) == [
+            ("trading-frame", "DEFAULTS_ORIGIN"), ("backtest-frame", "BACKTEST_ORIGIN")]
+        assert "return w !== null && e.source === w && e.origin === origin;" in script
+        # It sends one message, to the backtest page, addressed to the backtest origin
+        assert re.findall(r"\.postMessage\(([^;]*)\);", script) == [
+            "{type: 'kalshi-apply', query: QUERY, seq: TOLD}, BACKTEST_ORIGIN"]
+        # The number it sends back is a choice's only once goodSeq passed it
+        assert re.findall(r"\bTOLD = ([^;]+);", script) == ["0", "0", "goodSeq(m.seq) ? m.seq : 0"]
+        # It never reaches into a frame's page, opens a window or moves the tab page
+        for word in ("contentDocument", "document.domain", "location", "window.open",
+                     "window.top", "window.parent", "eval(", "innerHTML", "document.write",
+                     "allow-top-navigation"):
+            assert word not in script, word
+
+
+class TestTheDefaultsServerAgrees:
+    """The tab page and the live-defaults server name each other alike: where its pages are,
+    where they send their messages, who may frame them, the longest query and a run's id.
+    defaults_server is read here only; live_dashboard itself never imports it."""
+
+    def test_its_pages_tell_the_tab_page_and_no_other(self):
+        assert live_dashboard._PAGE_ORIGIN in config.LIVE_DASHBOARD_ORIGINS
+        assert set(config.LIVE_DASHBOARD_ORIGINS) == {
+            live_dashboard._PAGE_ORIGIN, f"http://localhost:{config.LIVE_DASHBOARD_PORT}"}
+        # The notifier sends each message to exactly those two origins, in one place
+        notify = defaults_server._NOTIFY_JS
+        assert (f"{json.dumps(list(config.LIVE_DASHBOARD_ORIGINS))}.forEach(function (origin) "
+                "{ window.parent.postMessage(message, origin); });") in notify
+        assert notify.count("postMessage") == 1
+        # The arming script sends one message, that a press is on its way, to those two
+        confirm = defaults_server._CONFIRM_JS
+        assert (f"{json.dumps(list(config.LIVE_DASHBOARD_ORIGINS))}.forEach(function(origin) "
+                "{\n          window.parent.postMessage({type: 'kalshi-sending'}, origin);") in confirm
+        assert confirm.count("postMessage") == 1
+        # The backtest port's pages may be framed by those same two
+        framed = dict(live_dashboard._FRAMED_HEADERS)["Content-Security-Policy"]
+        assert framed == "frame-ancestors " + " ".join(config.LIVE_DASHBOARD_ORIGINS)
+
+    def test_only_the_tab_page_may_frame_its_pages(self):
+        [ancestors] = [p for p in defaults_server._CSP.split("; ")
+                       if p.startswith("frame-ancestors ")]
+        allowed = ancestors.split()[1:]
+        assert live_dashboard._PAGE_ORIGIN in allowed
+        assert set(allowed) == set(config.LIVE_DASHBOARD_ORIGINS)
+        # Never the backtest page, which loads a chart library from the web
+        assert live_dashboard._BACKTEST_ORIGIN not in allowed
+        assert all(str(config.LIVE_BACKTEST_PORT) not in origin for origin in allowed)
+
+    def test_the_frames_point_where_it_listens(self):
+        assert (defaults_server.DEFAULTS_SERVER_HOST, defaults_server.DEFAULTS_SERVER_PORT) == (
+            config.DEFAULTS_SERVER_HOST, config.DEFAULTS_SERVER_PORT)
+        assert live_dashboard._DEFAULTS_ORIGIN == (
+            f"http://{defaults_server.DEFAULTS_SERVER_HOST}:{defaults_server.DEFAULTS_SERVER_PORT}")
+        assert live_dashboard.TRADING_URL == live_dashboard._DEFAULTS_ORIGIN + "/confirm"
+        assert live_dashboard.RUN_URL == live_dashboard._DEFAULTS_ORIGIN + "/runs/"
+        # Every run id the server makes (16 hexadecimal digits) is one the tab page takes
+        assert defaults_server._RUN_ID.pattern == "[0-9a-f]{16}"
+        assert "var RUN_ID = /^[0-9a-f]{16}$/;" in live_dashboard._SCRIPT
+
+    def test_the_longest_query_is_the_server_s_limit(self):
+        # The longest query the tab page takes, sent as a browser sends it, is answered by
+        # the server's own handler, and one character more is refused: the HTTP layer's
+        # limit on the request line is the tighter of the server's two. Each request goes
+        # through the handler's whole reading of its request line and headers, from memory;
+        # only the answer is replaced, by a note of what it would have been
+        address = urlsplit(live_dashboard.TRADING_URL)
+        assert _LONGEST == min(
+            config.DEFAULTS_SERVER_MAX_REQUEST_BYTES - len(f"{address.path}?"),
+            config.DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES
+            - len(f"GET {address.path}? HTTP/1.1\r\n"))
+        assert defaults_server.DEFAULTS_SERVER_MAX_REQUEST_BYTES == (
+            config.DEFAULTS_SERVER_MAX_REQUEST_BYTES)
+
+        def answer(sent: str) -> list:
+            answered = []
+            handler = object.__new__(defaults_server._Handler)
+            handler.client_address = ("127.0.0.1", 5555)
+            handler.rfile = io.BytesIO(f"GET {address.path}?{sent} HTTP/1.1\r\n"
+                                       f"Host: {address.netloc}\r\n\r\n".encode("ascii"))
+            handler.wfile = io.BytesIO()
+            handler._send = lambda response: answered.append(response.status)
+            handler._serve = lambda body: answered.append("served")
+            handler.handle_one_request()
+            return answered
+
+        assert answer("a" * _LONGEST) == ["served"]
+        assert answer("a" * (_LONGEST + 1)) == [414]
+        # The browser writes an apostrophe as %27, which the tab page counts as three
+        # characters: the longest query with one is served, one character more is not
+        with_apostrophe = "'" + "a" * (_LONGEST - 3)
+        assert len(with_apostrophe) + 2 * with_apostrophe.count("'") == _LONGEST
+        assert answer(with_apostrophe.replace("'", "%27")) == ["served"]
+        assert answer(("'" + "a" * (_LONGEST - 2)).replace("'", "%27")) == [414]
+
+    def test_the_trading_page_s_proposal_is_one_the_tab_page_takes(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "PROJECT_ROOT", tmp_path)
+        config.save_live_defaults(config.LiveSettings(
+            tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8, size_cap=0.1,
+            exclude_categories=("Kids' Shows",), exclude_tags=("Sports · Basketball",),
+            rebalance=True), source="")
+        app = defaults_server._App(config.DEFAULTS_SERVER_PORT, key=b"k" * 32)
+        address = urlsplit(live_dashboard.TRADING_URL)
+
+        def told(target: str) -> dict:
+            response = app.handle(defaults_server._Request("GET", target, address.netloc))
+            assert response.status == 200, response.body
+            found = re.search(r'<body data-dashboard-message="([^"]*)">', response.body)
+            return json.loads(html.unescape(found.group(1)))
+
+        # The trading page as the tab page first loads it: the saved defaults, as a query
+        # made only of the characters the tab page takes, well inside the longest
+        first = told(address.path)
+        assert first["type"] == "kalshi-trading"
+        query = first["query"]
+        assert re.fullmatch(r"[A-Za-z0-9_.!~*'()%&=+-]+", query), query
+        assert len(query) + 2 * query.count("'") <= _LONGEST
+        assert "exclude_category=Kids%27+Shows" in query
+        # The address the tab page builds from it (Reload, or after a run) proposes the same
+        assert told(f"{address.path}?{query}") == first
 
 
 # ---- keeping it read-only and away from the order path -----------------------------
