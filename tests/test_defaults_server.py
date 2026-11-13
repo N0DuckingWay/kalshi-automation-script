@@ -1086,9 +1086,10 @@ class TestConfirmPage:
     @pytest.mark.parametrize("saved", [
         {}, {"rebalance": True}, {"rebalance": True, "min_price_move": 0.25}])
     def test_missing_rebalance_settings_keep_the_saved_values(self, saved):
-        # A link that names neither field (the dashboard's save button on a
-        # page without the Rebalance view, a hand-made link) keeps both as
-        # saved, either way, shown as no change
+        # A link that names neither field (what the backtest page's filter
+        # bar passes the Trading tab from a page without the Rebalance view
+        # before it knows the Trading tab's proposal, a hand-made link) keeps
+        # both as saved, either way, shown as no change
         _save(LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
                            size_cap=0.1, **saved))
         page = _parse(_get(_app(), "/confirm?" + _query()).body)
@@ -3114,8 +3115,9 @@ class TestConfirmRefusals:
         response = _get(_app(), "/confirm?" + _query(category="Sports"))
         assert response.status == 400
         assert ("this link names category, which exclude_category replaced (the category "
-                "filter is now a list of categories NOT to trade): rebuild the backtest "
-                "dashboard, or open this server&#x27;s start page") in response.body
+                "filter is now a list of categories NOT to trade): open the trading page "
+                "again from the dashboard&#x27;s Trading tab (./start_dashboard.sh), or from "
+                "this server&#x27;s home page") in response.body
 
     def test_a_link_built_before_tag_exclusions_says_how_to_get_a_new_one(self):
         for query in (_query(tag="Basketball"),
@@ -3123,8 +3125,9 @@ class TestConfirmRefusals:
             response = _get(_app(), "/confirm?" + query)
             assert response.status == 400
             assert ("this link names tag, which exclude_tag replaced (the tag filter is "
-                    "now a list of tags NOT to trade): rebuild the backtest dashboard, or "
-                    "open this server&#x27;s start page") in response.body
+                    "now a list of tags NOT to trade): open the trading page again from "
+                    "the dashboard&#x27;s Trading tab (./start_dashboard.sh), or from this "
+                    "server&#x27;s home page") in response.body
             assert "<form" not in response.body
 
     def test_a_link_naming_both_retired_filter_fields_names_both(self):
@@ -3132,8 +3135,9 @@ class TestConfirmRefusals:
         assert response.status == 400
         assert ("this link names category and tag, which exclude_category and exclude_tag "
                 "replaced (the category and tag filters are now lists of categories and "
-                "tags NOT to trade): rebuild the backtest dashboard, or open this "
-                "server&#x27;s start page") in response.body
+                "tags NOT to trade): open the trading page again from the dashboard&#x27;s "
+                "Trading tab (./start_dashboard.sh), or from this server&#x27;s home "
+                "page") in response.body
 
     def test_a_tied_tag_in_an_excluded_category_is_proposed(self):
         # Excluding a tag of a category that is excluded anyway changes
@@ -3219,15 +3223,16 @@ class TestConfirmRefusals:
         # The dashboard built before Rebalance sends these; the refusal says what to do
         response = _get(_app(), "/confirm?" + _query(**{field: value}))
         assert response.status == 400
-        assert (f"this link was built before Rebalance (it names {field}): rebuild the "
-                "backtest dashboard, or open this server&#x27;s start page") in response.body
+        assert (f"this link was built before Rebalance (it names {field}): open the "
+                "trading page again from the dashboard&#x27;s Trading tab "
+                "(./start_dashboard.sh), or from this server&#x27;s home page") in response.body
         assert "<form" not in response.body
 
     # The refusal of a link that names the same-title cap and no older retired field
     _SAME_TITLE_CAP_REFUSAL = (
         "this link names same_title_size_cap, which is no longer used (the bot trades "
-        "time-series pairs only): rebuild the backtest dashboard, or open this "
-        "server&#x27;s start page")
+        "time-series pairs only): open the trading page again from the dashboard&#x27;s "
+        "Trading tab (./start_dashboard.sh), or from this server&#x27;s home page")
 
     @pytest.mark.parametrize("value", ["0.2", "0.05", "1", "0", "x", ""])
     def test_a_link_naming_the_same_title_cap_says_how_to_get_a_new_one(self, value):
@@ -3278,8 +3283,9 @@ class TestConfirmRefusals:
             response = _get(_app(), "/confirm?" + query)
             assert response.status == 400, query
             body = html.unescape(response.body)
-            assert (message + ": rebuild the backtest dashboard, or open this server's "
-                    "start page") in body, query
+            assert (message + ": open the trading page again from the dashboard's "
+                    "Trading tab (./start_dashboard.sh), or from this server's home "
+                    "page") in body, query
             assert "same_title_size_cap" not in body, query
             assert "<form" not in response.body
         # ... and without the cap, the very same message
@@ -4059,8 +4065,9 @@ class TestOutdatedFile:
         assert config.read_saved_live_defaults() is None
 
     def test_another_proposal_over_the_old_file_links_to_its_own_values(self):
-        # The dashboard's Save button proposes other values: the page says the
-        # save replaces the file with them, and links to the file's own
+        # A proposal of other values (from the dropdown bar, the Backtest tab
+        # or a link): the page says the save replaces the file with them, and
+        # links to the file's own
         config.LIVE_DEFAULTS_FILE.write_bytes(_OLD_VERSION_BYTES)
         response = _get(_app(), "/confirm?" + _query())
         assert response.status == 200
@@ -4204,9 +4211,10 @@ class TestOutdatedFile:
                    "This version saves the categories to EXCLUDE instead, and the values "
                    "offered here exclude none, so saving them as they are trades every "
                    "category. To keep the old filter, add <code>&exclude_category=<name></code> to the "
-                   "address for each category to leave out, or save from the backtest "
-                   "dashboard's Save as live defaults… button with those categories ticked "
-                   "in its Exclude categories menu.")
+                   "address for each category to leave out, or tick those categories in "
+                   "the Exclude categories menu of the dashboard's Trading tab before "
+                   "saving (that menu lists every category the backtest dashboard shows "
+                   "once this version has built the backtest dashboard).")
         index = _get(app, "/")
         assert index.status == 200
         for response in (index, _get(app, "/saved")):
@@ -4335,8 +4343,9 @@ class TestOutdatedFile:
                    "here exclude none, so saving them as they are trades every tag. To keep "
                    "the old filter, add <code>&exclude_tag=<name></code> to the address for "
                    "each tag to leave out (\"Category · Tag\" for a tag of one category), or "
-                   "save from the backtest dashboard's Save as live defaults… button with "
-                   "those tags ticked in its Exclude tags menu.")
+                   "tick those tags in the Exclude tags menu of the dashboard's Trading tab "
+                   "before saving (that menu lists every tag the backtest dashboard shows "
+                   "once this version has built the backtest dashboard).")
         app = _app()
         for response in (_get(app, "/"), _get(app, "/confirm"), _get(app, "/saved"),
                          _get(app, link)):
@@ -4525,8 +4534,9 @@ class TestSameTitleCapFile:
         assert 'class="warn"' not in response.body
 
     def test_another_proposal_over_it_links_to_its_own_values(self):
-        # A dashboard page's Save proposes other values: the page says the save
-        # replaces the file with them, and links to the file's own
+        # A proposal of other values (from the dropdown bar, the Backtest tab
+        # or a link): the page says the save replaces the file with them, and
+        # links to the file's own
         _, link = self._write()
         response = _get(_app(), "/confirm?" + _query())
         assert response.status == 200
@@ -4592,7 +4602,7 @@ class TestSameTitleCapFile:
 
     def test_the_account_s_file_is_saved_again_in_one_confirm_and_runs_read_it(self, capsys):
         # End to end, from the file exactly as the account has it saved: every
-        # live run refuses it; the start page links to its values; that page
+        # live run refuses it; the home page (/) links to its values; that page
         # shows them in eleven rows; one Confirm and save writes them with no
         # same-title cap; and live runs then read the new file
         from kalshi_betting import main
@@ -4606,7 +4616,7 @@ class TestSameTitleCapFile:
         assert exited.value.code == 2
         assert "same_title_size_cap, which is no longer used" in capsys.readouterr().err
         app = _app()
-        # The start page: the notice and the link
+        # The home page (/): the notice and the link
         index = _get(app, "/")
         assert index.status == 200
         assert self._notice(link) in index.body
@@ -4938,7 +4948,8 @@ class TestSave:
         assert record.getMessage() == (
             "Refused (400 Bad Request): this link names category, which exclude_category "
             "replaced (the category filter is now a list of categories NOT to trade): "
-            "rebuild the backtest dashboard, or open this server's start page")
+            "open the trading page again from the dashboard's Trading tab "
+            "(./start_dashboard.sh), or from this server's home page")
 
 
 class TestSavedPage:
@@ -7534,7 +7545,8 @@ class TestMain:
             run_main["run"](["--seed"])
         assert exit_info.value.code == 2
         assert (f"port {PORT} is in use — stop the other server, or change "
-                "config.DEFAULTS_SERVER_PORT and rebuild the dashboard") in capsys.readouterr().err
+                "config.DEFAULTS_SERVER_PORT and start ./start_dashboard.sh again (the live "
+                "dashboard reads it when it starts)") in capsys.readouterr().err
         assert run_main["asked"] == [f"http://127.0.0.1:{PORT}"]
         assert run_main["opened"] == [] and run_main["servers"] == []
         assert not (tmp_path / "kalshi_defaults_server.log").exists()

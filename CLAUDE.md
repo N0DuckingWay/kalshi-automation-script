@@ -104,7 +104,7 @@ Short forms, so every session has them. The full text, with the reasons and the 
 - Do not import `trader.py` from `scanner.py` or `strategy.py`.
 - Write output files only under `PROJECT_ROOT` (the one exception is the machine-wide live-run lock, `~/.kalshi_betting/live_run.lock`, which must never move under `PROJECT_ROOT`: every checkout shares it, or two real-money runs could trade at once).
 - Run `tests/test_scanner.py::TestNormalizeTitle` after any change to `_DATE_PATTERNS`.
-- Import `defaults_server` from nothing and never let it serve the dashboard; keep every check in front of a save or a run.
+- Import `defaults_server` from nothing and never let it serve the dashboard; keep every check in front of a save or a run; only the dashboard's tab page may frame its pages, and none of its pages listens for messages.
 - Let the defaults server import only `config` and `run_lock`, start a process only in `_App._start_run`, and never stop a run.
 - Write `live_defaults.json` only through `config.save_live_defaults`; add no config.py fallback to `main._resolve_live_settings`.
 - Only a real-money prod run takes the live-run lock, and it holds it until the run ends; a lock file that cannot be made or opened is exit 1, never 50.
@@ -153,8 +153,9 @@ python3 -m kalshi_betting.eda
 # Scheduler daemon (prod every day at 07:00 and 21:00 on the host's clock, config.SCHEDULER_RUN_TIMES)
 python3 -m kalshi_betting.scheduler
 
-# The dashboard (Live trading, Backtest and Data tabs) and the defaults server, whose pages save
-# the live defaults every live run trades and can start real-money runs
+# The dashboard (Live trading, Backtest, Trading and Data tabs, and Run once a run starts) and the
+# defaults server, whose pages (the Trading and Run tabs) save the live defaults every live run
+# trades and can start real-money runs
 ./start_dashboard.sh [--seed] [--no-browser]
 
 # Live check of the V2 order mapping (about 1c of real money; the user runs it). --step yes-close

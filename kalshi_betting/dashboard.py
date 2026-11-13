@@ -305,10 +305,10 @@ Dependencies:
     a "Rebalance until" choice as a run's label does (_move_label,
     _until_label) — and
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT, DASHBOARD_FILENAME (the
-    page's file name, which defaults_server opens when run on its own and
-    live_dashboard serves as its Backtest tab), DASHBOARD_FILES_DIRNAME
-    and DASHBOARD_BUILD_STALE_SECONDS (the folder of chunk files beside it,
-    and when a build folder still marked as being written is abandoned),
+    page's file name, which live_dashboard serves as its Backtest tab),
+    DASHBOARD_FILES_DIRNAME and DASHBOARD_BUILD_STALE_SECONDS (the folder of
+    chunk files beside it, and when a build folder still marked as being
+    written is abandoned),
     CONTRACT_PAYOUT_DOLLARS (named in the Sell select's title),
     LIVE_DASHBOARD_ORIGINS (the tab page's two addresses, the only ones the
     bar talks to), TRADING_QUERY_MAX_BYTES (the longest query the Trading

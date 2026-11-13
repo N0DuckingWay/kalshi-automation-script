@@ -36,8 +36,8 @@ And the echo's "live rule=" clause: the saved live defaults' rule (with their
 origin), "none saved" with no file, "not recorded" with a refused one — a read
 of its own, never a scenario of this run and never config.py's toggles. And the
 run's last line, after the one pointing at the dashboard: how the filter bar's
-scenario becomes the live defaults (the defaults server, then the page's save
-button).
+scenario becomes the live defaults (the launcher, the filter bar the Trading
+tab follows, then the Trading tab's buttons).
 
 And the depth model: main() fits it (depth_model.load_depth_model) before the
 fetch, hands it to run_backtest_sweep, and the config echo's last clause says
@@ -1462,8 +1462,9 @@ class TestDashboardHandoff:
     def test_the_run_closes_with_how_to_save_the_live_defaults(self, cli, monkeypatch, caplog):
         # After pointing at the page, the run says how its filter bar's
         # scenario becomes the live defaults, or is traded: the launcher (which
-        # shows this page as the live dashboard's Backtest tab), then the page's
-        # buttons (the page itself cannot write a file)
+        # shows this page as the live dashboard's Backtest tab), the filter bar
+        # (which the Trading tab follows), then the Trading tab's buttons (the
+        # page itself cannot write a file or start a run)
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
         messages = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
@@ -1472,8 +1473,9 @@ class TestDashboardHandoff:
         assert messages[opened + 1] == (
             "To save the filter bar's scenario as the live defaults, or to trade: run "
             "./start_dashboard.sh (it starts the defaults server and the live dashboard, whose "
-            "Backtest tab is this page), then use the filter bar's Save as live defaults… or "
-            "Trade using defaults… button.")
+            "Backtest tab is this page), choose the scenario on the Backtest tab's filter bar, "
+            "which the Trading tab follows, then use the Trading tab's Confirm and save or "
+            "Confirm and trade button.")
         assert messages[opened + 1:] == [messages[opened + 1]]
 
 

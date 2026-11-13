@@ -3,22 +3,23 @@
 # open the page on its Live trading tab.
 #
 # Two servers start from this checkout, each in the background. The live
-# dashboard (kalshi_betting.live_dashboard, read-only) serves the page's three
+# dashboard (kalshi_betting.live_dashboard, read-only) serves the page and its
 # tabs: Live trading, which reads the account from Kalshi on every load;
-# Backtest, backtest_dashboard.html as it is; and Data, eda_dashboard.html,
-# which each backtest rebuilds (or python3 -m kalshi_betting.eda). It opens
-# the page in the browser. The live-defaults server
-# (kalshi_betting.defaults_server) serves the pages the Backtest tab's "Save
-# as live defaults…" and "Trade using defaults…" buttons open; it opens
-# nothing itself, except with --seed. If
-# this checkout's servers are already running, the page just opens again.
+# Backtest, backtest_dashboard.html as it is; Trading, the live-defaults
+# server's trading page, where the live defaults are saved and live runs are
+# started; Data, eda_dashboard.html, which each backtest rebuilds (or python3
+# -m kalshi_betting.eda); and Run, the latest run's page, shown once a run
+# starts. It opens the page in the browser. The live-defaults server
+# (kalshi_betting.defaults_server) serves the pages the Trading and Run tabs
+# show; it opens nothing itself, except with --seed. If this checkout's
+# servers are already running, the page just opens again.
 # Ctrl-C stops both, and so does a SIGTERM or SIGHUP sent to this script
 # alone; stop them when you are done. A trading run the defaults server
 # started keeps going until it finishes.
 #
 #   ./start_dashboard.sh                start both and open the Live trading tab
-#   ./start_dashboard.sh --seed         start both and open the seed values'
-#                                       confirmation page instead
+#   ./start_dashboard.sh --seed         start both and open the trading page
+#                                       proposing the seed values instead
 #   ./start_dashboard.sh --no-browser   start both, open nothing, only log the addresses
 #   ./start_dashboard.sh --help         say this, and start nothing
 #
@@ -26,10 +27,10 @@
 # before anything starts. The flags are passed to the defaults server, and the
 # live dashboard gets --no-browser when either is given. If the live dashboard
 # stops with an error within 2 s of starting (its port held by another
-# program, say), the defaults server opens its own start page instead (the
-# backtest page; the seed page with --seed; nothing with --no-browser) and a
-# warning says so. If it stops later, a warning says so and the defaults
-# server keeps running. It can be run from any directory.
+# program, say), the defaults server opens its own trading page instead (on
+# the live defaults in force; on the seed values with --seed; nothing with
+# --no-browser) and a warning says so. If it stops later, a warning says so
+# and the defaults server keeps running. It can be run from any directory.
 #
 # KALSHI_PYTHON picks the Python this package is installed in (default: python3).
 set -euo pipefail
@@ -38,10 +39,11 @@ usage() {
   cat <<'EOF'
 usage: start_dashboard.sh [--seed] [--no-browser]
 
-Start the live dashboard (the Live trading, Backtest and Data tabs, read-only) and
-the live-defaults server from this checkout, and open the page on its Live trading tab.
+Start the live dashboard (its Live trading, Backtest, Trading and Data tabs) and the
+live-defaults server (the Trading tab's pages, where the live defaults are saved and
+live runs are started) from this checkout, and open the page on its Live trading tab.
 
-  --seed        open the seed values' confirmation page instead
+  --seed        open the trading page proposing the seed values instead
   --no-browser  open nothing; only log the addresses
   -h, --help    show this message and start nothing
 EOF
@@ -175,9 +177,9 @@ trap 'signalled=1; exit 130' INT
 trap 'signalled=1; exit 143' TERM
 trap 'signalled=1; exit 129' HUP
 
-# The live dashboard (its three tabs, read-only) opens the page itself, so the
-# defaults server opens nothing, except with --seed, when the seed
-# confirmation page is what opens
+# The live dashboard (the page and its tabs, read-only) opens the page itself,
+# so the defaults server opens nothing, except with --seed, when the trading
+# page proposing the seed values is what opens
 live_args=()
 if [ "$seed" = 1 ] || [ "$no_browser" = 1 ]; then
   live_args=(--no-browser)
@@ -187,7 +189,7 @@ fi
 live_pid=$!
 
 # Up to 2 s for it to stop at once. With an error (its port held by another
-# program, say) the defaults server opens its own start page instead; with 0,
+# program, say) the defaults server opens its own trading page instead; with 0,
 # this checkout's live dashboard was already running and has opened its page.
 tries=20
 while [ "$tries" -gt 0 ] && running "$live_pid"; do
@@ -204,9 +206,9 @@ if ! running "$live_pid"; then
     if [ "$no_browser" = 1 ]; then
       instead="only the defaults server runs"
     elif [ "$seed" = 1 ]; then
-      instead="only the defaults server runs (it opens the seed values' confirmation page)"
+      instead="only the defaults server runs (it opens its trading page on the seed values)"
     else
-      instead="only the defaults server runs, and it opens the backtest page itself"
+      instead="only the defaults server runs, and it opens its own trading page"
     fi
     echo "start_dashboard.sh: the live dashboard did not start (its message is above); $instead" >&2
   fi

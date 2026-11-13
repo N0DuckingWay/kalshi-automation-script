@@ -589,7 +589,8 @@ class TestDefaultsServerTradingPage:
             config.DEFAULTS_SERVER_MAX_REQUEST_BYTES - len("/confirm?"),
             config.DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES - len("GET /confirm? HTTP/1.1\r\n"))
         assert config.TRADING_QUERY_MAX_BYTES == 65_512
-        # The old marker's scan limit went with the dashboard's Trade link
+        # No limit on scanning the backtest page for a marker: the defaults
+        # server never reads that page
         assert not hasattr(config, "DASHBOARD_MARKER_SCAN_BYTES")
 
     def test_the_spread_bands_are_the_backtest_s_grid(self):
@@ -1529,8 +1530,9 @@ class TestFilterNameRefusal:
     config.filter_name_refusal says why one excluded category or tag would be
     refused — by the form check the defaults server reads every link's names
     through (config.check_filter_name, which defaults_server._name calls) or by
-    LiveSettings — so the dashboard's Save button can keep such a name out of
-    its link. A name it passes is one LiveSettings takes.
+    LiveSettings — so the backtest page's filter bar can keep such a name out
+    of the proposal it passes the Trading tab. A name it passes is one
+    LiveSettings takes.
     """
 
     @pytest.mark.parametrize("field, name", [
@@ -5188,7 +5190,7 @@ class TestLiveDefaults:
             config.live_defaults()
         message = str(err.value)
         assert str(config.LIVE_DEFAULTS_FILE) in message
-        assert "Save as live defaults…" in message
+        assert "save them in the dashboard's Trading tab (start ./start_dashboard.sh)" in message
         assert "python3 -m kalshi_betting.defaults_server --seed" in message
         assert "./start_dashboard.sh --seed" in message
         # It is also a LiveDefaultsError and a ValueError
@@ -5368,8 +5370,8 @@ class TestOutdatedSavedFile:
         assert "and its other settings are refused too (" in message, label
         assert reason in message, (label, message)
         assert "offer them" not in message
-        assert message.endswith("save new ones from its pages, from the seed values or the "
-                                "backtest dashboard)")
+        assert message.endswith("save new ones in its Trading tab, which offers the seed "
+                                "values)")
 
     def test_the_record_rules_come_first(self):
         # A file that breaks a rule outside its settings is an ordinary refusal
@@ -5460,8 +5462,8 @@ class TestCategoriesRetirement:
             f"only): these defaults traded only {', '.join(repr(name) for name in old)}, and "
             "this version saves what NOT to trade instead. Saved again as offered (no "
             "category excluded, no tag excluded, no same-title cap), they trade everything: "
-            "exclude each category not to trade before saving (start ./start_dashboard.sh, "
-            "or the backtest dashboard's \"Save as live defaults…\" button)")
+            "exclude each category not to trade before saving (in the dashboard's Trading "
+            "tab: start ./start_dashboard.sh)")
 
     def test_a_null_list_has_no_old_categories(self):
         assert _outdated(self._current_era()).old_categories is None
@@ -5596,9 +5598,8 @@ class TestTagsRetirement:
             f"{', '.join(repr(name) for name in old)} (a 'Category · Tag' limited that "
             "category alone), and this version saves what NOT to "
             "trade instead. Saved again as offered (no tag excluded, no same-title cap), "
-            "they trade everything: exclude each tag not to trade before saving (start "
-            "./start_dashboard.sh, or the backtest dashboard's \"Save as live "
-            "defaults…\" button)")
+            "they trade everything: exclude each tag not to trade before saving (in the "
+            "dashboard's Trading tab: start ./start_dashboard.sh)")
 
     @pytest.mark.parametrize("value", [
         b'"Basketball"', b"3", b"[]", b'["Basketball", "any"]', b'["Basketball", "NONE"]',
@@ -5887,8 +5888,8 @@ class TestSameTitleCapRetirement:
                 "trades time-series pairs only), and its other settings are refused too "
                 "(same_title_size_cap must be") in message, (cap, message)
         assert "offer them" not in message
-        assert message.endswith("save new ones from its pages, from the seed values or the "
-                                "backtest dashboard)")
+        assert message.endswith("save new ones in its Trading tab, which offers the seed "
+                                "values)")
 
     @pytest.mark.parametrize("cap", [0.05, 0.2, 0.95, 1, 1.0])
     def test_an_old_cap_the_older_version_took_reads_as_no_cap(self, cap):
@@ -5930,7 +5931,7 @@ class TestSameTitleCapRetirement:
             f'{config.LIVE_DEFAULTS_FILE}: "settings" holds {held}, and its other settings '
             "are refused too (it lacks same_title_size_cap, which every older version "
             "saved): save the live defaults again (start ./start_dashboard.sh and save new "
-            "ones from its pages, from the seed values or the backtest dashboard)"), label
+            "ones in its Trading tab, which offers the seed values)"), label
         # ... while the same file with the cap is offered
         assert _outdated(_text(self._record(**changes))).proposal is not None, label
 

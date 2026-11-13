@@ -88,8 +88,8 @@ _SERVER = "kalshi_betting.defaults_server"
 # error: at once (by the flags given), and later
 _LIVE_FAILED = "start_dashboard.sh: the live dashboard did not start (its message is above); "
 _LIVE_FAILED_INSTEAD = {
-    (): "only the defaults server runs, and it opens the backtest page itself",
-    ("--seed",): "only the defaults server runs (it opens the seed values' confirmation page)",
+    (): "only the defaults server runs, and it opens its own trading page",
+    ("--seed",): "only the defaults server runs (it opens its trading page on the seed values)",
     ("--no-browser",): "only the defaults server runs",
 }
 _LIVE_STOPPED = "start_dashboard.sh: the live dashboard stopped with exit status {status} " \
@@ -557,7 +557,8 @@ def test_with_seed_only_the_server_opens_a_page(tmp_path):
     process, err = _run([str(script), "--seed"], tmp_path,
                         _env(record, KALSHI_PYTHON=str(stub)))
     assert process.returncode == _STUB_SERVER_EXIT, err
-    # The seed confirmation page is what opens: the live dashboard opens nothing
+    # The trading page proposing the seed values is what opens: the live
+    # dashboard opens nothing
     assert _seen(record) == _expected(script.parent, ["--no-browser"], ["--seed"])
 
 
@@ -581,6 +582,8 @@ def test_help_is_printed_and_nothing_starts(tmp_path, arguments):
     assert result.returncode == 0, result.stderr
     assert result.stdout.startswith("usage: start_dashboard.sh [--seed] [--no-browser]\n")
     assert "--seed" in result.stdout and "--no-browser" in result.stdout
+    # It names the dashboard's tabs, the Trading tab among them
+    assert "Live trading, Backtest, Trading and Data tabs" in " ".join(result.stdout.split())
     assert result.stderr == ""
     # Not even the import check ran
     assert _calls(record) == []
@@ -620,7 +623,7 @@ def test_without_kalshi_python_it_runs_python3(tmp_path):
 def test_a_live_dashboard_that_fails_at_once_leaves_the_page_to_the_server(tmp_path,
                                                                             arguments):
     # Its port held by another program: it exits 2 at once, so the defaults
-    # server is given only the flags and opens its own start page, if any
+    # server is given only the flags and opens its own trading page, if any
     script = _checkout(tmp_path)
     stub = _write_stub(tmp_path / "bin")
     record = tmp_path / "record.txt"

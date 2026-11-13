@@ -19,7 +19,9 @@ Dependencies:
     outside the pipeline's import graph: the verification CLI (see
     CLAUDE.md's pipeline-isolation rule), defaults_server.py, the local pages
     that save the live defaults and start live trading runs with them, and
-    live_dashboard.py, the read-only local server of the dashboard's three tabs.
+    live_dashboard.py, the read-only local server of the dashboard's tab page
+    (its Live trading, Backtest, Trading and Data tabs, and a Run tab once a
+    run starts; the Trading and Run tabs frame defaults_server.py's pages).
 
 Notes:
     PROJECT_ROOT is derived from __file__ so the package works correctly on any
@@ -799,15 +801,17 @@ LIVE_DEFAULTS_SOURCE_PATTERN = (
 # ── Defaults server ───────────────────────────────────────────────────────────
 
 # Where defaults_server.py listens: the pages that save the live defaults and
-# start live runs with them. Loopback only. Changing the port needs a new
-# dashboard, since the page's save and trade addresses are written into it when
-# it is built.
+# start live runs with them, which the live dashboard's Trading and Run tabs
+# show in frames. Loopback only. The live dashboard builds those frames'
+# addresses from these when it starts, so after a change both servers must be
+# started again (./start_dashboard.sh); the backtest page names neither.
 DEFAULTS_SERVER_HOST = "127.0.0.1"
 DEFAULTS_SERVER_PORT = 8765
 
-# The longest request (path plus body) the server reads. The dashboard's Save
-# button can name hundreds of excluded tags (16 to 32 KB for 400) and keeps
-# itself disabled for an address that would not fit.
+# The longest request (path plus body) the server reads. A proposal can name
+# hundreds of excluded tags (16 to 32 KB for 400); the backtest page's filter
+# bar passes the Trading tab none that would not fit, as a query or as the
+# trading page's posted form.
 DEFAULTS_SERVER_MAX_REQUEST_BYTES = 65_536
 
 # The most excluded categories, and the most excluded tags, one confirmation
@@ -830,13 +834,15 @@ TRADING_QUERY_MAX_BYTES = min(
     DEFAULTS_SERVER_REQUEST_LINE_MAX_BYTES - len("GET /confirm? HTTP/1.1\r\n"))
 
 # Bytes the confirmation form adds when posted back: the fingerprint, nonce,
-# token, longest action and attention box fields. The Save button budgets with
-# it; a test checks the sum against a real form.
+# token, longest action and attention box fields. The backtest page's filter
+# bar budgets with it (dashboard._sync_max_form_bytes), so a proposal it
+# passes the Trading tab still fits DEFAULTS_SERVER_MAX_REQUEST_BYTES when the
+# trading page posts it back; a test checks the sum against a real form.
 DEFAULTS_SERVER_CONFIRM_FORM_EXTRA_BYTES = 218
 
-# Bytes the dashboard's Save button leaves unused under both of the defaults
-# server's limits (the request line and the request), in case its form grows
-# by a field
+# Bytes the backtest page's filter bar leaves unused under the defaults
+# server's request limit (DEFAULTS_SERVER_MAX_REQUEST_BYTES) when it budgets
+# the trading page's posted form, in case that form grows by a field
 DASHBOARD_SAVE_HEADROOM_BYTES = 64
 
 # Seconds the server waits on a silent connection before dropping it: it
@@ -3329,8 +3335,9 @@ def check_filter_name(text: str, field: str) -> str:
     spaces while being a different name to the filter. That also refuses a
     tied tag written with a doubled space ("Sports ·  Basketball").
     defaults_server._name reads every exclude_category and exclude_tag field
-    through it, and filter_name_refusal asks it for the dashboard's Save
-    button, so the two never disagree.
+    through it, and filter_name_refusal asks it for the backtest page, whose
+    filter bar passes the Trading tab only names the server takes, so the two
+    never disagree.
 
     Args:
         text (str): The name.
@@ -3360,8 +3367,10 @@ def filter_name_refusal(field: str, name: str) -> str | None:
     and then LiveSettings, which holds it to _names (no "any" or "none") and
     to _check_category_names or _check_tied_tags. Each of those judges a name
     on its own, so one name's verdict is the verdict of any list holding it.
-    The dashboard asks this of every category and tag its menus offer, so its
-    Save button never opens a link the server refuses.
+    The backtest page asks this of every category and tag its menus offer
+    (dashboard._sync_refused), so its filter bar never passes the Trading tab
+    a name the server refuses, and the names file written beside the page
+    (which the trading page's Exclude menus list) leaves such names out.
 
     Args:
         field (str): "exclude_categories" or "exclude_tags".
@@ -4267,11 +4276,11 @@ def _retired_message(retired: list[str], proposal: LiveSettings | None,
             traded only 'Economics', and this version saves what NOT to trade
             instead. Saved again as offered (no category excluded), they trade
             everything: exclude each category not to trade before saving
-            (start ./start_dashboard.sh, or the backtest dashboard's "Save as
-            live defaults…" button)'. A file that listed tags to trade says
-            "limited trading to the tags 'Basketball' (a 'Category · Tag'
-            limited that category alone)" and "exclude each tag not to
-            trade", and one that listed both names both. A file whose only
+            (in the dashboard's Trading tab: start ./start_dashboard.sh)'. A
+            file that listed tags to trade says "limited trading to the tags
+            'Basketball' (a 'Category · Tag' limited that category alone)"
+            and "exclude each tag not to trade", and one that listed both
+            names both. A file whose only
             retired setting is the same-title cap says '"settings" holds
             same_title_size_cap, which is no longer used (the bot trades
             time-series pairs only): save the live defaults again (start
@@ -4293,8 +4302,8 @@ def _retired_message(retired: list[str], proposal: LiveSettings | None,
     head = '"settings" holds ' + ", and ".join(parts)
     if proposal is None:
         return (f"{head}, and its other settings are refused too ({refused}): save the "
-                "live defaults again (start ./start_dashboard.sh and save new ones from "
-                "its pages, from the seed values or the backtest dashboard)")
+                "live defaults again (start ./start_dashboard.sh and save new ones in "
+                "its Trading tab, which offers the seed values)")
     offered = []
     if any(name in _RETIREMENTS[0][0] for name in retired):
         offered.append("rebalance yes, min price movement " + _move_text(proposal.min_price_move)
@@ -4324,9 +4333,8 @@ def _retired_message(retired: list[str], proposal: LiveSettings | None,
         return (f"{head}: these defaults {' and '.join(widened)}, and this "
                 f"version saves what NOT to trade instead. Saved again as offered "
                 f"({', '.join(offered)}), they trade everything: exclude each "
-                f"{' and '.join(kinds)} not to trade before saving (start "
-                "./start_dashboard.sh, or the backtest dashboard's \"Save as live "
-                "defaults…\" button)")
+                f"{' and '.join(kinds)} not to trade before saving (in the dashboard's "
+                "Trading tab: start ./start_dashboard.sh)")
     # The cap alone leaves every other setting as saved, which the list alone
     # would not say
     as_offered = ("saved, with no same-title cap" if offered == ["no same-title cap"]
@@ -4527,9 +4535,9 @@ def live_defaults() -> LiveSettings:
     saved = read_saved_live_defaults()
     if saved is None:
         raise LiveDefaultsMissing(
-            f"no live defaults are saved at {LIVE_DEFAULTS_FILE}: save them from the backtest "
-            "dashboard's \"Save as live defaults…\" button (with ./start_dashboard.sh "
-            "running), or start from the seed values with ./start_dashboard.sh --seed (or "
+            f"no live defaults are saved at {LIVE_DEFAULTS_FILE}: save them in the "
+            "dashboard's Trading tab (start ./start_dashboard.sh), or start from the seed "
+            "values with ./start_dashboard.sh --seed (or "
             "python3 -m kalshi_betting.defaults_server --seed) (live runs never fall back to "
             "config.py's toggles)")
     return saved

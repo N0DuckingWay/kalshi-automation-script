@@ -992,7 +992,9 @@ def _name(text: str, name: str) -> str:
             text-direction character, say), has spaces around it, or holds
             two spaces in a row.
     """
-    # Cross-module: the one check, which the dashboard's Save button asks too
+    # Cross-module: the one check, which the backtest page also asks (through
+    # config.filter_name_refusal) of every name its Exclude menus offer, so its
+    # filter bar never passes the Trading tab a name refused here
     return check_filter_name(text, name)
 
 
@@ -1116,10 +1118,10 @@ def _proposal(params: dict[str, list[str]],
     seed's note that leaves some out still proposes exactly the seed,
     whatever is saved. The one exception: a link that names rebalance=off and
     leaves rebalance_min_days_to_maturity out clears it, so a link that turns
-    rebalancing off without naming the limit (what the Save button of a
-    dashboard page without the "Rebalance until" choices sends while its
-    Rebalance is no, or a link made by hand) is not refused over a saved
-    limit.
+    rebalancing off without naming the limit (what the filter bar of a
+    backtest page without the "Rebalance until" choices passes the Trading
+    tab while its Rebalance is no and the Trading tab's proposal is not yet
+    known, or a link made by hand) is not refused over a saved limit.
     LiveSettings refuses a minimum price movement or a days-to-maturity limit
     with rebalancing off, as it refuses a minimum of days with no sell level.
     A link that names one of _RETIRED_FIELDS (built before rebalance and
@@ -1166,8 +1168,9 @@ def _proposal(params: dict[str, list[str]],
     older = [field_name for field_name in retired if field_name != "same_title_size_cap"]
     if retired and not older:
         raise ValueError("this link names same_title_size_cap, which is no longer used (the "
-                         "bot trades time-series pairs only): rebuild the backtest dashboard, "
-                         "or open this server's start page")
+                         "bot trades time-series pairs only): open the trading page "
+                         "again from the dashboard's Trading tab (./start_dashboard.sh), or "
+                         "from this server's home page")
     if older and set(older) <= {"category", "tag"}:
         # Categories or tags to trade, where a link now names the ones to exclude;
         # a link naming both is told about both
@@ -1177,11 +1180,13 @@ def _proposal(params: dict[str, list[str]],
                    else f"the category and tag filters are now lists of {kinds}")
         raise ValueError(f"this link names {' and '.join(older)}, which "
                          f"{' and '.join('exclude_' + name for name in older)} replaced "
-                         f"({filters} NOT to trade): rebuild the backtest dashboard, or "
-                         "open this server's start page")
+                         f"({filters} NOT to trade): open the trading page again from the "
+                         "dashboard's Trading tab (./start_dashboard.sh), or from this "
+                         "server's home page")
     if older:
         raise ValueError(f"this link was built before Rebalance (it names {older[0]}): "
-                         "rebuild the backtest dashboard, or open this server's start page")
+                         "open the trading page again from the dashboard's Trading tab "
+                         "(./start_dashboard.sh), or from this server's home page")
     unknown = sorted(set(params) - set(_FIELDS))
     if unknown:
         raise ValueError(f"unknown field {unknown[0]!r}")
@@ -1221,9 +1226,10 @@ def _proposal(params: dict[str, list[str]],
         rebalance_until = _whole_number(value["rebalance_min_days_to_maturity"],
                                         "rebalance_min_days_to_maturity")
     elif "rebalance" in value and not rebalance:
-        # A link that says rebalance=off without naming the limit (from a
-        # dashboard page without the "Rebalance until" choices, or made by
-        # hand): the limit goes with the switch rather than refuse the link
+        # A link that says rebalance=off without naming the limit (from the
+        # filter bar of a backtest page without the "Rebalance until" choices,
+        # or made by hand): the limit goes with the switch rather than refuse
+        # the link
         rebalance_until = None
     else:
         rebalance_until = _kept("rebalance_min_days_to_maturity", current, source)
@@ -1808,9 +1814,10 @@ def _widening_html(outdated: LiveDefaultsOutdated) -> str:
             f"{names}. This version saves the categories to EXCLUDE instead, and the "
             "values offered here exclude none, so saving them as they are trades every "
             "category. To keep the old filter, add <code>&amp;exclude_category=&lt;name&gt;"
-            "</code> to the address for each category to leave out, or save from the "
-            "backtest dashboard's Save as live defaults… button with those categories "
-            "ticked in its Exclude categories menu.</p>")
+            "</code> to the address for each category to leave out, or tick those "
+            "categories in the Exclude categories menu of the dashboard's Trading tab "
+            "before saving (that menu lists every category the backtest dashboard shows "
+            "once this version has built the backtest dashboard).</p>")
     old = _old_tags(outdated)
     if old is not None:
         names = ", ".join(html.escape(name) for name in old)
@@ -1820,8 +1827,9 @@ def _widening_html(outdated: LiveDefaultsOutdated) -> str:
             "offered here exclude none, so saving them as they are trades every tag. To "
             "keep the old filter, add <code>&amp;exclude_tag=&lt;name&gt;</code> to the "
             "address for each tag to leave out (\"Category · Tag\" for a tag of one "
-            "category), or save from the backtest dashboard's Save as live defaults… "
-            "button with those tags ticked in its Exclude tags menu.</p>")
+            "category), or tick those tags in the Exclude tags menu of the dashboard's "
+            "Trading tab before saving (that menu lists every tag the backtest dashboard "
+            "shows once this version has built the backtest dashboard).</p>")
     return "".join(parts)
 
 
@@ -1899,7 +1907,7 @@ def _outdated_notice_html(outdated: LiveDefaultsOutdated) -> str:
     and save replaces the file; when the file listed categories to trade, a
     second red paragraph says those values trade every category
     (_widening_html). With none (the file's other settings are refused too),
-    it links to the seed values and names the dashboard.
+    it links to the seed values and names the dashboard's Trading tab.
 
     Args:
         outdated (LiveDefaultsOutdated): Why the saved file is refused, with
@@ -1913,8 +1921,8 @@ def _outdated_notice_html(outdated: LiveDefaultsOutdated) -> str:
         seed = html.escape("/confirm?" + _seed_query())
         return (f"<p class=\"banner\">The saved live defaults were saved {when}, and every "
                 f"live run refuses them: {html.escape(str(outdated))}. Save new ones from "
-                f"<a href=\"{seed}\">the seed values</a> or the backtest dashboard's Save as "
-                "live defaults… button; a save replaces the file.</p>")
+                f"<a href=\"{seed}\">the seed values</a>, or in the dashboard's Trading tab "
+                "(<code>./start_dashboard.sh</code>); a save replaces the file.</p>")
     link = html.escape("/confirm?" + _settings_query(outdated.proposal))
     reading = html.escape(_outdated_reading(outdated))
     return (f"<p class=\"banner\">The saved live defaults were saved {when}, so every "
@@ -4720,7 +4728,8 @@ def _reuse_running_server(parser: argparse.ArgumentParser, base: str, *, seed: b
     running = _running_checkout(base)
     if running is None:
         parser.error(f"port {DEFAULTS_SERVER_PORT} is in use — stop the other server, "
-                     "or change config.DEFAULTS_SERVER_PORT and rebuild the dashboard")
+                     "or change config.DEFAULTS_SERVER_PORT and start ./start_dashboard.sh "
+                     "again (the live dashboard reads it when it starts)")
     if running.project_root != str(config.PROJECT_ROOT.resolve()):
         parser.error(f"port {DEFAULTS_SERVER_PORT} is served by the defaults server of "
                      f"{_log_safe(running.project_root)} — stop it (Ctrl-C in its terminal) "
