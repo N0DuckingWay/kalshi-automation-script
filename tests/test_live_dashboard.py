@@ -2280,6 +2280,36 @@ class TestTradingAndRunTabs:
         # Reload, then coming back once the wait has ended
         assert snaps["reloaded"]["loads"]["trading-frame"] == shown + 3
 
+    def test_a_choice_on_the_backtest_bar_while_a_press_is_on_its_way_loads_nothing(
+            self, tmp_path):
+        # A press of Confirm and trade on its way, then the reader goes to the Backtest tab
+        # and chooses there (or a choice made before the press finishes drawing): loading the
+        # trading page for that choice would cut the press off, so its answer, the run's page,
+        # would never be heard. The choice is not taken, and the bar is put back to the
+        # proposal the Trading tab shows; the answer still opens the Run tab, and the
+        # Trading frame then shows that proposal again
+        snaps = _relay(tmp_path, [
+            _from_trading({"type": "kalshi-trading", "query": _Q2}),
+            ["click", "tab-backtest"], _from_backtest({"type": "kalshi-ready"}),
+            ["click", "tab-trading"], _from_trading({"type": "kalshi-sending"}),
+            ["click", "tab-backtest"], ["snap", "before"],
+            _from_backtest({"type": "kalshi-bar", "query": _Q, "seq": 1}), ["snap", "chosen"],
+            _from_trading({"type": "kalshi-run", "run": _RUN}), ["snap", "answered"],
+            # The wait over, a choice on the bar moves the Trading tab again
+            _from_backtest({"type": "kalshi-bar", "query": _Q, "seq": 2}), ["snap", "after"]])
+        before, chosen = snaps["before"], snaps["chosen"]
+        assert chosen["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q2}"
+        assert (chosen["loads"], chosen["replaced"]) == (before["loads"], before["replaced"])
+        assert chosen["posted"] == [_apply(_Q2, 1)]
+        answered = snaps["answered"]
+        assert answered["el"]["tab-run"]["hidden"] is False
+        assert answered["el"]["run-frame"]["src"] == _RUN_URL + _RUN
+        assert answered["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q2}"
+        assert answered["loads"]["trading-frame"] == before["loads"]["trading-frame"] + 1
+        after = snaps["after"]
+        assert after["el"]["trading-frame"]["src"] == f"{_TRADING_URL}?{_Q}"
+        assert after["loads"]["trading-frame"] == answered["loads"]["trading-frame"] + 1
+
     @pytest.mark.parametrize("answer", [
         {"type": "kalshi-trading", "query": _Q}, {"type": "kalshi-run", "run": _RUN}])
     def test_the_answer_s_message_ends_the_wait_too(self, tmp_path, answer):
@@ -2732,8 +2762,10 @@ class TestTradingAndRunTabs:
         assert script.count("goodQuery(m.query)") == 2
         assert "m.type === 'kalshi-trading' && goodQuery(m.query)" in script
         assert "m.type === 'kalshi-bar' && goodQuery(m.query)" in script
-        # A choice on the backtest bar is taken only while the Backtest tab is shown
-        assert re.search(r"if \(SHOWN === 'backtest'\) \{\n(\s*//[^\n]*\n)*\s*QUERY = m\.query;"
+        # A choice on the backtest bar is taken only while the Backtest tab is shown and no
+        # press of the trading page's buttons is on its way
+        assert re.search(r"if \(SHOWN === 'backtest' && !SENDING\) \{\n(\s*//[^\n]*\n)*"
+                         r"\s*QUERY = m\.query;"
                          r"\n\s*loadTrading\(true\);\n\s*\} else \{", script)
         assert ("m.type === 'kalshi-run' && typeof m.run === 'string' && RUN_ID.test(m.run)"
                 in script)

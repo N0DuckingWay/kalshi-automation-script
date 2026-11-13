@@ -1124,9 +1124,10 @@ Coming to the Trading tab from another tab loads its page again, so its
 buttons start disabled and become clickable only once you have seen the page
 for a second and moved the mouse (a browser counts a page in a hidden tab of
 the dashboard as shown). Clicking the tab while it is shown loads nothing, and
-nor does coming back to it while a press of one of its buttons is on its way
-to the server (the pressed page can no longer be clicked), so the press is
-never cut off; Reload loads the page again.
+nor does coming back to it, or a choice on the Backtest tab's bar (the bar
+goes back to the pressed proposal), while a press of one of its buttons is on
+its way to the server (the pressed page can no longer be clicked), so the
+press is never cut off; Reload loads the page again.
 
 **The Backtest tab and the Trading tab follow each other.** The backtest
 dashboard's filter bar has no Save or Trade button. Shown in the Backtest tab,

@@ -107,13 +107,14 @@ Notes:
     made on that bar while the Backtest tab is shown: the bar shows that
     choice already, or one the reader has made since. A choice on the
     backtest page's bar is taken only while the Backtest tab is the one
-    shown; one that arrives after the reader has left that tab is not, and
-    the backtest page is told the Trading tab's proposal again, so its bar
-    goes back to what the Trading tab shows. Each proposal sent to the
-    backtest page carries the number of the last choice its bar told (the
-    bar numbers them), so the bar can set aside a proposal sent before its
-    latest choice arrived here. The trading page's buttons stay
-    off until the page has been visible for
+    shown and no press of the trading page's buttons is on its way (see
+    below); one that arrives after the reader has left that tab, or during
+    such a press, is not, and the backtest page is told the Trading tab's
+    proposal again, so its bar goes back to what the Trading tab shows.
+    Each proposal sent to the backtest page carries the number of the last
+    choice its bar told (the bar numbers them), so the bar can set aside a
+    proposal sent before its latest choice arrived here. The trading page's
+    buttons stay off until the page has been visible for
     config.DEFAULTS_SERVER_CONFIRM_ARM_MS (one second) and the mouse moves
     or a key is pressed (the arming delay, the defaults server's guard
     against a click aimed elsewhere), and a browser counts a page in a
@@ -124,10 +125,10 @@ Notes:
     Trading tab, the tab page loads nothing into its frame but what the
     Reload button asks for (the tab's own button clicked again loads
     nothing, so it never cuts off a press of Dry run or Confirm and trade on
-    its way to the server). Nor does coming back to the Trading tab while
-    such a press is on its way: the trading page says so when its form is
-    sent (it can then be clicked no more), and the next page its frame
-    loads, the answer, ends the wait.
+    its way to the server). Nor does coming back to the Trading tab, or a
+    choice on the backtest page's bar, while such a press is on its way: the
+    trading page says so when its form is sent (it can then be clicked no
+    more), and the next page its frame loads, the answer, ends the wait.
 
     Every number and sentence the page shows is formatted here (payload);
     the page's script only places them. One read of the account runs at a
@@ -2010,15 +2011,18 @@ _SCRIPT_TEMPLATE = """
       } else if (m.type === 'kalshi-bar' && goodQuery(m.query)) {
         // Taken or not, the proposal sent back next answers this choice
         TOLD = goodSeq(m.seq) ? m.seq : 0;
-        if (SHOWN === 'backtest') {
+        if (SHOWN === 'backtest' && !SENDING) {
           // The reader is choosing on that bar: the Trading tab follows
           QUERY = m.query;
           loadTrading(true);
         } else {
           // A choice that arrives after the reader has left the Backtest tab
           // is not taken, so the Trading tab never changes under the cursor,
-          // and the backtest bar is put back to the proposal the Trading tab
-          // shows
+          // nor one that arrives while a press of the trading page's buttons
+          // is on its way (SENDING: a page loaded over it would cut the press
+          // off, and its answer, which opens the run's page, would go
+          // unheard); the backtest bar is put back to the proposal the
+          // Trading tab shows
           toBacktest();
         }
       }

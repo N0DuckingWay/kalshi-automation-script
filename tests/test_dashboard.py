@@ -6627,7 +6627,8 @@ class TestFilterSummary:
                          "D.text.sync_unrecorded", "D.text.sync_not_here",
                          "D.text.sync_join", "T.sync_off_grid", "T.sync_no_view",
                          "T.sync_unlisted", "T.sync_not_with", "T.sync_fields",
-                         "T.sync_band_value", "T.sync_on", "T.sync_off", "T.sync_any",
+                         "D.text.sync_band_value", "D.text.sync_band_none", "T.sync_on",
+                         "T.sync_off", "T.sync_any",
                          "D.text.sync_percent", "D.text.sync_cap_full", "T.sync_cents",
                          "D.text.sync_until_one", "D.text.sync_until_many",
                          "T.sync_sell_value", "T.none_kept",
@@ -9618,6 +9619,68 @@ class TestTradingSync:
             [raw] = _told(snaps[name])
             read, _ = defaults_server._proposal(defaults_server._params(raw), None)
             assert (read.sell_at, read.sell_min_days) == (level, minimum), name
+
+    def test_beside_a_sell_level_the_bar_cannot_show_it_shows_the_minimum_of_days(
+            self, monkeypatch, tmp_path):
+        # The bar shows a level and a minimum of days; then the Trading tab
+        # proposes a level off the page's choices with another minimum the
+        # page offers. Sell stays as it stands (the note names the level), but
+        # Min. days shows the Trading tab's minimum: choosing another level
+        # then tells that minimum, so the days told are the days on the bar
+        page = self._kc(monkeypatch, tmp_path, _kc_sweep_sell(_kc_sweep_rebalance()))
+        data = TestFilterPage._data(page)
+        text, fields = data["text"], data["text"]["sync_fields"]
+        levels = data["sell_levels"]
+        days = [entry["value"] for entry in data["sell_days"]]
+        assert 0.9 not in [entry["value"] for entry in levels] and len(days) >= 2
+        common = {"tier_floors": True, "spread_band": tuple(data["bands"][0]["value"]),
+                  "interval_discount": data["ks"][1]["value"],
+                  "size_cap": data["caps"][1]["value"], "rebalance": False,
+                  "min_price_move": None}
+        first = _proposed(sell_at=levels[0]["value"], sell_min_days=days[0], **common)
+        off_grid = _proposed(sell_at=0.9, sell_min_days=days[1], **common)
+        snaps = TestSellScript._run(tmp_path, page, [
+            ["wait"], *_apply(defaults_server._settings_query(first)), ["snap", "first"],
+            *_apply(defaults_server._settings_query(off_grid)), ["snap", "off grid"],
+            ["set", "flt-sell", "1"], ["fire", "flt-sell"], ["settle"], ["snap", "level"]],
+            strict=True, js=TestRebalanceScript.WAIT, framed=True)
+        assert snaps["first"]["selects"]["flt-days"]["value"] == "0"
+        shown = snaps["off grid"]
+        assert shown["selects"]["flt-sell"]["value"] == "0"
+        assert shown["selects"]["flt-days"]["value"] == "1"
+        assert _note(shown) == text["sync_not_here"].format(
+            items=text["sync_off_grid"].format(
+                field=fields["sell"], value=config.live_setting_text("sell_at", 0.9)))
+        level = snaps["level"]
+        [raw] = _told(level)
+        read, _ = defaults_server._proposal(defaults_server._params(raw), None)
+        assert (read.sell_at, read.sell_min_days) == (levels[1]["value"], days[1])
+        assert level["selects"]["flt-days"]["value"] == "1"
+        assert _note(level) == ""
+
+    def test_a_spread_band_is_named_as_the_trading_tab_s_table_words_it(
+            self, monkeypatch, tmp_path):
+        # The query writes each end of the band as Python's repr (0.0); the
+        # table on the Trading tab writes it as config.live_setting_text does
+        # (0), and the note names a band off the page's choices in the
+        # table's words
+        page = self._kc(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        text, fields = data["text"], data["text"]["sync_fields"]
+        assert text["sync_band_none"] == config.live_setting_text("spread_band", (0.0, 1.0))
+        bands = [tuple(entry["value"]) for entry in data["bands"]]
+        for band in ((0.0, 0.45), (0.05, 0.35), (0.00005, 0.5)):
+            assert band not in bands
+            proposal = _proposed(tier_floors=True, spread_band=band,
+                                 interval_discount=data["ks"][1]["value"],
+                                 size_cap=data["caps"][1]["value"], rebalance=False)
+            snap = _run_script(tmp_path, page, [
+                ["wait"], *_apply(defaults_server._settings_query(proposal)), ["snap", "s"]],
+                strict=True, framed=True)["s"]
+            assert _note(snap) == text["sync_not_here"].format(
+                items=text["sync_off_grid"].format(
+                    field=fields["band"], value=config.live_setting_text("spread_band", band))
+            ), band
 
     def test_a_proposal_sent_before_the_bar_s_latest_choice_arrived_is_set_aside(
             self, monkeypatch, tmp_path):

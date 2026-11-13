@@ -7684,8 +7684,10 @@ _SYNC_BLOCKED_TEXT = {
 # cap as a percentage ("sync_percent", "sync_cap_full" for no cap), a
 # minimum price movement in cents ("sync_cents"), a "Rebalance until" limit
 # as days before maturity ("sync_until_one", "sync_until_many"), a sell
-# level as its share of the potential profit ("sync_sell_value"); k, the
-# band and Min. days to maturity as the query spells them, which are the
+# level as its share of the potential profit ("sync_sell_value"), a spread
+# band as its two ends ("sync_band_value", each end as the shortest number
+# that reads back as it: 0, not the query's 0.0) or "sync_band_none" for 0 to
+# 1; k and Min. days to maturity as the query spells them, which are the
 # table's words too. A choice on the bar changes on the Trading tab only the
 # settings the reader chose, so it keeps these. "sync_unshown" goes first
 # when the proposal could not be drawn (a chunk file that cannot be
@@ -7709,6 +7711,7 @@ _SYNC_APPLY_TEXT = {
                     "sell": "Sell", "days": "Min. days to maturity",
                     "category": _MENU_CAT_LABEL, "tag": _MENU_TAG_LABEL},
     "sync_band_value": "{low}-{high}",
+    "sync_band_none": live_setting_text("spread_band", (0.0, 1.0)),
     "sync_percent": "{n}%",
     "sync_cap_full": live_setting_text("size_cap", 1.0),
     "sync_cents": "{n}c",
@@ -16367,8 +16370,9 @@ _FILTER_JS = r"""
   // Rebalance back to no on a page with the Sell view: Sell and Min. days
   // go to the Trading tab's sell level and minimum of days (TRADING), as the
   // bar shows them with rebalancing off (wanted), so a level the bar could
-  // not show beside rebalancing is shown again. One off the page's choices,
-  // or no proposal known, leaves them as they are
+  // not show beside rebalancing is shown again. A level off the page's
+  // choices leaves Sell as it stands (its minimum of days still goes to the
+  // Trading tab's when the page offers it), and no proposal known leaves both
   function sellBack() {
     if (!D.sell_blocks || TRADING === null) { return; }
     var q = Object.create(null);
@@ -16515,14 +16519,16 @@ _FILTER_JS = r"""
     }
     return out;
   }
-  // A number as the query writes it (Python's repr of the float, or a whole
-  // number of days), or null for anything else
   // A setting's value from the Trading tab's query in the words of the
   // table on the Trading tab (config.live_setting_text): a share or a dollar
   // amount in hundredths (0.1 as 10: a 10% size cap, a 10c minimum price
-  // movement; 0.85 as 85: an 85% sell level), a size cap of 1 as no cap, and
-  // a "Rebalance until" limit as days before maturity; a value that is not a
-  // number goes as the query spells it
+  // movement; 0.85 as 85: an 85% sell level), a size cap of 1 as no cap, a
+  // "Rebalance until" limit as days before maturity, and a spread band as
+  // none for 0 to 1, else its two ends as numbers (0.0 as 0: the shortest
+  // form that reads back as the number, which is Python's %g form for an
+  // end of six digits or fewer, as the table writes it; one below 0.0001 in
+  // Python's exponent form, 5e-05). A value that is not a number, which the
+  // trading page never sends, keeps the query's spelling inside those words
   function hundredths(text) {
     var x = queryNumber(text);
     return x === null ? text : String(Math.round(x * 10000) / 100);
@@ -16535,6 +16541,18 @@ _FILTER_JS = r"""
   function untilText(text) {
     return text === '1' ? D.text.sync_until_one : fill(D.text.sync_until_many, {n: text});
   }
+  function bandText(low, high) {
+    var lo = queryNumber(low), hi = queryNumber(high);
+    function end(x, text) {
+      if (x === null) { return text; }
+      var s = x !== 0 && Math.abs(x) < 1e-4 ? x.toExponential() : String(x);
+      return s.replace(/e([+-])([0-9])$/, 'e$10$2');
+    }
+    if (lo === 0 && hi === 1) { return D.text.sync_band_none; }
+    return fill(D.text.sync_band_value, {low: end(lo, low), high: end(hi, high)});
+  }
+  // A number as the query writes it (Python's repr of the float, or a whole
+  // number of days), or null for anything else
   function queryNumber(text) {
     if (typeof text !== 'string' || !/^-?[0-9.]+(e[-+]?[0-9]+)?$/i.test(text)) { return null; }
     var x = Number(text);
@@ -16591,7 +16609,7 @@ _FILTER_JS = r"""
     if (low !== null && high !== null) {
       var b = placeOf(D.bands, queryNumber(low), queryNumber(high));
       if (b >= 0) { w.b = b; }
-      else { miss(T.sync_off_grid, 'band', fill(T.sync_band_value, {low: low, high: high})); }
+      else { miss(T.sync_off_grid, 'band', bandText(low, high)); }
     }
     var tier = one('tier_floors');
     if (tier === 'on') { w.t = 'on'; }
@@ -16656,12 +16674,18 @@ _FILTER_JS = r"""
         if (li >= 0) { w.s = String(li); } else { why = T.sync_off_grid; }
       }
       if (why !== null) {
-        // Named with its minimum of days, unless only the level is off the
-        // page's choices
         miss(why, 'sell', fill(T.sync_sell_value, {n: hundredths(sell)}));
-        if (dated && why !== T.sync_off_grid) { miss(why, 'days', days); }
+      }
+      if (why !== null && why !== T.sync_off_grid) {
+        // Not shown at all (beside rebalancing, or on a page without the
+        // Sell view): named with its minimum of days
+        if (dated) { miss(why, 'days', days); }
       } else if (!dated) {
-        // No minimum of days is not among the page's choices (it starts at 1)
+        // The minimum of days is shown, or named, beside a level off the
+        // page's choices too (Sell then stays as it stands), so the minimum
+        // a choice of another level tells, the Trading tab's, is the one on
+        // the bar or in the note. No minimum of days is not among the
+        // page's choices (it starts at 1)
         miss(T.sync_off_grid, 'days', T.sync_any);
       } else {
         var di = placeOf(D.sell_days, queryNumber(days));
