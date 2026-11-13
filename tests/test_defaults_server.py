@@ -5731,7 +5731,10 @@ class TestActions:
         app = _app(start_process=starter)
         _run_id(_post(app, _page_form(app, _query(), "confirm-trade")))
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
-        assert starter.run_json[0]["saved_note"] == defaults_server._NOTHING_SAVED_NOTE
+        # The run records which saved file it traded
+        assert starter.run_json[0]["saved_note"] == (
+            f"The saved live defaults ({config.read_saved_live_defaults().origin}); "
+            "nothing was saved.")
         assert "--dry-run" not in starter.calls[0][0]
 
     def test_dry_run_saves_nothing_and_asks_main_for_a_dry_run(self):
@@ -5762,7 +5765,8 @@ class TestActions:
         assert argv == [sys.executable, "-m", "kalshi_betting.main", "--mode", "prod",
                         *config.live_settings_argv(saved), "--result-file",
                         str(_run_folder(run_id) / "result.json")]
-        assert starter.run_json[0]["saved_note"] == defaults_server._NOTHING_SAVED_NOTE
+        assert starter.run_json[0]["saved_note"] == (
+            f"The saved live defaults ({saved.origin}); nothing was saved.")
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
 
     def test_the_page_with_no_address_fields_dry_runs_the_saved_defaults(self):

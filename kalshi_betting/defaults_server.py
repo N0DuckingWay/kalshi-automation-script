@@ -576,7 +576,9 @@ _ARMING_NOTE = ("The buttons become clickable a moment after this page is shown,
 
 # The notes a run gets about what it was started with
 _SAVED_NOTE = "Saved and verified: the file was read back and matches these settings."
-_NOTHING_SAVED_NOTE = "Nothing to save: these are already the live defaults."
+# A trade of the saved defaults as they are names the file it ran (its origin:
+# the file, its save time and its source note), so the run page records it
+_NOTHING_SAVED_NOTE = "The saved live defaults ({origin}); nothing was saved."
 _DRY_RUN_SAVED_NOTE = "Not saved: a dry run leaves the live defaults unchanged."
 
 # The warning a run page gives when orders may have been sent before the run ended
@@ -4176,7 +4178,9 @@ class _App:
         elif dry_run:
             note = _DRY_RUN_SAVED_NOTE
         else:
-            note = _NOTHING_SAVED_NOTE
+            # Nothing changed, so the defaults in force are what runs (current is
+            # never None here: with nothing saved, every setting counts as changed)
+            note = _NOTHING_SAVED_NOTE.format(origin=current.origin)
         return self._launch(use, settings=settings, dry_run=dry_run, saved_note=note,
                             saved=saved)
 
