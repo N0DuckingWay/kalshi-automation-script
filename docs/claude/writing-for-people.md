@@ -80,7 +80,7 @@ The opening of a pull request description:
 ```markdown
 ## What changes
 
-A new live setting, **Rebalance until**. With rebalancing on, each weekly run tops up
+A new live setting, **Rebalance until**. With rebalancing on, each live run tops up
 or sells part of the pairs the account holds, to keep each near the size the sizing
 rule wants. This setting stops that in the last 1 or 7 days before a pair's later
 market closes. The default, "maturity", rebalances right up to the close, as now.
