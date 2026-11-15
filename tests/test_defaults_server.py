@@ -109,17 +109,18 @@ KEY = b"k" * 32
 _REAL_POPEN = subprocess.Popen
 # A source note of the dashboard's shape
 DASHBOARD_NOTE = "backtest dashboard for 2025-09-24 to 2026-09-27"
-# The eleven rows of a comparison, in their order on the page
+# The twelve rows of a comparison, in their order on the page
 LABELS = ["tier floors", "spread band", "k", "per-trade cap",
           "exclude categories", "exclude tags", "rebalance", "min price movement",
-          "rebalance until", "sell at", "min days to maturity"]
+          "rebalance until", "sell at", "min days to maturity", "skip if closing within"]
 # A proposal's fields: the seed's values, spelled as the dashboard spells them
 _BASE = {"tier_floors": "off", "spread_min": "0", "spread_max": "0.5", "k": "0.8",
          "size_cap": "0.1"}
 # What _BASE proposes with nothing saved: the fields it leaves out take the
-# seed's values (rebalancing on with no minimum, no selling)
+# seed's values (rebalancing on with no minimum, no selling, "Skip if closing
+# within" at 7 days)
 _BASE_SETTINGS = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                              size_cap=0.1, rebalance=True)
+                              size_cap=0.1, rebalance=True, buy_min_days_to_close=7)
 # The ASCII digits as Arabic-Indic and as full-width digits (str.translate tables)
 _ARABIC_INDIC = str.maketrans("0123456789", "".join(chr(0x0660 + i) for i in range(10)))
 _FULL_WIDTH = str.maketrans("0123456789", "".join(chr(0xFF10 + i) for i in range(10)))
@@ -924,7 +925,7 @@ class TestConfirmPage:
         assert changed == {"tier floors", "spread band"}
         assert all(css == "same" for label, css in page.rows.items() if label not in changed)
         assert response.body.count('<span class="tag">changed</span>') == 2
-        assert "2 of 11 settings change." in response.body
+        assert "2 of 12 settings change." in response.body
         assert "Overwrite the live trading defaults?" in response.body
         assert f"This writes <code>{config.LIVE_DEFAULTS_FILE.absolute()}</code>" \
             in response.body
@@ -951,7 +952,7 @@ class TestConfirmPage:
         assert "none saved — live runs refuse to start until defaults are saved" in response.body
         assert set(page.rows.values()) == {"changed"}
         assert all(cells[1] == "—" for cells in page.cells.values())
-        assert "11 of 11 settings change." in response.body
+        assert "12 of 12 settings change." in response.body
         # The fields the link leaves out take the seed's values
         assert page.cells["rebalance"][2] == "yes"
         assert page.cells["min price movement"][2] == "any"
@@ -1243,7 +1244,7 @@ class TestConfirmPage:
             "rebalance until"]
         assert page.cells["rebalance until"][1:3] == ["7 days before maturity",
                                                       "1 day before maturity"]
-        assert "1 of 11 settings change." in response.body
+        assert "1 of 12 settings change." in response.body
         # Naming 0 puts it back to "maturity"
         page = _parse(_get(_app(), "/confirm?" + _query(
             rebalance_min_days_to_maturity="0")).body)
@@ -1267,7 +1268,7 @@ class TestConfirmPage:
         assert [label for label, css in page.rows.items() if css == "changed"] == [
             "rebalance", "min price movement", "rebalance until"]
         assert page.cells["rebalance until"][1:3] == ["7 days before maturity", "maturity"]
-        assert "3 of 11 settings change." in response.body
+        assert "3 of 12 settings change." in response.body
 
     def test_rebalance_off_without_the_field_clears_it_with_nothing_saved(self):
         settings, _ = defaults_server._proposal(
@@ -1295,6 +1296,91 @@ class TestConfirmPage:
         assert _get(_app(), "/confirm?" + _query(
             rebalance="off", min_price_move="off",
             rebalance_min_days_to_maturity="0")).status == 200
+
+    @pytest.mark.parametrize("saved", [None, 3, 7, 14])
+    def test_a_missing_skip_if_closing_within_keeps_the_saved_value(self, saved):
+        # A Trading-tab save that does not name it (the bar has no menu for it,
+        # so only a link built elsewhere can leave it out) keeps it as saved,
+        # shown as no change: a save never turns it off unasked
+        _save(replace(_BASE_SETTINGS, buy_min_days_to_close=saved))
+        response = _get(_app(), "/confirm?" + _query())
+        page = _parse(response.body)
+        words = "off" if saved is None else f"{saved} days"
+        assert page.rows["skip if closing within"] == "same"
+        assert page.cells["skip if closing within"][1:3] == [words, words]
+        assert "0 of 12 settings change." in response.body
+        proposed, _ = defaults_server._proposal(defaults_server._params(_query()),
+                                                config.read_saved_live_defaults())
+        assert proposed.buy_min_days_to_close == saved
+
+    def test_a_saved_file_without_skip_if_closing_within_proposes_seven_days(self):
+        # A file saved before the setting existed reads it as 7 days, and a
+        # link that leaves it out keeps that: nothing to save
+        _save(replace(_BASE_SETTINGS, rebalance_min_days_to_maturity=7))
+        record = json.loads(config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8"))
+        del record["settings"]["buy_min_days_to_close"]
+        config.LIVE_DEFAULTS_FILE.write_text(json.dumps(record), encoding="utf-8")
+        response = _get(_app(), "/confirm?" + _query())
+        assert response.status == 200
+        assert _parse(response.body).cells["skip if closing within"][1:3] == [
+            "7 days", "7 days"]
+        assert "0 of 12 settings change." in response.body
+
+    def test_a_missing_skip_if_closing_within_with_none_saved_is_the_seed_s(self):
+        settings, _ = defaults_server._proposal(defaults_server._params(_query()), None)
+        assert settings.buy_min_days_to_close == (
+            config.LIVE_DEFAULTS_SEED.buy_min_days_to_close) == 7
+
+    @pytest.mark.parametrize("given, expected, words", [
+        ("off", None, "off"), ("0", None, "off"), ("00", None, "off"),
+        ("3", 3, "3 days"), ("7", 7, "7 days"), ("14", 14, "14 days"),
+        # Plain ASCII digits as for the other day counts: leading zeros read as the number
+        ("014", 14, "14 days"),
+    ])
+    def test_a_named_skip_if_closing_within_is_proposed(self, given, expected, words):
+        query = _query(buy_min_days_to_close=given)
+        settings, _ = defaults_server._proposal(defaults_server._params(query), None)
+        assert settings.buy_min_days_to_close == expected
+        response = _get(_app(), "/confirm?" + query)
+        assert response.status == 200
+        assert _parse(response.body).cells["skip if closing within"][1:3] == ["—", words]
+
+    def test_off_over_a_saved_skip_if_closing_within_is_the_only_change_and_saves(self):
+        # Over the seed's 7 days saved, "off" or 0 changes that one row, and
+        # Confirm and save writes it as null, which reads back as off
+        _save(_BASE_SETTINGS)
+        for given in ("off", "0"):
+            response = _get(_app(), "/confirm?" + _query(buy_min_days_to_close=given))
+            page = _parse(response.body)
+            assert [label for label, css in page.rows.items() if css == "changed"] == [
+                "skip if closing within"]
+            assert page.cells["skip if closing within"][1:3] == ["7 days", "off"]
+            assert "1 of 12 settings change." in response.body
+        app = _app()
+        posted = _post(app, _page_form(app, _query(buy_min_days_to_close="off"), "confirm"))
+        assert posted.status == 303 and posted.location == "/saved"
+        assert config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8").endswith(
+            '"buy_min_days_to_close": null\n  }\n}\n')
+        assert config.read_saved_live_defaults() == replace(_BASE_SETTINGS,
+                                                            buy_min_days_to_close=None)
+
+    @pytest.mark.parametrize("given, reason", [
+        ("5", "buy_min_days_to_close must be 3, 7 or 14 days, or 0 for off, got 5"),
+        ("21", "buy_min_days_to_close must be 3, 7 or 14 days, or 0 for off, got 21"),
+        ("7.0", "buy_min_days_to_close must be a whole number of at most six digits, "
+                "got '7.0'"),
+        ("seven", "buy_min_days_to_close must be a whole number of at most six digits, "
+                  "got 'seven'"),
+        ("Off", "buy_min_days_to_close must be a whole number of at most six digits, "
+                "got 'Off'"),
+    ])
+    def test_a_malformed_skip_if_closing_within_is_refused_with_the_reason(self, given,
+                                                                          reason):
+        response = _get(_app(), "/confirm?" + _query(buy_min_days_to_close=given))
+        assert response.status == 400
+        assert reason in html.unescape(response.body)
+        assert "<form" not in response.body and "<button" not in response.body
+        assert config.read_saved_live_defaults() is None
 
     def test_a_limit_with_rebalancing_saved_off_is_refused_with_the_reason(self):
         # The switch is left out, so it stays at the saved off
@@ -1377,7 +1463,7 @@ class TestConfirmPage:
         assert ("These are already the live defaults: Confirm and save writes nothing, and "
                 "Dry run and Confirm and trade run them as they are.") in response.body
         assert "nothing to save" not in response.body.lower()
-        assert "0 of 11 settings change." in response.body
+        assert "0 of 12 settings change." in response.body
         # With nothing to save, the page does not say it writes, and the red
         # line says Confirm and trade runs the saved defaults as they are
         assert "This writes" not in response.body
@@ -1457,7 +1543,7 @@ class TestTradeAddress:
         assert "<form" not in response.body
         # Where it is sent, the saved defaults are proposed as they are
         page = _get(app, response.location)
-        assert page.status == 200 and "0 of 11 settings change." in page.body
+        assert page.status == 200 and "0 of 12 settings change." in page.body
         assert starter.calls == []
 
     def test_get_is_sent_there_with_nothing_saved_too(self):
@@ -1814,7 +1900,7 @@ class TestHome:
         response = _get(_app(start_process=_Starter()), "/confirm")
         assert response.status == 200
         assert "Overwrite the live trading defaults?" in response.body
-        assert "0 of 11 settings change." in response.body
+        assert "0 of 12 settings change." in response.body
         page = _parse(response.body)
         assert set(page.rows.values()) == {"same"}
         # Three real buttons, in their order
@@ -1842,7 +1928,7 @@ class TestHome:
         assert response.status == 200
         assert "Save the live trading defaults again?" in response.body
         assert f'<p class="banner">{_OUTDATED_CONFIRM_NOTICE}</p>' in response.body
-        assert "11 of 11 settings change." in response.body
+        assert "12 of 12 settings change." in response.body
         assert self._proposed(response) == (_OLD_VERSION_READS_AS, "")
         # Nothing is in force, so a dry run asks for the save first
         assert [b.get("id") for b in _parse(response.body).buttons] == [
@@ -2301,6 +2387,40 @@ class TestTradingBar:
         assert ("spread_min", "0.2") in page.hidden and len(
             [n for n, _ in page.hidden if n == "spread_min"]) == 1
 
+    @pytest.mark.parametrize("days, written", [(None, "off"), (3, "3"), (7, "7"), (14, "14")])
+    def test_skip_if_closing_within_rides_on_a_hidden_field(self, days, written):
+        # The bar has no menu for it: a hidden field right after the band's two
+        # carries the proposal's value, so a choice made on the bar asks for a
+        # page that proposes the same days
+        page = self._page(replace(_FULL_BASE, buy_min_days_to_close=days))
+        hidden = [(c["name"], c["value"]) for c in page.bar_controls
+                  if c.get("type") == "hidden"]
+        assert hidden[:3] == [("spread_min", "0.2"), ("spread_max", "0.8"),
+                              ("buy_min_days_to_close", written)]
+        assert not any(c.get("name") == "buy_min_days_to_close" for c in page.bar_controls
+                       if c["tag"] != "input")
+        # Each dropdown changed in turn, and a menu ticked anew, keeps it
+        for choose in ({"k": "0.75"}, {"rebalance": "off"}, {"sell_at": "off"},
+                       {"tb-band": "0.0|0.5"}):
+            query = _bar_query(page, choose=choose)
+            assert ("buy_min_days_to_close", [written]) in defaults_server._params(
+                query).items(), choose
+            settings, _ = defaults_server._proposal(defaults_server._params(query),
+                                                    config.read_saved_live_defaults())
+            assert settings.buy_min_days_to_close == days, choose
+        query = _bar_query(page, ticks={"exclude_category": []})
+        settings, _ = defaults_server._proposal(defaults_server._params(query),
+                                                config.read_saved_live_defaults())
+        assert settings.buy_min_days_to_close == days
+        # A proposal that differs from the saved value keeps its own on the bar too
+        other = 3 if days != 3 else 14
+        page = self._page(query=defaults_server._settings_query(
+            replace(_FULL_BASE, buy_min_days_to_close=other)))
+        query = _bar_query(page, choose={"k": "0.75"})
+        settings, _ = defaults_server._proposal(defaults_server._params(query),
+                                                config.read_saved_live_defaults())
+        assert settings.buy_min_days_to_close == other
+
     def test_each_menu_says_its_ticks_wait_for_apply(self):
         # A tick turns the buttons off until Apply (the arming script): a grey
         # line under each menu's Apply button says so
@@ -2677,7 +2797,7 @@ class TestBarRoundTrip:
         page = _parse(_get(app, "/confirm").body)
         # Unchanged, the bar asks for exactly what it shows: nothing changes
         response = _get(app, "/confirm?" + _bar_query(page))
-        assert response.status == 200 and "0 of 11 settings change." in response.body
+        assert response.status == 200 and "0 of 12 settings change." in response.body
         tried = 0
         for control in page.bar_controls:
             if control["tag"] != "select":
@@ -3145,6 +3265,16 @@ class TestConfirmRefusals:
         _query(rebalance="off", min_price_move="off", rebalance_min_days_to_maturity="7"),
         _query(rebalance_min_days_to_maturity="7") + "&rebalance_min_days_to_maturity=7",
         _query(rebalance_min_days_to_maturity="0") + "&rebalance_min_days_to_maturity=7",
+        # "Skip if closing within": 0, 3, 7 or 14 as plain ASCII digits, or off
+        _query(buy_min_days_to_close="5"), _query(buy_min_days_to_close="1"),
+        _query(buy_min_days_to_close="21"), _query(buy_min_days_to_close="-7"),
+        _query(buy_min_days_to_close="+7"), _query(buy_min_days_to_close=" 7"),
+        _query(buy_min_days_to_close="7.0"), _query(buy_min_days_to_close="1e1"),
+        _query(buy_min_days_to_close="seven"), _query(buy_min_days_to_close="Off"),
+        _query(buy_min_days_to_close="on"), _query(buy_min_days_to_close="true"),
+        _query(buy_min_days_to_close=""), _query(buy_min_days_to_close="７"),
+        _query(buy_min_days_to_close="٧"), _query(buy_min_days_to_close="1" * 7),
+        _query(buy_min_days_to_close="7") + "&buy_min_days_to_close=7",
         # Either rebalance field given twice
         _query(rebalance="on") + "&rebalance=on",
         _query(rebalance="on", min_price_move="0.1") + "&min_price_move=0.1",
@@ -3827,10 +3957,12 @@ _OLD_VERSION_BYTES = (
     b'  }\n'
     b'}\n')
 # What it reads as now: rebalance yes with the old 10c minimum, no category or
-# tag excluded, no same-title cap, the rest as saved
+# tag excluded, no same-title cap, "Skip if closing within" at 7 days (as any
+# saved file that leaves it out reads it), the rest as saved
 _OLD_VERSION_READS_AS = LiveSettings(tier_floors=False, spread_band=(0.0, 0.8),
                                      interval_discount=0.7, size_cap=0.15,
-                                     rebalance=True, min_price_move=0.10)
+                                     rebalance=True, min_price_move=0.10,
+                                     buy_min_days_to_close=7)
 # The notice the confirmation page shows above its table when it proposes them
 _OUTDATED_CONFIRM_NOTICE = (
     "The saved live defaults were saved before Rebalance. Below: their values, read as "
@@ -3929,7 +4061,7 @@ class TestOutdatedFile:
         assert page.cells["per-trade cap"][2] == "15%"
         assert page.cells["rebalance"][2] == "yes"
         assert page.cells["min price movement"][2] == "10c"
-        assert "11 of 11 settings change." in response.body
+        assert "12 of 12 settings change." in response.body
 
     def test_a_link_that_leaves_the_limit_out_keeps_the_old_file_s(self):
         # The old file's values in their new form carry no limit, so "maturity"
@@ -3969,7 +4101,7 @@ class TestOutdatedFile:
         # ... and every page reads it as the defaults in force
         assert _get(app, "/saved").status == 200
         home = _get(app, "/confirm")
-        assert home.status == 200 and "0 of 11 settings change." in home.body
+        assert home.status == 200 and "0 of 12 settings change." in home.body
         assert "saved before Rebalance" not in _get(app, "/").body
 
     def test_the_saved_page_refuses_with_the_notice_and_the_link(self):
@@ -4497,7 +4629,7 @@ class TestOutdatedFile:
 _UNLIKE_THE_CAP_ERA = LiveSettings(
     tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.2,
     exclude_categories=("Sports",), exclude_tags=("Basketball",), rebalance=False,
-    sell_at=0.9, sell_min_days=5)
+    sell_at=0.9, sell_min_days=5, buy_min_days_to_close=3)
 
 
 class TestSameTitleCapFile:
@@ -4587,12 +4719,13 @@ class TestSameTitleCapFile:
             "tier_floors": ["off"], "spread_min": ["0.2"], "spread_max": ["0.8"], "k": ["0.85"],
             "size_cap": ["0.1"], "rebalance": ["on"], "min_price_move": ["0.1"],
             "rebalance_min_days_to_maturity": ["7"], "sell_at": ["off"], "sell_min_days": ["off"],
+            "buy_min_days_to_close": ["7"],
             "exclude_tag": ["Climate and Weather · Ski Resorts", "Entertainment · General"]}
         # It proposes exactly them, whatever is saved
         for saved in (None, _UNLIKE_THE_CAP_ERA, config.LIVE_DEFAULTS_SEED):
             assert defaults_server._proposal(params, saved) == (_SAME_TITLE_CAP_ERA_PROPOSAL, "")
 
-    def test_the_confirmation_page_shows_the_banner_and_eleven_rows(self):
+    def test_the_confirmation_page_shows_the_banner_and_twelve_rows(self):
         from .test_config import _SAME_TITLE_CAP_ERA_PROPOSAL
         _, link = self._write()
         response = _get(_app(), link)
@@ -4604,8 +4737,11 @@ class TestSameTitleCapFile:
         assert ("Live defaults in force: none — the saved file was saved before the same-title "
                 "cap was removed, and live runs refuse it until it is saved again") in response.body
         page = _parse(response.body)
-        assert list(page.rows) == LABELS and len(page.rows) == 11
+        assert list(page.rows) == LABELS and len(page.rows) == 12
         assert "same-title cap" not in page.rows
+        # The file leaves "Skip if closing within" out, so it reads, and is
+        # offered, as 7 days
+        assert page.cells["skip if closing within"][2] == "7 days"
         # Nothing counts as in force: every row is a change from nothing
         assert set(page.rows.values()) == {"changed"}
         assert all(cells[1] == "—" for cells in page.cells.values())
@@ -4613,7 +4749,7 @@ class TestSameTitleCapFile:
             new for _, _, new, _ in config.live_settings_changes(None, _SAME_TITLE_CAP_ERA_PROPOSAL)]
         assert page.cells["exclude tags"][2] == (
             "Climate and Weather · Ski Resorts, Entertainment · General")
-        assert "11 of 11 settings change." in response.body
+        assert "12 of 12 settings change." in response.body
         # These settings warn of nothing, and the save sells nothing more
         assert config.live_rule_warnings(_SAME_TITLE_CAP_ERA_PROPOSAL) == []
         assert 'class="warn"' not in response.body
@@ -4688,7 +4824,7 @@ class TestSameTitleCapFile:
     def test_the_account_s_file_is_saved_again_in_one_confirm_and_runs_read_it(self, capsys):
         # End to end, from the file exactly as the account has it saved: every
         # live run refuses it; the home page (/) links to its values; that page
-        # shows them in eleven rows; one Confirm and save writes them with no
+        # shows them in twelve rows; one Confirm and save writes them with no
         # same-title cap; and live runs then read the new file
         from kalshi_betting import main
 
@@ -4714,7 +4850,7 @@ class TestSameTitleCapFile:
         assert self._BANNER in confirm.body
         page = _parse(confirm.body)
         assert list(page.rows) == LABELS and "same-title cap" not in page.rows
-        assert "11 of 11 settings change." in confirm.body
+        assert "12 of 12 settings change." in confirm.body
         # Confirm and save, through the page's own form
         posted = _post(app, _click(confirm.body, "confirm"))
         assert posted.status == 303 and posted.location == "/saved"
@@ -5101,7 +5237,7 @@ class TestSeed:
         assert list(params) == ["tier_floors", "spread_min", "spread_max", "k", "size_cap",
                                 "rebalance", "min_price_move",
                                 "rebalance_min_days_to_maturity", "sell_at", "sell_min_days",
-                                "source"]
+                                "buy_min_days_to_close", "source"]
         assert defaults_server._proposal(params, None) == (
             config.LIVE_DEFAULTS_SEED, config.LIVE_DEFAULTS_SEED_SOURCE)
 
@@ -5123,7 +5259,7 @@ class TestSeed:
         page = _parse(response.body)
         assert [label for label, css in page.rows.items() if css == "changed"] == [row]
         assert page.cells[row][1:3] == cells
-        assert "1 of 11 settings change." in response.body
+        assert "1 of 12 settings change." in response.body
 
     def test_the_seed_page_proposes_the_seed_s_rebalance_until(self):
         # Over saved defaults that stop short of maturity, the seed link changes
@@ -5138,7 +5274,7 @@ class TestSeed:
             assert [label for label, css in page.rows.items() if css == "changed"] == [
                 "rebalance until"]
             assert page.cells["rebalance until"][1:3] == ["7 days before maturity", "maturity"]
-            assert "1 of 11 settings change." in response.body
+            assert "1 of 12 settings change." in response.body
             assert defaults_server._proposal(
                 defaults_server._params(query), config.read_saved_live_defaults()) == (
                 config.LIVE_DEFAULTS_SEED, config.LIVE_DEFAULTS_SEED_SOURCE)
@@ -5186,7 +5322,7 @@ class TestSeed:
         page = _parse(response.body)
         assert [label for label, css in page.rows.items() if css == "changed"] == [
             "sell at", "min days to maturity"]
-        assert "2 of 11 settings change." in response.body
+        assert "2 of 12 settings change." in response.body
 
     def test_a_seed_link_that_leaves_selling_out_still_proposes_the_seed(self):
         # A seed link from before selling existed (no sell fields), opened over
@@ -5259,7 +5395,7 @@ class TestHelpers:
     def test_the_fields_hold_the_limit_once_and_in_the_queries_order(self):
         assert defaults_server._FIELDS.count("rebalance_min_days_to_maturity") == 1
         assert "rebalance_min_days_to_maturity" not in defaults_server._REPEATABLE
-        assert len(defaults_server._FIELDS) == 13
+        assert len(defaults_server._FIELDS) == 14
         names = list(defaults_server._params(defaults_server._settings_query(
             replace(config.LIVE_DEFAULTS_SEED, exclude_categories=("A",), exclude_tags=("B",)),
             source=config.LIVE_DEFAULTS_SEED_SOURCE)))
@@ -5267,11 +5403,11 @@ class TestHelpers:
 
     def test_the_same_title_cap_is_a_retired_field_and_no_proposal_field(self):
         # A link may not set it (it is refused), and no page or run names it:
-        # the eleven toggles are LiveSettings' own, the cap no longer among them
+        # the twelve toggles are LiveSettings' own, the cap no longer among them
         assert "same_title_size_cap" not in defaults_server._FIELDS
         assert defaults_server._RETIRED_FIELDS[-1] == "same_title_size_cap"
         assert "same_title_size_cap" not in config.LIVE_TOGGLE_FIELDS
-        assert len(config.LIVE_TOGGLE_FIELDS) == 11
+        assert len(config.LIVE_TOGGLE_FIELDS) == 12
         # The notice reads the Rebalance retirement from config's one list
         assert defaults_server._REBALANCE_RETIREMENTS == config._RETIREMENTS[0][0] == (
             "add_to_held_pairs", "trim_to_kelly", "trim_min_rise")
@@ -5555,7 +5691,7 @@ class TestRenderStates:
         self._state(app, state, monkeypatch)
         response = _get(app, "/confirm")
         assert response.status == 200
-        assert "0 of 11 settings change." in response.body
+        assert "0 of 12 settings change." in response.body
         page = self._check(response.body, _CONFIRM_LABELS, defaults_server._CONFIRM_ACTIONS)
         ids = [b.get("id") for b in page.buttons]
         assert (ids[0] == "confirm-dry-run") is (state != "own")
@@ -5731,7 +5867,10 @@ class TestActions:
         saved = config.read_saved_live_defaults()
         assert (saved.sell_at, saved.sell_min_days) == (0.85, 3)
         text = config.LIVE_DEFAULTS_FILE.read_text()
-        assert '"sell_at": 0.85,' in text and text.rstrip().endswith('"sell_min_days": 3\n  }\n}')
+        # The link left "Skip if closing within" out, so the seed's 7 days is
+        # kept, and written last
+        assert '"sell_at": 0.85,' in text and text.rstrip().endswith(
+            '"sell_min_days": 3,\n    "buy_min_days_to_close": 7\n  }\n}')
         [(argv, _)] = starter.calls
         assert argv[5:-2] == config.live_settings_argv(saved)
         assert "--sell-at=85" in argv and "--sell-min-days=3" in argv
@@ -5756,9 +5895,11 @@ class TestActions:
         run_id = _run_id(_post(app, form))
         saved = config.read_saved_live_defaults()
         assert (saved.rebalance, saved.min_price_move) == (True, 0.10)
-        # With no selling, the two keys are the file's last, in field order
+        # With no selling, the two keys come in field order, last but for
+        # "Skip if closing within" (the seed's 7 days, which the link left out)
         text = config.LIVE_DEFAULTS_FILE.read_text()
-        assert text.rstrip().endswith('"rebalance": true,\n    "min_price_move": 0.1\n  }\n}')
+        assert text.rstrip().endswith('"rebalance": true,\n    "min_price_move": 0.1,\n'
+                                      '    "buy_min_days_to_close": 7\n  }\n}')
         [(argv, _)] = starter.calls
         assert argv[5:-2] == config.live_settings_argv(saved)
         assert "--rebalance" in argv and "--min-price-move=10" in argv
@@ -5814,17 +5955,20 @@ class TestActions:
         form = _page_form(app, _query(k="0.75", exclude_category="Sports"), "confirm-trade")
         run_id = _run_id(_post(app, form))
         saved = config.read_saved_live_defaults()
-        # Nothing was saved before, so rebalancing is the seed's (on)
+        # Nothing was saved before, so rebalancing is the seed's (on), and so
+        # is "Skip if closing within" (7 days)
         assert saved == LiveSettings(tier_floors=False, spread_band=(0.0, 0.5),
                                      interval_discount=0.75, size_cap=0.1,
-                                     exclude_categories=("Sports",), rebalance=True)
+                                     exclude_categories=("Sports",), rebalance=True,
+                                     buy_min_days_to_close=7)
         folder = _run_folder(run_id)
         [(argv, kwargs)] = starter.calls
         assert argv == [sys.executable, "-m", "kalshi_betting.main", "--mode", "prod",
                         *config.live_settings_argv(saved), "--result-file",
                         str(folder / "result.json")]
-        # Rebalancing is spelled out, so the saved file never decides it
-        assert "--rebalance" in argv
+        # Rebalancing is spelled out, so the saved file never decides it, and
+        # so is "Skip if closing within"
+        assert "--rebalance" in argv and "--buy-min-days-to-close=7" in argv
         assert kwargs["cwd"] == config.PROJECT_ROOT
         assert kwargs["start_new_session"] is True
         assert kwargs["stdin"] is subprocess.DEVNULL

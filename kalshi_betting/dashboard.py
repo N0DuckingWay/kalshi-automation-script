@@ -216,7 +216,9 @@ Purpose:
     never sent with Rebalance no), its "Rebalance until" choice (only from
     a page that carries the choices: the choice's days, or 0, no days
     limit, at maturity and with Rebalance no), its Sell level and Min. days
-    to maturity (only from a page that simulated selling), each category
+    to maturity (only from a page that simulated selling), "Skip if closing
+    within" (which the bar has no menu for: as the Trading tab has it, or
+    left out while no proposal is known), each category
     ticked in the Exclude categories menu as a category live runs exclude
     (and so each kept category every one of whose tags is ticked, with its
     letter-case twins, each ticked or with every tag ticked too), and each
@@ -244,7 +246,8 @@ Purpose:
     every setting the page can show is chosen and drawn as a reader's
     choice would be, but not sent back (one the tab page sent before the
     bar's latest choice reached it, which its number says, is set aside), and the note names each setting
-    it cannot show (a value off its grids, a category or tag it does not
+    it cannot show but "Skip if closing within" (a value off its grids, a
+    category or tag it does not
     list, rebalancing or selling on a page without that view, or
     rebalancing together with a sell level). A proposal that arrives while
     a reader's choice is still loading is shown once that choice settles,
@@ -14272,8 +14275,9 @@ def _pack_text(raw: str) -> str:
 # when its seq (the last choice the tab page had heard) is below TOLD: applyQuery
 # chooses every setting of it the bar can show, ticks every category and tag
 # it excludes, and draws that scenario as a reader's choice would, but tells
-# nothing back; the note names each setting the bar cannot show
-# (D.text.sync_not_here), and nothing more is done when the selects and ticks
+# nothing back; the note names each setting the bar cannot show but "Skip if
+# closing within", which has no menu here (D.text.sync_not_here), and nothing
+# more is done when the selects and ticks
 # already name that scenario. A proposal that arrives while a reader's own
 # choice is still loading (SETTLING) is kept and shown once that choice
 # settles (settled), and one that cannot be drawn leaves the bar on the
@@ -14398,11 +14402,15 @@ _FILTER_JS = r"""
   var SETTINGS = ['tier', 'band', 'k', 'cap', 'rebalance', 'move', 'until', 'sell', 'days',
                   'names'];
   // The trading page's single-valued fields in its query's order, each with
-  // the setting a reader picks it by
+  // the setting a reader picks it by. "Skip if closing within"
+  // (buy_min_days_to_close, setting "close") has no menu on this page, so a
+  // reader never picks it: a choice passes it on as the Trading tab has it,
+  // or leaves it out while no proposal is known
   var SYNC_FIELDS = [['tier_floors', 'tier'], ['spread_min', 'band'], ['spread_max', 'band'],
                      ['k', 'k'], ['size_cap', 'cap'], ['rebalance', 'rebalance'],
                      ['min_price_move', 'move'], ['rebalance_min_days_to_maturity', 'until'],
-                     ['sell_at', 'sell'], ['sell_min_days', 'days']];
+                     ['sell_at', 'sell'], ['sell_min_days', 'days'],
+                     ['buy_min_days_to_close', 'close']];
   // PICK: the menus' ticks as last asked for (pickKey), so a click that
   // leaves them as they were redraws nothing
   var PICK = '|';
@@ -14571,7 +14579,8 @@ _FILTER_JS = r"""
   // (0, no days limit, for maturity and whenever Rebalance is no); and from
   // a page with the Sell view, the level and the minimum of days shown (off
   // for both when Sell shows no level). A field of a view the page lacks is
-  // left out. Each number as the base block holds it.
+  // left out, as is "Skip if closing within", which has no menu here. Each
+  // number as the base block holds it.
   function barValues(band, k, cap) {
     var out = {tier_floors: offAt(SHOWN[5]) ? 'off' : 'on', spread_min: band[0],
                spread_max: band[1], k: k, size_cap: cap};
@@ -16597,7 +16606,8 @@ _FILTER_JS = r"""
   // a tag of a category excluded left out as the menus leave it out), each
   // setting the proposal leaves out, or the bar cannot show, kept as it
   // stands; and, in the bar's order, the words naming each setting the bar
-  // cannot show (missing): a value off the page's choices, a choice of a
+  // cannot show but "Skip if closing within", which has no menu here
+  // (missing): a value off the page's choices, a choice of a
   // view the page lacks, a category or tag its menus do not list, or a sell
   // level beside rebalancing, which the bar never shows together (it shows
   // the rebalancing)
@@ -16739,7 +16749,8 @@ _FILTER_JS = r"""
   // be, but the Trading tab is told nothing back (choose with reader false).
   // The proposal becomes what the bar keeps for every setting the reader
   // has not picked since (TRADING, PICKED), and the red note names each
-  // setting the bar cannot show (D.text.sync_not_here), or is cleared.
+  // setting the bar cannot show but "Skip if closing within"
+  // (D.text.sync_not_here), or is cleared.
   // Nothing more is done when the selects and ticks already name that
   // scenario (on screen, or a proposal's still loading). While a choice the
   // reader made is still loading (SETTLING), the proposal is only kept

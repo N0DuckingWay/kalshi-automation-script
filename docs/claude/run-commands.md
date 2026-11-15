@@ -17,8 +17,9 @@ python3 -m kalshi_betting.main --mode dev --dry-run
 # Production live trading, from the saved live defaults (live_defaults.json in the
 # repo root: tier floors, spread band, k, per-trade cap, category/tag
 # filter, rebalancing with its minimum price movement and "rebalance until" days (with it
-# on, a production run trims held pairs before it buys and may add to them), and the sell
-# level and its minimum of days — each overridable for one run by the flags below, which
+# on, a production run trims held pairs before it buys and may add to them), the sell
+# level and its minimum of days, and "Skip if closing within" (a saved file that leaves
+# it out reads 7 days) — each overridable for one run by the flags below, which
 # the run marks
 # "(default: X)" on its "Live settings:" line and, when it submits orders under one,
 # names in a WARNING). With no saved file, a refused one, or one an older version saved
@@ -56,13 +57,13 @@ python3 -m kalshi_betting.main --mode prod --dry-run --result-file /tmp/run_resu
 
 # Production dry run replaying the live rule as it stood before the 2026-09-27
 # decision, for this run only (for time-series pairs, the only kind the bot trades).
-# It gives all eleven toggles, because a toggle no flag gives keeps its saved value (--no-rebalance and --no-sell too, so a saved "yes" or a
-# saved sell level does not leak into a replay of a rule that never rebalanced or sold;
-# --no-rebalance clears the saved minimum price movement and "rebalance until" setting as
+# It gives all twelve toggles, because a toggle no flag gives keeps its saved value (--no-rebalance, --no-sell and --no-buy-min-days-to-close too, so a saved "yes", a
+# saved sell level or a saved "Skip if closing within" does not leak into a replay of a rule that never rebalanced, sold or
+# skipped a market for closing soon; --no-rebalance clears the saved minimum price movement and "rebalance until" setting as
 # well); each flag that
 # departs from the saved live defaults is marked "(default: X)" on the "Live
 # settings:" line
-python3 -m kalshi_betting.main --mode prod --dry-run --tier-floors --spread-min 0 --spread-max 1 --interval-discount 0.75 --size-cap 20 --no-rebalance --no-sell --no-exclude-category --no-exclude-tag
+python3 -m kalshi_betting.main --mode prod --dry-run --tier-floors --spread-min 0 --spread-max 1 --interval-discount 0.75 --size-cap 20 --no-rebalance --no-sell --no-buy-min-days-to-close --no-exclude-category --no-exclude-tag
 
 # Production dry run that rebalances (no orders, nothing saved): before buying, sell part of each
 # exact held time-series pair, and of each lone leg whose earlier market paid out $0 (the later
@@ -131,6 +132,15 @@ python3 -m kalshi_betting.main --mode prod --dry-run --no-rebalance
 # paragraph under Key Patterns
 python3 -m kalshi_betting.main --mode prod --dry-run --sell-at 80 --sell-min-days 7
 python3 -m kalshi_betting.main --mode prod --dry-run --no-sell
+
+# "Skip if closing within" for this run only: 3, 7 or 14 days (0 is off;
+# --no-buy-min-days-to-close turns it off whatever is saved; the two are mutually
+# exclusive, and any other number exits 2 naming the flag). It needs no other setting.
+# The "Live settings:" line ends `skip if closing within 14 days`, marked "(default: X)"
+# when the saved value differs; a saved file that leaves the setting out reads 7 days,
+# and the Run tab's runs always pass one of the two flags
+python3 -m kalshi_betting.main --mode prod --dry-run --buy-min-days-to-close 14
+python3 -m kalshi_betting.main --mode prod --dry-run --no-buy-min-days-to-close
 
 # Exclude one Kalshi category this run: every other category trades, one never seen
 # included (named as the backtest dashboard's Exclude categories menu names its categories;
@@ -365,7 +375,7 @@ python3 -m kalshi_betting.scheduler
 # saved file, or one an older version saved (every file saved before the same-title cap was
 # removed), every live run exits 2. Confirm and trade (it saves first when the settings
 # change anything; with nothing changed it trades the saved defaults) and Dry run (no
-# orders, nothing saved) start `python -m kalshi_betting.main --mode prod` with all eleven
+# orders, nothing saved) start `python -m kalshi_betting.main --mode prod` with all twelve
 # toggles as flags, in its own session; each run's folder is under live_runs/, and its page,
 # /runs/<id>, opens in the Run tab. Confirm and save with nothing changed writes nothing
 # (/saved?unchanged=1), and /trade answers with a redirect to /confirm. Run it again

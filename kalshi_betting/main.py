@@ -159,6 +159,8 @@ from . import run_lock
 from ._http import api_error_summary
 from .auth import build_client, read_account_balance
 from .config import (
+    BUY_MIN_DAYS_TO_CLOSE_CHOICES,
+    BUY_MIN_DAYS_TO_CLOSE_DEFAULT,
     CATEGORY_FILTER_MAX_NAMED_SERIES,
     CONTRACT_PAYOUT_DOLLARS,
     EXIT_NO_TRADEABLE_SHARDS,
@@ -1377,6 +1379,8 @@ _LIVE_FLAGS = (
     ("no_sell", "--no-sell"),
     ("sell_min_days", "--sell-min-days"),
     ("no_sell_min_days", "--no-sell-min-days"),
+    ("buy_min_days_to_close", "--buy-min-days-to-close"),
+    ("no_buy_min_days_to_close", "--no-buy-min-days-to-close"),
     ("exclude_category", "--exclude-category"),
     ("no_exclude_category", "--no-exclude-category"),
     ("exclude_tag", "--exclude-tag"),
@@ -1403,7 +1407,9 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
     pairs only), whatever value it is given.
     --no-sell also clears the minimum of days, and --no-rebalance the minimum
     price move and the days to maturity, since none of them is allowed without
-    its switch. A saved file an older version wrote (holding add_to_held_pairs,
+    its switch. --buy-min-days-to-close N sets the run's "Skip if closing
+    within" days and --no-buy-min-days-to-close turns it off; it needs no
+    switch. A saved file an older version wrote (holding add_to_held_pairs,
     trim_to_kelly, trim_min_rise, categories, tags or same_title_size_cap) is
     refused too, with the remedy: save it again through the defaults server,
     whose pages offer its settings in their new form when they have one. Runs
@@ -1508,6 +1514,12 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
         overrides["sell_min_days"] = None
     if getattr(args, "sell_min_days", None) is not None:
         overrides["sell_min_days"] = args.sell_min_days
+    # "Skip if closing within": --no-buy-min-days-to-close turns it off for this
+    # run, --buy-min-days-to-close N sets it (argparse keeps the two exclusive)
+    if getattr(args, "no_buy_min_days_to_close", None):
+        overrides["buy_min_days_to_close"] = None
+    if getattr(args, "buy_min_days_to_close", None) is not None:
+        overrides["buy_min_days_to_close"] = args.buy_min_days_to_close
     # --exclude-category / --exclude-tag (repeatable) set the filter;
     # --no-exclude-category / --no-exclude-tag clear the saved one (argparse
     # keeps each pair mutually exclusive)
@@ -2517,6 +2529,24 @@ def _build_parser() -> argparse.ArgumentParser:
     sell_days.add_argument(
         "--no-sell-min-days", action="store_true", default=None,
         help="Set no minimum of days to maturity this run, whatever the saved live "
+             "defaults say",
+    )
+    # "Skip if closing within": LiveSettings holds it to
+    # config.BUY_MIN_DAYS_TO_CLOSE_CHOICES, and the words name those choices
+    skip_off, *skip_days = BUY_MIN_DAYS_TO_CLOSE_CHOICES
+    skip_closing = live.add_mutually_exclusive_group()
+    skip_closing.add_argument(
+        "--buy-min-days-to-close", type=int, default=None, metavar="N",
+        help="Skip if closing within N days: buy a pair, or add to a held one, only "
+             "when every market it would buy stops trading at least N days (24-hour "
+             f"spans) after this run looks: {skip_off} = off, or "
+             f"{', '.join(str(d) for d in skip_days[:-1])} or {skip_days[-1]}. Never "
+             "holds back a sale or a trim (default: the saved live defaults; a saved "
+             f"file that leaves it out reads {BUY_MIN_DAYS_TO_CLOSE_DEFAULT})",
+    )
+    skip_closing.add_argument(
+        "--no-buy-min-days-to-close", action="store_true", default=None,
+        help="Buy this run however soon a market stops trading, whatever the saved live "
              "defaults say",
     )
     # Filed as the backtest dashboard files a trade (_filter_by_category)

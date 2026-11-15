@@ -77,15 +77,17 @@ from .conftest import apply_pre_toggle_defaults
 def _settings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20,
               exclude_categories=None, exclude_tags=None, rebalance=False,
               min_price_move=None, rebalance_min_days_to_maturity=None, sell_at=None,
-              sell_min_days=None):
+              sell_min_days=None, buy_min_days_to_close=None):
     """A LiveSettings with every toggle named, defaulting to the pre-toggle
-    values conftest's apply_pre_toggle_defaults pins (no rebalancing, no selling)."""
+    values conftest's apply_pre_toggle_defaults pins (no rebalancing, no
+    selling, no "Skip if closing within")."""
     return LiveSettings(tier_floors=tier_floors, spread_band=spread_band,
                         interval_discount=interval_discount, size_cap=size_cap,
                         exclude_categories=exclude_categories, exclude_tags=exclude_tags,
                         rebalance=rebalance, min_price_move=min_price_move,
                         rebalance_min_days_to_maturity=rebalance_min_days_to_maturity,
-                        sell_at=sell_at, sell_min_days=sell_min_days)
+                        sell_at=sell_at, sell_min_days=sell_min_days,
+                        buy_min_days_to_close=buy_min_days_to_close)
 
 
 # An origin as read_saved_live_defaults writes it: any origin but config.py's
@@ -1275,6 +1277,47 @@ class TestLiveSettings:
         with pytest.raises(ValueError, match="must be 0, 1 or 7"):
             _settings(rebalance_min_days_to_maturity=2)
 
+    def test_skip_if_closing_within_defaults_to_off(self):
+        # A construction that names no days reads "Off": no minimum
+        assert LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                            size_cap=0.2).buy_min_days_to_close is None
+        assert _settings().buy_min_days_to_close is None
+
+    @pytest.mark.parametrize("days", [3, 7, 14])
+    def test_skip_if_closing_within_takes_the_menu_s_days(self, days):
+        # It needs no other setting: with rebalancing and selling off it is kept
+        assert config.BUY_MIN_DAYS_TO_CLOSE_CHOICES == (0, 3, 7, 14)
+        s = _settings(buy_min_days_to_close=days)
+        assert s.buy_min_days_to_close == days and type(s.buy_min_days_to_close) is int
+        assert dataclasses.replace(_settings(), buy_min_days_to_close=days) == s
+
+    def test_skip_if_closing_within_zero_is_stored_as_off(self):
+        # 0 days is "Off", the same as None, and replace turns a set value back to it
+        assert _settings(buy_min_days_to_close=0).buy_min_days_to_close is None
+        assert _settings(buy_min_days_to_close=0) == _settings()
+        on = _settings(buy_min_days_to_close=7)
+        assert dataclasses.replace(on, buy_min_days_to_close=0) == _settings()
+
+    @pytest.mark.parametrize("bad", [
+        5, 1, 2, 6, 8, 13, 15, 21, -3, -7, 100, 10 ** 400, True, False, 7.0, 3.0, 0.0,
+        float("nan"), float("inf"), "7", "off", [7], (7,)])
+    def test_skip_if_closing_within_other_than_its_choices_is_refused(self, bad):
+        # A bool is an int in Python and 7.0 a whole number in JSON's eyes:
+        # neither may pass for a day count, and the message names the field
+        with pytest.raises(ValueError, match=re.escape(
+                f"buy_min_days_to_close must be 3, 7 or 14 days, or 0 for off, got {bad!r}")):
+            _settings(buy_min_days_to_close=bad)
+        with pytest.raises(ValueError, match="buy_min_days_to_close"):
+            dataclasses.replace(_settings(), buy_min_days_to_close=bad)
+
+    def test_skip_if_closing_within_refuses_a_numpy_integer(self):
+        import numpy as np
+
+        # A numpy whole number is not a plain int, as the other day counts have it
+        for bad in (np.int64(7), np.int64(3), np.int64(0), np.uint8(14), np.bool_(True)):
+            with pytest.raises(ValueError, match="buy_min_days_to_close must be"):
+                _settings(buy_min_days_to_close=bad)
+
     @pytest.mark.parametrize("doc, stale", [
         ("README.md", "since live trading has no such setting"),
         ("CLAUDE.md", "there is no live setting to save it as"),
@@ -1384,11 +1427,12 @@ class TestLiveSettings:
         monkeypatch.setattr(config, "REBALANCE_MIN_DAYS_TO_MATURITY", 7)
         monkeypatch.setattr(config, "SELL_AT", 0.85)
         monkeypatch.setattr(config, "SELL_MIN_DAYS", 3)
+        monkeypatch.setattr(config, "BUY_MIN_DAYS_TO_CLOSE", 3)
         expected = _settings(True, (0.1, 0.6), 0.6, 0.35,
                              ("Economics",), ("Oil & Gas",),
                              rebalance=True, min_price_move=0.10,
                              rebalance_min_days_to_maturity=7,
-                             sell_at=0.85, sell_min_days=3)
+                             sell_at=0.85, sell_min_days=3, buy_min_days_to_close=3)
         assert live_settings() == expected
         # A minimum needs rebalancing on, so rebalance itself is checked apart
         assert all(getattr(expected, name) != getattr(shipped, name)
@@ -1417,6 +1461,7 @@ class TestLiveSettings:
             rebalance_min_days_to_maturity=config.REBALANCE_MIN_DAYS_TO_MATURITY,
             sell_at=config.SELL_AT,
             sell_min_days=config.SELL_MIN_DAYS,
+            buy_min_days_to_close=config.BUY_MIN_DAYS_TO_CLOSE,
         )
         assert type(s.tier_floors) is bool and type(s.rebalance) is bool
 
@@ -1452,6 +1497,14 @@ class TestLiveSettings:
         monkeypatch.setattr(config, "REBALANCE_MIN_DAYS_TO_MATURITY", 7)
         with pytest.raises(ValueError, match="rebalance_min_days_to_maturity needs rebalance on"):
             live_settings()
+
+    def test_live_settings_refuses_an_invalid_skip_if_closing_constant(self, monkeypatch):
+        # Not one of the menu's days: refused, naming the field
+        monkeypatch.setattr(config, "BUY_MIN_DAYS_TO_CLOSE", 5)
+        with pytest.raises(ValueError, match="buy_min_days_to_close must be"):
+            live_settings()
+        monkeypatch.setattr(config, "BUY_MIN_DAYS_TO_CLOSE", 14)
+        assert live_settings().buy_min_days_to_close == 14
 
     def test_there_is_no_same_title_cap(self):
         # The bot trades time-series pairs only: LiveSettings holds no
@@ -1500,13 +1553,15 @@ class TestLiveSettings:
         assert s.rebalance is False and s.min_price_move is None
         assert s.rebalance_min_days_to_maturity is None
         assert s.sell_at is None and s.sell_min_days is None
+        assert s.buy_min_days_to_close is None
         # Defaulted and last of the toggles, after the four required ones;
         # origin, not a toggle, comes after them
         assert list(config.LIVE_TOGGLE_FIELDS)[:4] == [
             "tier_floors", "spread_band", "interval_discount", "size_cap"]
-        assert list(config.LIVE_TOGGLE_FIELDS)[-7:] == [
+        assert list(config.LIVE_TOGGLE_FIELDS)[-8:] == [
             "exclude_categories", "exclude_tags", "rebalance", "min_price_move",
-            "rebalance_min_days_to_maturity", "sell_at", "sell_min_days"]
+            "rebalance_min_days_to_maturity", "sell_at", "sell_min_days",
+            "buy_min_days_to_close"]
         assert [f.name for f in dataclasses.fields(LiveSettings)][-1] == "origin"
         assert LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
                             size_cap=0.2, exclude_categories=("Sports",),
@@ -3336,7 +3391,7 @@ class TestDescribeLiveSettings:
             "tier floors on | spread band none | k 0.75 | per-trade cap 20% | "
             "exclude categories none | exclude tags none | "
             "rebalance no | min price movement any | rebalance until maturity | "
-            "sell at off | min days to maturity any")
+            "sell at off | min days to maturity any | skip if closing within off")
         assert config.describe_live_settings(s) == config.describe_live_settings(s, s)
 
     def test_the_shipped_values_render_with_no_mark(self):
@@ -3362,6 +3417,7 @@ class TestDescribeLiveSettings:
             7, "rebalance until 7 days before maturity (config: maturity)"),
         "sell_at": (None, "sell at off (config: 85% of potential profit)"),
         "sell_min_days": (3, "min days to maturity 3 (config: any)"),
+        "buy_min_days_to_close": (3, "skip if closing within 3 days (config: off)"),
     }
 
     def test_every_field_has_a_departure_row(self):
@@ -3375,7 +3431,7 @@ class TestDescribeLiveSettings:
             "k 0.8 (config: 0.75) | per-trade cap 100% (no cap) (config: 20%) | "
             "exclude categories none | exclude tags none | "
             "rebalance no | min price movement any | rebalance until maturity | "
-            "sell at off | min days to maturity any")
+            "sell at off | min days to maturity any | skip if closing within off")
         for name in config.LIVE_TOGGLE_FIELDS:
             value, mark = self._DEPARTURES[name]
             line = config.describe_live_settings(
@@ -3436,7 +3492,22 @@ class TestDescribeLiveSettings:
             line = config.describe_live_settings(_settings(sell_at=percent / 100))
             assert f"sell at {percent}% of potential profit |" in line, (percent, line)
         line = config.describe_live_settings(_settings(sell_at=0.85, sell_min_days=7))
-        assert line.endswith("sell at 85% of potential profit | min days to maturity 7")
+        assert line.endswith("sell at 85% of potential profit | min days to maturity 7 | "
+                             "skip if closing within off")
+
+    def test_skip_if_closing_within_renders_off_or_its_days(self):
+        # Last on the line: None is "off", each of the menu's days names its days
+        for days, text in ((None, "off"), (3, "3 days"), (7, "7 days"), (14, "14 days")):
+            line = config.describe_live_settings(_settings(buy_min_days_to_close=days))
+            assert line.endswith(f"| min days to maturity any | skip if closing within {text}")
+        # The mark names the reference's value, and only this field departs
+        ref = _settings(buy_min_days_to_close=7)
+        line = config.describe_live_settings(_settings(), ref)
+        assert line.endswith("skip if closing within off (config: 7 days)")
+        assert line.count("(config:") == 1
+        saved = dataclasses.replace(ref, origin=_SAVED_ORIGIN)
+        line = config.describe_live_settings(_settings(buy_min_days_to_close=14), saved)
+        assert line.endswith("skip if closing within 14 days (default: 7 days)")
 
     def test_k_renders_exactly(self):
         # 0.751 and 0.75 must never print alike: a departure would read as none
@@ -3458,7 +3529,8 @@ class TestDescribeLiveSettings:
                         "per-trade cap 100% (no cap) | "
                         "exclude categories none | exclude tags none | rebalance no | "
                         "min price movement any | rebalance until maturity | "
-                        "sell at off | min days to maturity any")
+                        "sell at off | min days to maturity any | "
+                        "skip if closing within off")
 
     def test_a_filter_renders_its_names_and_none_for_none(self):
         # Each field renders the run's value, then config's in the mark; None is
@@ -3501,7 +3573,7 @@ class TestDescribeLiveSettings:
             "k 0.8 (default: 0.75) | per-trade cap 100% (no cap) (default: 20%) | "
             "exclude categories none | exclude tags none | "
             "rebalance no | min price movement any | rebalance until maturity | "
-            "sell at off | min days to maturity any")
+            "sell at off | min days to maturity any | skip if closing within off")
         assert "(config:" not in line
         # Every field's mark follows the reference's origin, one mark per departure
         saved = dataclasses.replace(self._REFERENCE, origin=_SAVED_ORIGIN)
@@ -3883,7 +3955,8 @@ class TestPreToggleDefaults:
         "TIME_SERIES_TIER_FLOORS", "TIME_SERIES_SPREAD_BAND",
         "TIME_SERIES_INTERVAL_PROB_DISCOUNT", "BUDGET_FRACTION",
         "TRADE_EXCLUDE_CATEGORIES", "TRADE_EXCLUDE_TAGS", "REBALANCE", "MIN_PRICE_MOVE",
-        "REBALANCE_MIN_DAYS_TO_MATURITY", "SELL_AT", "SELL_MIN_DAYS"})
+        "REBALANCE_MIN_DAYS_TO_MATURITY", "SELL_AT", "SELL_MIN_DAYS",
+        "BUY_MIN_DAYS_TO_CLOSE"})
 
     @classmethod
     def _by_value_binders(cls, directory: pathlib.Path) -> list[tuple[str, str, str]]:
@@ -3904,12 +3977,15 @@ class TestPreToggleDefaults:
                 ("backtester", "TIME_SERIES_INTERVAL_PROB_DISCOUNT"),
                 ("backtest", "TIME_SERIES_INTERVAL_PROB_DISCOUNT")} <= {
             (module, toggle) for module, _, toggle in binders}
+        # config.py ships this one at its pre-toggle value, so it is moved off
+        # it first: the helper's own pin, not the shipped value, must read back
+        monkeypatch.setattr(config, "BUY_MIN_DAYS_TO_CLOSE", 14)
         apply_pre_toggle_defaults(monkeypatch)
         assert live_settings() == LiveSettings(
             tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20,
             exclude_categories=None, exclude_tags=None, rebalance=False,
             min_price_move=None, rebalance_min_days_to_maturity=None, sell_at=None,
-            sell_min_days=None)
+            sell_min_days=None, buy_min_days_to_close=None)
         for module, bound, toggle in binders:
             assert getattr(importlib.import_module(f"kalshi_betting.{module}"), bound) == (
                 getattr(config, toggle)), (module, toggle)
@@ -4183,19 +4259,26 @@ class TestLiveSettingsOrigin:
         assert dataclasses.replace(s, size_cap=0.35).origin == _SAVED_ORIGIN
         assert dataclasses.replace(s, exclude_categories=("Sports",)).origin == _SAVED_ORIGIN
 
-    def test_the_toggle_fields_are_the_eleven(self):
+    def test_the_toggle_fields_are_the_twelve(self):
         assert config.LIVE_TOGGLE_FIELDS == (
             "tier_floors", "spread_band", "interval_discount", "size_cap",
             "exclude_categories", "exclude_tags", "rebalance", "min_price_move",
-            "rebalance_min_days_to_maturity", "sell_at", "sell_min_days")
-        assert len(config.LIVE_TOGGLE_FIELDS) == 11
-        # The five a saved file may leave out, in field order, at the end
+            "rebalance_min_days_to_maturity", "sell_at", "sell_min_days",
+            "buy_min_days_to_close")
+        assert len(config.LIVE_TOGGLE_FIELDS) == 12
+        # The six a saved file may leave out, in field order, at the end
         assert config._OPTIONAL_TOGGLES == ("rebalance", "min_price_move",
                                             "rebalance_min_days_to_maturity", "sell_at",
-                                            "sell_min_days")
+                                            "sell_min_days", "buy_min_days_to_close")
         assert config._TOGGLE_DEFAULTS == {
             "rebalance": False, "min_price_move": None,
-            "rebalance_min_days_to_maturity": None, "sell_at": None, "sell_min_days": None}
+            "rebalance_min_days_to_maturity": None, "sell_at": None, "sell_min_days": None,
+            "buy_min_days_to_close": None}
+        # One of them a file that leaves it out reads as something other than
+        # its default: "Skip if closing within" reads as 7 days there
+        assert config._UNSAVED_TOGGLE_VALUES == {"buy_min_days_to_close": 7}
+        assert config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT == 7
+        assert set(config._UNSAVED_TOGGLE_VALUES) <= set(config._OPTIONAL_TOGGLES)
         # The settings an older version saved in their place (or, for the
         # same-title cap, beside them, which nothing replaced), refused when read
         assert config._RETIRED_TOGGLES == ("add_to_held_pairs", "trim_to_kelly",
@@ -4262,8 +4345,9 @@ def _valid_record(**changes) -> dict:
     Build a saved-defaults record the reader accepts, then apply changes.
 
     Its toggles are LIVE_DEFAULTS_SEED's, saved at 2026-09-27T21:05:13Z with
-    no source note and the optional toggles left out (the six-toggle
-    shape), so it reads as _SEED_REBALANCE_OFF.
+    no source note and the optional toggles left out (the six-toggle shape
+    of a file saved before "Skip if closing within" existed, whose missing
+    key reads as 7 days), so it reads as _SEED_REBALANCE_OFF.
 
     Args:
         **changes: Top-level keys to replace; a value of _DROP removes the key.
@@ -4331,13 +4415,15 @@ def _older_toggles(**changes) -> dict:
 # Marks a key _valid_record, _with_toggles or _older_toggles should remove
 _DROP = object()
 
-# LIVE_DEFAULTS_SEED with rebalancing off (no selling either): what
-# _valid_record's six-toggle file reads as, and what a save of it writes as
-# six toggles
+# LIVE_DEFAULTS_SEED with rebalancing off (no selling either, and "Skip if
+# closing within" at the seed's 7 days): what _valid_record's six-toggle file
+# reads as
 _SEED_REBALANCE_OFF = dataclasses.replace(config.LIVE_DEFAULTS_SEED, rebalance=False)
 
-# The exact bytes a save of _SEED_REBALANCE_OFF writes, with the seed's note, at
-# _FrozenDatetime's instant: the optional toggles are left out while off
+# A six-toggle file, with the seed's note, saved at _FrozenDatetime's instant
+# before "Skip if closing within" existed: the six required toggles alone,
+# every optional one left out, so it reads as _SEED_REBALANCE_OFF (the
+# missing skip-if-closing key as 7 days)
 _SIX_TOGGLE_BYTES = (
     b'{\n'
     b'  "format": "live-defaults-v1",\n'
@@ -4352,6 +4438,13 @@ _SIX_TOGGLE_BYTES = (
     b'    "exclude_tags": null\n'
     b'  }\n'
     b'}\n')
+
+# The exact bytes a save of _SEED_REBALANCE_OFF writes, with the seed's note, at
+# _FrozenDatetime's instant: the optional toggles off are left out, but for
+# "Skip if closing within", which is always written (here the seed's 7 days)
+_SEED_REBALANCE_OFF_BYTES = _SIX_TOGGLE_BYTES.replace(
+    b'    "exclude_tags": null\n',
+    b'    "exclude_tags": null,\n    "buy_min_days_to_close": 7\n')
 
 
 def _text(record) -> bytes:
@@ -4416,53 +4509,62 @@ class TestSavedLiveDefaults:
         again = config.read_saved_live_defaults()
         assert again == self._SETTINGS and again.origin == saved.origin
         text = config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8")
-        assert '"exclude_categories": ["Sports"],' in text and '"exclude_tags": ["Basketball"]\n' in text
-        # No same-title cap is written: the file holds the eleven toggles' names only
+        assert '"exclude_categories": ["Sports"],' in text and '"exclude_tags": ["Basketball"],\n' in text
+        # "Skip if closing within" off is written as null, last
+        assert text.endswith('"buy_min_days_to_close": null\n  }\n}\n')
+        # No same-title cap is written: the file holds the twelve toggles' names only
         assert "same_title_size_cap" not in text
 
     def test_the_written_text_is_pinned(self, monkeypatch):
-        # With rebalancing off, the key is left out, byte for byte
+        # With rebalancing off, its key is left out, byte for byte, and
+        # "Skip if closing within" is written last
         monkeypatch.setattr(config, "datetime", _FrozenDatetime)
         config.save_live_defaults(_SEED_REBALANCE_OFF, source=config.LIVE_DEFAULTS_SEED_SOURCE)
-        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SIX_TOGGLE_BYTES
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEED_REBALANCE_OFF_BYTES
 
     def test_an_on_save_writes_the_key_after_the_filters(self, monkeypatch):
         # The seed (rebalancing on, no minimum) writes the toggle, after the
-        # other six
+        # six required ones and before "Skip if closing within"
         monkeypatch.setattr(config, "datetime", _FrozenDatetime)
         config.save_live_defaults(config.LIVE_DEFAULTS_SEED,
                                   source=config.LIVE_DEFAULTS_SEED_SOURCE)
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SIX_TOGGLE_BYTES.replace(
             b'    "exclude_tags": null\n',
-            b'    "exclude_tags": null,\n    "rebalance": true\n')
+            b'    "exclude_tags": null,\n    "rebalance": true,\n'
+            b'    "buy_min_days_to_close": 7\n')
         assert config.read_saved_live_defaults() == config.LIVE_DEFAULTS_SEED
 
-    def test_selling_off_writes_exactly_the_bytes_written_before_it_existed(self, monkeypatch):
+    def test_selling_off_leaves_both_sell_keys_out(self, monkeypatch):
         # sell_at and sell_min_days at their defaults are not in the file at
-        # all, whether rebalancing is off or on
+        # all, whether rebalancing is off or on, so every other toggle's line
+        # is as it would be without them; "Skip if closing within" comes last
         monkeypatch.setattr(config, "datetime", _FrozenDatetime)
         for settings in (_SEED_REBALANCE_OFF, config.LIVE_DEFAULTS_SEED):
             config.save_live_defaults(settings, source=config.LIVE_DEFAULTS_SEED_SOURCE)
             text = config.LIVE_DEFAULTS_FILE.read_text()
             assert "sell_at" not in text and "sell_min_days" not in text
         assert config.LIVE_DEFAULTS_FILE.read_bytes().endswith(
-            b'    "exclude_tags": null,\n    "rebalance": true\n  }\n}\n')
+            b'    "exclude_tags": null,\n    "rebalance": true,\n'
+            b'    "buy_min_days_to_close": 7\n  }\n}\n')
 
     def test_a_selling_save_writes_its_keys_last_in_field_order(self, monkeypatch):
         monkeypatch.setattr(config, "datetime", _FrozenDatetime)
-        # A level and a minimum, after rebalancing
+        # A level and a minimum, after rebalancing and before "Skip if closing within"
         both = dataclasses.replace(config.LIVE_DEFAULTS_SEED, sell_at=0.85, sell_min_days=3)
         config.save_live_defaults(both, source=config.LIVE_DEFAULTS_SEED_SOURCE)
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SIX_TOGGLE_BYTES.replace(
             b'    "exclude_tags": null\n',
             b'    "exclude_tags": null,\n    "rebalance": true,\n'
-            b'    "sell_at": 0.85,\n    "sell_min_days": 3\n')
+            b'    "sell_at": 0.85,\n    "sell_min_days": 3,\n'
+            b'    "buy_min_days_to_close": 7\n')
         assert config.read_saved_live_defaults() == both
         # A level alone leaves the minimum out; rebalancing off leaves its key out too
         level = dataclasses.replace(_SEED_REBALANCE_OFF, sell_at=0.5)
         config.save_live_defaults(level, source=config.LIVE_DEFAULTS_SEED_SOURCE)
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SIX_TOGGLE_BYTES.replace(
-            b'    "exclude_tags": null\n', b'    "exclude_tags": null,\n    "sell_at": 0.5\n')
+            b'    "exclude_tags": null\n',
+            b'    "exclude_tags": null,\n    "sell_at": 0.5,\n'
+            b'    "buy_min_days_to_close": 7\n')
         assert config.read_saved_live_defaults() == level
         # Every level of the grid round-trips as the same float
         for percent in range(1, 101):
@@ -4478,15 +4580,22 @@ class TestSavedLiveDefaults:
         assert (saved.sell_at, saved.sell_min_days) == (0.9, 14)
         assert config.read_saved_live_defaults() == settings
 
-    def test_rebalancing_off_writes_exactly_the_bytes_written_before_it_existed(
-            self, monkeypatch):
+    def test_rebalancing_off_leaves_both_rebalance_keys_out(self, monkeypatch):
         # Both rebalance settings at their defaults are left out of the file:
-        # with selling off too it is byte for byte the six-toggle file
+        # with selling off too it is the six-toggle file plus the one line of
+        # "Skip if closing within", which is always written (7 days here, or
+        # null for off)
         monkeypatch.setattr(config, "datetime", _FrozenDatetime)
         assert (_SEED_REBALANCE_OFF.rebalance, _SEED_REBALANCE_OFF.min_price_move) == (
             False, None)
         config.save_live_defaults(_SEED_REBALANCE_OFF, source=config.LIVE_DEFAULTS_SEED_SOURCE)
-        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SIX_TOGGLE_BYTES
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEED_REBALANCE_OFF_BYTES
+        config.save_live_defaults(
+            dataclasses.replace(_SEED_REBALANCE_OFF, buy_min_days_to_close=None),
+            source=config.LIVE_DEFAULTS_SEED_SOURCE)
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SIX_TOGGLE_BYTES.replace(
+            b'    "exclude_tags": null\n',
+            b'    "exclude_tags": null,\n    "buy_min_days_to_close": null\n')
         for settings in (_SEED_REBALANCE_OFF,
                          dataclasses.replace(_SEED_REBALANCE_OFF, sell_at=0.85,
                                              sell_min_days=3)):
@@ -4494,7 +4603,8 @@ class TestSavedLiveDefaults:
             text = config.LIVE_DEFAULTS_FILE.read_bytes()
             assert b"rebalance" not in text and b"min_price_move" not in text
         assert config.LIVE_DEFAULTS_FILE.read_bytes().endswith(
-            b'    "sell_at": 0.85,\n    "sell_min_days": 3\n  }\n}\n')
+            b'    "sell_at": 0.85,\n    "sell_min_days": 3,\n'
+            b'    "buy_min_days_to_close": 7\n  }\n}\n')
 
     def test_a_rebalancing_save_writes_its_keys_in_field_order(self, monkeypatch):
         monkeypatch.setattr(config, "datetime", _FrozenDatetime)
@@ -4506,7 +4616,8 @@ class TestSavedLiveDefaults:
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SIX_TOGGLE_BYTES.replace(
             b'    "exclude_tags": null\n',
             b'    "exclude_tags": null,\n    "rebalance": true,\n    "min_price_move": 0.1,\n'
-            b'    "sell_at": 0.85,\n    "sell_min_days": 3\n')
+            b'    "sell_at": 0.85,\n    "sell_min_days": 3,\n'
+            b'    "buy_min_days_to_close": 7\n')
         assert config.read_saved_live_defaults() == everything
         # Every 5c step round-trips as the same float
         for cents in range(5, 101, 5):
@@ -4514,9 +4625,9 @@ class TestSavedLiveDefaults:
             assert config.save_live_defaults(wanted, source="") == wanted
             assert config.read_saved_live_defaults().min_price_move == cents / 100
 
-    def test_maturity_writes_exactly_the_bytes_written_before_it_existed(self, monkeypatch):
-        # The days to maturity at "maturity" (None) are left out of the file, so a
-        # file saved with it so is byte for byte the file saved without the setting
+    def test_maturity_leaves_the_days_to_maturity_out(self, monkeypatch):
+        # The days to maturity at "maturity" (None) are left out of the file, so
+        # every other toggle's line is as it would be without the setting
         monkeypatch.setattr(config, "datetime", _FrozenDatetime)
         for settings in (_SEED_REBALANCE_OFF, config.LIVE_DEFAULTS_SEED):
             assert settings.rebalance_min_days_to_maturity is None
@@ -4524,7 +4635,8 @@ class TestSavedLiveDefaults:
             assert b"rebalance_min_days_to_maturity" not in config.LIVE_DEFAULTS_FILE.read_bytes()
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SIX_TOGGLE_BYTES.replace(
             b'    "exclude_tags": null\n',
-            b'    "exclude_tags": null,\n    "rebalance": true\n')
+            b'    "exclude_tags": null,\n    "rebalance": true,\n'
+            b'    "buy_min_days_to_close": 7\n')
         # A 0 given in is stored as None, so it is left out too
         zero = dataclasses.replace(config.LIVE_DEFAULTS_SEED, rebalance_min_days_to_maturity=0)
         config.save_live_defaults(zero, source=config.LIVE_DEFAULTS_SEED_SOURCE)
@@ -4541,7 +4653,8 @@ class TestSavedLiveDefaults:
             b'    "exclude_tags": null\n',
             b'    "exclude_tags": null,\n    "rebalance": true,\n    "min_price_move": 0.1,\n'
             b'    "rebalance_min_days_to_maturity": 7,\n'
-            b'    "sell_at": 0.85,\n    "sell_min_days": 3\n')
+            b'    "sell_at": 0.85,\n    "sell_min_days": 3,\n'
+            b'    "buy_min_days_to_close": 7\n')
         assert config.read_saved_live_defaults() == everything
         # Alone, it follows rebalance directly
         one = dataclasses.replace(config.LIVE_DEFAULTS_SEED, rebalance_min_days_to_maturity=1)
@@ -4549,7 +4662,8 @@ class TestSavedLiveDefaults:
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SIX_TOGGLE_BYTES.replace(
             b'    "exclude_tags": null\n',
             b'    "exclude_tags": null,\n    "rebalance": true,\n'
-            b'    "rebalance_min_days_to_maturity": 1\n')
+            b'    "rebalance_min_days_to_maturity": 1,\n'
+            b'    "buy_min_days_to_close": 7\n')
         assert config.read_saved_live_defaults() == one
 
     @pytest.mark.parametrize("days", [1, 7])
@@ -4574,7 +4688,7 @@ class TestSavedLiveDefaults:
                             sell_min_days=3),
     ])
     def test_the_writer_never_writes_a_retired_key(self, settings):
-        # Only the eleven toggles' names reach the file, so a save always
+        # Only the twelve toggles' names reach the file, so a save always
         # writes a file every live run reads
         config.save_live_defaults(settings, source="")
         record = json.loads(config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8"))
@@ -4600,8 +4714,11 @@ class TestSavedLiveDefaults:
         saved = config.read_saved_live_defaults()
         assert saved == _SEED_REBALANCE_OFF and saved.rebalance is False
         assert saved.min_price_move is None
-        # ... and it reads selling off, the same way
+        # ... and it reads selling off, the same way, but "Skip if closing
+        # within" as 7 days, the one optional toggle a missing key does not
+        # read as off
         assert saved.sell_at is None and saved.sell_min_days is None
+        assert saved.buy_min_days_to_close == 7
         assert config.REBALANCE is True
         assert config.LIVE_DEFAULTS_SEED.rebalance is True
         assert saved.origin == ("live_defaults.json, saved 2026-09-27T21:05:13Z from "
@@ -4695,6 +4812,79 @@ class TestSavedLiveDefaults:
         config.LIVE_DEFAULTS_FILE.write_bytes(_text(_with_toggles(**changes)))
         assert config.read_saved_live_defaults() == dataclasses.replace(
             _SEED_REBALANCE_OFF, **expected)
+
+    def test_a_file_that_leaves_skip_if_closing_within_out_reads_seven_days(self):
+        # The shape of the live defaults the account saved before the setting
+        # existed: rebalancing on until 7 days before maturity, no selling and
+        # no "buy_min_days_to_close" key. Nobody chose a value for that file,
+        # and it reads as the one-week default, not as off
+        config.LIVE_DEFAULTS_FILE.write_bytes(_text(_with_toggles(
+            rebalance=True, rebalance_min_days_to_maturity=7)))
+        assert "buy_min_days_to_close" not in config.LIVE_DEFAULTS_FILE.read_text()
+        saved = config.read_saved_live_defaults()
+        assert saved.buy_min_days_to_close == 7 == config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT
+        # Every other setting as the file has it, and the run's one read agrees
+        assert saved == dataclasses.replace(config.LIVE_DEFAULTS_SEED,
+                                            rebalance_min_days_to_maturity=7)
+        assert config.live_defaults() == saved
+        # config.py's own value, which no live run reads, is off
+        assert config.BUY_MIN_DAYS_TO_CLOSE is None
+
+    @pytest.mark.parametrize("written, days", [(None, None), (0, None), (3, 3), (7, 7),
+                                               (14, 14)])
+    def test_a_file_naming_skip_if_closing_within_reads_it(self, written, days):
+        # Written as null or 0 it reads as off; a menu's days as those days
+        config.LIVE_DEFAULTS_FILE.write_bytes(_text(_with_toggles(
+            buy_min_days_to_close=written)))
+        assert config.read_saved_live_defaults() == dataclasses.replace(
+            _SEED_REBALANCE_OFF, buy_min_days_to_close=days)
+
+    @pytest.mark.parametrize("days", [None, 3, 7, 14])
+    def test_skip_if_closing_within_is_always_written(self, days, monkeypatch):
+        # Off is written as null, so a file saved with it off never reads back
+        # as 7 days; a set value is written as its days. Either way it is the
+        # last key, after every other toggle's line
+        monkeypatch.setattr(config, "datetime", _FrozenDatetime)
+        settings = dataclasses.replace(_SEED_REBALANCE_OFF, buy_min_days_to_close=days)
+        saved = config.save_live_defaults(settings, source=config.LIVE_DEFAULTS_SEED_SOURCE)
+        assert saved == settings and saved.buy_min_days_to_close == days
+        line = b'    "buy_min_days_to_close": ' + (b"null" if days is None
+                                                   else str(days).encode()) + b"\n"
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SIX_TOGGLE_BYTES.replace(
+            b'    "exclude_tags": null\n', b'    "exclude_tags": null,\n' + line)
+        assert config.read_saved_live_defaults() == settings
+        # A 0 given in is off, and written as null
+        if days is None:
+            zero = dataclasses.replace(_SEED_REBALANCE_OFF, buy_min_days_to_close=0)
+            config.save_live_defaults(zero, source=config.LIVE_DEFAULTS_SEED_SOURCE)
+            assert line in config.LIVE_DEFAULTS_FILE.read_bytes()
+            assert config.read_saved_live_defaults().buy_min_days_to_close is None
+
+    def test_a_save_whose_text_dropped_the_off_key_is_refused(self, monkeypatch):
+        # Were the writer's text ever to leave the null out, the file would
+        # read back as 7 days: its check of that text before writing refuses
+        # it, naming what it would read back as, and the file on disk is left
+        # as it was
+        config.save_live_defaults(config.LIVE_DEFAULTS_SEED, source="")
+        before = config.LIVE_DEFAULTS_FILE.read_bytes()
+        real = config._saved_text
+
+        def dropping(record: dict) -> str:
+            """The real text of the record, without its skip-if-closing key."""
+            settings = {name: value for name, value in record["settings"].items()
+                        if name != "buy_min_days_to_close"}
+            return real({**record, "settings": settings})
+
+        monkeypatch.setattr(config, "_saved_text", dropping)
+        off = dataclasses.replace(config.LIVE_DEFAULTS_SEED, buy_min_days_to_close=None)
+        with pytest.raises(config.LiveDefaultsError, match="would read back as") as err:
+            config.save_live_defaults(off, source="")
+        assert "buy_min_days_to_close=7" in str(err.value)
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
+        assert _only(config.LIVE_DEFAULTS_FILE.parent) == ["live_defaults.json"]
+        # Control: the same save with the real text goes through, as off
+        monkeypatch.setattr(config, "_saved_text", real)
+        assert config.save_live_defaults(off, source="").buy_min_days_to_close is None
 
     def test_the_origin_names_the_file_the_time_and_the_source(self, monkeypatch):
         monkeypatch.setattr(config, "datetime", _FrozenDatetime)
@@ -5059,7 +5249,18 @@ class TestSavedLiveDefaults:
             (_text(_with_toggles(rebalance=1)), "rebalance must be True or False"),
             (_text(_with_toggles(exclude_tags=_DROP)),
              "(rebalance, min_price_move, rebalance_min_days_to_maturity, sell_at, "
-             "sell_min_days may be left out, and then each reads as off)"),
+             "sell_min_days, buy_min_days_to_close may be left out, and then each reads "
+             "as off, except buy_min_days_to_close, which reads as 7)"),
+            (_text(_with_toggles(buy_min_days_to_close=True)),
+             '"buy_min_days_to_close" must be a number or null'),
+            (_text(_with_toggles(buy_min_days_to_close=False)),
+             '"buy_min_days_to_close" must be a number or null'),
+            (_text(_with_toggles(buy_min_days_to_close=5)),
+             "buy_min_days_to_close must be 3, 7 or 14 days, or 0 for off, got 5"),
+            (_text(_with_toggles(buy_min_days_to_close=7.0)),
+             "buy_min_days_to_close must be 3, 7 or 14 days, or 0 for off, got 7.0"),
+            (_text(_with_toggles(buy_min_days_to_close="7")),
+             "buy_min_days_to_close must be 3, 7 or 14 days, or 0 for off, got '7'"),
             (_text(_with_toggles(sell_at=True)), '"sell_at" must be a number or null'),
             (_text(_with_toggles(sell_at=0.85, sell_min_days=False)),
              '"sell_min_days" must be a number or null'),
@@ -5170,9 +5371,11 @@ class TestSavedLiveDefaults:
             spread_band=[0, 1], interval_discount=1, size_cap=1,
             exclude_categories=[" Sports "], exclude_tags=["Basketball"])))
         saved = config.read_saved_live_defaults()
+        # The record leaves "Skip if closing within" out, so it reads as 7 days
         assert saved == LiveSettings(tier_floors=False, spread_band=(0.0, 1.0),
                                      interval_discount=1.0, size_cap=1.0,
-                                     exclude_categories=("Sports",), exclude_tags=("Basketball",))
+                                     exclude_categories=("Sports",), exclude_tags=("Basketball",),
+                                     buy_min_days_to_close=7)
         assert saved.origin == "live_defaults.json, saved 2026-09-27T21:05:13Z"
 
 
@@ -5275,11 +5478,14 @@ class TestOutdatedSavedFile:
             "excluded, no same-title cap)")
         assert err.retired == ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise",
                                "categories", "tags", "same_title_size_cap")
-        # Every other setting as saved, and no same-title cap; the origin names
-        # the file as a read would
+        # Every other setting as saved, and no same-title cap; "Skip if
+        # closing within", which no older version saved, reads as 7 days, as
+        # in any saved file that leaves it out. The origin names the file as a
+        # read would
         assert err.proposal == LiveSettings(tier_floors=False, spread_band=(0.0, 0.8),
                                             interval_discount=0.7, size_cap=0.15,
-                                            rebalance=True, min_price_move=0.10)
+                                            rebalance=True, min_price_move=0.10,
+                                            buy_min_days_to_close=7)
         assert err.proposal.origin == (
             "live_defaults.json, saved 2026-10-11T18:22:05Z from backtest dashboard for "
             "2025-10-11 to 2026-10-11")
@@ -5393,7 +5599,8 @@ class TestOutdatedSavedFile:
         text = config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8")
         stored = json.loads(text)["settings"]
         assert not any(name in stored for name in config._RETIRED_TOGGLES)
-        assert '"rebalance": true,\n    "min_price_move": 0.1\n' in text
+        assert ('"rebalance": true,\n    "min_price_move": 0.1,\n'
+                '    "buy_min_days_to_close": 7\n') in text
 
 
 class TestCategoriesRetirement:
@@ -5729,12 +5936,14 @@ _SAME_TITLE_CAP_ERA_BYTES = (
     b'}\n')
 
 # What _SAME_TITLE_CAP_ERA_BYTES reads as now: every setting as saved, no
-# same-title cap, no selling
+# same-title cap, no selling, and "Skip if closing within" at 7 days (a file
+# that leaves it out, as every file of that era does, reads it so)
 _SAME_TITLE_CAP_ERA_PROPOSAL = LiveSettings(
     tier_floors=False, spread_band=(0.2, 0.8), interval_discount=0.85, size_cap=0.1,
     exclude_categories=None,
     exclude_tags=("Climate and Weather · Ski Resorts", "Entertainment · General"),
-    rebalance=True, min_price_move=0.1, rebalance_min_days_to_maturity=7)
+    rebalance=True, min_price_move=0.1, rebalance_min_days_to_maturity=7,
+    buy_min_days_to_close=7)
 
 # The one line its refusal says after the file's path
 _SAME_TITLE_CAP_ERA_MESSAGE = (
@@ -5786,9 +5995,12 @@ class TestSameTitleCapRetirement:
                 continue
             assert getattr(err.proposal, name) == (
                 tuple(value) if isinstance(value, list) else value), name
-        # ... and the two sell settings it leaves out read as off
+        # ... the two sell settings it leaves out read as off, and "Skip if
+        # closing within", which it leaves out too, as 7 days
         assert err.proposal.sell_at is None and err.proposal.sell_min_days is None
-        assert set(settings) - {"same_title_size_cap"} | {"sell_at", "sell_min_days"} == set(
+        assert err.proposal.buy_min_days_to_close == 7
+        assert set(settings) - {"same_title_size_cap"} | {
+            "sell_at", "sell_min_days", "buy_min_days_to_close"} == set(
             config.LIVE_TOGGLE_FIELDS)
         assert err.proposal.origin == (
             "live_defaults.json, saved 2026-11-09T22:38:14Z from backtest dashboard for "
@@ -5954,7 +6166,7 @@ class TestSameTitleCapRetirement:
         assert "it lacks same_title_size_cap" not in message, label
 
     def test_a_file_without_the_cap_is_not_outdated(self):
-        # The proposal's own shape, as the new writer saves it, reads as itself
+        # The same file without the cap is a usable file, and reads as the proposal
         record = self._record(same_title_size_cap=_DROP)
         config.LIVE_DEFAULTS_FILE.write_bytes(_text(record))
         assert config.read_saved_live_defaults() == _SAME_TITLE_CAP_ERA_PROPOSAL
@@ -5966,8 +6178,11 @@ class TestLiveDefaultsSeed:
     def test_the_seed_values(self):
         seed = config.LIVE_DEFAULTS_SEED
         assert seed == LiveSettings(tier_floors=False, spread_band=(0.0, 0.5),
-                                    interval_discount=0.8, size_cap=0.10, rebalance=True)
+                                    interval_discount=0.8, size_cap=0.10, rebalance=True,
+                                    buy_min_days_to_close=7)
         assert seed.min_price_move is None
+        # "Skip if closing within" at the one-week default
+        assert seed.buy_min_days_to_close == config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT
         assert seed.exclude_categories is None and seed.exclude_tags is None
         assert seed.origin == config.LIVE_DEFAULTS_FROM_CONFIG
 
@@ -6053,6 +6268,7 @@ class TestLiveSettingsChanges:
             ("rebalance until", "maturity", "maturity", False),
             ("sell at", "off", "off", False),
             ("min days to maturity", "any", "any", False),
+            ("skip if closing within", "off", "off", False),
         ]
 
     def test_changed_flags_exactly_the_fields_that_differ(self):
@@ -6072,11 +6288,11 @@ class TestLiveSettingsChanges:
 
     def test_no_current_defaults_changes_every_row(self):
         rows = config.live_settings_changes(None, config.LIVE_DEFAULTS_SEED)
-        assert len(rows) == len(config.LIVE_TOGGLE_FIELDS) == 11
+        assert len(rows) == len(config.LIVE_TOGGLE_FIELDS) == 12
         assert all(old == "—" and changed for _, old, _, changed in rows)
         assert [new for _, _, new, _ in rows] == [
             "off", "0-0.5", "0.8", "10%", "none", "none", "yes", "any", "maturity",
-            "off", "any"]
+            "off", "any", "7 days"]
         # No row names a same-title cap
         assert not any("same-title" in label for label, *_ in rows)
 
@@ -6130,6 +6346,23 @@ class TestLiveSettingsChanges:
         rows = config.live_settings_changes(_SEED_REBALANCE_OFF, config.LIVE_DEFAULTS_SEED)
         assert [row for row in rows if row[3]] == [("rebalance", "no", "yes", True)]
 
+    def test_choosing_skip_if_closing_within_shows_as_its_one_row(self):
+        # The seed's 7 days against off, then against each other choice
+        seed = config.LIVE_DEFAULTS_SEED
+        off = dataclasses.replace(seed, buy_min_days_to_close=None)
+        rows = config.live_settings_changes(off, seed)
+        assert [row for row in rows if row[3]] == [
+            ("skip if closing within", "off", "7 days", True)]
+        for days in (3, 14):
+            rows = config.live_settings_changes(
+                seed, dataclasses.replace(seed, buy_min_days_to_close=days))
+            assert [row for row in rows if row[3]] == [
+                ("skip if closing within", "7 days", f"{days} days", True)]
+        # A six-toggle file reads 7 days, so the seed changes nothing there
+        config.LIVE_DEFAULTS_FILE.write_bytes(_SIX_TOGGLE_BYTES)
+        rows = config.live_settings_changes(config.read_saved_live_defaults(), seed)
+        assert [row[0] for row in rows if row[3]] == ["rebalance"]
+
 
 class TestLiveSettingText:
     """live_setting_text: one toggle's value in the words of the "Live settings:" line and the
@@ -6154,7 +6387,9 @@ class TestLiveSettingText:
         ("rebalance_min_days_to_maturity", None, "maturity"),
         ("rebalance_min_days_to_maturity", 1, "1 day before maturity"),
         ("sell_at", None, "off"), ("sell_at", 0.8, "80% of potential profit"),
-        ("sell_min_days", None, "any"), ("sell_min_days", 14, "14")])
+        ("sell_min_days", None, "any"), ("sell_min_days", 14, "14"),
+        ("buy_min_days_to_close", None, "off"), ("buy_min_days_to_close", 3, "3 days"),
+        ("buy_min_days_to_close", 7, "7 days"), ("buy_min_days_to_close", 14, "14 days")])
     def test_its_words(self, field, value, words):
         assert config.live_setting_text(field, value) == words
 

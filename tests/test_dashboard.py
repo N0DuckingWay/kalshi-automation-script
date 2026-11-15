@@ -8424,8 +8424,11 @@ class TestTradingSync:
         known = {"tier_floors", "spread_min", "spread_max", "k", "size_cap",
                  "source", "exclude_category", "exclude_tag", "rebalance",
                  "min_price_move", "rebalance_min_days_to_maturity", "sell_at",
-                 "sell_min_days"}
+                 "sell_min_days", "buy_min_days_to_close"}
         assert set(query) <= known
+        # "Skip if closing within" has no menu on the page, so it goes only as
+        # the Trading tab spelled it: off, or one of the days the server takes
+        assert query.get("buy_min_days_to_close", "off") in ("off", "0", "3", "7", "14")
         # Rebalance's two fields are always sent together: the server refuses
         # a minimum with rebalancing off, and keeps a saved one a query leaves out
         assert len({name in query for name in ("rebalance", "min_price_move")}) == 1
@@ -9087,9 +9090,11 @@ class TestTradingSync:
         app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
         pb, pk, pc = data["primary"]
         # The page names no Rebalance choice, so the server keeps the saved one
-        # and its minimum, or the seed's with none saved
+        # and its minimum, or the seed's with none saved; and it has no "Skip if
+        # closing within" menu, so the same goes for those days (the seed's 7)
         kept = current if current is not None else config.LIVE_DEFAULTS_SEED
-        rebalance = {"rebalance": kept.rebalance, "min_price_move": kept.min_price_move}
+        rebalance = {"rebalance": kept.rebalance, "min_price_move": kept.min_price_move,
+                     "buy_min_days_to_close": kept.buy_min_days_to_close}
         cases = (
             ("primary", config.LiveSettings(
                 tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
@@ -9102,7 +9107,8 @@ class TestTradingSync:
         )
         for name, expected in cases:
             query = _told(snaps[name])[-1]
-            self._query(query)
+            # No Trading-tab proposal is known here, so the days go unnamed
+            assert "buy_min_days_to_close" not in self._query(query), name
             response = app.handle(defaults_server._Request("GET", f"/confirm?{query}",
                                                            _SERVER_HOST))
             assert response.status == 200, response.body
@@ -9240,9 +9246,11 @@ class TestTradingSync:
         app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
         pb, pk, pc = data["primary"]
         # The page names no Rebalance choice, so the server keeps the saved one
-        # and its minimum, or the seed's with none saved
+        # and its minimum, or the seed's with none saved; and it has no "Skip if
+        # closing within" menu, so the same goes for those days (the seed's 7)
         kept = current if current is not None else config.LIVE_DEFAULTS_SEED
-        rebalance = {"rebalance": kept.rebalance, "min_price_move": kept.min_price_move}
+        rebalance = {"rebalance": kept.rebalance, "min_price_move": kept.min_price_move,
+                     "buy_min_days_to_close": kept.buy_min_days_to_close}
         levels, days = data["sell_levels"], data["sell_days"]
         assert levels[0]["value"] == 0.25 and levels[1]["value"] == 0.5
         assert [d["value"] for d in days][:3] == [1, 2, 3]
@@ -9901,6 +9909,10 @@ class TestTradingSync:
             proposal = _proposed(tier_floors=True, rebalance=True, min_price_move=None,
                                  sell_at=data["sell_levels"][1]["value"], sell_min_days=3,
                                  **common)
+        # "Skip if closing within" has no menu on the page at all: the
+        # proposal's (the seed's 7 days) differs from the saved off, so a
+        # choice must pass it on as the Trading tab has it
+        assert proposal.buy_min_days_to_close == 7 and saved.buy_min_days_to_close is None
         # Each runner waits for the selects its page enables
         runner = {"no views": _run_script, "rebalance, no until": TestRebalanceScript._run,
                   "sell": TestSellScript._run}[page_kind]
@@ -15661,15 +15673,21 @@ class TestRebalanceScript:
         current = config.read_saved_live_defaults()
         app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
         pb, pk, pc = data["primary"]
+        # The page has no "Skip if closing within" menu, so the server keeps
+        # the saved days, or the seed's 7 with none saved
+        kept = (current if current is not None
+                else config.LIVE_DEFAULTS_SEED).buy_min_days_to_close
         cases = (
             ("primary", config.LiveSettings(
                 tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][pk]["value"],
-                size_cap=data["caps"][pc]["value"], rebalance=False)),
+                size_cap=data["caps"][pc]["value"], rebalance=False,
+                buy_min_days_to_close=kept)),
             ("chosen", config.LiveSettings(
                 tier_floors=False, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][0]["value"],
-                size_cap=data["caps"][pc]["value"], rebalance=True)),
+                size_cap=data["caps"][pc]["value"], rebalance=True,
+                buy_min_days_to_close=kept)),
         )
         for name, expected in cases:
             query = _told(snaps[name])[-1]

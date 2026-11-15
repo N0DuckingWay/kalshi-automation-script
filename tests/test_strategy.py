@@ -3281,6 +3281,7 @@ class TestTimeSeriesKellyParity:
             "REBALANCE_MIN_DAYS_TO_MATURITY",
             "SELL_AT",
             "SELL_MIN_DAYS",
+            "BUY_MIN_DAYS_TO_CLOSE",
         } | self._SAVED_FILE_INTERNALS
         # Every toggle constant config.live_settings() builds the toggles from is
         # forbidden, one per toggle, so a toggle added there cannot slip past

@@ -320,12 +320,15 @@ def _isolate_event_title_accumulator(tmp_path, monkeypatch):
 
 def apply_pre_toggle_defaults(mp) -> None:
     """
-    Pin every binding of the eleven live toggles to fixed values.
+    Pin every binding of the twelve live toggles to fixed values.
 
     Tier floors on, no spread band, k 0.75, a 20% per-trade cap, no category
-    or tag filter, no rebalancing (no adding to held pairs, no trimming) and
-    no selling. A file saved from these values holds only the other six
-    toggles, since the five optional ones are left out while off. Patches
+    or tag filter, no rebalancing (no adding to held pairs, no trimming), no
+    selling and no "Skip if closing within". A file saved from these values
+    holds the six required toggles and "buy_min_days_to_close": null, since
+    the writer leaves the other five optional ones out while they are off
+    and always writes that one (a file that leaves it out reads it as 7
+    days). Patches
     config's constants, read at call time, AND the by-value copies backtester
     (k and the per-trade cap) and backtest (k) bind at import, or a test would
     price with one value and size with another; no other module binds one by
@@ -347,6 +350,7 @@ def apply_pre_toggle_defaults(mp) -> None:
     mp.setattr(config, "REBALANCE_MIN_DAYS_TO_MATURITY", None)
     mp.setattr(config, "SELL_AT", None)
     mp.setattr(config, "SELL_MIN_DAYS", None)
+    mp.setattr(config, "BUY_MIN_DAYS_TO_CLOSE", None)
     mp.setattr(backtester, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.75)
     mp.setattr(backtester, "BUDGET_FRACTION", 0.20)
     mp.setattr(backtest, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.75)

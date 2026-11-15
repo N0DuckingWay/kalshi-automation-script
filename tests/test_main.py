@@ -349,7 +349,7 @@ class TestNoPairsMsg:
 @pytest.fixture
 def pinned_config_toggles(monkeypatch, _isolate_live_defaults):
     """
-    Pin the eleven live toggles and save them as this test's live defaults.
+    Pin the twelve live toggles and save them as this test's live defaults.
 
     Through conftest's apply_pre_toggle_defaults, the one definition of their
     values, then save_config_live_defaults into the test's own path (requested
@@ -911,6 +911,89 @@ class TestLiveSettingsFlags:
         assert "--rebalance-min-days-to-maturity" in err
         assert "--no-rebalance-min-days-to-maturity" in err
 
+    @pytest.mark.parametrize("mode", ["dev", "prod"])
+    @pytest.mark.parametrize("argv, saved, expected", [
+        # Given over saved off and over saved days; 0 is off, like the twin flag
+        (["--buy-min-days-to-close", "3"], None, 3),
+        (["--buy-min-days-to-close", "7"], None, 7),
+        (["--buy-min-days-to-close", "14"], 7, 14),
+        (["--buy-min-days-to-close", "0"], 7, None),
+        (["--no-buy-min-days-to-close"], 14, None),
+        (["--no-buy-min-days-to-close"], None, None),
+        # No flag keeps the saved value, and so do the rebalance and sell switches
+        ([], 3, 3),
+        ([], None, None),
+        (["--no-rebalance", "--no-sell"], 14, 14),
+    ])
+    def test_the_skip_if_closing_flags_lay_over_the_saved_days(
+        self, monkeypatch, mode, argv, saved, expected,
+    ):
+        _save_live_defaults(buy_min_days_to_close=saved)
+        seen = _main_with(monkeypatch, ["--mode", mode, *argv])
+        assert seen["code"] == EXIT_OK and seen["mode"] == mode
+        settings, reference = seen["settings"], seen["reference"]
+        assert reference.buy_min_days_to_close == saved
+        assert settings.buy_min_days_to_close == expected
+        assert settings.buy_min_days_to_close is None or (
+            type(settings.buy_min_days_to_close) is int)
+        # Nothing else moved (the saved defaults neither rebalance nor sell)
+        for other in config.LIVE_TOGGLE_FIELDS:
+            if other != "buy_min_days_to_close":
+                assert getattr(settings, other) == getattr(reference, other), other
+
+    def test_a_saved_file_without_the_setting_runs_at_seven_days_unless_a_flag_says(
+        self, monkeypatch,
+    ):
+        # A file saved before "Skip if closing within" existed has no key for
+        # it: a run reads 7 days, and a flag still moves it, marked against 7
+        saved = _save_live_defaults()
+        record = json.loads(config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8"))
+        del record["settings"]["buy_min_days_to_close"]
+        config.LIVE_DEFAULTS_FILE.write_text(json.dumps(record), encoding="utf-8")
+        kept = _main_with(monkeypatch, ["--mode", "prod"])
+        assert kept["reference"] == dataclasses.replace(saved, buy_min_days_to_close=7)
+        assert kept["settings"] == kept["reference"]
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--no-buy-min-days-to-close"])
+        assert seen["reference"].buy_min_days_to_close == 7
+        assert seen["settings"].buy_min_days_to_close is None
+        line = describe_live_settings(seen["settings"], seen["reference"])
+        assert line.endswith("skip if closing within off (default: 7 days)")
+        assert line.count("(default:") == 1
+
+    @pytest.mark.parametrize("value", ["5", "1", "2", "21", "-7", "100"])
+    def test_a_skip_if_closing_value_off_the_menu_is_a_usage_error(
+        self, monkeypatch, capsys, value,
+    ):
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--buy-min-days-to-close", value])
+        assert seen["code"] == 2
+        # Refused before logging, the client and either run mode
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "settings" not in seen
+        err = capsys.readouterr().err
+        assert "(--buy-min-days-to-close):" in err, err
+        assert (f"buy_min_days_to_close must be 3, 7 or 14 days, or 0 for off, "
+                f"got {value}") in err, err
+
+    @pytest.mark.parametrize("value", ["7.0", "1.5", "week", "7d"])
+    def test_a_fractional_or_non_numeric_skip_value_is_a_usage_error(
+        self, monkeypatch, capsys, value,
+    ):
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--buy-min-days-to-close", value])
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "invalid int value" in capsys.readouterr().err
+
+    def test_the_skip_if_closing_flag_and_its_off_twin_are_mutually_exclusive(
+        self, monkeypatch, capsys,
+    ):
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--buy-min-days-to-close", "7",
+                                        "--no-buy-min-days-to-close"])
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        err = capsys.readouterr().err
+        assert "not allowed with argument" in err, err
+        assert "--buy-min-days-to-close" in err and "--no-buy-min-days-to-close" in err
+
     def test_no_flag_hands_the_run_the_saved_defaults_themselves(self, monkeypatch):
         # The scheduler's exact argv (tests/test_scheduler.py pins it)
         seen = _main_with(monkeypatch, ["--mode", "prod"])
@@ -1297,6 +1380,7 @@ class TestLiveSettingsFlags:
                      "--no-min-price-move", "--rebalance-min-days-to-maturity",
                      "--no-rebalance-min-days-to-maturity",
                      "--sell-at", "--no-sell", "--sell-min-days", "--no-sell-min-days",
+                     "--buy-min-days-to-close", "--no-buy-min-days-to-close",
                      "--exclude-category", "--no-exclude-category", "--exclude-tag", "--no-exclude-tag"):
             assert flag in out, flag
         # None of the flags the rebalance flags replaced is left, nor the
@@ -1305,8 +1389,19 @@ class TestLiveSettingsFlags:
                      "--same-title-size-cap"):
             assert gone not in out, gone
         # Every value flag defaults to the saved live defaults, never a config.py constant
-        assert out.count("default: the saved live defaults") == 12
-        assert out.count("whatever the saved live defaults say") == 6
+        assert out.count("default: the saved live defaults") == 13
+        assert out.count("whatever the saved live defaults say") == 7
+        # "Skip if closing within" names its four choices from the one tuple,
+        # what it never holds back, and what a file without it reads as
+        skip_help = ("Skip if closing within N days: buy a pair, or add to a held one, "
+                     "only when every market it would buy stops trading at least N days "
+                     "(24-hour spans) after this run looks: 0 = off, or 3, 7 or 14. Never "
+                     "holds back a sale or a trim (default: the saved live defaults; a "
+                     "saved file that leaves it out reads 7)")
+        assert skip_help in out
+        assert config.BUY_MIN_DAYS_TO_CLOSE_CHOICES == (0, 3, 7, 14)
+        assert ("Buy this run however soon a market stops trading, whatever the saved "
+                "live defaults say") in out
         # The days to maturity name their three choices from the one grid, and say
         # what they need and what --no-rebalance does to them
         days_help = ("Rebalance (trim or add to) a held position only while its later "
@@ -1455,6 +1550,8 @@ class TestLogLiveSettings:
             "rebalance until 7 days before maturity (default: maturity)"),
         "sell_at": (["--sell-at", "85"], "sell at 85% of potential profit (default: off)"),
         "sell_min_days": (["--sell-min-days", "3"], "min days to maturity 3 (default: any)"),
+        "buy_min_days_to_close": (["--buy-min-days-to-close", "3"],
+                                  "skip if closing within 3 days (default: off)"),
     }
     # Extra saved defaults a flag needs: a minimum of days needs a sell level,
     # a minimum price move and days to maturity need rebalancing on
@@ -4244,7 +4341,10 @@ class TestLiveSettingsReachEverySite:
     time-series pairs trading (at its k of 0.6 the TS pair's Kelly fraction sits
     between 0.25 and the 0.35 per-trade cap, above config.py's pinned 20% cap,
     and the main pair's own Kelly fraction is above 0.35, so that cap binds it)
-    and turns rebalancing on; both seller planners get the run's settings too."""
+    and turns rebalancing on; both seller planners get the run's settings too.
+    Its "Skip if closing within" is 3 days, the shortest choice that differs
+    from the pinned off, since the replay's markets close on fixed dates
+    (_CLOSE, 2026-12-01) and its runs read the real clock."""
 
     _SETTINGS = LiveSettings(tier_floors=False, spread_band=(0.05, 0.9),
                              interval_discount=0.6, size_cap=0.35,
@@ -4252,7 +4352,7 @@ class TestLiveSettingsReachEverySite:
                              exclude_tags=("Hockey", "sports · soccer"),
                              rebalance=True,
                              min_price_move=0.10, rebalance_min_days_to_maturity=7,
-                             sell_at=0.85, sell_min_days=3)
+                             sell_at=0.85, sell_min_days=3, buy_min_days_to_close=3)
 
     # The cached /series listing: the TS pair's series (EVT) and the main
     # pair's (MAINEVT) under categories _SETTINGS keeps, the tick pair's under
@@ -4535,18 +4635,18 @@ class TestLiveSettingsReachEverySite:
 
         # pre_execution_check swallows exceptions — so none may have happened
         assert "Pre-execution check raised" not in caplog.text
-        # The run named its rule, its settings (all eleven marked) and the
+        # The run named its rule, its settings (all twelve marked) and the
         # lifted time-series exposure, and no other pair type's
         assert ("Time-series entry rule: "
                 + config.describe_time_series_rule(False, (0.05, 0.9))) in caplog.text
         echo = f"Live settings: {describe_live_settings(settings, reference)}"
-        assert echo in caplog.text and echo.count("(config:") == 11
+        assert echo in caplog.text and echo.count("(config:") == 12
         assert "This PRODUCTION run overrides" not in caplog.text
         assert "one time-series pair may stake up to 35%" in caplog.text
         assert "same-title pair may stake" not in caplog.text
         # The workbook's separator row carries the same marked line
         assert captured["run_note"] == f"settings: {describe_live_settings(settings, reference)}"
-        assert captured["run_note"].count("(config:") == 11
+        assert captured["run_note"].count("(config:") == 12
 
     def test_a_dev_run_handed_its_settings_reads_them_at_every_site(self, monkeypatch, caplog):
         settings, reference, calls, captured = self._run_under_the_tripwire(
@@ -4567,7 +4667,7 @@ class TestLiveSettingsReachEverySite:
         assert ("Time-series entry rule: "
                 + config.describe_time_series_rule(False, (0.05, 0.9))) in caplog.text
         echo = f"Live settings: {describe_live_settings(settings, reference)}"
-        assert echo in caplog.text and echo.count("(config:") == 11
+        assert echo in caplog.text and echo.count("(config:") == 12
         # Dev never submits an order, so never the production WARNING
         assert "This PRODUCTION run overrides" not in caplog.text
 
@@ -11477,7 +11577,7 @@ class TestResultFile:
 
 def _other_toggles(target: LiveSettings) -> LiveSettings:
     """
-    Build live defaults that differ from target in every one of the eleven toggles.
+    Build live defaults that differ from target in every one of the twelve toggles.
 
     All but two cases: a target that rebalances with no minimum price move, or
     with no days to maturity, meets defaults that do not rebalance, and so hold
@@ -11508,6 +11608,9 @@ def _other_toggles(target: LiveSettings) -> LiveSettings:
         # --no-sell-min-days to win over them
         sell_at=0.5 if target.sell_at != 0.5 else 0.6,
         sell_min_days=2 if target.sell_min_days != 2 else 3,
+        # Skipping 3 days (off for a target of 3), so a target that skips
+        # nothing needs --no-buy-min-days-to-close to win over it
+        buy_min_days_to_close=3 if target.buy_min_days_to_close != 3 else None,
     )
     for name in config.LIVE_TOGGLE_FIELDS:
         if name == "min_price_move" and target.rebalance and target.min_price_move is None:
@@ -11581,6 +11684,15 @@ _ARGV_TARGETS = {
         tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
         size_cap=0.2, rebalance=True, min_price_move=0.10,
         rebalance_min_days_to_maturity=7, sell_at=0.85, sell_min_days=3),
+    # "Skip if closing within": the shortest and longest choices, beside
+    # rebalancing and selling; off is every target above but the seed (7 days)
+    "skipping-if-closing-within-3-days": LiveSettings(
+        tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+        size_cap=0.1, buy_min_days_to_close=3),
+    "skipping-if-closing-within-14-days-rebalancing-and-selling": LiveSettings(
+        tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+        size_cap=0.2, rebalance=True, rebalance_min_days_to_maturity=7,
+        sell_at=0.85, sell_min_days=3, buy_min_days_to_close=14),
 }
 
 
@@ -11638,13 +11750,40 @@ class TestLiveSettingsArgv:
         else:
             assert args.sell_min_days == target.sell_min_days
             assert args.no_sell_min_days is None
+        # "Skip if closing within" is given either way: its days or the flag that
+        # turns it off, so a saved value (a file without it reads 7) never decides it
+        if target.buy_min_days_to_close is None:
+            assert (args.buy_min_days_to_close is None
+                    and args.no_buy_min_days_to_close is True)
+        else:
+            assert args.buy_min_days_to_close == target.buy_min_days_to_close
+            assert args.no_buy_min_days_to_close is None
 
     def test_the_seed_is_spelled_flag_by_flag(self):
         assert config.live_settings_argv(config.LIVE_DEFAULTS_SEED) == [
             "--no-tier-floors", "--spread-min=0.0", "--spread-max=0.5",
             "--interval-discount=0.8", "--size-cap=10",
             "--rebalance", "--no-min-price-move", "--no-rebalance-min-days-to-maturity",
-            "--no-sell", "--no-sell-min-days", "--no-exclude-category", "--no-exclude-tag"]
+            "--no-sell", "--no-sell-min-days", "--buy-min-days-to-close=7",
+            "--no-exclude-category", "--no-exclude-tag"]
+
+    @pytest.mark.parametrize("days, spelled", [
+        (None, "--no-buy-min-days-to-close"), (3, "--buy-min-days-to-close=3"),
+        (7, "--buy-min-days-to-close=7"), (14, "--buy-min-days-to-close=14")])
+    def test_skip_if_closing_within_is_spelled_after_the_sell_flags(self, days, spelled):
+        # One flag, right after the sell flags and before the filters, read
+        # back by main's parser over saved defaults that hold another value
+        target = dataclasses.replace(config.LIVE_DEFAULTS_SEED, buy_min_days_to_close=days)
+        argv = config.live_settings_argv(target)
+        at = argv.index("--no-sell-min-days")
+        assert argv[at:at + 3] == ["--no-sell-min-days", spelled, "--no-exclude-category"]
+        assert len([flag for flag in argv if "buy-min-days-to-close" in flag]) == 1
+        saved = config.save_live_defaults(_other_toggles(target), source="")
+        parser = main._build_parser()
+        settings, reference = main._resolve_live_settings(
+            parser.parse_args(["--mode", "prod", *argv]), parser)
+        assert settings == target and settings.buy_min_days_to_close == days
+        assert reference == saved and reference.buy_min_days_to_close != days
 
     @pytest.mark.parametrize("target", _ARGV_TARGETS.values(), ids=_ARGV_TARGETS.keys())
     def test_no_flag_names_the_same_title_cap(self, target):
