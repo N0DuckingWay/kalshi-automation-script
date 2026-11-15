@@ -138,7 +138,15 @@ python3 -m kalshi_betting.main --mode prod --dry-run --no-sell
 # exclusive, and any other number exits 2 naming the flag). It needs no other setting.
 # The "Live settings:" line ends `skip if closing within 14 days`, marked "(default: X)"
 # when the saved value differs; a saved file that leaves the setting out reads 7 days,
-# and the Run tab's runs always pass one of the two flags
+# and the Run tab's runs always pass one of the two flags. With it set, a run (prod or
+# dev) buys and adds to nothing closing sooner than that many 24-hour spans after the
+# moment it reads the markets, and logs `Skip if closing within 14 days: kept X of Y
+# markets closing on or after <time> (Z with no readable close)`, with Z above 0 also one
+# WARNING `Left out Z market(s) because their close time could not be read, …` (a held
+# pair held back from an add-on logs `Not adding to N held pair(s) and M lone leg(s)
+# this run: …`); a run left with nothing to buy ends as any run that finds no pairs,
+# its "No qualifying pairs found" line adding "and both markets closing at least 14
+# days after this run". Sales and trims are never held back
 python3 -m kalshi_betting.main --mode prod --dry-run --buy-min-days-to-close 14
 python3 -m kalshi_betting.main --mode prod --dry-run --no-buy-min-days-to-close
 
@@ -160,7 +168,14 @@ python3 -m kalshi_betting.main --mode prod --dry-run --exclude-category Politics
 # tags menu (the page's Live rule line names these boxes)
 python3 -m kalshi_betting.main --mode prod --dry-run --exclude-category Politics --exclude-tag "Sports · Hockey"
 
-# Live trading (either mode), only consider markets closing within 14 days from now
+# Live trading (either mode), only consider markets closing within 14 days from now.
+# Below the run's "Skip if closing within" days (say --max-horizon-days 5 under 7) no
+# market can pass both, and at exactly that many (--max-horizon-days 7 with 7) only one
+# closing in the short time between the run reading the markets and applying the
+# horizon can, so the run logs one WARNING once logging starts and goes on: it buys
+# nothing, or next to nothing. A production run's warning adds that its sales and
+# trims are not held back (a dev run makes none). With --result-file (prod only) the
+# warning is among the result's warnings
 python3 -m kalshi_betting.main --mode dev --max-horizon-days 14
 
 # Backtest from 2024-01-01, starting from what the account is worth now: its cash on

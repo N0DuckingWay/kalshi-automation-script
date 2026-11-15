@@ -2407,6 +2407,97 @@ class TestDaysLeftReached:
                 config.days_to_maturity(closes, day)
 
 
+class TestClosesFarEnough:
+    """closes_far_enough: the "Skip if closing within" test. A purchase passes
+    only when every market it buys closes at least the minimum of 24-hour
+    spans after the moment the bot looks; exactly the minimum passes. Always
+    with no minimum; never with no close, an unknown close or one with no time
+    zone; and a moment with no time zone is a caller's mistake."""
+
+    # The moment the bot looks, in UTC
+    _NOW = datetime(2026, 11, 14, 15, 30, tzinfo=UTC)
+
+    @pytest.mark.parametrize("closes", [
+        [], [None], [datetime(2026, 11, 14)], [_NOW - timedelta(days=30)], ["2027-01-01"],
+        [_NOW + timedelta(days=1), _NOW + timedelta(days=60)]])
+    def test_no_minimum_always_passes(self, closes):
+        assert config.closes_far_enough(closes, self._NOW, None) is True
+        # ... even at a moment with no time zone: nothing is compared
+        assert config.closes_far_enough(closes, datetime(2026, 11, 14), None) is True
+
+    @pytest.mark.parametrize("min_days", [3, 7, 14])
+    def test_exactly_the_minimum_passes_and_a_second_less_fails(self, min_days):
+        at = self._NOW + timedelta(days=min_days)
+        assert config.closes_far_enough([at], self._NOW, min_days) is True
+        assert config.closes_far_enough([at + timedelta(seconds=1)], self._NOW, min_days) is True
+        assert config.closes_far_enough([at - timedelta(seconds=1)], self._NOW,
+                                        min_days) is False
+        # A whole day short fails too
+        assert config.closes_far_enough([at - timedelta(days=1)], self._NOW, min_days) is False
+
+    def test_the_earlier_close_decides(self):
+        far = self._NOW + timedelta(days=30)
+        week = self._NOW + timedelta(days=7)
+        assert config.closes_far_enough([week, far], self._NOW, 7) is True
+        # The earlier market a second short fails the pair, in either order
+        for closes in ([week - timedelta(seconds=1), far], [far, week - timedelta(seconds=1)]):
+            assert config.closes_far_enough(closes, self._NOW, 7) is False
+
+    @pytest.mark.parametrize("unread", [
+        None, datetime(2027, 1, 1), date(2027, 1, 1), "2027-01-01T00:00:00Z", 1798761600],
+        ids=["none", "naive datetime", "a date", "text", "a number"])
+    def test_an_unknown_or_naive_close_fails_however_far_off(self, unread):
+        far = self._NOW + timedelta(days=60)
+        assert config.closes_far_enough([unread], self._NOW, 7) is False
+        # ... and fails a pair whose other market closes far enough
+        assert config.closes_far_enough([far, unread], self._NOW, 7) is False
+        assert config.closes_far_enough([far], self._NOW, 7) is True
+
+    def test_no_close_at_all_fails(self):
+        assert config.closes_far_enough([], self._NOW, 7) is False
+        assert config.closes_far_enough(iter(()), self._NOW, 3) is False
+
+    def test_any_iterable_of_closes_is_read(self):
+        closes = (self._NOW + timedelta(days=d) for d in (8, 9))
+        assert config.closes_far_enough(closes, self._NOW, 7) is True
+
+    def test_a_moment_with_no_time_zone_is_refused(self):
+        naive = datetime(2026, 11, 14, 15, 30)
+        with pytest.raises(ValueError, match="tz-aware now"):
+            config.closes_far_enough([self._NOW + timedelta(days=30)], naive, 7)
+        with pytest.raises(ValueError, match="tz-aware now"):
+            config.closes_far_enough([], naive, 3)
+
+    def test_a_close_in_another_zone_is_compared_as_the_same_moment(self):
+        # 7 days after the moment, written in Los Angeles time (PST, UTC-8)
+        zone = ZoneInfo("America/Los_Angeles")
+        at = (self._NOW + timedelta(days=7)).astimezone(zone)
+        assert config.closes_far_enough([at], self._NOW, 7) is True
+        assert config.closes_far_enough([at - timedelta(seconds=1)], self._NOW, 7) is False
+
+    @pytest.mark.parametrize("now, wall_hours, between_passes", [
+        # Clocks go back an hour on 2026-11-01 in Los Angeles: seven wall-clock
+        # days after noon PDT on 2026-10-29 is 169 hours on, so a close half an
+        # hour past the 168th hour passes, though a wall-clock rule would refuse it
+        (datetime(2026, 10, 29, 12, tzinfo=ZoneInfo("America/Los_Angeles")), 169, True),
+        # ... and forward an hour on 2027-03-14: seven wall-clock days after
+        # noon PST on 2027-03-10 is 167 hours on, so a close half an hour
+        # before the 168th hour fails, though a wall-clock rule would pass it
+        (datetime(2027, 3, 10, 12, tzinfo=ZoneInfo("America/Los_Angeles")), 167, False),
+    ], ids=["clocks go back", "clocks go forward"])
+    def test_a_los_angeles_moment_across_a_clock_change_still_means_168_hours(
+            self, now, wall_hours, between_passes):
+        # The cutoff is 7 x 24 hours on, whatever zone the moment is written in
+        week = now.astimezone(UTC) + timedelta(hours=168)
+        assert config.closes_far_enough([week], now, 7) is True
+        assert config.closes_far_enough([week - timedelta(seconds=1)], now, 7) is False
+        # Seven days added on the Los Angeles wall clock land an hour away
+        wall = (now + timedelta(days=7)).astimezone(UTC)
+        assert wall - now.astimezone(UTC) == timedelta(hours=wall_hours)
+        between = min(wall, week) + timedelta(minutes=30)
+        assert config.closes_far_enough([between], now, 7) is between_passes
+
+
 class TestHeldPairWinProb:
     """config.held_pair_win_prob: the chance a held pair pays, at today's quotes.
 

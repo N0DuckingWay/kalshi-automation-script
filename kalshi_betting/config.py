@@ -677,8 +677,8 @@ REBALANCE_MIN_DAYS_TO_MATURITY: int | None = None
 # "Skip if closing within": the fewest days (24-hour spans) from the moment
 # the bot looks to the close (when trading stops) of every market a purchase
 # would buy, a new pair or an add-on to a held one. Sales and trims never read
-# it. The choices LiveSettings.buy_min_days_to_close accepts; 0 is "Off",
-# stored as None.
+# it; a live run applies it through closes_far_enough. The choices
+# LiveSettings.buy_min_days_to_close accepts; 0 is "Off", stored as None.
 BUY_MIN_DAYS_TO_CLOSE_CHOICES = (0, 3, 7, 14)
 # The one-week default: what a saved live defaults file that leaves the
 # setting out (one saved before it existed) reads as, and what the seed
@@ -3584,7 +3584,8 @@ class LiveSettings:
             None (default) is "Off": no minimum. A real int: a bool, a float
             such as 7.0 or a numpy integer is refused. A saved file that
             leaves it out (one saved before the setting existed) reads it as
-            BUY_MIN_DAYS_TO_CLOSE_DEFAULT, 7 days, not as off.
+            BUY_MIN_DAYS_TO_CLOSE_DEFAULT, 7 days, not as off. A live run
+            applies it through closes_far_enough.
         origin (str): Where these toggles' defaults were read: the saved defaults
             file with when (and from what) it was saved, or LIVE_DEFAULTS_FROM_CONFIG
             for toggles built from this module's constants (the default).
@@ -5049,6 +5050,45 @@ def days_left_reached(left: int | None, min_days: int | None) -> bool:
         bool: True when there is no minimum, or `left` is known and at least `min_days`.
     """
     return min_days is None or (left is not None and left >= min_days)
+
+
+def closes_far_enough(closes, now: datetime, min_days: int | None) -> bool:
+    """
+    Whether every market a purchase would buy closes at least `min_days` days after `now`.
+
+    The test behind "Skip if closing within" (LiveSettings.buy_min_days_to_close):
+    a pair, new or an add-on, is bought only when each of its markets stops
+    trading (its close) at least `min_days` whole 24-hour spans after the
+    moment the bot looks, which a live run takes once, when it reads the
+    markets. Exactly `min_days` passes. Always True with no minimum; False
+    when there is no close or any close is unknown or has no time zone, so a
+    purchase whose close cannot be read is not made. Because every close
+    must pass, the earliest one decides. Live runs ask it through
+    scanner.filter_markets_closing_far_enough (the markets the time-series
+    finder may pair) and through main._run_prod's add-on step (the held
+    pairs and lone legs a run may add to). Sales and trims never ask it.
+
+    Args:
+        closes: Each market's close (a tz-aware datetime), or None when unknown, in any iterable.
+        now (datetime): The moment the bot looks (tz-aware, any zone).
+        min_days (int | None): The fewest days, or None for no minimum.
+
+    Returns:
+        bool: True when there is no minimum, or every close is known and on or after now + min_days.
+
+    Raises:
+        ValueError: When `now` has no time zone (a caller's mistake).
+    """
+    if min_days is None:
+        return True
+    if now.tzinfo is None:
+        raise ValueError("closes_far_enough needs a tz-aware now")
+    # In UTC, so a day is always 24 hours, even across a clock change
+    cutoff = now.astimezone(UTC) + timedelta(days=min_days)
+    moments = list(closes)
+    return bool(moments) and all(
+        isinstance(close, datetime) and close.tzinfo is not None and close >= cutoff
+        for close in moments)
 
 
 # ── Trimming a held pair to its Kelly size ────────────────────────────────────
