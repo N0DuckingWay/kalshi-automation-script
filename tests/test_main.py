@@ -345,11 +345,31 @@ class TestNoPairsMsg:
             # A run that searched names the same filter
             assert "category/tag filter" in main._no_pairs_msg(settings=filtered)
 
+    @pytest.mark.parametrize("days", [3, 7, 14])
+    def test_skip_if_closing_within_is_named_only_when_set(self, days):
+        # "Skip if closing within" alone can empty the list: named with its own
+        # days when set, after the time-series rule and before any category/tag
+        # filter, and nowhere when off or when the finder was not asked
+        plain = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+                             size_cap=0.2)
+        on = dataclasses.replace(plain, buy_min_days_to_close=days)
+        clause = f" — and both markets closing at least {days} days after this run"
+        assert "closing at least" not in main._no_pairs_msg(settings=plain)
+        msg = main._no_pairs_msg(settings=on)
+        assert msg == main._no_pairs_msg(settings=plain)[:-2] + clause + ")."
+        assert main._no_pairs_msg(sandbox=True, settings=on).endswith(clause + ").")
+        filtered = dataclasses.replace(on, exclude_categories=("Economics",))
+        assert (f"{clause} — among pairs filed under the run's category/tag filter "
+                f"({config.describe_trade_filter(filtered)})") in main._no_pairs_msg(
+                    settings=filtered)
+        assert main._no_pairs_msg(settings=on, time_series_searched=False) == (
+            main._no_pairs_msg(settings=plain, time_series_searched=False))
+
 
 @pytest.fixture
 def pinned_config_toggles(monkeypatch, _isolate_live_defaults):
     """
-    Pin the eleven live toggles and save them as this test's live defaults.
+    Pin the twelve live toggles and save them as this test's live defaults.
 
     Through conftest's apply_pre_toggle_defaults, the one definition of their
     values, then save_config_live_defaults into the test's own path (requested
@@ -911,6 +931,89 @@ class TestLiveSettingsFlags:
         assert "--rebalance-min-days-to-maturity" in err
         assert "--no-rebalance-min-days-to-maturity" in err
 
+    @pytest.mark.parametrize("mode", ["dev", "prod"])
+    @pytest.mark.parametrize("argv, saved, expected", [
+        # Given over saved off and over saved days; 0 is off, like the twin flag
+        (["--buy-min-days-to-close", "3"], None, 3),
+        (["--buy-min-days-to-close", "7"], None, 7),
+        (["--buy-min-days-to-close", "14"], 7, 14),
+        (["--buy-min-days-to-close", "0"], 7, None),
+        (["--no-buy-min-days-to-close"], 14, None),
+        (["--no-buy-min-days-to-close"], None, None),
+        # No flag keeps the saved value, and so do the rebalance and sell switches
+        ([], 3, 3),
+        ([], None, None),
+        (["--no-rebalance", "--no-sell"], 14, 14),
+    ])
+    def test_the_skip_if_closing_flags_lay_over_the_saved_days(
+        self, monkeypatch, mode, argv, saved, expected,
+    ):
+        _save_live_defaults(buy_min_days_to_close=saved)
+        seen = _main_with(monkeypatch, ["--mode", mode, *argv])
+        assert seen["code"] == EXIT_OK and seen["mode"] == mode
+        settings, reference = seen["settings"], seen["reference"]
+        assert reference.buy_min_days_to_close == saved
+        assert settings.buy_min_days_to_close == expected
+        assert settings.buy_min_days_to_close is None or (
+            type(settings.buy_min_days_to_close) is int)
+        # Nothing else moved (the saved defaults neither rebalance nor sell)
+        for other in config.LIVE_TOGGLE_FIELDS:
+            if other != "buy_min_days_to_close":
+                assert getattr(settings, other) == getattr(reference, other), other
+
+    def test_a_saved_file_without_the_setting_runs_at_seven_days_unless_a_flag_says(
+        self, monkeypatch,
+    ):
+        # A file saved before "Skip if closing within" existed has no key for
+        # it: a run reads 7 days, and a flag still moves it, marked against 7
+        saved = _save_live_defaults()
+        record = json.loads(config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8"))
+        del record["settings"]["buy_min_days_to_close"]
+        config.LIVE_DEFAULTS_FILE.write_text(json.dumps(record), encoding="utf-8")
+        kept = _main_with(monkeypatch, ["--mode", "prod"])
+        assert kept["reference"] == dataclasses.replace(saved, buy_min_days_to_close=7)
+        assert kept["settings"] == kept["reference"]
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--no-buy-min-days-to-close"])
+        assert seen["reference"].buy_min_days_to_close == 7
+        assert seen["settings"].buy_min_days_to_close is None
+        line = describe_live_settings(seen["settings"], seen["reference"])
+        assert line.endswith("skip if closing within off (default: 7 days)")
+        assert line.count("(default:") == 1
+
+    @pytest.mark.parametrize("value", ["5", "1", "2", "21", "-7", "100"])
+    def test_a_skip_if_closing_value_off_the_menu_is_a_usage_error(
+        self, monkeypatch, capsys, value,
+    ):
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--buy-min-days-to-close", value])
+        assert seen["code"] == 2
+        # Refused before logging, the client and either run mode
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "settings" not in seen
+        err = capsys.readouterr().err
+        assert "(--buy-min-days-to-close):" in err, err
+        assert (f"buy_min_days_to_close must be 3, 7 or 14 days, or 0 for off, "
+                f"got {value}") in err, err
+
+    @pytest.mark.parametrize("value", ["7.0", "1.5", "week", "7d"])
+    def test_a_fractional_or_non_numeric_skip_value_is_a_usage_error(
+        self, monkeypatch, capsys, value,
+    ):
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--buy-min-days-to-close", value])
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "invalid int value" in capsys.readouterr().err
+
+    def test_the_skip_if_closing_flag_and_its_off_twin_are_mutually_exclusive(
+        self, monkeypatch, capsys,
+    ):
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--buy-min-days-to-close", "7",
+                                        "--no-buy-min-days-to-close"])
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        err = capsys.readouterr().err
+        assert "not allowed with argument" in err, err
+        assert "--buy-min-days-to-close" in err and "--no-buy-min-days-to-close" in err
+
     def test_no_flag_hands_the_run_the_saved_defaults_themselves(self, monkeypatch):
         # The scheduler's exact argv (tests/test_scheduler.py pins it)
         seen = _main_with(monkeypatch, ["--mode", "prod"])
@@ -1297,6 +1400,7 @@ class TestLiveSettingsFlags:
                      "--no-min-price-move", "--rebalance-min-days-to-maturity",
                      "--no-rebalance-min-days-to-maturity",
                      "--sell-at", "--no-sell", "--sell-min-days", "--no-sell-min-days",
+                     "--buy-min-days-to-close", "--no-buy-min-days-to-close",
                      "--exclude-category", "--no-exclude-category", "--exclude-tag", "--no-exclude-tag"):
             assert flag in out, flag
         # None of the flags the rebalance flags replaced is left, nor the
@@ -1305,8 +1409,19 @@ class TestLiveSettingsFlags:
                      "--same-title-size-cap"):
             assert gone not in out, gone
         # Every value flag defaults to the saved live defaults, never a config.py constant
-        assert out.count("default: the saved live defaults") == 12
-        assert out.count("whatever the saved live defaults say") == 6
+        assert out.count("default: the saved live defaults") == 13
+        assert out.count("whatever the saved live defaults say") == 7
+        # "Skip if closing within" names its four choices from the one tuple,
+        # what it never holds back, and what a file without it reads as
+        skip_help = ("Skip if closing within N days: buy a pair, or add to a held one, "
+                     "only when every market it would buy stops trading at least N days "
+                     "(24-hour spans) after this run looks: 0 = off, or 3, 7 or 14. Never "
+                     "holds back a sale or a trim (default: the saved live defaults; a "
+                     "saved file that leaves it out reads 7)")
+        assert skip_help in out
+        assert config.BUY_MIN_DAYS_TO_CLOSE_CHOICES == (0, 3, 7, 14)
+        assert ("Buy this run however soon a market stops trading, whatever the saved "
+                "live defaults say") in out
         # The days to maturity name their three choices from the one grid, and say
         # what they need and what --no-rebalance does to them
         days_help = ("Rebalance (trim or add to) a held position only while its later "
@@ -1455,6 +1570,8 @@ class TestLogLiveSettings:
             "rebalance until 7 days before maturity (default: maturity)"),
         "sell_at": (["--sell-at", "85"], "sell at 85% of potential profit (default: off)"),
         "sell_min_days": (["--sell-min-days", "3"], "min days to maturity 3 (default: any)"),
+        "buy_min_days_to_close": (["--buy-min-days-to-close", "3"],
+                                  "skip if closing within 3 days (default: off)"),
     }
     # Extra saved defaults a flag needs: a minimum of days needs a sell level,
     # a minimum price move and days to maturity need rebalancing on
@@ -4244,7 +4361,20 @@ class TestLiveSettingsReachEverySite:
     time-series pairs trading (at its k of 0.6 the TS pair's Kelly fraction sits
     between 0.25 and the 0.35 per-trade cap, above config.py's pinned 20% cap,
     and the main pair's own Kelly fraction is above 0.35, so that cap binds it)
-    and turns rebalancing on; both seller planners get the run's settings too."""
+    and turns rebalancing on; both seller planners get the run's settings too.
+    Its "Skip if closing within" is 3 days, the shortest choice that differs
+    from the pinned off. The replay's markets close on fixed dates (_CLOSE,
+    2026-12-01, and _CLOSE_LATE), so main's clock is pinned (_MOMENT) well
+    before them, and no run here reads today's date."""
+
+    # 30 days before the earlier markets close: every "Skip if closing within"
+    # choice passes every market of the replay
+    _MOMENT = datetime.fromisoformat(_CLOSE) - timedelta(days=30)
+
+    @pytest.fixture(autouse=True)
+    def _pinned_clock(self, monkeypatch):
+        """Pin main's clock to _MOMENT for every test of the class."""
+        monkeypatch.setattr(main, "datetime", _Clock(self._MOMENT))
 
     _SETTINGS = LiveSettings(tier_floors=False, spread_band=(0.05, 0.9),
                              interval_discount=0.6, size_cap=0.35,
@@ -4252,7 +4382,7 @@ class TestLiveSettingsReachEverySite:
                              exclude_tags=("Hockey", "sports · soccer"),
                              rebalance=True,
                              min_price_move=0.10, rebalance_min_days_to_maturity=7,
-                             sell_at=0.85, sell_min_days=3)
+                             sell_at=0.85, sell_min_days=3, buy_min_days_to_close=3)
 
     # The cached /series listing: the TS pair's series (EVT) and the main
     # pair's (MAINEVT) under categories _SETTINGS keeps, the tick pair's under
@@ -4535,18 +4665,18 @@ class TestLiveSettingsReachEverySite:
 
         # pre_execution_check swallows exceptions — so none may have happened
         assert "Pre-execution check raised" not in caplog.text
-        # The run named its rule, its settings (all eleven marked) and the
+        # The run named its rule, its settings (all twelve marked) and the
         # lifted time-series exposure, and no other pair type's
         assert ("Time-series entry rule: "
                 + config.describe_time_series_rule(False, (0.05, 0.9))) in caplog.text
         echo = f"Live settings: {describe_live_settings(settings, reference)}"
-        assert echo in caplog.text and echo.count("(config:") == 11
+        assert echo in caplog.text and echo.count("(config:") == 12
         assert "This PRODUCTION run overrides" not in caplog.text
         assert "one time-series pair may stake up to 35%" in caplog.text
         assert "same-title pair may stake" not in caplog.text
         # The workbook's separator row carries the same marked line
         assert captured["run_note"] == f"settings: {describe_live_settings(settings, reference)}"
-        assert captured["run_note"].count("(config:") == 11
+        assert captured["run_note"].count("(config:") == 12
 
     def test_a_dev_run_handed_its_settings_reads_them_at_every_site(self, monkeypatch, caplog):
         settings, reference, calls, captured = self._run_under_the_tripwire(
@@ -4567,7 +4697,7 @@ class TestLiveSettingsReachEverySite:
         assert ("Time-series entry rule: "
                 + config.describe_time_series_rule(False, (0.05, 0.9))) in caplog.text
         echo = f"Live settings: {describe_live_settings(settings, reference)}"
-        assert echo in caplog.text and echo.count("(config:") == 11
+        assert echo in caplog.text and echo.count("(config:") == 12
         # Dev never submits an order, so never the production WARNING
         assert "This PRODUCTION run overrides" not in caplog.text
 
@@ -4682,6 +4812,16 @@ class TestSavedLiveDefaults:
     # Every toggle differs from the pinned constants; both pairs of the
     # live-shape replay trade under it
     _SAVED = TestLiveSettingsReachEverySite._SETTINGS
+
+    @pytest.fixture(autouse=True)
+    def _pinned_clock(self, monkeypatch):
+        """
+        Pin main's clock well before the replay's fixed market closes.
+
+        _SAVED turns "Skip if closing within" on, so a run that reaches the
+        market filter must not read today's date.
+        """
+        monkeypatch.setattr(main, "datetime", _Clock(TestLiveSettingsReachEverySite._MOMENT))
 
     def _save(self) -> LiveSettings:
         """
@@ -8821,6 +8961,608 @@ class TestRunProdRebalanceUntil:
         assert self._trimmed(seen) == trimmed
 
 
+# A fourth and fifth deadline of the TS-EARLY / TS-LATE question, in events of
+# their own: TS-MID by December 6 (_TS_MID_MARKET above) and TS-LAST by
+# December 16. Neither is held, and together they form a pair on the held
+# TS pair's ladder, which the finder's held-ladder guard refuses
+_TICKER_TS_LAST = "TS-LAST"
+_TS_LAST_MARKET = _mk_market(
+    _TICKER_TS_LAST, "EVT-TS-LAST", "Will Z happen by December 16, 2026?", "Outcome",
+    "0.70", "0.30", price_level_structure="linear_cent", close_time="2026-12-16T00:00:00Z",
+)
+
+
+@pytest.mark.usefixtures("pinned_config_toggles")
+class TestRunProdSkipClosing:
+    """"Skip if closing within" (LiveSettings.buy_min_days_to_close) in whole
+    runs. A pair is bought, and a held pair or lone leg added to, only when
+    both its markets close at least that many 24-hour spans after the moment
+    the run reads the markets; exactly that many passes. Sales and trims are
+    never held back, and a held pair with a market closing too soon reads
+    nothing for an add-on. Off, a market closing tomorrow is bought as
+    before. main's clock is pinned in every run here, each moment set against
+    the fixture markets' fixed closes, so no test reads today's date."""
+
+    # The main pair's earlier market (MAIN-EARLY), the TS pair's (TS-EARLY) and
+    # the tick, shard and held pairs' close at _CLOSE, 2026-12-01 00:00 UTC
+    _EARLY_CLOSE = datetime.fromisoformat(_CLOSE)
+    # 3.5 days before that: the TS pair's earlier market closes too soon for a
+    # 7-day minimum, its later one (2026-12-11) and TS-MID (2026-12-06) do not
+    _NEAR = _EARLY_CLOSE - timedelta(days=4) + timedelta(hours=12)
+
+    @staticmethod
+    def _freeze(monkeypatch, moment: datetime) -> None:
+        """Pin main's clock to `moment`."""
+        monkeypatch.setattr(main, "datetime", _Clock(moment))
+
+    @staticmethod
+    def _fills(moment: datetime, *tickers: str) -> tuple:
+        """
+        The fills listing: each named market last traded ten days before `moment`.
+
+        Args:
+            moment (datetime): The run's pinned moment.
+            *tickers (str): The markets that traded.
+
+        Returns:
+            tuple: _fill_row records; the oldest, on a market no longer held,
+                thirty days before `moment`, so the list reaches back past the wait.
+        """
+        return ((_fill_row("OLD-MKT", moment - timedelta(days=30)),)
+                + tuple(_fill_row(ticker, moment - timedelta(days=10)) for ticker in tickers))
+
+    @staticmethod
+    def _run(monkeypatch, caplog, client, mode: str, **changes) -> tuple:
+        """
+        Run one mode (a production dry run, or a dev run) with these settings.
+
+        Args:
+            monkeypatch (pytest.MonkeyPatch): pytest's per-test patcher.
+            caplog (pytest.LogCaptureFixture): Captures the run's log.
+            client: The live-shape client.
+            mode (str): "prod" or "dev".
+            **changes: LiveSettings fields replaced in the pinned config's toggles.
+
+        Returns:
+            tuple: (exit code, the market tickers each time-series finder call
+                read, and the tickers of each trade's markets A and B, in the
+                order the run traded or simulated them).
+        """
+        searched: list = []
+        real_ts = main.find_time_series_pairs
+
+        def ts_spy(*args, **kwargs):
+            # (client, blocked tickers, markets) in prod; markets by keyword in dev
+            markets = kwargs["markets"] if "markets" in kwargs else args[2]
+            searched.append([m.ticker for m in markets])
+            return real_ts(*args, **kwargs)
+
+        captured: dict = {"results": []}
+
+        def fake_log(results, balance_before, balance_after, *, run_note="", sales=()):
+            if not sales:
+                captured["results"] = results
+            return pathlib.Path("/fake/trade_log.xlsx")
+
+        def fake_simulation(results, candidates, balance_cents):
+            captured["results"] = results
+            return pathlib.Path("/fake/dev_sim.xlsx")
+
+        monkeypatch.setattr(main, "find_time_series_pairs", ts_spy)
+        monkeypatch.setattr(main, "append_to_prod_log", fake_log)
+        monkeypatch.setattr(main, "write_dev_simulation", fake_simulation)
+        reference = live_settings()
+        settings = dataclasses.replace(reference, **changes)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            if mode == "prod":
+                code = main._run_prod(client, _args(dry_run=True), settings, reference)
+            else:
+                code = main._run_dev(
+                    client, SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None),
+                    settings, reference)
+        traded = [(r.spec.pair.market_a.ticker, r.spec.pair.market_b.ticker)
+                  for r in captured["results"]]
+        return code, searched, traded
+
+    @staticmethod
+    def _filter_lines(caplog) -> list:
+        """The run's "Skip if closing within" filter lines."""
+        return [m for m in _messages(caplog) if m.startswith("Skip if closing within")]
+
+    @staticmethod
+    def _no_pairs_line(caplog) -> str:
+        """The run's one "No qualifying pairs found" line."""
+        [line] = [m for m in _messages(caplog) if m.startswith("No qualifying pairs found")]
+        return line
+
+    @pytest.mark.parametrize("mode", ["prod", "dev"])
+    @pytest.mark.parametrize("days_left, bought", [(7, True), (6, False)],
+                             ids=["7 days", "6 days"])
+    def test_a_pair_closing_in_six_days_is_not_bought_and_one_in_seven_is(
+            self, monkeypatch, caplog, mode, days_left, bought):
+        # The main pair's earlier market closes exactly 7, or 6, days after the moment
+        moment = self._EARLY_CLOSE - timedelta(days=days_left)
+        self._freeze(monkeypatch, moment)
+        client = _live_shape_client(monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD)
+        code, searched, traded = self._run(monkeypatch, caplog, client, mode,
+                                           buy_min_days_to_close=7)
+        assert code == EXIT_OK
+        main_pair = (_TICKER_MAIN_EARLY, _TICKER_MAIN_LATE)
+        assert (main_pair in traded) is bought
+        # The cutoff is the moment plus 7 x 24 hours. A production run reads the
+        # filter after HELD-A, which the account holds, is dropped; a dev run
+        # holds nothing
+        total = 7 if mode == "prod" else 8
+        cutoff = (moment + timedelta(days=7)).isoformat(timespec="seconds")
+        # 6 days before, only the four markets closing on 2026-12-11 are kept
+        kept = total if bought else 4
+        assert self._filter_lines(caplog) == [
+            f"Skip if closing within 7 days: kept {kept} of {total} markets closing on or "
+            f"after {cutoff} (0 with no readable close)"]
+        [markets] = searched
+        if bought:
+            assert _TICKER_MAIN_EARLY in markets
+            assert "No qualifying pairs found" not in caplog.text
+        else:
+            # Every market closing on 2026-12-01 is left out of the finder's list,
+            # so the run ends on its no-pairs line, naming the rule
+            assert not {_TICKER_MAIN_EARLY, _TICKER_TICK_A, _TICKER_SHARD_A,
+                        _TICKER_HELD_A} & set(markets)
+            assert _TICKER_MAIN_LATE in markets
+            assert traded == []
+            line = self._no_pairs_line(caplog)
+            assert " — and both markets closing at least 7 days after this run)." in line
+            assert ("in sandbox" in line) is (mode == "dev")
+        # The rule is on the run's "Live settings:" line, marked as departing
+        [line] = [m for m in _messages(caplog) if m.startswith("Live settings:")]
+        assert "skip if closing within 7 days (config: off)" in line
+
+    @pytest.mark.parametrize("mode", ["prod", "dev"])
+    def test_off_a_market_closing_tomorrow_is_bought(self, monkeypatch, caplog, mode):
+        # The main pair's earlier market closes a day after the moment. With the
+        # setting off nothing is held back and no filter line is logged; at 3
+        # days, the shortest choice, the same pair is not bought
+        self._freeze(monkeypatch, self._EARLY_CLOSE - timedelta(days=1))
+        main_pair = (_TICKER_MAIN_EARLY, _TICKER_MAIN_LATE)
+        for days, bought in ((None, True), (3, False)):
+            client = _live_shape_client(monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD)
+            code, searched, traded = self._run(monkeypatch, caplog, client, mode,
+                                               buy_min_days_to_close=days)
+            assert code == EXIT_OK
+            assert (main_pair in traded) is bought, days
+            assert (_TICKER_MAIN_EARLY in searched[0]) is bought, days
+            assert bool(self._filter_lines(caplog)) is (days is not None)
+            [line] = [m for m in _messages(caplog) if m.startswith("Live settings:")]
+            assert ("skip if closing within off" in line) is (days is None)
+
+    def test_off_a_live_run_sends_the_orders_of_a_pair_closing_tomorrow(self, monkeypatch,
+                                                                        caplog):
+        # A live (not dry-run) production run with the setting off, as the
+        # pinned config.py's toggles have it: the main pair, whose earlier
+        # market closes a day after the moment, is sent
+        self._freeze(monkeypatch, self._EARLY_CLOSE - timedelta(days=1))
+        code, results, sent, _positions = TestRunProdAddsToHeldPairsLive._run(
+            monkeypatch, caplog, add_on=False, held=None)
+        assert code == EXIT_OK
+        assert {_TICKER_MAIN_EARLY, _TICKER_MAIN_LATE} <= {b["ticker"] for b in sent}
+        assert any(r.spec.pair.market_a.ticker == _TICKER_MAIN_EARLY
+                   and r.status == "executed" for r in results)
+        assert not self._filter_lines(caplog)
+        assert "skip if closing within off" in caplog.text
+
+    def test_an_add_on_near_close_reads_nothing_while_the_sale_goes_out(self, monkeypatch,
+                                                                       caplog):
+        """
+        A live run with a sell level, rebalancing and a 7-day minimum, 3.5
+        days before the held TS pair's earlier market closes. The sellable
+        pair, whose markets close 2 and 3 days after the moment, is sold all
+        the same: the rule never holds back a sale. The TS pair is not added
+        to, and nothing is read for it: no fills list (the add-on wait's only
+        read here, since Kalshi values the positions at $0 and no trim is
+        planned), no candles of its markets, and the add-on planner is handed
+        nothing. Its markets stay blocked. With the setting off, the same run
+        reads the fills and adds to the pair.
+        """
+        moment = self._NEAR
+        held = _SELL_ROWS + _HELD_TS_PAIR
+        sell_closes = tuple((moment + timedelta(days=d)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                            for d in (2, 3))
+        ts_key = frozenset((_TICKER_TS_EARLY, _TICKER_TS_LATE))
+        real_add_ons = main.plan_add_ons
+        # What each run handed the add-on planner
+        handed: list = []
+
+        def add_ons_spy(client_, pairs, by_ticker, **kwargs):
+            handed.append(dict(pairs))
+            return real_add_ons(client_, pairs, by_ticker, **kwargs)
+
+        monkeypatch.setattr(main, "plan_add_ons", add_ons_spy)
+        for days in (7, None):
+            self._freeze(monkeypatch, moment)
+            exchange = _SellExchange(
+                monkeypatch, held_rows=held, before={**_LIVE_BALANCE_PAYLOAD, "portfolio_value": 0},
+                after=_AFTER_SALE_BALANCE, include_time_series=True, sell_closes=sell_closes,
+                fill_rows=self._fills(moment, *(row["ticker"] for row in held)))
+            exchange.now = moment
+            handed.clear()
+            code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
+                                              sell_at=0.80, rebalance=True,
+                                              buy_min_days_to_close=days)
+            assert code == EXIT_OK, _messages(caplog)[-5:]
+            messages = _messages(caplog)
+            sales, buys = exchange.orders()
+            # The take-profit sale goes out either way, though its markets close within 7 days
+            assert [(b["ticker"], b["count"]) for b in sales] == [
+                (_TICKER_SELL_EARLY, "30.00"), (_TICKER_SELL_LATE, "30.00")]
+            assert [r.status for r in report.sales] == ["sold"]
+            fills_read = [e for e in exchange.events if e[0] == "fills"]
+            [(_blocked, markets, add_on_pairs)] = seen["ts"]
+            if days == 7:
+                assert ("Not adding to 1 held pair(s) and 0 lone leg(s) this run: a held "
+                        "market of each closes within 7 days, or its close cannot be read "
+                        "(\"Skip if closing within\")") in messages
+                assert handed == [{}] and add_on_pairs == {}
+                assert fills_read == []
+                assert not any(m.startswith("Add-on check:") for m in messages)
+                # Only the sold pair's candles were read, for the take-profit checks
+                assert {e[1] for e in exchange.events if e[0] == "candles"} == _SELL_TICKERS
+                # The TS pair's markets stay out of the finder, and nothing is bought:
+                # every market left closes on 2026-12-01, too soon
+                assert not markets & set(ts_key)
+                assert buys == []
+            else:
+                # Control: off, the add-on planner is handed the pair and reads the
+                # fills for its wait, and the pair is added to
+                assert set(handed[0]) == {ts_key} and set(add_on_pairs) == {ts_key}
+                assert fills_read
+                assert any(m.startswith("Add-on check: YES TS-EARLY / NO TS-LATE")
+                           for m in messages)
+                assert {_TICKER_TS_EARLY, _TICKER_TS_LATE} <= {b["ticker"] for b in buys}
+                assert not any(m.startswith("Not adding to 1 held pair(s)") for m in messages)
+
+    def test_a_trim_still_goes_out_for_pairs_closing_within_the_days(self, monkeypatch,
+                                                                     caplog):
+        # TestRunProdRebalanceUntil's run (a production dry run through main(),
+        # rebalancing at a 10% cap), with a 14-day minimum set by its flag: the
+        # sellable pair, whose markets close 2.5 and 4.5 days after the moment
+        # (3 and 5 days after its date), and the TS pair (9.5 days) are both
+        # trimmed as without it, while nothing closing within 14 days is bought
+        until = TestRunProdRebalanceUntil()
+        _exchange, seen, code = until._run(monkeypatch, caplog,
+                                           ["--buy-min-days-to-close", "14"])
+        assert code == EXIT_OK
+        messages = _messages(caplog)
+        assert "Pairs to trim this run: 2 of 2" in messages
+        assert until._trimmed(seen) == [(_TICKER_SELL_EARLY, 19), (_TICKER_TS_EARLY, 14)]
+        assert any(m.startswith("Skip if closing within 14 days: kept ") for m in messages)
+        assert self._no_pairs_line(caplog).endswith(
+            " — and both markets closing at least 14 days after this run).")
+        assert ("skip if closing within 14 days (default: off)"
+                in until._settings_line(caplog))
+
+    def test_a_held_pair_held_back_frees_no_new_pair_on_its_later_market(self, monkeypatch,
+                                                                         caplog):
+        """
+        The account holds the TS pair (YES TS-EARLY, NO TS-LATE) on a ladder
+        that also lists TS-MID (2026-12-06) and TS-LAST (2026-12-16), neither
+        held. 3.5 days before TS-EARLY closes, under a 7-day minimum, the pair
+        is not added to, so TS-EARLY and TS-LATE both stay blocked: no
+        candidate pair is formed on TS-LATE, and the finder's held-ladder
+        guard refuses the one pair the ladder's other rungs form (TS-MID /
+        TS-LAST). With the setting off, the held pair is added to and the
+        guard still refuses every other pair on the ladder.
+        """
+        moment = self._NEAR
+        ladder = {_TICKER_TS_EARLY, _TICKER_TS_MID, _TICKER_TS_LATE, _TICKER_TS_LAST}
+        adds = TestRunProdAddsToHeldPairs()
+        real_filter = main._filter_by_category
+        # The time-series finder's candidates, as the category/tag filter gets them
+        formed: list = []
+
+        def filter_spy(pairs, settings_, listing_client, **kwargs):
+            formed.extend((p.market_a.ticker, p.market_b.ticker) for p in pairs)
+            return real_filter(pairs, settings_, listing_client, **kwargs)
+
+        monkeypatch.setattr(main, "_filter_by_category", filter_spy)
+        for days in (7, None):
+            self._freeze(monkeypatch, moment)
+            client = adds._client(
+                monkeypatch, extra_events=(_ev("TS Event", _TS_MID_MARKET),
+                                           _ev("TS Event", _TS_LAST_MARKET)),
+                fill_rows=self._fills(moment, _TICKER_HELD_A, _TICKER_TS_EARLY,
+                                      _TICKER_TS_LATE))
+            formed.clear()
+            caplog.clear()
+            results, seen = adds._dry_run(client, monkeypatch, caplog, add_on=True,
+                                          buy_min_days_to_close=days)
+            [(blocked, markets)] = seen["blocked"]
+            refused = ("Time-series candidates refused because one of their markets is on a "
+                       "ladder we already hold (counted before every other check): ")
+            if days == 7:
+                assert seen["ts"] == [{}]
+                assert {_TICKER_TS_EARLY, _TICKER_TS_LATE} <= blocked
+                assert not markets & {_TICKER_TS_EARLY, _TICKER_TS_LATE}
+                assert {_TICKER_TS_MID, _TICKER_TS_LAST} <= markets
+                # No candidate on the ladder, TS-LATE's included, reaches the
+                # filter, and the guard refused TS-MID / TS-LAST
+                assert not [pair for pair in formed if set(pair) & ladder]
+                assert f"{refused}1" in _messages(caplog)
+                assert results == []
+            else:
+                key = frozenset((_TICKER_TS_EARLY, _TICKER_TS_LATE))
+                assert [set(pairs) for pairs in seen["ts"]] == [{key}]
+                # The one candidate formed on the ladder is the add-on itself
+                assert [pair for pair in formed if set(pair) & ladder] == [
+                    (_TICKER_TS_EARLY, _TICKER_TS_LATE)]
+                assert any(m.startswith(refused) for m in _messages(caplog))
+                assert ((_TICKER_TS_EARLY, _TICKER_TS_LATE)
+                        in {(r.spec.pair.market_a.ticker, r.spec.pair.market_b.ticker)
+                            for r in results})
+
+    def test_a_lone_legs_new_partner_closing_too_soon_is_not_bought(self, monkeypatch,
+                                                                    caplog):
+        """
+        NO is held on the Dec 20 rung alone (its Dec 13 partner paid out). 6
+        days before the Dec 13 rung closes, under a 7-day minimum, the lone
+        leg itself passes (it closes in 13 days) and is handed to the finder,
+        but its new partner, the Dec 13 rung, is left out of the finder's list,
+        so no pair is bought beside it; Dec 20 / Dec 27 would buy YES on Dec
+        20, against the held side, so none is. With the setting off, the run
+        buys YES on Dec 13 beside the held NO on Dec 20.
+        """
+        l13, l20, l27 = _LADDER_TICKERS
+        moment = datetime(2026, 12, 7, tzinfo=UTC)
+        lone = ({"ticker": l20, "position_fp": "-30.00",
+                 "market_exposure_dollars": "18.00", "fees_paid_dollars": "0.50"},)
+        books = {**_ORDERBOOK_PAYLOADS, **_LADDER_BOOKS}
+        real_ts = main.find_time_series_pairs
+        # What each run handed the finder (its add-on keys and market tickers),
+        # and the trades it simulated
+        handed: list = []
+        captured: dict = {}
+
+        def ts_spy(*args, add_on_pairs=None, **kwargs):
+            handed.append((set(add_on_pairs), {m.ticker for m in args[2]}))
+            return real_ts(*args, add_on_pairs=add_on_pairs, **kwargs)
+
+        def fake_log(results, balance_before, balance_after, *, run_note="", sales=()):
+            if not sales:
+                captured["results"] = results
+            return pathlib.Path("/fake/trade_log.xlsx")
+
+        monkeypatch.setattr(main, "find_time_series_pairs", ts_spy)
+        monkeypatch.setattr(main, "append_to_prod_log", fake_log)
+        for days in (7, None):
+            self._freeze(monkeypatch, moment)
+            client = _live_shape_client(
+                monkeypatch, balance_payload={**_LIVE_BALANCE_PAYLOAD, "portfolio_value": 1_800},
+                include_held_position=False, extra_events=_LADDER_EVENTS, main_pair=False,
+                held_rows=lone, fill_rows=self._fills(moment, l20))
+            client.get_market_orderbook_without_preload_content = MagicMock(
+                side_effect=lambda ticker: _raw_json_response(books.get(
+                    ticker, {"orderbook_fp": {"yes_dollars": [], "no_dollars": []}})))
+            # A run that trims reads the settlements for a lone leg's paid-out
+            # partner; there is none, so the lone leg is not trimmed
+            client.get_settlements_without_preload_content = MagicMock(
+                return_value=_raw_json_response({"settlements": [], "cursor": None}))
+            handed.clear()
+            captured["results"] = []
+            reference = live_settings()
+            settings = dataclasses.replace(reference, rebalance=True,
+                                           buy_min_days_to_close=days)
+            caplog.clear()
+            with caplog.at_level(logging.INFO):
+                code = main._run_prod(client, _args(dry_run=True), settings, reference)
+            assert code == EXIT_OK
+            [(add_on_keys, markets)] = handed
+            # The lone leg passes the add-on step either way: its own market closes in 13 days
+            assert add_on_keys == {frozenset((l20,))}
+            traded = {(r.spec.pair.market_a.ticker, r.spec.pair.market_b.ticker)
+                      for r in captured["results"]}
+            if days == 7:
+                assert l13 not in markets and {l20, l27} <= markets
+                assert traded == set()
+                assert not any(m.startswith("Not adding to") and "lone leg" in m
+                               for m in _messages(caplog))
+            else:
+                assert l13 in markets
+                assert traded == {(l13, l20)}
+
+    # The add-on step's line for a held pair or lone leg it takes out
+    _NOT_ADDING = ("Not adding to {pairs} held pair(s) and {lone} lone leg(s) this run: a held "
+                   "market of each closes within 7 days, or its close cannot be read "
+                   "(\"Skip if closing within\")")
+
+    @classmethod
+    def _add_on_step_runs(cls, monkeypatch, caplog, make_client, moment: datetime) -> dict:
+        """
+        Run a production dry run with rebalancing on, under a 7-day minimum and then off.
+
+        Each run gets a fresh client from make_client, on main's clock pinned
+        to `moment`, through TestRunProdAddsToHeldPairs' dry run, with a spy
+        on the add-on planner (seller.plan_add_ons, as main binds it).
+
+        Args:
+            monkeypatch (pytest.MonkeyPatch): pytest's per-test patcher.
+            caplog (pytest.LogCaptureFixture): Captures each run's log.
+            make_client (Callable[[], MagicMock]): Builds one run's client.
+            moment (datetime): The run's pinned moment.
+
+        Returns:
+            dict: 7 and None (the setting) -> a dict with "handed" (what each
+                planner call was handed, as a dict), "fills" (how many times
+                the account's fills list was read), "seen" (the dry run's
+                record of the finder's inputs) and "messages" (the run's log).
+        """
+        real_add_ons = main.plan_add_ons
+        handed: list = []
+
+        def add_ons_spy(client_, pairs, by_ticker, **kwargs):
+            handed.append(dict(pairs))
+            return real_add_ons(client_, pairs, by_ticker, **kwargs)
+
+        monkeypatch.setattr(main, "plan_add_ons", add_ons_spy)
+        runs: dict = {}
+        for days in (7, None):
+            cls._freeze(monkeypatch, moment)
+            client = make_client()
+            handed.clear()
+            caplog.clear()
+            _results, seen = TestRunProdAddsToHeldPairs._dry_run(
+                client, monkeypatch, caplog, add_on=True, buy_min_days_to_close=days)
+            # Copied now: the next run's spies call through this run's, so they
+            # would add that run's calls to these lists
+            runs[days] = {"handed": list(handed),
+                          "fills": client.get_fills_without_preload_content.call_count,
+                          "seen": {name: list(calls) for name, calls in seen.items()},
+                          "messages": _messages(caplog)}
+        return runs
+
+    def test_a_lone_leg_closing_too_soon_is_not_added_to_and_reads_nothing(self, monkeypatch,
+                                                                           caplog):
+        """
+        NO is held on the Dec 13 rung alone (its partner paid out), and the
+        run looks 6 days before that rung closes, under a 7-day minimum. The
+        add-on step judges a lone leg's own held market, so it takes the lone
+        leg out: one line counting it as a lone leg, the add-on planner is
+        handed nothing, no fills list is read (Kalshi values the positions at
+        $0, so no trim reads one either) and the rung stays blocked. With the
+        setting off, the planner is handed the lone leg and reads the fills.
+        """
+        l13, _l20, _l27 = _LADDER_TICKERS
+        moment = datetime(2026, 12, 7, tzinfo=UTC)
+        key = frozenset((l13,))
+        lone = ({"ticker": l13, "position_fp": "-30.00",
+                 "market_exposure_dollars": "24.00", "fees_paid_dollars": "0.50"},)
+        books = {**_ORDERBOOK_PAYLOADS, **_LADDER_BOOKS}
+
+        def make_client():
+            client = _live_shape_client(
+                monkeypatch, balance_payload={**_LIVE_BALANCE_PAYLOAD, "portfolio_value": 0},
+                include_held_position=False, extra_events=_LADDER_EVENTS, main_pair=False,
+                held_rows=lone, fill_rows=self._fills(moment, l13))
+            client.get_market_orderbook_without_preload_content = MagicMock(
+                side_effect=lambda ticker: _raw_json_response(books.get(
+                    ticker, {"orderbook_fp": {"yes_dollars": [], "no_dollars": []}})))
+            return client
+
+        runs = self._add_on_step_runs(monkeypatch, caplog, make_client, moment)
+        on, off = runs[7], runs[None]
+        # Found as a lone leg either way, before the step
+        for run in (on, off):
+            assert any(m.startswith(f"Held market to add to (its partner has paid out): NO {l13}")
+                       for m in run["messages"])
+        assert self._NOT_ADDING.format(pairs=0, lone=1) in on["messages"]
+        assert on["handed"] == [{}] and on["seen"]["ts"] == [{}]
+        assert on["fills"] == 0
+        [(blocked, markets)] = on["seen"]["blocked"]
+        assert l13 in blocked and l13 not in markets
+        # Control: off, the planner is handed the lone leg and reads the fills for its wait
+        assert [set(pairs) for pairs in off["handed"]] == [{key}]
+        assert off["fills"] >= 1
+        assert not any(m.startswith("Not adding to 0 held pair(s)") for m in off["messages"])
+
+    def test_a_held_pair_missing_from_the_market_list_is_not_added_to(self, monkeypatch,
+                                                                      caplog):
+        """
+        The account holds YES on TS-EARLY and NO on TS-MID, 30 contracts
+        each: an exact pair. TS-MID is closed but not yet paid out, so the
+        run's market list lacks it; the run looks it up to learn its ladder
+        (and that lookup says it closes 15 days later), but the add-on step
+        reads each held market's close from the run's list only, where TS-MID
+        has none. So under a 7-day minimum, 10 days before TS-EARLY closes,
+        the pair is taken out: one line counting it as a held pair, the
+        add-on planner is handed nothing and no fills list is read. With the
+        setting off, the planner is handed the pair and reads the fills.
+        """
+        moment = self._EARLY_CLOSE - timedelta(days=10)
+        key = frozenset((_TICKER_TS_EARLY, _TICKER_TS_MID))
+        held = ({"ticker": _TICKER_TS_EARLY, "position_fp": "30.00",
+                 "market_exposure_dollars": "9.00", "fees_paid_dollars": "0.45"},
+                {"ticker": _TICKER_TS_MID, "position_fp": "-30.00",
+                 "market_exposure_dollars": "16.50", "fees_paid_dollars": "0.50"})
+
+        def make_client():
+            client = TestRunProdAddsToHeldPairs()._client(
+                monkeypatch, positions_value=0, held_rows=held, include_held_position=False,
+                fill_rows=self._fills(moment, _TICKER_TS_EARLY, _TICKER_TS_MID))
+            client.get_market_without_preload_content = MagicMock(
+                return_value=_raw_json_response({"market": {**_TS_MID_MARKET,
+                                                             "status": "closed"}}))
+            client.get_event_without_preload_content = MagicMock(
+                return_value=_raw_json_response({"event": {"event_ticker": "EVT-TS-MID",
+                                                           "title": "TS Event"}}))
+            return client
+
+        runs = self._add_on_step_runs(monkeypatch, caplog, make_client, moment)
+        on, off = runs[7], runs[None]
+        for run in (on, off):
+            # TS-MID was looked up, and the two held markets form one exact pair
+            assert any("(1 looked up because this run's market list did not have them)" in m
+                       for m in run["messages"])
+            assert any(m.startswith("Held pair to add to: YES TS-EARLY / NO TS-MID")
+                       for m in run["messages"])
+        assert self._NOT_ADDING.format(pairs=1, lone=0) in on["messages"]
+        assert on["handed"] == [{}] and on["seen"]["ts"] == [{}]
+        assert on["fills"] == 0
+        [(blocked, markets)] = on["seen"]["blocked"]
+        assert key <= blocked and _TICKER_TS_EARLY not in markets
+        # Control: off, the planner is handed the pair and reads the fills for its wait
+        assert [set(pairs) for pairs in off["handed"]] == [{key}]
+        assert off["fills"] >= 1
+        assert not any(m.startswith("Not adding to 1 held pair(s)") for m in off["messages"])
+
+    @pytest.mark.parametrize("mode", ["prod", "dev"])
+    @pytest.mark.parametrize("horizon, days, warned", [
+        (5, 7, "below"), (13, 14, "below"), (2, 3, "below"),
+        (7, 7, "equal"), (14, 14, "equal"), (3, 3, "equal"),
+        (8, 7, None), (30, 7, None), (5, None, None), (None, 7, None)],
+        ids=["5 under 7", "13 under 14", "2 under 3", "7 at 7", "14 at 14", "3 at 3",
+             "8 over 7", "30 over 7", "5, off", "no horizon"])
+    def test_a_horizon_at_or_below_the_minimum_warns_and_runs_on(self, monkeypatch, caplog,
+                                                                 mode, horizon, days, warned):
+        # Below the minimum no market can pass both filters; at the minimum
+        # only one closing in the short gap between the run reading the
+        # markets and applying the horizon can, so both warn. A dev run makes
+        # no sale or trim, so only a production run's warning mentions them
+        argv = ["--mode", mode]
+        if horizon is not None:
+            argv += ["--max-horizon-days", str(horizon)]
+        argv += (["--buy-min-days-to-close", str(days)] if days is not None
+                 else ["--no-buy-min-days-to-close"])
+        logged_from: list = []
+
+        def record_logging(path):
+            # Where the log stood when logging was set up
+            logged_from.append(len(caplog.records))
+
+        with caplog.at_level(logging.INFO):
+            out = _main_with(monkeypatch, argv, _setup_logging=record_logging)
+        # A warning, never a refusal: the run mode is called as always
+        assert out["code"] == EXIT_OK and out["mode"] == mode
+        assert out["settings"].buy_min_days_to_close == days
+        lines = [(i, r) for i, r in enumerate(caplog.records)
+                 if r.getMessage().startswith("--max-horizon-days")]
+        if warned is None:
+            assert lines == []
+            return
+        [(index, record)] = lines
+        assert record.levelno == logging.WARNING
+        assert index >= logged_from[0]
+        if warned == "below":
+            why = (f"is below this run's \"Skip if closing within\" of {days} days: no "
+                   f"market closes within {horizon} days and also at least {days} days "
+                   "after this run, so it buys nothing")
+        else:
+            why = (f"equals this run's \"Skip if closing within\" of {days} days: a market "
+                   f"must close at least {days} days after this run reads the markets and "
+                   f"at most {horizon} days after it applies the horizon, a little later, "
+                   "so it buys next to nothing")
+        tail = " (its sales and trims are not held back)" if mode == "prod" else ""
+        assert record.getMessage() == f"--max-horizon-days {horizon} {why}{tail}"
+
+
 class TestLiveRebalanceTextsSayWhatARunDoes:
     """The docs and docstrings must describe what a rebalancing run does: one
     setting, rebalance, both trims held pairs and adds to them; a pair trimmed
@@ -11477,7 +12219,7 @@ class TestResultFile:
 
 def _other_toggles(target: LiveSettings) -> LiveSettings:
     """
-    Build live defaults that differ from target in every one of the eleven toggles.
+    Build live defaults that differ from target in every one of the twelve toggles.
 
     All but two cases: a target that rebalances with no minimum price move, or
     with no days to maturity, meets defaults that do not rebalance, and so hold
@@ -11508,6 +12250,9 @@ def _other_toggles(target: LiveSettings) -> LiveSettings:
         # --no-sell-min-days to win over them
         sell_at=0.5 if target.sell_at != 0.5 else 0.6,
         sell_min_days=2 if target.sell_min_days != 2 else 3,
+        # Skipping 3 days (off for a target of 3), so a target that skips
+        # nothing needs --no-buy-min-days-to-close to win over it
+        buy_min_days_to_close=3 if target.buy_min_days_to_close != 3 else None,
     )
     for name in config.LIVE_TOGGLE_FIELDS:
         if name == "min_price_move" and target.rebalance and target.min_price_move is None:
@@ -11581,6 +12326,15 @@ _ARGV_TARGETS = {
         tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
         size_cap=0.2, rebalance=True, min_price_move=0.10,
         rebalance_min_days_to_maturity=7, sell_at=0.85, sell_min_days=3),
+    # "Skip if closing within": the shortest and longest choices, beside
+    # rebalancing and selling; off is every target above but the seed (7 days)
+    "skipping-if-closing-within-3-days": LiveSettings(
+        tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+        size_cap=0.1, buy_min_days_to_close=3),
+    "skipping-if-closing-within-14-days-rebalancing-and-selling": LiveSettings(
+        tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+        size_cap=0.2, rebalance=True, rebalance_min_days_to_maturity=7,
+        sell_at=0.85, sell_min_days=3, buy_min_days_to_close=14),
 }
 
 
@@ -11638,13 +12392,40 @@ class TestLiveSettingsArgv:
         else:
             assert args.sell_min_days == target.sell_min_days
             assert args.no_sell_min_days is None
+        # "Skip if closing within" is given either way: its days or the flag that
+        # turns it off, so a saved value (a file without it reads 7) never decides it
+        if target.buy_min_days_to_close is None:
+            assert (args.buy_min_days_to_close is None
+                    and args.no_buy_min_days_to_close is True)
+        else:
+            assert args.buy_min_days_to_close == target.buy_min_days_to_close
+            assert args.no_buy_min_days_to_close is None
 
     def test_the_seed_is_spelled_flag_by_flag(self):
         assert config.live_settings_argv(config.LIVE_DEFAULTS_SEED) == [
             "--no-tier-floors", "--spread-min=0.0", "--spread-max=0.5",
             "--interval-discount=0.8", "--size-cap=10",
             "--rebalance", "--no-min-price-move", "--no-rebalance-min-days-to-maturity",
-            "--no-sell", "--no-sell-min-days", "--no-exclude-category", "--no-exclude-tag"]
+            "--no-sell", "--no-sell-min-days", "--buy-min-days-to-close=7",
+            "--no-exclude-category", "--no-exclude-tag"]
+
+    @pytest.mark.parametrize("days, spelled", [
+        (None, "--no-buy-min-days-to-close"), (3, "--buy-min-days-to-close=3"),
+        (7, "--buy-min-days-to-close=7"), (14, "--buy-min-days-to-close=14")])
+    def test_skip_if_closing_within_is_spelled_after_the_sell_flags(self, days, spelled):
+        # One flag, right after the sell flags and before the filters, read
+        # back by main's parser over saved defaults that hold another value
+        target = dataclasses.replace(config.LIVE_DEFAULTS_SEED, buy_min_days_to_close=days)
+        argv = config.live_settings_argv(target)
+        at = argv.index("--no-sell-min-days")
+        assert argv[at:at + 3] == ["--no-sell-min-days", spelled, "--no-exclude-category"]
+        assert len([flag for flag in argv if "buy-min-days-to-close" in flag]) == 1
+        saved = config.save_live_defaults(_other_toggles(target), source="")
+        parser = main._build_parser()
+        settings, reference = main._resolve_live_settings(
+            parser.parse_args(["--mode", "prod", *argv]), parser)
+        assert settings == target and settings.buy_min_days_to_close == days
+        assert reference == saved and reference.buy_min_days_to_close != days
 
     @pytest.mark.parametrize("target", _ARGV_TARGETS.values(), ids=_ARGV_TARGETS.keys())
     def test_no_flag_names_the_same_title_cap(self, target):

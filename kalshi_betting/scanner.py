@@ -77,6 +77,9 @@ Dependencies:
     ask as this run's market list shows it). pair_log_name names a pair in
     the WARNING that refuses it for not being time-series, here and in
     strategy.compute_trade and strategy.select_portfolio.
+    filter_markets_closing_far_enough applies "Skip if closing within" to the
+    market list both run modes hand the time-series finder, through
+    config.closes_far_enough, the rule's one definition.
     Depends on the KalshiClient produced by auth.py.
 
 Notes:
@@ -193,6 +196,7 @@ from .config import (
     TIME_SERIES_LEG_SIDES,
     TIME_SERIES_SAME_EVENT_LADDERS,
     LiveSettings,
+    closes_far_enough,
     confirmed_fee_multiplier,
     describe_time_series_rule,
     fee_per_pair_approx,
@@ -2824,6 +2828,73 @@ def filter_markets_within_horizon(markets: list, max_horizon_days: int | None) -
         cutoff.isoformat(timespec="seconds"), max_horizon_days,
     )
     return within_horizon
+
+
+def filter_markets_closing_far_enough(markets: list, settings: LiveSettings, *,
+                                      now: datetime) -> list:
+    """
+    Keep the markets this run may buy: those closing at least the setting's days after now.
+
+    "Skip if closing within" (LiveSettings.buy_min_days_to_close): a pair, new
+    or an add-on, is bought only when both its markets stop trading (close)
+    at least that many 24-hour spans after the moment the run looks.
+    main._run_prod and _run_dev call it on the list the time-series finder
+    reads, after sales, trims, held ladders and add-on planning have used the
+    full list, so it holds back new pairs and add-ons only, never a sale or a
+    trim. Each market is judged by config.closes_far_enough, the one
+    definition of the rule, on its close_time; a market whose close_time is
+    missing or has no time zone is dropped, and counted apart in the log line.
+    Those markets then never reach the finder, so its WARNING about markets
+    with no close_time (_filter_active_markets) cannot count them; this filter
+    logs one WARNING with their count instead, silent at zero, so a Kalshi
+    reply that stops sending close times still shows among the run's warnings.
+
+    Args:
+        markets (list): ApiMarket objects.
+        settings (LiveSettings): The run's settings (no default: every caller passes the run's).
+        now (datetime): Keyword-only. The moment the run looks (tz-aware).
+
+    Returns:
+        list: markets unchanged when the setting is off (and nothing is
+            logged), else the markets that pass, in their order, with one
+            INFO line saying how many were kept, and one WARNING when any
+            market was left out because its close could not be read.
+
+    Raises:
+        ValueError: When the setting is on, a market is judged and `now` has
+            no time zone (config.closes_far_enough).
+    """
+    min_days = settings.buy_min_days_to_close
+    if min_days is None:
+        return markets
+    kept = []
+    unreadable = 0
+    for m in markets:
+        close = getattr(m, "close_time", None)
+        # Counted for the log lines only; closes_far_enough below decides
+        if not (isinstance(close, datetime) and close.tzinfo is not None):
+            unreadable += 1
+        # Cross-module: the one test of "Skip if closing within", which main's
+        # add-on step asks of the held markets too
+        if closes_far_enough((close,), now, min_days):
+            kept.append(m)
+    # The earliest close kept, as closes_far_enough reckons it (in UTC, so a
+    # day is 24 hours), written to the second as the horizon filter's line is
+    cutoff = now.astimezone(UTC) + timedelta(days=min_days)
+    logging.info(
+        "Skip if closing within %d days: kept %d of %d markets closing on or after %s "
+        "(%d with no readable close)",
+        min_days, len(kept), len(markets), cutoff.isoformat(timespec="seconds"), unreadable,
+    )
+    if unreadable:
+        # A WARNING, so it reaches the run result's warnings, as the finder's
+        # missing-close WARNING does when the setting is off
+        logging.warning(
+            "Left out %d market(s) because their close time could not be read, so this run "
+            "buys nothing on them (\"Skip if closing within\" needs each market's close)",
+            unreadable,
+        )
+    return kept
 
 
 def _nonnegative_decimal(raw: Any) -> Decimal | None:

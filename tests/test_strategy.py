@@ -3281,6 +3281,7 @@ class TestTimeSeriesKellyParity:
             "REBALANCE_MIN_DAYS_TO_MATURITY",
             "SELL_AT",
             "SELL_MIN_DAYS",
+            "BUY_MIN_DAYS_TO_CLOSE",
         } | self._SAVED_FILE_INTERNALS
         # Every toggle constant config.live_settings() builds the toggles from is
         # forbidden, one per toggle, so a toggle added there cannot slip past
@@ -3358,7 +3359,8 @@ class TestTimeSeriesKellyParity:
                 "_evaluate_size", "_solve_marginal_size", "_kelly_p",
                 "_compute_trade_specs", "_no_pairs_msg", "_log_live_settings",
                 "describe_live_settings", "live_rule_warnings", "_filter_by_category",
-                "describe_trade_filter"} <= set(takes_settings)
+                "describe_trade_filter", "filter_markets_closing_far_enough"} <= set(
+                    takes_settings)
         # _kelly_p_at's k is required: a default would price at config's k
         kelly_p_at = next(n for n in ast.walk(trees["strategy"])
                           if isinstance(n, ast.FunctionDef) and n.name == "_kelly_p_at")
@@ -5525,6 +5527,101 @@ class TestTimeSeriesKellyParity:
         callers = {func.name for func in ast.walk(tree) if isinstance(func, ast.FunctionDef)
                    and _calls_to(func, "_too_near_maturity")}
         assert callers == {"plan_trims", "plan_add_ons"}
+
+    def test_ast_skip_if_closing_within_decides_through_one_definition(self):
+        # "Skip if closing within": the market filter both run modes hand the
+        # time-series finder, and _run_prod's add-on step, decide through
+        # config.closes_far_enough, the one definition of the rule, with the
+        # run's own value of the setting and the run's one moment. The filter
+        # sits below every sale, trim, ladder and add-on read of the full
+        # market list, after the held-market drop and the horizon cap and
+        # before the finder, which reads the filtered list itself, so it holds
+        # back purchases only
+        assert scanner.closes_far_enough is config.closes_far_enough
+        assert main.closes_far_enough is config.closes_far_enough
+        assert main.filter_markets_closing_far_enough is scanner.filter_markets_closing_far_enough
+        assert _function_calls(scanner, "filter_markets_closing_far_enough",
+                               "closes_far_enough")
+        tree = ast.parse(inspect.getsource(main))
+        funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                 and n.name in ("_run_prod", "_run_dev")}
+        for name, func in funcs.items():
+            # The moment, taken once, right after the market fetch
+            moments = [n for n in ast.walk(func) if isinstance(n, ast.Assign)
+                       and [ast.unparse(t) for t in n.targets] == ["looked_at"]]
+            assert [ast.unparse(n.value) for n in moments] == ["datetime.now(UTC)"], name
+            [fetch] = _calls_to(func, "fetch_open_events_with_markets")
+            assert fetch.lineno < moments[0].lineno, name
+            # The filter: once, with the run's bare `settings` and that moment,
+            # after the horizon cap and before the finder
+            [filt] = _calls_to(func, "filter_markets_closing_far_enough")
+            assert [ast.unparse(a) for a in filt.args] == ["markets", "settings"], name
+            assert {k.arg: ast.unparse(k.value) for k in filt.keywords} == {
+                "now": "looked_at"}, name
+            [horizon] = _calls_to(func, "filter_markets_within_horizon")
+            [finder] = _calls_to(func, "find_time_series_pairs")
+            assert moments[0].lineno < horizon.lineno < filt.lineno < finder.lineno, name
+            # ... and its result is the list the finder reads: assigned to
+            # `markets`, handed to the finder as that bare name (prod: its
+            # third positional argument; dev: its `markets` keyword), and
+            # assigned nowhere in between
+            [assigned] = [n for n in ast.walk(func) if isinstance(n, ast.Assign)
+                          and n.value is filt]
+            assert [ast.unparse(t) for t in assigned.targets] == ["markets"], name
+            if name == "_run_dev":
+                handed = {k.arg: k.value for k in finder.keywords}.get("markets")
+            else:
+                handed = finder.args[2] if len(finder.args) > 2 else None
+            assert isinstance(handed, ast.Name) and handed.id == "markets", name
+            rebound = [n.lineno for n in ast.walk(func) if isinstance(n, ast.Name)
+                       and n.id == "markets" and isinstance(n.ctx, (ast.Store, ast.Del))
+                       and assigned.end_lineno < n.lineno < finder.lineno]
+            assert rebound == [], name
+        prod = funcs["_run_prod"]
+        [filt] = _calls_to(prod, "filter_markets_closing_far_enough")
+        # Below the held-market drop, and every read of the full list
+        [drop] = [n for n in ast.walk(prod) if isinstance(n, ast.Assign)
+                  and [ast.unparse(t) for t in n.targets] == ["markets"]
+                  and "blocked_tickers" in ast.unparse(n.value)]
+        assert drop.lineno < filt.lineno
+        for callee in ("resolve_held_ladders", "plan_sales", "plan_trims", "sell_positions",
+                       "held_pairs", "plan_add_ons"):
+            assert all(call.lineno < filt.lineno for call in _calls_to(prod, callee)), callee
+        # The add-on step: once, after held_pairs builds what the run may add to
+        # and before the at-cap drop, the sale drops and plan_add_ons, with
+        # each held market's close from the full list, the run's moment and
+        # the run's own value of the setting
+        [step] = _calls_to(prod, "closes_far_enough")
+        [pairs] = _calls_to(prod, "held_pairs")
+        [add_ons] = _calls_to(prod, "plan_add_ons")
+        [cap] = _calls_to(prod, "held_pair_fraction")
+        assert pairs.lineno < step.lineno < cap.lineno < add_ons.lineno
+        assert [ast.unparse(a) for a in step.args[1:]] == [
+            "looked_at", "settings.buy_min_days_to_close"]
+        assert "markets_by_ticker" in ast.unparse(step.args[0])
+        assert not step.keywords
+        # ... whose verdict takes pairs out of add_on_pairs before the planner reads it
+        drops = [n for n in ast.walk(prod) if isinstance(n, ast.Assign)
+                 and [ast.unparse(t) for t in n.targets] == ["add_on_pairs"]
+                 and "closing" in {x.id for x in ast.walk(n.value) if isinstance(x, ast.Name)}]
+        assert len(drops) == 1 and step.lineno < drops[0].lineno < add_ons.lineno
+        # The setting's value comes only from the run's settings: no rule site
+        # names a constant of it (its default or its choices), so off can never
+        # read as 7. main names them only in the flag help (_build_parser)
+        for module, allowed in ((main, {"_build_parser"}), (scanner, set())):
+            module_tree = ast.parse(inspect.getsource(module))
+            for func in ast.walk(module_tree):
+                if not isinstance(func, ast.FunctionDef):
+                    continue
+                named = {n.id for n in ast.walk(func) if isinstance(n, ast.Name)
+                         and n.id.startswith("BUY_MIN_DAYS_TO_CLOSE")}
+                if func.name not in allowed:
+                    assert not named, (module.__name__, func.name, named)
+        for func_name in ("_run_prod", "_run_dev", "_no_pairs_msg", "main"):
+            reads = {ast.unparse(n) for n in ast.walk(_def_named(inspect.getsource(main),
+                                                                func_name))
+                     if isinstance(n, ast.Attribute) and n.attr == "buy_min_days_to_close"}
+            assert reads <= {"settings.buy_min_days_to_close"}, (func_name, reads)
 
     def test_ast_the_backtest_reads_ladders_through_the_one_definition(self):
         # The backtest's one-open-trade-per-ladder rule labels each market

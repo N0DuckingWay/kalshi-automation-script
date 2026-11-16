@@ -101,6 +101,7 @@ Short forms, so every session has them. The full text, with the reasons and the 
 - Keep live selling failing closed: a sale's count is the plan's, never a position read; its reply is read by `_sale_fill_count`, never `_v2_fill_status`; the order is sent once; `_sale_limit` rounds the YES ask up and the NO's YES bid down; the rule's arithmetic stays in the shared functions; sales come before purchases, and the markets sold stay out of every purchase.
 - Keep live trimming failing closed: size a trim on the checked positions value, take its count from the plan, and trim nothing while an order rests on the account.
 - Count the rebalance wait only with `config.rebalance_rested`, from one last-trade day per path; a missing fill never reads as rested, and a price move (up or down alike) is tested only with `config.price_move_reached`.
+- Apply "Skip if closing within" only through `config.closes_far_enough`, with its value read only from `settings.buy_min_days_to_close`, to purchases only (new pairs and add-ons), below every sale and trim in `_run_prod`, failing closed; a test that runs a live run mode with it on pins main's clock.
 - Do not import `trader.py` from `scanner.py` or `strategy.py`.
 - Write output files only under `PROJECT_ROOT` (the one exception is the machine-wide live-run lock, `~/.kalshi_betting/live_run.lock`, which must never move under `PROJECT_ROOT`: every checkout shares it, or two real-money runs could trade at once).
 - Run `tests/test_scanner.py::TestNormalizeTitle` after any change to `_DATE_PATTERNS`.
