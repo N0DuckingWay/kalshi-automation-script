@@ -47,6 +47,11 @@ Dependencies:
     live module calls either except through config's own live helpers, and
     TestLiveBacktestSpreadParity pins _find_entry to the live spread rule),
     plus BUDGET_FRACTION (bound by value),
+    closes_far_enough (the one test of "Skip if closing within", shared with
+    live runs; _find_entry asks it at each Monday checkpoint) with
+    BUY_MIN_DAYS_TO_CLOSE_DEFAULT (bound by value: the rule's main value,
+    which _resolve_buy_min_days_to_close reads when a run names none) and
+    BUY_MIN_DAYS_TO_CLOSE_CHOICES (the days a run may name),
     pair_size_cap (one definition, shared with live sizing),
     held_pair_fraction (the one definition of an add-on's size, shared with
     live sizing), LiveSettings (one per simulation, handed to the live
@@ -321,6 +326,22 @@ Notes:
     UTC dates, so _prepare_candidates() refuses, before fetching, a schedule
     whose run does not fall once on its own UTC date (ScheduledRun.date_problems).
 
+    "Skip if closing within" (a live setting the backtest applies too) holds
+    back a purchase whose markets stop trading too soon. _find_entry skips a
+    Monday checkpoint that falls less than the run's minimum of days (24-hour
+    spans) before either leg's close, through config.closes_far_enough, the
+    test live runs ask; an earlier qualifying Monday of the same pair still
+    enters. Every backtest purchase (a new pair, an add-on, a re-buy) comes
+    from those Mondays, so the rule covers them all, and it never touches a
+    sale or a trim. Each leg is judged on _buy_rule_close: the scheduled
+    close a live run would have read where one is carried, else the start
+    (00:00 UTC) of the last day its wording includes. It never reads the
+    close Kalshi recorded, since a market whose event happened early closed
+    early, and judging it on that close would let the backtest read the
+    outcome. A leg with neither is never bought. The run's minimum is
+    config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT unless backtest.py names another
+    (_resolve_buy_min_days_to_close).
+
     Before grouping, _prepare_candidates() filters markets through
     _can_ever_enter(), a cheap per-market PREFILTER that drops only markets no
     entry checkpoint can reach, given Kalshi's observed candle behaviour (that
@@ -410,6 +431,8 @@ from .config import (
     BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS,
     BACKTEST_VOLUME_SHARE_WINDOW_SECONDS,
     BUDGET_FRACTION,
+    BUY_MIN_DAYS_TO_CLOSE_CHOICES,
+    BUY_MIN_DAYS_TO_CLOSE_DEFAULT,
     CANDLE_NO_ASK_CEILING,
     CANDLESTICK_FETCH_MAX_WORKERS,
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
@@ -444,6 +467,7 @@ from .config import (
     _names_text,
     _rebalance_until_text,
     _step_cap,
+    closes_far_enough,
     confirmed_fee_multiplier,
     days_left_reached,
     days_to_maturity,
@@ -2481,7 +2505,8 @@ class _Candidates:
     different ladder-flag ARGUMENT than _extract_pairs was handed (the DR-73c
     agreement rule: a pair the ladder rule admitted must be ordered and
     tiered by that same rule). _entries_for_band reads them from here and
-    takes none of them as arguments.
+    takes none of them as arguments, and reads the run's "Skip if closing
+    within" minimum (buy_min_days_to_close) from here the same way.
 
     The ladder flag is stored UNRESOLVED, which bounds that last guarantee:
     when it is None, _extract_pairs and every later _find_entry call each
@@ -2571,6 +2596,12 @@ class _Candidates:
         extra_data_report (ExtraDataReport | None): What the side data says
             about the pairs, as counts (report only); None on a hand-built
             instance.
+        buy_min_days_to_close (int | None): The "Skip if closing within"
+            minimum this run applies, in days
+            (_resolve_buy_min_days_to_close: the default or the run's
+            override); None with the rule off, and on a hand-built instance.
+            _entries_for_band hands it to every _find_entry call, like the
+            start date and the horizon.
     """
     all_pairs: list
     candles_by_ticker: dict
@@ -2588,6 +2619,7 @@ class _Candidates:
     stale_quote_max_age: float | None = None
     max_volume_share: float | None = None
     extra_data_report: ExtraDataReport | None = None
+    buy_min_days_to_close: int | None = None
 
 
 def _fee_multiplier_of(market: dict, fee_multipliers: dict | None) -> float:
@@ -4394,6 +4426,10 @@ class BacktestSweep:
             Reporting only: this run's own points never sell.
         live_sell_min_days (int | None): Their minimum of days before
             maturity; None for no minimum (or not recorded).
+        live_buy_min_days_to_close (int | None): Their "Skip if closing
+            within" days (3, 7 or 14); None for off (or not recorded).
+            Reporting only: this run applied its own minimum
+            (buy_min_days_to_close).
         entry_checkpoint (str | None): SCHEDULED_RUN.label() of the schedule
             the entry checkpoints were placed by (e.g. "Monday 09:00
             America/Los_Angeles"), for the dashboard header. None = not
@@ -4433,6 +4469,13 @@ class BacktestSweep:
             a sale may take (the resolved config.BACKTEST_MAX_VOLUME_SHARE,
             or backtest.py's override); False when the cap was off; None =
             not recorded (a hand-built sweep).
+        buy_min_days_to_close (int | bool | None): The "Skip if closing
+            within" days every entry pass of the run applied: a pair was
+            bought only at a Monday checkpoint at least that many days
+            before both its markets closed (the resolved
+            config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT, or backtest.py's override);
+            False when the rule was off; None = not recorded (a hand-built
+            sweep). Both production constructions record it.
         extra_data_report (ExtraDataReport | None): What the pair markets'
             side data says against the pairing rules, the integrity checks'
             failures, the candle anomalies and how many pair markets use a
@@ -4470,6 +4513,8 @@ class BacktestSweep:
     live_rebalance_min_days_to_maturity: int | None = None
     live_sell_at: float | None = None
     live_sell_min_days: int | None = None
+    # The saved live defaults' "Skip if closing within" days (None: off or not recorded)
+    live_buy_min_days_to_close: int | None = None
     # The dashboard's "Sell" family, lazy (None unless run_backtest_sweep(sell_sweep=True))
     sell_sweep: SellSweep | None = None
     # The depth model the trades' synthetic books came from (None: top of the book)
@@ -4482,6 +4527,8 @@ class BacktestSweep:
     stale_quote_max_age: float | bool | None = None
     # The volume cap's share (False: the cap was off; None: not recorded)
     max_volume_share: float | bool | None = None
+    # "Skip if closing within" days (False: the rule was off; None: not recorded)
+    buy_min_days_to_close: int | bool | None = None
     # What the side data says about the pairs, as counts (None: not recorded)
     extra_data_report: ExtraDataReport | None = None
 
@@ -5229,6 +5276,47 @@ def _resolve_stale_quote_max_age(value: Any = None) -> float | None:
         raise ValueError("the stale-quote limit must be a positive, finite number of "
                          f"seconds, None or False, got {value!r}")
     return float(value)
+
+
+def _resolve_buy_min_days_to_close(value: Any = None) -> int | None:
+    """
+    The "Skip if closing within" minimum a run applies, in days, or None when the rule is off.
+
+    A run's minimum can come from three places (the default, an override
+    such as backtest.py's --buy-min-days-to-close, or False for
+    --no-buy-min-days-to-close); this picks the one that applies and checks
+    it once, before the hour-long fetch, so a bad value stops the run at
+    once. The days must be one of config.BUY_MIN_DAYS_TO_CLOSE_CHOICES, a
+    real int as LiveSettings holds them: a bool, a float such as 7.0 or a
+    numpy integer is refused.
+
+    Args:
+        value (Any): None (the default) reads THIS MODULE's binding of
+            config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT at call time (itself None, or
+            0, to turn the rule off); False or 0 turns it off for this run;
+            another of the choices sets it for this run.
+
+    Returns:
+        int | None: The days, or None for no minimum.
+
+    Raises:
+        ValueError: For True, a float, a numpy integer, or a number that is
+            not one of the choices (the binding's value too).
+    """
+    if value is None:
+        value = BUY_MIN_DAYS_TO_CLOSE_DEFAULT
+        if value is None:
+            return None
+    elif value is False:
+        return None
+    # type() is int refuses a bool, a float such as 7.0 and a numpy integer
+    if type(value) is not int or value not in BUY_MIN_DAYS_TO_CLOSE_CHOICES:
+        off, *choices = BUY_MIN_DAYS_TO_CLOSE_CHOICES
+        raise ValueError("\"Skip if closing within\" must be "
+                         f"{', '.join(str(d) for d in choices[:-1])} or {choices[-1]} days, "
+                         f"{off}, None or False for off, got {value!r}")
+    # 0 days is "Off": no minimum
+    return value or None
 
 
 def _share_text(share: float | None) -> str:
@@ -6751,7 +6839,8 @@ def _same_series_dicts(mA: dict, mB: dict) -> bool:
 _SCHEDULED_CLOSE_KEY = "_scheduled_close"
 
 
-def _maturity_close(m: dict, *, as_date: bool = False) -> datetime | date | None:
+def _maturity_close(m: dict, *, as_date: bool = False,
+                    scheduled_only: bool = False) -> datetime | date | None:
     """
     The close a live run would have read for a market: its scheduled close, else its realized one.
 
@@ -6761,6 +6850,11 @@ def _maturity_close(m: dict, *, as_date: bool = False) -> datetime | date | None
     own timing (candle windows, scan end, prefilter, payouts) keeps the
     realized close.
 
+    With scheduled_only, only a carried scheduled close is returned, never
+    the realized close (close_time): _buy_rule_close reads it that way, so
+    "Skip if closing within" never judges a market on the close Kalshi
+    recorded, which for an event that happened early is when it happened.
+
     Known cost: a pair more than 31 days apart by realized close but within
     30 by scheduled close is never visited, so it can only miss trades.
 
@@ -6769,10 +6863,15 @@ def _maturity_close(m: dict, *, as_date: bool = False) -> datetime | date | None
         as_date (bool): Keyword-only. Return the UTC date (the realized
             close's date as _parse_iso_date reads it when no scheduled close
             is carried).
+        scheduled_only (bool): Keyword-only. True returns the carried
+            scheduled close (or its date with as_date) and None when no
+            scheduled close is carried, without ever reading close_time.
+            False (the default) falls back to the realized close.
 
     Returns:
         datetime | date | None: The moment (or its date). None when no
-            scheduled close is carried and close_time cannot be read.
+            scheduled close is carried and close_time cannot be read, and
+            with scheduled_only whenever no scheduled close is carried.
     """
     epoch = m.get(_SCHEDULED_CLOSE_KEY) if isinstance(m, dict) else None
     if isinstance(epoch, int) and not isinstance(epoch, bool):
@@ -6782,6 +6881,9 @@ def _maturity_close(m: dict, *, as_date: bool = False) -> datetime | date | None
             moment = None
         if moment is not None:
             return moment.date() if as_date else moment
+    if scheduled_only:
+        # No scheduled close carried, and the realized one is never read here
+        return None
     raw = m.get("close_time") if isinstance(m, dict) else None
     return _parse_iso_date(raw) if as_date else _parse_iso_datetime(raw)
 
@@ -6841,7 +6943,12 @@ def _stated_deadline_dict(m: dict, profile: tuple) -> date | None:
     The profile is PASSED IN rather than recomputed, because _extract_pairs
     classifies each group member exactly once and compares the cheap results
     pairwise (DR-70). _find_entry, which holds no such memo, is a deliberate
-    bounded exemption — see its own comment.
+    exemption at two sites — see its own comments. Its ladder branch reads
+    both rungs of each same-event pair, bounded by the ladder pair count.
+    With "Skip if closing within" on, _buy_rule_close (through
+    _wording_close) reads both legs' wording on every _find_entry call, for
+    every pair on every pass; that costs about 30 microseconds a call, so
+    seconds over a full run.
 
     Two cache-vs-live field divergences reach this reader, and NEITHER is the
     one-directional guarantee DR-69 gives deadline_profile — that rule holds
@@ -6891,6 +6998,64 @@ def _stated_deadline_dict(m: dict, profile: tuple) -> date | None:
         profile,
         m.get("event_title") or "", m.get("title") or "", m.get("subtitle") or "",
     )
+
+
+def _wording_close(m: dict) -> datetime | None:
+    """
+    The start (00:00 UTC) of the last day a market's wording includes, or None.
+
+    "By Nov 22" includes Nov 22, so this is Nov 22 00:00 UTC. Kalshi almost
+    always closes such a market later than this moment (typically at the end
+    of that day, US Eastern time, early on Nov 23 in UTC), so judging it on
+    this moment is stricter than a live run reading the real close, by the
+    gap from that midnight to the real close. The exception is a market
+    Kalshi lists to close before its wording's last day (a "By Dec 26"
+    market listed to close Dec 21, say): there the backtest can buy closer
+    to the real close than a live run would have, so it can buy what a live
+    run skipped. known-gotchas/backtest-entries.md has how often each
+    happens. Read from the wording alone
+    (scanner.stated_deadline, through _stated_deadline_dict, on the record's
+    own deadline profile), so it is known the day the market is listed and
+    says nothing about how or when it settled. _buy_rule_close falls back to
+    it when no scheduled close is carried.
+
+    Args:
+        m (dict): A market record (the compact historical._market_to_dict form).
+
+    Returns:
+        datetime | None: That day at 00:00 UTC (tz-aware); None when the
+            wording states no single day (scanner.stated_deadline gives none).
+    """
+    # The wording's last included day, by the one definition the live and
+    # backtest ladder rules share (scanner.stated_deadline)
+    last_day = _stated_deadline_dict(m, _deadline_profile_dict(m))
+    if last_day is None:
+        return None
+    return datetime(last_day.year, last_day.month, last_day.day, tzinfo=UTC)
+
+
+def _buy_rule_close(m: dict) -> datetime | None:
+    """
+    The close "Skip if closing within" judges a settled market on.
+
+    The scheduled close where one is carried (_maturity_close with
+    scheduled_only): what a live run read. Otherwise _wording_close, the
+    start of the last day the market's wording includes. Never the close
+    Kalshi recorded (close_time): a market whose event happened early closed
+    early, so judging it on that close would read the outcome and skip a
+    purchase a live run made. _find_entry reads it once per leg per call and
+    hands both to config.closes_far_enough at each Monday checkpoint.
+
+    Args:
+        m (dict): A market record (the compact historical._market_to_dict form).
+
+    Returns:
+        datetime | None: A tz-aware UTC moment; None when no scheduled close
+            is carried and the wording states no single day, and then the
+            pair is not bought.
+    """
+    scheduled = _maturity_close(m, scheduled_only=True)
+    return scheduled if scheduled is not None else _wording_close(m)
 
 
 def _ts_group_key(m: dict) -> str:
@@ -8228,6 +8393,67 @@ def _attach_leg_quotes(records: Iterable[dict], candles_by_ticker: dict,
                       "pay out: %d", _STALE_QUOTE_DAYS, stale_legs)
 
 
+@dataclass
+class _CloseRuleTally:
+    """
+    What "Skip if closing within" removed in one entry pass, counted for the run log.
+
+    _find_entry adds to it, only when handed one and only with the rule on;
+    _entries_for_band hands one to every call of the pass it is counting,
+    and _log_close_rule_tally writes the one line. Reporting only: nothing
+    decides a trade on it.
+
+    Attributes:
+        mondays (int): Qualifying Mondays the rule removed: each passed every
+            other entry check and fell less than the minimum of days (24-hour
+            spans) before a leg's close, or a leg's close could not be read.
+        mondays_on_wording (int): Of those, the Mondays on which every leg
+            that failed the rule was judged on a date read from its wording
+            (it carried no scheduled close), so the removal rests on that
+            date (_wording_close) rather than on a close a live run read.
+        pairs (int): Pairs that lost every qualifying Monday to the rule, so
+            that, without it, they would have entered this pass.
+        pairs_unreadable (int): Of those, the pairs a leg of which had
+            neither a scheduled close nor a readable date in its wording.
+    """
+    mondays: int = 0
+    mondays_on_wording: int = 0
+    pairs: int = 0
+    pairs_unreadable: int = 0
+
+
+def _log_close_rule_tally(tally: _CloseRuleTally, min_days: int,
+                          band: tuple[float, float] | None) -> None:
+    """
+    Log what "Skip if closing within" removed in the run's own entry pass, as one line.
+
+    Called once per run: by _prepare_entries after its pass, and by
+    _sweep_from_candidates after the tier-on bands' passes, with the tally of
+    the primary band's pass (or, when that pass only rescans the pairs the
+    no-band pre-pass let through, of the pre-pass, the one that scanned every
+    pair; the line names the band). Only with the rule on.
+
+    Args:
+        tally (_CloseRuleTally): The counts _find_entry added up.
+        min_days (int): The run's minimum of days.
+        band (tuple[float, float] | None): The band of the counted pass; None
+            names the default band.
+
+    Returns:
+        None
+    """
+    logging.info(
+        "Skip if closing within %d days (backtest), at band %s with the tier floors on: "
+        "removed %d qualifying Monday(s), %d of them on a close read from a market's "
+        "wording (no scheduled close known); %d pair(s) lost every qualifying Monday to "
+        "it, %d of them because a market had neither a scheduled close nor a date in its "
+        "wording",
+        min_days,
+        # None means the default band; label it the way the completion lines do
+        _band_label(time_series_spread_band(band)),
+        tally.mondays, tally.mondays_on_wording, tally.pairs, tally.pairs_unreadable)
+
+
 def _find_entry(
     candles_a: list[dict],
     candles_b: list[dict],
@@ -8240,6 +8466,8 @@ def _find_entry(
     spread_band: tuple[float, float] | None = None,
     *,
     tier_floors: bool = True,
+    min_days_to_close: int | None = None,
+    _skips: _CloseRuleTally | None = None,
 ) -> dict | None:
     """
     Find every Monday on which a potential pair was tradeable at the required threshold.
@@ -8250,7 +8478,9 @@ def _find_entry(
     one-year figure bounds how far back the window can reach, it does not
     describe where the window ends. At each Monday, reads the candlestick
     prices, applies the price gap, price-sum, and fee filters from the live
-    trading logic, and returns the first qualifying Monday's entry data with
+    trading logic, then, with min_days_to_close, skips a Monday less than
+    that many days before either leg's buy-rule close ("Skip if closing
+    within"), and returns the first qualifying Monday's entry data with
     every later qualifying Monday listed under "later". It uses only price
     and date rules — no probability model — so it knows nothing about k or
     the size cap, and one pass per spread band (and tier setting) serves
@@ -8344,6 +8574,19 @@ def _find_entry(
     Scanning stops at the earlier close date (not the later one) because after
     the first market closes, the pair is no longer open for entry.
 
+    "Skip if closing within" (min_days_to_close) is the last test of each
+    Monday, so it removes only Mondays that passed every other one: a Monday
+    whose checkpoint falls less than min_days_to_close days (24-hour spans)
+    before either leg's close is skipped, through config.closes_far_enough,
+    the test live runs ask. `continue`, never `return None`: an earlier
+    qualifying Monday still enters, and the "later" list keeps the Mondays
+    the rule lets through. Each leg is judged on _buy_rule_close (the
+    scheduled close where one is carried, else the start of the last day its
+    wording includes; never the recorded close_time), read once per call; a
+    leg with neither fails every Monday. Both must pass, so the earlier close
+    decides, in whichever order the swap put the legs. The scan window
+    (scan_end) stays on the realized closes: candles exist only until then.
+
     Args:
         candles_a (list[dict]): Market A's hourly price history, oldest first:
             one dict per hour of data with "ts" (the hour's end, Unix seconds)
@@ -8386,6 +8629,14 @@ def _find_entry(
             not applied (the band sweep's tier-floors-off family) — still
             only at a strictly positive spread; True (the default) layers
             the floor on the tier.
+        min_days_to_close (int | None): Keyword-only. "Skip if closing
+            within": the fewest days (24-hour spans) from a Monday's
+            checkpoint to each leg's _buy_rule_close for that Monday to
+            qualify. None (the default) is off; _entries_for_band hands the
+            run's resolved value (_Candidates.buy_min_days_to_close).
+        _skips (_CloseRuleTally | None): PRIVATE, keyword-only. A tally the
+            call adds what the rule removed to, for the run log; None (the
+            default) counts nothing. Never changes the result.
 
     The fee check charges each leg at its own market's fee multiplier
     (_charged_fee_multiplier: what _prepare_candidates wrote on the market
@@ -8407,9 +8658,10 @@ def _find_entry(
             prices and mA/mB (the same market dicts on every Monday, not
             copies) and the same gap_days. () when the pair qualified on one
             Monday only. Read them through _entry_mondays().
-            Returns None if no qualifying Monday was found in the scan window, or
-            if either leg's close_time is missing or unparseable (no scan window
-            can be derived, so the pair is simply not enterable).
+            Returns None if no qualifying Monday was found in the scan window
+            (min_days_to_close may have removed every one), or if either
+            leg's close_time is missing or unparseable (no scan window can be
+            derived, so the pair is simply not enterable).
 
     Raises:
         ValueError: When pair_type is not "time_series" — a caller bug, since
@@ -8550,6 +8802,21 @@ def _find_entry(
     # swap above, so mA is the earlier contract)
     fee_mult_of_a = _charged_fee_multiplier(mA)
     fee_mult_of_b = _charged_fee_multiplier(mB)
+    # "Skip if closing within": the close each leg is judged on, read once
+    # per call and only with the rule on (_buy_rule_close: the scheduled
+    # close where carried, else the start of the last day its wording names,
+    # never the recorded close). Both must pass, so the earlier one decides,
+    # whatever order the swap above chose. Unlike the ladder branch above,
+    # this reads both legs' wording for every pair, on every pass: about 30
+    # microseconds a call, so seconds over a full run
+    buy_closes = ((_buy_rule_close(mA), _buy_rule_close(mB))
+                  if min_days_to_close is not None else ())
+    # For the run log only: which legs' closes were read from their wording
+    # (no scheduled close carried), and what the rule removed in this call
+    from_wording = (tuple(close is not None and _maturity_close(m, scheduled_only=True) is None
+                          for m, close in zip((mA, mB), buy_closes, strict=True))
+                    if _skips is not None and buy_closes else ())
+    removed = removed_on_wording = 0
     # Every qualifying Monday, earliest first (see Returns)
     mondays: list[dict] = []
     # The Mondays to test (SCHEDULED_RUN's weekday), each at its checkpoint
@@ -8563,7 +8830,9 @@ def _find_entry(
     candles_at_a = _candles_at_or_before(candles_a, checkpoints)
     candles_at_b = _candles_at_or_before(candles_b, checkpoints)
     for ts, ca, cb in zip(checkpoints, candles_at_a, candles_at_b, strict=True):
-        entry_date = datetime.fromtimestamp(ts, tz=UTC).date()
+        # This Monday's checkpoint, the moment the backtest looks
+        moment = datetime.fromtimestamp(ts, tz=UTC)
+        entry_date = moment.date()
 
         # Optional horizon cap: skip a Monday when the later of the two closes
         # (as a live run would see them) is more than max_horizon_days away.
@@ -8649,6 +8918,24 @@ def _find_entry(
                 price_a, price_b, multiplier_a=fee_mult_of_a, multiplier_b=fee_mult_of_b):
             continue
 
+        # "Skip if closing within", the last test, so it removes only Mondays
+        # that passed every other one: skip this Monday when a leg closes
+        # less than min_days_to_close 24-hour spans after its checkpoint, or
+        # its close cannot be read. The one test live runs ask too
+        # (config.closes_far_enough); always passes with the rule off.
+        # `continue`, never `return None`, which would drop the earlier
+        # qualifying Mondays already kept
+        if not closes_far_enough(buy_closes, moment, min_days_to_close):
+            if _skips is not None:
+                removed += 1
+                # On a wording date when every leg that failed was judged on
+                # its wording (each leg asked the same test on its own)
+                failed = [i for i, close in enumerate(buy_closes)
+                          if not closes_far_enough((close,), moment, min_days_to_close)]
+                if all(from_wording[i] for i in failed):
+                    removed_on_wording += 1
+            continue
+
         mondays.append({
             "entry_date": entry_date,
             "pA": pA, "pB": pB, "nA": nA, "nB": nB,
@@ -8661,6 +8948,15 @@ def _find_entry(
             "gap_days": gap_days,
         })
 
+    if _skips is not None and removed:
+        # What the rule removed, for the run log (reporting only)
+        _skips.mondays += removed
+        _skips.mondays_on_wording += removed_on_wording
+        if not mondays:
+            # The rule alone kept this pair out of the pass
+            _skips.pairs += 1
+            if None in buy_closes:
+                _skips.pairs_unreadable += 1
     if not mondays:
         return None
     # The first qualifying Monday is the entry itself (the calibration and the
@@ -10124,6 +10420,7 @@ def _prepare_candidates(
     scheduled_close: bool | None = None,
     stale_quote_max_age: Any = None,
     max_volume_share: Any = None,
+    buy_min_days_to_close: Any = None,
 ) -> _Candidates | None:
     """
     Run the half of the backtest that depends on neither the band nor k.
@@ -10193,6 +10490,13 @@ def _prepare_candidates(
             cap off, a share in (0, 1] sets it. Resolved and checked before
             anything is fetched, and carried on the result to every quote
             the entry passes attach.
+        buy_min_days_to_close (Any): Keyword-only. The "Skip if closing
+            within" minimum in days (_resolve_buy_min_days_to_close): None
+            (the default) reads THIS MODULE's BUY_MIN_DAYS_TO_CLOSE_DEFAULT
+            at call time, False or 0 turns the rule off, 3, 7 or 14 (config's
+            BUY_MIN_DAYS_TO_CLOSE_CHOICES) sets it. Resolved and checked
+            before anything is fetched, and carried on the result
+            (_Candidates.buy_min_days_to_close) to every entry pass.
 
     Returns:
         _Candidates | None: The candidate pairs (time-series, in scan
@@ -10227,13 +10531,18 @@ def _prepare_candidates(
             either walk over a streamed corpus whose cache file cannot be
             read, or whose complete walk yields a different record count.
         ValueError: Before any fetch, for a stale-quote limit that is not a
-            positive, finite number of seconds, None or False.
+            positive, finite number of seconds, None or False, a volume cap
+            that is not a share in (0, 1], None or False, or a "Skip if
+            closing within" minimum that is not one of the choices, None or
+            False.
     """
 
     # The stale-quote limit this run trades under, checked before any fetch
     stale_limit = _resolve_stale_quote_max_age(stale_quote_max_age)
     # ... and the volume cap
     volume_share = _resolve_max_volume_share(max_volume_share)
+    # ... and the "Skip if closing within" minimum (None: off)
+    buy_min_days = _resolve_buy_min_days_to_close(buy_min_days_to_close)
     # Feasibility pre-check, BEFORE any network call: if [start_date, today]
     # holds no run weekday, no trade can be entered, so skip the fetch. The
     # end is today, NOT yesterday (a market that settled early can still
@@ -10547,6 +10856,7 @@ def _prepare_candidates(
         stale_quote_max_age=stale_limit,
         max_volume_share=volume_share,
         extra_data_report=extra_data_report,
+        buy_min_days_to_close=buy_min_days,
     )
 
 
@@ -10640,14 +10950,15 @@ def _live_rule_fields(live: LiveSettings | None) -> dict:
     """
     Name the BacktestSweep keywords that record the saved live defaults.
 
-    Both production BacktestSweep constructions spread this, so the twelve
-    fields are recorded together from one read or not at all.
+    Both production BacktestSweep constructions spread this, so the thirteen
+    fields (one per live toggle, and where the defaults were read) are
+    recorded together from one read or not at all.
 
     Args:
         live (LiveSettings | None): _live_settings_for_report()'s result.
 
     Returns:
-        dict: The twelve live_* keywords from live; {} when live is None.
+        dict: The thirteen live_* keywords from live; {} when live is None.
     """
     if live is None:
         return {}
@@ -10657,7 +10968,8 @@ def _live_rule_fields(live: LiveSettings | None) -> dict:
             "live_size_cap": live.size_cap,
             "live_rebalance": live.rebalance, "live_min_price_move": live.min_price_move,
             "live_rebalance_min_days_to_maturity": live.rebalance_min_days_to_maturity,
-            "live_sell_at": live.sell_at, "live_sell_min_days": live.sell_min_days}
+            "live_sell_at": live.sell_at, "live_sell_min_days": live.sell_min_days,
+            "live_buy_min_days_to_close": live.buy_min_days_to_close}
 
 
 # The label a recorded live rule is named with, in the log line and page header
@@ -11038,6 +11350,7 @@ def _entries_for_band(
     *,
     tier_floors: bool = True,
     _pairs: list | None = None,
+    _skips: _CloseRuleTally | None = None,
 ) -> list[dict]:
     """
     Locate each candidate pair's tradeable Mondays under one spread band.
@@ -11061,6 +11374,9 @@ def _entries_for_band(
     extraction and the candle fetch used, and a second copy passed here could
     disagree with them (for the ladder flag, that is the DR-73c inversion —
     a ladder admitted on stated deadlines and then entered on close_time).
+    The run's "Skip if closing within" minimum is read from candidates too
+    (buy_min_days_to_close, resolved once per run), so every pass of a run
+    applies the one value the run resolved.
     The flag is carried UNRESOLVED, so this pass hands _find_entry the same
     ARGUMENT _extract_pairs was handed; when that argument is None each of
     them resolves this module's TIME_SERIES_SAME_EVENT_LADDERS at its own
@@ -11092,6 +11408,11 @@ def _entries_for_band(
             could have produced an entry at this band (see
             _sweep_from_candidates' no-band pre-pass). candidates.all_pairs
             itself is never mutated.
+        _skips (_CloseRuleTally | None): PRIVATE, keyword-only. A tally every
+            _find_entry call of this pass adds what "Skip if closing within"
+            removed to, for the run log; None (the default) counts nothing.
+            _prepare_entries and _sweep_from_candidates hand one to the
+            run's own pass only, and only with the rule on.
 
     Returns:
         list[dict]: One record per time-series pair that produced an entry,
@@ -11140,6 +11461,10 @@ def _entries_for_band(
             spread_band=spread_band,
             # Backtest-only: False drops the deadline-gap tier for this pass
             tier_floors=tier_floors,
+            # "Skip if closing within": the run's one resolved minimum (None: off)
+            min_days_to_close=candidates.buy_min_days_to_close,
+            # What the rule removed, counted for the run log (None: not counted)
+            _skips=_skips,
         )
         if entry is None:
             continue
@@ -11176,6 +11501,7 @@ def _prepare_entries(
     scheduled_close: bool | None = None,
     stale_quote_max_age: Any = None,
     max_volume_share: Any = None,
+    buy_min_days_to_close: Any = None,
 ) -> tuple[list[dict] | None, OutcomeLabelCoverage | None]:
     """
     Run the half of the backtest that does not depend on the interval discount.
@@ -11225,6 +11551,15 @@ def _prepare_entries(
             seconds, handed straight to _prepare_candidates(); None (default)
             resolves BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS there, False turns
             the check off.
+        max_volume_share (Any): Keyword-only. The volume cap's share, handed
+            straight to _prepare_candidates(); None (default) resolves
+            BACKTEST_MAX_VOLUME_SHARE there, False turns the cap off.
+        buy_min_days_to_close (Any): Keyword-only. The "Skip if closing
+            within" minimum in days, handed straight to
+            _prepare_candidates(); None (default) resolves
+            BUY_MIN_DAYS_TO_CLOSE_DEFAULT there, False or 0 turns the rule
+            off. With the rule on, the entry pass's counts of what it
+            removed are logged in one line (_log_close_rule_tally).
 
     Returns:
         tuple[list[dict] | None, OutcomeLabelCoverage | None]: The prepared
@@ -11267,6 +11602,7 @@ def _prepare_entries(
         same_event_ladders=same_event_ladders,
         fee_multipliers=fee_multipliers, scheduled_close=scheduled_close,
         stale_quote_max_age=stale_quote_max_age, max_volume_share=max_volume_share,
+        buy_min_days_to_close=buy_min_days_to_close,
     )
     if candidates is None:
         return None, None
@@ -11277,8 +11613,10 @@ def _prepare_entries(
     # interval discount and is run exactly once, ahead of any sizing. At the
     # default spread band (spread_band=None, which _find_entry resolves to
     # config.BACKTEST_DEFAULT_SPREAD_BAND, i.e. no band), with the tier floors
-    # on, it is the tier rule alone.
-    raw_entries = _entries_for_band(candidates, spread_band=None)
+    # on, it is the tier rule alone. With "Skip if closing within" on, what
+    # it removed is counted for the run log
+    skips = None if candidates.buy_min_days_to_close is None else _CloseRuleTally()
+    raw_entries = _entries_for_band(candidates, spread_band=None, _skips=skips)
     # The prices that value each entry's trades at market while open, taken
     # from the candles before they are released with this function's locals,
     # with the depth model their synthetic books are built from
@@ -11288,6 +11626,9 @@ def _prepare_entries(
 
     logging.info("Prepared %d candidate entries for sizing", len(raw_entries))
     _log_qualifying_mondays(raw_entries, None)
+    if skips is not None:
+        # What "Skip if closing within" removed in this, the run's one pass
+        _log_close_rule_tally(skips, candidates.buy_min_days_to_close, None)
     return raw_entries, candidates.label_coverage
 
 
@@ -13733,6 +14074,7 @@ def run_backtest(
     scheduled_close: bool | None = None,
     stale_quote_max_age: Any = None,
     max_volume_share: Any = None,
+    buy_min_days_to_close: Any = None,
 ) -> tuple[list[BacktestTrade], pd.DataFrame]:
     """
     Replay the time-series pair strategy on all settled Kalshi markets from start_date.
@@ -13751,7 +14093,9 @@ def run_backtest(
          potential pair, in parallel across CANDLESTICK_FETCH_MAX_WORKERS
          threads.                                                   [prepare]
       5. Find every entry checkpoint (config.SCHEDULED_RUN's weekly moment) where
-         the pair was tradeable at the threshold.                   [prepare]
+         the pair was tradeable at the threshold (with "Skip if closing
+         within" on, only those at least that many days before both
+         markets close).                                            [prepare]
       6. Keep each pair's qualifying Mondays that pass the Kelly gate;
          exclude (and count, with one summary WARNING) any candidate whose
          settlement was earlier-YES/later-NO — impossible for a
@@ -13792,6 +14136,15 @@ def run_backtest(
             seconds, handed through _prepare_entries() to
             _prepare_candidates(); None (default) resolves
             BACKTEST_STALE_QUOTE_MAX_AGE_SECONDS there, False turns it off.
+        max_volume_share (Any): Keyword-only. The volume cap's share, handed
+            through _prepare_entries() to _prepare_candidates(); None
+            (default) resolves BACKTEST_MAX_VOLUME_SHARE there, False turns
+            it off.
+        buy_min_days_to_close (Any): Keyword-only. The "Skip if closing
+            within" minimum in days, handed through _prepare_entries() to
+            _prepare_candidates(), which resolves and checks it before
+            anything is fetched; None (default) reads
+            BUY_MIN_DAYS_TO_CLOSE_DEFAULT there, False or 0 turns it off.
 
     Returns:
         tuple[list[BacktestTrade], pd.DataFrame]: (trades, equity_df).
@@ -13806,7 +14159,8 @@ def run_backtest(
     Raises:
         ValueError: Before any fetch, from _prepare_candidates(), when
             SCHEDULED_RUN cannot place the entry checkpoints (a configuration
-            error).
+            error), or for a stale-quote limit, volume cap or "Skip if
+            closing within" minimum it refuses.
         KeyError: Propagates out of the candlestick-fetch pool
             (_fetch_candles_parallel) if a ticker needed by a candidate pair
             was not properly excluded by the eligibility prefilter — this is
@@ -13844,7 +14198,7 @@ def run_backtest(
         hist_client, live_client, start_date, use_cache, max_horizon_days,
         fee_multipliers=fee_multipliers,
         scheduled_close=scheduled_close, stale_quote_max_age=stale_quote_max_age,
-        max_volume_share=max_volume_share,
+        max_volume_share=max_volume_share, buy_min_days_to_close=buy_min_days_to_close,
     )
     if raw_entries is None:
         # Same empty-result shape the zero-trade path produces, so backtest.py
@@ -14331,7 +14685,10 @@ def _sweep_from_candidates(
     produced an entry there — each band's accepted Mondays are a subset of
     the no-band band's (see the comment at the pre-pass), so this changes no
     band's entries and turns every other band's full scan into a rescan of
-    the few pairs that can enter at all. Then the candles and the pair list
+    the few pairs that can enter at all. Every pass applies the run's "Skip
+    if closing within" minimum (candidates.buy_min_days_to_close), and with
+    it on, one line logs what it removed in the run's own pass
+    (_log_close_rule_tally). Then the candles and the pair list
     are released (candidates.candles_by_ticker and candidates.all_pairs are
     deleted) before any simulation runs: nothing after Phase 1 reads either,
     and the simulations are where a band sweep spends its time.
@@ -14506,9 +14863,11 @@ def _sweep_from_candidates(
             (carried from candidates), config_same_event_ladders (the
             configured switch, read beside same_event_ladders's
             resolution), tier_off_scenarios, tier_off_calibrations_by_band,
-            cap_sweep, tier_off_cap_sweep, the twelve
-            live_* fields, entry_checkpoint, sell_sweep, depth_model and
-            rebalance_sweep — see BacktestSweep.
+            cap_sweep, tier_off_cap_sweep, the thirteen
+            live_* fields, entry_checkpoint, sell_sweep, depth_model,
+            rebalance_sweep and the run's settings (scheduled_close,
+            stale_quote_max_age, max_volume_share, buy_min_days_to_close,
+            carried from candidates) — see BacktestSweep.
 
     Raises:
         ValueError: If tier_off_sweep is set without band_sweep (the tier-off
@@ -14571,8 +14930,9 @@ def _sweep_from_candidates(
     #     both YES asks are banded into [0.01, 0.99]);
     #   * everything else — the leg order, the deadline gap and its cap, the
     #     horizon, the candle lookups, the refusal of a spread that is not
-    #     strictly positive, the live-quote checks and the fee check — never
-    #     reads the band.
+    #     strictly positive, the live-quote checks, the fee check and "Skip
+    #     if closing within" (one minimum for the whole run) — never reads
+    #     the band.
     # Float arithmetic keeps each comparison monotone in the threshold, so no
     # float edge can admit at a band what no band refused. A pair that
     # produced NO entry at (0.0, 1.0) therefore produces none at any band, and
@@ -14583,12 +14943,19 @@ def _sweep_from_candidates(
     no_band = time_series_spread_band((0.0, 1.0))
     no_band_entries: list[dict] | None = None
     rescan: list | None = None
+    # With "Skip if closing within" on, what it removed in the run's own pass
+    # is counted for one log line: the primary band's pass, tier floors on,
+    # when it scans every pair (a single-band run, or a primary band that is
+    # the no-band band), else the no-band pre-pass, the one pass that does
+    # (a rescan leaves out the pairs the rule kept from entering there)
+    skips = None if candidates.buy_min_days_to_close is None else _CloseRuleTally()
+    skips_band = no_band if band_sweep else primary_band
     if band_sweep:
         n_ts_pairs = sum(1 for _, pair_type in candidates.all_pairs
                          if pair_type == "time_series")
         logging.info("No-band pre-pass: scanning all %d time-series pairs at %s",
                      n_ts_pairs, _band_label(no_band))
-        no_band_entries = _entries_for_band(candidates, no_band)
+        no_band_entries = _entries_for_band(candidates, no_band, _skips=skips)
         # The pairs that entered at the no-band band, matched on the legs'
         # TICKERS (a duplicate is rescanned, never lost) — a new list;
         # candidates.all_pairs itself is never mutated.
@@ -14608,7 +14975,7 @@ def _sweep_from_candidates(
         elif rescan is None:
             # A single-band run: the one full time-series _find_entry pass,
             # exactly as before the pre-pass existed.
-            ts_entries = _entries_for_band(candidates, band)
+            ts_entries = _entries_for_band(candidates, band, _skips=skips)
         else:
             # The time-series _find_entry pass at this band — the only
             # per-band cost of Phase 1 — narrowed to the pairs the pre-pass
@@ -14619,6 +14986,9 @@ def _sweep_from_candidates(
         logging.info("Prepared %d candidate entries for sizing", len(entries_by_band[band]))
         # How many Mondays this band's entries qualified on (DR-75), zero included
         _log_qualifying_mondays(entries_by_band[band], band)
+    if skips is not None:
+        # What "Skip if closing within" removed in the run's own pass, once
+        _log_close_rule_tally(skips, candidates.buy_min_days_to_close, skips_band)
 
     # ── Tier floors off (tier_off_sweep): the bands where a deadline-gap tier
     # binds, entered again with the tiers not applied. A band whose floor is
@@ -14986,6 +15356,9 @@ def _sweep_from_candidates(
         # The volume cap every buy and sale was held to (False: off)
         max_volume_share=(False if candidates.max_volume_share is None
                           else candidates.max_volume_share),
+        # "Skip if closing within": the days every entry pass applied (False: off)
+        buy_min_days_to_close=(False if candidates.buy_min_days_to_close is None
+                               else candidates.buy_min_days_to_close),
         # What the side data says about the pairs, as counts (report only)
         extra_data_report=candidates.extra_data_report,
     )
@@ -15015,6 +15388,7 @@ def run_backtest_sweep(
     scheduled_close: bool | None = None,
     stale_quote_max_age: Any = None,
     max_volume_share: Any = None,
+    buy_min_days_to_close: Any = None,
 ) -> BacktestSweep:
     """
     Replay the time-series pair strategy at one interval discount, or at a grid
@@ -15218,6 +15592,19 @@ def run_backtest_sweep(
             module's BACKTEST_MAX_VOLUME_SHARE at call time, False turns the
             cap off, a share in (0, 1] sets it. Logged on one setting line
             and recorded on the result (BacktestSweep.max_volume_share).
+        buy_min_days_to_close (Any): Keyword-only. The "Skip if closing
+            within" minimum in days (_resolve_buy_min_days_to_close): None
+            (default) resolves this module's BUY_MIN_DAYS_TO_CLOSE_DEFAULT at
+            call time, False or 0 turns the rule off, another of config's
+            BUY_MIN_DAYS_TO_CLOSE_CHOICES sets it. A pair is bought only at a
+            Monday checkpoint at least that many days (24-hour spans) before
+            each of its markets closes (_find_entry). Logged on one setting
+            line, recorded on the result
+            (BacktestSweep.buy_min_days_to_close), and, with the rule on,
+            what it removed in the run's own entry pass is logged in one
+            line (_log_close_rule_tally). A max_horizon_days at or below the
+            minimum logs one WARNING (the backtest then buys next to
+            nothing) and the run goes on.
 
     Returns:
         BacktestSweep: primary (the effective-discount, primary-band result),
@@ -15232,8 +15619,9 @@ def run_backtest_sweep(
             None when not recorded, the tier-off family, empty unless
             tier_off_sweep, the lazy cap_sweep and tier_off_cap_sweep,
             the live_* fields, entry_checkpoint, the
-            lazy sell_sweep, depth_model and the lazy rebalance_sweep — see
-            BacktestSweep.
+            lazy sell_sweep, depth_model, the lazy rebalance_sweep and the
+            run's settings (scheduled_close, stale_quote_max_age,
+            max_volume_share, buy_min_days_to_close) — see BacktestSweep.
 
     Raises:
         ValueError: Before any fetch or log line, if tier_off_sweep is set
@@ -15257,7 +15645,9 @@ def run_backtest_sweep(
             not a positive, finite number of seconds, None or False, if
             max_volume_share (or, with None, this module's
             BACKTEST_MAX_VOLUME_SHARE) is not a share in (0, 1], None or
-            False, or if
+            False, if buy_min_days_to_close (or, with None, this module's
+            BUY_MIN_DAYS_TO_CLOSE_DEFAULT) is not one of config's
+            BUY_MIN_DAYS_TO_CLOSE_CHOICES, None or False, or if
             spread_band is not a valid band; and,
             before any fetch, from _prepare_candidates() when SCHEDULED_RUN
             cannot place the entry checkpoints (a configuration error).
@@ -15326,6 +15716,8 @@ def run_backtest_sweep(
     stale_limit = _resolve_stale_quote_max_age(stale_quote_max_age)
     # ... and for the volume cap (None: off)
     volume_share = _resolve_max_volume_share(max_volume_share)
+    # ... and for "Skip if closing within" (None: off)
+    buy_min_days = _resolve_buy_min_days_to_close(buy_min_days_to_close)
     # And for k: every simulation hands it to the live sizer, whose
     # LiveSettings takes only a k in (0, 1]
     if interval_discount is not None and (
@@ -15469,6 +15861,41 @@ def run_backtest_sweep(
         "config.BACKTEST_MAX_VOLUME_SHARE" if max_volume_share is None
         else "run-level override",
     )
+    # And whether a purchase is held back near its markets' close, and what
+    # close the backtest judges each market on
+    logging.info(
+        "Skip if closing within (backtest): %s (%s)",
+        f"{buy_min_days} days — a pair is bought, or added to, only at a Monday checkpoint "
+        f"at least {buy_min_days} days (24-hour spans) before each of its markets closes; "
+        "a market's close is its scheduled close where one is known, else the start "
+        "(00:00 UTC) of the last day its wording names, never the close Kalshi recorded"
+        if buy_min_days is not None else
+        "off — a pair is bought however soon its markets close",
+        "config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT" if buy_min_days_to_close is None
+        else "run-level override",
+    )
+    if (max_horizon_days is not None and buy_min_days is not None
+            and max_horizon_days <= buy_min_days):
+        # The horizon keeps a Monday only when its markets close within its
+        # days of that Monday; "Skip if closing within" keeps one only when
+        # they close at least its days after the checkpoint. Below, only a
+        # market Kalshi closed before the date in its wording can pass both
+        # (the horizon reads the close Kalshi recorded where no schedule is
+        # carried, the rule the wording); at equal, also one closing on the
+        # horizon's last day after the checkpoint's hour. A warning, not a
+        # refusal, as in a live run
+        if max_horizon_days < buy_min_days:
+            why = (f"is below this run's \"Skip if closing within\" of {buy_min_days} days: "
+                   f"a Monday is kept only when its markets close within {max_horizon_days} "
+                   f"days of it and also at least {buy_min_days} days after it, which only a "
+                   "market that closed before the date in its wording can do, so the "
+                   "backtest buys next to nothing")
+        else:
+            why = (f"equals this run's \"Skip if closing within\" of {buy_min_days} days: a "
+                   f"Monday is kept only when its markets close within {max_horizon_days} "
+                   f"days of it and also at least {buy_min_days} days after its checkpoint, "
+                   "so the backtest buys next to nothing")
+        logging.warning("--max-horizon-days %d %s", max_horizon_days, why)
     # The saved live defaults (never main.py's per-run overrides), read ONCE
     # before the fetch, so a refused file warns at the top of the run
     live = _live_settings_for_report()
@@ -15482,6 +15909,7 @@ def run_backtest_sweep(
         same_event_ladders=same_event_ladders,
         fee_multipliers=fee_multipliers, scheduled_close=scheduled_close,
         stale_quote_max_age=stale_quote_max_age, max_volume_share=max_volume_share,
+        buy_min_days_to_close=buy_min_days_to_close,
     )
     if candidates is None:
         # Nothing can be simulated at any discount or band. Build the empty
@@ -15512,6 +15940,8 @@ def run_backtest_sweep(
                                                     else stale_limit),
                                max_volume_share=(False if volume_share is None
                                                  else volume_share),
+                               buy_min_days_to_close=(False if buy_min_days is None
+                                                      else buy_min_days),
                                **_live_rule_fields(live))
     else:
         # Every entry pass and simulation. It deletes the candles and pair list
