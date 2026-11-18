@@ -15589,15 +15589,10 @@ def run_backtest_sweep(
             within" minimum in days (_resolve_buy_min_days_to_close): None
             (default) resolves this module's BUY_MIN_DAYS_TO_CLOSE_DEFAULT at
             call time, False or 0 turns the rule off, another of config's
-            BUY_MIN_DAYS_TO_CLOSE_CHOICES sets it. A pair is bought only at a
-            Monday checkpoint at least that many days (24-hour spans) before
-            each of its markets closes (_find_entry). Logged on one setting
-            line, recorded on the result
-            (BacktestSweep.buy_min_days_to_close), and, with the rule on,
-            what it removed in the run's own entry pass is logged in one
-            line (_log_close_rule_tally). A max_horizon_days at or below the
-            minimum logs one WARNING (the backtest then buys next to
-            nothing) and the run goes on.
+            BUY_MIN_DAYS_TO_CLOSE_CHOICES sets it. Applied in _find_entry,
+            logged with what it removed, and recorded on the result
+            (BacktestSweep.buy_min_days_to_close); a max_horizon_days at or
+            below it logs a WARNING.
 
     Returns:
         BacktestSweep: primary (the effective-discount, primary-band result),
