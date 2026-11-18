@@ -1,0 +1,477 @@
+{
+  "note": "SHA-256 of every byte a dashboard build writes, per case of tests/dashboard_chunks_golden.py::CASES: the page, every file in the folder of chunk files beside it, and that folder's entries \u2014 captured by running that module as a script against source_tree at source_sha, the commit before the walk parked chunks on disk (the recipe is in its module docstring). tests/test_dashboard.py::TestParkedChunks replays the same code against the tree under test; every digest must match, and one that diverges in an environment other than rendering_env skips rather than fails.",
+  "source_sha": "6792c8e",
+  "source_tree": "tip",
+  "rendering_env": {
+    "plotly": "6.9.0",
+    "pandas": "3.0.3",
+    "numpy": "2.4.6",
+    "python": "3.11.15",
+    "zlib": "1.3.2",
+    "orjson": "3.11.9"
+  },
+  "cases": {
+    "size_cap_sweep": {
+      "page": "07286b3b947985af4d0e71eb34260b3b22053719636b03cb380f1675fd6ad98e",
+      "entries": [
+        ".lock",
+        "build",
+        "build/chunk-1.js",
+        "build/chunk-2.js",
+        "build/chunk-3.js",
+        "build/chunk-4.js"
+      ],
+      "files": {
+        ".lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "build/chunk-1.js": "0016f90f736acc47229589310031d02c7b2975c98e2c40b1cdcc73c9d3ebb41a",
+        "build/chunk-2.js": "1ace51494c6d1f39a8791f6a131a0621c8e1abd69bef5b9a982c874ec30df866",
+        "build/chunk-3.js": "51e33d63d00b216e8df08c3cd1e3c5bc7221168a8a2b11a6388dcd86d0977ddf",
+        "build/chunk-4.js": "725d57f42d14982ff19f44e98ccb0614b7527d4e34d92dbc056398e000163a85"
+      }
+    },
+    "tier_floors_off": {
+      "page": "28c59d910b492b22b65a4bf208ce28b50e7a97bc7fe13c3ca6b53ee0e9625a06",
+      "entries": [
+        ".lock",
+        "build",
+        "build/chunk-1.js",
+        "build/chunk-2.js",
+        "build/chunk-3.js",
+        "build/chunk-4.js",
+        "build/chunk-5.js",
+        "build/chunk-6.js"
+      ],
+      "files": {
+        ".lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "build/chunk-1.js": "0016f90f736acc47229589310031d02c7b2975c98e2c40b1cdcc73c9d3ebb41a",
+        "build/chunk-2.js": "1ace51494c6d1f39a8791f6a131a0621c8e1abd69bef5b9a982c874ec30df866",
+        "build/chunk-3.js": "51e33d63d00b216e8df08c3cd1e3c5bc7221168a8a2b11a6388dcd86d0977ddf",
+        "build/chunk-4.js": "725d57f42d14982ff19f44e98ccb0614b7527d4e34d92dbc056398e000163a85",
+        "build/chunk-5.js": "721685c166b3cf28c8f66de15323c12525aa92510c0be85c05c8eeaf4508c2a8",
+        "build/chunk-6.js": "ff36b3c8a6cb585859e1216e2ad9b4f6a499f2be9b9e06be3c0a6454fc4a0805"
+      }
+    },
+    "tier_floors_off_every_cap": {
+      "page": "ae233528aadf816ff14aece85d88c9e36431d414e6fe2abf3054e11903e4e0ce",
+      "entries": [
+        ".lock",
+        "build",
+        "build/chunk-1.js",
+        "build/chunk-2.js",
+        "build/chunk-3.js",
+        "build/chunk-4.js",
+        "build/chunk-5.js",
+        "build/chunk-6.js",
+        "build/chunk-7.js",
+        "build/chunk-8.js"
+      ],
+      "files": {
+        ".lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "build/chunk-1.js": "0016f90f736acc47229589310031d02c7b2975c98e2c40b1cdcc73c9d3ebb41a",
+        "build/chunk-2.js": "1ace51494c6d1f39a8791f6a131a0621c8e1abd69bef5b9a982c874ec30df866",
+        "build/chunk-3.js": "51e33d63d00b216e8df08c3cd1e3c5bc7221168a8a2b11a6388dcd86d0977ddf",
+        "build/chunk-4.js": "725d57f42d14982ff19f44e98ccb0614b7527d4e34d92dbc056398e000163a85",
+        "build/chunk-5.js": "721685c166b3cf28c8f66de15323c12525aa92510c0be85c05c8eeaf4508c2a8",
+        "build/chunk-6.js": "7a544fb10edbf9b7651ce3da06de2ccc9f810bef3ef494de26be1cee6f01b657",
+        "build/chunk-7.js": "ff36b3c8a6cb585859e1216e2ad9b4f6a499f2be9b9e06be3c0a6454fc4a0805",
+        "build/chunk-8.js": "83adf1439cb02242395ef786cf1da9abb45b897e81a6b3b73df8263c5d6aea36"
+      }
+    },
+    "rebalance": {
+      "page": "4fdd723e33a53accacad5474d5e207c75b05801fcbfc8a55da2f9dedd45a9f19",
+      "entries": [
+        ".lock",
+        "build",
+        "build/chunk-1.js",
+        "build/chunk-10.js",
+        "build/chunk-11.js",
+        "build/chunk-2.js",
+        "build/chunk-3.js",
+        "build/chunk-4.js",
+        "build/chunk-5.js",
+        "build/chunk-6.js",
+        "build/chunk-7.js",
+        "build/chunk-8.js",
+        "build/chunk-9.js"
+      ],
+      "files": {
+        ".lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "build/chunk-1.js": "0016f90f736acc47229589310031d02c7b2975c98e2c40b1cdcc73c9d3ebb41a",
+        "build/chunk-10.js": "fc247ccb8ac48e67a59c0b0497d690e026608abb746577b58d605d9d01b02f77",
+        "build/chunk-11.js": "68fe1e75d2e826f0f9f7000f787241188d985e4cb8266758a6627f84df887d0a",
+        "build/chunk-2.js": "1ace51494c6d1f39a8791f6a131a0621c8e1abd69bef5b9a982c874ec30df866",
+        "build/chunk-3.js": "51e33d63d00b216e8df08c3cd1e3c5bc7221168a8a2b11a6388dcd86d0977ddf",
+        "build/chunk-4.js": "725d57f42d14982ff19f44e98ccb0614b7527d4e34d92dbc056398e000163a85",
+        "build/chunk-5.js": "721685c166b3cf28c8f66de15323c12525aa92510c0be85c05c8eeaf4508c2a8",
+        "build/chunk-6.js": "ff36b3c8a6cb585859e1216e2ad9b4f6a499f2be9b9e06be3c0a6454fc4a0805",
+        "build/chunk-7.js": "e7186570f24a3d4c1d923f362d6651a285dac3799f554a29473c6bf529f17612",
+        "build/chunk-8.js": "dd02e8dad0351bd6e6a060a70bbcbf7f7e9b7238b4b11963e64f19264f315abd",
+        "build/chunk-9.js": "323b9c622d1d2db9cb2938c27342896d78dc41dd3aa311d475479ed02ea6abdf"
+      }
+    },
+    "price_movement": {
+      "page": "6e49a7e536856df1d03b1d38f73bb45f6ada3a91c468522f2761541a3d18f3a7",
+      "entries": [
+        ".lock",
+        "build",
+        "build/chunk-1.js",
+        "build/chunk-10.js",
+        "build/chunk-11.js",
+        "build/chunk-12.js",
+        "build/chunk-13.js",
+        "build/chunk-2.js",
+        "build/chunk-3.js",
+        "build/chunk-4.js",
+        "build/chunk-5.js",
+        "build/chunk-6.js",
+        "build/chunk-7.js",
+        "build/chunk-8.js",
+        "build/chunk-9.js"
+      ],
+      "files": {
+        ".lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "build/chunk-1.js": "0016f90f736acc47229589310031d02c7b2975c98e2c40b1cdcc73c9d3ebb41a",
+        "build/chunk-10.js": "fc247ccb8ac48e67a59c0b0497d690e026608abb746577b58d605d9d01b02f77",
+        "build/chunk-11.js": "68fe1e75d2e826f0f9f7000f787241188d985e4cb8266758a6627f84df887d0a",
+        "build/chunk-12.js": "203600f9bc8b45b59a232e34b3f53849d3f21c6c3ea748649364e0d85ee50d24",
+        "build/chunk-13.js": "6beb4d89ea4b852562c60577e2203b1fe226d7de5bf36d08b5c26d37fd7ae235",
+        "build/chunk-2.js": "1ace51494c6d1f39a8791f6a131a0621c8e1abd69bef5b9a982c874ec30df866",
+        "build/chunk-3.js": "51e33d63d00b216e8df08c3cd1e3c5bc7221168a8a2b11a6388dcd86d0977ddf",
+        "build/chunk-4.js": "725d57f42d14982ff19f44e98ccb0614b7527d4e34d92dbc056398e000163a85",
+        "build/chunk-5.js": "721685c166b3cf28c8f66de15323c12525aa92510c0be85c05c8eeaf4508c2a8",
+        "build/chunk-6.js": "ff36b3c8a6cb585859e1216e2ad9b4f6a499f2be9b9e06be3c0a6454fc4a0805",
+        "build/chunk-7.js": "e7186570f24a3d4c1d923f362d6651a285dac3799f554a29473c6bf529f17612",
+        "build/chunk-8.js": "dd02e8dad0351bd6e6a060a70bbcbf7f7e9b7238b4b11963e64f19264f315abd",
+        "build/chunk-9.js": "323b9c622d1d2db9cb2938c27342896d78dc41dd3aa311d475479ed02ea6abdf"
+      }
+    },
+    "rebalance_until": {
+      "page": "f9be9d9d4c6072b7c25074eafe9da0605376ad4a6250d37d37f2d247765eacfb",
+      "entries": [
+        ".lock",
+        "build",
+        "build/chunk-1.js",
+        "build/chunk-10.js",
+        "build/chunk-11.js",
+        "build/chunk-12.js",
+        "build/chunk-13.js",
+        "build/chunk-14.js",
+        "build/chunk-15.js",
+        "build/chunk-2.js",
+        "build/chunk-3.js",
+        "build/chunk-4.js",
+        "build/chunk-5.js",
+        "build/chunk-6.js",
+        "build/chunk-7.js",
+        "build/chunk-8.js",
+        "build/chunk-9.js"
+      ],
+      "files": {
+        ".lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "build/chunk-1.js": "0016f90f736acc47229589310031d02c7b2975c98e2c40b1cdcc73c9d3ebb41a",
+        "build/chunk-10.js": "fc247ccb8ac48e67a59c0b0497d690e026608abb746577b58d605d9d01b02f77",
+        "build/chunk-11.js": "68fe1e75d2e826f0f9f7000f787241188d985e4cb8266758a6627f84df887d0a",
+        "build/chunk-12.js": "203600f9bc8b45b59a232e34b3f53849d3f21c6c3ea748649364e0d85ee50d24",
+        "build/chunk-13.js": "6beb4d89ea4b852562c60577e2203b1fe226d7de5bf36d08b5c26d37fd7ae235",
+        "build/chunk-14.js": "b535b4af36127994ab6ab3fc16793f220694365ad03fafea329a36995960d8a3",
+        "build/chunk-15.js": "ac86a78b1475cf577e499a3eaf11d88ba01beeb3770250439a44a9ff9ff7f154",
+        "build/chunk-2.js": "1ace51494c6d1f39a8791f6a131a0621c8e1abd69bef5b9a982c874ec30df866",
+        "build/chunk-3.js": "51e33d63d00b216e8df08c3cd1e3c5bc7221168a8a2b11a6388dcd86d0977ddf",
+        "build/chunk-4.js": "725d57f42d14982ff19f44e98ccb0614b7527d4e34d92dbc056398e000163a85",
+        "build/chunk-5.js": "721685c166b3cf28c8f66de15323c12525aa92510c0be85c05c8eeaf4508c2a8",
+        "build/chunk-6.js": "ff36b3c8a6cb585859e1216e2ad9b4f6a499f2be9b9e06be3c0a6454fc4a0805",
+        "build/chunk-7.js": "e7186570f24a3d4c1d923f362d6651a285dac3799f554a29473c6bf529f17612",
+        "build/chunk-8.js": "dd02e8dad0351bd6e6a060a70bbcbf7f7e9b7238b4b11963e64f19264f315abd",
+        "build/chunk-9.js": "323b9c622d1d2db9cb2938c27342896d78dc41dd3aa311d475479ed02ea6abdf"
+      }
+    },
+    "sell": {
+      "page": "bb91da1328c18690ab04d17e55fc9592e3313ce48e760732646322a238a2b3bf",
+      "entries": [
+        ".lock",
+        "build",
+        "build/chunk-1.js",
+        "build/chunk-10.js",
+        "build/chunk-2.js",
+        "build/chunk-3.js",
+        "build/chunk-4.js",
+        "build/chunk-5.js",
+        "build/chunk-6.js",
+        "build/chunk-7.js",
+        "build/chunk-8.js",
+        "build/chunk-9.js"
+      ],
+      "files": {
+        ".lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "build/chunk-1.js": "0016f90f736acc47229589310031d02c7b2975c98e2c40b1cdcc73c9d3ebb41a",
+        "build/chunk-10.js": "ce493b5679205b9677c1bc7a02a0f48b0c1e9d200e0c243bc02c12f3a922471a",
+        "build/chunk-2.js": "1ace51494c6d1f39a8791f6a131a0621c8e1abd69bef5b9a982c874ec30df866",
+        "build/chunk-3.js": "51e33d63d00b216e8df08c3cd1e3c5bc7221168a8a2b11a6388dcd86d0977ddf",
+        "build/chunk-4.js": "725d57f42d14982ff19f44e98ccb0614b7527d4e34d92dbc056398e000163a85",
+        "build/chunk-5.js": "84f9d6bbc26edc12bba787b5d4231ce61db47cf518a5f6d1c84f4f35b9eb1caf",
+        "build/chunk-6.js": "6a0be96c69b0b76a7566ff558aefa74a3961dc93ca527a017d51814fe8134084",
+        "build/chunk-7.js": "df4ae9d9e4b6593da2fe8b331cf434e7d2502ab1fefefac55c058723c12e1aa4",
+        "build/chunk-8.js": "06b2a1862be3ca6ce1b8f3efd484521fd69e55aff616e73ccc02489448ee3a89",
+        "build/chunk-9.js": "a764c9fd1199e29b84001a36e20db01d0f7629afa7f67afc9ecfab47f0cd4212"
+      }
+    },
+    "sell_and_every_view": {
+      "page": "fb5c4c5e4eba769b67f2944f12bf39d86d0168d662693b6acadfe93ff8dd2766",
+      "entries": [
+        ".lock",
+        "build",
+        "build/chunk-1.js",
+        "build/chunk-10.js",
+        "build/chunk-11.js",
+        "build/chunk-12.js",
+        "build/chunk-13.js",
+        "build/chunk-14.js",
+        "build/chunk-15.js",
+        "build/chunk-16.js",
+        "build/chunk-17.js",
+        "build/chunk-18.js",
+        "build/chunk-19.js",
+        "build/chunk-2.js",
+        "build/chunk-20.js",
+        "build/chunk-21.js",
+        "build/chunk-22.js",
+        "build/chunk-3.js",
+        "build/chunk-4.js",
+        "build/chunk-5.js",
+        "build/chunk-6.js",
+        "build/chunk-7.js",
+        "build/chunk-8.js",
+        "build/chunk-9.js"
+      ],
+      "files": {
+        ".lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "build/chunk-1.js": "0016f90f736acc47229589310031d02c7b2975c98e2c40b1cdcc73c9d3ebb41a",
+        "build/chunk-10.js": "fc247ccb8ac48e67a59c0b0497d690e026608abb746577b58d605d9d01b02f77",
+        "build/chunk-11.js": "68fe1e75d2e826f0f9f7000f787241188d985e4cb8266758a6627f84df887d0a",
+        "build/chunk-12.js": "203600f9bc8b45b59a232e34b3f53849d3f21c6c3ea748649364e0d85ee50d24",
+        "build/chunk-13.js": "6beb4d89ea4b852562c60577e2203b1fe226d7de5bf36d08b5c26d37fd7ae235",
+        "build/chunk-14.js": "b535b4af36127994ab6ab3fc16793f220694365ad03fafea329a36995960d8a3",
+        "build/chunk-15.js": "ac86a78b1475cf577e499a3eaf11d88ba01beeb3770250439a44a9ff9ff7f154",
+        "build/chunk-16.js": "84f9d6bbc26edc12bba787b5d4231ce61db47cf518a5f6d1c84f4f35b9eb1caf",
+        "build/chunk-17.js": "6a0be96c69b0b76a7566ff558aefa74a3961dc93ca527a017d51814fe8134084",
+        "build/chunk-18.js": "df4ae9d9e4b6593da2fe8b331cf434e7d2502ab1fefefac55c058723c12e1aa4",
+        "build/chunk-19.js": "06b2a1862be3ca6ce1b8f3efd484521fd69e55aff616e73ccc02489448ee3a89",
+        "build/chunk-2.js": "1ace51494c6d1f39a8791f6a131a0621c8e1abd69bef5b9a982c874ec30df866",
+        "build/chunk-20.js": "a764c9fd1199e29b84001a36e20db01d0f7629afa7f67afc9ecfab47f0cd4212",
+        "build/chunk-21.js": "ce493b5679205b9677c1bc7a02a0f48b0c1e9d200e0c243bc02c12f3a922471a",
+        "build/chunk-22.js": "2d192747a68918b1a92b91b38a120dad74ceec4192bcd4ca060b9778c075aeef",
+        "build/chunk-3.js": "51e33d63d00b216e8df08c3cd1e3c5bc7221168a8a2b11a6388dcd86d0977ddf",
+        "build/chunk-4.js": "725d57f42d14982ff19f44e98ccb0614b7527d4e34d92dbc056398e000163a85",
+        "build/chunk-5.js": "721685c166b3cf28c8f66de15323c12525aa92510c0be85c05c8eeaf4508c2a8",
+        "build/chunk-6.js": "ff36b3c8a6cb585859e1216e2ad9b4f6a499f2be9b9e06be3c0a6454fc4a0805",
+        "build/chunk-7.js": "e7186570f24a3d4c1d923f362d6651a285dac3799f554a29473c6bf529f17612",
+        "build/chunk-8.js": "dd02e8dad0351bd6e6a060a70bbcbf7f7e9b7238b4b11963e64f19264f315abd",
+        "build/chunk-9.js": "323b9c622d1d2db9cb2938c27342896d78dc41dd3aa311d475479ed02ea6abdf"
+      }
+    },
+    "rebalance_cell_raises": {
+      "page": "0d59dca3a760849011a201ae715135f06188bc41abddb0416a2c0c179a5e1eb0",
+      "entries": [
+        ".lock",
+        "build",
+        "build/chunk-1.js",
+        "build/chunk-2.js",
+        "build/chunk-3.js",
+        "build/chunk-4.js",
+        "build/chunk-5.js",
+        "build/chunk-6.js"
+      ],
+      "files": {
+        ".lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "build/chunk-1.js": "0016f90f736acc47229589310031d02c7b2975c98e2c40b1cdcc73c9d3ebb41a",
+        "build/chunk-2.js": "1ace51494c6d1f39a8791f6a131a0621c8e1abd69bef5b9a982c874ec30df866",
+        "build/chunk-3.js": "51e33d63d00b216e8df08c3cd1e3c5bc7221168a8a2b11a6388dcd86d0977ddf",
+        "build/chunk-4.js": "725d57f42d14982ff19f44e98ccb0614b7527d4e34d92dbc056398e000163a85",
+        "build/chunk-5.js": "721685c166b3cf28c8f66de15323c12525aa92510c0be85c05c8eeaf4508c2a8",
+        "build/chunk-6.js": "ff36b3c8a6cb585859e1216e2ad9b4f6a499f2be9b9e06be3c0a6454fc4a0805"
+      }
+    },
+    "price_movement_cell_raises": {
+      "page": "ee26ec068b9fde63ff8fe939dc2422ea0df4a28bfa66e1f3264ea6c12aa075c3",
+      "entries": [
+        ".lock",
+        "build",
+        "build/chunk-1.js",
+        "build/chunk-10.js",
+        "build/chunk-11.js",
+        "build/chunk-2.js",
+        "build/chunk-3.js",
+        "build/chunk-4.js",
+        "build/chunk-5.js",
+        "build/chunk-6.js",
+        "build/chunk-7.js",
+        "build/chunk-8.js",
+        "build/chunk-9.js"
+      ],
+      "files": {
+        ".lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "build/chunk-1.js": "0016f90f736acc47229589310031d02c7b2975c98e2c40b1cdcc73c9d3ebb41a",
+        "build/chunk-10.js": "fc247ccb8ac48e67a59c0b0497d690e026608abb746577b58d605d9d01b02f77",
+        "build/chunk-11.js": "68fe1e75d2e826f0f9f7000f787241188d985e4cb8266758a6627f84df887d0a",
+        "build/chunk-2.js": "1ace51494c6d1f39a8791f6a131a0621c8e1abd69bef5b9a982c874ec30df866",
+        "build/chunk-3.js": "51e33d63d00b216e8df08c3cd1e3c5bc7221168a8a2b11a6388dcd86d0977ddf",
+        "build/chunk-4.js": "725d57f42d14982ff19f44e98ccb0614b7527d4e34d92dbc056398e000163a85",
+        "build/chunk-5.js": "721685c166b3cf28c8f66de15323c12525aa92510c0be85c05c8eeaf4508c2a8",
+        "build/chunk-6.js": "ff36b3c8a6cb585859e1216e2ad9b4f6a499f2be9b9e06be3c0a6454fc4a0805",
+        "build/chunk-7.js": "e7186570f24a3d4c1d923f362d6651a285dac3799f554a29473c6bf529f17612",
+        "build/chunk-8.js": "dd02e8dad0351bd6e6a060a70bbcbf7f7e9b7238b4b11963e64f19264f315abd",
+        "build/chunk-9.js": "323b9c622d1d2db9cb2938c27342896d78dc41dd3aa311d475479ed02ea6abdf"
+      }
+    },
+    "rebalance_until_cell_raises": {
+      "page": "6bb0cdb7faa2b5ed151f273449a8fe99ba35a274ffb78446707961efff1b3751",
+      "entries": [
+        ".lock",
+        "build",
+        "build/chunk-1.js",
+        "build/chunk-10.js",
+        "build/chunk-11.js",
+        "build/chunk-12.js",
+        "build/chunk-13.js",
+        "build/chunk-2.js",
+        "build/chunk-3.js",
+        "build/chunk-4.js",
+        "build/chunk-5.js",
+        "build/chunk-6.js",
+        "build/chunk-7.js",
+        "build/chunk-8.js",
+        "build/chunk-9.js"
+      ],
+      "files": {
+        ".lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "build/chunk-1.js": "0016f90f736acc47229589310031d02c7b2975c98e2c40b1cdcc73c9d3ebb41a",
+        "build/chunk-10.js": "fc247ccb8ac48e67a59c0b0497d690e026608abb746577b58d605d9d01b02f77",
+        "build/chunk-11.js": "68fe1e75d2e826f0f9f7000f787241188d985e4cb8266758a6627f84df887d0a",
+        "build/chunk-12.js": "203600f9bc8b45b59a232e34b3f53849d3f21c6c3ea748649364e0d85ee50d24",
+        "build/chunk-13.js": "6beb4d89ea4b852562c60577e2203b1fe226d7de5bf36d08b5c26d37fd7ae235",
+        "build/chunk-2.js": "1ace51494c6d1f39a8791f6a131a0621c8e1abd69bef5b9a982c874ec30df866",
+        "build/chunk-3.js": "51e33d63d00b216e8df08c3cd1e3c5bc7221168a8a2b11a6388dcd86d0977ddf",
+        "build/chunk-4.js": "725d57f42d14982ff19f44e98ccb0614b7527d4e34d92dbc056398e000163a85",
+        "build/chunk-5.js": "721685c166b3cf28c8f66de15323c12525aa92510c0be85c05c8eeaf4508c2a8",
+        "build/chunk-6.js": "ff36b3c8a6cb585859e1216e2ad9b4f6a499f2be9b9e06be3c0a6454fc4a0805",
+        "build/chunk-7.js": "e7186570f24a3d4c1d923f362d6651a285dac3799f554a29473c6bf529f17612",
+        "build/chunk-8.js": "dd02e8dad0351bd6e6a060a70bbcbf7f7e9b7238b4b11963e64f19264f315abd",
+        "build/chunk-9.js": "323b9c622d1d2db9cb2938c27342896d78dc41dd3aa311d475479ed02ea6abdf"
+      }
+    },
+    "tier_floors_off_fallback": {
+      "page": "73ddf32a40b934428ceab683d86e95405e5c526a8fd33a581ed174aaaea40bd8",
+      "entries": [
+        ".lock",
+        "build",
+        "build/chunk-1.js",
+        "build/chunk-2.js",
+        "build/chunk-3.js",
+        "build/chunk-4.js",
+        "build/chunk-5.js",
+        "build/chunk-6.js"
+      ],
+      "files": {
+        ".lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "build/chunk-1.js": "0016f90f736acc47229589310031d02c7b2975c98e2c40b1cdcc73c9d3ebb41a",
+        "build/chunk-2.js": "1ace51494c6d1f39a8791f6a131a0621c8e1abd69bef5b9a982c874ec30df866",
+        "build/chunk-3.js": "51e33d63d00b216e8df08c3cd1e3c5bc7221168a8a2b11a6388dcd86d0977ddf",
+        "build/chunk-4.js": "725d57f42d14982ff19f44e98ccb0614b7527d4e34d92dbc056398e000163a85",
+        "build/chunk-5.js": "721685c166b3cf28c8f66de15323c12525aa92510c0be85c05c8eeaf4508c2a8",
+        "build/chunk-6.js": "ff36b3c8a6cb585859e1216e2ad9b4f6a499f2be9b9e06be3c0a6454fc4a0805"
+      }
+    },
+    "size_cap_fallback": {
+      "page": "7178c68110661434c41bdc08ffa369da56b5cd83e3824fea96e6b8c2490085f6",
+      "entries": [
+        ".lock",
+        "build",
+        "build/chunk-1.js",
+        "build/chunk-2.js"
+      ],
+      "files": {
+        ".lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "build/chunk-1.js": "1ace51494c6d1f39a8791f6a131a0621c8e1abd69bef5b9a982c874ec30df866",
+        "build/chunk-2.js": "725d57f42d14982ff19f44e98ccb0614b7527d4e34d92dbc056398e000163a85"
+      }
+    },
+    "off_cell_fails_without_fallback": {
+      "page": "1b5f58ef67b9f5778e33e90a7243bfdb805cec7df045ee6ac3b11178233b94e5",
+      "entries": [
+        ".lock",
+        "build",
+        "build/chunk-1.js",
+        "build/chunk-2.js",
+        "build/chunk-3.js",
+        "build/chunk-4.js"
+      ],
+      "files": {
+        ".lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "build/chunk-1.js": "1ace51494c6d1f39a8791f6a131a0621c8e1abd69bef5b9a982c874ec30df866",
+        "build/chunk-2.js": "725d57f42d14982ff19f44e98ccb0614b7527d4e34d92dbc056398e000163a85",
+        "build/chunk-3.js": "721685c166b3cf28c8f66de15323c12525aa92510c0be85c05c8eeaf4508c2a8",
+        "build/chunk-4.js": "ff36b3c8a6cb585859e1216e2ad9b4f6a499f2be9b9e06be3c0a6454fc4a0805"
+      }
+    },
+    "chunk_cannot_be_built": {
+      "page": "560969a60facdde6055d0f5634a8e25926ba68bcb372e968164747df3b9e376e",
+      "entries": null,
+      "files": {}
+    },
+    "primary_not_the_first_chunk": {
+      "page": "560969a60facdde6055d0f5634a8e25926ba68bcb372e968164747df3b9e376e",
+      "entries": null,
+      "files": {}
+    },
+    "folder_cannot_be_made": {
+      "page": "f7a55bd1fcae58485c01f4a9e9005098727a6fd71ec5f06273939d3bdcfbd9ca",
+      "entries": null,
+      "files": {}
+    },
+    "sell_build_fails": {
+      "page": "329df29aa01bae6e0766fe4fae16dc6e7ecfcac016082856bb8336a1319ddb97",
+      "entries": [
+        ".lock",
+        "build",
+        "build/chunk-1.js",
+        "build/chunk-2.js",
+        "build/chunk-3.js",
+        "build/chunk-4.js"
+      ],
+      "files": {
+        ".lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "build/chunk-1.js": "0016f90f736acc47229589310031d02c7b2975c98e2c40b1cdcc73c9d3ebb41a",
+        "build/chunk-2.js": "1ace51494c6d1f39a8791f6a131a0621c8e1abd69bef5b9a982c874ec30df866",
+        "build/chunk-3.js": "51e33d63d00b216e8df08c3cd1e3c5bc7221168a8a2b11a6388dcd86d0977ddf",
+        "build/chunk-4.js": "725d57f42d14982ff19f44e98ccb0614b7527d4e34d92dbc056398e000163a85"
+      }
+    },
+    "sell_view_only": {
+      "page": "3261c5f4d84aa2af1d37a02de9cfd074f0c84c32a31140a6756f4215f718d150",
+      "entries": [
+        ".lock",
+        "build",
+        "build/chunk-1.js",
+        "build/chunk-2.js",
+        "build/chunk-3.js",
+        "build/chunk-4.js",
+        "build/chunk-5.js",
+        "build/chunk-6.js"
+      ],
+      "files": {
+        ".lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "build/chunk-1.js": "84f9d6bbc26edc12bba787b5d4231ce61db47cf518a5f6d1c84f4f35b9eb1caf",
+        "build/chunk-2.js": "6a0be96c69b0b76a7566ff558aefa74a3961dc93ca527a017d51814fe8134084",
+        "build/chunk-3.js": "df4ae9d9e4b6593da2fe8b331cf434e7d2502ab1fefefac55c058723c12e1aa4",
+        "build/chunk-4.js": "06b2a1862be3ca6ce1b8f3efd484521fd69e55aff616e73ccc02489448ee3a89",
+        "build/chunk-5.js": "a764c9fd1199e29b84001a36e20db01d0f7629afa7f67afc9ecfab47f0cd4212",
+        "build/chunk-6.js": "ce493b5679205b9677c1bc7a02a0f48b0c1e9d200e0c243bc02c12f3a922471a"
+      }
+    },
+    "one_chunk": {
+      "page": "16e1424aa9f327ba2af5de3bad8e090d3f9dd4dec9ed4d25642edfedaee30abe",
+      "entries": null,
+      "files": {}
+    }
+  }
+}

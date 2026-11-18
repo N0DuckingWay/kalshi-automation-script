@@ -29,6 +29,10 @@ whose primary sits off index 0 on both axes, and the seven sections that
 predate it are pinned against digests captured on main by
 tests/dashboard_golden.py (TestGoldenSections). Tests that do render a whole
 page stub dashboard.yf.download and redirect dashboard.PROJECT_ROOT.
+
+Every byte a whole build writes, the page and the chunk files beside it, is
+pinned against digests captured before the walk parked its chunks on disk,
+by tests/dashboard_chunks_golden.py (TestParkedChunks).
 """
 import ast
 import base64
@@ -47,6 +51,9 @@ import random
 import re
 import shutil
 import subprocess
+import sys
+import time
+import tracemalloc
 import warnings
 import weakref
 from array import array
@@ -97,7 +104,7 @@ from kalshi_betting.treasury import (
 
 # test_backtester as a module, never its classes: a Test* class imported
 # here would be collected twice
-from . import dashboard_golden
+from . import dashboard_chunks_golden, dashboard_golden
 from . import test_backtester as _tb
 from .conftest import save_config_live_defaults
 
@@ -18701,6 +18708,551 @@ class TestScenarioChunksAreFiles:
         with pytest.raises(ValueError, match="boom"):
             _kc_page(monkeypatch, tmp_path, _kc_sweep())
         assert TestSidecarFolders._folders(tmp_path) == []
+
+
+class TestParkedChunks:
+    """While the walk packs the page's chunks, every chunk but the page's own
+    waits on disk in a parking folder (dashboard._ChunkParking) and memory
+    keeps a placeholder: the build writes exactly the bytes it wrote when it
+    held every chunk in memory, in every case tests/dashboard_chunks_golden.py
+    builds (the digests were captured from the commit before parking, by
+    running that module as a script; the recipe is in its docstring), and
+    the parking folder is gone however the build ends but a kill (or a
+    Ctrl-C during that folder's own deletion). A files folder that cannot
+    take the parking folder stops the build with the mkdir's own error."""
+
+    _PATH = Path(__file__).parent / "fixtures" / "dashboard_chunks_golden.json"
+
+    @pytest.fixture(scope="class")
+    def parked(self, tmp_path_factory) -> dict:
+        """Every golden case built as production builds it: case -> digest."""
+        fx = sys.modules[__name__]
+        return {name: dashboard_chunks_golden.digest(
+                    dashboard_chunks_golden.build(fx, name, tmp_path_factory.mktemp(name)))
+                for name in dashboard_chunks_golden.CASES}
+
+    def test_every_case_writes_what_the_commit_before_parking_wrote(self, parked):
+        golden = json.loads(self._PATH.read_text(encoding="utf-8"))
+        assert set(parked) == set(golden["cases"])
+        diverged = sorted(name for name, got in parked.items() if got != golden["cases"][name])
+        env = dashboard_chunks_golden.rendering_environment()
+        if diverged and env != golden["rendering_env"]:
+            pytest.skip(
+                f"cases {diverged} diverge from the golden, but it was captured under "
+                f"{golden['rendering_env']} and this is {env}; re-capture it "
+                "(tests/dashboard_chunks_golden.py's docstring) to compare in this environment")
+        assert not diverged, (
+            f"cases {diverged} diverged from {golden['source_sha'][:7]}, the commit before "
+            "parking")
+
+    def test_parking_changes_no_byte(self, parked, tmp_path):
+        # The same cases with every chunk held in memory through the walk, as
+        # before parking: the page, every file beside it and that folder's
+        # entries are the same bytes. Never skipped: one environment builds both
+        fx = sys.modules[__name__]
+        for name in dashboard_chunks_golden.CASES:
+            folder = tmp_path / name
+            folder.mkdir()
+            held = dashboard_chunks_golden.digest(
+                dashboard_chunks_golden.build(fx, name, folder, in_memory=True))
+            assert held == parked[name], name
+
+    # ─── What is parked, and when ─────────────────────────────────────────────
+
+    @staticmethod
+    def _walk(sweep: BacktestSweep, parking=None) -> tuple:
+        """(the grid walked, the chunk visitor) of one sweep's page walk."""
+        trades, curve = sweep.primary.trades, sweep.primary.equity_df
+        source = dashboard._grid_source(sweep, trades, curve, 0.75)
+        walked, chunker, _kd = dashboard._build_filter_grid(
+            source, trades, curve, 0.75, _FLT_START, 1000.0, _FLT_SERIES_TIERS,
+            parking=parking)
+        return walked, chunker
+
+    @staticmethod
+    def _entries(root: Path) -> list[str] | None:
+        """Every name in the files folder beside the page (None: no folder)."""
+        return sorted(p.name for p in root.iterdir()) if root.exists() else None
+
+    def test_every_chunk_past_the_page_s_own_is_parked_as_its_file(self, tmp_path):
+        parking = dashboard._ChunkParking(tmp_path / config.DASHBOARD_FILENAME)
+        _, parked = self._walk(_kc_sweep_until(_kc_sweep_tiers()), parking)
+        _, held = self._walk(_kc_sweep_until(_kc_sweep_tiers()))
+        assert len(parked.chunks) == len(held.chunks) > 2
+        # The page's own chunk stays in memory; every later one is a placeholder
+        assert parked.chunks[0] == held.chunks[0]
+        assert all(isinstance(c, dashboard._ParkedChunk) for c in parked.chunks[1:])
+        folder = parking.folder
+        assert folder.parent == tmp_path / config.DASHBOARD_FILES_DIRNAME
+        assert dashboard._PARKING_NAME.fullmatch(folder.name).group(1) == str(os.getpid())
+        assert (folder / ".writing").is_file() and not (folder / "chunk-0.js").exists()
+        for i in range(1, len(held.chunks)):
+            chunk, element = parked.chunks[i], held.chunks[i]
+            text = (folder / f"chunk-{i}.js").read_text(encoding="utf-8")
+            # The file is the chunk file the page will have, byte for byte, and
+            # reads back as the element the walk packed
+            assert text == dashboard._chunk_file_text(_PACKED.fullmatch(element).group(2))
+            assert (chunk.element_id, chunk.size) == (f"dash-chunk-{i}", len(text))
+            assert parking.element(i, chunk) == element
+        parking.remove()
+        assert parking.folder is None
+        assert not (tmp_path / config.DASHBOARD_FILES_DIRNAME).exists()
+
+    def test_the_parking_folder_is_made_only_for_a_chunk_past_the_page_s_own(
+            self, monkeypatch, tmp_path):
+        made, parked = [], []
+        real_make, real_write = dashboard._ChunkParking._make, dashboard._write_chunk_file
+
+        def make(self):
+            made.append(self.root)
+            real_make(self)
+
+        def write(folder, chunk_id, element):
+            parked.append((folder.name.startswith(".parking-"), chunk_id))
+            return real_write(folder, chunk_id, element)
+
+        monkeypatch.setattr(dashboard._ChunkParking, "_make", make)
+        monkeypatch.setattr(dashboard, "_write_chunk_file", write)
+        (tmp_path / "one").mkdir()
+        (tmp_path / "many").mkdir()
+        # A page of one chunk parks nothing and makes no folder
+        trades = _flt_trades()
+        curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path / "one")
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        dashboard.generate_dashboard(trades, curve, _FLT_START, 1000.0,
+                                     series_categories=_FLT_SERIES)
+        assert made == [] and parked == []
+        assert not (tmp_path / "one" / config.DASHBOARD_FILES_DIRNAME).exists()
+        # A page of several: one folder, made for chunk 1, every chunk from 1 on parked once
+        page = _kc_page(monkeypatch, tmp_path / "many")
+        ids = sorted(TestScenarioChunksAreFiles._files(page))
+        assert made == [tmp_path / "many" / config.DASHBOARD_FILES_DIRNAME]
+        assert parked == [(True, i) for i in ids] and ids[0] == 1
+
+    def test_an_id_handed_out_again_parks_the_new_chunk(self, monkeypatch, tmp_path):
+        # The size-cap sweep's last cell raises after four chunks were packed:
+        # the grid is walked again from the eager points, handing out ids 1
+        # and 2 again for other lists, and leaving chunk 3 parked and unnamed
+        writes: dict[int, list[str]] = {}
+        real = dashboard._write_chunk_file
+
+        def write(folder, chunk_id, element):
+            writes.setdefault(chunk_id, []).append(element)
+            return real(folder, chunk_id, element)
+
+        monkeypatch.setattr(dashboard, "_write_chunk_file", write)
+        parking = dashboard._ChunkParking(tmp_path / config.DASHBOARD_FILENAME)
+        _, chunker = self._walk(_kc_sweep(raise_on=(_KC_B1, 0.75)), parking)
+        _, held = self._walk(_kc_sweep(raise_on=(_KC_B1, 0.75)))
+        again = sorted(i for i, elements in writes.items() if len(set(elements)) > 1)
+        assert again == [1, 2] and len(chunker.chunks) == 3 and 3 in writes
+        for i in again:
+            assert parking.element(i, chunker.chunks[i]) == writes[i][-1] == held.chunks[i]
+        assert (parking.folder / "chunk-3.js").exists()
+
+    # ─── A build that cannot finish ───────────────────────────────────────────
+
+    @pytest.mark.parametrize("phase", ["__call__", "off", "rebalance", "move", "maturity"])
+    def test_a_chunk_that_cannot_be_parked_stops_the_build(self, monkeypatch, tmp_path, phase):
+        # The disk fills while the walk packs one kind of cell (each kind is
+        # walked behind a handler that would cost only a view, or the bar):
+        # the write's own error reaches the caller and nothing of the build is
+        # left, the files folder made only for parking included
+        error = OSError(28, "No space left on device")
+        real, inside, calls = dashboard._write_chunk_file, [], []
+        method = getattr(dashboard._ChunkVisitor, phase)
+
+        def watched(self, *args, **kwargs):
+            inside.append(phase)
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                inside.pop()
+
+        def full_disk(folder, chunk_id, element):
+            calls.append(folder)
+            if inside:
+                raise error
+            return real(folder, chunk_id, element)
+
+        monkeypatch.setattr(dashboard._ChunkVisitor, phase, watched)
+        monkeypatch.setattr(dashboard, "_write_chunk_file", full_disk)
+        with pytest.raises(OSError) as raised:
+            _kc_page(monkeypatch, tmp_path, _kc_sweep_until(_kc_sweep_tiers()))
+        assert raised.value is error
+        assert calls and calls[-1].name.startswith(".parking-") and not calls[-1].exists()
+        assert not (tmp_path / config.DASHBOARD_FILES_DIRNAME).exists()
+        assert not (tmp_path / config.DASHBOARD_FILENAME).exists()
+        assert not list(tmp_path.glob(f".{config.DASHBOARD_FILENAME}.*.tmp"))
+
+    def test_a_chunk_that_cannot_be_parked_keeps_the_last_page_and_its_folder(
+            self, monkeypatch, tmp_path):
+        root = tmp_path / config.DASHBOARD_FILES_DIRNAME
+        page = _kc_page(monkeypatch, tmp_path)
+        before = self._entries(root)
+        error = OSError(28, "No space left on device")
+        real, calls = dashboard._write_chunk_file, []
+
+        def full_disk(folder, chunk_id, element):
+            calls.append(folder)
+            if len(calls) == 2:
+                raise error
+            return real(folder, chunk_id, element)
+
+        monkeypatch.setattr(dashboard, "_write_chunk_file", full_disk)
+        with pytest.raises(OSError) as raised:
+            _kc_page(monkeypatch, tmp_path)
+        # Stopped mid-walk, one chunk parked: the last page and its folder stay,
+        # and nothing of this build is left
+        assert raised.value is error and calls[0].name.startswith(".parking-")
+        assert not calls[0].exists() and len(before) == 2
+        assert self._entries(root) == before
+        assert (tmp_path / config.DASHBOARD_FILENAME).read_text(encoding="utf-8") == page
+
+    @pytest.mark.parametrize("where, part", [
+        ("walk", "_list_payload"),
+        ("header", "_fills_html"),
+        ("page", "_section_benchmark"),
+    ])
+    def test_an_interruption_leaves_nothing_parked(self, monkeypatch, tmp_path, where, part):
+        # Ctrl-C during the walk (after chunks were parked), while the header
+        # is built, or while the page is written: no parking folder and no
+        # build folder is left, and the interruption reaches the caller
+        root = tmp_path / config.DASHBOARD_FILES_DIRNAME
+        real, calls, parked = getattr(dashboard, part), [], []
+        write = dashboard._write_chunk_file
+
+        def interrupted(*args, **kwargs):
+            calls.append(None)
+            if len(calls) == (4 if where == "walk" else 1):
+                raise KeyboardInterrupt
+            return real(*args, **kwargs)
+
+        def recording(folder, chunk_id, element):
+            parked.append(folder)
+            return write(folder, chunk_id, element)
+
+        monkeypatch.setattr(dashboard, part, interrupted)
+        monkeypatch.setattr(dashboard, "_write_chunk_file", recording)
+        with pytest.raises(KeyboardInterrupt):
+            _kc_page(monkeypatch, tmp_path, _kc_sweep_tiers())
+        assert parked and not parked[0].exists()
+        if where == "walk":
+            # The files folder was made only for parking
+            assert not root.exists()
+        else:
+            # The build folder was made (with the builds' lock file) and removed
+            assert self._entries(root) == [".lock"]
+        assert not (tmp_path / config.DASHBOARD_FILENAME).exists()
+
+    # ─── Folders an earlier build left ────────────────────────────────────────
+
+    @staticmethod
+    def _dead_pid() -> int:
+        """The id of a process that has just ended (skips should it be reused at once)."""
+        process = subprocess.Popen([sys.executable, "-c", "pass"])
+        process.wait()
+        try:
+            os.kill(process.pid, 0)
+        except ProcessLookupError:
+            return process.pid
+        pytest.skip("the ended process's id is already in use again")
+
+    @staticmethod
+    def _leftover(root: Path, name: str, *, age: float | None = 0.0) -> Path:
+        """A parking folder an earlier build left: a chunk file and, unless
+        age is None, a mark that many seconds old."""
+        folder = root / name
+        folder.mkdir(parents=True)
+        (folder / "chunk-1.js").write_text("x", encoding="utf-8")
+        if age is not None:
+            (folder / ".writing").write_text("", encoding="utf-8")
+            when = time.time() - age
+            os.utime(folder / ".writing", (when, when))
+        return folder
+
+    def test_a_dead_build_s_parking_folder_is_deleted_before_the_walk_parks(
+            self, monkeypatch, tmp_path):
+        # Deleted when the next build makes its own parking folder, before its
+        # first chunk is parked (the cleanup after publishing is switched off
+        # here, so only that place can delete it)
+        root = tmp_path / config.DASHBOARD_FILES_DIRNAME
+        dead = self._leftover(root, f".parking-20260101T000000Z-{self._dead_pid()}-deadbeef")
+        real, seen = dashboard._write_chunk_file, []
+
+        def write(folder, chunk_id, element):
+            seen.append(dead.exists())
+            return real(folder, chunk_id, element)
+
+        monkeypatch.setattr(dashboard, "_write_chunk_file", write)
+        monkeypatch.setattr(dashboard, "_remove_old_builds", lambda root, keep: None)
+        _kc_page(monkeypatch, tmp_path)
+        assert seen and seen[0] is False
+
+    def test_a_dead_build_s_parking_folder_is_deleted_after_the_next_page_is_published(
+            self, monkeypatch, tmp_path):
+        # A page of one chunk parks nothing: the cleanup after publishing
+        # deletes the folder of a build whose process is gone
+        root = tmp_path / config.DASHBOARD_FILES_DIRNAME
+        dead = self._leftover(root, f".parking-20260101T000000Z-{self._dead_pid()}-deadbeef")
+        trades = _flt_trades()
+        curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        dashboard.generate_dashboard(trades, curve, _FLT_START, 1000.0,
+                                     series_categories=_FLT_SERIES)
+        assert not dead.exists() and self._entries(root) == [".lock"]
+
+    def test_a_running_build_s_parking_folder_is_kept_however_old(self, monkeypatch, tmp_path):
+        # This process's (and pid 1's, which the system will not let us
+        # signal, or lets root signal: running either way), with a mark long
+        # past DASHBOARD_BUILD_STALE_SECONDS: a whole build of several chunks
+        # (both cleanups) keeps them
+        root = tmp_path / config.DASHBOARD_FILES_DIRNAME
+        stale = config.DASHBOARD_BUILD_STALE_SECONDS + 60
+        mine = self._leftover(root, f".parking-20260101T000000Z-{os.getpid()}-deadbeef",
+                              age=stale)
+        init = self._leftover(root, ".parking-20260101T000000Z-1-deadbeef", age=stale)
+        data = TestFilterPage._data(_kc_page(monkeypatch, tmp_path))
+        assert mine.exists() and init.exists()
+        assert self._entries(root) == sorted([".lock", data["sidecar_dir"].split("/")[1],
+                                              mine.name, init.name])
+
+    def test_a_parking_folder_whose_process_cannot_be_told_is_judged_by_its_mark(
+            self, tmp_path):
+        # Not a name a build writes (no process id, or 0, or one too large to
+        # check): kept while its mark is young or missing, deleted once stale
+        root = tmp_path / config.DASHBOARD_FILES_DIRNAME
+        stale = config.DASHBOARD_BUILD_STALE_SECONDS + 60
+        old = self._leftover(root, ".parking-not-a-build-name", age=stale)
+        young = self._leftover(root, ".parking-20260101T000000Z-0-deadbeef", age=0.0)
+        unmarked = self._leftover(root, ".parking-x", age=None)
+        huge = self._leftover(root, f".parking-20260101T000000Z-{2**70}-deadbeef", age=stale)
+        # A build folder past its mark's age is still deleted as before
+        build = self._leftover(root, "20260101T000000Z-1-deadbeef", age=stale)
+        dashboard._remove_old_builds(root, None)
+        assert (old.exists(), young.exists(), unmarked.exists(), huge.exists(),
+                build.exists()) == (False, True, True, False, False)
+
+    # ─── Memory ───────────────────────────────────────────────────────────────
+
+    def test_the_walk_holds_placeholders_not_chunks(self, monkeypatch, tmp_path):
+        # Every chunk made large (a pad of random hex, which packs to about
+        # half its length): the walk's peak of traced memory with parking is
+        # lower than without it by most of the bytes the chunks hold
+        real = dashboard._list_payload
+        rng = random.Random()
+
+        def padded(*args, **kwargs):
+            listed = real(*args, **kwargs)
+            listed["pad"] = rng.randbytes(200_000).hex()
+            return listed
+
+        monkeypatch.setattr(dashboard, "_list_payload", padded)
+
+        def peak(parking) -> tuple[int, list]:
+            """The walk's traced peak above where it started, and its chunks."""
+            rng.seed(7)
+            sweep = _kc_sweep_until(_kc_sweep_tiers())
+            gc.collect()
+            start = tracemalloc.get_traced_memory()[0]
+            tracemalloc.reset_peak()
+            _, chunker = self._walk(sweep, parking)
+            return tracemalloc.get_traced_memory()[1] - start, chunker.chunks
+
+        parking = dashboard._ChunkParking(tmp_path / "page.html")
+        tracemalloc.start()
+        try:
+            held_peak, held = peak(None)
+            sizes = sum(len(chunk) for chunk in held[1:])
+            del held
+            parked_peak, parked = peak(parking)
+        finally:
+            tracemalloc.stop()
+            parking.remove()
+        assert len(parked) > 10 and sizes > 10 * 200_000
+        assert held_peak - parked_peak > 0.75 * sizes, (held_peak, parked_peak, sizes)
+
+    # ─── A files folder that cannot take the parking folder ───────────────────
+
+    @pytest.mark.parametrize("kind", ["a regular file", "a folder this user cannot write"])
+    def test_a_files_folder_that_cannot_take_the_parking_folder_stops_the_build(
+            self, monkeypatch, tmp_path, caplog, kind):
+        # The build stops at its first chunk past the page's own, raising the
+        # parking folder's mkdir's own error, with no WARNING about the
+        # parking folders before it; the last page and its folder stay, and
+        # nothing new is left. (No page holding every chunk is written
+        # instead: that would hold every chunk in memory through the walk)
+        root = tmp_path / config.DASHBOARD_FILES_DIRNAME
+        if kind == "a regular file":
+            # The last page is one of one chunk, so it has no folder
+            trades = _flt_trades()
+            curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+            monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+            monkeypatch.setattr(dashboard.yf, "download",
+                                lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+            dashboard.generate_dashboard(trades, curve, _FLT_START, 1000.0,
+                                         series_categories=_FLT_SERIES)
+            root.write_text("not a folder", encoding="utf-8")
+            expected = NotADirectoryError
+        else:
+            if os.geteuid() == 0:
+                pytest.skip("the superuser can write into any folder")
+            _kc_page(monkeypatch, tmp_path)
+            os.chmod(root, 0o555)
+            expected = PermissionError
+        before = {path: path.read_bytes() if path.is_file() else None
+                  for path in sorted(tmp_path.rglob("*"))}
+        try:
+            with caplog.at_level(logging.WARNING), pytest.raises(expected) as raised:
+                _kc_page(monkeypatch, tmp_path)
+            after = {path: path.read_bytes() if path.is_file() else None
+                     for path in sorted(tmp_path.rglob("*"))}
+        finally:
+            if root.is_dir():
+                os.chmod(root, 0o755)
+        made = Path(raised.value.filename)
+        assert made.parent == root and made.name.startswith(".parking-")
+        assert not [r for r in caplog.records if "parking" in r.getMessage()]
+        assert after == before and (tmp_path / config.DASHBOARD_FILENAME) in before
+
+    # ─── A Ctrl-C between the build's steps ───────────────────────────────────
+
+    @pytest.mark.parametrize("window", ["the lost bar's warning", "between header and page",
+                                        "the parking folder just made"])
+    def test_a_ctrl_c_between_the_build_s_steps_leaves_nothing_parked(
+            self, monkeypatch, tmp_path, window):
+        # A Ctrl-C at the few points that lie outside the walk, the header and
+        # the page's write while chunks are parked: while the WARNING that the
+        # bar was lost is logged, as the temporary page is named, and the
+        # instant the parking folder exists. The interruption reaches the
+        # caller, and no parking folder (nor build folder) is left
+        root = tmp_path / config.DASHBOARD_FILES_DIRNAME
+        if window == "the lost bar's warning":
+            # The walk files the primary under chunk 1 after parking chunks,
+            # so the bar is lost and its WARNING logged
+            real_walk, real_warning = dashboard._build_filter_grid, logging.warning
+
+            def walked_wrongly(*args, **kwargs):
+                source, chunker, kd = real_walk(*args, **kwargs)
+                pb, pk, pc = source.primary
+                chunker.grid[pb][pk][pc] = 1
+                return source, chunker, kd
+
+            def warning(msg, *args, **kwargs):
+                if str(msg).startswith("The page-wide filter could not be built"):
+                    raise KeyboardInterrupt
+                return real_warning(msg, *args, **kwargs)
+
+            monkeypatch.setattr(dashboard, "_build_filter_grid", walked_wrongly)
+            monkeypatch.setattr(dashboard.logging, "warning", warning)
+        elif window == "between header and page":
+            # The temporary page's name, the last step before the write, asks
+            # for the process id
+            real_getpid = os.getpid
+
+            def getpid():
+                if sys._getframe(1).f_code.co_name == "generate_dashboard":
+                    raise KeyboardInterrupt
+                return real_getpid()
+
+            monkeypatch.setattr(os, "getpid", getpid)
+        else:
+            real_mkdir = Path.mkdir
+
+            def mkdir(self, *args, **kwargs):
+                real_mkdir(self, *args, **kwargs)
+                if self.name.startswith(".parking-"):
+                    raise KeyboardInterrupt
+
+            monkeypatch.setattr(Path, "mkdir", mkdir)
+        with pytest.raises(KeyboardInterrupt):
+            _kc_page(monkeypatch, tmp_path, _kc_sweep_tiers())
+        if window == "between header and page":
+            # The build folder was made (with the builds' lock file) and removed
+            assert self._entries(root) == [".lock"]
+        else:
+            # The files folder was made only for parking
+            assert not root.exists()
+        assert not (tmp_path / config.DASHBOARD_FILENAME).exists()
+        assert not list(tmp_path.glob(f".{config.DASHBOARD_FILENAME}.*.tmp"))
+
+    # ─── How parked chunks reach the build folder ─────────────────────────────
+
+    def test_a_parked_chunk_reaches_the_build_folder_by_a_rename(self, monkeypatch, tmp_path):
+        # Each chunk file beside the page is the very file the walk parked
+        # (the same inode), renamed into the build's folder: never written
+        # there again, nor copied
+        real, parked, written = dashboard._write_chunk_file, {}, []
+
+        def write(folder, chunk_id, element):
+            size = real(folder, chunk_id, element)
+            if folder.name.startswith(".parking-"):
+                parked[chunk_id] = dashboard._chunk_file(folder, chunk_id).stat().st_ino
+            else:
+                written.append(chunk_id)
+            return size
+
+        monkeypatch.setattr(dashboard, "_write_chunk_file", write)
+        page = _kc_page(monkeypatch, tmp_path, _kc_sweep_tiers())
+        files = TestScenarioChunksAreFiles._files(page)
+        assert len(files) > 1 and written == []
+        assert {i: path.stat().st_ino for i, path in files.items()} == \
+            {i: parked[i] for i in files}
+
+    def test_the_build_logs_the_bytes_of_the_files_it_moved(self, monkeypatch, tmp_path, caplog):
+        # Chunks made large enough (a pad of seeded random hex) that their
+        # files' total shows in the line's one decimal of MB: the line counts
+        # every chunk file beside the page and their real bytes
+        real = dashboard._list_payload
+        rng = random.Random(7)
+
+        def padded(*args, **kwargs):
+            listed = real(*args, **kwargs)
+            listed["pad"] = rng.randbytes(60_000).hex()
+            return listed
+
+        monkeypatch.setattr(dashboard, "_list_payload", padded)
+        with caplog.at_level(logging.INFO):
+            page = _kc_page(monkeypatch, tmp_path)
+        files = TestScenarioChunksAreFiles._files(page)
+        total = sum(path.stat().st_size for path in files.values())
+        assert len(files) > 1 and total > 200_000
+        line = re.compile(r"Dashboard: (\d+) scenario chunk file\(s\) \((\d+\.\d) MB\) "
+                          r"written beside the page in \d+ s")
+        logged = [match.groups() for r in caplog.records
+                  if (match := line.fullmatch(r.getMessage()))]
+        assert logged == [(str(len(files)), f"{total / 1e6:.1f}")]
+
+    # ─── Two builds at once ───────────────────────────────────────────────────
+
+    def test_a_files_folder_another_build_removed_is_made_again(self, monkeypatch, tmp_path):
+        # Another build, which made the files folder only for parking, removes
+        # it (empty) after this build found it there and before this build
+        # made its parking folder in it: the folder is made again and the
+        # chunk parked
+        page = tmp_path / config.DASHBOARD_FILENAME
+        root = tmp_path / config.DASHBOARD_FILES_DIRNAME
+        element = dashboard._packed_json_script("dash-chunk-1", {"list": {"n": 1}, "strings": []})
+        other = dashboard._ChunkParking(page)
+        other.park(1, "dash-chunk-1", element)
+        real, removed = dashboard._remove_abandoned_parking, []
+
+        def the_other_build_ends(files_folder):
+            other.remove()
+            removed.append(not root.exists())
+            return real(files_folder)
+
+        monkeypatch.setattr(dashboard, "_remove_abandoned_parking", the_other_build_ends)
+        parking = dashboard._ChunkParking(page)
+        parked = parking.park(1, "dash-chunk-1", element)
+        assert removed == [True] and parking.folder.is_dir()
+        assert parking.element(1, parked) == element
+        parking.remove()
+        assert not list(root.iterdir())
 
 
 class TestSoldTradeRow:
