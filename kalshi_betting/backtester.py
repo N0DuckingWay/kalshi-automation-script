@@ -326,21 +326,14 @@ Notes:
     UTC dates, so _prepare_candidates() refuses, before fetching, a schedule
     whose run does not fall once on its own UTC date (ScheduledRun.date_problems).
 
-    "Skip if closing within" (a live setting the backtest applies too) holds
-    back a purchase whose markets stop trading too soon. _find_entry skips a
-    Monday checkpoint that falls less than the run's minimum of days (24-hour
-    spans) before either leg's close, through config.closes_far_enough, the
-    test live runs ask; an earlier qualifying Monday of the same pair still
-    enters. Every backtest purchase (a new pair, an add-on, a re-buy) comes
-    from those Mondays, so the rule covers them all, and it never touches a
-    sale or a trim. Each leg is judged on _buy_rule_close: the scheduled
-    close a live run would have read where one is carried, else the start
-    (00:00 UTC) of the last day its wording includes. It never reads the
-    close Kalshi recorded, since a market whose event happened early closed
-    early, and judging it on that close would let the backtest read the
-    outcome. A leg with neither is never bought. The run's minimum is
-    config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT unless backtest.py names another
-    (_resolve_buy_min_days_to_close).
+    "Skip if closing within": _find_entry skips a Monday checkpoint that is
+    less than the run's minimum days before either leg's close (asked of
+    config.closes_far_enough, as live runs do). An earlier Monday can still
+    enter. Sales and trims are never held back. Each leg's close comes from
+    _buy_rule_close: the scheduled close if carried, else the wording's last
+    day (00:00 UTC), never the recorded close, which would leak the outcome.
+    A leg with neither is never bought. The minimum defaults to
+    config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT (_resolve_buy_min_days_to_close).
 
     Before grouping, _prepare_candidates() filters markets through
     _can_ever_enter(), a cheap per-market PREFILTER that drops only markets no
