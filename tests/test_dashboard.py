@@ -3248,7 +3248,10 @@ class TestLiveRuleHeader:
 class TestEntryCheckpointHeader:
     """The page header names the entry checkpoint (the backtest's weekly
     moment, BacktestSweep.entry_checkpoint) under the run-settings line, says
-    the live runs are at other times, or says it was not recorded."""
+    the live runs are at other times, or says it was not recorded. A run that
+    applied "Skip if closing within" (BacktestSweep.buy_min_days_to_close)
+    adds that it bought only contracts closing at least that many days after
+    the checkpoint; off or not recorded, the line is unchanged."""
 
     _LABEL = "Monday 09:00 America/Los_Angeles"
     _RECORDED = (f"Entry checkpoint: {_LABEL}, once a week (live runs are at "
@@ -3313,6 +3316,55 @@ class TestEntryCheckpointHeader:
         page = TestRunSettingsHeader._page(monkeypatch, tmp_path, sweep=sweep)
         assert (f"Entry checkpoint: {backtester.SCHEDULED_RUN.label()}, once a week "
                 "(live runs are at other times)</p>") in page
+
+    @pytest.mark.parametrize("days", [3, 7, 14])
+    def test_skip_if_closing_within_adds_its_days(self, days):
+        # The run applied "Skip if closing within": the line says what it bought
+        pt = _scn_point((0.3, 0.6), 0.75)
+        sweep = BacktestSweep(primary=pt, points=[pt], calibration=None,
+                              entry_checkpoint=self._LABEL, buy_min_days_to_close=days)
+        assert dashboard._entry_checkpoint_html(sweep).endswith(
+            f"Entry checkpoint: {self._LABEL}, once a week (live runs are at other times); "
+            f"buys only contracts closing at least {days} days after it</p>")
+
+    @pytest.mark.parametrize("value", [False, None, 0, True, "7", 7.0, MagicMock()])
+    def test_the_rule_off_or_not_recorded_keeps_the_line_as_it_was(self, value):
+        # Off (False), not recorded (None) or anything but a number of days:
+        # the line is exactly the one a run without the rule printed
+        pt = _scn_point((0.3, 0.6), 0.75)
+        sweep = BacktestSweep(primary=pt, points=[pt], calibration=None,
+                              entry_checkpoint=self._LABEL, buy_min_days_to_close=value)
+        assert dashboard._entry_checkpoint_html(sweep).endswith(self._RECORDED)
+        assert "buys only" not in dashboard._entry_checkpoint_html(sweep)
+
+    @pytest.mark.parametrize("days", [3, 7, 14])
+    def test_the_rule_without_a_recorded_checkpoint_is_a_sentence_of_its_own(self, days):
+        # No checkpoint to call "it": the rule's clause names the checkpoint
+        # in a sentence of its own
+        pt = _scn_point((0.3, 0.6), 0.75)
+        for label in (None, ""):
+            sweep = BacktestSweep(primary=pt, points=[pt], calibration=None,
+                                  entry_checkpoint=label, buy_min_days_to_close=days)
+            assert dashboard._entry_checkpoint_html(sweep) == (
+                '<p style="color:#616161; font-size:14px;">Entry checkpoint: not recorded. '
+                f"Buys only contracts closing at least {days} days after the checkpoint.</p>")
+        # Off or not recorded, the not-recorded line is exactly what it was
+        for value in (False, None, 0):
+            sweep = BacktestSweep(primary=pt, points=[pt], calibration=None,
+                                  buy_min_days_to_close=value)
+            assert dashboard._entry_checkpoint_html(sweep) == (
+                '<p style="color:#616161; font-size:14px;">' + self._NOT_RECORDED)
+
+    def test_a_run_with_the_rule_on_reaches_the_page(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        monkeypatch.setattr(backtester, "BUY_MIN_DAYS_TO_CLOSE_DEFAULT", 7)
+        sweep = backtester.run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1),
+                                              1000.0, sweep=False)
+        assert sweep.buy_min_days_to_close == 7
+        page = TestRunSettingsHeader._page(monkeypatch, tmp_path, sweep=sweep)
+        assert (f"Entry checkpoint: {backtester.SCHEDULED_RUN.label()}, once a week "
+                "(live runs are at other times); buys only contracts closing at least 7 "
+                "days after it</p>") in page
 
 
 class TestFillsHeader:

@@ -585,7 +585,10 @@ Notes:
     (BacktestSweep.config_same_event_ladders), naming a departure from this
     checkout's config rather than rendering a bare on/off. The line under it
     names the entry checkpoint (BacktestSweep.entry_checkpoint), the weekly
-    moment (config.SCHEDULED_RUN) at which every simulated trade was opened. The
+    moment (config.SCHEDULED_RUN) at which every simulated trade was opened,
+    and, when the run applied "Skip if closing within"
+    (BacktestSweep.buy_min_days_to_close), that it bought only contracts
+    closing at least that many days after it. The
     fills line after it says how many of the primary scenario's trades walked
     a modeled order book and how many filled at the top of the book, and, with
     no depth model, that every trade did (_fills_html). Trade rows read what
@@ -5534,6 +5537,10 @@ def _entry_checkpoint_html(sweep: BacktestSweep | None) -> str:
     (config.SCHEDULER_RUN_TIMES), so the line says so. generate_dashboard()
     prints this line under the run-settings line. Anything but a non-empty
     str (no sweep, a hand-built sweep, a test stand-in) reads "not recorded".
+    When the run applied "Skip if closing within"
+    (BacktestSweep.buy_min_days_to_close holds its days), the line adds that
+    the run bought only contracts closing at least that many days after the
+    checkpoint; with the rule off or not recorded it adds nothing.
 
     Args:
         sweep (BacktestSweep | None): The run's sweep payload, or None.
@@ -5541,12 +5548,26 @@ def _entry_checkpoint_html(sweep: BacktestSweep | None) -> str:
     Returns:
         str: One grey <p> line: "Entry checkpoint: <label>, once a week (live
             runs are at other times)", or "Entry checkpoint: not recorded".
+            With the rule on, the first is followed by "; buys only
+            contracts closing at least N days after it" and the second by
+            ". Buys only contracts closing at least N days after the
+            checkpoint."
     """
     label = None if sweep is None else getattr(sweep, "entry_checkpoint", None)
-    if isinstance(label, str) and label:
+    recorded = isinstance(label, str) and bool(label)
+    if recorded:
         text = f"{html.escape(label)}, once a week (live runs are at other times)"
     else:
         text = "not recorded"
+    # "Skip if closing within": a number of days when the run applied it,
+    # False when it was off, None when not recorded (a bool is not a number here)
+    days = None if sweep is None else getattr(sweep, "buy_min_days_to_close", None)
+    if isinstance(days, int) and not isinstance(days, bool) and days > 0:
+        span = f"{days} day{'' if days == 1 else 's'}"
+        # With no checkpoint named, "it" would point at nothing, so the
+        # clause is a sentence of its own that names the checkpoint
+        text += (f"; buys only contracts closing at least {span} after it" if recorded
+                 else f". Buys only contracts closing at least {span} after the checkpoint.")
     return f'<p style="color:#616161; font-size:14px;">Entry checkpoint: {text}</p>'
 
 

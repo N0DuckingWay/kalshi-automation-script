@@ -10,6 +10,7 @@ Purpose:
     --no-same-event-ladders, --scheduled-close / --no-scheduled-close,
     --stale-quote-hours / --no-stale-quote-check,
     --max-volume-share / --no-volume-cap,
+    --buy-min-days-to-close / --no-buy-min-days-to-close,
     --spread-min, --spread-max, --no-band-sweep,
     --no-cap-sweep, --no-sell-sweep, --sell-workers, --no-rebalance-sweep,
     --no-move-sweep, --no-maturity-sweep, --no-eda, --dashboard-only,
@@ -64,6 +65,8 @@ Dependencies:
     BACKTEST_SWEEP_HEADER_MAX_BYTES (the saved sweep file: where it goes, the
     format tag it is written in, the most of its first line a rebuild reads),
     MIN_BALANCE_CENTS (the low starting-balance WARNING),
+    BUY_MIN_DAYS_TO_CLOSE_DEFAULT and BUY_MIN_DAYS_TO_CLOSE_CHOICES (the
+    "Skip if closing within" flags' check, help text and pre-fetch echo),
     TIME_SERIES_INTERVAL_PROB_DISCOUNT and TIME_SERIES_SAME_EVENT_LADDERS
     (the pre-fetch echo and the flag's help text), the deadline-gap tier constants
     MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS,
@@ -144,6 +147,15 @@ Notes:
     next-day traded contracts a backtest buy or sale may take. It reads hours
     a live run cannot see, only ever makes a trade smaller, and never reaches
     a live run.
+
+    --buy-min-days-to-close N / --no-buy-min-days-to-close is the one-run
+    override for the backtest's "Skip if closing within" (the live setting
+    the backtest applies too; config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT, 7 days,
+    by default): a pair is bought, or added to, only at a Monday checkpoint
+    at least N days before both its markets close, N one of
+    config.BUY_MIN_DAYS_TO_CLOSE_CHOICES (0 is off). An N outside those
+    choices exits 2 before anything is fetched. It never reaches a live
+    run, which reads the saved live defaults (or main.py's own flag).
 
     That setting reaches kalshi_backtest.log (the pre-fetch echo below and
     run_backtest_sweep's resolved line) AND the HTML dashboard's own page
@@ -335,6 +347,8 @@ from .config import (
     BACKTEST_SWEEP_FILENAME,
     BACKTEST_SWEEP_FORMAT,
     BACKTEST_SWEEP_HEADER_MAX_BYTES,
+    BUY_MIN_DAYS_TO_CLOSE_CHOICES,
+    BUY_MIN_DAYS_TO_CLOSE_DEFAULT,
     DASHBOARD_SELL_MAX_WORKERS,
     EDA_MAX_WORKERS,
     MAX_DEADLINE_GAP_DAYS,
@@ -500,6 +514,21 @@ def _volume_cap_text(share: float | None) -> str:
     return "off" if share is None else f"{share * 100:g}%"
 
 
+def _skip_closing_text(days: int | None) -> str:
+    """
+    A "Skip if closing within" minimum as the pre-fetch echo and --help name it: "7 days", or "off".
+
+    Args:
+        days (int | None): The days; None or 0 for the rule off.
+
+    Returns:
+        str: The days with " days" (" day" for one), or "off".
+    """
+    if not days:
+        return "off"
+    return f"{days} day{'' if days == 1 else 's'}"
+
+
 def _fills_echo(depth_model: DepthModel | None) -> str:
     """
     Say how the run's trades will fill, for the pre-fetch config line.
@@ -629,6 +658,8 @@ _RUN_ONLY_FLAGS = (
     ("no_stale_quote_check", "--no-stale-quote-check"),
     ("max_volume_share", "--max-volume-share"),
     ("no_volume_cap", "--no-volume-cap"),
+    ("buy_min_days_to_close", "--buy-min-days-to-close"),
+    ("no_buy_min_days_to_close", "--no-buy-min-days-to-close"),
     ("spread_min", "--spread-min"), ("spread_max", "--spread-max"),
     ("no_band_sweep", "--no-band-sweep"),
 )
@@ -1416,6 +1447,27 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-volume-cap", action="store_true",
         help="Hold a trade only to the modeled book, for this run. Backtest only.",
     )
+    # "Skip if closing within": days for this run, or off; neither given reads
+    # config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT at call time. The words name
+    # config.BUY_MIN_DAYS_TO_CLOSE_CHOICES, the only days main() accepts
+    skip_off, *skip_days = BUY_MIN_DAYS_TO_CLOSE_CHOICES
+    skip_closing = parser.add_mutually_exclusive_group()
+    skip_closing.add_argument(
+        "--buy-min-days-to-close", type=int, default=None, metavar="N",
+        help="Skip if closing within N days: buy a pair, or add to a held one, only at "
+             "a Monday checkpoint at least N days (24-hour spans) before each of its "
+             f"markets closes: {skip_off} = off, or "
+             f"{', '.join(str(d) for d in skip_days[:-1])} or {skip_days[-1]}. A market's "
+             "close is its scheduled close where one is known, else the start of the last "
+             "day its wording names, never the close Kalshi recorded (default: "
+             "config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT, currently "
+             f"{_skip_closing_text(BUY_MIN_DAYS_TO_CLOSE_DEFAULT)}). Backtest only: a live "
+             "run reads the saved live defaults, or main.py's own --buy-min-days-to-close.",
+    )
+    skip_closing.add_argument(
+        "--no-buy-min-days-to-close", action="store_true",
+        help="Buy however soon a market closes, for this run. Backtest only.",
+    )
     # Each side is independently optional; the omitted one resolves from
     # config's own default band (see the validation block below), not from a
     # literal (0.0, 1.0) here — which is why the help names the constant
@@ -1543,7 +1595,8 @@ def main() -> None:
     --max-horizon-days, --interval-discount, --no-sweep,
     --same-event-ladders / --no-same-event-ladders, --scheduled-close /
     --no-scheduled-close, --stale-quote-hours / --no-stale-quote-check,
-    --max-volume-share / --no-volume-cap, --spread-min,
+    --max-volume-share / --no-volume-cap, --buy-min-days-to-close /
+    --no-buy-min-days-to-close, --spread-min,
     --spread-max, --no-band-sweep, --no-cap-sweep, --no-sell-sweep,
     --no-rebalance-sweep, --no-move-sweep, --no-maturity-sweep, --sell-workers,
     --no-eda, --dashboard-only, --accept-changed-simulator); with --dashboard-only it
@@ -1609,6 +1662,12 @@ def main() -> None:
     if args.max_volume_share is not None and not (
             math.isfinite(args.max_volume_share) and 0 < args.max_volume_share <= 100):
         parser.error("--max-volume-share must be a percent above 0 and at most 100")
+    if (args.buy_min_days_to_close is not None
+            and args.buy_min_days_to_close not in BUY_MIN_DAYS_TO_CLOSE_CHOICES):
+        skip_off, *skip_days = BUY_MIN_DAYS_TO_CLOSE_CHOICES
+        parser.error(f"--buy-min-days-to-close must be "
+                     f"{', '.join(str(d) for d in skip_days[:-1])} or {skip_days[-1]} days, "
+                     f"or {skip_off} for off")
 
     # Resolved here, BEFORE logging is configured (TS-20 — see the comment
     # below). The configured default is read and validated on EVERY run,
@@ -1706,6 +1765,15 @@ def main() -> None:
     volume_echo = _volume_cap_text(effective_volume)
     if volume_echo != _volume_cap_text(BACKTEST_MAX_VOLUME_SHARE):
         volume_echo += f" (config: {_volume_cap_text(BACKTEST_MAX_VOLUME_SHARE)})"
+    # ... and for "Skip if closing within" (days for the sweep; None: config's
+    # default; False: off)
+    buy_min_days_to_close = (False if args.no_buy_min_days_to_close
+                             else args.buy_min_days_to_close)
+    effective_skip = (BUY_MIN_DAYS_TO_CLOSE_DEFAULT if buy_min_days_to_close is None
+                      else None if buy_min_days_to_close is False else buy_min_days_to_close)
+    skip_echo = _skip_closing_text(effective_skip)
+    if skip_echo != _skip_closing_text(BUY_MIN_DAYS_TO_CLOSE_DEFAULT):
+        skip_echo += f" (config: {_skip_closing_text(BUY_MIN_DAYS_TO_CLOSE_DEFAULT)})"
     # Same pre-fetch echo, same reason, for the spread band: the VALUE is
     # resolved through the same config function run_backtest_sweep calls
     # (never a by-value copy of BACKTEST_DEFAULT_SPREAD_BAND), so it cannot
@@ -1788,11 +1856,11 @@ def main() -> None:
     logging.info(
         "Backtest config: start=%s | balance=$%.2f | cache=%s | scheduled close=%s "
         "| k=%.3f | stale quotes=%s | volume cap=%s | ladders=%s | spread band=%g-%g "
-        "| band sweep=%s | cap sweep=%s "
+        "| skip if closing within=%s | band sweep=%s | cap sweep=%s "
         "| sell sweep=%s | rebalance sweep=%s | live rule=%s | fills=%s",
         start_date, start.dollars, "on" if use_cache else "off", scheduled_echo,
         effective_k, stale_echo, volume_echo, ladders_echo, echo_floor, echo_ceiling,
-        "on" if band_sweep else "off", "on" if cap_sweep else "off",
+        skip_echo, "on" if band_sweep else "off", "on" if cap_sweep else "off",
         f"on ({sell_workers} worker process{'' if sell_workers == 1 else 'es'})"
         if sell_sweep else "off",
         # A default run reads "on"; the family without its minimum price
@@ -1873,6 +1941,9 @@ def main() -> None:
         stale_quote_max_age=stale_quote_max_age,
         # The share of the next day's volume a buy or sale may take (None: config; False: off)
         max_volume_share=max_volume_share,
+        # "Skip if closing within": the fewest days from a checkpoint to both
+        # markets' close for a purchase (None: config; False: off)
+        buy_min_days_to_close=buy_min_days_to_close,
         spread_band=spread_band,
         band_sweep=band_sweep,
         # The dashboard's "Tier floors: off" view: the band sweep's

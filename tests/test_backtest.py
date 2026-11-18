@@ -486,6 +486,79 @@ class TestMaxVolumeShareArgument:
         assert config.BACKTEST_VOLUME_SHARE_WINDOW_SECONDS == 86_400
 
 
+class TestBuyMinDaysToCloseArgument:
+    """--buy-min-days-to-close N / --no-buy-min-days-to-close: the backtest's
+    "Skip if closing within" for this run. N must be one of
+    config.BUY_MIN_DAYS_TO_CLOSE_CHOICES (0 is off); neither flag hands the
+    sweep None, so backtester's binding of the default applies."""
+
+    def test_default_is_no_override(self, cli, monkeypatch):
+        _run(monkeypatch)
+        assert cli["sweep_kwargs"]["buy_min_days_to_close"] is None
+
+    @pytest.mark.parametrize("flags, value", [(["--buy-min-days-to-close", "3"], 3),
+                                              (["--buy-min-days-to-close", "7"], 7),
+                                              (["--buy-min-days-to-close", "14"], 14),
+                                              (["--buy-min-days-to-close", "0"], 0),
+                                              (["--no-buy-min-days-to-close"], False)])
+    def test_the_flags_reach_the_sweep(self, cli, monkeypatch, flags, value):
+        _run(monkeypatch, *flags)
+        assert cli["sweep_kwargs"]["buy_min_days_to_close"] == value
+        assert type(cli["sweep_kwargs"]["buy_min_days_to_close"]) is type(value)
+
+    @pytest.mark.parametrize("days", ["5", "-3", "1", "21", "7.0", "seven"])
+    def test_a_day_count_outside_the_menu_is_a_usage_error(self, cli, monkeypatch, capsys,
+                                                           days):
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "--buy-min-days-to-close", days)
+        assert exc.value.code == 2
+        # Refused before anything is fetched or simulated
+        assert "sweep_kwargs" not in cli
+        err = capsys.readouterr().err
+        if days not in ("7.0", "seven"):
+            # A whole number, refused by the menu check, which names the choices
+            assert "--buy-min-days-to-close must be 3, 7 or 14 days, or 0 for off" in err
+
+    def test_the_two_flags_are_exclusive(self, cli, monkeypatch):
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "--buy-min-days-to-close", "7", "--no-buy-min-days-to-close")
+        assert exc.value.code == 2
+        assert "sweep_kwargs" not in cli
+
+    @pytest.mark.parametrize("flags, configured, echo", [
+        ([], 7, "| spread band=0-1 | skip if closing within=7 days | band sweep="),
+        ([], None, "| skip if closing within=off | band sweep="),
+        (["--no-buy-min-days-to-close"], 7,
+         "| skip if closing within=off (config: 7 days) | band sweep="),
+        (["--buy-min-days-to-close", "0"], 7,
+         "| skip if closing within=off (config: 7 days) | band sweep="),
+        (["--buy-min-days-to-close", "3"], 7,
+         "| skip if closing within=3 days (config: 7 days) | band sweep="),
+        (["--buy-min-days-to-close", "7"], 7, "| skip if closing within=7 days | band sweep="),
+        (["--buy-min-days-to-close", "14"], None,
+         "| skip if closing within=14 days (config: off) | band sweep="),
+    ])
+    def test_the_config_echo_names_it(self, cli, monkeypatch, caplog, flags, configured, echo):
+        monkeypatch.setattr(backtest, "BUY_MIN_DAYS_TO_CLOSE_DEFAULT", configured)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, *flags)
+        assert echo in caplog.text
+
+    def test_the_help_text_names_the_choices_and_the_default(self, cli, monkeypatch, capsys):
+        with pytest.raises(SystemExit):
+            _run(monkeypatch, "--help")
+        help_text = " ".join(capsys.readouterr().out.split())
+        assert "0 = off, or 3, 7 or 14." in help_text
+        assert "config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT, currently 7 days)" in help_text
+        assert "never the close Kalshi recorded" in help_text
+
+    def test_the_shipped_bindings_are_the_config_s(self):
+        from kalshi_betting import config
+        assert (backtest.BUY_MIN_DAYS_TO_CLOSE_DEFAULT
+                == config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT == 7)
+        assert backtest.BUY_MIN_DAYS_TO_CLOSE_CHOICES == config.BUY_MIN_DAYS_TO_CLOSE_CHOICES
+
+
 class TestSameEventLaddersArgument:
     """--same-event-ladders / --no-same-event-ladders (DR-73c)."""
 
@@ -2125,7 +2198,8 @@ class TestDashboardOnly:
     @pytest.mark.parametrize("damage", ["not gzip", "no header line", "header not json",
                                         "other format", "before tag exclusions",
                                         "before rebalance until", "before until choices",
-                                        "before the same-title removal", "no fingerprint"])
+                                        "before the same-title removal",
+                                        "before skip if closing within", "no fingerprint"])
     def test_a_file_whose_header_cannot_be_read_exits_1(self, rebuild, monkeypatch, damage):
         path = rebuild["path"]
         if damage == "not gzip":
@@ -2156,6 +2230,11 @@ class TestDashboardOnly:
             # two same-title caps, CapSweep its same-title entries and
             # ExtraDataReport four same-title counts
             _rewrite_header(path, format="backtest-sweep-v6")
+        elif damage == "before skip if closing within":
+            # The format a run saved before the backtest applied "Skip if
+            # closing within": BacktestSweep had no buy_min_days_to_close or
+            # live_buy_min_days_to_close
+            _rewrite_header(path, format="backtest-sweep-v7")
         else:
             _rewrite_header(path, fingerprint_parts=None)
         with pytest.raises(SystemExit) as exc:
@@ -2165,13 +2244,15 @@ class TestDashboardOnly:
         assert exc.value.code.startswith(f"backtest: {path} cannot be used: ")
         assert exc.value.code.endswith("run the backtest again to save a new one")
         if damage in ("other format", "before tag exclusions", "before rebalance until",
-                      "before until choices", "before the same-title removal"):
+                      "before until choices", "before the same-title removal",
+                      "before skip if closing within"):
             old = {"other format": "v1", "before tag exclusions": "v3",
                    "before rebalance until": "v4", "before until choices": "v5",
-                   "before the same-title removal": "v6"}[damage]
+                   "before the same-title removal": "v6",
+                   "before skip if closing within": "v7"}[damage]
             assert f"'backtest-sweep-{old}'" in exc.value.code
             assert repr(config.BACKTEST_SWEEP_FORMAT) in exc.value.code
-            assert config.BACKTEST_SWEEP_FORMAT == "backtest-sweep-v7"
+            assert config.BACKTEST_SWEEP_FORMAT == "backtest-sweep-v8"
         assert "dashboard" not in rebuild
 
     @pytest.mark.parametrize("damage", ["cut short", "not the inputs"])
@@ -2235,6 +2316,8 @@ class TestDashboardOnly:
         ["--max-horizon-days", "5"], ["--interval-discount", "0.5"], ["--no-sweep"],
         ["--same-event-ladders"], ["--no-same-event-ladders"], ["--spread-min", "0.1"],
         ["--spread-max", "0.9"], ["--no-band-sweep"],
+        ["--buy-min-days-to-close", "3"], ["--buy-min-days-to-close", "0"],
+        ["--no-buy-min-days-to-close"],
     ])
     def test_a_flag_that_shapes_a_run_is_refused(self, rebuild, monkeypatch, capsys, argv):
         with pytest.raises(SystemExit) as exc:

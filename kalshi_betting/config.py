@@ -677,12 +677,16 @@ REBALANCE_MIN_DAYS_TO_MATURITY: int | None = None
 # "Skip if closing within": the fewest days (24-hour spans) from the moment
 # the bot looks to the close (when trading stops) of every market a purchase
 # would buy, a new pair or an add-on to a held one. Sales and trims never read
-# it; a live run applies it through closes_far_enough. The choices
-# LiveSettings.buy_min_days_to_close accepts; 0 is "Off", stored as None.
+# it. A live run applies it through closes_far_enough, and so does the
+# backtest, at each Monday entry checkpoint (backtester._find_entry). The
+# choices LiveSettings.buy_min_days_to_close accepts, and backtest.py's
+# --buy-min-days-to-close too; 0 is "Off", stored as None.
 BUY_MIN_DAYS_TO_CLOSE_CHOICES = (0, 3, 7, 14)
 # The one-week default: what a saved live defaults file that leaves the
-# setting out (one saved before it existed) reads as, and what the seed
-# proposes for a first save (LIVE_DEFAULTS_SEED).
+# setting out (one saved before it existed) reads as, what the seed proposes
+# for a first save (LIVE_DEFAULTS_SEED), and the backtest's main value: a
+# backtest run applies it unless backtest.py says otherwise for that run
+# (backtester binds it by value, so a test patches backtester's binding).
 BUY_MIN_DAYS_TO_CLOSE_DEFAULT = 7
 # config.py's own value of the toggle, read only by live_settings() (tests and
 # direct library calls); a live run reads the saved live defaults instead
@@ -1011,13 +1015,11 @@ BACKTEST_SWEEP_FILENAME = "backtest_sweep.pkl.gz"
 # A rebuild refuses a file with any other tag; change it whenever the line's
 # keys, the pickled inputs' keys or the fields of the classes pickled in them
 # (BacktestSweep and the lazy families it holds) change, so an older file is
-# refused rather than misread. v7: the backtest simulates time-series pairs
-# only, so BacktestSweep lost same_title_point, same_title_size_cap and
-# live_same_title_size_cap, CapSweep lost st_entries and same_title_eager,
-# and ExtraDataReport lost its four same-title counts (strikes_differ,
-# strikes_checked, sources_differ, sources_checked); v6 files, from before,
-# are refused.
-BACKTEST_SWEEP_FORMAT = "backtest-sweep-v7"
+# refused rather than misread. v8: the backtest applies "Skip if closing
+# within", so BacktestSweep gained buy_min_days_to_close (the run's own
+# value) and live_buy_min_days_to_close (the saved live defaults' value);
+# v7 files, from before, are refused.
+BACKTEST_SWEEP_FORMAT = "backtest-sweep-v8"
 
 # The most bytes a rebuild reads for the saved sweep file's first line (the
 # JSON one): the real line is a few hundred bytes, so a file that runs past
@@ -3585,7 +3587,9 @@ class LiveSettings:
             such as 7.0 or a numpy integer is refused. A saved file that
             leaves it out (one saved before the setting existed) reads it as
             BUY_MIN_DAYS_TO_CLOSE_DEFAULT, 7 days, not as off. A live run
-            applies it through closes_far_enough.
+            applies it through closes_far_enough; the backtest applies the
+            same test at each Monday checkpoint, at its own value of the
+            setting (backtester._find_entry), never this field.
         origin (str): Where these toggles' defaults were read: the saved defaults
             file with when (and from what) it was saved, or LIVE_DEFAULTS_FROM_CONFIG
             for toggles built from this module's constants (the default).
@@ -5066,7 +5070,12 @@ def closes_far_enough(closes, now: datetime, min_days: int | None) -> bool:
     must pass, the earliest one decides. Live runs ask it through
     scanner.filter_markets_closing_far_enough (the markets the time-series
     finder may pair) and through main._run_prod's add-on step (the held
-    pairs and lone legs a run may add to). Sales and trims never ask it.
+    pairs and lone legs a run may add to). The backtest asks it in
+    backtester._find_entry, at each Monday entry checkpoint (the moment the
+    backtest looks), on each leg's backtester._buy_rule_close: the scheduled
+    close a live run would have read where one is carried, else the start
+    of the last day the market's wording includes, never the close Kalshi
+    recorded. Sales and trims never ask it.
 
     Args:
         closes: Each market's close (a tz-aware datetime), or None when unknown, in any iterable.

@@ -232,6 +232,20 @@ python3 -m kalshi_betting.backtest --no-stale-quote-check
 python3 -m kalshi_betting.backtest --max-volume-share 5
 python3 -m kalshi_betting.backtest --no-volume-cap
 
+# Backtest with "Skip if closing within" at 3 days, or off, for THIS run only (default:
+# config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT, 7 days — a pair is bought, or added to, only at a
+# Monday checkpoint at least that many days (24-hour spans) before each of its markets
+# closes, judged on its scheduled close where one is known, else the start (00:00 UTC) of
+# the last day its wording names, never the close Kalshi recorded; N is 0 (off), 3, 7 or
+# 14, any other N exits 2 before anything is fetched; run-only, so --dashboard-only
+# refuses both; backtest only: a live run reads the saved live defaults). The log names
+# it on a "Skip if closing within (backtest): ..." line and, with it on, counts what it
+# removed once: "Skip if closing within 3 days (backtest), at band 0-1 with the tier
+# floors on: removed M qualifying Monday(s), ...". A --max-horizon-days at or below the
+# run's days logs one WARNING (the backtest then buys next to nothing) and the run goes on
+python3 -m kalshi_betting.backtest --buy-min-days-to-close 3
+python3 -m kalshi_betting.backtest --no-buy-min-days-to-close
+
 # Backtest at a specific PRIMARY-scenario time-series spread band on pB - pA
 # (backtest only; the live band is the saved live defaults', or main.py's own
 #  --spread-min/--spread-max for one live run, read only through config.LiveSettings — no module outside config/backtester/backtest/dashboard calls

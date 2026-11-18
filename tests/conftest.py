@@ -4,15 +4,16 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Suite-wide pytest fixtures and two helpers. Thirteen autouse guards
+    Suite-wide pytest fixtures and two helpers. Fourteen autouse guards
     (_offline_event_reads_for_the_session,
     _isolate_event_title_accumulator, _isolate_treasury_rates,
     _fresh_order_write_pacer, _fresh_v2_mapping_disproof_state,
     _isolate_live_defaults_for_the_session, _isolate_live_defaults,
     _isolate_live_runs, _isolate_live_dashboard,
     _offline_market_details_for_the_session, _isolate_market_details,
-    _stale_quote_check_off_for_the_session and
-    _volume_cap_off_for_the_session, in the order described here): one
+    _stale_quote_check_off_for_the_session,
+    _volume_cap_off_for_the_session and
+    _skip_closing_off_for_the_session, in the order described here): one
     answers every per-event read the backtest makes (each pair market's
     event fee override as none, its facts as no settlement source and no
     mutually_exclusive flag) and points those reads' caches and Kalshi's
@@ -54,7 +55,13 @@ Purpose:
     stale_quote_max_age argument); and one turns the backtest's volume cap
     off the same way (backtester's binding of config.BACKTEST_MAX_VOLUME_SHARE
     set to None), for the same reason: the suite's figures were pinned before
-    it existed, and a test of the cap turns it on itself.
+    it existed, and a test of the cap turns it on itself; and one turns the
+    backtest's "Skip if closing within" off the same way (backtester's
+    binding of config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT set to None), since the
+    suite's figures were pinned before the backtest applied it and many
+    fixtures enter a pair days before its earlier market closes; a test of
+    the rule turns it on itself (its monkeypatch, or the run's
+    buy_min_days_to_close argument).
     pre_toggle_defaults pins
     the live toggles for a test whose figures assume fixed values (they pin
     arithmetic, not config.py's policy); its helper, apply_pre_toggle_defaults,
@@ -279,6 +286,30 @@ def _volume_cap_off_for_the_session():
     """
     mp = pytest.MonkeyPatch()
     mp.setattr(backtester, "BACKTEST_MAX_VOLUME_SHARE", None)
+    yield
+    mp.undo()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _skip_closing_off_for_the_session():
+    """
+    Turn the backtest's "Skip if closing within" off for the whole session.
+
+    The suite's figures were pinned before the backtest applied the rule, and
+    many of its fixtures enter a pair on a Monday a few days before its
+    earlier market closes, which the shipped 7 days would skip.
+    Session-scoped, like the volume-cap one above, because class setup runs
+    whole backtests before any function-scoped fixture. A test of the rule
+    turns it on with its own monkeypatch of
+    backtester.BUY_MIN_DAYS_TO_CLOSE_DEFAULT (undone back to None), or hands
+    a run its buy_min_days_to_close, or hands _find_entry its
+    min_days_to_close. Live runs never read this binding.
+
+    Yields:
+        None: The setting holds until the session ends.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setattr(backtester, "BUY_MIN_DAYS_TO_CLOSE_DEFAULT", None)
     yield
     mp.undo()
 

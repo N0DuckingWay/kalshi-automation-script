@@ -2946,7 +2946,10 @@ class TestTimeSeriesKellyParity:
                      if isinstance(node, ast.FunctionDef)}
         readers = {name for name, node in functions.items()
                    if name != "_maturity_close" and _calls_to(node, "_maturity_close")}
-        assert readers == {"_find_entry", "_simulate_at_discount", "_apply_scheduled_closes"}
+        # _buy_rule_close ("Skip if closing within") reads the scheduled
+        # close only, never the realized one: see the pin below
+        assert readers == {"_find_entry", "_simulate_at_discount", "_apply_scheduled_closes",
+                           "_buy_rule_close"}
         for name in ("_can_ever_enter", "_checkpoint_floor", "_fetch_candles_parallel",
                      "_candle_window_open", "_extract_pairs", "_attach_leg_quotes",
                      "_leg_quotes", "_prepare_candidates"):
@@ -2971,6 +2974,52 @@ class TestTimeSeriesKellyParity:
         # The rule is the one market_details defines
         assert _function_calls(backtester, "_write_scheduled_close", "scheduled_close")
         assert _function_calls(backtester, "_prepare_candidates", "load_close_rules")
+
+    def test_ast_the_buy_rule_never_reads_the_recorded_close(self):
+        # "Skip if closing within" judges a settled market on its scheduled
+        # close where carried, else the start of the last day its wording
+        # includes, and NEVER on the close Kalshi recorded (close_time): a
+        # market whose event happened early closed early, so reading that
+        # close would read the outcome. Neither of the two functions that
+        # work the close out names "close_time", parses a time
+        # (_parse_iso_*), or reads _maturity_close without scheduled_only=True
+        tree = ast.parse(inspect.getsource(backtester))
+        functions = {node.name: node for node in ast.walk(tree)
+                     if isinstance(node, ast.FunctionDef)}
+        for name in ("_buy_rule_close", "_wording_close"):
+            func = functions[name]
+            strings = {n.value for n in ast.walk(func)
+                       if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+            assert "close_time" not in strings, name
+            names = {n.id for n in ast.walk(func) if isinstance(n, ast.Name)} | {
+                n.attr for n in ast.walk(func) if isinstance(n, ast.Attribute)}
+            assert not {n for n in names if n.startswith("_parse_iso")}, name
+            for call in _calls_to(func, "_maturity_close"):
+                keywords = {k.arg: ast.unparse(k.value) for k in call.keywords}
+                assert keywords == {"scheduled_only": "True"}, (name, keywords)
+        # _buy_rule_close reads the schedule, then the wording, and nothing else
+        assert len(_calls_to(functions["_buy_rule_close"], "_maturity_close")) == 1
+        assert _function_calls(backtester, "_buy_rule_close", "_wording_close")
+        assert not _calls_to(functions["_wording_close"], "_maturity_close")
+        # The wording's day comes from the one definition the ladder rule
+        # shares with the live finder (scanner.stated_deadline)
+        assert _function_calls(backtester, "_wording_close", "_stated_deadline_dict")
+        assert _function_calls(backtester, "_stated_deadline_dict", "stated_deadline")
+        # _find_entry reads the rule's closes only through _buy_rule_close, and
+        # its own other _maturity_close read is for the run log's count alone,
+        # with scheduled_only=True too
+        find = functions["_find_entry"]
+        [buy_closes] = [n for n in ast.walk(find) if isinstance(n, ast.Assign)
+                        and [ast.unparse(t) for t in n.targets] == ["buy_closes"]]
+        assert [ast.unparse(c) for c in _calls_to(buy_closes, "_buy_rule_close")] == [
+            "_buy_rule_close(mA)", "_buy_rule_close(mB)"]
+        scheduled_only = [c for c in _calls_to(find, "_maturity_close")
+                          if any(k.arg == "scheduled_only" for k in c.keywords)]
+        assert [ast.unparse(c) for c in scheduled_only] == [
+            "_maturity_close(m, scheduled_only=True)"]
+        [counted] = [n for n in ast.walk(find) if isinstance(n, ast.Assign)
+                     and [ast.unparse(t) for t in n.targets] == ["from_wording"]]
+        assert _calls_to(counted, "_maturity_close") == scheduled_only
 
     def test_ast_the_backtest_looks_for_time_series_pairs_only(self):
         # The backtest finds no same-title pairs: _prepare_candidates groups
@@ -5622,6 +5671,74 @@ class TestTimeSeriesKellyParity:
                                                                 func_name))
                      if isinstance(n, ast.Attribute) and n.attr == "buy_min_days_to_close"}
             assert reads <= {"settings.buy_min_days_to_close"}, (func_name, reads)
+
+        # The backtest's half: _find_entry decides through the same function,
+        # once per Monday, as the LAST test before a Monday is recorded, with
+        # each leg's _buy_rule_close, the Monday's checkpoint and the run's
+        # minimum, skipping only that Monday (`continue`)
+        assert backtester.closes_far_enough is config.closes_far_enough
+        find = _def_named(inspect.getsource(backtester), "_find_entry")
+        deciding = [c for c in _calls_to(find, "closes_far_enough")
+                    if [ast.unparse(a) for a in c.args]
+                    == ["buy_closes", "moment", "min_days_to_close"]]
+        assert len(deciding) == 1 and not deciding[0].keywords
+        [loop] = [n for n in ast.walk(find) if isinstance(n, ast.For)
+                  and ast.unparse(n.target) == "(ts, ca, cb)"]
+        [moment] = [n for n in loop.body if isinstance(n, ast.Assign)
+                    and [ast.unparse(t) for t in n.targets] == ["moment"]]
+        assert ast.unparse(moment.value) == "datetime.fromtimestamp(ts, tz=UTC)"
+        [append] = [i for i, n in enumerate(loop.body) if isinstance(n, ast.Expr)
+                    and ast.unparse(n.value).startswith("mondays.append(")]
+        rule = loop.body[append - 1]
+        assert isinstance(rule, ast.If) and ast.unparse(rule.test) == (
+            "not closes_far_enough(buy_closes, moment, min_days_to_close)")
+        assert isinstance(rule.body[-1], ast.Continue) and not rule.orelse
+        # Every other closes_far_enough call in _find_entry is inside that
+        # branch (the run log's per-leg count), never a second decision
+        inside = {id(c) for c in _calls_to(rule, "closes_far_enough")}
+        assert all(id(c) in inside for c in _calls_to(find, "closes_far_enough"))
+        assert not [n for n in ast.walk(find) if isinstance(n, ast.Return)
+                    and n.lineno > rule.lineno and n.lineno <= rule.end_lineno]
+        # The minimum is the run's one resolved value, read from the
+        # candidates by the one caller and resolved once per run
+        (value,) = _keyword_values(backtester, "_entries_for_band", "_find_entry",
+                                   "min_days_to_close")
+        assert ast.unparse(value) == "candidates.buy_min_days_to_close"
+        assert _function_calls(backtester, "_prepare_candidates",
+                               "_resolve_buy_min_days_to_close")
+        assert _function_calls(backtester, "run_backtest_sweep",
+                               "_resolve_buy_min_days_to_close")
+        # ... and the default is read nowhere but the resolver (and the
+        # setting line's source clause names it only as text)
+        backtester_tree = ast.parse(inspect.getsource(backtester))
+        named = {func.name for func in ast.walk(backtester_tree)
+                 if isinstance(func, ast.FunctionDef)
+                 and any(isinstance(n, ast.Name) and n.id == "BUY_MIN_DAYS_TO_CLOSE_DEFAULT"
+                         for n in ast.walk(func))}
+        assert named == {"_resolve_buy_min_days_to_close"}
+        # ... and _find_entry is the only place the backtest applies it: no
+        # other backtester code names closes_far_enough or _buy_rule_close
+        # (as a call or as a value), and only _buy_rule_close names
+        # _wording_close, so the rule cannot be applied a second time
+        # elsewhere, on some other close
+        parents = {id(child): node for node in ast.walk(backtester_tree)
+                   for child in ast.iter_child_nodes(node)}
+
+        def users(name: str) -> set[str]:
+            found = set()
+            for node in ast.walk(backtester_tree):
+                if ((isinstance(node, ast.Name) and node.id == name)
+                        or (isinstance(node, ast.Attribute) and node.attr == name)):
+                    owner = parents.get(id(node))
+                    while owner is not None and not isinstance(
+                            owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        owner = parents.get(id(owner))
+                    found.add("<module>" if owner is None else owner.name)
+            return found
+
+        assert users("closes_far_enough") == {"_find_entry"}
+        assert users("_buy_rule_close") == {"_find_entry"}
+        assert users("_wording_close") == {"_buy_rule_close"}
 
     def test_ast_the_backtest_reads_ladders_through_the_one_definition(self):
         # The backtest's one-open-trade-per-ladder rule labels each market
