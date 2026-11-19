@@ -101,6 +101,7 @@ from kalshi_betting.auth import AccountBalance
 from kalshi_betting.backtester import (
     BacktestSweep,
     CapSweep,
+    CloseSweep,
     CorpusProvenance,
     RebalanceSweep,
     SellSweep,
@@ -1050,12 +1051,50 @@ class TestMaturitySweepArgument:
             "on (no minimum price movements, no Rebalance until)")
 
     def test_the_help_names_what_it_skips_and_the_live_setting(self, cli, monkeypatch, capsys):
-        text = _option_help(monkeypatch, capsys, "--no-maturity-sweep", "--sell-workers")
+        text = _option_help(monkeypatch, capsys, "--no-maturity-sweep", "--no-close-sweep")
         assert text.startswith("Skip the Rebalance family's \"Rebalance until\" choices")
         assert "Rebalance itself is still built" in text
         assert "skipping them leaves the page's \"Rebalance until\" select shut" in text
         assert text.endswith("its own saved rebalance_min_days_to_maturity (main.py "
                              "--rebalance-min-days-to-maturity for one run)")
+        assert "sweep_kwargs" not in cli
+
+
+class TestCloseSweepArgument:
+    """--no-close-sweep: the other "Skip if closing within" choices
+    (BacktestSweep.close_sweep) are ON by default, like the other lazy
+    families, and the flag threads close_sweep=False into run_backtest_sweep
+    and moves nothing else."""
+
+    def test_the_choices_are_on_by_default(self, cli, monkeypatch):
+        _run(monkeypatch)
+        assert cli["sweep_kwargs"]["close_sweep"] is True
+
+    def test_no_close_sweep_turns_only_them_off(self, cli, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        default_kwargs = cli["sweep_kwargs"]
+        default_echo = TestMoveSweepArgument._echo(caplog)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, "--no-close-sweep")
+        kwargs = cli["sweep_kwargs"]
+        assert kwargs["close_sweep"] is False
+        # No other keyword moves (each run builds a client of its own), and
+        # the run's settings line is the same
+        skipped = {"close_sweep", "hist_client"}
+        assert set(kwargs) == set(default_kwargs)
+        assert ({key: value for key, value in kwargs.items() if key not in skipped}
+                == {key: value for key, value in default_kwargs.items()
+                    if key not in skipped})
+        assert TestMoveSweepArgument._echo(caplog) == default_echo
+
+    def test_the_help_says_what_it_skips_and_the_live_setting(self, cli, monkeypatch, capsys):
+        text = _option_help(monkeypatch, capsys, "--no-close-sweep", "--sell-workers")
+        assert text.startswith("Skip the other \"Skip if closing within\" choices")
+        assert "No page shows them yet" in text
+        assert text.endswith("a live run applies its own saved buy_min_days_to_close "
+                             "(main.py --buy-min-days-to-close for one run)")
         assert "sweep_kwargs" not in cli
 
 
@@ -2199,7 +2238,8 @@ class TestDashboardOnly:
                                         "other format", "before tag exclusions",
                                         "before rebalance until", "before until choices",
                                         "before the same-title removal",
-                                        "before skip if closing within", "no fingerprint"])
+                                        "before skip if closing within",
+                                        "before the other closing choices", "no fingerprint"])
     def test_a_file_whose_header_cannot_be_read_exits_1(self, rebuild, monkeypatch, damage):
         path = rebuild["path"]
         if damage == "not gzip":
@@ -2235,6 +2275,10 @@ class TestDashboardOnly:
             # closing within": BacktestSweep had no buy_min_days_to_close or
             # live_buy_min_days_to_close
             _rewrite_header(path, format="backtest-sweep-v7")
+        elif damage == "before the other closing choices":
+            # The format a run saved before BacktestSweep held close_sweep, the
+            # other "Skip if closing within" choices
+            _rewrite_header(path, format="backtest-sweep-v8")
         else:
             _rewrite_header(path, fingerprint_parts=None)
         with pytest.raises(SystemExit) as exc:
@@ -2245,14 +2289,15 @@ class TestDashboardOnly:
         assert exc.value.code.endswith("run the backtest again to save a new one")
         if damage in ("other format", "before tag exclusions", "before rebalance until",
                       "before until choices", "before the same-title removal",
-                      "before skip if closing within"):
+                      "before skip if closing within", "before the other closing choices"):
             old = {"other format": "v1", "before tag exclusions": "v3",
                    "before rebalance until": "v4", "before until choices": "v5",
                    "before the same-title removal": "v6",
-                   "before skip if closing within": "v7"}[damage]
+                   "before skip if closing within": "v7",
+                   "before the other closing choices": "v8"}[damage]
             assert f"'backtest-sweep-{old}'" in exc.value.code
             assert repr(config.BACKTEST_SWEEP_FORMAT) in exc.value.code
-            assert config.BACKTEST_SWEEP_FORMAT == "backtest-sweep-v8"
+            assert config.BACKTEST_SWEEP_FORMAT == "backtest-sweep-v9"
         assert "dashboard" not in rebuild
 
     @pytest.mark.parametrize("damage", ["cut short", "not the inputs"])
@@ -2335,7 +2380,7 @@ class TestDashboardOnly:
         run_only = {dest for dest, _ in backtest._RUN_ONLY_FLAGS}
         rebuild = {"dashboard_only", "accept_changed_simulator", "sell_workers",
                    "no_cap_sweep", "no_sell_sweep", "no_rebalance_sweep", "no_move_sweep",
-                   "no_maturity_sweep", "no_eda"}
+                   "no_maturity_sweep", "no_close_sweep", "no_eda"}
         assert run_only | rebuild == dests
         assert not run_only & rebuild
 
@@ -2347,15 +2392,18 @@ class TestDashboardOnly:
     def test_the_skip_flags_drop_their_families(self, cli, monkeypatch, tmp_path, caplog):
         # The saved sweep carries a stand-in for every family each flag drops
         cli["result"] = dataclasses.replace(
-            _sweep(), sell_sweep=SimpleNamespace(), rebalance_sweep=SimpleNamespace())
+            _sweep(), sell_sweep=SimpleNamespace(), rebalance_sweep=SimpleNamespace(),
+            close_sweep=SimpleNamespace())
         _run(monkeypatch)
         with caplog.at_level(logging.INFO):
-            _run(monkeypatch, "--dashboard-only", "--no-sell-sweep", "--no-rebalance-sweep")
+            _run(monkeypatch, "--dashboard-only", "--no-sell-sweep", "--no-rebalance-sweep",
+                 "--no-close-sweep")
         sweep = cli["dashboard"][1]["sweep"]
-        assert (sweep.sell_sweep, sweep.rebalance_sweep) == (None,) * 2
+        assert (sweep.sell_sweep, sweep.rebalance_sweep, sweep.close_sweep) == (None,) * 3
         assert any(r.getMessage() == (
             "Dashboard rebuilt without: Sell (--no-sell-sweep); "
-            "Rebalance (--no-rebalance-sweep)")
+            "Rebalance (--no-rebalance-sweep); "
+            "the other \"Skip if closing within\" choices (--no-close-sweep)")
             for r in caplog.records)
 
 
@@ -2373,6 +2421,10 @@ def _families() -> dict:
                                 **lists, **common),
         "rebalance_sweep": RebalanceSweep(caps=(0.1, 0.2), bands=band, min_moves=(0.05, 0.1),
                                           maturity_days=(1, 7), **lists, **common),
+        "close_sweep": CloseSweep(days=(0, 3, 14), own_days=7, caps=(0.1, 0.2), bands=band,
+                                  off_bands=(), entries_by_days={0: {}, 3: {}, 14: {}},
+                                  off_entries_by_days={}, end_dates={}, off_end_dates={},
+                                  **common),
     }
 
 
@@ -2388,7 +2440,7 @@ class TestWithoutFamilies:
     @staticmethod
     def _call(sweep, **off):
         flags = {"cap_sweep": True, "sell_sweep": True, "rebalance_sweep": True,
-                 "move_sweep": True, "maturity_sweep": True}
+                 "move_sweep": True, "maturity_sweep": True, "close_sweep": True}
         flags.update(dict.fromkeys(off, False))
         return backtest._without_families(sweep, **flags)
 
@@ -2401,15 +2453,18 @@ class TestWithoutFamilies:
         sweep = self._sweep()
         out, notes = self._call(sweep, cap_sweep=False)
         assert out.cap_sweep is None and out.tier_off_cap_sweep is None
-        for name in ("sell_sweep", "rebalance_sweep"):
+        for name in ("sell_sweep", "rebalance_sweep", "close_sweep"):
             assert getattr(out, name) == dataclasses.replace(getattr(sweep, name), caps=(0.2,))
         assert notes == ["the size caps (--no-cap-sweep)"]
         # The loaded sweep is left as it was
         assert sweep.cap_sweep.caps == (0.1, 0.2) and sweep.sell_sweep.caps == (0.1, 0.2)
+        assert sweep.close_sweep.caps == (0.1, 0.2)
 
     @pytest.mark.parametrize("flag, names, note", [
         ("sell_sweep", ("sell_sweep",), "Sell (--no-sell-sweep)"),
         ("rebalance_sweep", ("rebalance_sweep",), "Rebalance (--no-rebalance-sweep)"),
+        ("close_sweep", ("close_sweep",),
+         "the other \"Skip if closing within\" choices (--no-close-sweep)"),
     ])
     def test_each_flag_drops_its_family(self, flag, names, note):
         out, notes = self._call(self._sweep(), **{flag: False})
@@ -2455,7 +2510,7 @@ class TestWithoutFamilies:
 
     def test_a_family_the_run_did_not_build_is_not_named(self):
         out, notes = self._call(_sweep(), cap_sweep=False, sell_sweep=False,
-                                rebalance_sweep=False)
+                                rebalance_sweep=False, close_sweep=False)
         assert notes == []
 
 
@@ -2605,7 +2660,7 @@ def saved_golden_run(tmp_path_factory):
         def run(**flags):
             options = {"band_sweep": True, "tier_off_sweep": True, "cap_sweep": True,
                        "sell_sweep": True, "rebalance_sweep": True, "move_sweep": True,
-                       "maturity_sweep": True}
+                       "maturity_sweep": True, "close_sweep": True}
             options.update(flags)
             # As backtest.py sets them: the minimum price movements and the
             # "Rebalance until" choices go with their family
@@ -2655,7 +2710,8 @@ class TestRebuildFromTheSavedSweep:
 
     def test_every_lazy_family_is_saved(self, saved_golden_run):
         swept, loaded = saved_golden_run.swept, saved_golden_run.loaded["sweep"]
-        for name in ("cap_sweep", "tier_off_cap_sweep", "sell_sweep", "rebalance_sweep"):
+        for name in ("cap_sweep", "tier_off_cap_sweep", "sell_sweep", "rebalance_sweep",
+                     "close_sweep"):
             assert getattr(swept, name) is not None, name
             assert type(getattr(loaded, name)) is type(getattr(swept, name)), name
         assert (loaded.rebalance_sweep.min_moves == swept.rebalance_sweep.min_moves
@@ -2663,6 +2719,17 @@ class TestRebuildFromTheSavedSweep:
         assert (loaded.rebalance_sweep.maturity_days == swept.rebalance_sweep.maturity_days
                 == (1, 7))
         assert loaded.sell_sweep.levels == swept.sell_sweep.levels
+        # The other "Skip if closing within" choices (the suite's own is off),
+        # with their entries, read back into the same cell
+        assert loaded.close_sweep.days == swept.close_sweep.days == (3, 7, 14)
+        band, k = swept.close_sweep.bands[0], swept.close_sweep.ks[0]
+        for days in swept.close_sweep.days:
+            mine = swept.close_sweep.cell(days, band, k)
+            theirs = loaded.close_sweep.cell(days, band, k)
+            assert list(mine) == list(theirs) == list(swept.close_sweep.caps)
+            for cap, by_pop in mine.items():
+                assert ([dataclasses.astuple(t) for t in by_pop["all"].trades]
+                        == [dataclasses.astuple(t) for t in theirs[cap]["all"].trades])
 
     def test_the_rebuilt_page_is_byte_identical(self, saved_golden_run):
         live = _page_and_sidecars(saved_golden_run.live_page)
@@ -2674,6 +2741,7 @@ class TestRebuildFromTheSavedSweep:
     @pytest.mark.parametrize("off", [
         ("cap_sweep", "move_sweep", "maturity_sweep"),
         ("sell_sweep", "rebalance_sweep"),
+        ("close_sweep",),
     ])
     def test_the_skip_flags_build_the_page_a_run_with_them_builds(self, saved_golden_run, off):
         flags = dict.fromkeys(off, False)
@@ -2681,7 +2749,7 @@ class TestRebuildFromTheSavedSweep:
         expected = _page_and_sidecars(saved_golden_run.page(saved_golden_run.inputs_of(ran),
                                                             "run-with-flags"))
         kept = {"cap_sweep": True, "sell_sweep": True, "rebalance_sweep": True,
-                "move_sweep": True, "maturity_sweep": True}
+                "move_sweep": True, "maturity_sweep": True, "close_sweep": True}
         kept.update(flags)
         loaded = saved_golden_run.loaded
         sweep, dropped = backtest._without_families(loaded["sweep"], **kept)

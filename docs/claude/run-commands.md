@@ -299,6 +299,15 @@ python3 -m kalshi_betting.backtest --no-move-sweep
 # Rebalance itself is still built, and --no-rebalance-sweep skips them too. Backtest only
 python3 -m kalshi_betting.backtest --no-maturity-sweep
 
+# Backtest without the other "Skip if closing within" choices (ON by default in the CLI:
+# BacktestSweep.close_sweep, a lazy backtester.CloseSweep, holds for every choice of
+# config.BUY_MIN_DAYS_TO_CLOSE_CHOICES but the run's own the pairs it would buy, found during
+# the run in a few more entry passes, and simulates each band x k x cap cell at it, tier floors
+# on and off, the "all" population only, never adding, trimming or selling, only when a report
+# reads it). No page shows them yet, so skipping them changes no page. Backtest only — a live
+# run applies its own saved buy_min_days_to_close (main.py --buy-min-days-to-close for one run)
+python3 -m kalshi_betting.backtest --no-close-sweep
+
 # Backtest without the dashboard's "Sell" family (ON by default in the CLI, and lazy like the
 # cap sweep: the run simulates nothing — the dashboard step then reads every sell level and
 # minimum of days to maturity of every scenario the filter bar shows that does not rebalance
@@ -328,10 +337,9 @@ python3 -m kalshi_betting.backtest --sell-workers 4
 python3 -m kalshi_betting.backtest --dashboard-only
 
 # The same, quickly, to check a small dashboard change: each of --no-sell-sweep,
-# --no-rebalance-sweep, --no-move-sweep, --no-maturity-sweep and --no-cap-sweep drops that family
-# (or that part of it) from the saved run,
-# giving the page a run with that flag would have built (the Sell select alone took 1.4 to 4.6 h on
-# the last 365-day runs)
+# --no-rebalance-sweep, --no-move-sweep, --no-maturity-sweep, --no-close-sweep and --no-cap-sweep
+# drops that family (or that part of it) from the saved run, giving the page a run with that flag
+# would have built (the Sell select alone took 1.4 to 4.6 h on the last 365-day runs)
 python3 -m kalshi_betting.backtest --dashboard-only --no-sell-sweep --no-rebalance-sweep
 
 # A rebuild is refused (exit 2) when the simulator's code (backtester, strategy, scanner,

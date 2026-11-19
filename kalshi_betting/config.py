@@ -1015,11 +1015,12 @@ BACKTEST_SWEEP_FILENAME = "backtest_sweep.pkl.gz"
 # A rebuild refuses a file with any other tag; change it whenever the line's
 # keys, the pickled inputs' keys or the fields of the classes pickled in them
 # (BacktestSweep and the lazy families it holds) change, so an older file is
-# refused rather than misread. v8: the backtest applies "Skip if closing
-# within", so BacktestSweep gained buy_min_days_to_close (the run's own
-# value) and live_buy_min_days_to_close (the saved live defaults' value);
-# v7 files, from before, are refused.
-BACKTEST_SWEEP_FORMAT = "backtest-sweep-v8"
+# refused rather than misread. v9: BacktestSweep gained close_sweep, the
+# lazy family holding the other "Skip if closing within" choices' entries
+# and results (backtester.CloseSweep); v8 files, from before, are refused.
+# (v8 added buy_min_days_to_close, the run's own value, and
+# live_buy_min_days_to_close, the saved live defaults' value.)
+BACKTEST_SWEEP_FORMAT = "backtest-sweep-v9"
 
 # The most bytes a rebuild reads for the saved sweep file's first line (the
 # JSON one): the real line is a few hundred bytes, so a file that runs past

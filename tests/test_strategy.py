@@ -5700,10 +5700,17 @@ class TestTimeSeriesKellyParity:
         assert not [n for n in ast.walk(find) if isinstance(n, ast.Return)
                     and n.lineno > rule.lineno and n.lineno <= rule.end_lineno]
         # The minimum is the run's one resolved value, read from the
-        # candidates by the one caller and resolved once per run
+        # candidates by the one caller and resolved once per run, or the one
+        # choice a pass names for itself (the other choices' entries, where
+        # 0 is off)
         (value,) = _keyword_values(backtester, "_entries_for_band", "_find_entry",
                                    "min_days_to_close")
-        assert ast.unparse(value) == "candidates.buy_min_days_to_close"
+        assert ast.unparse(value) == "min_days"
+        passes = _def_named(inspect.getsource(backtester), "_entries_for_band")
+        [chosen] = [n for n in ast.walk(passes) if isinstance(n, ast.Assign)
+                    and [ast.unparse(t) for t in n.targets] == ["min_days"]]
+        assert ast.unparse(chosen.value) == (
+            "candidates.buy_min_days_to_close if _close_days is None else _close_days or None")
         assert _function_calls(backtester, "_prepare_candidates",
                                "_resolve_buy_min_days_to_close")
         assert _function_calls(backtester, "run_backtest_sweep",
@@ -5739,6 +5746,50 @@ class TestTimeSeriesKellyParity:
         assert users("closes_far_enough") == {"_find_entry"}
         assert users("_buy_rule_close") == {"_find_entry"}
         assert users("_wording_close") == {"_buy_rule_close"}
+
+    def test_ast_only_the_other_choices_passes_name_a_close_choice(self):
+        # _entries_for_band's private _close_days makes one pass apply a
+        # "Skip if closing within" choice other than the run's own. Only the
+        # code that finds the other choices' entries names it:
+        # _close_choice_entries (a band sweep's, once per Tier floors
+        # setting) and _sweep_from_candidates' branch for a run without a
+        # band sweep. Every other pass, the run's own included, leaves it
+        # out and applies the run's minimum
+        functions = {node.name: node for node in ast.walk(ast.parse(inspect.getsource(backtester)))
+                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        naming: dict[str, list] = {}
+        for name, func in functions.items():
+            for call in _calls_to(func, "_entries_for_band"):
+                if any(k.arg == "_close_days" for k in call.keywords):
+                    naming.setdefault(name, []).append(call)
+        assert set(naming) == {"_close_choice_entries", "_sweep_from_candidates"}
+
+        def chosen(call: ast.Call) -> str:
+            return next(ast.unparse(k.value) for k in call.keywords if k.arg == "_close_days")
+
+        # _close_choice_entries: its one scan with no minimum (0 is off), and
+        # each choice's rescans, looping over the choices it was handed
+        assert sorted(chosen(c) for c in naming["_close_choice_entries"]) == ["0", "days"]
+        choices = functions["_close_choice_entries"]
+        [loop] = [n for n in ast.walk(choices) if isinstance(n, ast.For)
+                  and ast.unparse(n.target) == "days"]
+        assert ast.unparse(loop.iter) == "close_days"
+        # _sweep_from_candidates: one call, inside the branch a run without a
+        # band sweep takes for the other choices, once per choice
+        sweep = functions["_sweep_from_candidates"]
+        [branch] = [n for n in ast.walk(sweep) if isinstance(n, ast.If)
+                    and ast.unparse(n.test) == "close_days and (not band_sweep)"]
+        [loop] = [n for n in branch.body if isinstance(n, ast.For)]
+        assert (ast.unparse(loop.target), ast.unparse(loop.iter)) == ("days", "close_days")
+        [call] = naming["_sweep_from_candidates"]
+        assert call in [c for stmt in loop.body for c in _calls_to(stmt, "_entries_for_band")]
+        assert chosen(call) == "days"
+        # ... and the choices it loops over are the resolver's, with the
+        # family on only
+        [assigned] = [n for n in ast.walk(sweep) if isinstance(n, ast.Assign)
+                      and [ast.unparse(t) for t in n.targets] == ["close_days"]]
+        assert ast.unparse(assigned.value) == (
+            "_resolve_close_choices(candidates.buy_min_days_to_close) if close_sweep else ()")
 
     def test_ast_the_backtest_reads_ladders_through_the_one_definition(self):
         # The backtest's one-open-trade-per-ladder rule labels each market
