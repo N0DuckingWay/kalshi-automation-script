@@ -334,6 +334,9 @@ Notes:
     day (00:00 UTC), never the recorded close, which would leak the outcome.
     A leg with neither is never bought. The minimum defaults to
     config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT (_resolve_buy_min_days_to_close).
+    With close_sweep, _sweep_from_candidates also finds the entries of the
+    menu's other choices (config.BUY_MIN_DAYS_TO_CLOSE_CHOICES), which the
+    run's own results never read.
 
     Before grouping, _prepare_candidates() filters markets through
     _can_ever_enter(), a cheap per-market PREFILTER that drops only markets no
@@ -403,7 +406,7 @@ import statistics
 import sys
 from array import array
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
@@ -2593,8 +2596,10 @@ class _Candidates:
             minimum this run applies, in days
             (_resolve_buy_min_days_to_close: the default or the run's
             override); None with the rule off, and on a hand-built instance.
-            _entries_for_band hands it to every _find_entry call, like the
-            start date and the horizon.
+            _entries_for_band hands it to every _find_entry call of a pass,
+            like the start date and the horizon, unless the pass names
+            another of the menu's choices (its private _close_days, for
+            _sweep_from_candidates' close_sweep).
     """
     all_pairs: list
     candles_by_ticker: dict
@@ -5312,6 +5317,50 @@ def _resolve_buy_min_days_to_close(value: Any = None) -> int | None:
     return value or None
 
 
+def _resolve_close_choices(own_days: int | None) -> tuple[int, ...]:
+    """
+    Name the "Skip if closing within" choices the backtest also works out, besides the run's own.
+
+    The menu offers every value of this module's BUY_MIN_DAYS_TO_CLOSE_CHOICES
+    (0 is "Off"). The run's own choice is the one the main results apply;
+    with close_sweep on, _sweep_from_candidates also finds the entries of
+    each choice this returns. Reads the binding when called (patch
+    backtester's, never config's) and checks it.
+
+    Args:
+        own_days (int | None): The run's own minimum, as resolved by
+            _resolve_buy_min_days_to_close: the days, or None for off, which
+            is the menu's 0.
+
+    Returns:
+        tuple[int, ...]: The other choices' days, ascending, 0 for "Off"
+            (the menu's own values), e.g. (0, 3, 14) for a run at 7 days.
+            Empty when the menu offers no other choice.
+
+    Raises:
+        ValueError: If BUY_MIN_DAYS_TO_CLOSE_CHOICES is not a tuple, a value
+            of it is not a whole number of days of at least 0 (a bool, 7.0, a
+            numpy integer or "7" included), or one is named twice.
+    """
+    choices = BUY_MIN_DAYS_TO_CLOSE_CHOICES
+    if not isinstance(choices, tuple):
+        raise ValueError("BUY_MIN_DAYS_TO_CLOSE_CHOICES must be a tuple of whole days, got "
+                         f"{choices!r}")
+    for days in choices:
+        # type() is int refuses a bool, a float such as 7.0 and a numpy
+        # integer, as LiveSettings does
+        if type(days) is not int or days < 0:
+            raise ValueError("each of BUY_MIN_DAYS_TO_CLOSE_CHOICES must be a whole number "
+                             f"of days of at least 0, got {days!r} in {choices!r}")
+        # The check a run's own value gets
+        _resolve_buy_min_days_to_close(days)
+    if len(set(choices)) != len(choices):
+        raise ValueError(f"BUY_MIN_DAYS_TO_CLOSE_CHOICES names a value twice: {choices!r}")
+    # The run's own choice on the menu's scale: None (off) is 0
+    own = 0 if own_days is None else own_days
+    return tuple(sorted(days for days in choices if days != own))
+
+
 def _share_text(share: float | None) -> str:
     """
     The volume cap's share as the log lines print it ("10%", "2.5%").
@@ -6935,13 +6984,15 @@ def _stated_deadline_dict(m: dict, profile: tuple) -> date | None:
 
     The profile is PASSED IN rather than recomputed, because _extract_pairs
     classifies each group member exactly once and compares the cheap results
-    pairwise (DR-70). _find_entry, which holds no such memo, is a deliberate
-    exemption at two sites — see its own comments. Its ladder branch reads
-    both rungs of each same-event pair, bounded by the ladder pair count.
-    With "Skip if closing within" on, _buy_rule_close (through
-    _wording_close) reads both legs' wording on every _find_entry call, for
-    every pair on every pass; that costs about 30 microseconds a call, so
-    seconds over a full run.
+    pairwise (DR-70). _find_entry's ladder branch, which holds no such memo,
+    is a deliberate exemption — see its own comments: it reads both rungs
+    of each same-event pair on every call, bounded by the ladder pair
+    count. With "Skip if closing within" on, _buy_rule_close (through
+    _wording_close) reads a market's wording once per market per entry
+    pass: _entries_for_band hands every _find_entry call of its pass one
+    dict of the closes read so far (_closes), and a direct caller that
+    hands none reads it once per leg per call. A read costs about 30
+    microseconds.
 
     Two cache-vs-live field divergences reach this reader, and NEITHER is the
     one-directional guarantee DR-69 gives deadline_profile — that rule holds
@@ -7036,8 +7087,10 @@ def _buy_rule_close(m: dict) -> datetime | None:
     start of the last day the market's wording includes. Never the close
     Kalshi recorded (close_time): a market whose event happened early closed
     early, so judging it on that close would read the outcome and skip a
-    purchase a live run made. _find_entry reads it once per leg per call and
-    hands both to config.closes_far_enough at each Monday checkpoint.
+    purchase a live run made. _find_entry reads it once per market per
+    entry pass (through the pass's _closes; a direct caller with no such
+    dict reads it once per leg per call) and hands both legs' to
+    config.closes_far_enough at each Monday checkpoint.
 
     Args:
         m (dict): A market record (the compact historical._market_to_dict form).
@@ -8318,7 +8371,8 @@ def _leg_quotes(market: dict, candles: list[dict], start_date: date,
 def _attach_leg_quotes(records: Iterable[dict], candles_by_ticker: dict,
                        start_date: date, depth_model: DepthModel | None = None, *,
                        stale_max_age: float | None = None,
-                       volume_share: float | None = None) -> None:
+                       volume_share: float | None = None,
+                       report_tickers: Collection[str] | None = None) -> None:
     """
     Give each entry record the prices that value its trades at market: the one writer of "leg_quotes".
 
@@ -8350,6 +8404,14 @@ def _attach_leg_quotes(records: Iterable[dict], candles_by_ticker: dict,
             (the default) caps nothing. With it on, one INFO line (silent at
             zero) counts the markets with no readable volume ahead at some
             checkpoint, which are not capped there.
+        report_tickers (Collection[str] | None): Keyword-only. The markets
+            the two report lines count (the INFO line above and a DEBUG line
+            counting the legs valued on a quote more than _STALE_QUOTE_DAYS
+            days old); every record still gets its quotes. None (the
+            default) counts every market handed in. _sweep_from_candidates
+            names its run's own records' markets, so the lines read as a run
+            without the other "Skip if closing within" choices would write
+            them.
     """
     by_ticker: dict[str, LegQuotes | None] = {}
     by_pair: dict[tuple[str, str], dict] = {}
@@ -8367,7 +8429,8 @@ def _attach_leg_quotes(records: Iterable[dict], candles_by_ticker: dict,
                                                      stale_max_age=stale_max_age,
                                                      volume_share=volume_share)
                     by_ticker[ticker] = quotes
-                    stale_legs += 1 if stale_days else 0
+                    if stale_days and (report_tickers is None or ticker in report_tickers):
+                        stale_legs += 1
             if by_ticker[tickers[0]] is None or by_ticker[tickers[1]] is None:
                 continue
             pair = by_pair[tickers] = {tickers[0]: by_ticker[tickers[0]],
@@ -8375,9 +8438,10 @@ def _attach_leg_quotes(records: Iterable[dict], candles_by_ticker: dict,
         rec["leg_quotes"] = pair
     if volume_share is not None:
         # Markets the volume cap cannot read at some checkpoint, so it leaves
-        # them uncapped there (silent at zero)
-        unread = sum(1 for quotes in by_ticker.values()
-                     if quotes is not None and np.isnan(quotes.volume_ahead_checkpoints).any())
+        # them uncapped there (silent at zero), of those the lines report on
+        unread = sum(1 for ticker, quotes in by_ticker.items()
+                     if (report_tickers is None or ticker in report_tickers)
+                     and quotes is not None and np.isnan(quotes.volume_ahead_checkpoints).any())
         if unread:
             logging.info("Markets with no readable volume ahead, not capped: %d", unread)
     if stale_legs:
@@ -8461,6 +8525,7 @@ def _find_entry(
     tier_floors: bool = True,
     min_days_to_close: int | None = None,
     _skips: _CloseRuleTally | None = None,
+    _closes: dict | None = None,
 ) -> dict | None:
     """
     Find every Monday on which a potential pair was tradeable at the required threshold.
@@ -8575,7 +8640,8 @@ def _find_entry(
     qualifying Monday still enters, and the "later" list keeps the Mondays
     the rule lets through. Each leg is judged on _buy_rule_close (the
     scheduled close where one is carried, else the start of the last day its
-    wording includes; never the recorded close_time), read once per call; a
+    wording includes; never the recorded close_time), read once per call, or
+    once per entry pass through the pass's _closes; a
     leg with neither fails every Monday. Both must pass, so the earlier close
     decides, in whichever order the swap put the legs. The scan window
     (scan_end) stays on the realized closes: candles exist only until then.
@@ -8630,6 +8696,13 @@ def _find_entry(
         _skips (_CloseRuleTally | None): PRIVATE, keyword-only. A tally the
             call adds what the rule removed to, for the run log; None (the
             default) counts nothing. Never changes the result.
+        _closes (dict | None): PRIVATE, keyword-only. One entry pass's
+            ticker -> _buy_rule_close of that market, which this call reads
+            each leg's close from and fills in for a leg it lacks, only with
+            the rule on; _entries_for_band hands every call of its pass the
+            same dict, so each market's close is worked out once per pass.
+            None (the default) works out both legs' closes in this call.
+            Never changes the result.
 
     The fee check charges each leg at its own market's fee multiplier
     (_charged_fee_multiplier: what _prepare_candidates wrote on the market
@@ -8795,15 +8868,21 @@ def _find_entry(
     # swap above, so mA is the earlier contract)
     fee_mult_of_a = _charged_fee_multiplier(mA)
     fee_mult_of_b = _charged_fee_multiplier(mB)
-    # "Skip if closing within": the close each leg is judged on, read once
-    # per call and only with the rule on (_buy_rule_close: the scheduled
-    # close where carried, else the start of the last day its wording names,
-    # never the recorded close). Both must pass, so the earlier one decides,
-    # whatever order the swap above chose. Unlike the ladder branch above,
-    # this reads both legs' wording for every pair, on every pass: about 30
-    # microseconds a call, so seconds over a full run
-    buy_closes = ((_buy_rule_close(mA), _buy_rule_close(mB))
-                  if min_days_to_close is not None else ())
+    # "Skip if closing within": the close each leg is judged on, read only
+    # with the rule on (_buy_rule_close: the scheduled close where carried,
+    # else the start of the last day its wording names, never the recorded
+    # close). Both must pass, so the earlier one decides, whatever order the
+    # swap above chose. Reading a market's wording takes about 30
+    # microseconds, so an entry pass hands in its own _closes and each
+    # market is read once per pass, however many pairs it is in; a direct
+    # caller hands none and each leg is read once per call
+    if min_days_to_close is not None and _closes is not None:
+        for m in (mA, mB):
+            if m["ticker"] not in _closes:
+                _closes[m["ticker"]] = _buy_rule_close(m)
+    buy_closes = (() if min_days_to_close is None
+                  else (_closes[mA["ticker"]], _closes[mB["ticker"]]) if _closes is not None
+                  else (_buy_rule_close(mA), _buy_rule_close(mB)))
     # For the run log only: which legs' closes were read from their wording
     # (no scheduled close carried), and what the rule removed in this call
     from_wording = (tuple(close is not None and _maturity_close(m, scheduled_only=True) is None
@@ -11344,6 +11423,7 @@ def _entries_for_band(
     tier_floors: bool = True,
     _pairs: list | None = None,
     _skips: _CloseRuleTally | None = None,
+    _close_days: int | None = None,
 ) -> list[dict]:
     """
     Locate each candidate pair's tradeable Mondays under one spread band.
@@ -11369,7 +11449,11 @@ def _entries_for_band(
     a ladder admitted on stated deadlines and then entered on close_time).
     The run's "Skip if closing within" minimum is read from candidates too
     (buy_min_days_to_close, resolved once per run), so every pass of a run
-    applies the one value the run resolved.
+    applies the one value the run resolved, unless _close_days names another
+    of the menu's choices for this pass alone (the other choices'
+    entries, _sweep_from_candidates' close_sweep). With the rule on, each
+    market's close for it is worked out once per pass (a dict handed to
+    every _find_entry call), not once per pair.
     The flag is carried UNRESOLVED, so this pass hands _find_entry the same
     ARGUMENT _extract_pairs was handed; when that argument is None each of
     them resolves this module's TIME_SERIES_SAME_EVENT_LADDERS at its own
@@ -11406,6 +11490,14 @@ def _entries_for_band(
             removed to, for the run log; None (the default) counts nothing.
             _prepare_entries and _sweep_from_candidates hand one to the
             run's own pass only, and only with the rule on.
+        _close_days (int | None): PRIVATE, keyword-only. A "Skip if closing
+            within" choice of the menu (config.BUY_MIN_DAYS_TO_CLOSE_CHOICES)
+            to apply in this pass instead of the run's own: its days, or 0
+            for off. None (the default, and what every caller but
+            _sweep_from_candidates' other choices passes) applies the run's
+            own minimum, candidates.buy_min_days_to_close. Pair extraction
+            and the candle fetch are never redone for a choice: they read
+            nothing of the rule.
 
     Returns:
         list[dict]: One record per time-series pair that produced an entry,
@@ -11427,6 +11519,13 @@ def _entries_for_band(
     # owns both the default and the rule (time_series_spread_band).
     time_series_spread_band(spread_band)
 
+    # "Skip if closing within" for this pass: the run's own minimum, or the
+    # choice the caller named (0 is off, which _find_entry reads as None)
+    min_days = (candidates.buy_min_days_to_close if _close_days is None
+                else _close_days or None)
+    # Each market's close for the rule, worked out at most once in this pass
+    # (filled by _find_entry, only with the rule on)
+    closes: dict = {}
     raw_entries: list[dict] = []
     # Pairs of any type other than time-series: refused, never scanned, and
     # named on the WARNING after the loop
@@ -11454,10 +11553,13 @@ def _entries_for_band(
             spread_band=spread_band,
             # Backtest-only: False drops the deadline-gap tier for this pass
             tier_floors=tier_floors,
-            # "Skip if closing within": the run's one resolved minimum (None: off)
-            min_days_to_close=candidates.buy_min_days_to_close,
+            # "Skip if closing within": the run's one resolved minimum, or
+            # this pass's choice (None: off)
+            min_days_to_close=min_days,
             # What the rule removed, counted for the run log (None: not counted)
             _skips=_skips,
+            # This pass's closes for the rule, each market's worked out once
+            _closes=closes,
         )
         if entry is None:
             continue
@@ -14532,6 +14634,105 @@ def _entered_pairs(candidates: _Candidates, entries: list[dict]) -> list:
             and frozenset((item[0][0]["ticker"], item[0][1]["ticker"])) in entered]
 
 
+def _close_choice_label(days: int) -> str:
+    """
+    Name one "Skip if closing within" choice for a log line: "off" or "N days".
+
+    Args:
+        days (int): The choice, 0 for off.
+
+    Returns:
+        str: "off" for 0, else e.g. "7 days".
+    """
+    return "off" if days == 0 else f"{days} days"
+
+
+def _close_choice_entries(
+    candidates: _Candidates,
+    close_days: tuple[int, ...],
+    bands: Sequence[tuple[float, float]],
+    *,
+    tier_floors: bool = True,
+    free_scan: tuple[list[dict], list] | None = None,
+) -> tuple[dict[int, dict[tuple[float, float], list[dict]]], list]:
+    """
+    Find the entries of "Skip if closing within" choices other than the run's own, at every band of one Tier floors setting.
+
+    _sweep_from_candidates calls it with close_sweep on a band sweep, once
+    per Tier floors setting (a single-band run scans each choice in full
+    there instead). The no-band band (0, 1) is scanned once over every
+    time-series pair with no minimum; then each choice rescans only the
+    pairs that entered there, at every band in `bands`. That is exact. The rule is a per-Monday test
+    that reads no band and only removes Mondays, so at one Tier floors
+    setting a choice's accepted Mondays at a band are a subset of the same
+    band's with no minimum, and those are a subset of the no-band band's
+    (the pre-pass argument in _sweep_from_candidates). A pair that never
+    enters at the no-band band with no minimum therefore enters at no band
+    with any minimum. The run's own pre-pass cannot serve as this scan
+    unless the run's own choice is off: at 7 days it leaves out a pair whose
+    only qualifying Monday is 5 days before a close, which "off" and 3 days
+    enter. The off choice's no-band entries ARE the no-minimum scan's, so
+    that band is not scanned twice.
+
+    Args:
+        candidates (_Candidates): The sweep's candidates, before its pair
+            list and candles are released.
+        close_days (tuple[int, ...]): The choices to find, ascending, 0 for
+            off (_resolve_close_choices).
+        bands (Sequence[tuple[float, float]]): The resolved bands to find each
+            choice's entries at: the run's bands (tier floors on) or the
+            tier-floors-off family's binding bands.
+        tier_floors (bool): Keyword-only. The Tier floors setting of every
+            pass here (False: the tier-floors-off family's).
+        free_scan (tuple[list[dict], list] | None): Keyword-only. The no-band
+            band's entries with no minimum at this tier setting and the pairs
+            that produced them (_entered_pairs), when the caller already has
+            them: the run's own pre-pass, when the run's own choice is off.
+            None (the default) scans every pair here.
+
+    Returns:
+        tuple: (by_days, rescan). by_days maps each choice to band -> its
+            entries, in the order of `bands`; rescan is the list of pairs the
+            no-minimum scan let through, which the caller releases with the
+            candles.
+    """
+    no_band = time_series_spread_band((0.0, 1.0))
+    setting = "" if tier_floors else " with the tier floors off"
+    if free_scan is None:
+        n_ts_pairs = sum(1 for _, pair_type in candidates.all_pairs
+                         if pair_type == "time_series")
+        logging.info("Other \"Skip if closing within\" choices%s: scanning all %d time-series "
+                     "pairs at %s with no minimum", setting, n_ts_pairs, _band_label(no_band))
+        # The one full scan of this setting with no minimum: it bounds every
+        # choice at every band
+        free_entries = _entries_for_band(candidates, no_band, tier_floors=tier_floors,
+                                         _close_days=0)
+        # The pairs that entered there, matched on the legs' tickers (a new
+        # list; candidates.all_pairs is never mutated)
+        rescan = _entered_pairs(candidates, free_entries)
+        logging.info("Other \"Skip if closing within\" choices%s: %d of %d time-series pairs "
+                     "produced an entry with no minimum; each choice rescans only those",
+                     setting, len(rescan), n_ts_pairs)
+    else:
+        free_entries, rescan = free_scan
+    by_days: dict[int, dict[tuple[float, float], list[dict]]] = {}
+    for days in close_days:
+        by_band: dict[tuple[float, float], list[dict]] = {}
+        for band in bands:
+            if days == 0 and band == no_band:
+                # Off at the no-band band IS the no-minimum scan: never run it twice
+                by_band[band] = free_entries
+            else:
+                # This choice at this band, over the pairs that can enter at all
+                by_band[band] = _entries_for_band(candidates, band, tier_floors=tier_floors,
+                                                  _pairs=rescan, _close_days=days)
+        by_days[days] = by_band
+        logging.info("Other \"Skip if closing within\" choices%s: %s: %d entries over %d "
+                     "band(s)", setting, _close_choice_label(days),
+                     sum(len(entries) for entries in by_band.values()), len(by_band))
+    return by_days, rescan
+
+
 def _band_populations(
     entries: list[dict],
     split_date: date,
@@ -14662,6 +14863,7 @@ def _sweep_from_candidates(
     rebalance_sweep: bool = False,
     move_sweep: bool = False,
     maturity_sweep: bool = False,
+    close_sweep: bool = False,
 ) -> BacktestSweep:
     """
     Run every entry pass and every simulation of one backtest over one fetch.
@@ -14678,10 +14880,12 @@ def _sweep_from_candidates(
     produced an entry there — each band's accepted Mondays are a subset of
     the no-band band's (see the comment at the pre-pass), so this changes no
     band's entries and turns every other band's full scan into a rescan of
-    the few pairs that can enter at all. Every pass applies the run's "Skip
-    if closing within" minimum (candidates.buy_min_days_to_close), and with
-    it on, one line logs what it removed in the run's own pass
-    (_log_close_rule_tally). Then the candles and the pair list
+    the few pairs that can enter at all. Every one of those passes applies
+    the run's "Skip if closing within" minimum
+    (candidates.buy_min_days_to_close), and with the rule on, one line logs
+    what it removed in the run's own pass (_log_close_rule_tally); only the
+    passes close_sweep adds for the other choices (below) apply another.
+    Then the candles and the pair list
     are released (candidates.candles_by_ticker and candidates.all_pairs are
     deleted) before any simulation runs: nothing after Phase 1 reads either,
     and the simulations are where a band sweep spends its time.
@@ -14787,6 +14991,25 @@ def _sweep_from_candidates(
     _resolve_maturity_days), simulated only when a report reads
     RebalanceSweep.maturity_grid.
 
+    With close_sweep, Phase 1 also finds the entries of every "Skip if
+    closing within" choice of the menu besides the run's own
+    (_resolve_close_choices: 0 for off, 3, 7 or 14 days), at every band and,
+    with the tier-off family, at every binding band with the tier floors
+    off. It runs after the tier-on band loop and the tier-off loop. On a
+    band sweep each Tier floors setting gets one full scan with no minimum
+    at the no-band band (the run's own pre-pass when the run's own choice
+    is off, else one more), and every choice rescans only the pairs that
+    entered there (_close_choice_entries: exact, since the rule only
+    removes Mondays and reads no band); a single-band run scans every pair
+    at its one band per choice. Every choice's records get their quotes in
+    the one _attach_leg_quotes call, before the candles are released, and
+    that call's two report lines count only the run's own records' markets
+    (report_tickers). So the run's own passes, entries, log lines and tally
+    are those of a run without it. Its own INFO lines each begin "Other
+    \"Skip if closing within\" choices": two for each extra no-minimum scan
+    (what it scans, then how many pairs entered), then one per choice and
+    Tier floors setting (its entries over its bands).
+
     Args:
         candidates (_Candidates): _prepare_candidates() output. CONSUMED: its
             candles_by_ticker and all_pairs attributes are deleted after
@@ -14847,6 +15070,10 @@ def _sweep_from_candidates(
             until" choices of this module's REBALANCE_MATURITY_DAYS besides
             "maturity" (RebalanceSweep.maturity_days). False (default)
             leaves them empty.
+        close_sweep (bool): Keyword-only. When True, Phase 1 also finds the
+            entries of every other "Skip if closing within" choice, as
+            described above. False (default) finds none: the run's passes
+            and log lines are exactly those of a run without it.
 
     Returns:
         BacktestSweep: primary, points (the primary band's k sweep),
@@ -14871,8 +15098,10 @@ def _sweep_from_candidates(
             without rebalance_sweep; from
             config.time_series_spread_band for an invalid band; with
             move_sweep, from _resolve_min_moves for a bad
-            MIN_PRICE_MOVES; or, with maturity_sweep, from
-            _resolve_maturity_days for a bad REBALANCE_MATURITY_DAYS.
+            MIN_PRICE_MOVES; with maturity_sweep, from
+            _resolve_maturity_days for a bad REBALANCE_MATURITY_DAYS; or,
+            with close_sweep, from _resolve_close_choices for a bad
+            BUY_MIN_DAYS_TO_CLOSE_CHOICES.
         AttributeError: If candidates has already fed a sweep (its
             all_pairs and candles_by_ticker were deleted) — loud rather than
             a silent sweep with no pairs and therefore no entries.
@@ -14886,6 +15115,10 @@ def _sweep_from_candidates(
     if maturity_sweep and not rebalance_sweep:
         raise ValueError("maturity_sweep needs rebalance_sweep: the \"Rebalance until\" "
                          "choices are part of the Rebalance family")
+    # The other "Skip if closing within" choices, checked before any pass
+    # runs (0 is off; empty without close_sweep)
+    close_days = (_resolve_close_choices(candidates.buy_min_days_to_close)
+                  if close_sweep else ())
     start_date = candidates.start_date
     primary_band = time_series_spread_band(spread_band)
     # The saved live defaults: run_backtest_sweep's read, or our own for a
@@ -14924,8 +15157,8 @@ def _sweep_from_candidates(
     #   * everything else — the leg order, the deadline gap and its cap, the
     #     horizon, the candle lookups, the refusal of a spread that is not
     #     strictly positive, the live-quote checks, the fee check and "Skip
-    #     if closing within" (one minimum for the whole run) — never reads
-    #     the band.
+    #     if closing within" (one minimum for every pass compared here: the
+    #     run's own) — never reads the band.
     # Float arithmetic keeps each comparison monotone in the threshold, so no
     # float edge can admit at a band what no band refused. A pair that
     # produced NO entry at (0.0, 1.0) therefore produces none at any band, and
@@ -14933,6 +15166,12 @@ def _sweep_from_candidates(
     # the entries a full scan gives it — in the same order, since the subset
     # keeps all_pairs' order (pinned against a full scan per band by
     # TestBandSweepPhaseOneSubset). A single-band run keeps its one full scan.
+    # The same argument covers the other "Skip if closing within" choices
+    # (close_sweep, below): the rule is a per-Monday test that reads no band
+    # and only removes Mondays, so a pair that never enters at (0.0, 1.0)
+    # with NO minimum enters at no band with any minimum, at that Tier
+    # floors setting. Their rescans therefore start from a no-minimum scan,
+    # never from this pre-pass, which applies the run's own minimum.
     no_band = time_series_spread_band((0.0, 1.0))
     no_band_entries: list[dict] | None = None
     rescan: list | None = None
@@ -15020,16 +15259,64 @@ def _sweep_from_candidates(
             logging.info("Tier floors off: prepared %d candidate entries for sizing",
                          len(tier_off_entries[band]))
             _log_qualifying_mondays(tier_off_entries[band], band, tier_floors=False)
+
+    # ── "Skip if closing within": the other choices' entries (close_sweep) ──
+    # Every choice of the menu besides the run's own (0 is off), found at
+    # every band the run covers, tier floors on and, with the tier-off
+    # family, off, after the run's own passes above, which do not change.
+    # On a band sweep each Tier floors setting gets ONE full scan with no
+    # minimum at the no-band band, and every choice rescans only the pairs
+    # that entered there (exact: _close_choice_entries says why). When the
+    # run's own choice is off, its own pre-pass IS that scan. The reuse above
+    # of the run's own pre-pass as the no-band band's entries stays tied to
+    # the run's own choice: that scan applied the run's minimum, which bounds
+    # no smaller one. A single-band run scans every pair at its one band per
+    # choice (the tier-off family needs a band sweep).
+    # days -> band -> that choice's entries, tier floors on and off
+    close_entries: dict[int, dict[tuple[float, float], list[dict]]] = {}
+    close_off_entries: dict[int, dict[tuple[float, float], list[dict]]] = {}
+    # The no-minimum scans' rescan lists: pair tuples, released below with the candles
+    close_rescan = close_off_rescan = None
+    own_off = candidates.buy_min_days_to_close is None
+    if close_days and not band_sweep:
+        for days in close_days:
+            # The one full time-series pass at the primary band, at this choice
+            close_entries[days] = {primary_band: _entries_for_band(
+                candidates, primary_band, _close_days=days)}
+            logging.info("Other \"Skip if closing within\" choices: %s: %d entries over 1 "
+                         "band(s)", _close_choice_label(days),
+                         len(close_entries[days][primary_band]))
+    elif close_days:
+        # Tier floors on, rescanning from the run's own pre-pass when that
+        # had no minimum, else from a scan of its own
+        close_entries, close_rescan = _close_choice_entries(
+            candidates, close_days, bands,
+            free_scan=(no_band_entries, rescan) if own_off else None)
+        if tier_off_bands:
+            # Tier floors off, at the family's binding bands only, the same way
+            close_off_entries, close_off_rescan = _close_choice_entries(
+                candidates, close_days, tier_off_bands, tier_floors=False,
+                free_scan=(off_no_band_entries, off_rescan) if own_off else None)
+
     # The prices that value every entry's trades at market while open (every
-    # band's records, tier floors on and off), taken from the candles before
-    # they are released, with the depth model their synthetic books are built
-    # from. Each market's LegQuotes is shared by every record that holds it.
+    # band's records, tier floors on and off, every closing choice's
+    # included), taken from the candles before they are released, with the
+    # depth model their synthetic books are built from. Each market's
+    # LegQuotes is shared by every record that holds it. The call's two
+    # report lines (markets with no readable volume, stale legs) count the
+    # run's own records' markets only, so they read as they would in a run
+    # without the other closing choices.
+    own_records = [rec for entries in (*entries_by_band.values(), *tier_off_entries.values())
+                   for rec in entries]
+    choice_entries = [entries for by_band in (*close_entries.values(), *close_off_entries.values())
+                      for entries in by_band.values()]
     _attach_leg_quotes(
-        [rec for entries in (*entries_by_band.values(), *tier_off_entries.values())
-         for rec in entries],
+        [*own_records, *(rec for entries in choice_entries for rec in entries)],
         candidates.candles_by_ticker, candidates.start_date, depth_model,
         stale_max_age=candidates.stale_quote_max_age,
-        volume_share=candidates.max_volume_share)
+        volume_share=candidates.max_volume_share,
+        report_tickers={rec["entry"][leg]["ticker"] for rec in own_records
+                        for leg in ("mA", "mB")})
     # Nothing below reads a candle or the pair list. Releasing both here keeps
     # the peak at a single-band run's entry-pass peak and, like the
     # single-band path (whose pair list dies with _prepare_entries' locals),
@@ -15039,9 +15326,11 @@ def _sweep_from_candidates(
     # label_coverage, start_date, same_event_ladders, corpus_provenance — are
     # read after this point. The pre-passes' rescan lists are lists of pair
     # tuples too, so they go with them (their entries already live on in
-    # entries_by_band and tier_off_entries).
+    # entries_by_band and tier_off_entries, and the other closing choices'
+    # in close_entries and close_off_entries).
     del candidates.candles_by_ticker, candidates.all_pairs
     del rescan, no_band_entries, off_rescan, off_no_band_entries
+    del close_rescan, close_off_rescan, choice_entries, own_records
 
     # ── Phase 2: simulations ───────────────────────────────────────────────
     primary_entries = entries_by_band[primary_band]
