@@ -312,7 +312,8 @@ Dependencies:
     page's file name, which live_dashboard serves as its Backtest tab),
     DASHBOARD_FILES_DIRNAME and DASHBOARD_BUILD_STALE_SECONDS (the folder of
     chunk files beside it, and when a build folder still marked as being
-    written is abandoned),
+    written, or a parking folder whose process cannot be told, is
+    abandoned),
     CONTRACT_PAYOUT_DOLLARS (named in the Sell select's title),
     LIVE_DASHBOARD_ORIGINS (the tab page's two addresses, the only ones the
     bar talks to), TRADING_QUERY_MAX_BYTES (the longest query the Trading
@@ -489,9 +490,13 @@ Notes:
     tier-floors-off family included, and a notice replaces it only if even
     that fails). Only one cell's
     points are ever alive, so a cap grid's points are never held in memory
-    together; the chunks are held as separate packed strings until each is
-    written (the page's first into the page, every other as a file in the
-    build's folder), and the page is streamed to disk piece by piece, never
+    together; nor are the chunks: the page's first is held as a packed
+    string until it is written into the page, and every other is parked on
+    disk the moment it is packed (_ChunkParking: a private folder under
+    DASHBOARD_FILES_DIRNAME, its file exactly the chunk file it becomes,
+    memory keeping only a small _ParkedChunk), then renamed into the build's
+    folder as the page is written — or read back into the page when that
+    folder cannot be made. The page is streamed to disk piece by piece, never
     joined into one string or encoded whole. A size-cap cell (or the size-cap sweep
     itself) that cannot be read costs the cap axis (the eager points are
     walked instead, with one WARNING, and the header's run-settings line says
@@ -10400,8 +10405,13 @@ class _ChunkVisitor:
     same list. The primary scenario's chunk is built from the page's own
     trades and curve, first, so it is chunk 0 and its views are exactly what
     the sections render. generate_dashboard writes chunk 0 into the page and
-    every other chunk as a file in the build's folder beside it
-    (_write_chunk_file), where the script loads it from when chosen.
+    every other chunk as a file in the build's folder beside it, where the
+    script loads it from when chosen. Handed a parking folder (_ChunkParking,
+    as generate_dashboard hands it one), the visitor writes each chunk past
+    the page's own there the moment it packs it, as the very file it will
+    become, and keeps only a _ParkedChunk in its place, so a large grid's
+    chunks never pile up in memory; handed none, it keeps every chunk's
+    element in memory.
     Trade-table rows are split (_trade_row_head / _trade_row_tail): the
     heads go in one table shared by every chunk (heads, shipped in the base
     block), where equal heads are stored once, the tails in the chunk's own
@@ -10451,14 +10461,26 @@ class _ChunkVisitor:
 
     A failure while building a chunk is caught here: one WARNING, and the
     visitor marks itself failed and drops what it built — the page is then
-    written without the bar, as when the filter's data cannot be built.
+    written without the bar, as when the filter's data cannot be built. A
+    chunk that cannot be parked (a full disk) is not caught: its
+    _ChunkParkError passes every handler here, and the build stops.
+
+    Every cut the walk makes (reset, reset_off, reset_rebalance, reset_move,
+    reset_maturity, a failure) shortens the list of chunks alone, placeholders
+    included; the files of parked chunks it drops stay in the parking folder,
+    where nothing moves them, and go with it, and an id handed out again parks
+    the new chunk over the dropped one's file.
 
     Attributes:
         axis (pd.DatetimeIndex): The page's date axis — the page's own curve.
         categories (list[str]), subcats (list[tuple[str, str]]): The bar's
             labels (_filter_labels), and cat_index / sub_index into them.
         heads (_StringTable): The shared row-head table.
-        chunks (list[str]): The packed <script> elements, by id.
+        chunks (list): By id, each chunk's packed <script> element, or the
+            _ParkedChunk that stands for it in the parking folder (every chunk
+            past the page's own, when the visitor has one).
+        parking (_ChunkParking | None): Where chunks past the page's own are
+            parked as they are packed; None keeps them in memory.
         grid (list): [band][k][cap] -> chunk id, or None for a scenario
             never simulated.
         grid_off (list | None): The same for the tier-floors-off cells of
@@ -10497,6 +10519,7 @@ class _ChunkVisitor:
         series_categories: dict[str, tuple[str, tuple[str, ...]]] | None,
         *,
         risk_free: RiskFreeRates | None = None,
+        parking: "_ChunkParking | None" = None,
     ) -> None:
         """
         Prepare to walk a grid.
@@ -10516,12 +10539,17 @@ class _ChunkVisitor:
                 view's Sharpe and Sortino subtracts. None (default)
                 subtracts nothing. One rate serves the whole page, so the
                 chunk dedup (_list_key) needs none in its key.
+            parking (_ChunkParking | None): Keyword-only. The build's parking
+                folder: every chunk past the page's own (chunk 0) is written
+                there as it is packed, and memory keeps a _ParkedChunk in
+                its place. None (default) keeps every chunk in memory.
         """
         self.trades, self.equity_df, self.k_used = trades, equity_df, k_used
         self.start_date, self.initial_balance = start_date, initial_balance
         self.series_categories = series_categories
-        # Kept across reset(): the rate does not depend on the grid walked
+        # Kept across reset(): neither depends on the grid walked
         self.risk_free = risk_free
+        self.parking = parking
         self.axis = pd.DatetimeIndex(pd.to_datetime(list(equity_df["date"])))
         self.reset(source)
 
@@ -10538,7 +10566,7 @@ class _ChunkVisitor:
         self.cat_index = {c: i for i, c in enumerate(self.categories)}
         self.sub_index = {pair: i for i, pair in enumerate(self.subcats)}
         self.heads = _StringTable()
-        self.chunks: list[str | None] = []
+        self.chunks: list[str | _ParkedChunk | None] = []
         self.seen: dict[str, int] = {}
         self.grid = [[[None] * len(source.caps) for _ in source.ks] for _ in source.bands]
         self.grid_off = (None if source.tier_binds is None else
@@ -11144,6 +11172,10 @@ class _ChunkVisitor:
         """
         The id of the chunk holding one list priced at k, packing it if new.
 
+        A new chunk past the page's own (chunk 0) is parked on disk at once
+        when the visitor has a parking folder, and its _ParkedChunk is what
+        the list of chunks holds.
+
         Args:
             bi (int): Band index.
             ki (int): k index.
@@ -11158,6 +11190,10 @@ class _ChunkVisitor:
         Returns:
             int: The chunk id — an existing one when an equal list at an
                 equal k was packed before.
+
+        Raises:
+            _ChunkParkError: If the chunk cannot be parked (it passes every
+                handler of Exception on the walk's way out).
         """
         key = self._key(bi, ki, k, listed, phase=phase)
         if key not in self.seen:
@@ -11167,8 +11203,13 @@ class _ChunkVisitor:
                                 self.cat_index, self.sub_index, strings, heads=self.heads,
                                 risk_free=self.risk_free, mix_gaps=self.mix_gaps)
             cid = len(self.chunks)
-            self.chunks.append(_packed_json_script(
-                f"dash-chunk-{cid}", {"list": lst, "strings": strings.items}))
+            element_id = f"dash-chunk-{cid}"
+            element = _packed_json_script(element_id, {"list": lst, "strings": strings.items})
+            if self.parking is not None and cid >= _PAGE_CHUNKS:
+                # On disk at once, as the file it will become: memory keeps
+                # only its placeholder
+                element = self.parking.park(cid, element_id, element)
+            self.chunks.append(element)
             if primary:
                 self.primary_views = {view_key: {"n": view["n"]}
                                       for view_key, view in lst["views"].items()}
@@ -11178,6 +11219,9 @@ class _ChunkVisitor:
     def _fail(self) -> None:
         """
         Give up on the bar: one WARNING, and every chunk dropped.
+
+        The files of chunks already parked are left in the parking folder,
+        which generate_dashboard removes with them.
         """
         logging.warning("A page-wide filter chunk could not be built; the dashboard "
                         "is written without the bar", exc_info=True)
@@ -11196,6 +11240,7 @@ def _build_filter_grid(
     pooled_k: float | None = None,
     explorer: _ExplorerVisitor | None = None,
     risk_free: RiskFreeRates | None = None,
+    parking: "_ChunkParking | None" = None,
 ) -> tuple[_GridSource, _ChunkVisitor, _KdVisitor]:
     """
     Walk the page's grid once with the page's visitors.
@@ -11219,15 +11264,23 @@ def _build_filter_grid(
             and interval-discount visitors' Sharpe and Sortino subtract (the
             explorer's visitor carries its own). None (default) subtracts
             nothing.
+        parking (_ChunkParking | None): Keyword-only. The build's parking
+            folder, handed to the chunk visitor: every chunk past the page's
+            own is written there as the walk packs it, and memory keeps only
+            a placeholder (_ParkedChunk). None (default) keeps every chunk in
+            memory.
 
     Returns:
         tuple[_GridSource, _ChunkVisitor, _KdVisitor]: The grid
             actually walked (the source, or its eager fallback) and the two
             filter visitors — one walk, so a size-cap sweep's cells are
             simulated once for both of them and for the explorer's.
+
+    Raises:
+        _ChunkParkError: If a chunk cannot be parked; the walk stops there.
     """
     chunks = _ChunkVisitor(source, trades, equity_df, k_used, start_date, initial_balance,
-                           series_categories, risk_free=risk_free)
+                           series_categories, risk_free=risk_free, parking=parking)
     kd = _KdVisitor(source, chunks.axis, pooled_k, risk_free=risk_free)
     axis_end = chunks.axis[-1] if len(chunks.axis) else None
     visitors = [chunks, kd] + ([] if explorer is None else [explorer])
@@ -11260,6 +11313,19 @@ _SELL_NONE = "none"
 # the page and delete the folders of earlier builds
 _BUILD_WRITING = ".writing"
 _BUILD_LOCK = ".lock"
+
+# How many chunks the page itself holds whenever its build has a folder of
+# chunk files: the run's own scenario's, chunk 0. Every later chunk is a file
+_PAGE_CHUNKS = 1
+
+# The start of a parking folder's name (_ChunkParking: where a build's chunks
+# wait on disk while the walk packs them). A build folder's name starts with
+# a digit (_build_name), so the two are never mistaken for each other
+_PARKING_PREFIX = ".parking-"
+# A whole parking folder name, _PARKING_PREFIX plus a build name; the group is
+# the id of the process that made it
+_PARKING_NAME = re.compile(re.escape(_PARKING_PREFIX)
+                           + r"[0-9]{8}T[0-9]{6}Z-([1-9][0-9]*)-[0-9a-f]+")
 
 
 @dataclass(frozen=True)
@@ -11470,6 +11536,11 @@ def _sell_days_phrase(days: int) -> str:
     return f" and at least {_sell_days_option(days)} before its last market closes"
 
 
+# What a chunk file holds before and after its packed block (_chunk_file_text)
+_CHUNK_FILE_HEAD = 'window.__dashChunk(document.currentScript,"'
+_CHUNK_FILE_TAIL = '");\n'
+
+
 def _chunk_file_text(packed: str) -> str:
     """
     The text of one chunk file: a call that hands its packed block to the page's script.
@@ -11487,7 +11558,29 @@ def _chunk_file_text(packed: str) -> str:
     Returns:
         str: One line of JavaScript.
     """
-    return f'window.__dashChunk(document.currentScript,"{packed}");\n'
+    return f"{_CHUNK_FILE_HEAD}{packed}{_CHUNK_FILE_TAIL}"
+
+
+def _chunk_file_packed(text: str) -> str:
+    """
+    The packed block one chunk file holds: the reverse of _chunk_file_text.
+
+    Used when a chunk parked on disk during the walk (_ChunkParking) has to go
+    into the page after all, because the build's folder could not be made.
+
+    Args:
+        text (str): A chunk file's whole text.
+
+    Returns:
+        str: The block between the call's quotes.
+
+    Raises:
+        ValueError: If the text is not one call of _chunk_file_text's form
+            (never from a file this build wrote).
+    """
+    if not (text.startswith(_CHUNK_FILE_HEAD) and text.endswith(_CHUNK_FILE_TAIL)):
+        raise ValueError("a parked chunk file does not hold one chunk call")
+    return text[len(_CHUNK_FILE_HEAD):-len(_CHUNK_FILE_TAIL)]
 
 
 def _sell_key_file(out_dir: Path, key: str) -> Path:
@@ -11955,13 +12048,30 @@ def _builds_lock(root: Path):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def _build_name() -> str:
+    """
+    A folder name no other build's has: the UTC time, this process's id and a random suffix.
+
+    Every build folder is named this way (_new_build_folder), and every
+    parking folder is named _PARKING_PREFIX plus such a name (_ChunkParking),
+    whose process id says whether its build may still be running
+    (_parking_abandoned).
+
+    Returns:
+        str: "<YYYYMMDDTHHMMSSZ>-<process id>-<8 hex digits>".
+    """
+    return f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{os.getpid()}-{secrets.token_hex(4)}"
+
+
 def _new_build_folder(page: Path) -> Path:
     """
     Make this build's folder of chunk files, marked as still being written.
 
-    The folder holds the page's scenario chunks (_write_chunk_file) and the
-    Sell select's (_build_sell_grid). Named by the UTC time, the process and a
-    random suffix, so two builds never share one, under
+    The folder holds the page's scenario chunks (moved there from the
+    parking folder they waited in during the walk, _ChunkParking.move, or
+    written there, _write_chunk_file) and the Sell select's
+    (_build_sell_grid). Named by the UTC time, the process and a random
+    suffix (_build_name), so two builds never share one, under
     DASHBOARD_FILES_DIRNAME beside the page; made, and marked
     (_BUILD_WRITING), under the builds' lock, so a build cleaning up never
     meets it unmarked.
@@ -11974,7 +12084,7 @@ def _new_build_folder(page: Path) -> Path:
     """
     root = page.parent / DASHBOARD_FILES_DIRNAME
     root.mkdir(parents=True, exist_ok=True)
-    name = f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{os.getpid()}-{secrets.token_hex(4)}"
+    name = _build_name()
     with _builds_lock(root):
         folder = root / name
         folder.mkdir()
@@ -11984,19 +12094,25 @@ def _new_build_folder(page: Path) -> Path:
 
 def _write_chunk_file(folder: Path, chunk_id: int, element: str) -> int:
     """
-    Write one of the page's scenario chunks as a file beside the page.
+    Write one of the page's scenario chunks as a file: in a parking folder during the walk, or beside the page.
 
     The page's script loads the file only when that scenario is chosen (load,
     sidecarText), so the browser never holds a scenario nobody opened. The
     chunk arrives as the <script> element _packed_json_script made; the file
     holds its packed text in the one call every chunk file holds
-    (_chunk_file_text), under the name the script asks for (_chunk_file). The
-    folder is unpublished until the page is (_publish_page), so no reader can
-    meet a half-written file.
+    (_chunk_file_text), under the name the script asks for (_chunk_file).
+    The walk writes each chunk past the page's own into the build's parking
+    folder the moment it is packed (_ChunkParking.park), and the page's
+    build moves that very file into the build's folder (_ChunkParking.move);
+    a chunk held in memory instead (a walk handed no parking folder) is
+    written into the build's folder here when the page is written. Either
+    folder is unpublished until the page is (_publish_page), so no reader
+    can meet a half-written file.
 
     Args:
-        folder (Path): The build's folder of chunk files (it exists).
-        chunk_id (int): The chunk's id, at or past the page's inline_chunks.
+        folder (Path): The parking folder or the build's folder of chunk
+            files (it exists).
+        chunk_id (int): The chunk's id: any but the page's own, 0.
         element (str): The packed <script> element.
 
     Returns:
@@ -12031,16 +12147,325 @@ def _clear_build_folder(folder: Path) -> None:
                         "no page names them", folder, exc_info=True)
 
 
+@dataclass(frozen=True)
+class _ParkedChunk:
+    """
+    What memory keeps of a chunk parked on disk during the walk (_ChunkParking.park).
+
+    It stands in the chunk visitor's list of chunks (_ChunkVisitor.chunks) at
+    the chunk's id, so the ids, the list's length and every cut the walk
+    makes to it are what they would be with the chunk's text there.
+
+    Attributes:
+        element_id (str): The id its <script> element has ("dash-chunk-<id>"),
+            should the page have to hold it after all.
+        size (int): The bytes of its file, which become a chunk file of the
+            page as they are.
+    """
+
+    element_id: str
+    size: int
+
+
+class _ChunkParkError(BaseException):
+    """
+    A chunk could not be parked on disk: the build stops, and generate_dashboard raises the OSError it carries.
+
+    A BaseException, not an Exception, so that it passes through every
+    handler on its way out of the walk that would otherwise cost a view or
+    the bar and carry on — the chunk visitor's own (_ChunkVisitor's
+    __call__, off, rebalance, move and maturity), _walk_move_cells' and
+    _walk_maturity_cells', and generate_dashboard's around the page-wide
+    filter. A disk that cannot take a chunk cannot take the page's folder
+    of chunk files either, so the build stops as it does when a chunk file
+    cannot be written, and the page in place and its folder stay.
+
+    A DASHBOARD_FILES_DIRNAME that cannot take the parking folder (a regular
+    file, or a folder this user cannot write) stops the build the same way,
+    at its first chunk past the page's own, with the mkdir's own error. It
+    does not fall back to a page that holds every chunk: that would hold
+    every chunk in memory through the walk, the gigabytes parking exists to
+    avoid. The page-holds-every-chunk fallback covers only a build folder
+    that cannot be made after the parking folder could be (generate_dashboard).
+
+    Attributes:
+        error (OSError): What the write (or making the folder) raised.
+    """
+
+    def __init__(self, error: OSError) -> None:
+        """
+        Carry the error that stopped the park.
+
+        Args:
+            error (OSError): What the write (or making the folder) raised.
+        """
+        super().__init__(error)
+        self.error = error
+
+
+class _ChunkParking:
+    """
+    The folder a build parks its scenario chunks in while the walk packs them.
+
+    The walk packs one chunk per distinct scenario trade list (_ChunkVisitor),
+    and every chunk but the page's own (chunk 0) becomes a file in the
+    build's folder of chunk files. That folder is made only after the walk,
+    once the page is known to need it, so until then each chunk past the
+    page's own waits here as the very file it will become (park), and memory
+    keeps a _ParkedChunk in its place: a large grid's chunks never pile up in
+    memory. When the page is written, each chunk the page still names is
+    renamed into the build's folder (move) — or, when that folder could not
+    be made, read back into the page (element) — and this folder is then
+    removed (remove), on every way out of the build (generate_dashboard).
+    Files of chunks the walk dropped (a view that failed, a walk begun
+    again) stay here unmoved and go with the folder.
+
+    The folder is made at the first park, under DASHBOARD_FILES_DIRNAME beside
+    the page, so each move is a rename on one filesystem. It is named
+    _PARKING_PREFIX plus a build name (_build_name), which carries this
+    process's id: a later build deletes it only once that process is gone
+    (_parking_abandoned) — after an out-of-memory kill, a forced quit or a
+    Ctrl-C that lands while it is being deleted, the only ways a build
+    leaves it (or part of it) behind. It is made without the builds' lock,
+    whose file would keep a DASHBOARD_FILES_DIRNAME made only for parking from
+    being removed, and holds a mark (_BUILD_WRITING), so a build running code
+    that knows no parking folder keeps it as a build still being written for
+    DASHBOARD_BUILD_STALE_SECONDS (two days) after it is made, then deletes
+    it as a crashed build's, even while this walk runs on. Only a build that
+    started before a pull and is still running two days into a build
+    started after it, in the same checkout, can do that; the build whose
+    folder it was then stops at its next park. The mark is never refreshed.
+    Before the folder is made, the parking folders of builds whose process
+    is gone are deleted (_remove_abandoned_parking), so their disk is free
+    before the walk fills this one.
+
+    Attributes:
+        root (Path): DASHBOARD_FILES_DIRNAME beside the page.
+        folder (Path | None): The parking folder; None until the first park
+            tries to make it, and again once removed.
+        made_root (bool): Whether this build made root, which remove() then
+            removes too when nothing else is in it.
+    """
+
+    def __init__(self, page: Path) -> None:
+        """
+        Prepare to park a build's chunks; nothing is made until the first park.
+
+        Args:
+            page (Path): The dashboard file the build will write.
+        """
+        self.root = page.parent / DASHBOARD_FILES_DIRNAME
+        self.folder: Path | None = None
+        self.made_root = False
+
+    def _make(self) -> None:
+        """
+        Make the parking folder, with its mark, after deleting abandoned ones.
+
+        The folder is recorded before it is made, so remove() deletes it
+        however soon after its mkdir the build is stopped (a Ctrl-C), and it
+        is made with its parents, so a root that another build removed (it
+        was empty) after this one found it is made again.
+
+        Raises:
+            OSError: If root or the folder cannot be made (root is a regular
+                file, say, or cannot be written: the folder's own mkdir
+                raises it), or the mark written; remove() still deletes
+                whatever was made.
+        """
+        try:
+            self.root.mkdir(parents=True)
+            self.made_root = True
+        except FileExistsError:
+            pass
+        _remove_abandoned_parking(self.root)
+        folder = self.root / f"{_PARKING_PREFIX}{_build_name()}"
+        self.folder = folder
+        folder.mkdir(parents=True)
+        (folder / _BUILD_WRITING).write_text("", encoding="utf-8")
+
+    def park(self, chunk_id: int, element_id: str, element: str) -> _ParkedChunk:
+        """
+        Write one chunk to the parking folder (made now if it is not yet) as the file it will become.
+
+        The text is exactly its chunk file's (_write_chunk_file, named
+        _chunk_file(folder, chunk_id)); an id the walk hands out again after
+        dropping chunks is written over the file of the chunk dropped.
+
+        Args:
+            chunk_id (int): The chunk's id (past the page's own).
+            element_id (str): Its <script> element's id.
+            element (str): The packed <script> element (_packed_json_script).
+
+        Returns:
+            _ParkedChunk: What memory keeps in the chunk's place.
+
+        Raises:
+            _ChunkParkError: If the folder cannot be made or the file
+                written; it carries the OSError.
+        """
+        try:
+            if self.folder is None:
+                self._make()
+            size = _write_chunk_file(self.folder, chunk_id, element)
+        except OSError as error:
+            raise _ChunkParkError(error) from error
+        return _ParkedChunk(element_id=element_id, size=size)
+
+    def move(self, chunk_id: int, folder: Path) -> None:
+        """
+        Move one parked chunk's file into the build's folder of chunk files, by a rename.
+
+        Args:
+            chunk_id (int): The chunk's id.
+            folder (Path): The build's folder (on the same filesystem).
+
+        Raises:
+            OSError: If the rename fails.
+        """
+        os.replace(_chunk_file(self.folder, chunk_id), _chunk_file(folder, chunk_id))
+
+    def element(self, chunk_id: int, parked: _ParkedChunk) -> str:
+        """
+        The <script> element of one parked chunk, read back from its file, for the page to hold.
+
+        Exactly the element the walk packed (_packed_element over the file's
+        block): used only when the build's folder could not be made, so
+        every chunk goes into the page.
+
+        Args:
+            chunk_id (int): The chunk's id.
+            parked (_ParkedChunk): Its placeholder.
+
+        Returns:
+            str: The packed <script> element.
+
+        Raises:
+            OSError: If the file cannot be read.
+            ValueError: If it does not hold one chunk call (never from a file
+                park wrote).
+        """
+        text = _chunk_file(self.folder, chunk_id).read_text(encoding="utf-8")
+        return _packed_element(parked.element_id, _chunk_file_packed(text))
+
+    def remove(self) -> None:
+        """
+        Delete the parking folder, and root too when this build made it and nothing else is in it; never raises.
+
+        Called once the page's chunks are in place and on every other way out
+        of the build, so calling it again does nothing. Root is only ever
+        removed when empty (another build may have put its own folder there
+        since). A folder that cannot be deleted costs disk only, with a
+        WARNING: the next build deletes it once this process is gone. One that
+        was never made (its mkdir failed or was cut short) needs no WARNING.
+        A Ctrl-C that lands while the folder is being deleted leaves what is
+        left of it, which the next build deletes once this process is gone.
+        """
+        if self.folder is not None:
+            folder, self.folder = self.folder, None
+            try:
+                shutil.rmtree(folder)
+            except OSError:
+                if os.path.lexists(folder):
+                    logging.warning("Could not delete the dashboard build's parking folder "
+                                    "%s; a later build deletes it", folder, exc_info=True)
+        if self.made_root:
+            self.made_root = False
+            with contextlib.suppress(OSError):
+                self.root.rmdir()
+
+
+def _parking_abandoned(folder: Path, now: float) -> bool:
+    """
+    Whether a parking folder's build is over, so the folder can be deleted; never raises.
+
+    A build removes its own parking folder (_ChunkParking.remove) on every way
+    out but an out-of-memory kill, a forced quit or a Ctrl-C during that
+    removal, so a folder whose process is no longer running is abandoned.
+    One whose process is running — this process included — never is,
+    however old its mark: that build may still be walking its grid. So a
+    dead build's folder whose process id the system has since given to
+    another process (any user's: one this user may not signal counts as
+    running) is kept until that process ends. A folder whose process cannot
+    be told (a name _ChunkParking did not write, or an id the system refuses
+    to check) is judged as a build folder is: abandoned once its mark
+    (_BUILD_WRITING) is DASHBOARD_BUILD_STALE_SECONDS old, and kept when its
+    mark cannot be read.
+
+    Args:
+        folder (Path): A folder under DASHBOARD_FILES_DIRNAME whose name starts
+            with _PARKING_PREFIX.
+        now (float): The time to age its mark against (time.time()).
+
+    Returns:
+        bool: True when the folder can be deleted.
+    """
+    match = _PARKING_NAME.fullmatch(folder.name)
+    if match is not None:
+        try:
+            # Signal 0 only checks that the process exists
+            os.kill(int(match.group(1)), 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            # Running, as another user
+            return False
+        except (OSError, OverflowError):
+            pass
+        else:
+            return False
+    try:
+        age = now - (folder / _BUILD_WRITING).stat().st_mtime
+    except OSError:
+        return False
+    return age >= DASHBOARD_BUILD_STALE_SECONDS
+
+
+def _remove_abandoned_parking(root: Path) -> None:
+    """
+    Delete every parking folder under root whose build is over (_parking_abandoned); never raises.
+
+    Called by a build just before it makes its own parking folder, so the
+    disk an earlier build that was killed mid-walk left full is free before
+    this walk fills it. A folder it cannot list or delete is a WARNING: the
+    next build tries again. A root that is no folder (a regular file) or is
+    gone holds no parking folder, and is left without a word to the mkdir
+    that follows, whose own error says what is wrong.
+
+    Args:
+        root (Path): DASHBOARD_FILES_DIRNAME beside the page.
+    """
+    now = time.time()
+    try:
+        children = [child for child in root.iterdir() if child.name.startswith(_PARKING_PREFIX)]
+    except (FileNotFoundError, NotADirectoryError):
+        return
+    except OSError:
+        logging.warning("Could not list the dashboard's parking folders in %s; the next "
+                        "build tries again", root, exc_info=True)
+        return
+    for child in children:
+        try:
+            if child.is_dir() and _parking_abandoned(child, now):
+                shutil.rmtree(child)
+        except OSError:
+            logging.warning("Could not delete the parking folder %s an earlier dashboard build "
+                            "left; the next build tries again", child, exc_info=True)
+
+
 def _remove_old_builds(root: Path, keep: str | None) -> None:
     """
-    Delete every build folder but this build's and those still being written.
+    Delete every build folder but this build's and those still being written, and every abandoned parking folder.
 
     Called under the builds' lock, right after the page is replaced: a folder
     no page reads any more is deleted, unless its mark (_BUILD_WRITING) is
     younger than DASHBOARD_BUILD_STALE_SECONDS — another backtest building
-    its page now. Never raises: it runs after the new page is in place, so a
-    folder it cannot list, read or delete is a WARNING (the next build tries
-    again), and one whose mark it cannot read is kept.
+    its page now. A parking folder (_ChunkParking: another build's chunks,
+    waiting on disk while its walk packs them) is never a build folder: it is
+    deleted only once its build is over (_parking_abandoned: its process is
+    gone), whatever its mark's age. Never raises: it runs after the new page
+    is in place, so a folder it cannot list, read or delete is a WARNING
+    (the next build tries again), and one whose mark it cannot read is kept.
 
     Args:
         root (Path): The folder of every build's folder of chunk files.
@@ -12057,6 +12482,10 @@ def _remove_old_builds(root: Path, keep: str | None) -> None:
     for child in children:
         try:
             if not child.is_dir() or child.name == keep:
+                continue
+            if child.name.startswith(_PARKING_PREFIX):
+                if _parking_abandoned(child, now):
+                    shutil.rmtree(child)
                 continue
             try:
                 age = now - (child / _BUILD_WRITING).stat().st_mtime
@@ -14111,8 +14540,29 @@ def _packed_text_script(element_id: str, raw: str) -> str:
         str: The <script type="text/plain" data-encoding="gzip+base64"> element,
             gzip's mtime pinned to 0 so the same text always packs alike.
     """
+    return _packed_element(element_id, _pack_text(raw))
+
+
+def _packed_element(element_id: str, packed: str) -> str:
+    """
+    The <script> element that carries one packed block in the page.
+
+    The one definition of the element every packed block is written in
+    (_packed_text_script); a chunk parked on disk during the walk that has to
+    go into the page after all is rebuilt with it from its file's block
+    (_ChunkParking.element).
+
+    Args:
+        element_id (str): The block's id.
+        packed (str): The block, gzip-compressed and base64-encoded
+            (_pack_text): its alphabet holds no "<", so nothing in it can
+            close the element early.
+
+    Returns:
+        str: The <script type="text/plain" data-encoding="gzip+base64"> element.
+    """
     return (f'<script type="text/plain" id="{element_id}" data-encoding="gzip+base64">'
-            f"{_pack_text(raw)}</script>")
+            f"{packed}</script>")
 
 
 def _pack_text(raw: str) -> str:
@@ -16860,7 +17310,10 @@ def generate_dashboard(
     (tier-floors-off scenarios included, when the run carries that family),
     the first of them (the run's own scenario) written into the page after
     the sections and every other as a file in a new folder beside the page
-    (_write_chunk_file), the packed base block after the chunk
+    — parked on disk the moment the walk packs it (_ChunkParking, a private
+    folder beside that one, so memory holds a placeholder rather than the
+    chunk) and moved into the new folder by a rename as the page is
+    written — the packed base block after the chunk
     (_ChunkVisitor, _filter_payload, _packed_json_script), and the script
     that swaps a selection in (_FILTER_JS), which loads a chosen scenario's
     file when it is first chosen. The filter's grid — every spread band x
@@ -16894,8 +17347,11 @@ def generate_dashboard(
     alone, and a folder no chunk was written to is deleted. The folder is
     made whenever the page has more than one chunk or a Sell view; when it
     cannot be made, one WARNING says so, every scenario chunk stays in the
-    page and the Sell select stays disabled. If the filter's data
-    cannot be built, the page is written without the bar and its script,
+    page (each parked one read back from its file) and the Sell select
+    stays disabled — a fallback that needs the parking folder: when
+    DASHBOARD_FILES_DIRNAME cannot take even that (a regular file, or a
+    folder this user cannot write), the build stops instead (below). If the
+    filter's data cannot be built, the page is written without the bar and its script,
     with a notice in the bar's place (and in the k-hat breakdown's, which
     reads the same base block, and in the interval-discount section, which
     then shows the run's own k and cap only) and a WARNING in the log. The
@@ -16914,7 +17370,19 @@ def generate_dashboard(
     every earlier build's folder of chunk files happen together under a lock
     (_publish_page), so the page in place always has its folder, and a build
     still writing its own is never touched; a page that fails to be written
-    deletes its own new folder and leaves the previous page and folder. The
+    deletes its own new folder and leaves the previous page and folder. A
+    chunk that cannot be parked stops the build the same way, raising the
+    OSError that stopped it, before any new folder is made: a full disk, or
+    a DASHBOARD_FILES_DIRNAME that cannot take the parking folder (a
+    regular file, or a folder this user cannot write; the build then stops
+    at its first chunk past the page's own rather than hold every chunk in
+    memory for a page that holds them all). The parking folder is removed
+    once the page's chunks are in place, before the page is published (and
+    with it DASHBOARD_FILES_DIRNAME, when the build made that folder only
+    for parking and nothing else is in it), and on every other way out, a
+    Ctrl-C included; only an out-of-memory kill, a forced quit or a Ctrl-C
+    that lands while the folder is being deleted leaves it (or what is left
+    of it) to the next build, which deletes it once this process is gone. The
     page and its folder are kept, copied and moved together. Once the page
     is published, the names its filter bar's Exclude menus list are written
     beside it (_write_filter_names, config.BACKTEST_FILTER_NAMES_FILENAME),
@@ -17023,6 +17491,16 @@ def generate_dashboard(
     Returns:
         Path: Absolute path to the HTML file written,
             PROJECT_ROOT / "backtest_dashboard.html".
+
+    Raises:
+        OSError: When the page, a chunk file or a parked chunk cannot be
+            written, or the page cannot be published; and when the folder
+            of chunk files beside the page (DASHBOARD_FILES_DIRNAME) cannot
+            take the parking folder — it is a regular file, or this user
+            cannot write it — at the first chunk past the page's own, with
+            the parking folder's mkdir's own error (no page holding every
+            chunk is written instead). The previous page and its folder stay
+            in place, and nothing of this build is left.
     """
     out_path = PROJECT_ROOT / DASHBOARD_FILENAME
     # The window's last day for the Period line: the day handed in, else
@@ -17130,13 +17608,20 @@ def generate_dashboard(
     # How many of the chunks the page holds itself (the rest are files in
     # build_folder); set once the filter's data is built
     inline_chunks = 0
+    # Where the walk parks every chunk past the page's own, on disk, until the
+    # page is written (made at the first such chunk); removed on every way
+    # out from here on
+    parking = _ChunkParking(out_path)
     try:
         source = _grid_source(sweep, trades, equity_df, k_used)
         explorer_visitor = (_new_explorer_visitor(source, sweep, risk_free=risk_free)
                             if explores else None)
+        # One walk over every scenario, packing each new trade list as a chunk
+        # and parking it on disk at once
         source, chunker, kd_visitor = _build_filter_grid(
             source, trades, equity_df, k_used, start_date, initial_balance, series_categories,
-            pooled_k=_pooled_k(sweep), explorer=explorer_visitor, risk_free=risk_free)
+            pooled_k=_pooled_k(sweep), explorer=explorer_visitor, risk_free=risk_free,
+            parking=parking)
         walked = source
         if explores:
             explorer_data = None if explorer_visitor is None else explorer_visitor.payload()
@@ -17169,7 +17654,7 @@ def generate_dashboard(
             # The folder of chunk files beside the page: every chunk but the
             # first, and the Sell select's. Made now, since the base block
             # names it; without it every chunk stays in the page
-            if len(chunker.chunks) > 1 or source.sell is not None:
+            if len(chunker.chunks) > _PAGE_CHUNKS or source.sell is not None:
                 try:
                     build_folder = _new_build_folder(out_path)
                 except OSError:
@@ -17192,14 +17677,14 @@ def generate_dashboard(
                 if sell_grid is None:
                     # Whatever a failed build left there, no page will load
                     _clear_build_folder(build_folder)
-            if build_folder is not None and len(chunker.chunks) <= 1 and (
+            if build_folder is not None and len(chunker.chunks) <= _PAGE_CHUNKS and (
                     sell_grid is None or not sell_grid.sidecars):
                 # Nothing for the page to load from it
                 shutil.rmtree(build_folder, ignore_errors=True)
                 build_folder = None
             # How many chunks the page itself holds: its own run's alone when
             # the others are files
-            inline_chunks = 1 if build_folder is not None else len(chunker.chunks)
+            inline_chunks = _PAGE_CHUNKS if build_folder is not None else len(chunker.chunks)
             # Said once for the whole page, never once per trade list
             unmixable = len(chunker.mix_gaps) + (0 if sell_grid is None else sell_grid.mix_gaps)
             if unmixable:
@@ -17255,13 +17740,29 @@ def generate_dashboard(
             base_block = _packed_json_script("dash-data", filter_data)
             chunks = chunker.chunks
             sell_blocks = list(sell_grid.blocks) if sell_grid is not None else []
+    except _ChunkParkError as parked:
+        # A chunk could not be parked (a full disk, or a files folder that
+        # cannot take the parking folder): the build stops as it does when a
+        # chunk file cannot be written, the page in place and its folder
+        # stay, and the caller sees the write's (or the mkdir's) own error
+        parking.remove()
+        raise parked.error from None
     except Exception:
+        # First, so a Ctrl-C during the WARNING leaves nothing parked: the page
+        # holds no chunk now
+        parking.remove()
         logging.warning("The page-wide filter could not be built; the dashboard is "
                         "written without it", exc_info=True)
         filter_data = filter_bar = base_block = None
         chunks = []
         sell_blocks = []
+    except BaseException:
+        # Interrupted (Ctrl-C): nothing of the parked chunks is left
+        parking.remove()
+        raise
     if filter_bar is None:
+        # The page holds no chunk, so no parked one is read
+        parking.remove()
         # The notice in the bar's place
         filter_data, chunks, sell_blocks = None, [], []
         if build_folder is not None:
@@ -17273,6 +17774,7 @@ def generate_dashboard(
         kd, kd_failed = None, False
     if explores and explorer_data is None and not explorer_failed:
         # The walk never got as far as the explorer: its own eager points
+        # (only when the bar was lost, so nothing is parked any more)
         explorer_data, explorer_failed = _explorer_fallback(sweep, risk_free=risk_free)
         explorer_rebuilt = not explorer_failed
 
@@ -17346,8 +17848,17 @@ def generate_dashboard(
 {header_note}
 {filter_bar}
 """
+        # Where the page is streamed before it is renamed over the target
+        # (below); the pid in its name keeps two concurrent runs apart. Named
+        # inside this block, whose handler removes the parking folder, so that
+        # nothing from here to the write's own handler can be stopped with
+        # chunks still parked: the tuple of sections between the two makes no
+        # call, and Python acts on a Ctrl-C only at a call or a loop's turn
+        tmp_path = out_path.with_name(f".{out_path.name}.{os.getpid()}.tmp")
+        published = False
     except BaseException:
-        # No page will name the folder made for this build
+        # No page will name the folder made for this build, nor read a parked chunk
+        parking.remove()
         if build_folder is not None:
             shutil.rmtree(build_folder, ignore_errors=True)
         raise
@@ -17391,15 +17902,13 @@ def generate_dashboard(
         lambda: terms_section_html(PAGE_BACKTEST),
     )
 
-    # Streamed beside the target, then renamed over it: the rename is atomic,
-    # so the previous dashboard is replaced only by a complete page. The
-    # temporary name carries the pid so two concurrent runs never share one.
-    # The page's own chunk (the others are written as files into the build's
-    # folder as they come up), then the Sell view's blocks, precede the base
-    # block, and all of them precede the script that reads them. newline=""
-    # writes every "\n" as-is on any platform.
-    tmp_path = out_path.with_name(f".{out_path.name}.{os.getpid()}.tmp")
-    published = False
+    # Streamed beside the target (tmp_path, named above), then renamed over
+    # it: the rename is atomic, so the previous dashboard is replaced only by
+    # a complete page. The page's own chunk (the others go into the build's
+    # folder as files as they come up: a parked chunk's file renamed there, a
+    # chunk held in memory written there), then the Sell view's blocks,
+    # precede the base block, and all of them precede the script that reads
+    # them. newline="" writes every "\n" as-is on any platform.
     try:
         with tmp_path.open("w", encoding="utf-8", newline="") as page:
             page.write(head)
@@ -17410,7 +17919,15 @@ def generate_dashboard(
                 started, files, written = time.monotonic(), 0, 0
                 for i, chunk in enumerate(chunks):
                     if i < inline_chunks:
-                        page.write(chunk)
+                        # A parked chunk is read back only when the build's
+                        # folder could not be made, so every chunk is in the page
+                        page.write(parking.element(i, chunk)
+                                   if isinstance(chunk, _ParkedChunk) else chunk)
+                    elif isinstance(chunk, _ParkedChunk):
+                        # Its file is already the chunk file: moved, not copied
+                        parking.move(i, build_folder)
+                        written += chunk.size
+                        files += 1
                     else:
                         written += _write_chunk_file(build_folder, i, chunk)
                         files += 1
@@ -17425,10 +17942,16 @@ def generate_dashboard(
                 page.write(base_block)
                 page.write(_FILTER_JS)
             page.write("\n</body>\n</html>")
+        # Every chunk the page names is in place: what is left parked (chunks
+        # the walk dropped) goes before the page is published, and with it a
+        # files folder made only for parking, as if never made
+        parking.remove()
         # The page replaced, then the folders no page reads any more deleted
         _publish_page(tmp_path, out_path, build_folder)
         published = True
     finally:
+        # First, as in every handler above: nothing parked outlives the build
+        parking.remove()
         tmp_path.unlink(missing_ok=True)
         if not published and build_folder is not None:
             # The previous page stays, and reads its own folder
