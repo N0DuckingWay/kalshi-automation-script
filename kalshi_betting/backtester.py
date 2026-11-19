@@ -318,6 +318,16 @@ Notes:
     page reads those cells yet. No other family adds to or trims held
     pairs, so a backtest never simulates one without the other.
 
+    With close_sweep, it also returns the other "Skip if closing within"
+    choices (BacktestSweep.close_sweep, a CloseSweep): every choice of
+    config.BUY_MIN_DAYS_TO_CLOSE_CHOICES besides the run's own, with the
+    entries each one finds (looked for during the run, after the run's own)
+    and every scenario of the same grid at it, tier floors on and off, the
+    "all" population only, never adding, trimming or selling. It too
+    simulates nothing during the run; each cell is simulated when a report
+    reads it, ending its curves on the day its eager twin's ended. No page
+    reads those cells yet.
+
     An ENTRY CHECKPOINT is a moment at which the backtest may open a
     simulated trade: the weekly moment config.SCHEDULED_RUN names (Monday
     09:00 America/Los_Angeles) on each run weekday. The live scheduler runs
@@ -336,7 +346,8 @@ Notes:
     config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT (_resolve_buy_min_days_to_close).
     With close_sweep, _sweep_from_candidates also finds the entries of the
     menu's other choices (config.BUY_MIN_DAYS_TO_CLOSE_CHOICES), which the
-    run's own results never read.
+    run's own results never read, and returns their results on demand
+    (CloseSweep, BacktestSweep.close_sweep).
 
     Before grouping, _prepare_candidates() filters markets through
     _can_ever_enter(), a cheap per-market PREFILTER that drops only markets no
@@ -2805,8 +2816,11 @@ class CapSweep:
     they are simulated, exactly as before the cap sweep, so an eager phase
     that straddles UTC midnight can end two cells' (or two populations')
     curves on different days; every cap of ONE population ends on the same
-    day. A population with no eager point (a hand-built CapSweep) reads the
-    clock at simulation time.
+    day. On a sweep that neither adds, sells early nor trims, a population
+    with neither an eager point nor a day in end_dates (a hand-built
+    CapSweep, say) reads the clock at simulation time (end_dates says what
+    the others do). The sell, Rebalance and close families build CapSweeps
+    with no eager point and hand them the run's end-date maps instead.
 
     Retention (TS-07's residency rule, declared): the sweep keeps
     entries_by_band alive for the reader: one small entry dict per band per
@@ -2953,10 +2967,14 @@ class CapSweep:
         end_dates (dict): (band, k, population) -> the day that population's
             curves end on, for a cell with no eager point (the eager map is
             empty for a sweep whose setting no eager run shares: one that
-            adds to held pairs, sells early or trims to Kelly); a cell with
-            an eager point ends where that point's curve ended. A cell in
-            neither map ends on today (UTC) on a sweep that does none of
-            those, and is refused (ValueError) on one that does. The keys
+            adds to held pairs, sells early or trims to Kelly, or one of
+            CloseSweep's, over another "Skip if closing within" choice's
+            entries); a cell with an eager point ends where that point's
+            curve ended. A cell in neither map ends on today (UTC) on a sweep
+            that neither adds, sells early nor trims, and is refused
+            (ValueError) on one that does; CloseSweep's sweeps are of the
+            first kind, so CloseSweep.sweep refuses a missing day itself,
+            before it builds one. The keys
             must be the exact band and k objects the cells are read with.
             Not in repr.
         simulated (int): Simulations this object has run (each cap point
@@ -4253,6 +4271,185 @@ class RebalanceSweep:
         return _entry_events(self.entries_by_band) | _entry_events(self.off_entries_by_band)
 
 
+@dataclass(frozen=True)
+class CloseSweep:
+    """
+    The other "Skip if closing within" choices: every scenario of the filter bar's first four menus at each, simulated on demand.
+
+    The backtest's main results apply the run's own "Skip if closing
+    within" choice (BacktestSweep.buy_min_days_to_close: 7 days unless a run
+    says otherwise). This family holds the entries of every OTHER choice of
+    the menu (config.BUY_MIN_DAYS_TO_CLOSE_CHOICES: 0 for off, 3, 7 and 14
+    days), which Phase 1 of _sweep_from_candidates found at every band and,
+    with the tier-floors-off family, at every binding band with the tier
+    floors off, so a report can show each choice's results at every spread
+    band, Tier floors setting, k and size cap. Nothing is simulated while
+    the backtest runs: sweep() builds, for one choice and Tier floors
+    setting, a plain CapSweep over that choice's entries, and cell() reads
+    one (band, k) cell of it, every cap, the "all" population only. Every
+    simulation here neither adds to held pairs, trims nor sells, and none
+    runs the split-half or top-event check, which are reported for the
+    run's own choice only.
+
+    No eager run applies another choice, so such a CapSweep has no eager
+    point to take its curves' last day from, and a CapSweep with no setting
+    of its own would quietly end a cell with no end day on whatever day
+    (UTC) the cell is read. So each cell ends on the day the run's own
+    eager "all" point of the same (band, k) ended (end_dates /
+    off_end_dates), and sweep() itself refuses (ValueError) a setting whose
+    map lacks a day for any of its (band, k) cells, so no cell can be read
+    around that check. Each cap is simulated until one reaches the cap the
+    walk stops depending on, which every larger cap shares (CapSweep).
+
+    Retention: each choice's own entry dicts (a rescan makes new ones),
+    one per band per entry. Their market dicts are corpus records the run's
+    own entries share wherever a pair enters at both, and their quotes are
+    the one LegQuotes per market every record shares; a choice below the
+    run's own (off, or 3 days under a 7-day run) also keeps the pairs that
+    enter only there. Not measured on a full corpus.
+
+    Attributes:
+        days (tuple[int, ...]): The choices besides the run's own,
+            ascending, 0 for off (_resolve_close_choices): the menu's own
+            values, which every map here is keyed by.
+        own_days (int): The run's own choice, 0 for off; its results are the
+            main ones, never this family's.
+        caps (tuple[float, ...]): The size caps of every scenario (the
+            size-cap sweep's, or the run's own alone).
+        primary_cap (float): The run's own cap.
+        bands (tuple): The tier-on bands.
+        off_bands (tuple): The bands a deadline-gap tier binds at, re-run
+            with the tier floors off; () without the tier-floors-off family.
+        ks (tuple[float, ...]): The k grid.
+        primary_k (float): The run's own k.
+        start_date (date): The backtest's start date.
+        initial_balance (float): The balance every simulation starts from.
+        entries_by_days (dict): Choice -> band -> that choice's tier-on
+            entries. Not in repr.
+        off_entries_by_days (dict): Choice -> binding band -> that choice's
+            tier-off entries; {} without the tier-floors-off family. Not in
+            repr.
+        end_dates (dict): (band, k, "all") -> the day the run's own tier-on
+            eager point's curve ended. Not in repr.
+        off_end_dates (dict): The same for the tier-off family. Not in repr.
+    """
+    days: tuple[int, ...]
+    own_days: int
+    caps: tuple[float, ...]
+    primary_cap: float
+    bands: tuple
+    off_bands: tuple
+    ks: tuple[float, ...]
+    primary_k: float
+    start_date: date
+    initial_balance: float
+    entries_by_days: dict = field(repr=False)
+    off_entries_by_days: dict = field(repr=False)
+    end_dates: dict = field(repr=False)
+    off_end_dates: dict = field(repr=False)
+
+    def __post_init__(self) -> None:
+        """
+        Refuse choices that name the run's own, or entry maps that do not hold exactly the choices.
+
+        Raises:
+            ValueError: If own_days is one of days (its results are the
+                main ones), or entries_by_days does not hold exactly the
+                choices of days, or off_entries_by_days does not hold
+                exactly them on a family with tier-off bands (and nothing
+                on one without).
+        """
+        if self.own_days in self.days:
+            raise ValueError(
+                f"CloseSweep's days {self.days!r} name the run's own choice "
+                f"{self.own_days!r}, whose results are the main ones")
+        if set(self.entries_by_days) != set(self.days):
+            raise ValueError(f"CloseSweep's entries are for {sorted(self.entries_by_days)!r}, "
+                             f"not its days {self.days!r}")
+        wanted = set(self.days) if self.off_bands else set()
+        if set(self.off_entries_by_days) != wanted:
+            raise ValueError(f"CloseSweep's tier-off entries are for "
+                             f"{sorted(self.off_entries_by_days)!r}, not {sorted(wanted)!r}")
+
+    def sweep(self, days: int, *, tier_floors: bool = True,
+              caps: Iterable[float] | None = None) -> CapSweep:
+        """
+        The lazy size-cap sweep at one "Skip if closing within" choice and Tier floors setting.
+
+        Args:
+            days (int): One of self.days (0 for off).
+            tier_floors (bool): Keyword-only. True (default) for the tier-on
+                bands; False for the bands the tiers bind at, re-run with the
+                tier floors off.
+            caps (Iterable[float] | None): Keyword-only. The caps to simulate,
+                each one of self.caps; None (default) means every one.
+
+        Returns:
+            CapSweep: Over that choice's entries at that setting's bands,
+                every k and the caps chosen, the "all" population only, with
+                no eager point and no checks, each cell ending on its eager
+                twin's day; it neither adds to held pairs, trims nor sells.
+                Nothing is simulated until one of its cells is read.
+
+        Raises:
+            ValueError: For a choice not in self.days (the run's own
+                included: its results are the main ones; a bool or 7.0 too),
+                tier floors off on a run without the tier-floors-off family,
+                a cap not in self.caps, or an end-date map with no day for
+                one of the setting's (band, k) cells.
+        """
+        # type() is int as well, since True and 7.0 compare equal to 1 and 7
+        if type(days) is not int or days not in self.days:
+            own = (" (the run's own choice, whose results are the main ones)"
+                   if type(days) is int and days == self.own_days else "")
+            raise ValueError(f"\"Skip if closing within\" {days!r}{own} is not one of "
+                             f"{self.days}")
+        if not tier_floors and not self.off_bands:
+            raise ValueError("this run has no tier-floors-off family to skip closing in")
+        chosen = self.caps if caps is None else tuple(sorted(set(caps)))
+        if any(cap not in self.caps for cap in chosen):
+            raise ValueError(f"size caps {chosen!r} are not all among {self.caps}")
+        bands = self.bands if tier_floors else self.off_bands
+        end_dates = self.end_dates if tier_floors else self.off_end_dates
+        # A CapSweep with no setting of its own ends a cell with no end day on
+        # today, so a missing day is refused here, before any cell is read
+        missing = [(band, k) for band in bands for k in self.ks
+                   if end_dates.get((band, k, "all")) is None]
+        if missing:
+            raise ValueError(f"no end day recorded for the (band, k) cells {missing!r}: "
+                             "their curves would end on whatever day they were read")
+        return CapSweep(
+            caps=chosen, primary_cap=self.primary_cap, bands=tuple(bands), ks=self.ks,
+            primary_k=self.primary_k, start_date=self.start_date,
+            initial_balance=self.initial_balance, split_date=None, checks=False,
+            entries_by_band=(self.entries_by_days if tier_floors
+                             else self.off_entries_by_days)[days],
+            eager={}, tier_floors=tier_floors, end_dates=end_dates)
+
+    def cell(self, days: int, band: tuple[float, float], k: float, *,
+             tier_floors: bool = True) -> dict[float, dict[str, SweepPoint]]:
+        """
+        One (band, k) cell, every size cap, at one "Skip if closing within" choice.
+
+        Args:
+            days (int): One of self.days (0 for off).
+            band (tuple[float, float]): One of the setting's bands.
+            k (float): One of self.ks.
+            tier_floors (bool): Keyword-only. The Tier floors setting.
+
+        Returns:
+            dict[float, dict[str, SweepPoint]]: cap -> {"all": point}.
+
+        Raises:
+            ValueError: As sweep(), and for a k not in self.ks, whose cell
+                has no end day either.
+            KeyError: For a band the setting does not hold.
+        """
+        if k not in self.ks:
+            raise ValueError(f"k {k!r} is not one of {self.ks}")
+        return self.sweep(days, tier_floors=tier_floors).cell(band, k)
+
+
 @dataclass
 class BacktestSweep:
     """
@@ -4479,6 +4676,14 @@ class BacktestSweep:
             failures, the candle anomalies and how many pair markets use a
             scheduled close, as counts; report only. None = not recorded (a
             hand-built sweep, or the Monday-infeasible window).
+        close_sweep (CloseSweep | None): The other "Skip if closing within"
+            choices: every choice of config.BUY_MIN_DAYS_TO_CLOSE_CHOICES
+            besides the run's own (buy_min_days_to_close), each with its own
+            entries at every band and Tier floors setting, its results at
+            every k and size cap simulated when a report reads them (the
+            "all" population only, never adding, trimming or selling). None
+            unless run_backtest_sweep(close_sweep=True) ran on a feasible
+            window. Every other field here is the run's own choice's.
     """
     primary: SweepPoint
     points: list[SweepPoint]
@@ -4529,6 +4734,9 @@ class BacktestSweep:
     buy_min_days_to_close: int | bool | None = None
     # What the side data says about the pairs, as counts (None: not recorded)
     extra_data_report: ExtraDataReport | None = None
+    # The other "Skip if closing within" choices, lazy (None unless
+    # run_backtest_sweep(close_sweep=True))
+    close_sweep: CloseSweep | None = None
 
 
 def _settlement_receipt(n: int, outcome_a: str, outcome_b: str, pair_type: str) -> float:
@@ -5324,8 +5532,12 @@ def _resolve_close_choices(own_days: int | None) -> tuple[int, ...]:
     The menu offers every value of this module's BUY_MIN_DAYS_TO_CLOSE_CHOICES
     (0 is "Off"). The run's own choice is the one the main results apply;
     with close_sweep on, _sweep_from_candidates also finds the entries of
-    each choice this returns. Reads the binding when called (patch
-    backtester's, never config's) and checks it.
+    each choice this returns and builds the family that works out their
+    results on demand (CloseSweep). Reads the binding when called (patch
+    backtester's, never config's) and checks it: run_backtest_sweep calls
+    this before its fetch when the family is on, so a bad choice stops the
+    run before anything downloads, and _sweep_from_candidates calls it again
+    to build the family.
 
     Args:
         own_days (int | None): The run's own minimum, as resolved by
@@ -15005,10 +15217,19 @@ def _sweep_from_candidates(
     the one _attach_leg_quotes call, before the candles are released, and
     that call's two report lines count only the run's own records' markets
     (report_tickers). So the run's own passes, entries, log lines and tally
-    are those of a run without it. Its own INFO lines each begin "Other
-    \"Skip if closing within\" choices": two for each extra no-minimum scan
-    (what it scans, then how many pairs entered), then one per choice and
-    Tier floors setting (its entries over its bands).
+    are those of a run without it. Phase 2 then returns a CloseSweep
+    (BacktestSweep.close_sweep) over those entries, the same bands and k
+    grid, the size-cap sweep's caps (every cap of SIZE_CAP_SWEEP and the
+    run's own; the run's own cap alone without the size-cap sweep), tier
+    floors on and off. It simulates nothing here: no eager run applies
+    another choice, so each cell ends its curves on the day its eager
+    twin's ended, recorded in the end-date maps above as for the sell and
+    Rebalance families, and every one of its simulations neither adds to
+    held pairs, trims nor sells. The family's own INFO lines each begin
+    "Other \"Skip if closing within\" choices": two for each extra
+    no-minimum scan (what it scans, then how many pairs entered), then one
+    per choice and Tier floors setting (its entries over its bands), then
+    one naming the family's grid once it is built.
 
     Args:
         candidates (_Candidates): _prepare_candidates() output. CONSUMED: its
@@ -15071,9 +15292,11 @@ def _sweep_from_candidates(
             "maturity" (RebalanceSweep.maturity_days). False (default)
             leaves them empty.
         close_sweep (bool): Keyword-only. When True, Phase 1 also finds the
-            entries of every other "Skip if closing within" choice, as
-            described above. False (default) finds none: the run's passes
-            and log lines are exactly those of a run without it.
+            entries of every other "Skip if closing within" choice, and the
+            close family described above is returned on
+            BacktestSweep.close_sweep. False (default) finds none and returns
+            None: the run's passes and log lines are exactly those of a run
+            without it.
 
     Returns:
         BacktestSweep: primary, points (the primary band's k sweep),
@@ -15085,9 +15308,9 @@ def _sweep_from_candidates(
             resolution), tier_off_scenarios, tier_off_calibrations_by_band,
             cap_sweep, tier_off_cap_sweep, the thirteen
             live_* fields, entry_checkpoint, sell_sweep, depth_model,
-            rebalance_sweep and the run's settings (scheduled_close,
+            rebalance_sweep, the run's settings (scheduled_close,
             stale_quote_max_age, max_volume_share, buy_min_days_to_close,
-            carried from candidates) — see BacktestSweep.
+            carried from candidates) and close_sweep — see BacktestSweep.
 
     Raises:
         ValueError: If tier_off_sweep is set without band_sweep (the tier-off
@@ -15414,12 +15637,13 @@ def _sweep_from_candidates(
     # it holds references to points already kept above, never a copy.
     eager: dict[tuple, SweepPoint] = {}
     # (band, k, "all") -> the last day the eager "all" point's curve ends on.
-    # The sell and Rebalance families end every cell's curves there too, so a
-    # cell and its eager twin cover one span. Filled only with one of those
-    # families (the tier-off loop fills its own map, since the two share keys).
+    # The sell, Rebalance and close families end every cell's curves there
+    # too, so a cell and its eager twin cover one span. Filled only with one
+    # of those families (the tier-off loop fills its own map, since the two
+    # share keys).
     lazy_end_dates: dict[tuple, date | None] = {}
     lazy_off_end_dates: dict[tuple, date | None] = {}
-    lazy_families = sell_sweep or rebalance_sweep
+    lazy_families = sell_sweep or rebalance_sweep or close_sweep
     for bi, band in enumerate(bands, start=1):
         entries = entries_by_band[band]
         # The primary's is the object already measured and logged above.
@@ -15463,8 +15687,8 @@ def _sweep_from_candidates(
                 # single-band run (band_sweep False) still seeds its cells
                 eager[(band, point_k, "all")] = point
             if lazy_families:
-                # Keyed by the exact band and k objects the sell and Rebalance
-                # cells are read with (the tuples this loop and
+                # Keyed by the exact band and k objects the sell, Rebalance
+                # and close cells are read with (the tuples this loop and
                 # CapSweep.bands/.ks hold)
                 lazy_end_dates[(band, point_k, "all")] = _curve_end_date(point)
             if not band_sweep:
@@ -15527,8 +15751,8 @@ def _sweep_from_candidates(
     # carries it, resolved at simulation time) unioned into SIZE_CAP_SWEEP, as
     # the k grid unions its primary, so the eager points are always exact
     # members. Read by the size-cap sweeps and, with the size-cap sweep on, by
-    # the sell and Rebalance families; a run without the size-cap sweep
-    # never reads a point's stamped cap here.
+    # the sell, Rebalance and close families; a run without the size-cap
+    # sweep never reads a point's stamped cap here.
     caps = (tuple(sorted(set(SIZE_CAP_SWEEP) | {primary.size_cap}))
             if cap_sweep else ())
     capped = None
@@ -15606,6 +15830,27 @@ def _sweep_from_candidates(
                      "x %d k, each simulated when the dashboard reads it",
                      len(rebalance_caps), len(bands), len(tier_off_bands), len(grid))
 
+    closed = None
+    if close_sweep:
+        # Every other "Skip if closing within" choice over the same grid,
+        # tier floors on and off, from the entries Phase 1 found for each:
+        # the size-cap sweep's caps when it ran, else the run's own cap. No
+        # eager run applies another choice, so each cell takes its curves'
+        # last day from the end-date maps built above; nothing simulated here
+        close_caps = caps if cap_sweep else (primary.size_cap,)
+        closed = CloseSweep(
+            days=close_days, own_days=candidates.buy_min_days_to_close or 0,
+            caps=close_caps, primary_cap=primary.size_cap, bands=tuple(bands),
+            off_bands=tuple(tier_off_bands), ks=tuple(grid), primary_k=effective_k,
+            start_date=start_date, initial_balance=initial_balance,
+            entries_by_days=close_entries, off_entries_by_days=close_off_entries,
+            end_dates=lazy_end_dates, off_end_dates=lazy_off_end_dates)
+        logging.info("Other \"Skip if closing within\" choices: %s x %d size cap(s) x %d "
+                     "band(s) (%d with the tier floors off) x %d k, each simulated when a "
+                     "report reads it",
+                     ", ".join(_close_choice_label(days) for days in close_days) or "none",
+                     len(close_caps), len(bands), len(tier_off_bands), len(grid))
+
     return BacktestSweep(
         primary=primary, points=points, calibration=calibration,
         label_coverage=candidates.label_coverage,
@@ -15643,6 +15888,8 @@ def _sweep_from_candidates(
                                else candidates.buy_min_days_to_close),
         # What the side data says about the pairs, as counts (report only)
         extra_data_report=candidates.extra_data_report,
+        # The other "Skip if closing within" choices, lazy (None: not asked for)
+        close_sweep=closed,
     )
 
 
@@ -15671,6 +15918,7 @@ def run_backtest_sweep(
     stale_quote_max_age: Any = None,
     max_volume_share: Any = None,
     buy_min_days_to_close: Any = None,
+    close_sweep: bool = False,
 ) -> BacktestSweep:
     """
     Replay the time-series pair strategy at one interval discount, or at a grid
@@ -15755,6 +16003,14 @@ def run_backtest_sweep(
     (naming the wait after a trade, REBALANCE_MIN_DAYS_SINCE_TRADE), one
     saying whether the minimum price movements are on, and, from
     _sweep_from_candidates, one summary line.
+
+    With close_sweep, the result also carries the other "Skip if closing
+    within" choices (BacktestSweep.close_sweep): every choice of
+    config.BUY_MIN_DAYS_TO_CLOSE_CHOICES besides the run's own, each with
+    its own entries (found during the run, after the run's own) and its
+    results over the same grid, tier floors on and off, simulated only when
+    a report reads them, with no adding to held pairs, no trimming and no
+    selling. _sweep_from_candidates logs what it found and one summary line.
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
@@ -15882,6 +16138,15 @@ def run_backtest_sweep(
             logged with what it removed, and recorded on the result
             (BacktestSweep.buy_min_days_to_close); a max_horizon_days at or
             below it logs a WARNING.
+        close_sweep (bool): Keyword-only. When True, also return
+            BacktestSweep.close_sweep — a lazy CloseSweep over every other
+            choice of this module's BUY_MIN_DAYS_TO_CLOSE_CHOICES
+            (_resolve_close_choices, checked before any fetch), over the same
+            grid (with cap_sweep, every cap of SIZE_CAP_SWEEP and the run's
+            own cap; without, the run's own cap alone). It adds a few entry
+            passes to the run and no simulation. False (default) returns
+            None, as does the infeasible window. Backtest-only: a live run
+            applies its own saved choice.
 
     Returns:
         BacktestSweep: primary (the effective-discount, primary-band result),
@@ -15896,9 +16161,10 @@ def run_backtest_sweep(
             None when not recorded, the tier-off family, empty unless
             tier_off_sweep, the lazy cap_sweep and tier_off_cap_sweep,
             the live_* fields, entry_checkpoint, the
-            lazy sell_sweep, depth_model, the lazy rebalance_sweep and the
+            lazy sell_sweep, depth_model, the lazy rebalance_sweep, the
             run's settings (scheduled_close, stale_quote_max_age,
-            max_volume_share, buy_min_days_to_close) — see BacktestSweep.
+            max_volume_share, buy_min_days_to_close) and the lazy
+            close_sweep — see BacktestSweep.
 
     Raises:
         ValueError: Before any fetch or log line, if tier_off_sweep is set
@@ -15924,7 +16190,9 @@ def run_backtest_sweep(
             BACKTEST_MAX_VOLUME_SHARE) is not a share in (0, 1], None or
             False, if buy_min_days_to_close (or, with None, this module's
             BUY_MIN_DAYS_TO_CLOSE_DEFAULT) is not one of config's
-            BUY_MIN_DAYS_TO_CLOSE_CHOICES, None or False, or if
+            BUY_MIN_DAYS_TO_CLOSE_CHOICES, None or False, if close_sweep is
+            set and this module's BUY_MIN_DAYS_TO_CLOSE_CHOICES is not a
+            tuple of distinct whole numbers of days of at least 0, or if
             spread_band is not a valid band; and,
             before any fetch, from _prepare_candidates() when SCHEDULED_RUN
             cannot place the entry checkpoints (a configuration error).
@@ -15947,7 +16215,7 @@ def run_backtest_sweep(
         (config_same_event_ladders), the entry checkpoint
         and, when usable live defaults are saved, the live_* fields recorded,
         and the live-rule line logged either way, so callers need no special
-        case. No sell or Rebalance family is built there (both are None).
+        case. No sell, Rebalance or close family is built there (all are None).
 
         Before the fetch, one INFO line names the entry checkpoint and its UTC
         times over [start_date, today]; it never raises. _prepare_candidates
@@ -15995,6 +16263,10 @@ def run_backtest_sweep(
     volume_share = _resolve_max_volume_share(max_volume_share)
     # ... and for "Skip if closing within" (None: off)
     buy_min_days = _resolve_buy_min_days_to_close(buy_min_days_to_close)
+    # ... and, when the close family rides the result, for the menu's other
+    # choices, which the run finds entries for after its own
+    if close_sweep:
+        _resolve_close_choices(buy_min_days)
     # And for k: every simulation hands it to the live sizer, whose
     # LiveSettings takes only a k in (0, 1]
     if interval_discount is not None and (
@@ -16219,6 +16491,8 @@ def run_backtest_sweep(
                                                  else volume_share),
                                buy_min_days_to_close=(False if buy_min_days is None
                                                       else buy_min_days),
+                               # No entries were found, so no other choice either
+                               close_sweep=None,
                                **_live_rule_fields(live))
     else:
         # Every entry pass and simulation. It deletes the candles and pair list
@@ -16231,6 +16505,7 @@ def run_backtest_sweep(
             sell_sweep=sell_sweep, live=live,
             depth_model=depth_model, rebalance_sweep=rebalance_sweep,
             move_sweep=move_sweep, maturity_sweep=maturity_sweep,
+            close_sweep=close_sweep,
         )
     # On every path, "none recorded" included, so the report never omits it
     logging.info("%s", _live_rule_line(result))

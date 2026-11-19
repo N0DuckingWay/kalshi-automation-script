@@ -13,7 +13,8 @@ Purpose:
     --buy-min-days-to-close / --no-buy-min-days-to-close,
     --spread-min, --spread-max, --no-band-sweep,
     --no-cap-sweep, --no-sell-sweep, --sell-workers, --no-rebalance-sweep,
-    --no-move-sweep, --no-maturity-sweep, --no-eda, --dashboard-only,
+    --no-move-sweep, --no-maturity-sweep, --no-close-sweep, --no-eda,
+    --dashboard-only,
     --accept-changed-simulator), configures logging to kalshi_backtest.log, constructs the necessary API
     clients, works out the starting balance (--balance, or else what the Kalshi
     account is worth when the run starts), fits the depth model from the saved
@@ -269,6 +270,16 @@ Notes:
     reads every one as it is built, for its "Rebalance until" select.
     --no-maturity-sweep skips them (that select then stays shut) and still
     builds Rebalance itself; --no-rebalance-sweep skips them too.
+
+    The other "Skip if closing within" choices are ON by default too
+    (close_sweep=True): the result carries a lazy CloseSweep
+    (BacktestSweep.close_sweep) holding, for every choice of
+    config.BUY_MIN_DAYS_TO_CLOSE_CHOICES besides the run's own, the pairs
+    that choice would buy (found during the run, after the run's own, in a
+    few more entry passes) and every scenario of the grid at it, simulated
+    only when a report reads it. No page reads them yet. --no-close-sweep
+    skips them. A live run applies its own saved "Skip if closing within"
+    choice (main.py --buy-min-days-to-close for one run).
 
     Every full run saves what it hands generate_dashboard, right after the
     sweep and before the page is built, in config.BACKTEST_SWEEP_FILENAME in
@@ -1134,21 +1145,22 @@ def _load_saved_inputs(path: Path) -> dict[str, Any]:
 
 def _without_families(sweep: BacktestSweep, *, cap_sweep: bool, sell_sweep: bool,
                       rebalance_sweep: bool, move_sweep: bool,
-                      maturity_sweep: bool) -> tuple[BacktestSweep, list[str]]:
+                      maturity_sweep: bool,
+                      close_sweep: bool) -> tuple[BacktestSweep, list[str]]:
     """
     Drop lazy families from a loaded sweep, as a run given the matching --no-*-sweep flags builds it.
 
     Each flag that is False drops its family, so the rebuilt page leaves its
     select disabled and skips its simulations: a quick page for checking a
-    change. Without the size-cap sweep, a run builds the Sell and Rebalance
-    families at its own cap alone, so those that stay are narrowed to it
-    too. Without the minimum price movements, the Rebalance family stays and
-    carries none; without the "Rebalance until" choices, likewise.
+    change. Without the size-cap sweep, a run builds the Sell, Rebalance
+    and close families at its own cap alone, so those that stay are narrowed
+    to it too. Without the minimum price movements, the Rebalance family
+    stays and carries none; without the "Rebalance until" choices, likewise.
 
     Args:
         sweep (BacktestSweep): The loaded sweep; left as it is.
-        cap_sweep, sell_sweep, rebalance_sweep, move_sweep, maturity_sweep
-            (bool): Whether each family stays.
+        cap_sweep, sell_sweep, rebalance_sweep, move_sweep, maturity_sweep,
+            close_sweep (bool): Whether each family stays.
 
     Returns:
         tuple[BacktestSweep, list[str]]: The sweep the page is built from
@@ -1163,7 +1175,7 @@ def _without_families(sweep: BacktestSweep, *, cap_sweep: bool, sell_sweep: bool
             dropped.append("the size caps (--no-cap-sweep)")
         # The other lazy families at the run's own cap, as a run without the
         # size-cap sweep builds them
-        for name in ("sell_sweep", "rebalance_sweep"):
+        for name in ("sell_sweep", "rebalance_sweep", "close_sweep"):
             family = getattr(sweep, name)
             if family is not None and family.caps != (family.primary_cap,):
                 changes[name] = replace(family, caps=(family.primary_cap,))
@@ -1183,6 +1195,9 @@ def _without_families(sweep: BacktestSweep, *, cap_sweep: bool, sell_sweep: bool
         if not maturity_sweep and family.maturity_days:
             changes["rebalance_sweep"] = replace(family, maturity_days=())
             dropped.append("Rebalance until (--no-maturity-sweep)")
+    if not close_sweep and sweep.close_sweep is not None:
+        changes["close_sweep"] = None
+        dropped.append("the other \"Skip if closing within\" choices (--no-close-sweep)")
     return (replace(sweep, **changes) if changes else sweep), dropped
 
 
@@ -1333,7 +1348,7 @@ def _rebuild_dashboard(parser: argparse.ArgumentParser, args: argparse.Namespace
     sweep, dropped = _without_families(
         inputs["sweep"], cap_sweep=not args.no_cap_sweep, sell_sweep=not args.no_sell_sweep,
         rebalance_sweep=not args.no_rebalance_sweep, move_sweep=not args.no_move_sweep,
-        maturity_sweep=not args.no_maturity_sweep)
+        maturity_sweep=not args.no_maturity_sweep, close_sweep=not args.no_close_sweep)
     if dropped:
         logging.info("Dashboard rebuilt without: %s", "; ".join(dropped))
     # The T-bill yields, read again: never raises (see the full run's read)
@@ -1552,6 +1567,15 @@ def _build_parser() -> argparse.ArgumentParser:
              "--rebalance-min-days-to-maturity for one run)",
     )
     parser.add_argument(
+        "--no-close-sweep", action="store_true",
+        help="Skip the other \"Skip if closing within\" choices (every one of "
+             "config.BUY_MIN_DAYS_TO_CLOSE_CHOICES but this run's own): which pairs each "
+             "would buy is found during the run, in a few more entry passes, and each "
+             "scenario at it is simulated only when a report reads it. No page shows them "
+             "yet. Backtest only — a live run applies its own saved buy_min_days_to_close "
+             "(main.py --buy-min-days-to-close for one run)",
+    )
+    parser.add_argument(
         "--sell-workers", type=int, default=None, metavar="N",
         help="Worker processes the dashboard simulates its Sell select in "
              "(default: one less than this machine's CPU count, at most "
@@ -1598,8 +1622,9 @@ def main() -> None:
     --max-volume-share / --no-volume-cap, --buy-min-days-to-close /
     --no-buy-min-days-to-close, --spread-min,
     --spread-max, --no-band-sweep, --no-cap-sweep, --no-sell-sweep,
-    --no-rebalance-sweep, --no-move-sweep, --no-maturity-sweep, --sell-workers,
-    --no-eda, --dashboard-only, --accept-changed-simulator); with --dashboard-only it
+    --no-rebalance-sweep, --no-move-sweep, --no-maturity-sweep, --no-close-sweep,
+    --sell-workers, --no-eda, --dashboard-only, --accept-changed-simulator); with
+    --dashboard-only it
     hands over to _rebuild_dashboard, which rebuilds the page from the saved
     inputs and runs nothing below. Otherwise it configures
     logging, constructs historical and live
@@ -1630,7 +1655,9 @@ def main() -> None:
     bar, Interval Discount section and scenario explorer); the lazily
     simulated sell family (result.sell_sweep) and Rebalance family
     (result.rebalance_sweep, with its minimum price movements and its
-    "Rebalance until" choices) are read the same way.
+    "Rebalance until" choices) are read the same way. The lazily simulated
+    other "Skip if closing within" choices (result.close_sweep) are saved
+    with the rest, and no page reads them yet.
     """
     parser = _build_parser()
     args = parser.parse_args()
@@ -1801,6 +1828,9 @@ def main() -> None:
     move_sweep = rebalance_sweep and not args.no_move_sweep
     # ... and its "Rebalance until" choices, the same way
     maturity_sweep = rebalance_sweep and not args.no_maturity_sweep
+    # ... and the other "Skip if closing within" choices: a few more entry
+    # passes during the run, and nothing simulated until a report reads them
+    close_sweep = not args.no_close_sweep
     # The dashboard simulates the Sell select in worker processes: one less
     # than the CPUs (the main process waits on them), within the config bound
     sell_workers = _sell_workers(args.sell_workers)
@@ -1959,11 +1989,13 @@ def main() -> None:
         move_sweep=move_sweep,
         # ... and its "Rebalance until" choices (simulated only when read)
         maturity_sweep=maturity_sweep,
+        # The other "Skip if closing within" choices (simulated only when read)
+        close_sweep=close_sweep,
         # Every trade's order book is built from this table (None: top of book)
         depth_model=depth_model,
         # Each series' fee multiplier (carried only)
         fee_multipliers=fee_multipliers,
-    )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep, and the lazy sell and Rebalance families (sell_sweep, rebalance_sweep) unless --no-sell-sweep / --no-rebalance-sweep
+    )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep, the lazy sell and Rebalance families (sell_sweep, rebalance_sweep) unless --no-sell-sweep / --no-rebalance-sweep, and the lazy other "Skip if closing within" choices (close_sweep) unless --no-close-sweep
     # What the dashboard is handed, saved before the page is built, so
     # --dashboard-only can rebuild the page (or finish a build that stopped)
     # without running the backtest again. period_end is the window's last day,
@@ -1984,7 +2016,9 @@ def main() -> None:
     # a cell is read) only by the dashboard, whose one grid walk reads
     # every cell as the page is built (filter bar, Interval Discount section
     # and scenario explorer). The sell and Rebalance families
-    # (result.sell_sweep and result.rebalance_sweep) are lazy the same way.
+    # (result.sell_sweep and result.rebalance_sweep) are lazy the same way,
+    # and so are the other "Skip if closing within" choices
+    # (result.close_sweep), which no page reads yet.
     trades, equity_df = result.primary.trades, result.primary.equity_df
 
     if not trades:
@@ -2021,7 +2055,8 @@ def main() -> None:
     # cell of them is simulated here, in the page's one grid walk), the lazy
     # sell and Rebalance families (sell_sweep and rebalance_sweep, None under
     # --no-sell-sweep and --no-rebalance-sweep) and the header's run-settings
-    # line;
+    # line (it also carries close_sweep, the other "Skip if closing within"
+    # choices, None under --no-close-sweep, which the page does not read yet);
     # interval_discount is the resolved k these trades were sized at, which
     # the Risk section's Kelly scatter must price on
     #

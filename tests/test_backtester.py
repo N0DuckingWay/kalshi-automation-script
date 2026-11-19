@@ -13714,8 +13714,8 @@ class TestBandSweepPhaseOneSubset:
         assert all(days is not None for *_rest, days, _out in on[len(off):])
         assert [m for m in on_messages if m not in other_choices(on_messages)] == off_messages
         # Two lines per extra scan (none when the run's own choice is off),
-        # then one per choice and setting
-        assert len(other_choices(on_messages)) == (2 * 2 if own else 0) + 3 * 2
+        # then one per choice and setting, then the family's one summary line
+        assert len(other_choices(on_messages)) == (2 * 2 if own else 0) + 3 * 2 + 1
         assert "Other \"Skip if closing within\" choices: 14 days: 30 entries over 36 " \
                "band(s)" in on_messages
 
@@ -13765,6 +13765,299 @@ class TestBandSweepPhaseOneSubset:
             else:
                 assert any(m.startswith("Legs valued on a quote") for m in off_messages)
 
+
+@pytest.fixture(scope="class")
+def close_run():
+    """The close fixture of TestBandSweepPhaseOneSubset (ICE, DEW, MIST and
+    FOG, whose first possible Mondays fall 26.3, 5.3, 12.3 and 12.3 days
+    before their closes) through run_backtest_sweep on a narrowed grid:
+    floors 0 and 0.25 x ceilings 0.6 and 1 (all four bands bind, so each
+    has a tier-floors-off twin) x k 0.5 and the primary 0.75. The size-cap
+    sweep, the tier-floors-off family and the close family are on, and Sell
+    and Rebalance are OFF, so the end-date maps come from the close family
+    alone. Runs: the run's own choice at 7 days with the close family on
+    ("on") and off ("off"), at off with it on ("own_off"), and at 7 days
+    without the size-cap sweep ("no_cap"). The clock is pinned, so every
+    curve ends on one known day. "direct" holds, for every choice, Tier
+    floors setting and band, the entries a run whose own choice it is finds
+    by a full scan, with their quotes, as a run gives them."""
+    toggles = pytest.MonkeyPatch()
+    mp = pytest.MonkeyPatch()
+    try:
+        apply_pre_toggle_defaults(toggles)
+        fixture = TestBandSweepPhaseOneSubset()
+        markets = fixture._close_markets()
+        mp.setattr(backtester, "fetch_all_settled_markets", lambda *a, **k: markets)
+        mp.setattr(backtester, "fetch_candlesticks",
+                   lambda _c, ticker, *a, **k: fixture._CLOSE_CANDLES[ticker])
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.25))
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.6, 1.0))
+        mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
+        mp.setattr(backtester, "datetime", type(
+            "Clock", (TestCapSweepEndDate._Clock,),
+            {"moment": datetime(2026, 9, 26, 12, 0, tzinfo=UTC)}))
+        start = date(2026, 1, 1)
+
+        def run(own, **kw):
+            handler = _LogCapture()
+            root = logging.getLogger()
+            old_level = root.level
+            root.setLevel(logging.INFO)
+            root.addHandler(handler)
+            try:
+                res = run_backtest_sweep(
+                    hist_client=MagicMock(), live_client=MagicMock(), start_date=start,
+                    initial_balance=10_000.0, same_event_ladders=True,
+                    buy_min_days_to_close=own,
+                    **{"band_sweep": True, "tier_off_sweep": True, "cap_sweep": True,
+                       "close_sweep": True, **kw})
+            finally:
+                root.removeHandler(handler)
+                root.setLevel(old_level)
+            return res, list(handler.messages)
+
+        on, msgs_on = run(7)
+        off, msgs_off = run(7, close_sweep=False)
+        own_off, _ = run(0)
+        no_cap, _ = run(7, cap_sweep=False)
+        direct: dict = {}
+        for days in (0, 3, 7, 14):
+            candidates = backtester._prepare_candidates(
+                MagicMock(), MagicMock(), start, True, None, same_event_ladders=True,
+                buy_min_days_to_close=days)
+            for tier_floors, bands in ((True, on.close_sweep.bands),
+                                       (False, on.close_sweep.off_bands)):
+                for band in bands:
+                    entries = backtester._entries_for_band(candidates, band,
+                                                           tier_floors=tier_floors)
+                    backtester._attach_leg_quotes(
+                        entries, candidates.candles_by_ticker, candidates.start_date, None,
+                        stale_max_age=candidates.stale_quote_max_age,
+                        volume_share=candidates.max_volume_share)
+                    direct[(tier_floors, days, band)] = entries
+        mp.undo()
+        yield SimpleNamespace(on=on, off=off, own_off=own_off, no_cap=no_cap,
+                              msgs_on=msgs_on, msgs_off=msgs_off, direct=direct, start=start)
+    finally:
+        mp.undo()
+        toggles.undo()
+
+
+@pytest.mark.usefixtures("close_run")
+class TestCloseSweep:
+    """run_backtest_sweep(close_sweep=True): the other "Skip if closing
+    within" choices, a lazy CloseSweep over every choice of the menu but the
+    run's own, tier floors on and off, the "all" population only, with no
+    adding to held pairs, no trimming and no selling. The run's own results
+    do not change; every cell is simulated when read, equals a direct
+    simulation of that choice's own entries, and ends on the day the run's
+    own eager point of that (band, k) ended."""
+
+    _OTHERS = "Other \"Skip if closing within\" choices"
+
+    @staticmethod
+    def _settings(family):
+        """(tier_floors, bands, end dates) for each Tier floors setting."""
+        return ((True, family.bands, family.end_dates),
+                (False, family.off_bands, family.off_end_dates))
+
+    def test_off_is_the_default_and_builds_nothing(self, close_run):
+        assert inspect.signature(run_backtest_sweep).parameters["close_sweep"].default is False
+        assert inspect.signature(backtester._sweep_from_candidates).parameters[
+            "close_sweep"].default is False
+        assert close_run.off.close_sweep is None
+
+    def test_the_infeasible_window_has_no_close_sweep(self, monkeypatch):
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                 start_date=date(2026, 1, 1), band_sweep=True,
+                                 cap_sweep=True, close_sweep=True)
+        assert res.close_sweep is None
+
+    def test_the_family_holds_every_other_choice_over_the_run_s_grid(self, close_run):
+        on, own_off, no_cap = close_run.on, close_run.own_off, close_run.no_cap
+        family = on.close_sweep
+        assert (family.days, family.own_days) == ((0, 3, 14), 7)
+        assert (own_off.close_sweep.days, own_off.close_sweep.own_days) == ((3, 7, 14), 0)
+        # The size-cap sweep's caps, bands and k grid, tier floors on and off
+        assert family.caps == on.cap_sweep.caps and len(family.caps) > 1
+        assert family.bands == on.cap_sweep.bands and len(family.bands) == 4
+        assert family.off_bands == on.tier_off_cap_sweep.bands == family.bands
+        assert family.ks == on.cap_sweep.ks == (0.5, 0.75)
+        assert (family.primary_cap, family.primary_k) == (on.primary.size_cap, on.primary.k)
+        assert sorted(family.entries_by_days) == sorted(family.off_entries_by_days) == [0, 3, 14]
+        # Without the size-cap sweep, the run's own cap alone
+        assert no_cap.close_sweep.caps == (no_cap.primary.size_cap,)
+        # One summary line, after the lines that say what each choice found
+        summary = [m for m in close_run.msgs_on if m.startswith(self._OTHERS + ": off, ")]
+        assert summary == [
+            f"{self._OTHERS}: off, 3 days, 14 days x {len(family.caps)} size cap(s) x 4 "
+            "band(s) (4 with the tier floors off) x 2 k, each simulated when a report "
+            "reads it"]
+
+    def test_every_choice_s_entries_are_a_full_scan_s_at_that_choice(self, close_run):
+        rows = TestPrepareEntriesGolden._rows
+        for run in (close_run.on, close_run.own_off):
+            family = run.close_sweep
+            for days in family.days:
+                for tier_floors, maps in ((True, family.entries_by_days),
+                                          (False, family.off_entries_by_days)):
+                    for band, entries in maps[days].items():
+                        assert rows(entries) == rows(
+                            close_run.direct[(tier_floors, days, band)]), (days, band)
+                        assert all("leg_quotes" in rec for rec in entries)
+
+    def test_every_cell_equals_a_direct_simulation_and_ends_on_the_main_day(self, close_run):
+        start = close_run.start
+        checked = traded = 0
+        trades_by_choice: dict = {}
+        for run in (close_run.on, close_run.own_off):
+            family = run.close_sweep
+            eagers = {True: run.cap_sweep.eager, False: run.tier_off_cap_sweep.eager}
+            for tier_floors, bands, end_dates in self._settings(family):
+                for days in family.days:
+                    for band in bands:
+                        for k in family.ks:
+                            cell = family.cell(days, band, k, tier_floors=tier_floors)
+                            assert tuple(cell) == family.caps
+                            # The main run's eager twin of this (band, k)
+                            twin = eagers[tier_floors][(band, k, "all")]
+                            end = end_dates[(band, k, "all")]
+                            assert end == backtester._curve_end_date(twin) == date(2026, 9, 26)
+                            for cap, by_pop in cell.items():
+                                assert set(by_pop) == {"all"}
+                                point = by_pop["all"]
+                                assert (point.add_to_held, point.trim_to_kelly, point.sell_at,
+                                        point.tier_floors, point.size_cap, point.halves,
+                                        point.ex_top_event) == (
+                                    False, False, None, tier_floors, cap, None, None)
+                                assert backtester._curve_end_date(point) == end
+                                direct = backtester._simulate_at_discount(
+                                    close_run.direct[(tier_floors, days, band)], start,
+                                    10_000.0, k=k, spread_band=band, size_cap=cap, quiet=True,
+                                    end_date=end,
+                                    **({} if tier_floors else {"tier_floors": False}))
+                                TestSellSweep._same_run(point, direct)
+                                checked += 1
+                                traded += bool(point.trades)
+                                if (run is close_run.on and tier_floors and k == 0.75
+                                        and band == (0.0, 1.0) and cap == family.primary_cap):
+                                    trades_by_choice[days] = sorted(
+                                        t.ticker_a for t in point.trades)
+        assert checked == 2 * 2 * 3 * 4 * 2 * len(close_run.on.close_sweep.caps)
+        # Not vacuous: cells trade, and the choices trade different pairs
+        assert traded > checked // 2
+        assert trades_by_choice[0] == trades_by_choice[3] != trades_by_choice[14]
+        assert "DEW-A" in trades_by_choice[0] and "DEW-A" not in trades_by_choice[14]
+
+    def test_with_the_family_on_the_run_s_own_results_do_not_change(self, close_run):
+        on, off = close_run.on, close_run.off
+        same = TestTierOffSweep._same_point
+        same(on.primary, off.primary)
+        for mine, theirs in ((on.points, off.points), (on.scenarios, off.scenarios),
+                             (on.tier_off_scenarios, off.tier_off_scenarios)):
+            assert len(mine) == len(theirs) > 0
+            for a, b in zip(mine, theirs, strict=True):
+                same(a, b)
+        # Every other field, the lazy size-cap sweeps aside, is equal
+        lazy = {"primary", "points", "scenarios", "tier_off_scenarios", "cap_sweep",
+                "tier_off_cap_sweep", "close_sweep"}
+        for f in fields(backtester.BacktestSweep):
+            if f.name not in lazy:
+                assert getattr(on, f.name) == getattr(off, f.name), f.name
+        # The size-cap sweeps hold the same entries and give the same cells
+        rows = TestPrepareEntriesGolden._rows
+        for name in ("cap_sweep", "tier_off_cap_sweep"):
+            mine, theirs = getattr(on, name), getattr(off, name)
+            assert (mine.caps, mine.bands, mine.ks) == (theirs.caps, theirs.bands, theirs.ks)
+            for band in mine.bands:
+                assert rows(mine.entries_by_band[band]) == rows(theirs.entries_by_band[band])
+            band = mine.bands[0]
+            a, b = mine.cell(band, 0.5), theirs.cell(band, 0.5)
+            for cap in mine.caps:
+                for population in a[cap]:
+                    TestSellSweep._same_run(a[cap][population], b[cap][population])
+        # Every log line but the other choices' is the same, in the same order
+        assert [m for m in close_run.msgs_on if not m.startswith((self._OTHERS, "Peak RSS"))] \
+            == [m for m in close_run.msgs_off if not m.startswith("Peak RSS")]
+        assert not any(m.startswith(self._OTHERS) for m in close_run.msgs_off)
+
+    def test_a_close_run_never_adds_trims_sells_or_checks(self, close_run):
+        family = close_run.on.close_sweep
+        for tier_floors in (True, False):
+            swept = family.sweep(14, tier_floors=tier_floors)
+            assert (swept.add_to_held, swept.trim_to_kelly, swept.sell_at, swept.checks,
+                    swept.eager, swept.split_date, swept.tier_floors) == (
+                False, False, None, False, {}, None, tier_floors)
+            assert swept.entries_by_band is (family.entries_by_days if tier_floors
+                                             else family.off_entries_by_days)[14]
+            assert swept.end_dates is (family.end_dates if tier_floors
+                                       else family.off_end_dates)
+
+    def test_a_choice_or_setting_it_does_not_hold_is_refused(self, close_run):
+        family = close_run.on.close_sweep
+        band = family.bands[0]
+        with pytest.raises(ValueError, match="the run's own choice"):
+            family.sweep(7)
+        for bad in (5, 7.0, 14.0, True, None, "3"):
+            with pytest.raises(ValueError, match="is not one of"):
+                family.sweep(bad)
+        with pytest.raises(ValueError, match="size caps"):
+            family.sweep(3, caps=(0.123,))
+        with pytest.raises(ValueError, match="k 0.6 is not one of"):
+            family.cell(3, band, 0.6)
+        bare = dc_replace(family, off_bands=(), off_entries_by_days={}, off_end_dates={})
+        with pytest.raises(ValueError, match="tier-floors-off"):
+            bare.sweep(3, tier_floors=False)
+        # A cell with no end day is refused in sweep() itself, so no cell of
+        # the CapSweep can be read around the check (it would end on today)
+        for tier_floors, bands, end_dates in self._settings(family):
+            key = (bands[-1], family.ks[0], "all")
+            for gone in ({k: v for k, v in end_dates.items() if k != key},
+                         {**end_dates, key: None}):
+                name = "end_dates" if tier_floors else "off_end_dates"
+                holed = dc_replace(family, **{name: gone})
+                with pytest.raises(ValueError, match="no end day"):
+                    holed.sweep(3, tier_floors=tier_floors)
+                with pytest.raises(ValueError, match="no end day"):
+                    holed.cell(3, band, family.ks[1], tier_floors=tier_floors)
+
+    def test_a_family_s_days_never_name_the_run_s_own(self, close_run):
+        family = close_run.on.close_sweep
+        with pytest.raises(ValueError, match="the run's own choice"):
+            dc_replace(family, days=(0, 3, 7, 14))
+        with pytest.raises(ValueError, match="not its days"):
+            dc_replace(family, days=(0, 3))
+        with pytest.raises(ValueError, match="tier-off entries"):
+            dc_replace(family, off_entries_by_days={0: {}})
+
+    def test_the_family_survives_pickling(self, close_run):
+        family = close_run.on.close_sweep
+        copy = pickle.loads(pickle.dumps(family))
+        assert (copy.days, copy.caps, copy.bands, copy.off_bands, copy.ks) == (
+            family.days, family.caps, family.bands, family.off_bands, family.ks)
+        band, k = (0.0, 1.0), 0.75
+        for days in family.days:
+            a, b = family.cell(days, band, k), copy.cell(days, band, k)
+            for cap in family.caps:
+                TestSellSweep._same_run(a[cap]["all"], b[cap]["all"])
+
+    @pytest.mark.parametrize("bad", [(0, 3, True), (0, 7.0), (0, 7, 7), (0, -3, 7),
+                                     (0, np.int64(7)), [0, 7], 7, (0, "7")])
+    def test_bad_choices_are_refused_before_any_fetch(self, monkeypatch, caplog, bad):
+        monkeypatch.setattr(backtester, "BUY_MIN_DAYS_TO_CLOSE_CHOICES", bad)
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **k: pytest.fail("fetched"))
+        with caplog.at_level(logging.INFO), pytest.raises(
+                ValueError, match="BUY_MIN_DAYS_TO_CLOSE_CHOICES"):
+            run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                               start_date=date(2026, 1, 1), close_sweep=True)
+        # Refused before the run's first line
+        assert not caplog.records
+        # Only a run that asks for them reads them
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        assert run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                  start_date=date(2026, 1, 1)).close_sweep is None
 
 @pytest.mark.usefixtures("golden_band_sweep")
 class TestTimeSeriesPopulation:
