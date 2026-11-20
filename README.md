@@ -548,7 +548,8 @@ backtest.py (CLI)
   │         │                              and off, the "all" population only, never adding,
   │         │                              trimming or selling; each cell simulated only when a
   │         │                              report reads it, ending its curves on the day its
-  │         │                              eager twin's ended (no page reads them yet)
+  │         │                              eager twin's ended (the dashboard build packs each
+  │         │                              choice's chunks; no page script reads them yet)
   │         └─ SellSweep (sell family; default, not with --no-sell-sweep) — every level of
   │                                        config.TAKE_PROFIT_LEVELS (80% to 100% in 1% steps),
   │                                        each with every minimum of TAKE_PROFIT_MIN_DAYS
@@ -597,9 +598,14 @@ backtest.py (CLI)
                                                 over the scenario grid reads each CapSweep cell
                                                 (simulating it) and then each binding band's
                                                 tier-floors-off CapSweep cell, then the Rebalance
-                                                family's cells and each of their minimum price
-                                                movements (the bar's Rebalance and Min. price
-                                                movement selects),
+                                                family's cells, each of their minimum price
+                                                movements and "Rebalance until" choices (the bar's
+                                                Rebalance, Min. price movement and Rebalance until
+                                                selects), then, last, every cell of each other
+                                                "Skip if closing within" choice (CloseSweep, one
+                                                choice at a time, each choice's chunks written too;
+                                                no page script reads them yet, and a choice that
+                                                fails costs that choice alone),
                                                 packs one chunk per distinct
                                                 trade list, keeps the k section's rows and curves at
                                                 every k and cap and the explorer's figures for every

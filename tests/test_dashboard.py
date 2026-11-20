@@ -33,6 +33,12 @@ page stub dashboard.yf.download and redirect dashboard.PROJECT_ROOT.
 Every byte a whole build writes, the page and the chunk files beside it, is
 pinned against digests captured before the walk parked its chunks on disk,
 by tests/dashboard_chunks_golden.py (TestParkedChunks).
+
+The page's data for the other "Skip if closing within" choices (TestCloseData,
+TestCloseRightFile, TestCloseCategories, TestCloseFailures) is built from a
+real backtester.CloseSweep over entry records the backtester's own helpers
+quote, every curve ending on a fixed day: each choice's chunk is decoded
+against the main grid of a run whose own choice it is.
 """
 import ast
 import base64
@@ -3675,20 +3681,36 @@ class TestScenarioExplorerPageSize:
     budget is its measurement + 20%. (Before this branch's packed chunks,
     main measured this construction — its family trading the tier-on list,
     with the explorer's unpacked tier-off view — at 2,909,152 bytes without
-    the family and 4,122,568 with it.)"""
+    the family and 4,122,568 with it.)
+
+    The other "Skip if closing within" choices (a stand-in for
+    BacktestSweep.close_sweep: off, 3 and 14 days, each trading an 88-trade
+    list of its own on a curve of its own at every band and k, and, with the
+    tier-floors-off family, another at every binding band with the tiers
+    off) add 13 chunk files per choice and Tier floors setting, every one a
+    file beside the page. Measured 2026-11-19 (plotly 6.9.0, pandas 3.0.3,
+    numpy 2.4.6): 4,442,374 bytes without the tier-floors-off family and
+    7,885,744 with it, against 1,881,801 and 2,799,246 for the same sweep
+    without the choices the same day (a page without them has no key for
+    them in its base block). Each budget is its measurement + 20%."""
 
     PAGE_BYTES_MEASURED = 1_736_090
     BUDGET = int(PAGE_BYTES_MEASURED * 1.2)
     PAGE_BYTES_MEASURED_FAMILY = 2_632_657
     BUDGET_FAMILY = int(PAGE_BYTES_MEASURED_FAMILY * 1.2)
+    PAGE_BYTES_MEASURED_CLOSE = 4_442_374
+    BUDGET_CLOSE = int(PAGE_BYTES_MEASURED_CLOSE * 1.2)
+    PAGE_BYTES_MEASURED_CLOSE_FAMILY = 7_885_744
+    BUDGET_CLOSE_FAMILY = int(PAGE_BYTES_MEASURED_CLOSE_FAMILY * 1.2)
 
-    @pytest.mark.parametrize("family", [False, True], ids=["tier-on-only", "tier-off-family"])
-    def test_page_size_under_5mb_for_a_468_cell_sweep(self, monkeypatch, tmp_path, family):
-        import numpy as np
-        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(dashboard.yf, "download",
-                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+    @staticmethod
+    def _sweep(family: bool) -> tuple:
+        """
+        The 468-cell sweep, with its tier-floors-off family when `family`.
 
+        Returns:
+            tuple: (the sweep, its random generator for any draw after it).
+        """
         bands = [(lo, hi) for lo in config.SPREAD_BAND_SWEEP_FLOORS
                  for hi in config.SPREAD_BAND_SWEEP_CEILINGS]
         ks = list(config.INTERVAL_DISCOUNT_SWEEP)
@@ -3745,9 +3767,17 @@ class TestScenarioExplorerPageSize:
             same_event_ladders=True, split_date=date(2023, 5, 1),
             tier_off_scenarios=off, tier_off_calibrations_by_band=off_cals,
         )
+        return sweep, rng
 
+    @pytest.mark.parametrize("family", [False, True], ids=["tier-on-only", "tier-off-family"])
+    def test_page_size_under_5mb_for_a_468_cell_sweep(self, monkeypatch, tmp_path, family):
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        sweep, _rng = self._sweep(family)
         out_path = dashboard.generate_dashboard(
-            trades, shared_equity, date(2020, 1, 1), 10_000.0, sweep=sweep)
+            sweep.primary.trades, sweep.primary.equity_df, date(2020, 1, 1), 10_000.0,
+            sweep=sweep)
         page = _read_page(out_path)
         # The family reaches the bar only when it exists: its off grid in the
         # base block, and a chunk per k of its own list (13 more)
@@ -3773,6 +3803,51 @@ class TestScenarioExplorerPageSize:
         # The page and its chunk files together
         size = _dashboard_bytes(out_path)
         budget = self.BUDGET_FAMILY if family else self.BUDGET
+        assert size <= budget, f"page was {size} bytes"
+
+    @pytest.mark.parametrize("family", [False, True], ids=["tier-on-only", "tier-off-family"])
+    def test_the_other_skip_choices_stay_under_budget(self, monkeypatch, tmp_path, family):
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        sweep, rng = self._sweep(family)
+        # The grid's axes, ascending as the page orders them
+        bands = sorted({p.spread_band for p in sweep.scenarios})
+        ks = sorted({p.k for p in sweep.scenarios})
+        binding = [band for band in bands if backtester._tier_floors_bind(band)] if family else []
+        # Each other choice (off, 3 and 14 days) trades a list of its own, on
+        # a curve of its own, at every band and k (and, with the family, yet
+        # another at every binding band with the tiers off): drawn after the
+        # sweep, so the rest of the page is the same either way
+        sweeps = {}
+        for i, days in enumerate((0, 3, 14)):
+            for tier_floors, at in ((True, bands), (False, binding)):
+                if not at:
+                    continue
+                walk = 10_000.0 * np.cumprod(1.0 + rng.normal(0.0, 0.01, 2459))
+                listed = [_scn_trade(profit=float(p),
+                                     event_ticker=f"KXEVENT-26NOV{i}{j:02d}-ABCDEF")
+                          for j, p in enumerate(rng.normal(0.0, 20.0, 88))]
+                point = SweepPoint(k=0.75, trades=listed,
+                                   equity_df=make_equity(list(walk), start=date(2019, 12, 31)))
+                sweeps[(days, tier_floors)] = _FakeCapSweep(
+                    {(band, k, None): point for band in at for k in ks},
+                    bands=tuple(at), ks=tuple(ks), caps=(None,))
+        sweep = dataclasses.replace(sweep, close_sweep=_FakeCloseSweep(
+            sweeps, bands=tuple(bands), off_bands=tuple(binding), ks=tuple(ks), caps=(None,)))
+        out_path = dashboard.generate_dashboard(
+            sweep.primary.trades, sweep.primary.equity_df, date(2020, 1, 1), 10_000.0,
+            sweep=sweep)
+        page = _read_page(out_path)
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        # A chunk per k of each choice's list, with the family another per k
+        # of each choice's tier-off list
+        assert len(chunks) == (26 if family else 13) + 3 * 13 * (2 if family else 1)
+        assert data["close_state"] == "shown" and None not in data["grid_close"]
+        assert (data["grid_close_off"] is not None) is family
+        # The page and its chunk files together
+        size = _dashboard_bytes(out_path)
+        budget = self.BUDGET_CLOSE_FAMILY if family else self.BUDGET_CLOSE
         assert size <= budget, f"page was {size} bytes"
 
 
@@ -4824,11 +4899,13 @@ def _flat_ids(value) -> set[int]:
 
 
 def _grid_chunk_ids(data: dict) -> set[int]:
-    """Every chunk id the base block's scenario grids name — the Sell select's
-    ids are in its own blocks, not here."""
+    """Every chunk id the base block's scenario grids name, the other "Skip
+    if closing within" choices' included — the Sell select's ids are in its
+    own blocks, not here."""
     return set().union(*(_flat_ids(data.get(key)) for key in (
         "grid", "grid_off", "grid_rebalance", "grid_rebalance_off",
-        "grid_move", "grid_move_off", "grid_maturity", "grid_maturity_off")))
+        "grid_move", "grid_move_off", "grid_maturity", "grid_maturity_off",
+        "grid_close", "grid_close_off")))
 
 
 def _chunk_src(page: str, chunk_id: int) -> str:
@@ -13694,7 +13771,7 @@ def _mv_warnings(caplog) -> list:
 
 class TestMoveView:
     """The page's data for the Rebalance family's minimum price movements: the
-    walk's last phase reads every rebalancing scenario again at each minimum,
+    walk then reads every rebalancing scenario again at each minimum,
     a run of its own gets a chunk, a run that repeats another stores that
     run's chunk id, and a cell that cannot be read costs this view alone."""
 
@@ -13936,8 +14013,11 @@ class TestMoveView:
         assert len(lines) == 6
 
     def test_the_walk_reads_the_minimums_after_every_rebalance_cell(self):
-        # They are the last cells to pack a chunk, which is what lets their
-        # chunks be dropped without cutting into any other family's
+        # The minimums are read after every Rebalance cell, and the walk reads
+        # the "Rebalance until" choices and the other "Skip if closing within"
+        # choices only after the minimums. So when a minimum fails, every
+        # chunk packed since the first minimum is a minimum's own, and
+        # dropping them cuts into no other view's chunks
         sweep = _kc_sweep_move(_kc_sweep_tiers())
         order: list[str] = []
 
@@ -14292,7 +14372,7 @@ _UT_KEYS = ("maturity", "grid_maturity", "grid_maturity_off", "maturity_state")
 
 class TestUntilView:
     """The page's data for the Rebalance family's "Rebalance until" choices:
-    the walk's last phase reads every rebalancing scenario again at each
+    the walk then reads every rebalancing scenario again at each
     choice and minimum, starting from the records of the runs it has read;
     a run of its own gets a chunk, a run that repeats another stores that
     run's chunk id, and the base block carries them (the select is rendered
@@ -14649,8 +14729,9 @@ class TestUntilView:
         assert len(lines) == 6
 
     def test_the_walk_reads_the_choices_after_every_move_cell(self):
-        # They are the last cells to pack a chunk, which is what lets their
-        # chunks be dropped without cutting into any other family's
+        # Nothing packs a chunk after them before their reset point (the other
+        # "Skip if closing within" choices come after it), which is what lets
+        # their chunks be dropped without cutting into any other family's
         sweep = _kc_sweep_until(_kc_sweep_tiers())
         family = sweep.rebalance_sweep
         order: list[str] = []
@@ -18854,7 +18935,8 @@ class TestParkedChunks:
 
     # ─── A build that cannot finish ───────────────────────────────────────────
 
-    @pytest.mark.parametrize("phase", ["__call__", "off", "rebalance", "move", "maturity"])
+    @pytest.mark.parametrize("phase", ["__call__", "off", "rebalance", "move", "maturity",
+                                       "close"])
     def test_a_chunk_that_cannot_be_parked_stops_the_build(self, monkeypatch, tmp_path, phase):
         # The disk fills while the walk packs one kind of cell (each kind is
         # walked behind a handler that would cost only a view, or the bar):
@@ -18879,8 +18961,11 @@ class TestParkedChunks:
 
         monkeypatch.setattr(dashboard._ChunkVisitor, phase, watched)
         monkeypatch.setattr(dashboard, "_write_chunk_file", full_disk)
+        sweep = _kc_sweep_until(_kc_sweep_tiers())
         with pytest.raises(OSError) as raised:
-            _kc_page(monkeypatch, tmp_path, _kc_sweep_until(_kc_sweep_tiers()))
+            # The other "Skip if closing within" choices only where they are
+            # the kind of cell the disk fills on
+            _kc_page(monkeypatch, tmp_path, _kc_sweep_close(sweep) if phase == "close" else sweep)
         assert raised.value is error
         assert calls and calls[-1].name.startswith(".parking-") and not calls[-1].exists()
         assert not (tmp_path / config.DASHBOARD_FILES_DIRNAME).exists()
@@ -19253,6 +19338,1017 @@ class TestParkedChunks:
         assert parking.element(1, parked) == element
         parking.remove()
         assert not list(root.iterdir())
+
+
+# ─── The other "Skip if closing within" choices ──────────────────────────────
+
+# Every choice of the "Skip if closing within" menu (whole days, 0 for off),
+# the run's own, and the day every simulation here ends its curve on (a fixed
+# day, so no page here changes with the clock)
+_CL_CHOICES = (0, 3, 7, 14)
+_CL_OWN = 7
+_CL_END = date(2026, 4, 1)
+# The _kc grid's axes, which every family here is built over
+_CL_BANDS, _CL_KS, _CL_CAPS = (_KC_B0, _KC_B1), (0.6, 0.75), (0.05, 0.2, 1.0)
+# Which pairs each choice enters (_cl_records' names, in Monday order): at band
+# 0-1 and at 0.3-0.6 with the tier floors on, and at 0-1 (the one band the
+# tiers bind at) with them off. 3 days enters exactly what the run's own 7
+# days does; off enters one more pair (oil, whose category no other scenario
+# trades); 14 days one fewer, and nothing at 0.3-0.6
+_CL_ENTERS = {
+    0: (("hockey", "basket", "oil"), ("basket", "oil"), ("hockey", "basket", "rain", "oil")),
+    3: (("hockey", "basket"), ("basket",), ("hockey", "basket", "rain")),
+    7: (("hockey", "basket"), ("basket",), ("hockey", "basket", "rain")),
+    14: (("hockey",), (), ("hockey", "rain")),
+}
+# The keys of the base block that carry the other choices' data, in order
+_CL_KEYS = ("close", "close_own", "grid_close", "grid_close_off", "close_state")
+
+
+def _cl_records() -> dict[str, dict]:
+    """
+    Four time-series pairs as the backtester's entry pass records them, quoted by its own writer.
+
+    Each buys YES on its earlier market at 0.20 and NO on its later one at
+    0.40 on one Monday (tests/test_backtester.py's _ladder_record quotes: the
+    Kelly rule passes at k 0.60 and 0.75, sizing past the 5% cap at both and
+    past the 20% one at 0.60), and both its markets settle No. Each is on
+    events of its own, filed by _FLT_SERIES_TIERS: "hockey" (Sports · Hockey,
+    Monday 1), "basket" (Sports · Basketball, Monday 2), "rain" (Climate ·
+    Rain, Monday 2) and "oil" (Commodities · Oil & Gas, Monday 3).
+    """
+    pairs = {"hockey": ("KXNHLHART", 31, _tb._LADDER_M1, "2026-02-10", "2026-03-20"),
+             "basket": ("KXNCAAMBGAME", 7, _tb._LADDER_M2, "2026-02-17", "2026-03-24"),
+             "rain": ("KXRAIN", 3, _tb._LADDER_M2, "2026-02-12", "2026-03-18"),
+             "oil": ("KXBRENTW", 5, _tb._LADDER_M3, "2026-02-24", "2026-03-27")}
+    records, candles = {}, {}
+    for name, (series, n, monday, close_a, close_b) in pairs.items():
+        a, b = f"{name.upper()}-A", f"{name.upper()}-B"
+        records[name] = _tb._ladder_record(
+            _tb._ladder_market(a, f"{series}-{n}", close_a),
+            _tb._ladder_market(b, f"{series}-{n + 1}", close_b), name, (monday,))
+        candles[a] = [_tb._candle(_tb._ck(monday), 0.20, 0.82)]
+        candles[b] = [_tb._candle(_tb._ck(monday), 0.60, 0.42)]
+    _tb._quoted(list(records.values()), candles, _FLT_START)
+    return records
+
+
+def _cl_entries(days: int, records: dict) -> tuple[dict, dict]:
+    """(band -> entries with the tier floors on, binding band -> entries with them off) of one choice."""
+    on_b0, on_b1, off_b0 = _CL_ENTERS[days]
+    return ({_KC_B0: [records[n] for n in on_b0], _KC_B1: [records[n] for n in on_b1]},
+            {_KC_B0: [records[n] for n in off_b0]})
+
+
+def _cl_refusing(refused: int) -> type:
+    """
+    A CloseSweep class that refuses one choice by the family's own rule.
+
+    Its sweep() reads the choice `refused` with the tier-on end-date map
+    missing one cell's day, so CloseSweep.sweep itself refuses it, as it
+    refuses any setting whose curves would end on whatever day they are read.
+    """
+    class Refusing(backtester.CloseSweep):
+        def sweep(self, days, **kwargs):
+            """CloseSweep.sweep, which refuses the choice `refused`."""
+            if days != refused:
+                return super().sweep(days, **kwargs)
+            gapped = {key: day for key, day in self.end_dates.items()
+                      if key != (_KC_B1, 0.75, "all")}
+            return backtester.CloseSweep.sweep(dataclasses.replace(self, end_dates=gapped),
+                                               days, **kwargs)
+    return Refusing
+
+
+def _cl_family(own_days: int = _CL_OWN, *, records: dict | None = None, tiers: bool = True,
+               days: tuple | None = None, cls: type | None = None) -> backtester.CloseSweep:
+    """
+    A real backtester.CloseSweep over the _kc grid's axes.
+
+    Every choice but `own_days` (or exactly `days`), each over its own
+    entries (_CL_ENTERS, from _cl_records), with a tier-floors-off half at
+    the one band the tiers bind at when `tiers`; every cell ends its curve on
+    _CL_END. Nothing is simulated until a cell is read. `cls` builds it as a
+    subclass (_cl_refusing).
+    """
+    records = records or _cl_records()
+    days = tuple(d for d in _CL_CHOICES if d != own_days) if days is None else tuple(days)
+    entries = {d: _cl_entries(d, records) for d in days}
+    ends = {(band, k, "all"): _CL_END for band in _CL_BANDS for k in _CL_KS}
+    return (cls or backtester.CloseSweep)(
+        days=days, own_days=own_days, caps=_CL_CAPS, primary_cap=0.2, bands=_CL_BANDS,
+        off_bands=(_KC_B0,) if tiers else (), ks=_CL_KS, primary_k=0.75,
+        start_date=_FLT_START, initial_balance=1000.0,
+        entries_by_days={d: on for d, (on, _off) in entries.items()},
+        off_entries_by_days={d: off for d, (_on, off) in entries.items()} if tiers else {},
+        end_dates=ends,
+        off_end_dates=({key: day for key, day in ends.items() if key[0] == _KC_B0}
+                       if tiers else {}))
+
+
+def _kc_sweep_close(base: BacktestSweep | None = None, **family) -> BacktestSweep:
+    """
+    A _kc sweep (_kc_sweep() unless `base`) plus a real "Skip if closing within" family.
+
+    The family is _cl_family's (its keywords pass through), with its
+    tier-floors-off half only when `base` carries the tier-floors-off family.
+    Its lists are real simulations, so none equals a list of the _kc grid's.
+    """
+    sweep = base or _kc_sweep()
+    return dataclasses.replace(sweep, close_sweep=_cl_family(
+        tiers=bool(sweep.tier_off_scenarios), **family))
+
+
+def _cl_point(entries: list, band, k: float, *, tier_floors: bool = True) -> SweepPoint:
+    """One simulation at the run's own 20% cap, its curve ending on _CL_END."""
+    return backtester._simulate_at_discount(
+        entries, _FLT_START, 1000.0, k=k, spread_band=band, size_cap=0.2, quiet=True,
+        end_date=_CL_END, **({} if tier_floors else {"tier_floors": False}))
+
+
+def _cl_sweep(own_days: int = _CL_OWN, *, tiers: bool = True, family: bool = True,
+              cls: type | None = None) -> BacktestSweep:
+    """
+    A sweep whose every result is a real simulation, at the run's own choice `own_days`.
+
+    The run's own entries (_CL_ENTERS[own_days]) at every band and k:
+    simulated at the 20% cap (the eager points) and at every other cap
+    through a real CapSweep; with `tiers`, the tier-floors-off family at
+    band 0-1 the same way; with `family`, every other choice as a real
+    CloseSweep (_cl_family, class `cls`). Every curve ends on _CL_END, so the
+    pages of two of these share one date axis, and a cell's chunk can be
+    compared across them.
+    """
+    records = _cl_records()
+    on, off = _cl_entries(own_days, records)
+    eager = {(band, k, "all"): _cl_point(on[band], band, k)
+             for band in _CL_BANDS for k in _CL_KS}
+    primary = eager[(_KC_B0, 0.75, "all")]
+    lazy = {"caps": _CL_CAPS, "primary_cap": 0.2, "ks": _CL_KS, "primary_k": 0.75,
+            "start_date": _FLT_START, "initial_balance": 1000.0, "split_date": None,
+            "checks": False}
+    sweep = BacktestSweep(
+        primary=primary, points=[primary], calibration=None, scenarios=list(eager.values()),
+        calibrations_by_band=dict.fromkeys(_CL_BANDS), same_event_ladders=True,
+        cap_sweep=backtester.CapSweep(**lazy, bands=_CL_BANDS, entries_by_band=on,
+                                      eager=eager))
+    if tiers:
+        off_eager = {(_KC_B0, k, "all"): _cl_point(off[_KC_B0], _KC_B0, k, tier_floors=False)
+                     for k in _CL_KS}
+        sweep = dataclasses.replace(
+            sweep, tier_off_scenarios=list(off_eager.values()),
+            tier_off_calibrations_by_band={_KC_B0: None},
+            tier_off_cap_sweep=backtester.CapSweep(**lazy, bands=(_KC_B0,),
+                                                   entries_by_band=off, eager=off_eager,
+                                                   tier_floors=False))
+    if family:
+        sweep = dataclasses.replace(sweep, close_sweep=_cl_family(
+            own_days, records=records, tiers=tiers, cls=cls))
+    return sweep
+
+
+class _FakeCloseSweep:
+    """
+    A backtester.CloseSweep stand-in carrying what the dashboard reads of one:
+    days, own_days, bands, off_bands, ks, caps and sweep().
+
+    `sweeps` maps (choice, tier floors on) to the CapSweep stand-in sweep()
+    hands back for that choice and setting, whatever caps it is asked for;
+    `asked` records each call.
+    """
+
+    def __init__(self, sweeps: dict, *, days=(0, 3, 14), own_days=_CL_OWN,
+                 bands=_CL_BANDS, off_bands=(), ks=_CL_KS, caps=_CL_CAPS):
+        self.sweeps = sweeps
+        self.days, self.own_days = tuple(days), own_days
+        self.bands, self.off_bands, self.ks, self.caps = bands, off_bands, ks, caps
+        self.asked: list = []
+
+    def sweep(self, days, *, tier_floors=True, caps=None):
+        """The stand-in CapSweep of one choice and Tier floors setting."""
+        self.asked.append((days, tier_floors, caps))
+        return self.sweeps[(days, tier_floors)]
+
+
+def _cl_page(monkeypatch, root: Path, sweep: BacktestSweep, series=_FLT_SERIES_TIERS) -> _Page:
+    """A whole page of a sweep, written to `root` (made if missing) with its files folder."""
+    root.mkdir(parents=True, exist_ok=True)
+    return TestFilterPage()._page(monkeypatch, root, sweep, series)
+
+
+def _cl_walk(sweep: BacktestSweep, series=_FLT_SERIES_TIERS) -> tuple:
+    """
+    (the grid walked, the base block, {chunk id: chunk}) of a sweep's page walk.
+
+    Every chunk is held in memory; the base block carries the other choices'
+    keys exactly when the sweep carries the family, as generate_dashboard
+    builds it.
+    """
+    trades, curve = sweep.primary.trades, sweep.primary.equity_df
+    source = dashboard._grid_source(sweep, trades, curve, 0.75)
+    walked, chunker, _kd = dashboard._build_filter_grid(
+        source, trades, curve, 0.75, _FLT_START, 1000.0, series)
+    base = dashboard._filter_payload(
+        walked, chunker, _FLT_START, 1000.0, series,
+        close_state=None if getattr(sweep, "close_sweep", None) is None else "unavailable")
+    return walked, base, {cid: _unpack(block) for cid, block in enumerate(chunker.chunks)}
+
+
+def _cl_norm(chunk: dict, data: dict) -> dict:
+    """
+    A chunk with every index into a page-wide table replaced by what it names.
+
+    One trade list packed on two pages differs only in those indexes: its
+    views' keys ("c<i>" and "s<i>", into the page's category and category ·
+    tag lists), its category table and its best and worst rows (into the
+    chunk's own strings and the base block's shared row heads). With the
+    names and the HTML they stand for in their place, the two chunks of one
+    list compare equal.
+    """
+    listed, strings = dict(chunk["list"]), chunk["strings"]
+    views = {}
+    for key, view in listed.pop("views").items():
+        if key == "all":
+            name = "all"
+        elif key[0] == "c":
+            name = "c " + data["categories"][int(key[1:])]
+        else:
+            ci, tag = data["subcats"][int(key[1:])]
+            name = f"s {data['categories'][ci]} · {tag}"
+        view = dict(view)
+        if "table" in view:
+            view["table"] = strings[view["table"]]
+        for which in ("best", "worst"):
+            if which in view:
+                view[which] = [data["rows"][head] + strings[tail] for head, tail in view[which]]
+        views[name] = view
+    return {**listed, "views": views}
+
+
+def _cl_same(chunk: dict, point: SweepPoint) -> None:
+    """Assert a chunk is the point's run: its whole-run figures, trade count and every trade's profit."""
+    view = chunk["list"]["views"]["all"]
+    kpis = dashboard._performance_kpis(point.equity_df, point.trades, 1000.0)
+    assert view["kpi"] == {name: value for name, _, value, _ in kpis}
+    assert view["n"] == len(point.trades)
+    assert chunk["list"]["pf"] == [t.profit for t in point.trades]
+
+
+def _cl_files(page: _Page) -> dict[str, str]:
+    """The text of every chunk file beside a page, by file name."""
+    return {src.rsplit("/", 1)[1]: text for src, text in page.files.items()}
+
+
+def _cl_warnings(caplog) -> list[str]:
+    """Every WARNING about the other "Skip if closing within" choices."""
+    return [r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and "Skip if closing within" in r.getMessage()]
+
+
+def _cl_cells(grid: list):
+    """(band index, k index, cap index, chunk id) of every cell of a [band][k][cap] grid."""
+    return [(bi, ki, ci, cid) for bi, band in enumerate(grid) for ki, row in enumerate(band)
+            for ci, cid in enumerate(row)]
+
+
+def _cl_raise_at(monkeypatch, is_target, band, k) -> None:
+    """Make a real CapSweep's read of one (band, k) cell raise, for the sweep is_target picks."""
+    real = backtester.CapSweep.cell
+
+    def cell(self, at_band, at_k):
+        """CapSweep.cell, raising at the target sweep's (band, k)."""
+        if is_target(self) and (at_band, at_k) == (band, k):
+            raise RuntimeError("the simulation failed")
+        return real(self, at_band, at_k)
+
+    monkeypatch.setattr(backtester.CapSweep, "cell", cell)
+
+
+@pytest.fixture
+def _cl_stopped_clock(monkeypatch):
+    """
+    Stop backtester's clock where the golden digests stop it, for one test.
+
+    The _kc fixtures draw their curves to backtester's today; with the clock
+    stopped, two pages a test builds can never straddle a UTC midnight.
+    """
+    monkeypatch.setattr(backtester, "datetime", dashboard_chunks_golden._CapturedClock)
+
+
+def _cl_check_runs(data: dict, chunks: dict, family) -> int:
+    """
+    Assert every chunk the other choices' grids name is that choice's own run.
+
+    Each id of "grid_close" and of a binding band's row of "grid_close_off"
+    decodes to exactly the cell a direct read of the family simulates at
+    that choice, band, k, cap and Tier floors setting (a non-binding band's
+    off row is that choice's tier-on row). Returns how many were checked.
+    """
+    checked = 0
+    for ci, days in enumerate(data["close"]):
+        if data["grid_close"][ci] is None:
+            continue
+        settings = [("grid_close", True)] + (
+            [("grid_close_off", False)] if data["grid_close_off"] is not None else [])
+        for key, tier_floors in settings:
+            for bi, ki, capi, cid in _cl_cells(data[key][ci]):
+                if not tier_floors and not data["tier_binds"][bi]:
+                    assert data[key][ci][bi] == data["grid_close"][ci][bi]
+                    continue
+                cell = family.cell(days, _CL_BANDS[bi], _CL_KS[ki], tier_floors=tier_floors)
+                _cl_same(chunks[cid], cell[data["caps"][capi]["value"]]["all"])
+                checked += 1
+    return checked
+
+
+def _cl_same_runs(mine, theirs, page: tuple, other: tuple, where: tuple = ()) -> int:
+    """
+    Assert two pages' grids of one view name the same runs, cell for cell.
+
+    The two grids must have one shape, with null (or any other value that is
+    not a chunk id) exactly where the other has it, and each pair of chunk
+    ids must name chunks that decode equal once every page-wide index in
+    them is replaced by what it names (_cl_norm): two pages can number their
+    chunks and their categories differently. `page` and `other` are each
+    (base block, {chunk id: chunk}). Returns how many ids were compared.
+    """
+    if isinstance(mine, list):
+        assert isinstance(theirs, list), where
+        return sum(_cl_same_runs(a, b, page, other, (*where, i))
+                   for i, (a, b) in enumerate(zip(mine, theirs, strict=True)))
+    if isinstance(mine, int) and not isinstance(mine, bool):
+        assert isinstance(theirs, int) and not isinstance(theirs, bool), where
+        (data, chunks), (their_data, their_chunks) = page, other
+        assert _cl_norm(chunks[mine], data) == _cl_norm(their_chunks[theirs], their_data), where
+        return 1
+    assert mine == theirs, where
+    return 0
+
+
+@pytest.mark.usefixtures("_cl_stopped_clock")
+class TestCloseData:
+    """The base block's data for the other "Skip if closing within" choices
+    (the run's own is the page as rendered): the walk's last phase reads
+    every scenario of each other choice, one choice at a time, packing each
+    new trade list as a chunk; the base block names the choices and each
+    one's chunk id per scenario. Nothing on the page reads them, and a page
+    whose run carried no such family has no key for them at all."""
+
+    def test_a_page_without_the_family_ships_no_key_for_it(self, monkeypatch, tmp_path):
+        data = TestFilterPage._data(_kc_page(monkeypatch, tmp_path,
+                                             _kc_sweep_until(_kc_sweep_tiers())))
+        assert not set(_CL_KEYS) & set(data)
+        # ... and _filter_payload ships none unless told the run carried them
+        _, _, base, _ = _flt_payload(_flt_sweep_tiers(), series=_FLT_SERIES_TIERS)
+        assert not set(_CL_KEYS) & set(base)
+
+    def test_every_choice_has_a_chunk_at_every_cell_it_simulated(self, monkeypatch, tmp_path):
+        page = _cl_page(monkeypatch, tmp_path, _cl_sweep())
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        assert (data["close"], data["close_own"], data["close_state"]) == ([0, 3, 14], 7, "shown")
+        # The keys come right after the "Rebalance until" ones
+        keys = list(data)
+        at = keys.index("maturity_state") + 1
+        assert tuple(keys[at:at + len(_CL_KEYS)]) == _CL_KEYS
+        assert data["tier_binds"] == [True, False]
+        for ci in range(3):
+            grid, off = data["grid_close"][ci], data["grid_close_off"][ci]
+            # Every cell of both settings, every cap, names a chunk the page has
+            assert [len(grid), len(grid[0]), len(grid[0][0])] == [2, 2, 3]
+            for _bi, _ki, _capi, cid in _cl_cells(grid) + _cl_cells(off):
+                assert isinstance(cid, int) and cid in chunks
+            # 0.3-0.6, where the tiers never bind: its off view is its run
+            assert off[1] == grid[1]
+        assert _cl_check_runs(data, chunks, _cl_sweep().close_sweep) == 3 * (12 + 6)
+
+    def test_a_choice_s_cell_is_cut_to_the_page_s_last_day(self, monkeypatch, tmp_path):
+        # The family ends the curves of one cell, (0.3-0.6, k 0.60), a day
+        # past the page's last day, as a cell simulated after midnight UTC
+        # can. The walk cuts them there before any visitor reads them, as it
+        # cuts every other kind of cell
+        late = _CL_END + timedelta(days=1)
+        sweep = _cl_sweep()
+        family = dataclasses.replace(sweep.close_sweep, end_dates={
+            **sweep.close_sweep.end_dates, (_KC_B1, 0.6, "all"): late})
+        sweep = dataclasses.replace(sweep, close_sweep=family)
+        last = pd.Timestamp(_CL_END)
+        uncut = family.cell(0, _KC_B1, 0.6)[0.2]["all"].equity_df
+        assert pd.Timestamp(uncut["date"].iloc[-1]) == pd.Timestamp(late)
+        handed: list = []
+        real = dashboard._ChunkVisitor.close
+
+        def close(self, days, bi, ki, ci, pops, *, off=False):
+            handed.append(pd.Timestamp(pops["all"].equity_df["date"].iloc[-1]))
+            return real(self, days, bi, ki, ci, pops, off=off)
+        monkeypatch.setattr(dashboard._ChunkVisitor, "close", close)
+        page = _cl_page(monkeypatch, tmp_path, sweep)
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        # The chunk each choice's grid names at that cell is the family's run
+        # there, cut to that day
+        for ci, days in enumerate(data["close"]):
+            cut = dashboard._cut_to_axis(family.cell(days, _KC_B1, 0.6), last)
+            for capi, cap in enumerate(data["caps"]):
+                _cl_same(chunks[data["grid_close"][ci][1][0][capi]], cut[cap["value"]]["all"])
+        # ... and so is every curve a choice's chunk is packed from (the
+        # page's figures also cut each curve there on their own, so the
+        # chunks alone cannot show a missing cut; a visitor that read a
+        # point's own curve would)
+        assert len(handed) == 3 * (12 + 6) and set(handed) == {last}
+
+    def test_a_list_equal_to_another_scenario_s_shares_its_chunk(self, monkeypatch, tmp_path):
+        page = _cl_page(monkeypatch, tmp_path, _cl_sweep())
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        on, off = data["grid_close"], data["grid_close_off"]
+        # 3 days enters what the run's own 7 does: every one of its cells, both
+        # settings, is the main grid's own chunk (one file each)
+        assert on[1] == data["grid"] and off[1] == data["grid_off"]
+        # Off, with the tiers off at (0-1, k 0.60, no cap): full Kelly spends the
+        # cash before the oil pair's Monday, so it trades the run's own list
+        # there and shares that chunk; every other cell of it, and every cell
+        # of 14 days, trades a list of its own
+        main = _flat_ids(data["grid"]) | _flat_ids(data["grid_off"])
+        ids0, ids14 = _flat_ids([on[0], off[0]]), _flat_ids([on[2], off[2]])
+        assert ids0 & main == {off[0][0][0][2]} == {data["grid_off"][0][0][2]}
+        assert ids14.isdisjoint(main | ids0)
+        # ... and within a choice, the caps at k 0.75 that size alike (20% and
+        # none: the Kelly fraction stays under 20%) share one
+        for grid in (on[0], on[2]):
+            assert grid[0][1][1] == grid[0][1][2] != grid[0][1][0]
+        assert len(chunks) == len(main | ids0 | ids14)
+        # No two chunks hold one list (a list with trades is priced at its k,
+        # so an equal list at another k is another chunk)
+        texts = [json.dumps(chunk, sort_keys=True) for chunk in chunks.values()
+                 if chunk["list"]["views"]["all"]["n"]]
+        assert len(set(texts)) == len(texts)
+
+    def test_the_walk_reads_the_choices_last_one_at_a_time(self, monkeypatch):
+        sweep = _kc_sweep_close(_kc_sweep_until(_kc_sweep_tiers()))
+        order: list[str] = []
+        caps: list[int] = []
+
+        def note(name: str) -> None:
+            if not order or order[-1] != name:
+                order.append(name)
+        real_maturity, real_close = dashboard._ChunkVisitor.maturity, dashboard._ChunkVisitor.close
+
+        def maturity(self, *args, **kwargs):
+            note("maturity")
+            return real_maturity(self, *args, **kwargs)
+
+        def close(self, days, bi, ki, ci, pops, *, off=False):
+            note(f"close {days}" + (" off" if off else ""))
+            caps.append(ci)
+            return real_close(self, days, bi, ki, ci, pops, off=off)
+        monkeypatch.setattr(dashboard._ChunkVisitor, "maturity", maturity)
+        monkeypatch.setattr(dashboard._ChunkVisitor, "close", close)
+        _cl_walk(sweep)
+        assert order == ["maturity", "close 0", "close 0 off", "close 3", "close 3 off",
+                         "close 14", "close 14 off"]
+        # Every cell hands over the run's own 20% cap first
+        assert caps[:3] == [1, 0, 2]
+
+    def test_a_grid_walked_with_no_visitor_to_read_them_keeps_none(self):
+        sweep = _cl_sweep()
+        trades, curve = sweep.primary.trades, sweep.primary.equity_df
+        source = dashboard._grid_source(sweep, trades, curve, 0.75)
+        assert source.close_attached == (0, 3, 14) and len(source.close_sweeps) == 6
+        # The interval-discount section's visitor has no `close` method
+        visitor = dashboard._KdVisitor(source, pd.DatetimeIndex(pd.to_datetime(curve["date"])),
+                                       None)
+        walked = dashboard._walk_grid(source, [visitor], None)
+        assert walked.close_attached == () and walked.close_sweeps == {}
+        assert walked.close_days == (0, 3, 14) and walked.close_own == 7
+
+    def test_the_log_counts_what_each_choice_costs(self, caplog):
+        with caplog.at_level(logging.INFO):
+            _cl_walk(_cl_sweep())
+        lines = [r.getMessage() for r in caplog.records
+                 if 'read for "Skip if closing within"' in r.getMessage()]
+        # Few cells: a line per cell, choice by choice, tier floors on then off
+        assert len(lines) == 3 * (4 + 2)
+        pattern = re.compile(r'Dashboard: (\d)/(\d) (band x k|binding band x k) cells read for '
+                             r'"Skip if closing within" (off|3 days|14 days)( with the tier floors '
+                             r'off)? \((\d+) cap points simulated, (\d+) shared so far\)')
+        found = [pattern.fullmatch(line).groups() for line in lines]
+        assert [(g[3], g[4] is not None) for g in found] == [
+            (label, off) for label in ("off", "3 days", "14 days")
+            for off, n in ((False, 4), (True, 2)) for _ in range(n)]
+        # Each setting's last line: every cap of every cell simulated or shared
+        for g in found:
+            if g[0] == g[1]:
+                assert int(g[5]) + int(g[6]) == int(g[1]) * 3 and int(g[5]) > 0
+
+    # The memo test's two cases: (the choices, whether the grid has the
+    # tier-floors-off view, the two steps handed the same list object, each
+    # (choice, tier floors off))
+    _MEMO = {"the choice": ((0, 3), False, ((0, False), (3, False))),
+             "the tier floors": ((3,), True, ((3, False), (3, True)))}
+
+    @pytest.mark.parametrize("case", list(_MEMO))
+    def test_a_list_s_key_is_worked_out_again_for_every_choice(self, case):
+        # One choice's lists are gone before the next choice's are made, so a
+        # new list can sit where an old one did. Here the very same list
+        # object, refilled, is handed at two steps in a row of the grid's one
+        # (band, k) cell: a key remembered for it at one step must not be read
+        # at the other, whichever of the choice or the Tier floors setting
+        # tells the two steps apart
+        days, tiers, (first, second) = self._MEMO[case]
+        plain = _kc_trades(5)
+        curve = backtester._build_equity_curve(plain, _FLT_START, 1000.0)
+        refills = {first: plain[:1], second: plain}
+        listed: list = []
+
+        class Refilled:
+            """A one-cell CapSweep stand-in that refills ONE list object as its cell is read."""
+
+            simulated = reused = 0
+
+            def __init__(self, at):
+                self.at = at
+
+            def cell(self, band, k):
+                """The cell, its list refilled now."""
+                listed[:] = refills[self.at]
+                return {0.2: {"all": SweepPoint(k=k, trades=listed, equity_df=curve,
+                                                spread_band=band, size_cap=0.2)}}
+
+            def entry_events(self):
+                """No event beyond the page's own."""
+                return set()
+        own = SweepPoint(k=0.75, trades=_kc_trades(3), spread_band=_KC_B0, size_cap=0.2,
+                         equity_df=backtester._build_equity_curve(_kc_trades(3), _FLT_START,
+                                                                  1000.0))
+        sweep = BacktestSweep(primary=own, points=[own], calibration=None,
+                              label_coverage=_scn_coverage(),
+                              cap_sweep=_FakeCapSweep({(_KC_B0, 0.75, 0.2): own},
+                                                      bands=(_KC_B0,), ks=(0.75,), caps=(0.2,)))
+        if tiers:
+            sweep = dataclasses.replace(
+                sweep, tier_off_scenarios=[dataclasses.replace(own, tier_floors=False)],
+                tier_off_calibrations_by_band={_KC_B0: None})
+        sweep = dataclasses.replace(sweep, close_sweep=_FakeCloseSweep(
+            {(d, not off): Refilled((d, off)) for d, off in (first, second)}, days=days,
+            bands=(_KC_B0,), off_bands=(_KC_B0,) if tiers else (), ks=(0.75,), caps=(0.2,)))
+        _, base, chunks = _cl_walk(sweep)
+        ids = [base["grid_close_off" if off else "grid_close"][days.index(d)][0][0][0]
+               for d, off in (first, second)]
+        # Two chunks, each its own step's list
+        assert ids[0] != ids[1]
+        for cid, at in zip(ids, (first, second), strict=True):
+            assert chunks[cid]["list"]["views"]["all"]["n"] == len(refills[at])
+
+
+class TestCloseRightFile:
+    """The right file for each choice: on the page of a run whose own choice
+    is one value, the chunk each other choice's grid names at a scenario is
+    exactly the chunk the MAIN grid names at that scenario on the page of a
+    run whose own choice is that other one — the same trades, curve and
+    figures, decoded (the two pages number their chunks and categories
+    differently) — and exactly what a direct read of the family simulates
+    there. Checked for every pair of the menu's four choices, every band, k
+    and size cap, with the tier floors on and off."""
+
+    @pytest.fixture(scope="class")
+    def pages(self, tmp_path_factory) -> dict:
+        """The run's own choice -> (its sweep, its page's base block, its page's chunks)."""
+        out = {}
+        with pytest.MonkeyPatch.context() as mp:
+            for own in _CL_CHOICES:
+                sweep = _cl_sweep(own)
+                page = _cl_page(mp, tmp_path_factory.mktemp(f"own{own}"), sweep)
+                out[own] = (sweep, TestFilterPage._data(page), TestFilterPage._chunks(page))
+        return out
+
+    @pytest.mark.parametrize("own", _CL_CHOICES)
+    def test_each_choice_s_chunk_is_the_run_at_that_choice(self, pages, own):
+        sweep, data, chunks = pages[own]
+        assert data["close"] == [d for d in _CL_CHOICES if d != own] and data["close_own"] == own
+        compared = 0
+        for ci, days in enumerate(data["close"]):
+            _other_sweep, other, other_chunks = pages[days]
+            for key, main_key in (("grid_close", "grid"), ("grid_close_off", "grid_off")):
+                grid = data[key][ci]
+                assert grid is not None
+                for bi, ki, capi, cid in _cl_cells(grid):
+                    theirs = other[main_key][bi][ki][capi]
+                    assert _cl_norm(chunks[cid], data) == _cl_norm(other_chunks[theirs], other), (
+                        days, key, bi, ki, capi)
+                    compared += 1
+        assert compared == 3 * (12 + 12)
+        # ... and each is what the family simulates there, read directly
+        assert _cl_check_runs(data, chunks, sweep.close_sweep) == 3 * (12 + 6)
+
+    def test_the_choices_trade_different_runs(self, pages):
+        # Not vacuous: at the primary scenario the four choices' runs are three
+        # different lists (3 days and 7 days enter the same pairs)
+        _sweep, data, chunks = pages[_CL_OWN]
+        shown = {7: chunks[data["grid"][0][1][1]]}
+        for ci, days in enumerate(data["close"]):
+            shown[days] = chunks[data["grid_close"][ci][0][1][1]]
+        counts = {days: chunk["list"]["views"]["all"]["n"] for days, chunk in shown.items()}
+        assert counts == {0: 3, 3: 2, 7: 2, 14: 1}
+        assert shown[3] == shown[7] and shown[0] != shown[7] != shown[14]
+
+
+@pytest.mark.usefixtures("_cl_stopped_clock")
+class TestCloseCategories:
+    """The bar's Category and Tag lists cover every trade any attached choice
+    could make, both Tier floors settings, and nothing else: a category only
+    another choice trades is offered (at 0 trades) — the one thing a reader
+    can see of the choices on this page — and a choice the page could not
+    read adds none."""
+
+    def test_a_category_only_another_choice_trades_is_offered(self, monkeypatch, tmp_path):
+        page = _cl_page(monkeypatch, tmp_path / "with", _cl_sweep())
+        bare = _cl_page(monkeypatch, tmp_path / "without", _cl_sweep(family=False))
+        data, other = TestFilterPage._data(page), TestFilterPage._data(bare)
+
+        def tags(d):
+            return {(d["categories"][c], tag) for c, tag in d["subcats"]}
+        # Only off enters the oil pair
+        assert set(data["categories"]) - set(other["categories"]) == {"Commodities"}
+        assert tags(data) - tags(other) == {("Commodities", "Oil & Gas")}
+        rows = [row["text"] for row in _page_elements(page)["menus"]["flt-cat"]["rows"]]
+        assert "Commodities (0)" in rows
+
+    def test_the_lists_hold_both_settings_of_every_attached_choice_and_nothing_else(self):
+        # A pair only 14 days enters, and only with the tier floors off
+        snow = _tb._ladder_record(_tb._ladder_market("SNOW-A", "KXSNOW-1", "2026-02-10"),
+                                  _tb._ladder_market("SNOW-B", "KXSNOW-2", "2026-03-20"),
+                                  "snow", (_tb._LADDER_M1,))
+        sweep = _cl_sweep()
+        family = sweep.close_sweep
+        family = dataclasses.replace(family, off_entries_by_days={
+            **family.off_entries_by_days, 14: {_KC_B0: [*family.off_entries_by_days[14][_KC_B0],
+                                                        snow]}})
+        sweep = dataclasses.replace(sweep, close_sweep=family)
+        trades, curve = sweep.primary.trades, sweep.primary.equity_df
+        source = dashboard._grid_source(sweep, trades, curve, 0.75)
+        bare = dashboard._grid_source(dataclasses.replace(sweep, close_sweep=None), trades,
+                                      curve, 0.75)
+        wanted = set(bare.events)
+        for days in family.days:
+            wanted |= (family.sweep(days).entry_events()
+                       | family.sweep(days, tier_floors=False).entry_events())
+        assert set(source.events) == wanted and source.off_events == bare.off_events
+        assert ("KXSNOW-1", backtester.infer_category("KXSNOW-1")) in source.events - bare.events
+
+    def test_a_refused_choice_adds_no_category(self, monkeypatch, tmp_path, caplog):
+        with caplog.at_level(logging.WARNING):
+            page = _cl_page(monkeypatch, tmp_path, _cl_sweep(cls=_cl_refusing(0)))
+        data = TestFilterPage._data(page)
+        assert data["close"] == [0, 3, 14] and data["grid_close"][0] is None
+        assert "Commodities" not in data["categories"]
+        assert _cl_warnings(caplog) == [
+            'The "Skip if closing within" off results could not be read; the page has none '
+            "for that choice"]
+
+
+@pytest.mark.usefixtures("_cl_stopped_clock")
+class TestCloseFailures:
+    """What a failure costs the other "Skip if closing within" choices. A
+    choice the family refuses costs that choice alone: one WARNING naming
+    it, its grids null, and every other choice, every other view and every
+    chunk file the same as on the page of the family without that choice. A
+    choice whose cell raises mid-walk costs the same but for one thing: the
+    bar's category and tag lists are made before the walk, so a category or
+    tag only that choice trades stays listed (at 0 trades, in the names file
+    beside the page too), as after a failed Rebalance phase, and every chunk
+    numbers its categories over those longer lists; every grid still names
+    the same runs as on the page without that choice. A family with no
+    choice shows none, with one WARNING. A choice is never tried (or warned
+    about) a second time when the walk falls back to the run's own cap.
+    Every other path that drops or moves chunks — the size-cap and
+    tier-floors-off fallbacks, a failed Rebalance, price-movement or
+    "Rebalance until" phase, a Sell select built after the choices or one
+    that fails, a build folder that cannot be made — keeps each choice's
+    chunks, each still the choice's own run; a chunk of a choice that cannot
+    be parked stops the build, and one that cannot be built loses the bar,
+    as any chunk does."""
+
+    @staticmethod
+    def _same_but_for(page: _Page, absent: _Page, days: int) -> None:
+        """
+        Assert a page that lost one choice is the page of the family without it, but for that choice.
+
+        Its grids are null where the other page has no entry for it; every
+        other choice's grids, every other key of the base block (the main,
+        tier-off, Rebalance, movement and "Rebalance until" grids, the
+        category lists, the shared row heads among them), the page's own
+        chunk and every chunk file beside the page are the same. Only for a
+        choice that trades no category or tag of its own: one that does
+        keeps them listed when it fails mid-walk (the test of off below).
+        """
+        data, other = TestFilterPage._data(page), TestFilterPage._data(absent)
+        assert data["close"] == [0, 3, 14] and other["close"] == [d for d in (0, 3, 14)
+                                                                   if d != days]
+        ci = data["close"].index(days)
+        assert data["grid_close"][ci] is None and data["grid_close_off"][ci] is None
+        assert [g for i, g in enumerate(data["grid_close"]) if i != ci] == other["grid_close"]
+        assert ([g for i, g in enumerate(data["grid_close_off"]) if i != ci]
+                == other["grid_close_off"])
+        # The build folder's name is the build's own
+        left = {"close", "grid_close", "grid_close_off", "sidecar_dir"}
+        assert ({key: value for key, value in data.items() if key not in left}
+                == {key: value for key, value in other.items() if key not in left})
+        assert _packed_blocks(page)["dash-chunk-0"] == _packed_blocks(absent)["dash-chunk-0"]
+        assert _cl_files(page) == _cl_files(absent)
+        # Not vacuous: every view the families build is on both pages
+        for key in ("grid_off", "grid_rebalance", "grid_move", "grid_maturity"):
+            assert data[key] is not None, key
+
+    def test_a_choice_the_family_refuses_costs_that_choice_alone(self, monkeypatch, tmp_path,
+                                                                 caplog):
+        with caplog.at_level(logging.WARNING):
+            page = _cl_page(monkeypatch, tmp_path / "refused", _kc_sweep_close(
+                _kc_sweep_until(_kc_sweep_tiers()), cls=_cl_refusing(3)))
+        assert _cl_warnings(caplog) == [
+            'The "Skip if closing within" 3 days results could not be read; the page has none '
+            "for that choice"]
+        # Its traceback is the family's own refusal
+        (record,) = [r for r in caplog.records if "3 days results" in r.getMessage()]
+        assert "no end day recorded" in str(record.exc_info[1])
+        absent = _cl_page(monkeypatch, tmp_path / "absent", _kc_sweep_close(
+            _kc_sweep_until(_kc_sweep_tiers()), days=(0, 14)))
+        self._same_but_for(page, absent, 3)
+        assert TestFilterPage._data(page)["close_state"] == "shown"
+
+    def test_a_choice_whose_cell_raises_mid_walk_costs_that_choice_alone(
+            self, monkeypatch, tmp_path, caplog):
+        sweep = _kc_sweep_close(_kc_sweep_until(_kc_sweep_tiers()))
+        family = sweep.close_sweep
+        # Its tier-on cells' last (0.3-0.6, k 0.75) raises, after the three
+        # before it were packed
+        _cl_raise_at(monkeypatch, lambda capped: capped.entries_by_band is
+                     family.entries_by_days[3], _KC_B1, 0.75)
+        packed: list[int] = []
+        real = dashboard._ChunkVisitor.close
+
+        def counted(self, days, *args, **kwargs):
+            before = len(self.chunks)
+            real(self, days, *args, **kwargs)
+            if days == 3:
+                packed.append(len(self.chunks) - before)
+        monkeypatch.setattr(dashboard._ChunkVisitor, "close", counted)
+        with caplog.at_level(logging.WARNING):
+            page = _cl_page(monkeypatch, tmp_path / "raised", sweep)
+        assert _cl_warnings(caplog) == [
+            'A simulation for "Skip if closing within" 3 days failed; the page has no results '
+            "for that choice"]
+        (record,) = [r for r in caplog.records if "3 days failed" in r.getMessage()]
+        assert str(record.exc_info[1]) == "the simulation failed"
+        # Not vacuous: the choice packed chunks of its own before it failed
+        assert sum(packed) > 0
+        absent = _cl_page(monkeypatch, tmp_path / "absent", _kc_sweep_close(
+            _kc_sweep_until(_kc_sweep_tiers()), days=(0, 14)))
+        # No file of it is left beside the page, and 14 days' ids follow on
+        # from where its chunks began
+        self._same_but_for(page, absent, 3)
+
+    def test_a_choice_that_fails_mid_walk_keeps_its_own_categories_listed(
+            self, monkeypatch, tmp_path, caplog):
+        # Off is the one scenario that enters the oil pair, the only trade in
+        # Commodities. Its last cell, at band 0-1 with the tier floors off,
+        # raises after every other cell of it was packed
+        sweep = _kc_sweep_close(_kc_sweep_until(_kc_sweep_tiers()))
+        family = sweep.close_sweep
+        _cl_raise_at(monkeypatch, lambda capped: capped.entries_by_band is
+                     family.off_entries_by_days[0], _KC_B0, 0.75)
+        packed: list[int] = []
+        real = dashboard._ChunkVisitor.close
+
+        def counted(self, days, *args, **kwargs):
+            before = len(self.chunks)
+            real(self, days, *args, **kwargs)
+            if days == 0:
+                packed.append(len(self.chunks) - before)
+        monkeypatch.setattr(dashboard._ChunkVisitor, "close", counted)
+        with caplog.at_level(logging.WARNING):
+            page = _cl_page(monkeypatch, tmp_path / "raised", sweep)
+        assert _cl_warnings(caplog) == [
+            'A simulation for "Skip if closing within" off failed; the page has no results '
+            "for that choice"]
+        # Not vacuous: off packed chunks of its own before it failed
+        assert sum(packed) > 0
+        absent = _cl_page(monkeypatch, tmp_path / "absent", _kc_sweep_close(
+            _kc_sweep_until(_kc_sweep_tiers()), days=(3, 14)))
+        data, other = TestFilterPage._data(page), TestFilterPage._data(absent)
+        assert data["close"] == [0, 3, 14] and other["close"] == [3, 14]
+        assert data["grid_close"][0] is None and data["grid_close_off"][0] is None
+
+        def tags(d):
+            return {(d["categories"][c], tag) for c, tag in d["subcats"]}
+        # The bar's lists were made before the walk: off's category and tag
+        # stay listed, at 0 trades, and the names file beside the page (which
+        # the Trading tab's Exclude menus read) lists them too
+        assert set(data["categories"]) - set(other["categories"]) == {"Commodities"}
+        assert tags(data) - tags(other) == {("Commodities", "Oil & Gas")}
+        rows = [row["text"] for row in _page_elements(page)["menus"]["flt-cat"]["rows"]]
+        assert "Commodities (0)" in rows
+        names = TestFilterNamesFile._names(tmp_path / "raised")
+        their_names = TestFilterNamesFile._names(tmp_path / "absent")
+        assert set(names["categories"]) - set(their_names["categories"]) == {"Commodities"}
+        assert set(names["tags"]) - set(their_names["tags"]) == {"Commodities · Oil & Gas"}
+        # Every grid still names the same runs as the page without off, its
+        # other choices' grids included
+        mine = (data, TestFilterPage._chunks(page))
+        theirs = (other, TestFilterPage._chunks(absent))
+        compared = 0
+        for key in ("grid", "grid_off", "grid_rebalance", "grid_rebalance_off", "grid_move",
+                    "grid_move_off", "grid_maturity", "grid_maturity_off"):
+            assert data[key] is not None, key
+            compared += _cl_same_runs(data[key], other[key], mine, theirs, (key,))
+        for key in ("grid_close", "grid_close_off"):
+            compared += _cl_same_runs(data[key][1:], other[key], mine, theirs, (key,))
+        assert compared == 87 + 2 * (12 + 12)
+        # No file of off is left: the page has the same chunk files as the
+        # page without it, under the same names, though their category
+        # numbers differ (Commodities comes before Other and Sports)
+        assert set(_cl_files(page)) == set(_cl_files(absent))
+        assert _cl_files(page) != _cl_files(absent)
+
+    def test_one_warning_per_refused_choice_across_the_size_cap_fallback(
+            self, monkeypatch, tmp_path, caplog):
+        sweep = _cl_sweep(cls=_cl_refusing(3))
+        # The size-cap sweep's last cell raises: the whole grid is walked
+        # again from the eager points, at the run's own cap alone
+        _cl_raise_at(monkeypatch, lambda capped: capped is sweep.cap_sweep, _KC_B1, 0.75)
+        with caplog.at_level(logging.WARNING):
+            page = _cl_page(monkeypatch, tmp_path, sweep)
+        assert any("The size-cap sweep could not be simulated" in r.getMessage()
+                   for r in caplog.records)
+        assert _cl_warnings(caplog) == [
+            'The "Skip if closing within" 3 days results could not be read; the page has none '
+            "for that choice"]
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        assert [cap["value"] for cap in data["caps"]] == [0.2]
+        # Every other choice at that one cap, each chunk its own run there
+        assert data["close"] == [0, 3, 14] and data["close_state"] == "shown"
+        assert data["grid_close"][1] is None and data["grid_close_off"][1] is None
+        for ci in (0, 2):
+            assert [len(data["grid_close"][ci]), len(data["grid_close"][ci][0]),
+                    len(data["grid_close"][ci][0][0])] == [2, 2, 1]
+        assert _cl_check_runs(data, chunks, sweep.close_sweep) == 2 * (4 + 2)
+
+    def test_a_family_with_no_choice_shows_none(self, monkeypatch, tmp_path, caplog):
+        with caplog.at_level(logging.WARNING):
+            page = _cl_page(monkeypatch, tmp_path, _kc_sweep_close(_kc_sweep_tiers(), days=()))
+        # One WARNING says why, and the page lists no choice and names no
+        # run's own, as for a family that does not fit the page
+        assert _cl_warnings(caplog) == [
+            'The run worked out no "Skip if closing within" choice besides its own; the page '
+            "has no other choice to show"]
+        data = TestFilterPage._data(page)
+        assert [data[key] for key in _CL_KEYS] == [[], None, [], [], "unavailable"]
+
+    def test_the_tier_floors_off_fallback_keeps_every_choice_at_every_cap(
+            self, monkeypatch, tmp_path, caplog):
+        sweep = _cl_sweep()
+        # The tier-floors-off size-cap sweep's first cell raises: the page's
+        # own off cells are walked again at the run's own cap alone
+        _cl_raise_at(monkeypatch, lambda capped: capped is sweep.tier_off_cap_sweep,
+                     _KC_B0, 0.6)
+        with caplog.at_level(logging.WARNING):
+            page = _cl_page(monkeypatch, tmp_path, sweep)
+        assert any("The tier-floors-off size-cap sweep could not be simulated" in r.getMessage()
+                   for r in caplog.records)
+        assert _cl_warnings(caplog) == []
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        assert [[cid is not None for cid in row] for row in data["grid_off"][0]] == [
+            [False, True, False]] * 2
+        # The choices' own tier-off cells come from their own sweeps: every cap
+        assert data["close_state"] == "shown"
+        assert _cl_check_runs(data, chunks, sweep.close_sweep) == 3 * (12 + 6)
+
+    # A cell of each phase the walk reads before the choices raises: (the
+    # sweep's keyword, the base block's state key of the view it costs)
+    _PHASES = {"rebalance": ({"raise_on": (_KC_B0, 0.75)}, "rebalance_state"),
+               "price movement": ({"move_raise": ((False, _KC_B0, 0.75), 2)}, "move_state"),
+               "rebalance until": ({"maturity_raise": ((False, _KC_B0, 0.75), 6)},
+                                   "maturity_state")}
+
+    @pytest.mark.parametrize("phase", list(_PHASES))
+    def test_a_failed_rebalance_phase_keeps_every_choice(self, monkeypatch, tmp_path, caplog,
+                                                         phase):
+        failing, state = self._PHASES[phase]
+        good = _cl_page(monkeypatch, tmp_path / "good", _kc_sweep_close(
+            _kc_sweep_until(_kc_sweep_tiers())))
+        sweep = _kc_sweep_close(_kc_sweep_until(_kc_sweep_tiers(), **failing))
+        with caplog.at_level(logging.WARNING):
+            bad = _cl_page(monkeypatch, tmp_path / "bad", sweep)
+        assert _cl_warnings(caplog) == []
+        data, chunks = TestFilterPage._data(bad), TestFilterPage._chunks(bad)
+        theirs, their_chunks = TestFilterPage._data(good), TestFilterPage._chunks(good)
+        assert (data[state], theirs[state]) == ("unavailable", "shown")
+        assert data["close_state"] == "shown"
+        # The phase's dropped chunks came before every choice's: each choice's
+        # chunks are the same runs, under ids that follow on from the drop
+        for key in ("grid_close", "grid_close_off"):
+            for grid, their_grid in zip(data[key], theirs[key], strict=True):
+                for (bi, ki, capi, cid), (*_at, theirs_cid) in zip(
+                        _cl_cells(grid), _cl_cells(their_grid), strict=True):
+                    assert (_cl_norm(chunks[cid], data)
+                            == _cl_norm(their_chunks[theirs_cid], theirs)), (key, bi, ki, capi)
+        assert _cl_check_runs(data, chunks, sweep.close_sweep) == 3 * (12 + 6)
+
+    def test_a_failed_sell_build_keeps_every_choice_s_files(self, monkeypatch, tmp_path):
+        def fail(tasks, workers):
+            raise RuntimeError("the pool could not start")
+        monkeypatch.setattr(dashboard, "_run_sell_tasks", fail)
+        sweep = _kc_sweep_sell(_kc_sweep_close(_kc_sweep_tiers()))
+        page = _cl_page(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        assert data["sell_state"] == "unavailable" and data["close_state"] == "shown"
+        # Every chunk the choices name is a file beside the page (_chunks reads
+        # each one a grid names), and each is the choice's own run
+        named = _flat_ids(data["grid_close"]) | _flat_ids(data["grid_close_off"])
+        assert {f"chunk-{cid}.js" for cid in named} <= set(_cl_files(page))
+        assert _cl_check_runs(data, TestFilterPage._chunks(page), sweep.close_sweep) == 54
+
+    def test_the_sell_select_s_files_follow_every_choice_s(self, monkeypatch, tmp_path):
+        sweep = _kc_sweep_sell(_kc_sweep_close(_kc_sweep_tiers()))
+        page = _cl_page(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        assert data["sell_state"] == "shown" and data["close_state"] == "shown"
+        named = _grid_chunk_ids(data)
+        sold = {cid for block in _sl_blocks(page) for cid in _flat_ids(block)} - {-1}
+        # Each new sell list is numbered after every chunk the walk packed, the
+        # choices' included, and every chunk either names is a file
+        assert min(sold - named) > max(named)
+        assert {f"chunk-{cid}.js" for cid in (named | sold) - {0}} == set(_cl_files(page))
+        assert _cl_check_runs(data, TestFilterPage._chunks(page), sweep.close_sweep) == 54
+
+    def test_a_choice_s_chunk_that_cannot_be_built_loses_the_bar(self, monkeypatch, tmp_path,
+                                                                caplog):
+        real_payload, real_close = dashboard._list_payload, dashboard._ChunkVisitor.close
+        inside: list = []
+
+        def watched(self, *args, **kwargs):
+            inside.append(None)
+            try:
+                return real_close(self, *args, **kwargs)
+            finally:
+                inside.pop()
+
+        def broken(*args, **kwargs):
+            if inside:
+                raise RuntimeError("a chunk could not be built")
+            return real_payload(*args, **kwargs)
+        monkeypatch.setattr(dashboard._ChunkVisitor, "close", watched)
+        monkeypatch.setattr(dashboard, "_list_payload", broken)
+        with caplog.at_level(logging.WARNING):
+            page = _cl_page(monkeypatch, tmp_path, _kc_sweep_close(_kc_sweep_tiers()))
+        # As for any chunk: the bar is lost, the page is written with the
+        # notice in its place, and nothing is left beside it
+        assert "A page-wide filter chunk could not be built" in caplog.text
+        assert 'id="dash-data"' not in page and "dash-chunk-" not in page
+        assert dashboard._FILTER_UNAVAILABLE_HTML in page
+        assert not (tmp_path / config.DASHBOARD_FILES_DIRNAME).exists()
+
+    def test_a_folder_that_cannot_be_made_keeps_every_choice_in_the_page(
+            self, monkeypatch, tmp_path):
+        def refuse(_page):
+            raise OSError(30, "Read-only file system")
+        monkeypatch.setattr(dashboard, "_new_build_folder", refuse)
+        sweep = _kc_sweep_close(_kc_sweep_tiers())
+        page = _cl_page(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        chunks = {int(name[len("dash-chunk-"):]): block
+                  for name, block in _packed_blocks(page).items()
+                  if name.startswith("dash-chunk-")}
+        assert data["sidecar_dir"] is None and not page.files
+        assert data["inline_chunks"] == len(chunks) == max(chunks) + 1
+        assert _cl_check_runs(data, chunks, sweep.close_sweep) == 54
+
+    def test_a_choice_s_chunk_that_cannot_be_parked_keeps_the_last_page(
+            self, monkeypatch, tmp_path):
+        root = tmp_path / config.DASHBOARD_FILES_DIRNAME
+        page = _cl_page(monkeypatch, tmp_path, _kc_sweep_close(_kc_sweep_tiers()))
+        before = sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
+        error = OSError(28, "No space left on device")
+        real_write, real_close = dashboard._write_chunk_file, dashboard._ChunkVisitor.close
+        inside: list = []
+
+        def watched(self, *args, **kwargs):
+            inside.append(None)
+            try:
+                return real_close(self, *args, **kwargs)
+            finally:
+                inside.pop()
+
+        def full_disk(folder, chunk_id, element):
+            if inside:
+                raise error
+            return real_write(folder, chunk_id, element)
+        monkeypatch.setattr(dashboard._ChunkVisitor, "close", watched)
+        monkeypatch.setattr(dashboard, "_write_chunk_file", full_disk)
+        with pytest.raises(OSError) as raised:
+            _cl_page(monkeypatch, tmp_path, _kc_sweep_close(_kc_sweep_tiers()))
+        # The build stopped at a choice's first new chunk: the last page and
+        # its folder stay as they were, and nothing of this build is left
+        assert raised.value is error
+        assert sorted(path.relative_to(root).as_posix() for path in root.rglob("*")) == before
+        assert (tmp_path / config.DASHBOARD_FILENAME).read_text(encoding="utf-8") == page
 
 
 class TestSoldTradeRow:
@@ -20044,15 +21140,29 @@ class TestFilterPageSize:
     BUDGET_REBALANCE = int(PAGE_BYTES_MEASURED_REBALANCE * 1.2)
     PAGE_BYTES_MEASURED_REBALANCE_FAMILY = 1_975_552
     BUDGET_REBALANCE_FAMILY = int(PAGE_BYTES_MEASURED_REBALANCE_FAMILY * 1.2)
+    # The other "Skip if closing within" choices (off, 3 and 14 days), each
+    # trading yet another list at every band (a worst case: a real choice
+    # mostly trades the lists of the run's own choice and shares their
+    # chunks), and with the tier-floors-off family at every binding band with
+    # the tiers off too: 108 and 162 more chunk files. Measured 2026-11-19
+    # (plotly 6.9.0, pandas 3.0.3, numpy 2.4.6): 2,443,764 and 3,483,598
+    # bytes, against 974,720 and 1,279,324 for the page without them the
+    # same day. Each budget is its measurement + 20%.
+    PAGE_BYTES_MEASURED_CLOSE = 2_443_764
+    BUDGET_CLOSE = int(PAGE_BYTES_MEASURED_CLOSE * 1.2)
+    PAGE_BYTES_MEASURED_CLOSE_FAMILY = 3_483_598
+    BUDGET_CLOSE_FAMILY = int(PAGE_BYTES_MEASURED_CLOSE_FAMILY * 1.2)
 
     @pytest.mark.parametrize(
-        "family, rebalance, quoted",
-        [(False, False, False), (True, False, False), (False, True, False),
-         (True, True, False), (False, False, True), (True, False, True)],
+        "family, rebalance, quoted, close",
+        [(False, False, False, False), (True, False, False, False),
+         (False, True, False, False), (True, True, False, False),
+         (False, False, True, False), (True, False, True, False),
+         (False, False, False, True), (True, False, False, True)],
         ids=["tier-on-only", "tier-off-family", "rebalance", "rebalance-and-tier-off-family",
-             "quoted", "quoted-and-tier-off-family"])
+             "quoted", "quoted-and-tier-off-family", "close", "close-and-tier-off-family"])
     def test_distinct_band_lists_stay_under_budget(self, monkeypatch, tmp_path, family,
-                                                   rebalance, quoted):
+                                                   rebalance, quoted, close):
         import random
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
@@ -20129,6 +21239,22 @@ class TestFilterPageSize:
                 sweeps[True] = capped(off_scenarios, binding)
             sweep = dataclasses.replace(sweep, rebalance_sweep=_FakeRebalanceSweep(
                 sweeps, bands=tuple(bands), off_bands=tuple(binding), ks=(0.75,), caps=(0.2,)))
+        if close:
+            # Each other "Skip if closing within" choice (off, 3 and 14 days)
+            # trades yet another list at every band, and at every binding band
+            # with the tiers off: drawn after everything else, so the rest of
+            # the page is the same either way
+            close_sweeps = {}
+            for i, days in enumerate((0, 3, 14)):
+                for tier_floors, at in ((True, bands), (False, binding)):
+                    if at:
+                        close_sweeps[(days, tier_floors)] = _FakeCapSweep(
+                            {(band, 0.75, 0.2): point(2000 + 1000 * i + 100 * j, band)
+                             for j, band in enumerate(at)},
+                            bands=tuple(at), ks=(0.75,), caps=(0.2,))
+            sweep = dataclasses.replace(sweep, close_sweep=_FakeCloseSweep(
+                close_sweeps, bands=tuple(sorted(bands)), off_bands=tuple(binding),
+                ks=(0.75,), caps=(0.2,)))
         out = dashboard.generate_dashboard(
             scenarios[0].trades, scenarios[0].equity_df, start, 10_000.0, sweep=sweep,
             interval_discount=0.75, series_categories=categories)
@@ -20136,7 +21262,13 @@ class TestFilterPageSize:
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
         # Nothing collapsed: every list is its own
         assert len(chunks) == (54 if family else 36) + (
-            (36 + (18 if family else 0)) if rebalance else 0)
+            (36 + (18 if family else 0)) if rebalance else 0) + (
+            3 * (36 + (18 if family else 0)) if close else 0)
+        if close:
+            assert data["close_state"] == "shown" and None not in data["grid_close"]
+            assert _flat_ids(data["grid_close"]).isdisjoint(_flat_ids(data["grid"]))
+        else:
+            assert not {"close", "grid_close", "close_state"} & set(data)
         assert all(band is not None for band in data["khat"])
         if family:
             assert len(binding) == 18 and len(data["bands_off"]) == 36
@@ -20161,6 +21293,8 @@ class TestFilterPageSize:
             assert data["rebalance_state"] == "not simulated"
         if quoted:
             budget = self.BUDGET_QUOTED_FAMILY if family else self.BUDGET_QUOTED
+        elif close:
+            budget = self.BUDGET_CLOSE_FAMILY if family else self.BUDGET_CLOSE
         elif rebalance:
             budget = self.BUDGET_REBALANCE_FAMILY if family else self.BUDGET_REBALANCE
         else:
