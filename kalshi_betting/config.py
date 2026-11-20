@@ -2430,17 +2430,6 @@ ORDER_WRITE_BURST = 8
 # one goes unnoticed). Past versions: CLAUDE.md's prefilter gotcha.
 SETTLED_PREFILTER_CACHE_TAG = "checkpoint-v3"
 
-# How long historical.load_series_categories reuses its cached copy of Kalshi's
-# /series listing (every series' official category and tags — 14,391 series in
-# ONE response, measured 2026-09-25) before fetching it again. It feeds the
-# backtest dashboard's category/tag views, each trade of a production run's
-# result file, the Live trading tab's categories and, with a live filter set,
-# main._filter_by_category (a dev run reads the cached copy however old). A
-# series' category rarely changes, so a week is plenty; a series the copy lacks
-# is filed by historical.series_labels' fallback until the next refresh.
-# Seven days in seconds.
-SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS = 7 * 86_400
-
 # Hard cap on the per-ticker event-title fallback in
 # historical._load_or_build_event_titles. That fallback exists for the handful
 # of archived events the bulk listings no longer carry, and it costs ONE HTTP

@@ -1847,15 +1847,16 @@ def main() -> None:
             " (the band sweep's grid bands are unaffected)" if band_sweep else "",
         )
 
-    # Kalshi's /series listing, read once: the dashboard files each trade under
-    # its series' category and tags. One cached read-only GET of /series, which
-    # never raises (it falls back to a stale copy or to {}); its weekly
-    # refresh also rewrites the fee multipliers read just below
+    # Kalshi's /series listing, fetched again every backtest so a series
+    # Kalshi added since the last read is filed by its real labels: the
+    # dashboard files each trade under its series' category and tags. One
+    # read-only GET of /series, which never raises (it falls back to the saved
+    # copy or to {}); its fetch also rewrites the fee multipliers read just below
     series_categories = load_series_categories(live_client)
     # ... and each series' fee multiplier from the same cache file (the line
-    # above's refresh writes both; upgrade=True makes the one fetch that adds
-    # the fees to a current file from before they were kept). Carried by the
-    # sweep; no fee reads it yet
+    # above's fetch writes both; upgrade=True makes one more fetch only when
+    # that fetch failed and the saved file is from before the fees were
+    # kept). Carried by the sweep; no fee reads it yet
     fee_multipliers = load_series_fee_multipliers(live_client, upgrade=True)
     result = run_backtest_sweep(
         hist_client=hist_client,

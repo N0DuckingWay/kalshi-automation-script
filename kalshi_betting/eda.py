@@ -1710,7 +1710,8 @@ INVENTORY_DESCRIPTIONS = {
     "event_competitions.json": ("The competition each event names (a league, for example), "
                                 "left by an earlier backtest; no longer read, and safe to "
                                 "delete."),
-    "series_categories.json": "Kalshi's category and tags for each series, refreshed weekly.",
+    "series_categories.json": ("Kalshi's category and tags for each series, fetched again by "
+                               "every live run, backtest and Live tab load."),
     "treasury_bill_rates.json": ("The 8-week Treasury bill auction yields the dashboards "
                                  "subtract from Sharpe and Sortino."),
     "live_marks": ("Daily prices of finalized markets the Live trading tab has read, kept so "

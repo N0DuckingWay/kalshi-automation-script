@@ -201,7 +201,6 @@ from .config import (
     PROD_URL,
     PROJECT_ROOT,
     RECENT_CANDLES_RATE_LIMIT_SLEEP_SECONDS,
-    SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS,
     SETTLED_FETCH_CHUNK_RECORDS,
     SETTLED_FETCH_MAX_WORKERS,
 )
@@ -505,7 +504,6 @@ def _save_series_listing(
 
 def load_series_categories(
     client: Any,
-    max_age_seconds: int = SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS,
 ) -> dict[str, tuple[str, tuple[str, ...]]]:
     """
     Map every Kalshi series ticker to its official category and tags.
@@ -521,9 +519,14 @@ def load_series_categories(
     result (main.py --result-file) and file the bot's purchases on the live
     dashboard's Live trading tab.
 
-    The listing is cached in backtest_cache/series_categories.json and reused
-    while younger than max_age_seconds. It is one read-only GET (retried like
-    every other historical read). It never raises: a failed fetch logs a WARNING
+    Given a client, it fetches the listing on every call, with no age limit,
+    so a series Kalshi added since the last fetch is filed by its real
+    labels, and saves it in backtest_cache/series_categories.json: the copy a
+    dev run, the Data page and the fee multipliers read, and the fallback
+    when a fetch fails. Every production run, every backtest and every Live
+    trading tab load calls it with a client. It is one read-only GET of about
+    21 MB, which took 0.2-0.8 s (measured 2026-11-19), retried like every
+    other historical read. It never raises: a failed fetch logs a WARNING
     and returns the cached copy however old, or {} — on which the dashboard files
     by infer_category, a run's result records no category and a set live
     category/tag filter keeps nothing. A cached copy that cannot be read is
@@ -533,36 +536,25 @@ def load_series_categories(
     Args:
         client (Any): A KalshiClient pointed at prod (build_prod_live_client() or
             a production run's own), or None to read the cached copy only.
-        max_age_seconds (int): Reuse the cached copy while it is younger than
-            this. Defaults to config.SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS.
-            Ignored when client is None.
 
     Returns:
         dict[str, tuple[str, tuple[str, ...]]]: series ticker -> (category,
             tags). A series with no category maps to ""; with no tags to ().
     """
     cached_map: dict[str, tuple[str, tuple[str, ...]]] = {}
-    fetched_at: datetime | None = None
     try:
         cached = _load_json_cache(_SERIES_CATEGORIES_CACHE)
         if isinstance(cached, dict):
             cached_map = _parse_series_categories(cached.get("series"))
-            try:
-                fetched_at = datetime.fromisoformat(cached.get("fetched_at"))
-            except (TypeError, ValueError):
-                fetched_at = None
     except Exception as exc:  # a folder that cannot be searched, a file nested too deeply
         logging.warning(
             "Series categories: could not read the cached /series listing (%s) — "
             "treating it as missing", _exception_summary(exc))
-        cached_map, fetched_at = {}, None
+        cached_map = {}
     if client is None:
         # Dev mode: the sandbox key must never sign a production request
         return cached_map
     now = datetime.now(UTC)
-    if (cached_map and fetched_at is not None and fetched_at.tzinfo is not None
-            and 0 <= (now - fetched_at).total_seconds() < max_age_seconds):
-        return cached_map
     try:
         fresh, fees = _fetch_series_listing(client)
     except Exception as exc:  # never end a run over it (the live filter fails closed on {})
@@ -627,7 +619,6 @@ def _read_series_cache_quietly() -> dict | None:
 
 def load_series_fee_multipliers(
     client: Any,
-    max_age_seconds: int = SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS,
     *,
     upgrade: bool = False,
 ) -> dict[str, float]:
@@ -642,18 +633,17 @@ def load_series_fee_multipliers(
     and the backtester carry it so a later change can.
 
     This reader is a companion of load_series_categories, which a run calls
-    first with the same client and whose fetch (the weekly refresh) writes
-    both blocks. So it reads the file as it stands, with no request. The one
-    exception is opt-in: with upgrade=True, a file that load_series_categories
-    would serve as current (younger than max_age_seconds, its "series" block
-    non-empty) but that has no "fees" block (written before the block
-    existed) is upgraded by one fetch of the 19 MB listing, through the
-    retried GET. Live runs never upgrade (a retry can wait about a minute
-    and log WARNINGs): they read the file only, so an old file gives {} and
-    every market the full fee, the safe direction (a fee is never lowered
-    by a multiplier it could not read). The
-    backtest (backtest.py) upgrades. A missing or stale file is never fetched
-    here (the categories reader just tried). It never raises, and a failed
+    first with the same client and whose fetch writes both blocks. So it
+    reads the file as it stands, with no request. The one exception is
+    opt-in: with upgrade=True, a file whose "series" block is non-empty but
+    that has no "fees" block (written before the block existed, and still
+    there because the categories reader's fetch just failed) is upgraded by
+    one more fetch of the listing, through the retried GET. Live runs never
+    upgrade (a retry can wait about a minute and log WARNINGs): they read
+    the file only, so an old file gives {} and every market the full fee,
+    the safe direction (a fee is never lowered by a multiplier it could not
+    read). The backtest (backtest.py) upgrades. A missing file is never
+    fetched here (the categories reader just tried). It never raises, and a failed
     fetch, unreadable file or failed cache write adds no WARNING of the
     categories reader's own: they log at INFO. Logs one INFO line counting
     the series listed and those below 1.
@@ -661,8 +651,6 @@ def load_series_fee_multipliers(
     Args:
         client (Any): A KalshiClient pointed at prod, used only by an upgrade;
             None reads the cached copy only (a dev run; no request is made).
-        max_age_seconds (int): How young the file must be to be upgraded.
-            Used only with upgrade=True.
         upgrade (bool): Keyword-only. Allow the one upgrade fetch above.
             Defaults to False.
 
@@ -673,39 +661,32 @@ def load_series_fee_multipliers(
     """
     cached = _read_series_cache_quietly()
     cached_fees: dict[str, tuple[str, float | None]] | None = None
-    fetched_at: datetime | None = None
     has_series = False
     if cached is not None:
         cached_fees = _parse_series_fees(cached.get("fees"))
         has_series = bool(_parse_series_categories(cached.get("series")))
-        try:
-            fetched_at = datetime.fromisoformat(cached.get("fetched_at"))
-        except (TypeError, ValueError):
-            fetched_at = None
 
     def known(fees: dict[str, tuple[str, float | None]] | None) -> dict[str, float]:
         return {t: m for t, (_, m) in (fees or {}).items() if m is not None}
 
     result = known(cached_fees)
-    if upgrade and client is not None and cached_fees is None and has_series \
-            and fetched_at is not None and fetched_at.tzinfo is not None:
+    if upgrade and client is not None and cached_fees is None and has_series:
         now = datetime.now(UTC)
-        if 0 <= (now - fetched_at).total_seconds() < max_age_seconds:
-            # A current file from before the "fees" block: upgrade it once
+        # A file from before the "fees" block: upgrade it once
+        try:
+            fresh, fees = _fetch_series_listing(client)
+        except Exception as exc:  # never end a run over it (readers charge the full fee)
+            logging.info("Series fee listing unavailable (%s) — every series is charged "
+                         "the full fee", _exception_summary(exc))
+        else:
+            result = known(fees)
             try:
-                fresh, fees = _fetch_series_listing(client)
-            except Exception as exc:  # never end a run over it (readers charge the full fee)
-                logging.info("Series fee listing unavailable (%s) — every series is charged "
-                             "the full fee", _exception_summary(exc))
-            else:
-                result = known(fees)
-                try:
-                    _save_series_listing(now, fresh, fees)
-                except Exception as exc:  # the listing is in hand: only the cache is lost
-                    logging.info(
-                        "Series fee multipliers: could not cache Kalshi's /series listing "
-                        "(%s) — this run still uses the %d series it fetched",
-                        _exception_summary(exc), len(fresh))
+                _save_series_listing(now, fresh, fees)
+            except Exception as exc:  # the listing is in hand: only the cache is lost
+                logging.info(
+                    "Series fee multipliers: could not cache Kalshi's /series listing "
+                    "(%s) — this run still uses the %d series it fetched",
+                    _exception_summary(exc), len(fresh))
     _log_fee_multipliers(result)
     return result
 
