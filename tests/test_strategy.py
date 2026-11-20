@@ -2915,6 +2915,13 @@ class TestTimeSeriesKellyParity:
             func = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
                         and node.name == mode)
             [read] = _calls_to(func, "load_series_categories")
+            if mode == "_run_prod":
+                # Fetched again every production run (no cached copy is young
+                # enough), so a series Kalshi added since the copy was saved
+                # is filed by its real category and tag
+                assert ast.unparse(read) == (
+                    "load_series_categories(client, "
+                    "max_age_seconds=LIVE_SERIES_LISTING_MAX_AGE_SECONDS)")
             [fees] = _calls_to(func, "load_series_fee_multipliers")
             [attach] = _calls_to(func, "_attach_fee_multipliers")
             # The run's markets, and the multipliers just read, handed to the attach

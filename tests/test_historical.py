@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from kalshi_betting import historical
+from kalshi_betting import config, historical
 
 
 def _read_slice_file(path) -> list[dict]:
@@ -6825,6 +6825,33 @@ class TestLoadSeriesCategories:
         calls = self._stub(monkeypatch, self.LISTING)
         assert "KXNCAAMBGAME" in historical.load_series_categories(MagicMock())
         assert len(calls) == 1
+
+    def test_a_production_run_fetches_over_a_copy_saved_moments_ago(self, cache,
+                                                                     monkeypatch):
+        # A production run passes config.LIVE_SERIES_LISTING_MAX_AGE_SECONDS:
+        # no cached copy is young enough, so a series Kalshi added since the
+        # copy was saved is in the listing the run files its pairs by
+        cache.write_text(json.dumps({"fetched_at": datetime.now(UTC).isoformat(),
+                                     "series": {"KXA": ["Sports", ["Soccer"]]}}))
+        calls = self._stub(monkeypatch, self.LISTING)
+        got = historical.load_series_categories(
+            MagicMock(), max_age_seconds=config.LIVE_SERIES_LISTING_MAX_AGE_SECONDS)
+        assert "KXNCAAMBGAME" in got and "KXA" not in got
+        assert len(calls) == 1
+        # ... and the fetch replaced the copy, which the run's fee multipliers
+        # are read from next
+        assert set(json.loads(cache.read_text())["series"]) == set(got)
+
+    def test_a_production_run_whose_fetch_fails_keeps_the_cached_copy(self, cache,
+                                                                      monkeypatch, caplog):
+        cache.write_text(json.dumps({"fetched_at": datetime.now(UTC).isoformat(),
+                                     "series": {"KXA": ["Sports", ["Soccer"]]}}))
+        self._stub(monkeypatch, RuntimeError("offline"))
+        with caplog.at_level(logging.WARNING):
+            assert historical.load_series_categories(
+                MagicMock(), max_age_seconds=config.LIVE_SERIES_LISTING_MAX_AGE_SECONDS) == {
+                "KXA": ("Sports", ("Soccer",))}
+        assert "using the cached copy of 1 series" in caplog.text
 
     def test_a_failed_fetch_falls_back_to_the_stale_copy(self, cache, monkeypatch, caplog):
         old = datetime(2020, 1, 1, tzinfo=UTC)

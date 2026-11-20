@@ -534,8 +534,10 @@ def load_series_categories(
         client (Any): A KalshiClient pointed at prod (build_prod_live_client() or
             a production run's own), or None to read the cached copy only.
         max_age_seconds (int): Reuse the cached copy while it is younger than
-            this. Defaults to config.SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS.
-            Ignored when client is None.
+            this. Defaults to config.SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS (a
+            week, for the backtest and the dashboards). A production run
+            passes config.LIVE_SERIES_LISTING_MAX_AGE_SECONDS (0), so it
+            fetches every time. Ignored when client is None.
 
     Returns:
         dict[str, tuple[str, tuple[str, ...]]]: series ticker -> (category,
@@ -642,7 +644,8 @@ def load_series_fee_multipliers(
     and the backtester carry it so a later change can.
 
     This reader is a companion of load_series_categories, which a run calls
-    first with the same client and whose fetch (the weekly refresh) writes
+    first with the same client and whose fetch (every production run's, or
+    the backtest's and the dashboards' weekly refresh) writes
     both blocks. So it reads the file as it stands, with no request. The one
     exception is opt-in: with upgrade=True, a file that load_series_categories
     would serve as current (younger than max_age_seconds, its "series" block

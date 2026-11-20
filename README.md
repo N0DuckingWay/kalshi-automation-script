@@ -256,8 +256,8 @@ main.py
   ├─ scanner.fetch_open_events_with_markets() — fetch open events + their markets from EVERY exchange shard, tagged; combo (MVE) markets are not read (config.INCLUDE_MVE_MARKETS off) (attaches event titles for grouping; drops only markets on trading-inactive shards)
   ├─ main._log_shard_coverage()    — audit advertised shards vs ingested markets/funds (reports, never aborts;
   │                                   the empty "Combos" shard is named as not read, not as a gap)
-  ├─ historical.load_series_categories() — read Kalshi's /series listing once per run (prod: the cached copy,
-  │                                   refreshed once a week; dev: the cached copy only); a run stopped below $50, or one
+  ├─ historical.load_series_categories() — read Kalshi's /series listing once per run (prod: fetched again every
+  │                                   run, the cached copy only if that fails; dev: the cached copy only); a run stopped below $50, or one
   │                                   whose ingest scanned nothing (exit 30), reads none
   ├─ historical.load_series_fee_multipliers() — each series' fee multiplier, from the same listing and cache file
   │                                   (read from the file the listing's refresh writes; no request of its own); carried, not yet used for a fee
@@ -743,7 +743,8 @@ falls back to `kalshi_private_key.pem` when it's absent.
   backtest_cache/                ← Disk cache for historical data
     series_categories.json        ← Kalshi's category + tags per series (dashboard breakdowns and the
                                     live category/tag filter), plus each series' fee type and fee
-                                    multiplier (not yet used); refreshed weekly
+                                    multiplier (not yet used); fetched again every production
+                                    run, refreshed weekly by the backtest and the dashboards
     event_competitions.json       ← Each event's competition label, left by an earlier backtest:
                                     nothing reads or writes it, and it may be deleted
     treasury_bill_rates.json      ← The 8-week T-bill's auction yields (Treasury Fiscal Data), the
@@ -1760,10 +1761,13 @@ The filter runs after the time-series finder and before any
 order book is read; with neither set it does nothing. It reads no listing of
 its own: every run reads the listing once, right after the market fetch, and
 the filter (and, on a run started with `--result-file`, each trade's category
-and tag in its result) uses that copy. A production run
-refreshes the listing when its cached copy
-(`backtest_cache/series_categories.json`) is over a week old; a dev run reads
-the cached copy only. With no listing at all it keeps no pair (it never
+and tag in its result) uses that copy. A production run fetches the listing
+again every run (`config.LIVE_SERIES_LISTING_MAX_AGE_SECONDS`, about a second),
+so a series Kalshi added since the last run is filed by its real category and
+tag. Only when that fetch fails does it use the cached copy
+(`backtest_cache/series_categories.json`), and then it leaves out any pair
+whose series the copy lacks, since that pair's category and tag are not known.
+A dev run reads the cached copy only. With no listing at all it keeps no pair (it never
 guesses a category) — the run then finds no pair and exits `0`, like any run
 that finds none, so the filter's WARNING is the line that says why — and a
 name no series carries (for a tied tag, a category and tag no series carries

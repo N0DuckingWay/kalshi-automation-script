@@ -168,6 +168,7 @@ from .config import (
     EXIT_TIME_SERIES_SKIPPED,
     EXIT_TRADES_NEED_ATTENTION,
     LIVE_DEFAULTS_FROM_CONFIG,
+    LIVE_SERIES_LISTING_MAX_AGE_SECONDS,
     MIN_BALANCE_CENTS,
     PRICE_MOVE_STEP_CENTS,
     PROJECT_ROOT,
@@ -1794,7 +1795,10 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     stay blocked.
 
     Every run reads Kalshi's /series listing once, right after the market
-    fetch (a cached copy, refreshed once a week): the category/tag filter
+    fetch (fetched again each run, so it lists the series Kalshi added
+    since the last run; the cached copy only when that fetch fails, and
+    then the filter leaves out any pair whose series the copy lacks): the
+    category/tag filter
     and, handed a report (--result-file), each trade's category and tag in
     the report read it. Each market's fee multiplier, from the same cache
     file, is set right after (_attach_fee_multipliers), before the sale
@@ -1926,11 +1930,14 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         report.message = blind_reason
         return EXIT_NO_TRADEABLE_SHARDS
 
-    # Kalshi's /series listing, once per run (cached a week): what the
-    # category/tag filter and the run result file a pair by. Read first,
-    # because its weekly refresh writes the cache file the fee multipliers
+    # Kalshi's /series listing, fetched again every production run, so a
+    # series Kalshi added since the cached copy was saved is filed by its real
+    # category and tag (the cached copy is used only when the fetch fails):
+    # what the category/tag filter and the run result file a pair by. Read
+    # first, because its fetch writes the cache file the fee multipliers
     # below are read from
-    series_categories = load_series_categories(client)
+    series_categories = load_series_categories(
+        client, max_age_seconds=LIVE_SERIES_LISTING_MAX_AGE_SECONDS)
     # Each series' fee multiplier (each leg's fee, and a paid-out partner's in
     # the sale block, read it when confirmed), read from the cache file the
     # listing above refreshed: no request of its own on a live run, so an old

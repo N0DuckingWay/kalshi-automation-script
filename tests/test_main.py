@@ -399,6 +399,29 @@ def _seed_series_listing(series: dict, fetched_at: datetime | None = None, *,
          "fees": {t: ["quadratic", (fees or {}).get(t, 1)] for t in series}}))
 
 
+def _fetch_seeded_series_listing(client) -> tuple[dict, dict]:
+    """
+    Answer a fetch of Kalshi's /series listing with the listing seeded on disk.
+
+    Stands in for historical._fetch_series_listing, which every production
+    run calls right after its market fetch (no cached copy is young enough).
+    It reads the copy _seed_series_listing wrote when the fetch is made, so
+    a test may seed its listing after building its client, and the rest of
+    the read (saving the copy, reading the fee multipliers from it) runs as
+    it does live.
+
+    Args:
+        client: The client the run fetches with (unused).
+
+    Returns:
+        tuple[dict, dict]: (series ticker -> (category, tags), series ticker ->
+            (fee type, multiplier)), as historical._fetch_series_listing returns them.
+    """
+    cached = json.loads(historical._SERIES_CATEGORIES_CACHE.read_text())
+    return (historical._parse_series_categories(cached.get("series")),
+            historical._parse_series_fees(cached.get("fees")) or {})
+
+
 def _main_with(monkeypatch, argv: list, **patches) -> dict:
     """
     Run main.main() with argv up to its dispatch and return what it did.
@@ -2922,13 +2945,14 @@ def _live_shape_client(
     else:
         monkeypatch.setattr(scanner_mod, "INCLUDE_MVE_MARKETS", False)
 
-    # A fresh cached /series listing, which every run reads right after the
-    # market fetch: a production run then makes no listing request, so
-    # client.rest_client.request serves the order POSTs alone. It lists no
-    # series of the fixed set, so a pair is filed by its ticker prefix and
-    # every market is charged the full fee; a test seeds its own listing to
-    # file pairs or list fee multipliers
+    # A cached /series listing, which every run reads right after the market
+    # fetch: a dev run reads this copy, and a production run's fetch is
+    # answered with it, so client.rest_client.request serves the order POSTs
+    # alone. It lists no series of the fixed set, so a pair is filed by its
+    # ticker prefix and every market is charged the full fee; a test seeds its
+    # own listing to file pairs or list fee multipliers
     _seed_series_listing({"KXNOTLISTED": ["Other", []]})
+    monkeypatch.setattr(historical, "_fetch_series_listing", _fetch_seeded_series_listing)
 
     client = MagicMock()
 
@@ -3600,9 +3624,11 @@ class TestFeeMultipliersAreAttached:
         events: list = []
         real_load = main.load_series_categories
 
-        def load(client):
-            listing = real_load(client)
-            events.append(("listing", client, listing))
+        def load(client, **kwargs):
+            # A production run's fetch is answered with the seeded listing
+            # (_live_shape_client); the age the run asked for is kept
+            listing = real_load(client, **kwargs)
+            events.append(("listing", client, listing, kwargs))
             return listing
 
         def multipliers(markets) -> dict:
@@ -3651,9 +3677,11 @@ class TestFeeMultipliersAreAttached:
         settings = dataclasses.replace(live_settings(), rebalance=True)
         with caplog.at_level(logging.INFO):
             main._run_prod(client, _args(dry_run=True), settings)
-        # One read, with the run's own client
+        # One read, with the run's own client, fetched again (no cached copy
+        # is young enough)
         reads = [event for event in events if event[0] == "listing"]
         assert len(reads) == 1 and reads[0][1] is client
+        assert reads[0][3] == {"max_age_seconds": config.LIVE_SERIES_LISTING_MAX_AGE_SECONDS}
         listing = reads[0][2]
         # The listing first, then the trim planner and the time-series finder,
         # then the filter, handed the very same copy
@@ -3686,7 +3714,7 @@ class TestFeeMultipliersAreAttached:
                                                   max_horizon_days=None))
         # No listing client: the sandbox key never signs a production request
         reads = [event for event in events if event[0] == "listing"]
-        assert len(reads) == 1 and reads[0][1] is None
+        assert len(reads) == 1 and reads[0][1] is None and reads[0][3] == {}
         assert [event[0] for event in events] == [
             "listing", "time_series", "filter"]
         # Every market's fee multiplier is set before the finder: dev drops no
@@ -9780,7 +9808,7 @@ class TestSizesOnPortfolioValue:
         # market fetch: a stand-in listing no market of the run, so no request
         # reaches the fake client and the run has a listing to file by
         monkeypatch.setattr(main, "load_series_categories",
-                            lambda client: {"KXNOTLISTED": ("Other", ())})
+                            lambda client, **kwargs: {"KXNOTLISTED": ("Other", ())})
         with caplog.at_level(logging.INFO):
             code = main._run_prod(MagicMock(), _args(dry_run=dry_run), report=report)
         return code, seen
@@ -10759,7 +10787,7 @@ class TestResultFile:
                 TradeResult(spec=s, status=status) for s in portfolio],
             "append_to_prod_log": lambda *a, **k: logged.append(a) or pathlib.Path("/fake"),
             # Kalshi's /series listing, which the run reads to file each trade
-            "load_series_categories": lambda client: _RESULT_FILE_LISTING,
+            "load_series_categories": lambda client, **kwargs: _RESULT_FILE_LISTING,
         }
         patches.update(stubs)
         argv = (["--mode", "prod"] + (["--result-file", str(path)] if result_file else [])
@@ -11285,12 +11313,13 @@ class TestResultFile:
         client = MagicMock()
         events = []
 
-        def listing(client_):
+        def listing(client_, **kwargs):
             """
             Record a read of Kalshi's /series listing, then return it.
 
             Args:
                 client_: The client the run reads it with.
+                **kwargs: How old a cached copy the run accepts (ignored).
 
             Returns:
                 dict: _RESULT_FILE_LISTING.
@@ -11333,7 +11362,7 @@ class TestResultFile:
         # The listing could not be read and no copy is cached: each trade's
         # category and tag are null, not infer_category's "Other"
         seen, result, _ = self._run(monkeypatch, tmp_path, caplog,
-                                    load_series_categories=lambda client: {})
+                                    load_series_categories=lambda client, **kwargs: {})
         assert seen["code"] == result["exit_code"] == EXIT_OK
         assert result["trades"] == [{**self._trade("executed"), "category": None, "tag": None}]
 
@@ -11345,21 +11374,23 @@ class TestResultFile:
         reads = []
         seen, result, _ = self._run(
             monkeypatch, tmp_path, caplog, find_time_series_pairs=lambda *a, **k: [],
-            load_series_categories=lambda client: reads.append(client) or {})
+            load_series_categories=lambda client, **kwargs: reads.append(client) or {})
         assert seen["code"] == result["exit_code"] == EXIT_OK
         assert len(reads) == 1 and result["trades"] == []
 
     def test_a_run_without_the_flag_reads_the_listing_once(self, monkeypatch, tmp_path,
                                                            caplog):
         # A scheduled run writes no result and sets no category/tag filter, and
-        # still reads the listing once (a cached copy, refreshed once a week):
-        # each market's fee multiplier is read from the copy that read refreshes
+        # still reads the listing once, fetched again (no cached copy is young
+        # enough, so a series Kalshi added since the last run is filed by its
+        # real category and tag): each market's fee multiplier is read from
+        # the copy that fetch saves
         reads = []
         seen, result, _ = self._run(
             monkeypatch, tmp_path, caplog, result_file=False,
-            load_series_categories=lambda client: reads.append(client) or {})
+            load_series_categories=lambda client, **kwargs: reads.append(kwargs) or {})
         assert seen["code"] == EXIT_OK and result is None
-        assert len(reads) == 1
+        assert reads == [{"max_age_seconds": config.LIVE_SERIES_LISTING_MAX_AGE_SECONDS}]
         # ... and it traded and wrote its trade log as before
         assert len(seen["trade_log_calls"]) == 1
         assert not (tmp_path / "result.json").exists()
