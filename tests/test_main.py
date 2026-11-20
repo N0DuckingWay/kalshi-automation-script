@@ -419,6 +419,29 @@ def _seed_series_listing(series: dict, fetched_at: datetime | None = None, *,
          "fees": {t: ["quadratic", (fees or {}).get(t, 1)] for t in series}}))
 
 
+def _fetch_seeded_series_listing(client) -> tuple[dict, dict]:
+    """
+    Answer a fetch of Kalshi's /series listing with the listing seeded on disk.
+
+    Stands in for historical._fetch_series_listing, which every production
+    run calls right after its market fetch (the listing is fetched on every
+    read with a client). It reads the copy _seed_series_listing wrote when the fetch is made, so
+    a test may seed its listing after building its client, and the rest of
+    the read (saving the copy, reading the fee multipliers from it) runs as
+    it does live.
+
+    Args:
+        client: The client the run fetches with (unused).
+
+    Returns:
+        tuple[dict, dict]: (series ticker -> (category, tags), series ticker ->
+            (fee type, multiplier)), as historical._fetch_series_listing returns them.
+    """
+    cached = json.loads(historical._SERIES_CATEGORIES_CACHE.read_text())
+    return (historical._parse_series_categories(cached.get("series")),
+            historical._parse_series_fees(cached.get("fees")) or {})
+
+
 def _main_with(monkeypatch, argv: list, **patches) -> dict:
     """
     Run main.main() with argv up to its dispatch and return what it did.
@@ -3039,13 +3062,14 @@ def _live_shape_client(
     else:
         monkeypatch.setattr(scanner_mod, "INCLUDE_MVE_MARKETS", False)
 
-    # A fresh cached /series listing, which every run reads right after the
-    # market fetch: a production run then makes no listing request, so
-    # client.rest_client.request serves the order POSTs alone. It lists no
-    # series of the fixed set, so a pair is filed by its ticker prefix and
-    # every market is charged the full fee; a test seeds its own listing to
-    # file pairs or list fee multipliers
+    # A cached /series listing, which every run reads right after the market
+    # fetch: a dev run reads this copy, and a production run's fetch is
+    # answered with it, so client.rest_client.request serves the order POSTs
+    # alone. It lists no series of the fixed set, so a pair is filed by its
+    # ticker prefix and every market is charged the full fee; a test seeds its
+    # own listing to file pairs or list fee multipliers
     _seed_series_listing({"KXNOTLISTED": ["Other", []]})
+    monkeypatch.setattr(historical, "_fetch_series_listing", _fetch_seeded_series_listing)
 
     client = MagicMock()
 
@@ -12094,8 +12118,9 @@ class TestResultFile:
     def test_a_run_without_the_flag_reads_the_listing_once(self, monkeypatch, tmp_path,
                                                            caplog):
         # A scheduled run writes no result and sets no category/tag filter, and
-        # still reads the listing once (a cached copy, refreshed once a week):
-        # each market's fee multiplier is read from the copy that read refreshes
+        # still reads the listing once, fetched again (so a series Kalshi added
+        # since the last run is filed by its real category and tag): each
+        # market's fee multiplier is read from the copy that fetch saves
         reads = []
         seen, result, _ = self._run(
             monkeypatch, tmp_path, caplog, result_file=False,

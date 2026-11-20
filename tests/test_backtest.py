@@ -1532,7 +1532,7 @@ class TestDashboardHandoff:
         assert kwargs["interval_discount"] == result.primary.k
 
     def test_the_series_categories_are_passed_through(self, cli, monkeypatch):
-        # One read of the listing, before the sweep (its weekly refresh also
+        # One read of the listing, before the sweep (its fetch also
         # rewrites the fee multipliers the sweep is handed): the dashboard files
         # each trade by it, and the sweep is not handed it
         reads: list = []

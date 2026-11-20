@@ -2626,7 +2626,9 @@ class _LiveReader:
             str: The JSON text.
         """
         client = self._kalshi()
-        # Cross-module: the categories the bot's purchases are filed under, as on the backtest page
+        # Cross-module: the categories the bot's purchases are filed under, as on the
+        # backtest page, from Kalshi's /series listing fetched again on every load
+        # (about a second; the saved copy if the fetch fails)
         series = historical.load_series_categories(client)
         risk_free = self._risk_free.first()
         view = live_portfolio.build_live_view(client, risk_free=risk_free,
