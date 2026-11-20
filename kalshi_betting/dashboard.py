@@ -137,7 +137,7 @@ Purpose:
     When the family also carries "Rebalance until" choices
     (backtester.RebalanceSweep.maturity_days: add to or trim a held position
     only while its later market closes at least that many days after the
-    run), the walk's last phase reads every Rebalance scenario at each
+    run), the walk then reads every Rebalance scenario at each
     choice and each minimum (_walk_maturity_cells, through
     RebalanceSweep.maturity_grid, which starts from the runs already read
     and simulates only the runs that differ). A run of its own is packed as
@@ -153,6 +153,26 @@ Purpose:
     chunk, and a page that shows Rebalance without the choices says why in
     a short note beside it. Like Rebalance it changes the trade sections and
     the header's trade count only.
+
+    The run's own "Skip if closing within" choice (the backtest buys a pair
+    only when both its contracts close at least that many days after the
+    weekly checkpoint; 7 days unless the run says otherwise) is the page as
+    rendered. When the sweep also carries the other choices of that menu
+    (BacktestSweep.close_sweep, a lazy backtester.CloseSweep: off, 3, 7 and
+    14 days but the run's own), the walk's last phase reads every scenario
+    the bar's first four selects reach — band, Tier floors, k and size cap —
+    at each of those choices, one choice at a time (_with_close,
+    _walk_close_cells: each cell simulated as it is read, the "all"
+    population only). A run of its own is packed as a chunk, a list equal
+    to one already packed shares that chunk, and the base block carries the
+    choices ("close", "close_own") and each choice's chunk ids per scenario
+    ("grid_close" and its tier-floors-off twin, with "close_state"). The bar
+    has no menu for these choices, and the page's script does not read
+    those keys: the one thing a reader sees of them is the bar's Exclude
+    menus, which list a category or tag only another choice traded (at 0
+    trades), as they do one only a Rebalance, Sell or tier-floors-off run
+    traded. A choice whose results cannot be read or simulated costs that
+    choice alone, with one WARNING naming it.
 
     The bar's Sell choice is "no selling" (the page as rendered) or one of the
     sell family's levels (backtester.SellSweep; config.TAKE_PROFIT_LEVELS,
@@ -299,7 +319,10 @@ Dependencies:
     rebalance_sweep (a backtester.RebalanceSweep, whose move_grid hands back
     a backtester.SameMove for a minimum price movement that repeats another
     run, and whose maturity_grid a backtester.SameMaturity for a "Rebalance
-    until" choice that does) by their attributes; imports backtester itself to
+    until" choice that does) and close_sweep (a backtester.CloseSweep, whose
+    sweep() builds one choice's lazy CapSweep) by their attributes, with
+    _close_choice_label() to word a "Skip if closing within" choice as the
+    run's log lines do; imports backtester itself to
     read, and in a worker process install, its SCHEDULED_RUN and
     TAKE_PROFIT_HOLD_DAYS (_run_sell_task, which installs config's
     CONFIRMED_FEE_MULTIPLIERS beside them; TAKE_PROFIT_HOLD_DAYS also names
@@ -468,8 +491,10 @@ Notes:
     (_GridSource.rebalance_cell and rebalance_off_cell, handed to the
     visitors that define a `rebalance` method: the chunk visitor), their
     minimum price movements (move_cell, to the visitors with a `move`
-    method) and their "Rebalance until" choices (maturity_cell, to the
-    visitors with a `maturity` method) — by
+    method), their "Rebalance until" choices (maturity_cell, to the
+    visitors with a `maturity` method) and, last, each other "Skip if
+    closing within" choice in turn (_GridSource.close_sweeps, to the
+    visitors with a `close` method: the chunk visitor) — by
     visitors that keep only what they
     build (the Sell select's cells are not walked: _build_sell_grid simulates
     them afterwards, in worker processes, over the grid the walk walked):
@@ -506,7 +531,9 @@ Notes:
     WARNING, the header saying so, the tier-on cap axis kept); an Add to
     held pairs cell that cannot be simulated costs only that choice (one
     WARNING, the select shut with a note, every other chunk kept), and so
-    does a Sell band whose simulations fail (one WARNING naming the band,
+    does a "Skip if closing within" choice whose results cannot be read or
+    simulated (one WARNING naming it, every other chunk kept), and a Sell
+    band whose simulations fail (one WARNING naming the band,
     its cells shown as never simulated) or a Sell build that cannot run at
     all (one WARNING, the select shut); a chunk that
     cannot be built,
@@ -659,6 +686,7 @@ from .backtester import (
     _calibration_bucket,
     _cap_percent,
     _carry_steps,
+    _close_choice_label,
     _exact_label,
     _live_filter_text,
     _live_rebalance_note,
@@ -8122,6 +8150,27 @@ class _GridSource:
             "reused" and "same" counts maturity_cell's reads have added up
             for that setting, read only for the walk's log; empty until a
             cell is read.
+        close_days (tuple[int, ...]): The other "Skip if closing within"
+            choices the run worked out (backtester.CloseSweep.days: every
+            choice of the menu but the run's own, in whole days, ascending,
+            0 for off; with one, the backtest buys a pair only when both its
+            contracts close at least that many days after the weekly
+            checkpoint), each listed even when its results could not be
+            read, so the page can name it. Empty when the run carried no such
+            family, or one that holds no choice, does not fit this grid or
+            cannot be read (_with_close).
+        close_own (int | None): The run's own choice (CloseSweep.own_days, 0
+            for off), whose results are the grid's main ones; None without
+            close_days.
+        close_attached (tuple[int, ...]): The choices of close_days whose
+            results the walk reads (ascending): every one whose lazy sweeps
+            could be built, less any the walk could not read to the end.
+        close_sweeps (dict): (choice, tier floors off) -> the
+            backtester.CapSweep that choice's cells come from at the grid's
+            caps (CloseSweep.sweep), simulated as the walk reads them: the
+            tier-on one for every attached choice and, when the grid has the
+            tier-floors-off view, the tier-off one too (read at the binding
+            bands only). Empty without an attached choice.
     """
     bands: tuple
     ks: tuple
@@ -8150,6 +8199,10 @@ class _GridSource:
     maturity_days: tuple[int, ...] = ()
     maturity_cell: Callable | None = None
     maturity_stats: dict = field(default_factory=dict)
+    close_days: tuple[int, ...] = ()
+    close_own: int | None = None
+    close_attached: tuple[int, ...] = ()
+    close_sweeps: dict = field(default_factory=dict)
 
 
 def _primary_calibration(sweep: BacktestSweep | None) -> IntervalCalibration | None:
@@ -8615,6 +8668,140 @@ def _with_sell(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSour
         source.off_fallback(), **fields))
 
 
+def _close_choice_text(days: int) -> str:
+    """
+    Name one "Skip if closing within" choice in a log line.
+
+    Args:
+        days (int): The choice in whole days, 0 for off.
+
+    Returns:
+        str: '"Skip if closing within" off', or e.g. '"Skip if closing
+            within" 3 days' (backtester's wording of a choice).
+    """
+    return f'"Skip if closing within" {_close_choice_label(days)}'
+
+
+def _with_close(source: "_GridSource", sweep: BacktestSweep | None, *,
+                skip: frozenset = frozenset()) -> "_GridSource":
+    """
+    Attach the run's other "Skip if closing within" choices to a grid, when they fit.
+
+    The family (BacktestSweep.close_sweep, a backtester.CloseSweep) holds the
+    entries of every choice of the menu but the run's own (0 for off, 3, 7
+    and 14 days: the backtest buys a pair only when both its contracts close
+    at least that many days after the weekly checkpoint). It is lazy only:
+    each choice's cells are simulated as the walk reads them, the "all"
+    population alone, never adding to, trimming or selling a held pair. It
+    fits a grid on the very same bands and ks whose caps are among its own —
+    the size-cap grid, or the eager grid at the run's own cap, so the
+    choices survive the walk's cap-axis fallback — and, when the grid has
+    the tier-floors-off view, only if it also holds every band the tiers
+    bind at, so every choice the page shows has both Tier floors settings
+    whenever the page has both. A family that holds no choice, does not fit,
+    or whose axes cannot be read gets no view at all: one WARNING from this
+    call, and the source as it was. Each grid the page builds is offered the
+    family afresh, so the grid the walk falls back to (at the run's own cap)
+    warns a second time when the family does not suit it either.
+
+    Each choice, ascending, gets its own lazy size-cap sweeps over exactly
+    the grid's caps (CloseSweep.sweep): the tier-on one and, with the
+    tier-floors-off view, the tier-off one. A choice whose sweeps cannot be
+    built or whose entry events cannot be read (sweep() refuses a setting
+    whose curves would have no end day) costs that choice alone: one WARNING
+    naming it, and it is left out of close_attached, its events with it.
+    Every other choice's entry events, both settings, join the grid's events
+    (before the walk, so the bar's category and tag lists cover every trade
+    a choice could make). Every choice stays in close_days, so the page can
+    still name one that could not be read.
+
+    The grid's off_fallback (the eager tier-off lookup the walk swaps in when
+    a tier-floors-off cell fails) is re-wrapped to keep the choices, as
+    _with_rebalance and _with_sell keep their families; the choices' own
+    tier-off cells come from their own sweeps, so that fallback leaves them
+    as they are.
+
+    Args:
+        source (_GridSource): The grid, its tier-floors-off family already
+            attached (_with_tier_off).
+        sweep (BacktestSweep | None): The run's sweep, or None.
+        skip (frozenset): Keyword-only. Choices to leave out without trying
+            them (or warning again): those the grid the walk falls back from
+            could not attach (_grid_source). Empty (default) tries every one.
+
+    Returns:
+        _GridSource: The source itself when there is no family, no band or no
+            fit (with one WARNING when a family existed but holds no choice,
+            does not fit or cannot be read); else a copy carrying close_days,
+            close_own, close_attached, close_sweeps and the attached choices'
+            events.
+    """
+    family = getattr(sweep, "close_sweep", None) if sweep is not None else None
+    if family is None or source.bands == (None,):
+        return source
+    # The bands the tiers bind at, where each choice's tier-off cells are read
+    binding = (None if source.tier_binds is None else
+               {band for band, own in zip(source.bands, source.tier_binds, strict=True)
+                if own})
+    try:
+        days = tuple(sorted(family.days))
+        own_days = family.own_days
+        usable = (tuple(family.bands) == tuple(source.bands)
+                  and tuple(family.ks) == tuple(source.ks)
+                  and set(source.caps) <= set(family.caps)
+                  and (binding is None or binding <= set(family.off_bands)))
+    except Exception:
+        logging.warning('The other "Skip if closing within" choices could not be read; the '
+                        "page has no results for them", exc_info=True)
+        return source
+    if not days:
+        # A family with no choice has nothing to show: the page lists no
+        # choice and names no run's own choice
+        logging.warning('The run worked out no "Skip if closing within" choice besides its '
+                        "own; the page has no other choice to show")
+        return source
+    if not usable:
+        logging.warning('The other "Skip if closing within" choices do not match the page\'s '
+                        "grid of scenarios (its bands, ks or caps, or the bands the tier "
+                        "floors bind at); that grid has no results for them")
+        return source
+    sweeps: dict = {}
+    events = set(source.events)
+    attached = []
+    for choice in days:
+        if choice in skip:
+            continue
+        try:
+            # The choice's lazy sweeps at exactly the grid's caps: nothing is
+            # simulated until the walk reads a cell
+            on = family.sweep(choice, caps=source.caps)
+            # Every entry's event, as the simulations file their trades, so
+            # the bar lists a category only this choice could trade
+            found = set(on.entry_events())
+            off = None
+            if binding is not None:
+                off = family.sweep(choice, tier_floors=False, caps=source.caps)
+                found |= set(off.entry_events())
+        except Exception:
+            logging.warning("The %s results could not be read; the page has none for that "
+                            "choice", _close_choice_text(choice), exc_info=True)
+            continue
+        sweeps[(choice, False)] = on
+        if off is not None:
+            sweeps[(choice, True)] = off
+        events |= found
+        attached.append(choice)
+    fields = {"close_days": days, "close_own": own_days, "close_attached": tuple(attached),
+              "close_sweeps": sweeps, "events": frozenset(events)}
+    attached_grid = dataclasses.replace(source, **fields)
+    if source.off_fallback is None:
+        return attached_grid
+    # The walk swaps in off_fallback() when a tier-floors-off cell fails: it
+    # keeps the choices (and the events, so the bar's lists never move)
+    return dataclasses.replace(attached_grid, off_fallback=lambda: dataclasses.replace(
+        source.off_fallback(), **fields))
+
+
 def _trade_events(points) -> frozenset:
     """
     The (event ticker, fallback category) of every trade some points hold.
@@ -8740,6 +8927,8 @@ def _grid_source(
     k_used: float | None,
     *,
     use_cap_sweep: bool = True,
+    with_close: bool = True,
+    close_skip: frozenset = frozenset(),
 ) -> _GridSource:
     """
     Pick the grid of scenarios the page offers, from what the sweep carries.
@@ -8774,7 +8963,15 @@ def _grid_source(
     each logs a WARNING saying so (_warn_rebalance_lost_with_the_cap_sweep).
     Every banded
     shape, the walk's fallbacks included, carries the Sell family (_with_sell)
-    when its bands and ks are the grid's and its caps include the grid's.
+    when its bands and ks are the grid's and its caps include the grid's,
+    and so, when with_close is True, the other "Skip if closing within"
+    choices (_with_close, attached after the tier-floors-off family, whose
+    binding bands it reads): the size-cap grid at every cap, the eager grid
+    at the run's own. The size-cap grid's fallback (the eager grid the walk
+    falls back to) is built with close_skip naming the choices the size-cap
+    grid could not attach, so it neither tries them again nor warns about
+    them a second time. The grid without a recorded band carries none of
+    them, with a WARNING when the run carried them.
 
     The k axis is the sweep's own: its primary entry is sweep.primary.k,
     never k_used, which names the one k only without a sweep. An
@@ -8790,11 +8987,33 @@ def _grid_source(
         k_used (float | None): The k the page names (used without a sweep).
         use_cap_sweep (bool): Keyword-only. False ignores sweep.cap_sweep
             and the Rebalance family — the walk's fallback.
+        with_close (bool): Keyword-only. False attaches no "Skip if closing
+            within" choice: the scenario explorer's own rebuild
+            (_explorer_from_sweep), whose visitor reads none of their cells.
+            True (default).
+        close_skip (frozenset): Keyword-only. "Skip if closing within"
+            choices to leave out without trying them (_with_close's skip):
+            the size-cap grid's fallback passes those that grid could not
+            attach. Empty (default).
 
     Returns:
-        _GridSource: The grid (with its tier-floors-off family and its
-            Rebalance family, when the page can show them).
+        _GridSource: The grid (with its tier-floors-off family, its
+            Rebalance family, its other "Skip if closing within" choices and
+            its Sell family, when the page can show them).
     """
+    def close(source: _GridSource, skip: frozenset = close_skip) -> _GridSource:
+        """
+        Attach the other "Skip if closing within" choices, unless this grid takes none.
+
+        Args:
+            source (_GridSource): The grid, its tier-floors-off family attached.
+            skip (frozenset): The choices to leave out untried.
+
+        Returns:
+            _GridSource: _with_close's grid, or the source when with_close is False.
+        """
+        return _with_close(source, sweep, skip=skip) if with_close else source
+
     if sweep is None or sweep.primary.spread_band is None:
         if use_cap_sweep and sweep is not None and sweep.cap_sweep is not None:
             logging.warning("The size-cap sweep cannot be placed on a run whose primary "
@@ -8803,16 +9022,26 @@ def _grid_source(
             logging.warning("The Rebalance simulations cannot be placed on a run whose "
                             "primary records no spread band; the filter bar's Rebalance "
                             "select stays disabled")
+        if with_close and getattr(sweep, "close_sweep", None) is not None:
+            logging.warning('The other "Skip if closing within" choices cannot be placed on a '
+                            "run whose primary records no spread band; the page has no "
+                            "results for them")
         return _unbanded_source(sweep, trades, equity_df, k_used)
     capped = sweep.cap_sweep
     if use_cap_sweep and capped is not None:
         primary = sweep.primary
+        # The "Skip if closing within" choices the size-cap grid could not
+        # attach, filled in once it is built: its fallback (called only after
+        # this function has returned) leaves them out without trying them, or
+        # warning about them, again
+        refused: set = set()
         try:
             bands, ks, caps = tuple(capped.bands), tuple(capped.ks), tuple(capped.caps)
             if primary.spread_band in bands and primary.k in ks and capped.primary_cap in caps:
                 # The tier-floors-off family rides along (_with_tier_off), and
-                # so does the Rebalance family (_with_rebalance)
-                return _with_sell(_with_rebalance(_with_tier_off(_GridSource(
+                # so do the Rebalance family (_with_rebalance) and the other
+                # "Skip if closing within" choices (_with_close)
+                grid = close(_with_rebalance(_with_tier_off(_GridSource(
                     bands=bands, ks=ks, caps=caps,
                     primary=(bands.index(primary.spread_band), ks.index(primary.k),
                              caps.index(capped.primary_cap)),
@@ -8824,9 +9053,12 @@ def _grid_source(
                     # the categories and tags exist before any cell is simulated
                     events=frozenset(capped.entry_events()),
                     checks=bool(capped.checks), cap_sweep=capped,
-                    fallback=lambda: _grid_source(sweep, trades, equity_df, k_used,
-                                                  use_cap_sweep=False)), sweep), sweep),
-                    sweep)
+                    fallback=lambda: _grid_source(
+                        sweep, trades, equity_df, k_used, use_cap_sweep=False,
+                        with_close=with_close,
+                        close_skip=close_skip | frozenset(refused))), sweep), sweep))
+                refused.update(set(grid.close_days) - set(grid.close_attached))
+                return _with_sell(grid, sweep)
         except Exception:
             # The cap axis alone is lost, as when a cell cannot be simulated
             # in the walk: the eager points still give the bar every band and k
@@ -8834,20 +9066,23 @@ def _grid_source(
                             "the run's own cap only", exc_info=True)
             if getattr(sweep, "rebalance_sweep", None) is not None:
                 _warn_rebalance_lost_with_the_cap_sweep()
-            return _with_sell(_with_tier_off(_eager_source(sweep), sweep), sweep)
+            return _with_sell(close(_with_tier_off(_eager_source(sweep), sweep),
+                                    close_skip | frozenset(refused)), sweep)
         logging.warning(
             "The size-cap sweep does not hold this run's primary scenario (band %s, "
             "k %s, cap %s); the dashboard offers the run's own cap only",
             primary.spread_band, primary.k, capped.primary_cap)
         if getattr(sweep, "rebalance_sweep", None) is not None:
             _warn_rebalance_lost_with_the_cap_sweep()
-        return _with_sell(_with_tier_off(_eager_source(sweep), sweep), sweep)
+        return _with_sell(close(_with_tier_off(_eager_source(sweep), sweep)), sweep)
     source = _with_tier_off(_eager_source(sweep), sweep)
     # The walk's cap-axis fallback (use_cap_sweep False) never carries the
     # Rebalance view: that family's caps are the size-cap grid's, and the walk
-    # logs both the lost cap axis and the lost view. The Sell family fits the
-    # eager grid's one cap, so every shape keeps it
-    return _with_sell(_with_rebalance(source, sweep) if use_cap_sweep else source, sweep)
+    # logs both the lost cap axis and the lost view. The other "Skip if closing
+    # within" choices and the Sell family fit the eager grid's one cap, so
+    # every shape keeps them
+    return _with_sell(close(_with_rebalance(source, sweep) if use_cap_sweep else source),
+                      sweep)
 
 
 def _filter_labels(
@@ -9408,10 +9643,72 @@ def _walk_maturity_cells(source: _GridSource, takers: list,
     return None
 
 
+def _walk_close_cells(source: _GridSource, takers: list, axis_end: pd.Timestamp | None,
+                      days: int) -> Exception | None:
+    """
+    Hand every scenario of one other "Skip if closing within" choice to the visitors that take it.
+
+    Two passes over that choice's lazy size-cap sweeps
+    (source.close_sweeps): every (band, k) with the tier floors on, then,
+    when the grid has the tier-floors-off view, every binding band's cell
+    with them off. Each cell is read (the sweep simulates it here), cut to
+    the page's axis (_cut_to_axis) and handed to each visitor's close(choice,
+    band index, k index, cap index, {population: point}, off=...), one cell
+    alive at a time, the primary cap first. The page's own trades are never
+    substituted: each of these cells is a simulation of its own, over the
+    entries that choice lets in.
+
+    Args:
+        source (_GridSource): The grid (days is one of its close_attached).
+        takers (list): The visitors with a `close` method.
+        axis_end (pd.Timestamp | None): The page's last date.
+        days (int): The choice, in whole days (0 for off).
+
+    Returns:
+        Exception | None: The exception a cell raised, which stops this
+            choice; None when every cell was visited, or when every visitor
+            had failed and the rest were left unread.
+    """
+    pc = source.primary[2]
+    caps = [pc] + [ci for ci in range(len(source.caps)) if ci != pc]
+    phases = [(False, [(bi, ki) for bi in range(len(source.bands))
+                       for ki in range(len(source.ks))])]
+    if source.tier_binds is not None and (days, True) in source.close_sweeps:
+        phases.append((True, [(bi, ki) for bi, binds in enumerate(source.tier_binds) if binds
+                              for ki in range(len(source.ks))]))
+    for off, cells in phases:
+        capped = source.close_sweeps[(days, off)]
+        step = max(1, math.ceil(len(cells) / _WALK_PROGRESS_LINES))
+        for done, (bi, ki) in enumerate(cells, 1):
+            if all(getattr(visit, "failed", False) for visit in takers):
+                # A visitor that has failed keeps nothing it is handed, so
+                # no further cell is simulated for it
+                return None
+            try:
+                by_cap = capped.cell(source.bands[bi], source.ks[ki])
+            except Exception as exc:
+                return exc
+            by_cap = _cut_to_axis(by_cap, axis_end)
+            for ci in caps:
+                pops = by_cap.get(source.caps[ci])
+                if pops:
+                    for visit in takers:
+                        visit.close(days, bi, ki, ci, pops, off=off)
+            del by_cap
+            if done % step == 0 or done == len(cells):
+                logging.info("Dashboard: %d/%d %s read for %s%s (%d cap points simulated, %d "
+                             "shared so far)", done, len(cells),
+                             "binding band x k cells" if off else "band x k cells",
+                             _close_choice_text(days),
+                             " with the tier floors off" if off else "",
+                             getattr(capped, "simulated", 0), getattr(capped, "reused", 0))
+    return None
+
+
 def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | None
                ) -> tuple[Exception | None, _GridSource]:
     """
-    Hand every scenario of a grid to each visitor: tier-on, tier-off, rebalancing, price movements, "Rebalance until".
+    Hand every scenario of a grid to each visitor: tier-on, tier-off, rebalancing, price movements, "Rebalance until", other "Skip if closing within" choices.
 
     First the tier-on cells (_walk_cells: the primary cell and cap first, so
     the primary scenario's chunk is always chunk 0, one cell alive at a
@@ -9450,14 +9747,25 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
     until" choices (source.maturity_cell), its cells were walked and so
     were their minimums (if it has any), every one of those cells is read
     again at each choice and minimum for the visitors with a `maturity`
-    method (_walk_maturity_cells). These are the last cells to pack a
-    chunk, so dropping what they packed cuts into nothing else: a cell that
-    raises there costs the choices alone — ONE WARNING (with the traceback),
-    the grid returned without them, and `reset_maturity(grid)` on each taker
-    — while the Rebalance and Min. price movement views keep their chunks
-    and grids. A grid whose choices were not read to the end, for any
+    method (_walk_maturity_cells). A cell that raises there costs those
+    choices alone — ONE WARNING (with the traceback), the grid returned
+    without them, and `reset_maturity(grid)` on each taker — while the
+    Rebalance and Min. price movement views keep their chunks and grids. A
+    grid whose "Rebalance until" choices were not read to the end, for any
     reason, is returned without them, so no page shows a view of them that
-    was never built.
+    was never built. Last, each other "Skip if closing within" choice the
+    grid carries (source.close_attached), one at a time, ascending, for the
+    visitors with a `close` method (_walk_close_cells: its tier-on cells,
+    then its binding bands' tier-off cells). These are the last cells to
+    pack a chunk, and each choice is packed after the one before it, so
+    dropping what one choice packed cuts into nothing else: a cell that
+    raises costs that choice alone — ONE WARNING (with the traceback)
+    naming it, the grid returned without it, and `reset_close(grid,
+    choice)` on each visitor that defines it — while every earlier choice
+    and every other view keep their chunks and grids, and the next choice
+    is walked. A choice not read to the end, for any reason (a cell that
+    raised, no visitor to read it, every visitor failed), is returned
+    without it the same way.
 
     Args:
         source (_GridSource): The grid.
@@ -9475,7 +9783,11 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
             maturity(band index, k index, cap index, choice index, minimum
             place, SweepPoint | SameMaturity, off=bool) method taking each
             "Rebalance until" choice of those cells, with a
-            reset_maturity(grid) method dropping what maturity() built.
+            reset_maturity(grid) method dropping what maturity() built — and
+            a close(choice, band index, k index, cap index, {population:
+            SweepPoint}, off=bool) method taking each cell of the other
+            "Skip if closing within" choices, with a reset_close(grid,
+            choice) method dropping what close() built for that choice.
         axis_end (pd.Timestamp | None): The page's last date.
 
     Returns:
@@ -9485,7 +9797,8 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
             off_fallback when the tier-off size-cap sweep could not be read,
             and without the Rebalance family, or that family's minimum price
             movements or "Rebalance until" choices, when it could not be
-            simulated.
+            simulated, and without each other "Skip if closing within"
+            choice that could not be read to the end.
     """
     error = _walk_cells(source, visitors, axis_end)
     if error is not None:
@@ -9553,7 +9866,9 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
                     reset_move(source)
         else:
             moved = True
-    # The last cells to pack a chunk, so dropping them cuts into nothing else
+    # Packed after every other kind of cell but the other "Skip if closing
+    # within" choices, which are walked only after this phase's reset point
+    # below: dropping these chunks drops nothing else
     maturity_takers = [visit for visit in move_takers
                        if hasattr(visit, "maturity") and not getattr(visit, "failed", False)]
     chosen = False
@@ -9576,6 +9891,36 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
             reset_maturity = getattr(visit, "reset_maturity", None)
             if reset_maturity is not None:
                 reset_maturity(source)
+    # Last, the other "Skip if closing within" choices, one at a time and
+    # ascending: the last cells to pack a chunk, each choice after the one
+    # before it, so dropping one choice's chunks cuts into nothing else
+    for days in source.close_attached:
+        # A visitor that has failed keeps nothing more, so no cell is
+        # simulated for it
+        close_takers = [visit for visit in visitors
+                        if hasattr(visit, "close") and not getattr(visit, "failed", False)]
+        read = False
+        if close_takers:
+            error = _walk_close_cells(source, close_takers, axis_end, days)
+            if error is None:
+                # Read to the end, unless every taker failed and the rest was left unread
+                read = not all(getattr(visit, "failed", False) for visit in close_takers)
+            else:
+                # Costs this choice alone: every earlier choice and every other
+                # view keep what they built, and the next choice is walked
+                logging.warning("A simulation for %s failed; the page has no results for that "
+                                "choice", _close_choice_text(days), exc_info=error)
+        if not read:
+            # A choice not read to the end leaves the page no view of it
+            source = dataclasses.replace(
+                source,
+                close_attached=tuple(d for d in source.close_attached if d != days),
+                close_sweeps={key: capped for key, capped in source.close_sweeps.items()
+                              if key[0] != days})
+            for visit in visitors:
+                reset_close = getattr(visit, "reset_close", None)
+                if reset_close is not None:
+                    reset_close(source, days)
     return None, source
 
 
@@ -9595,12 +9940,15 @@ def _walk_grid(source: _GridSource, visitors: list,
     view's other caps, recovered inside the walk (_walk_once, off_fallback),
     with the tier-on cap axis kept. One walk reads, in order, the tier-on
     cells, the tier-floors-off ones, the Rebalance ones, each Rebalance
-    cell's minimum price movements, then its "Rebalance until" choices
-    (_walk_once); a Rebalance, price-movement or "Rebalance until" cell that
-    raises costs its own view alone (and the views read after it from its
-    runs), inside the walk. The fallback grid carries the same
-    tier-floors-off family, at the run's own cap (_grid_source attaches it
-    to every banded shape), so the second walk keeps the Tier floors choice.
+    cell's minimum price movements, its "Rebalance until" choices, then
+    each other "Skip if closing within" choice in turn (_walk_once); a
+    Rebalance, price-movement or "Rebalance until" cell that raises costs
+    its own view alone (and the views read after it from its runs), and a
+    "Skip if closing within" cell that raises costs its own choice alone,
+    inside the walk. The fallback grid carries the same tier-floors-off
+    family and the same "Skip if closing within" choices, at the run's own
+    cap (_grid_source attaches them to every banded shape), so the second
+    walk keeps the Tier floors choice and those choices' results.
     The other layer is each visitor's own: it catches its own failure and
     marks itself failed, costing only what it builds.
 
@@ -10455,9 +10803,23 @@ class _ChunkVisitor:
     that minimum for a run at "maturity", or the id this cell stored for an
     earlier choice. maturity_grid() and maturity_off_grid() read those grids
     for the page, a cell null where every choice at every minimum shows the
-    movement view's chunk. These cells are the last the walk packs, so
-    reset_maturity() drops what they packed and leaves everything else, the
-    Rebalance and movement grids included, as it was.
+    movement view's chunk. Only the other "Skip if closing within" choices
+    are packed after these cells, and the walk reaches them only after its
+    "Rebalance until" reset point, so reset_maturity() drops what these
+    cells packed and leaves everything else, the Rebalance and movement
+    grids included, as it was.
+
+    Each cell of another "Skip if closing within" choice (one the run worked
+    out besides its own: off, 3, 7 or 14 days) that the walk hands to
+    `close` is packed the same way (its own run, priced at the cell's k,
+    never the page's trades) and filed in that choice's grid,
+    grids_close[choice] for the tier-on cells and grids_close_off[choice]
+    for the binding bands' tier-off cells; it shares a chunk with any
+    scenario, of any phase or choice, that traded an equal list at an equal
+    k. These are the last cells the walk packs, one choice after another,
+    so reset_close() drops what one choice packed and leaves everything
+    else, every earlier choice included, as it was. close_grids() and
+    close_off_grids() read the grids for the page.
 
     A failure while building a chunk is caught here: one WARNING, and the
     visitor marks itself failed and drops what it built — the page is then
@@ -10466,10 +10828,10 @@ class _ChunkVisitor:
     _ChunkParkError passes every handler here, and the build stops.
 
     Every cut the walk makes (reset, reset_off, reset_rebalance, reset_move,
-    reset_maturity, a failure) shortens the list of chunks alone, placeholders
-    included; the files of parked chunks it drops stay in the parking folder,
-    where nothing moves them, and go with it, and an id handed out again parks
-    the new chunk over the dropped one's file.
+    reset_maturity, reset_close, a failure) shortens the list of chunks
+    alone, placeholders included; the files of parked chunks it drops stay
+    in the parking folder, where nothing moves them, and go with it, and an
+    id handed out again parks the new chunk over the dropped one's file.
 
     Attributes:
         axis (pd.DatetimeIndex): The page's date axis — the page's own curve.
@@ -10500,6 +10862,15 @@ class _ChunkVisitor:
             choices those of source.maturity_days and the places 0 for no
             minimum and i + 1 for source.moves[i]; empty when the grid
             carries no choice.
+        grids_close (dict): "Skip if closing within" choice (whole days, 0
+            for off) -> [band][k][cap] -> chunk id or None, for that
+            choice's tier-on cells; one per choice of source.close_attached,
+            a choice's grid dropped when the walk drops the choice
+            (reset_close).
+        grids_close_off (dict): The same for each choice's tier-off cells
+            at the bands the tiers bind at (other rows stay None until
+            close_off_grids() aliases them); empty when the grid has no
+            tier-floors-off view.
         primary_views (dict | None): The primary chunk's view key -> {"n"},
             for the bar's option counts.
         risk_free (RiskFreeRates | None): The rates every view's Sharpe and
@@ -10557,6 +10928,13 @@ class _ChunkVisitor:
         """
         Start again for a grid: its labels, an empty grid, no chunk.
 
+        Every grid starts empty (all None) on the grid's axes: the tier-on
+        grid, the tier-off one, the Rebalance, movement and "Rebalance
+        until" ones, and, per other "Skip if closing within" choice in
+        source.close_attached, grids_close[choice] for its tier-on cells and,
+        on a grid with the tier-floors-off view, grids_close_off[choice] for
+        its binding bands' tier-off cells.
+
         Args:
             source (_GridSource): The grid about to be walked.
         """
@@ -10591,6 +10969,16 @@ class _ChunkVisitor:
             {} if source.maturity_cell is None else
             {key: [[[None] * len(source.caps) for _ in source.ks] for _ in source.bands]
              for key in self.grids_rebalance})
+        # Each other "Skip if closing within" choice's grids: one per choice
+        # the walk will read, tier on, and the tier-off ones only on a grid
+        # with the tier-floors-off view
+        self.grids_close: dict[int, list] = {
+            days: [[[None] * len(source.caps) for _ in source.ks] for _ in source.bands]
+            for days in source.close_attached}
+        self.grids_close_off: dict[int, list] = (
+            {} if source.tier_binds is None else
+            {days: [[[None] * len(source.caps) for _ in source.ks] for _ in source.bands]
+             for days in source.close_attached if (days, True) in source.close_sweeps})
         self.primary_views: dict | None = None
         self.failed = False
         # (phase, band, k) of the cell whose list keys are memoised: a cell's
@@ -10601,7 +10989,9 @@ class _ChunkVisitor:
         # minimum price movement of a Rebalance cell has a phase of its own
         # ("move<i>", or "move<i>_off"), since one minimum's lists are gone
         # before the next minimum's are made; so has each "Rebalance until"
-        # choice at each minimum ("maturity<days>_<place>", or with "_off")
+        # choice at each minimum ("maturity<days>_<place>", or with "_off"),
+        # and each other "Skip if closing within" choice under each Tier
+        # floors setting ("close<days>", or "close<days>_off")
         self._cell: tuple[str, int, int] | None = None
         self._keys: dict[tuple[int, float | None], str] = {}
         # (chunks, row heads) held when the first off cell was packed, so
@@ -10613,6 +11003,9 @@ class _ChunkVisitor:
         self._move_mark: tuple[int, int] | None = None
         # ... and for the first "Rebalance until" choice packed, for reset_maturity
         self._maturity_mark: tuple[int, int] | None = None
+        # ... and, per other "Skip if closing within" choice, its first chunk
+        # packed, for reset_close
+        self._close_marks: dict[int, tuple[int, int]] = {}
         # One item per packed list whose tags the page cannot combine into a
         # mix (_list_payload's mix_gaps): generate_dashboard says so once
         self.mix_gaps: list = []
@@ -10657,7 +11050,9 @@ class _ChunkVisitor:
                 pairs rebalanced), "rebalance_off" (both), a Rebalance
                 cell at one minimum price movement ("move<i>", or
                 "move<i>_off") or at one "Rebalance until" choice and minimum
-                ("maturity<days>_<place>", or with "_off"); each is a
+                ("maturity<days>_<place>", or with "_off"), or a cell of
+                another "Skip if closing within" choice ("close<days>", or
+                "close<days>_off" with the tier floors off); each is a
                 separate memo from the others' cell of the same band and k.
                 "on" (default).
 
@@ -11066,10 +11461,11 @@ class _ChunkVisitor:
         Drop every "Rebalance until" chunk and grid.
 
         Every chunk and row head packed since the first "Rebalance until"
-        choice is dropped (with its dedup key). Those are the last cells the
-        walk packs, so every chunk before that mark and every other grid —
-        the Rebalance and minimum-price-movement ones included — are kept,
-        as are the labels.
+        choice is dropped (with its dedup key). The walk packs nothing after
+        those cells before it calls this (the other "Skip if closing within"
+        choices come later), so every chunk before that mark and every other
+        grid — the Rebalance and minimum-price-movement ones included — are
+        kept, as are the labels.
 
         Args:
             source (_GridSource): The grid walked from here on (without the
@@ -11166,6 +11562,127 @@ class _ChunkVisitor:
             return None
         return [self._maturity_rows(True, bi) if binds else on[bi]
                 for bi, binds in enumerate(self.source.tier_binds)]
+
+    def close(self, days: int, bi: int, ki: int, ci: int, pops: dict, *,
+              off: bool = False) -> None:
+        """
+        Build (or share) the chunk of one scenario's "all" point at another "Skip if closing within" choice.
+
+        Its own run, over the entries that choice lets in, priced at the
+        cell's k (never the page's trades); it shares a chunk with any
+        scenario, of any phase or choice, that traded an equal list at an
+        equal k. The choice's mark is set at its first chunk, so
+        reset_close() can drop exactly what it packed.
+
+        Args:
+            days (int): The choice, in whole days (0 for off).
+            bi (int): Band index.
+            ki (int): k index.
+            ci (int): Cap index.
+            pops (dict): Population -> SweepPoint; a scenario with no "all"
+                point stays a null cell of the choice's grid.
+            off (bool): Keyword-only. Whether the cell is a binding band's
+                with the tier floors off. False (default).
+        """
+        point = pops.get(_ALL_VIEW)
+        grid = (self.grids_close_off if off else self.grids_close).get(days)
+        if point is None or self.failed or grid is None:
+            return
+        if days not in self._close_marks:
+            self._close_marks[days] = (len(self.chunks), len(self.heads.items))
+        try:
+            # The choice and the Tier floors setting are part of the phase, so a
+            # key memoised for another choice's list (an object since freed,
+            # whose id a new list may reuse) is never read for this one
+            phase = f"close{days}" + ("_off" if off else "")
+            grid[bi][ki][ci] = self._chunk(bi, ki, self.source.ks[ki], point.trades,
+                                           point.equity_df, False, phase=phase)
+        except Exception:
+            self._fail()
+
+    def reset_close(self, source: _GridSource, days: int) -> None:
+        """
+        Drop one "Skip if closing within" choice's chunks and grids.
+
+        Every chunk and row head packed since the choice's first chunk is
+        dropped (with its dedup key). The walk reads the choices one after
+        another and drops a choice right after reading it, before the next
+        is read, and nothing is packed after the choices, so what follows
+        that mark is that choice's chunks alone: every earlier choice's
+        chunks and every other chunk, grid and label are kept.
+
+        Args:
+            source (_GridSource): The grid walked from here on (without the
+                choice).
+            days (int): The choice, in whole days (0 for off).
+        """
+        self.source = source
+        self._drop_since(self._close_marks.pop(days, None))
+        self.grids_close.pop(days, None)
+        self.grids_close_off.pop(days, None)
+
+    def _close_grid(self, days: int) -> list | None:
+        """
+        One "Skip if closing within" choice's tier-on grid, when the page has a view of it.
+
+        Args:
+            days (int): The choice, in whole days (0 for off).
+
+        Returns:
+            list | None: [band][k][cap] -> chunk id or None; None when the
+                choice has no grid (never attached, or dropped because the
+                walk could not read it to the end), when none of its cells
+                was simulated (a grid of nothing but None is never shown as a
+                view: the family simulates every cell it holds, so such a
+                grid says only that nothing could be read), or when a chunk
+                failed.
+        """
+        grid = self.grids_close.get(days)
+        if grid is None or self.failed:
+            return None
+        if all(cid is None for band in grid for row in band for cid in row):
+            return None
+        return grid
+
+    def close_grids(self) -> list:
+        """
+        Every other "Skip if closing within" choice's tier-on grid, in the grid's order.
+
+        Returns:
+            list: One entry per choice of source.close_days (ascending):
+                None for a choice with no view (_close_grid), else its
+                [band][k][cap] -> chunk id or None. Empty when the grid
+                carries no choice.
+        """
+        return [self._close_grid(days) for days in self.source.close_days]
+
+    def close_off_grids(self) -> list | None:
+        """
+        Every other "Skip if closing within" choice's grid with the tier floors off.
+
+        A binding band's row is the choice's own tier-floors-off chunks (None
+        where it has no point), every other band's that same choice's
+        tier-on row — its off view IS its run, as off_grid() has it.
+
+        Returns:
+            list | None: One entry per choice of source.close_days: None for
+                a choice with no tier-on view, else [band][k][cap] -> chunk
+                id or None. None when the grid has no tier-floors-off view.
+        """
+        if self.source.tier_binds is None:
+            return None
+        blank = [[None] * len(self.source.caps) for _ in self.source.ks]
+        out = []
+        for days in self.source.close_days:
+            on = self._close_grid(days)
+            if on is None:
+                out.append(None)
+                continue
+            own = self.grids_close_off.get(days)
+            out.append([[list(row) for row in ((own[bi] if own is not None else blank)
+                                               if binds else on[bi])]
+                        for bi, binds in enumerate(self.source.tier_binds)])
+        return out
 
     def _chunk(self, bi: int, ki: int, k: float | None, listed: list,
                curve: pd.DataFrame, primary: bool, *, phase: str = "on") -> int:
@@ -12714,9 +13231,11 @@ def _explorer_from_sweep(sweep: BacktestSweep, *,
     could not be read at all: the eager grid (_grid_source without the
     size-cap sweep: every band x k the run simulated, at the run's own cap,
     with the tier-floors-off family attached when the page can show it —
-    _with_tier_off — so the rebuilt section keeps its Tier floors view)
-    walked with an explorer visitor alone, which takes the off cells through
-    its `off` method, curves ending on the primary curve's last date.
+    _with_tier_off — so the rebuilt section keeps its Tier floors view, and
+    without the other "Skip if closing within" choices, which the explorer
+    never shows) walked with an explorer visitor alone, which takes the off
+    cells through its `off` method, curves ending on the primary curve's
+    last date.
 
     Args:
         sweep (BacktestSweep): A sweep with scenarios.
@@ -12731,9 +13250,10 @@ def _explorer_from_sweep(sweep: BacktestSweep, *,
         RuntimeError: If the visitor failed (it logged why).
     """
     primary = sweep.primary
-    # The eager points alone: nothing here simulates
+    # The eager points alone: nothing here simulates. The explorer shows the
+    # run's own "Skip if closing within" choice only, so no other is attached
     source = _grid_source(sweep, primary.trades, primary.equity_df, primary.k,
-                          use_cap_sweep=False)
+                          use_cap_sweep=False, with_close=False)
     visitor = _ExplorerVisitor(source, sweep, risk_free=risk_free)
     eq = primary.equity_df
     axis_end = (pd.Timestamp(pd.to_datetime(eq["date"].iloc[-1]))
@@ -13527,6 +14047,7 @@ def _filter_payload(
     inline_chunks: int | None = None,
     move_state: str = "not simulated",
     maturity_state: str = "not simulated",
+    close_state: str | None = None,
 ) -> dict:
     """
     Build the base data block the page's filter bar and script read on load.
@@ -13547,7 +14068,10 @@ def _filter_payload(
     too its tier-off twin (chunks.rebalance_off_grid()), and, when the walk
     read its minimum price movements, their grids (chunks.move_grid(),
     move_off_grid()), and its "Rebalance until" choices', when it read
-    those (chunks.maturity_grid(), maturity_off_grid()). The lists themselves
+    those (chunks.maturity_grid(), maturity_off_grid()). When the run
+    carried other "Skip if closing within" choices (close_state not None),
+    each choice's grids too (chunks.close_grids(), close_off_grids()), which
+    the page's script does not read. The lists themselves
     are the chunks, each packed on its own: the script inflates one only
     when a reader chooses that scenario, and only the first (the page's own
     run) is in the page, the others being files beside it (inline_chunks,
@@ -13622,6 +14146,12 @@ def _filter_payload(
             carried none) or "unavailable" (it carried some, and the page
             could not read them or has no Rebalance view to show them
             beside); ignored when it has the view. "not simulated" (default).
+        close_state (str | None): Keyword-only. Whether the run carried other
+            "Skip if closing within" choices (BacktestSweep.close_sweep):
+            None (default) when it carried none, and the block then has no
+            key for them at all; else what the block says when no
+            choice has a view, "unavailable" (the page could not use or read
+            them; the log says why). Ignored when one has a view: "shown".
 
     Returns:
         dict: "dates" (the shared axis, ISO dates), "bands" ([{label,
@@ -13698,7 +14228,23 @@ def _filter_payload(
             has no minimums — chunks.maturity_grid()), "grid_maturity_off"
             (the same beside "grid_move_off" and "grid_rebalance_off", null
             wherever "grid_rebalance_off" is) and "maturity_state" ("shown",
-            else maturity_state); and the Sell view's:
+            else maturity_state); only when close_state is not None, the
+            data of the other "Skip if closing within" choices (the page's
+            script does not read it): "close" (every choice the run worked out
+            besides its own, ascending, in the menu's own values — whole
+            days, 0 for off — a choice whose results could not be read
+            included; [] when the run worked out no other choice, or its
+            choices do not fit the page's grid or cannot be read),
+            "close_own" (the run's own choice, 0 for off, whose results are
+            "grid"'s; null with "close" []), "grid_close"
+            ([choice, in "close" order] -> null for a choice with no view,
+            else [band][k][cap] -> chunk id or null —
+            chunks.close_grids()), "grid_close_off" (null without the
+            tier-floors-off view, else per choice null or [band][k][cap] ->
+            chunk id or null: a binding band's own tier-off chunks, every
+            other band's that choice's "grid_close" row —
+            chunks.close_off_grids()) and "close_state" ("shown" when some
+            choice has a view, else close_state); and the Sell view's:
             "sell_blocks" (null without the view, else [Tier floors 0 on / 1
             off][band] -> the number i of the packed block "dash-sell-<i>"
             holding that band's chunk ids ([k][cap] -> one id per sell level
@@ -13739,6 +14285,9 @@ def _filter_payload(
                      if (rebalance_view and source.maturity_cell is not None
                          and (move_view or not source.moves)) else None)
     maturity_view = grid_maturity is not None
+    # The other "Skip if closing within" choices: each one's grid, null for a
+    # choice the page has no view of, read only when the run carried them
+    grid_close = chunks.close_grids() if close_state is not None else []
     # Per band, its k-hat population broken down like its trades
     # (_khat_band) — each group with its k-hat − k at every k of the bar,
     # for the performance section's cards
@@ -13873,6 +14422,19 @@ def _filter_payload(
         "grid_maturity_off": (chunks.maturity_off_grid()
                               if (maturity_view and off_view) else None),
         "maturity_state": "shown" if maturity_view else maturity_state,
+        # The other "Skip if closing within" choices, only when the run
+        # carried them (no key at all otherwise): the choices in
+        # the menu's own values, the run's own, each choice's grid and its
+        # tier-floors-off twin (null without that view), and why a page has
+        # none. The page's script does not read them
+        **({} if close_state is None else {
+            "close": list(source.close_days),
+            "close_own": source.close_own,
+            "grid_close": grid_close,
+            "grid_close_off": chunks.close_off_grids() if off_view else None,
+            "close_state": ("shown" if any(grid is not None for grid in grid_close)
+                            else close_state),
+        }),
         # The Sell view: which packed block holds each band's chunk ids
         # (null without the view), the levels' and minimums' names, and why a
         # page has none
@@ -17321,7 +17883,8 @@ def generate_dashboard(
     before anything is written (_build_filter_grid), because the header
     needs its result: a
     size-cap sweep's cells are simulated during that walk (the
-    tier-floors-off size-cap sweep's and the Rebalance family's too),
+    tier-floors-off size-cap sweep's, the Rebalance family's and the other
+    "Skip if closing within" choices' too),
     a size-cap sweep the walk could
     not use is named on the run-settings line (_run_settings_html's
     cap_sweep_unused, and tier_off_cap_sweep_unused for the tier-floors-off
@@ -17419,7 +17982,9 @@ def generate_dashboard(
             walk simulates, and the tier-floors-off family, whose binding
             bands' cells the walk reads at the run's own cap — and, from its
             lazy tier-floors-off size-cap sweep (tier_off_cap_sweep), at
-            every other cap — via _grid_source).
+            every other cap — and the other "Skip if closing within" choices
+            (close_sweep), whose cells the walk simulates at every cap the
+            grid offers — via _grid_source).
             Passed whole rather than unpacked — it already carries the
             calibration, every swept point, the primary k, the band x k x
             population scenarios and the run's outcome-label census, and
@@ -17735,7 +18300,11 @@ def generate_dashboard(
                 # ... and for its "Rebalance until" choices, the same way
                 maturity_state=("unavailable" if getattr(
                     getattr(sweep, "rebalance_sweep", None), "maturity_days", ())
-                    else "not simulated"))
+                    else "not simulated"),
+                # ... and whether the run carried other "Skip if closing
+                # within" choices: None ships no key for them at all
+                close_state=("unavailable" if getattr(sweep, "close_sweep", None) is not None
+                             else None))
             filter_bar = _filter_bar_html(filter_data, chunker.primary_views or {})
             base_block = _packed_json_script("dash-data", filter_data)
             chunks = chunker.chunks

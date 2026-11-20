@@ -13,7 +13,9 @@ Purpose:
     build's folder beside the page, which the page loads when a reader
     chooses that scenario. Each case builds one whole page with
     dashboard.generate_dashboard, offline and with every name and date the
-    page prints pinned, and records the SHA-256 of the page, of every file
+    page prints pinned — backtester's clock included (CAPTURED_AT), since
+    every equity curve drawn with no end day of its own runs to that
+    clock's day — and records the SHA-256 of the page, of every file
     in the folder of chunk files beside it (config.DASHBOARD_FILES_DIRNAME)
     and the list of that folder's entries. The cases cover a plain size-cap
     sweep, the tier-floors-off view, the Rebalance, minimum price movement,
@@ -35,7 +37,8 @@ Purpose:
     digest of the tree under test against itself would prove nothing.
 
 Dependencies:
-    kalshi_betting.config and kalshi_betting.dashboard, and the page
+    kalshi_betting.config, kalshi_betting.dashboard and
+    kalshi_betting.backtester (whose clock a build stops), and the page
     fixtures of tests/test_dashboard.py (handed in as `fx`) — from whichever
     tree is first on sys.path. Imported by tests/test_dashboard.py; run
     directly to capture.
@@ -51,6 +54,19 @@ Notes:
     DIFFERENT one. Within one environment two builds of a case write the
     same bytes (no random id is left in the page once the build folder's
     name is pinned), so no normaliser is applied.
+
+    Every case is built with backtester's clock reading CAPTURED_AT, midday
+    (UTC) on the day the digests were captured: the cases' equity curves
+    (each fixture's simulations, and _one_chunk's) are drawn with no end day,
+    so without it they would run to the day the test runs, and every digest
+    would hold on the capture day alone. With it, a re-capture reproduces the
+    same digests on any day. The pin replaces backtester.datetime with
+    _CapturedClock, a datetime subclass whose now() reads CAPTURED_AT and
+    which counts every real datetime (a pandas Timestamp included) as its
+    own instance, so backtester's isinstance(..., datetime) checks answer
+    as they do unpinned. backtester reads its clock only through
+    datetime.now; dashboard's own reads (the Period line's today, the build
+    folder's name) are pinned by PERIOD_END and BUILD_NAME.
 
     Re-capture (only when the oracle commit or the rendering environment
     changes):
@@ -74,7 +90,7 @@ import subprocess
 import sys
 import tempfile
 import zlib
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import numpy as np
@@ -82,7 +98,7 @@ import pandas as pd
 import plotly
 import pytest
 
-from kalshi_betting import config, dashboard
+from kalshi_betting import backtester, config, dashboard
 
 # The window's last day every case's page names (its Period line and the
 # source note its bar proposes), so a digest does not move with the clock
@@ -90,6 +106,48 @@ PERIOD_END = date(2026, 1, 31)
 # The name every case's build folder is given, in place of the time, process
 # and random suffix a build names it by
 BUILD_NAME = "build"
+# What backtester's clock reads while a case is built: midday (UTC) on the
+# day the digests were captured. Every curve a case draws with no end day of
+# its own runs to that clock's day, so a digest does not move with the clock
+CAPTURED_AT = datetime(2026, 11, 18, 12, 0, tzinfo=UTC)
+
+
+class _AnyDatetime(type):
+    """The type of _CapturedClock: it counts every real datetime as an instance."""
+
+    def __instancecheck__(cls, instance) -> bool:
+        """
+        Say whether a value is a datetime, as the real class would.
+
+        backtester's isinstance(value, datetime) checks run against
+        _CapturedClock while it stands in for the real class; a pandas
+        Timestamp or any other real datetime must still pass them.
+
+        Args:
+            instance: The value tested.
+
+        Returns:
+            bool: Whether it is a real datetime (any subclass of one).
+        """
+        return isinstance(instance, datetime)
+
+
+class _CapturedClock(datetime, metaclass=_AnyDatetime):
+    """backtester's datetime while a case is built: a clock stopped at CAPTURED_AT."""
+
+    @classmethod
+    def now(cls, tz=None):
+        """
+        The moment CAPTURED_AT, as the real datetime.now gives a moment.
+
+        Args:
+            tz: A time zone, or None for the local time without a zone.
+
+        Returns:
+            datetime: CAPTURED_AT in that zone (local and without a zone for None).
+        """
+        return (CAPTURED_AT.astimezone().replace(tzinfo=None) if tz is None
+                else CAPTURED_AT.astimezone(tz))
 
 
 def _offline(*_args, **_kwargs):
@@ -269,6 +327,11 @@ def build(fx, name: str, folder: Path, *, in_memory: bool = False) -> Path:
     """
     Build one case's whole page into `folder`, offline, its names and dates pinned.
 
+    backtester's clock is stopped at CAPTURED_AT before the case's sweep is
+    built, so every curve drawn with no end day of its own (each fixture's
+    simulations, and the page's own curve in _one_chunk) ends on the same
+    day whenever the case is built.
+
     Args:
         fx: The module of page fixtures (tests/test_dashboard.py).
         name (str): The case (a key of CASES).
@@ -282,6 +345,8 @@ def build(fx, name: str, folder: Path, *, in_memory: bool = False) -> Path:
         Path: The page written.
     """
     with pytest.MonkeyPatch.context() as mp:
+        # Before the case's fixtures draw a curve: each runs to backtester's today
+        mp.setattr(backtester, "datetime", _CapturedClock)
         mp.setattr(dashboard, "PROJECT_ROOT", folder)
         mp.setattr(dashboard.yf, "download", _offline)
         made = dashboard._new_build_folder
