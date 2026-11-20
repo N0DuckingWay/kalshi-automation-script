@@ -6811,45 +6811,26 @@ class TestLoadSeriesCategories:
         assert on_disk["series"]["KXNCAAMBGAME"] == ["Sports", ["Basketball"]]
         assert datetime.fromisoformat(on_disk["fetched_at"]).tzinfo is not None
 
-    def test_a_fresh_cache_is_served_without_a_request(self, cache, monkeypatch):
+    def test_a_copy_saved_moments_ago_is_fetched_again(self, cache, monkeypatch):
+        # No saved copy is reused, so a series Kalshi added since the copy was
+        # saved is in the listing a run files its pairs by
         cache.write_text(json.dumps({"fetched_at": datetime.now(UTC).isoformat(),
                                      "series": {"KXA": ["Sports", ["Soccer"]]}}))
         calls = self._stub(monkeypatch, self.LISTING)
-        assert historical.load_series_categories(MagicMock()) == {"KXA": ("Sports", ("Soccer",))}
-        assert calls == []
-
-    def test_a_stale_cache_is_refetched(self, cache, monkeypatch):
-        old = datetime.now(UTC) - timedelta(seconds=historical.SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS + 1)
-        cache.write_text(json.dumps({"fetched_at": old.isoformat(),
-                                     "series": {"KXA": ["Sports", ["Soccer"]]}}))
-        calls = self._stub(monkeypatch, self.LISTING)
-        assert "KXNCAAMBGAME" in historical.load_series_categories(MagicMock())
-        assert len(calls) == 1
-
-    def test_a_production_run_fetches_over_a_copy_saved_moments_ago(self, cache,
-                                                                     monkeypatch):
-        # A production run passes config.LIVE_SERIES_LISTING_MAX_AGE_SECONDS:
-        # no cached copy is young enough, so a series Kalshi added since the
-        # copy was saved is in the listing the run files its pairs by
-        cache.write_text(json.dumps({"fetched_at": datetime.now(UTC).isoformat(),
-                                     "series": {"KXA": ["Sports", ["Soccer"]]}}))
-        calls = self._stub(monkeypatch, self.LISTING)
-        got = historical.load_series_categories(
-            MagicMock(), max_age_seconds=config.LIVE_SERIES_LISTING_MAX_AGE_SECONDS)
+        got = historical.load_series_categories(MagicMock())
         assert "KXNCAAMBGAME" in got and "KXA" not in got
         assert len(calls) == 1
         # ... and the fetch replaced the copy, which the run's fee multipliers
         # are read from next
         assert set(json.loads(cache.read_text())["series"]) == set(got)
 
-    def test_a_production_run_whose_fetch_fails_keeps_the_cached_copy(self, cache,
-                                                                      monkeypatch, caplog):
+    def test_a_failed_fetch_keeps_a_copy_saved_moments_ago(self, cache, monkeypatch,
+                                                           caplog):
         cache.write_text(json.dumps({"fetched_at": datetime.now(UTC).isoformat(),
                                      "series": {"KXA": ["Sports", ["Soccer"]]}}))
         self._stub(monkeypatch, RuntimeError("offline"))
         with caplog.at_level(logging.WARNING):
-            assert historical.load_series_categories(
-                MagicMock(), max_age_seconds=config.LIVE_SERIES_LISTING_MAX_AGE_SECONDS) == {
+            assert historical.load_series_categories(MagicMock()) == {
                 "KXA": ("Sports", ("Soccer",))}
         assert "using the cached copy of 1 series" in caplog.text
 
@@ -6972,9 +6953,9 @@ class TestLoadSeriesFeeMultipliers:
     kept in a "fees" block of the same cache file as the categories, read by
     load_series_fee_multipliers, fetched together with the categories (one
     request per run), and nothing else about load_series_categories moves.
-    The fee reader never refreshes a missing or stale file itself (the
-    categories reader does, just before it); it only upgrades a current file
-    that has no "fees" block."""
+    The fee reader never fetches a missing file itself (the categories
+    reader does, just before it); it only upgrades, when asked, a file that
+    has no "fees" block."""
 
     LISTING = {"series": [
         {"ticker": "KXMLBGAME", "category": "Sports", "tags": ["Baseball"],
@@ -7048,11 +7029,11 @@ class TestLoadSeriesFeeMultipliers:
     def test_an_old_cache_without_fees_still_reads_for_categories(self, cache, monkeypatch):
         self._write(cache, series={"KXA": ["Sports", ["Soccer"]]})
         calls = self._stub(monkeypatch, self.LISTING)
-        # Fresh for categories: no request
-        assert historical.load_series_categories(MagicMock()) == {"KXA": ("Sports", ("Soccer",))}
+        # Read with no client (a dev run): the file as it stands, no request
+        assert historical.load_series_categories(None) == {"KXA": ("Sports", ("Soccer",))}
         assert calls == []
 
-    def test_a_current_cache_without_fees_is_upgraded_by_one_request(self, cache, monkeypatch):
+    def test_a_cache_without_fees_is_upgraded_by_one_request(self, cache, monkeypatch):
         self._write(cache, series={"KXA": ["Sports", ["Soccer"]]})
         calls = self._stub(monkeypatch, self.LISTING)
         # No client: nothing to fetch with, so nothing is known
@@ -7065,21 +7046,27 @@ class TestLoadSeriesFeeMultipliers:
         assert historical.load_series_fee_multipliers(MagicMock(), upgrade=True) == {
             "KXMLBGAME": 0.5, "KXBTCY": 0.0, "KXFULL": 1.0}
         assert len(calls) == 1
+        # The categories reader fetches again; the file then has fees, so the
+        # next opted-in read makes no request
         assert "KXMLBGAME" in historical.load_series_categories(MagicMock())
         assert historical.load_series_fee_multipliers(MagicMock(), upgrade=True)["KXBTCY"] == 0.0
-        assert len(calls) == 1
+        assert len(calls) == 2
 
-    def test_a_stale_cache_is_left_to_the_categories_reader(self, cache, monkeypatch):
-        old = datetime.now(UTC) - timedelta(
-            seconds=historical.SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS + 1)
-        for blocks in ({"series": {"KXA": ["Sports", []]}},
-                       {"series": {"KXA": ["Sports", []]}, "fees": {"KXA": ["quadratic", 0.5]}}):
-            cache.write_text(json.dumps({"fetched_at": old.isoformat(), **blocks}))
-            calls = self._stub(monkeypatch, self.LISTING)
-            got = historical.load_series_fee_multipliers(MagicMock(), upgrade=True)
-            # No request of its own: the file as it stands, however old
-            assert calls == []
-            assert got == ({"KXA": 0.5} if "fees" in blocks else {})
+    def test_an_old_file_is_upgraded_whatever_its_age(self, cache, monkeypatch):
+        old = datetime(2020, 1, 1, tzinfo=UTC)
+        # With a fee block: read as it stands, no request
+        cache.write_text(json.dumps({"fetched_at": old.isoformat(),
+                                     "series": {"KXA": ["Sports", []]},
+                                     "fees": {"KXA": ["quadratic", 0.5]}}))
+        calls = self._stub(monkeypatch, self.LISTING)
+        assert historical.load_series_fee_multipliers(MagicMock(), upgrade=True) == {"KXA": 0.5}
+        assert calls == []
+        # Without one: one upgrade fetch, however old the file
+        cache.write_text(json.dumps({"fetched_at": old.isoformat(),
+                                     "series": {"KXA": ["Sports", []]}}))
+        historical.load_series_fee_multipliers(MagicMock(), upgrade=True)
+        assert len(calls) == 1
+        calls.clear()
         # ... and the categories reader's fetch refreshes both blocks
         historical.load_series_categories(MagicMock())
         assert len(calls) == 1
@@ -7092,13 +7079,13 @@ class TestLoadSeriesFeeMultipliers:
         assert calls == []
         assert not cache.exists()
 
-    def test_a_fresh_cache_with_fees_makes_no_request(self, cache, monkeypatch):
+    def test_a_cache_with_fees_makes_no_request(self, cache, monkeypatch):
         self._write(cache, series={"KXA": ["Sports", []]}, fees={"KXA": ["quadratic", 0.5]})
         calls = self._stub(monkeypatch, self.LISTING)
         assert historical.load_series_fee_multipliers(MagicMock()) == {"KXA": 0.5}
         assert calls == []
 
-    def test_both_readers_on_a_stale_cache_make_one_request(self, cache, monkeypatch):
+    def test_both_readers_make_one_request_between_them(self, cache, monkeypatch):
         calls = self._stub(monkeypatch, self.LISTING)
         client = MagicMock()
         cats = historical.load_series_categories(client)
@@ -7205,7 +7192,7 @@ class TestLoadSeriesFeeMultipliers:
         assert param.kind is inspect.Parameter.KEYWORD_ONLY and param.default is False
 
     @pytest.mark.parametrize("series", [{}, None, [], "x", {"KXA": "not a pair"}])
-    def test_a_current_file_whose_series_block_is_empty_is_not_upgraded(
+    def test_a_file_whose_series_block_is_empty_is_not_upgraded(
         self, cache, monkeypatch, series,
     ):
         # The categories reader would not serve this file as current, so its
@@ -7271,7 +7258,6 @@ class TestUsableCandleAsk:
             assert value == float(raw)
 
     def test_the_no_ask_ceiling(self):
-        from kalshi_betting import config
 
         assert historical.CANDLE_NO_ASK_CEILING == 0.99
         # One definition, config's
@@ -7566,7 +7552,6 @@ class TestAskBefore:
         assert math.isnan(historical.ask_before([], t, "yes", window=7 * day))
 
     def test_the_shipped_window_is_seven_days(self):
-        from kalshi_betting import config
 
         # config gives the age limit in whole days; callers pass it in seconds
         assert config.PRICE_THEN_MAX_AGE_DAYS == 7

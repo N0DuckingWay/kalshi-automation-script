@@ -2430,35 +2430,6 @@ ORDER_WRITE_BURST = 8
 # one goes unnoticed). Past versions: CLAUDE.md's prefilter gotcha.
 SETTLED_PREFILTER_CACHE_TAG = "checkpoint-v3"
 
-# How long historical.load_series_categories reuses its cached copy of Kalshi's
-# /series listing (every series' official category and tags — 14,391 series in
-# ONE response, measured 2026-09-25) before fetching it again. It feeds the
-# backtest dashboard's category/tag views and the Live trading tab's
-# categories. A production run does not use this age: it fetches the listing
-# every run (LIVE_SERIES_LISTING_MAX_AGE_SECONDS), and a dev run reads the
-# cached copy however old. A series' category rarely changes, so a week is
-# plenty for the dashboards; a series the copy lacks is filed by
-# historical.series_labels' fallback until the next refresh.
-# Seven days in seconds.
-SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS = 7 * 86_400
-
-# How long a production run (main._run_prod, dry runs included) reuses the
-# cached copy of Kalshi's /series listing: not at all, so every production run
-# fetches the listing again, right after its market fetch. Kalshi adds new
-# series every day. While the live category/tag filter excludes anything, a
-# pair whose series the copy lacks is left out, because its category and tag
-# are not known (main._filter_by_category), and a series the copy lacks has no
-# fee multiplier, so its legs are priced at the full fee. One fetch is one GET
-# of about 21 MB (16,757 series): 0.2-0.8 s, plus about 0.2 s to read it and
-# save the copy (measured 2026-11-19), against a run of about a minute. A
-# download that breaks is retried after 2 s (_http.api_call_with_retry), and a
-# fetch that still fails falls back to the cached copy however old, with a
-# WARNING. A dev run never fetches (the sandbox key never signs a production
-# request), and the backtest and the dashboards reuse the copy for
-# SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS. 0 seconds: no cached copy is young
-# enough.
-LIVE_SERIES_LISTING_MAX_AGE_SECONDS = 0
-
 # Hard cap on the per-ticker event-title fallback in
 # historical._load_or_build_event_titles. That fallback exists for the handful
 # of archived events the bulk listings no longer carry, and it costs ONE HTTP
