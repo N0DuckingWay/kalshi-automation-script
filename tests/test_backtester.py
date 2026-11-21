@@ -15552,8 +15552,13 @@ class TestLiveRuleLine:
                                    cap_sweep=True)
             assert self._line(caplog) == (
                 f"Live time-series rule (saved live defaults): {rule} — not simulated by this run")
+            # The page adds the saved "Skip if closing within" choice, which
+            # the log line does not name: off, as the run's own (the suite
+            # turns the backtest's rule off, and config.py's live value is off)
+            assert (res.live_buy_min_days_to_close, res.buy_min_days_to_close) == (None, False)
             assert dashboard._live_rule_html(res, bar=None).endswith(
-                "— not simulated by this run</p>")
+                "— not simulated by this run; the live defaults' Skip if closing within is "
+                "off, this run's own choice</p>")
 
     @pytest.mark.parametrize("tier_floors, band, page_tail", [
         (True, (0.0, 1.0), "this run's primary"),
@@ -15586,8 +15591,14 @@ class TestLiveRuleLine:
             10_000.0, sweep=res).read_text(encoding="utf-8")
         found = re.findall(r"Live rule \(saved live defaults\): ([^<]*)</p>", page)
         assert len(found) == 1
-        # The rule, then where the page shows it, as the log line words it
-        assert found[0] == html.escape(rule, quote=False) + " — " + page_tail
+        # The rule, then where the page shows it, as the log line words it,
+        # then the saved "Skip if closing within" choice, which only the page
+        # names: off, as the run's own (the suite turns the backtest's rule
+        # off, and config.py's live value is off)
+        assert (res.live_buy_min_days_to_close, res.buy_min_days_to_close) == (None, False)
+        assert found[0] == (html.escape(rule, quote=False) + " — " + page_tail
+                            + "; the live defaults' Skip if closing within is off, this "
+                            "run's own choice")
         # The log's verdict and the page's are the one verdict
         where = backtester._live_rule_view(res).where
         assert line.endswith("— not simulated by this run") == (

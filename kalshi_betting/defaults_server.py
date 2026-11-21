@@ -29,7 +29,7 @@ Purpose:
         the seed values, config.LIVE_DEFAULTS_SEED); with fields in its
         address (from a link, --seed, or its own dropdown bar) it proposes
         those. At its top, a bar of dropdowns (the backtest page's filter
-        bar's eleven controls, in that bar's order and words) shows the
+        bar's twelve controls, in that bar's order and words) shows the
         proposal; choosing another value shows the page again proposing it,
         and nothing is written on the way. Under the bar it shows the live
         defaults in force beside the proposed ones with every change
@@ -96,8 +96,9 @@ Dependencies:
     their source note, the source-note pattern, the exit codes, the run
     result's format tag, the DEFAULTS_SERVER_* and SCHEDULER_* constants,
     the dropdown bar's choices (DEFAULTS_SERVER_SPREAD_BANDS,
-    DEFAULTS_SERVER_SIZE_CAPS, INTERVAL_DISCOUNT_SWEEP, MIN_PRICE_MOVES,
-    REBALANCE_MATURITY_DAYS, TAKE_PROFIT_LEVELS, TAKE_PROFIT_MIN_DAYS), the
+    DEFAULTS_SERVER_SIZE_CAPS, INTERVAL_DISCOUNT_SWEEP,
+    BUY_MIN_DAYS_TO_CLOSE_CHOICES, MIN_PRICE_MOVES, REBALANCE_MATURITY_DAYS,
+    TAKE_PROFIT_LEVELS, TAKE_PROFIT_MIN_DAYS), the
     backtest page's names file (BACKTEST_FILTER_NAMES_*),
     LIVE_DASHBOARD_ORIGINS (the only pages that may frame this server's),
     count_text (a run page writes an add-on's held count exactly) and
@@ -244,6 +245,7 @@ from .config import (
     BACKTEST_FILTER_NAMES_FILENAME,
     BACKTEST_FILTER_NAMES_FORMAT,
     BACKTEST_FILTER_NAMES_MAX_BYTES,
+    BUY_MIN_DAYS_TO_CLOSE_CHOICES,
     DEFAULTS_SERVER_CHECKOUT_MAX_BYTES,
     DEFAULTS_SERVER_CHECKOUT_TIMEOUT_SECONDS,
     DEFAULTS_SERVER_CONFIRM_ARM_MS,
@@ -584,6 +586,7 @@ _SAVE_FIRST = "A dry run needs saved defaults — save these first"
 # check-box menus' labels (dashboard._MENU_CAT_LABEL and _MENU_TAG_LABEL)
 _BAR_BAND_LABEL = "Spread band"
 _BAR_SELECT_LABELS = (("tier_floors", "Tier floors"), ("k", "k"), ("size_cap", "Size cap"),
+                      ("buy_min_days_to_close", "Skip if closing within"),
                       ("rebalance", "Rebalance"), ("min_price_move", "Min. price movement"),
                       ("rebalance_min_days_to_maturity", "Rebalance until"),
                       ("sell_at", "Sell"), ("sell_min_days", "Min. days to maturity"))
@@ -1282,7 +1285,8 @@ def _proposal(params: dict[str, list[str]],
         sell_min_days = _kept("sell_min_days", current, source)
     # "Skip if closing within": "off" or 0 means off (LiveSettings stores 0 as
     # None and refuses anything but config.BUY_MIN_DAYS_TO_CLOSE_CHOICES). The
-    # bar has no menu for it, so its form carries the proposal's value hidden
+    # bar's dropdown always names it; a link that leaves it out (one made by
+    # hand, or by a backtest page) keeps the saved value
     if "buy_min_days_to_close" in value:
         buy_min_days_to_close = (
             None if value["buy_min_days_to_close"] == "off"
@@ -2309,22 +2313,24 @@ def _bar_html(settings: LiveSettings, source: str, names: _FilterNames) -> str:
     """
     Build the trading page's dropdown bar: a GET form back to /confirm showing the proposal.
 
-    The eleven controls, in the backtest page's filter bar's order and words:
-    Spread band, Tier floors, k, Size cap, Rebalance, Min. price movement,
-    Rebalance until, Sell, Min. days to maturity, then the Exclude categories
-    and Exclude tags menus. Each dropdown offers config's grid
-    (DEFAULTS_SERVER_SPREAD_BANDS, INTERVAL_DISCOUNT_SWEEP,
-    DEFAULTS_SERVER_SIZE_CAPS, MIN_PRICE_MOVES, REBALANCE_MATURITY_DAYS,
+    The twelve controls, in the backtest page's filter bar's order and words:
+    Spread band, Tier floors, k, Size cap, Skip if closing within,
+    Rebalance, Min. price movement, Rebalance until, Sell, Min. days to
+    maturity, then the Exclude categories and Exclude tags menus. Each
+    dropdown offers config's grid (DEFAULTS_SERVER_SPREAD_BANDS,
+    INTERVAL_DISCOUNT_SWEEP, DEFAULTS_SERVER_SIZE_CAPS,
+    BUY_MIN_DAYS_TO_CLOSE_CHOICES, MIN_PRICE_MOVES, REBALANCE_MATURITY_DAYS,
     TAKE_PROFIT_LEVELS, TAKE_PROFIT_MIN_DAYS) plus the proposal's own value
     when it is off the grid, that value selected. Choices that do not apply
     are not offered: with Rebalance no, Min. price movement offers only "any"
     and Rebalance until only "maturity"; with Sell off, Min. days to
-    maturity offers only "any". The spread band dropdown has no name: two
-    hidden fields, spread_min and spread_max, carry it (the bar script
-    copies a choice into them). "Skip if closing within"
-    (buy_min_days_to_close) has no dropdown: a hidden field of that name
-    carries the proposal's value, so a choice made on the bar keeps it. Each
-    menu lists the names the proposal excludes, ticked, then the names
+    maturity offers only "any". "Skip if closing within" (the bot buys no
+    pair, and adds to none, whose markets stop trading within that many
+    days) depends on no other setting, so it always offers every choice of
+    BUY_MIN_DAYS_TO_CLOSE_CHOICES, its 0 as "off". The spread band dropdown
+    has no name: two hidden fields, spread_min and spread_max, carry it (the
+    bar script copies a choice into them). Each menu lists the names the
+    proposal excludes, ticked, then the names
     file's others (_listed), and a grey note says when that file could not
     be used. A hidden source field keeps the page's source note, but never
     the seed's, which may label only the seed values. So the form, sent as a
@@ -2353,13 +2359,11 @@ def _bar_html(settings: LiveSettings, source: str, names: _FilterNames) -> str:
              f"<input type=\"hidden\" name=\"spread_min\" "
              f"value=\"{_query_value('spread_min', band[0])}\">"
              f"<input type=\"hidden\" name=\"spread_max\" "
-             f"value=\"{_query_value('spread_max', band[1])}\">",
-             # "Skip if closing within" has no dropdown on this bar: the
-             # proposal's value rides along, so a choice made on the bar keeps it
-             "<input type=\"hidden\" name=\"buy_min_days_to_close\" value=\""
-             f"{_query_value('buy_min_days_to_close', settings.buy_min_days_to_close)}\">"]
+             f"value=\"{_query_value('spread_max', band[1])}\">"]
     # Each dropdown's values, as LiveSettings holds them; "maturity" (0 days)
-    # is None there, and a choice that does not apply is not offered
+    # and "Skip if closing within" off (0 days) are None there, and a choice
+    # that does not apply is not offered
+    skip_days = settings.buy_min_days_to_close
     values = {
         "tier_floors": (_bar_choices((True, False), settings.tier_floors, ordered=False),
                         settings.tier_floors, "tier_floors"),
@@ -2367,6 +2371,11 @@ def _bar_html(settings: LiveSettings, source: str, names: _FilterNames) -> str:
               settings.interval_discount, "interval_discount"),
         "size_cap": (_bar_choices(DEFAULTS_SERVER_SIZE_CAPS, settings.size_cap),
                      settings.size_cap, "size_cap"),
+        # Every choice always applies: the rule reads no other setting
+        "buy_min_days_to_close": (
+            _bar_choices(tuple(days or None for days in BUY_MIN_DAYS_TO_CLOSE_CHOICES),
+                         skip_days),
+            skip_days, "buy_min_days_to_close"),
         "rebalance": (_bar_choices((False, True), settings.rebalance, ordered=False),
                       settings.rebalance, "rebalance"),
         "min_price_move": (_bar_choices((None, *MIN_PRICE_MOVES) if settings.rebalance
