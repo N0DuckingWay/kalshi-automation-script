@@ -3258,6 +3258,200 @@ class TestLiveRuleHeader:
         }[page_kind]
 
 
+class TestLiveRuleCloseNote:
+    """The live-rule line's "Skip if closing within" note (dashboard._live_close_note):
+    the saved live defaults' choice (BacktestSweep.live_buy_min_days_to_close, None
+    for off), whether it is this run's own (buy_min_days_to_close: days, False for
+    off), and otherwise where the filter bar's Skip if closing within menu shows it
+    (the base block's "close" list and its grids) or why the page cannot. It sits
+    between the sizing note and the rebalancing one, the filter bar's own order."""
+
+    _HEAD = (f"Live rule (saved live defaults): "
+             f"{config.describe_time_series_rule(True, (0.0, 1.0))} — this run's primary")
+
+    @staticmethod
+    def _sweep(live, own, **fields) -> BacktestSweep:
+        """TestLiveRuleHeader's sweep (a live rule that is this run's primary unless
+        `fields` say otherwise) recording the saved choice `live` (None for off)
+        and the run's own `own` (days, False for off, None for not recorded)."""
+        return dataclasses.replace(TestLiveRuleHeader._sweep(**fields),
+                                   live_buy_min_days_to_close=live, buy_min_days_to_close=own)
+
+    @staticmethod
+    def _bar(choices=(0, 3, 14), own=7, *, grids=None, off_grids=True, **bar) -> dict:
+        """TestLiveRuleHeader's base block plus the other choices' keys as
+        _filter_payload ships them: every choice's grid holds a chunk in every
+        cell unless `grids` gives them ([choice] -> null or [band][k][cap]);
+        the tier-floors-off twin is the same, or null when off_grids is False."""
+        base = TestLiveRuleHeader._bar(**bar)
+
+        def copy() -> list:
+            """A copy of the base grid, every row a list of its own."""
+            return [[list(cells) for cells in row] for row in base["grid"]]
+
+        return {**base, "close": list(choices), "close_own": own,
+                "grid_close": [copy() for _ in choices] if grids is None else grids,
+                "grid_close_off": [copy() for _ in choices] if off_grids else None,
+                "close_state": "shown"}
+
+    @staticmethod
+    def _text(sweep, bar) -> str:
+        """The line's text, without its <p> and </p>."""
+        return TestLiveRuleHeader()._text(sweep, bar)
+
+    def test_the_words_are_the_trading_tab_s(self):
+        # The note names a choice in the words the Trading tab's dropdown and
+        # table use for it, so a reader finds the same words on both pages
+        for days in config.BUY_MIN_DAYS_TO_CLOSE_CHOICES:
+            assert backtester._close_choice_label(days) == config.live_setting_text(
+                "buy_min_days_to_close", days or None)
+
+    @pytest.mark.parametrize("live, own", [(None, False), (3, 3), (7, 7), (14, 14)])
+    def test_the_run_s_own_choice_is_named_as_such(self, live, own):
+        words = config.live_setting_text("buy_min_days_to_close", live)
+        sweep = self._sweep(live, own)
+        for bar in (None, self._bar(), TestLiveRuleHeader._bar()):
+            assert self._text(sweep, bar) == (
+                f"{self._HEAD}; the live defaults' Skip if closing within is {words}, this "
+                "run's own choice"), bar
+
+    @pytest.mark.parametrize("live, own", [(None, 7), (3, 7), (14, 7), (7, False), (3, False)])
+    def test_another_choice_the_bar_offers_is_named_with_its_option(self, live, own):
+        words = config.live_setting_text("buy_min_days_to_close", live)
+        own_words = "off" if own is False else f"{own} days"
+        choices = [d for d in config.BUY_MIN_DAYS_TO_CLOSE_CHOICES if d != (own or 0)]
+        sweep = self._sweep(live, own)
+        assert self._text(sweep, self._bar(choices, own or 0)) == (
+            f"{self._HEAD}; the live defaults' Skip if closing within is {words}, where this "
+            f"run's own choice is {own_words} — choose Skip if closing within \"{words}\" in "
+            "the filter bar to see it")
+
+    def test_a_tier_floors_off_rule_reads_the_tier_off_grids(self):
+        band = (0.0, 0.5)
+        fields = {"live_tier_floors": False, "live_spread_band": band,
+                  "calibrations_by_band": {(0.0, 1.0): None, band: None},
+                  "tier_off_calibrations_by_band": {(0.0, 1.0): None, band: None},
+                  "tier_off_scenarios": [object()]}
+        sweep = self._sweep(3, 7, **fields)
+        bands = [band, (0.0, 1.0)]
+        shown = ' — choose Skip if closing within "3 days" in the filter bar to see it'
+        assert self._text(sweep, self._bar(bands=bands)).endswith(shown)
+        # The tier-on grids alone do not show a tier-off rule
+        assert self._text(sweep, self._bar(bands=bands, off_grids=False)).endswith(
+            " — this page does not show that choice")
+        # ... nor does a tier-off grid with no chunk at that band; one with no
+        # chunk at another band still does
+        bar = self._bar(bands=bands)
+        bar["grid_close_off"][1][0] = [[None]]
+        assert self._text(sweep, bar).endswith(" — this page does not show that choice")
+        bar = self._bar(bands=bands)
+        bar["grid_close_off"][1][1] = [[None]]
+        assert self._text(sweep, bar).endswith(shown)
+
+    def test_a_choice_the_page_cannot_show_says_so(self):
+        sweep = self._sweep(3, 7)
+        cannot = (f"{self._HEAD}; the live defaults' Skip if closing within is 3 days, where "
+                  "this run's own choice is 7 days — this page does not show that choice")
+        for bar in (
+                # no family on the page, or a family without that choice
+                TestLiveRuleHeader._bar(), self._bar(choices=(0, 14)),
+                self._bar(choices=()),
+                # the choice's grid is null (refused, failed, or not read to the end)
+                self._bar(grids=[[[["c"]]], None, [[["c"]]]]),
+                # ... or holds no chunk at the rule's band
+                self._bar(grids=[[[["c"]]], [[[None]]], [[["c"]]]]),
+        ):
+            assert self._text(sweep, bar) == cannot, bar
+        # A page without a filter bar cannot show it either
+        assert self._text(sweep, None) == (
+            f"{self._HEAD}; the live defaults' Skip if closing within is 3 days, where this "
+            "run's own choice is 7 days — this page's filter bar could not be built, so it "
+            "does not show that choice")
+
+    def test_a_rule_the_page_does_not_show_names_the_two_choices_alone(self):
+        # Not simulated: the line already says the page does not show the rule
+        sweep = self._sweep(3, 7, live_spread_band=(0.3, 0.6),
+                            calibrations_by_band={(0.0, 1.0): None})
+        assert self._text(sweep, self._bar()).endswith(
+            "— not simulated by this run; the live defaults' Skip if closing within is 3 "
+            "days, where this run's own choice is 7 days")
+        # Elsewhere on the grid, with no bar
+        sweep = self._sweep(3, 7, live_spread_band=(0.3, 0.6),
+                            calibrations_by_band={(0.0, 1.0): None, (0.3, 0.6): None})
+        assert self._text(sweep, None).endswith(
+            "— not shown: this page's filter bar could not be built; the live defaults' Skip "
+            "if closing within is 3 days, where this run's own choice is 7 days")
+
+    @pytest.mark.parametrize("rebalance, sell, held", [
+        (True, None, "rebalancing"), (None, 0.85, "selling"),
+        (True, 0.85, "rebalancing and selling")])
+    def test_rebalancing_or_selling_saved_is_left_out_at_another_choice(self, rebalance, sell,
+                                                                         held):
+        # The bar shows rebalancing and selling at the run's own choice only, so
+        # the note says the other choice leaves out what the saved defaults do;
+        # the rebalancing and selling notes follow it
+        sweep = dataclasses.replace(self._sweep(3, 7), live_rebalance=rebalance,
+                                    live_sell_at=sell)
+        text = self._text(sweep, self._bar())
+        clause = (' — choose Skip if closing within "3 days" in the filter bar to see it, '
+                  f"without the {held}, which the filter bar never shows at another choice")
+        assert clause in text
+        after = text[text.index(clause) + len(clause):]
+        assert after.startswith("; the live defaults rebalance" if rebalance
+                                else "; the live defaults sell")
+        # At the run's own choice nothing is left out
+        same = dataclasses.replace(sweep, live_buy_min_days_to_close=7)
+        assert "without the" not in self._text(same, self._bar())
+
+    def test_the_note_sits_between_the_sizing_and_rebalancing_notes(self):
+        sweep = dataclasses.replace(self._sweep(3, 7, live_sizing=(0.8, 0.1)),
+                                    live_rebalance=True)
+        text = self._text(sweep, self._bar(ks=(0.75, 0.8), caps=(0.2, 0.1)))
+        sizing = text.index("; the live defaults size at")
+        close = text.index("; the live defaults' Skip if closing within")
+        rebalance = text.index("; the live defaults rebalance")
+        assert sizing < close < rebalance
+
+    @pytest.mark.parametrize("live", [None, 3, 7, 14])
+    def test_no_note_without_the_run_s_own_choice(self, live):
+        # A hand-built sweep that recorded no choice of its own: its saved
+        # value of None could be off or not recorded, so nothing is said
+        sweep = self._sweep(live, None)
+        assert self._text(sweep, self._bar()) == self._HEAD
+        assert "Skip if closing within" not in self._text(sweep, None)
+
+    def test_no_note_when_no_live_rule_was_recorded(self):
+        for sweep in (self._sweep(3, 7, live_tier_floors=None),
+                      self._sweep(None, False, live_spread_band=None)):
+            assert dashboard._live_rule_html(sweep, bar=self._bar()) == (
+                TestLiveRuleHeader._P + "Live rule: none recorded — no usable live defaults "
+                "were saved when this run started, and live runs refuse to start without "
+                "them</p>")
+
+    @pytest.mark.parametrize("saved", ["own", "other"])
+    def test_a_page_with_the_family_names_its_own_menu_choice(self, monkeypatch, tmp_path,
+                                                              saved):
+        # A whole page built from a run that worked out the other choices (its
+        # own is 7 days): the header names the saved choice from the page's
+        # own base block
+        assert _CL_OWN == 7
+        live = _CL_OWN if saved == "own" else 3
+        sweep = dataclasses.replace(
+            _cl_sweep(), live_tier_floors=True, live_spread_band=_KC_B0,
+            buy_min_days_to_close=_CL_OWN, live_buy_min_days_to_close=live)
+        page = _cl_page(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        assert data["close"] == [0, 3, 14] and data["close_own"] == _CL_OWN
+        line = dashboard._live_rule_html(sweep, bar=data)
+        assert line in page
+        assert line.endswith(
+            "; the live defaults' Skip if closing within is 7 days, this run's own choice</p>"
+            if live == _CL_OWN else
+            "; the live defaults' Skip if closing within is 3 days, where this run's own "
+            'choice is 7 days — choose Skip if closing within "3 days" in the filter bar to '
+            "see it</p>"), line
+
+
 class TestEntryCheckpointHeader:
     """The page header names the entry checkpoint (the backtest's weekly
     moment, BacktestSweep.entry_checkpoint) under the run-settings line, says
@@ -6828,12 +7022,16 @@ def _page_elements(page: str) -> dict:
     the script reach. A select's or button's id may be double-quoted (the
     filter bar's) or single-quoted (the scenario explorer's); a button is
     disabled when its tag carries the bare "disabled" attribute (attribute
-    values, such as its title, are not read for it)."""
+    values, such as its title, are not read for it). An option Python
+    rendered shut (its bare "disabled" attribute, after "selected") carries
+    "disabled": True; every other option has no such key."""
     selects = {}
     for m in re.finditer(r"""<select id=(["'])([^"']+)\1([^>]*)>(.*?)</select>""", page, re.S):
-        options = [{"value": value, "text": html.unescape(text), "selected": bool(chosen)}
-                   for value, chosen, text in re.findall(
-                       r'<option value="([^"]*)"( selected)?>(.*?)</option>', m.group(4))]
+        options = [{"value": value, "text": html.unescape(text), "selected": bool(chosen),
+                    **({"disabled": True} if shut else {})}
+                   for value, chosen, shut, text in re.findall(
+                       r'<option value="([^"]*)"( selected)?( disabled)?>(.*?)</option>',
+                       m.group(4))]
         selects[m.group(2)] = {"options": options, "disabled": " disabled" in m.group(3)}
     # The check-box menus (<details>): the button's text, the "All" box and
     # every row — its text, and whether Python rendered it ticked, disabled
@@ -8562,8 +8760,9 @@ class TestTradingSync:
                  "min_price_move", "rebalance_min_days_to_maturity", "sell_at",
                  "sell_min_days", "buy_min_days_to_close"}
         assert set(query) <= known
-        # "Skip if closing within" has no menu on the page, so it goes only as
-        # the Trading tab spelled it: off, or one of the days the server takes
+        # "Skip if closing within" has no open menu on this page (its run worked
+        # out no other choice), so it goes only as the Trading tab spelled it:
+        # off, or one of the days the server takes
         assert query.get("buy_min_days_to_close", "off") in ("off", "0", "3", "7", "14")
         # Rebalance's two fields are always sent together: the server refuses
         # a minimum with rebalancing off, and keeps a saved one a query leaves out
@@ -10045,9 +10244,10 @@ class TestTradingSync:
             proposal = _proposed(tier_floors=True, rebalance=True, min_price_move=None,
                                  sell_at=data["sell_levels"][1]["value"], sell_min_days=3,
                                  **common)
-        # "Skip if closing within" has no menu on the page at all: the
-        # proposal's (the seed's 7 days) differs from the saved off, so a
-        # choice must pass it on as the Trading tab has it
+        # "Skip if closing within" has no open menu on this page (its run
+        # worked out no other choice): the proposal's (the seed's 7 days)
+        # differs from the saved off, so a choice must pass it on as the
+        # Trading tab has it
         assert proposal.buy_min_days_to_close == 7 and saved.buy_min_days_to_close is None
         # Each runner waits for the selects its page enables
         runner = {"no views": _run_script, "rebalance, no until": TestRebalanceScript._run,
@@ -14976,14 +15176,15 @@ class TestUntilFailures:
 
 class TestRebalanceSelect:
     """The bar's "Rebalance" select as Python renders it: after Size cap and
-    before Min. price movement, Rebalance until and Sell, shut, with its two options, its rule
+    Skip if closing within and before Min. price movement, Rebalance until
+    and Sell, shut, with its two options, its rule
     in the hover text and, on a page without the view, the reason beside it."""
 
     def test_the_select_follows_the_size_cap_and_is_rendered_shut(self, monkeypatch, tmp_path):
         page = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance())
         ids = re.findall(r'<select id="(flt-[a-z]+)"', page)
-        assert ids == ["flt-band", "flt-tier", "flt-k", "flt-cap", "flt-rebalance", "flt-move",
-                       "flt-until", "flt-sell", "flt-days"]
+        assert ids == ["flt-band", "flt-tier", "flt-k", "flt-cap", "flt-close", "flt-rebalance",
+                       "flt-move", "flt-until", "flt-sell", "flt-days"]
         # ... and before the Exclude categories and Exclude tags menus
         bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
         assert (bar.index('id="flt-cap"') < bar.index('id="flt-rebalance"')
@@ -18797,7 +18998,11 @@ class TestParkedChunks:
     keeps a placeholder: the build writes exactly the bytes it wrote when it
     held every chunk in memory, in every case tests/dashboard_chunks_golden.py
     builds (the digests were captured from the commit before parking, by
-    running that module as a script; the recipe is in its docstring), and
+    running that module as a script, the recipe in its docstring; the page
+    digests of the cases with the filter bar were since amended by hand for
+    the bar's "Skip if closing within" menu, and every case's for the
+    glossary term of that name in the page's Terms section, each previous
+    one in the fixture's "amended" notes), and
     the parking folder is gone however the build ends but a kill (or a
     Ctrl-C during that folder's own deletion). A files folder that cannot
     take the parking folder stops the build with the mkdir's own error."""
@@ -20034,7 +20239,8 @@ class TestCloseFailures:
         Its grids are null where the other page has no entry for it; every
         other choice's grids, every other key of the base block (the main,
         tier-off, Rebalance, movement and "Rebalance until" grids, the
-        category lists, the shared row heads among them), the page's own
+        category lists, the shared row heads among them; the words for the
+        choices, "close_text", are each page's own choices'), the page's own
         chunk and every chunk file beside the page are the same. Only for a
         choice that trades no category or tag of its own: one that does
         keeps them listed when it fails mid-walk (the test of off below).
@@ -20047,8 +20253,11 @@ class TestCloseFailures:
         assert [g for i, g in enumerate(data["grid_close"]) if i != ci] == other["grid_close"]
         assert ([g for i, g in enumerate(data["grid_close_off"]) if i != ci]
                 == other["grid_close_off"])
-        # The build folder's name is the build's own
-        left = {"close", "grid_close", "grid_close_off", "sidecar_dir"}
+        # The build folder's name is the build's own, and each page's words
+        # for the choices are those of its own choices
+        assert data["close_text"] == dashboard._close_text(data["close"])
+        assert other["close_text"] == dashboard._close_text(other["close"])
+        left = {"close", "grid_close", "grid_close_off", "close_text", "sidecar_dir"}
         assert ({key: value for key, value in data.items() if key not in left}
                 == {key: value for key, value in other.items() if key not in left})
         assert _packed_blocks(page)["dash-chunk-0"] == _packed_blocks(absent)["dash-chunk-0"]
@@ -20349,6 +20558,815 @@ class TestCloseFailures:
         assert raised.value is error
         assert sorted(path.relative_to(root).as_posix() for path in root.rglob("*")) == before
         assert (tmp_path / config.DASHBOARD_FILENAME).read_text(encoding="utf-8") == page
+
+
+def _cl_words(days: int) -> str:
+    """A "Skip if closing within" choice in the words of the Trading tab's table (0 is off)."""
+    return config.live_setting_text("buy_min_days_to_close", None if days == 0 else days)
+
+
+def _cl_views_sweep() -> BacktestSweep:
+    """A _kc sweep with the tier-floors-off, Rebalance (minimums and "Rebalance
+    until" choices), Sell and "Skip if closing within" families: every select
+    of the bar has a view (the run's own choice 7 days, the others off, 3
+    and 14 days)."""
+    return _kc_sweep_sell(_kc_sweep_close(_kc_sweep_until(_kc_sweep_tiers())))
+
+
+def _cl_repacked(page: _Page, change) -> _Page:
+    """The page with its base block changed by `change(data)` (in place) and
+    packed again as the page packs it, its files read from the same folder."""
+    data = TestFilterPage._data(page)
+    change(data)
+    text = page.replace(_DASH_DATA.search(page).group(0),
+                        dashboard._packed_json_script("dash-data", data))
+    return _Page(text, page.root)
+
+
+def _cl_new_files(snaps: dict, names: list[str]) -> dict[str, list[str]]:
+    """For snapshots taken in this order, the chunk files each window loaded
+    (a snapshot's "files" lists every load since the run began)."""
+    out, seen = {}, 0
+    for name in names:
+        files = snaps[name]["files"]
+        out[name], seen = files[seen:], len(files)
+    return out
+
+
+def _cl_shown(page: str, cid: int) -> list[str]:
+    """The chunk files a choice that draws chunk `cid` loads, with the drawn
+    chunks not kept (keep=0): its own file, or none for the page's own chunk."""
+    return [] if cid < TestFilterPage._data(page)["inline_chunks"] else [_chunk_src(page, cid)]
+
+
+@pytest.mark.usefixtures("_cl_stopped_clock")
+class TestCloseMenu:
+    """The bar's "Skip if closing within" select as Python renders it: right
+    after Size cap, named as the Trading tab names the setting; on a page
+    whose run worked out the other choices, every choice config offers,
+    ascending, each in the Trading tab's words, the run's own selected and
+    marked primary, a choice the page has no results for shut and marked;
+    on any other page the run's own choice alone, as the run recorded it,
+    shut, with a grey note saying why. The base block of a page without the
+    other choices gains nothing."""
+
+    def test_a_page_with_the_choices_offers_each_in_the_trading_tab_s_words(
+            self, monkeypatch, tmp_path):
+        page = _cl_page(monkeypatch, tmp_path, _cl_sweep())
+        data = TestFilterPage._data(page)
+        assert data["close"] == [0, 3, 14] and data["close_own"] == 7
+        select = _page_elements(page)["selects"]["flt-close"]
+        # Rendered shut, as every select is until the script has its data
+        assert select["disabled"] is True
+        assert select["options"] == [
+            {"value": str(days), "text": _cl_words(days) + (" (primary)" if days == 7 else ""),
+             "selected": days == 7} for days in config.BUY_MIN_DAYS_TO_CLOSE_CHOICES]
+        # Right after Size cap, under the name every word of the page gives it
+        bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
+        assert bar.index('id="flt-cap"') < bar.index('id="flt-close"') \
+            < bar.index('id="flt-rebalance"')
+        assert f'<label>{dashboard._CLOSE_LABEL}: <select id="flt-close"' in bar
+        # Its hover text: the rule, then what the other choices show and that
+        # the Trading tab follows a choice picked here
+        title = re.search(r'<select id="flt-close"[^>]*title="([^"]*)"', bar).group(1)
+        assert html.unescape(title) == dashboard._CLOSE_TITLE + dashboard._CLOSE_TITLE_CHOICES
+        # The grey note beside it is empty: the script fills it at another choice
+        assert re.search(r'&nbsp;<span id="flt-close-note" style="color:#9E9E9E; '
+                         r'font-size:13px;"></span>', bar)
+        # The words the script needs, from Python: each choice's, its phrase,
+        # the grey note and the red note's two templates
+        text = data["close_text"]
+        assert list(data)[list(data).index("close_state") + 1] == "close_text"
+        assert text == {"field": dashboard._CLOSE_LABEL,
+                        "values": {str(d): _cl_words(d)
+                                   for d in config.BUY_MIN_DAYS_TO_CLOSE_CHOICES},
+                        "phrases": [f', "{dashboard._CLOSE_LABEL}" {_cl_words(d)}'
+                                    for d in data["close"]],
+                        "note": dashboard._CLOSE_OTHER_NOTE,
+                        "not_with": dashboard._CLOSE_SYNC_NOT_WITH,
+                        "unavailable": dashboard._CLOSE_SYNC_UNAVAILABLE}
+        # The summary line says what the select reaches, once
+        reach = data["text"]["unfiltered"]
+        assert (reach.count(dashboard._CLOSE_REACH)
+                + reach.count(dashboard._CLOSE_REACH_NO_EXPLORER)) == 1
+
+    def test_a_choice_the_page_has_no_results_for_is_shut(self, monkeypatch, tmp_path):
+        page = _cl_page(monkeypatch, tmp_path, _cl_sweep(cls=_cl_refusing(3)))
+        data = TestFilterPage._data(page)
+        assert data["grid_close"][1] is None and data["close_state"] == "shown"
+        options = _page_elements(page)["selects"]["flt-close"]["options"]
+        assert options[1] == {"value": "3", "selected": False, "disabled": True,
+                              "text": _cl_words(3) + dashboard._CLOSE_OPTION_UNAVAILABLE}
+        assert [o.get("disabled", False) for o in options] == [False, True, False, False]
+
+    @pytest.mark.parametrize("recorded, value, words", [
+        (7, "7", "7 days"), (14, "14", "14 days"), (False, "0", "off"),
+        (None, "", "not recorded")])
+    def test_a_page_without_the_choices_offers_the_run_s_own_alone(
+            self, monkeypatch, tmp_path, recorded, value, words):
+        sweep = dataclasses.replace(_kc_sweep(), buy_min_days_to_close=recorded)
+        page = _kc_page(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        assert words == ("not recorded" if recorded is None
+                         else _cl_words(0 if recorded is False else recorded))
+        select = _page_elements(page)["selects"]["flt-close"]
+        assert select == {"disabled": True, "options": [
+            {"value": value, "text": words + " (primary)", "selected": True}]}
+        bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
+        note = re.search(r'<span id="flt-close-note" style="color:#9E9E9E; font-size:13px;">'
+                         r"([^<]*)</span>", bar).group(1)
+        assert html.unescape(note) == dashboard._CLOSE_NOTES["not simulated"]
+        # Its hover text is the rule alone: the page offers no other choice,
+        # and the Trading tab keeps its own value
+        title = re.search(r'<select id="flt-close"[^>]*title="([^"]*)"', bar).group(1)
+        assert html.unescape(title) == dashboard._CLOSE_TITLE
+        # Its base block gains nothing: no key, no word, no reach sentence
+        assert not {"close", "close_own", "grid_close", "grid_close_off", "close_state",
+                    "close_text"} & set(data)
+        assert dashboard._CLOSE_REACH not in data["text"]["unfiltered"]
+        assert dashboard._CLOSE_REACH_NO_EXPLORER not in data["text"]["unfiltered"]
+        assert dashboard._CLOSE_LABEL not in json.dumps(data, ensure_ascii=False)
+
+    def test_a_page_whose_choices_could_not_be_read_offers_the_run_s_own_alone(
+            self, monkeypatch, tmp_path):
+        # A family with no choice: the base block names no run's own, so the
+        # select shows the run's own as the sweep recorded it, with the note
+        # that the other choices are not available
+        sweep = dataclasses.replace(_kc_sweep_close(_kc_sweep_tiers(), days=()),
+                                    buy_min_days_to_close=7)
+        page = _cl_page(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        assert (data["close"], data["close_own"], data["close_state"]) == ([], None,
+                                                                           "unavailable")
+        assert _page_elements(page)["selects"]["flt-close"]["options"] == [
+            {"value": "7", "text": "7 days (primary)", "selected": True}]
+        assert html.unescape(re.search(r'<span id="flt-close-note"[^>]*>([^<]*)</span>',
+                                       page).group(1)) == dashboard._CLOSE_NOTES["unavailable"]
+        assert dashboard._CLOSE_REACH not in data["text"]["unfiltered"]
+        assert html.unescape(re.search(r'<select id="flt-close"[^>]*title="([^"]*)"',
+                                       page).group(1)) == dashboard._CLOSE_TITLE
+        # ... and one whose every choice has no grid: the base block's own
+        # choice alone, whatever the sweep recorded
+        shown = TestFilterPage._data(_cl_page(monkeypatch, tmp_path / "all", _cl_sweep()))
+        shut = {**shown, "grid_close": [None] * 3, "grid_close_off": [None] * 3,
+                "close_state": "unavailable"}
+        bar = dashboard._filter_bar_html(shut, {}, own_close=14)
+        assert re.search(r'<select id="flt-close"[^>]*><option value="7" selected>7 days '
+                         r"\(primary\)</option></select>", bar)
+
+    def test_the_bar_s_label_is_the_name_the_page_s_words_give_the_setting(self):
+        # The test pinning the backtest bar to the Trading tab's reads every
+        # label from _filter_bar_html's source, so the label is written out
+        # there; it must be the name every other word of the page uses
+        source = inspect.getsource(dashboard._filter_bar_html)
+        assert re.findall(r'<label>([^<:]+): <select id="flt-close"', source) == [
+            dashboard._CLOSE_LABEL]
+        assert dashboard._CLOSE_LABEL == "Skip if closing within"
+        # Every word is Python's: none is written in the script
+        for words in (dashboard._CLOSE_TITLE, dashboard._CLOSE_TITLE_CHOICES,
+                      dashboard._CLOSE_OTHER_NOTE,
+                      dashboard._CLOSE_REACH, dashboard._CLOSE_REACH_NO_EXPLORER,
+                      dashboard._CLOSE_SYNC_NOT_WITH, dashboard._CLOSE_SYNC_UNAVAILABLE,
+                      dashboard._CLOSE_OPTION_UNAVAILABLE.strip(),
+                      *dashboard._CLOSE_NOTES.values(), dashboard._close_phrase(3),
+                      dashboard._CLOSE_LABEL + " 3", "no results", "shown only at"):
+            assert words not in dashboard._FILTER_JS, words
+
+
+@pytest.mark.usefixtures("_cl_stopped_clock")
+class TestCloseScript:
+    """The bar's "Skip if closing within" select under the page script (run
+    outside a browser). Each choice draws its own chunk, from its own grid
+    under the Tier floors choice shown — never another choice's, nor the
+    main grid's where they differ — and a choice the page has no grid for
+    draws nothing. At any choice but the run's own the Rebalance, Min. price
+    movement, "Rebalance until", Sell and Min. days selects are shut and keep
+    their values, a grey note says why, and back at the run's own they open
+    again on the scenario drawn before. Shown in the dashboard, the choice
+    goes to the Trading tab once the reader picks it, while the shut selects
+    never do: their fields go as the Trading tab has them (or are left out
+    while the bar knows no proposal that names them), and a field a told
+    choice left out is never sent later from the bar unless the reader picks
+    it. A proposal's choice is shown, and the red note names what the bar
+    cannot show beside it and where the bar shows it. A page without the
+    other choices keeps the select shut and the Trading tab's value as it
+    is, unnamed."""
+
+    def test_each_choice_draws_its_own_chunk(self, monkeypatch, tmp_path):
+        sweep = _cl_sweep()
+        page = _cl_page(monkeypatch, tmp_path, sweep)
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        cells, steps = [], [["wait"], ["snap", "ready"]]
+        for tier, key in (("on", "grid_close"), ("off", "grid_close_off")):
+            for ci, days in enumerate(data["close"]):
+                for bi, ki, capi, cid in _cl_cells(data[key][ci]):
+                    name = f"{tier} {days} {bi} {ki} {capi}"
+                    steps += [["set", "flt-tier", tier], ["set", "flt-close", str(days)],
+                              ["set", "flt-band", str(bi)], ["set", "flt-k", str(ki)],
+                              ["set", "flt-cap", str(capi)], ["fire", "flt-cap"], ["settle"],
+                              ["snap", name]]
+                    cells.append((name, tier, ci, bi, ki, capi, cid))
+        snaps = _run_script(tmp_path, page, steps, strict=True, keep=0)
+        loaded = _cl_new_files(snaps, ["ready"] + [cell[0] for cell in cells])
+        text = data["text"]
+        assert snaps["ready"]["selects"]["flt-close"]["disabled"] is False
+        assert snaps["ready"]["selects"]["flt-close"]["value"] == "7"
+        assert len(cells) == 3 * 2 * 12
+        for name, tier, ci, bi, ki, capi, cid in cells:
+            snap = snaps[name]
+            # The one file loaded is that choice's chunk at that cell
+            assert loaded[name] == _cl_shown(page, cid), name
+            view = chunks[cid]["list"]["views"]["all"]
+            assert snap["text"]["hdr-trades"] == str(view["n"]), name
+            # Named as that choice's run: its own phrase, never rebalancing or selling
+            phrase = (_phrase(data, bi, ki, capi) if tier == "on"
+                      else _phrase_off(data, bi, ki, capi)) + data["close_text"]["phrases"][ci]
+            primary_cell = [bi, ki, capi] == data["primary"]
+            assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
+                text, phrase, False, None, view["n"], view["n"],
+                note="other_run" if primary_cell else None), name
+        # Not vacuous: the choices draw different runs at one cell, and a
+        # choice's figures are its family's own simulation there
+        at = {days: [c for c in cells if c[0] == f"on {days} 0 1 1"][0][-1]
+              for days in data["close"]}
+        assert len({at[0], at[14], data["grid"][0][1][1]}) == 3
+        family = sweep.close_sweep.cell(14, _CL_BANDS[0], _CL_KS[1])[0.2]["all"]
+        kpis = dashboard._performance_kpis(family.equity_df, family.trades, 1000.0)
+        drawn = snaps["on 14 0 1 1"]["text"]
+        assert {name: drawn[f"kpi-{name}"] for name, *_ in kpis} == {
+            name: value for name, _, value, _ in kpis}
+        assert drawn["hdr-trades"] == str(len(family.trades))
+
+    def test_a_choice_with_no_grid_draws_nothing_and_is_named(self, monkeypatch, tmp_path):
+        page = _cl_page(monkeypatch, tmp_path, _cl_sweep(cls=_cl_refusing(3)))
+        data = TestFilterPage._data(page)
+        assert data["grid_close"][1] is None
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["snap", "ready"],
+            ["set", "flt-close", "3"], ["fire", "flt-close"], ["settle"], ["snap", "three"],
+            ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"], ["snap", "off"]],
+            strict=True, keep=0)
+        assert snaps["ready"]["selects"]["flt-close"]["disabledOptions"] == ["3"]
+        # A script that sets it all the same (no reader can) draws the
+        # scenario the run never simulated: no file, no other choice's run
+        snap = snaps["three"]
+        pb, pk, pc = data["primary"]
+        assert _cl_new_files(snaps, ["ready", "three"])["three"] == []
+        assert snap["text"]["flt-summary"] == data["text"]["missing"].format(
+            scenario=_phrase(data, pb, pk, pc) + data["close_text"]["phrases"][1]) \
+            + data["text"]["unfiltered"]
+        assert snap["text"]["hdr-trades"] == "0"
+        # The option stays shut under either Tier floors choice
+        assert snaps["off"]["selects"]["flt-close"]["disabledOptions"] == ["3"]
+        # A proposal naming it is named in the red note, the select kept
+        query = defaults_server._settings_query(_proposed(
+            tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
+            interval_discount=data["ks"][pk]["value"], size_cap=data["caps"][pc]["value"],
+            rebalance=False, min_price_move=None, rebalance_min_days_to_maturity=None,
+            sell_at=None, sell_min_days=None, buy_min_days_to_close=3))
+        snap = _run_script(tmp_path, page, [["wait"], *_apply(query), ["snap", "s"]],
+                           strict=True, framed=True)["s"]
+        assert snap["selects"]["flt-close"]["value"] == "7"
+        assert _note(snap) == data["text"]["sync_not_here"].format(
+            items=dashboard._CLOSE_SYNC_UNAVAILABLE.format(field=dashboard._CLOSE_LABEL,
+                                                          value=_cl_words(3)))
+
+    def test_a_choice_with_no_grid_under_the_tier_floors_shown_is_shut_there(
+            self, monkeypatch, tmp_path):
+        # A base block whose 14-day choice has a grid with the tier floors on
+        # but none with them off: the option shuts once the tier floors are
+        # off, and a script that picks it there draws nothing
+        page = _cl_page(monkeypatch, tmp_path, _cl_sweep())
+
+        def no_off_view(data):
+            data["grid_close_off"][2] = None
+        page = _cl_repacked(page, no_off_view)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["snap", "ready"],
+            ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"], ["snap", "off"],
+            ["set", "flt-close", "14"], ["fire", "flt-close"], ["settle"], ["snap", "fourteen"],
+            ["set", "flt-tier", "on"], ["fire", "flt-tier"], ["settle"], ["snap", "on"]],
+            strict=True, keep=0)
+        data = TestFilterPage._data(page)
+        assert "disabledOptions" not in snaps["ready"]["selects"]["flt-close"]
+        assert snaps["off"]["selects"]["flt-close"]["disabledOptions"] == ["14"]
+        assert _cl_new_files(snaps, ["off", "fourteen"])["fourteen"] == []
+        assert snaps["fourteen"]["text"]["flt-summary"].startswith(
+            data["text"]["missing"].split("{scenario}")[0])
+        assert "disabledOptions" not in snaps["on"]["selects"]["flt-close"]
+        pb, pk, pc = data["primary"]
+        assert _cl_new_files(snaps, ["off", "fourteen", "on"])["on"] == _cl_shown(
+            page, data["grid_close"][2][pb][pk][pc])
+
+    def test_a_cell_a_choice_has_no_chunk_for_draws_nothing(self, monkeypatch, tmp_path):
+        # The 14-day choice holds no chunk at one cell other than the run's
+        # own, where the main grid's chunk is a file: picking that cell draws
+        # the scenario the run never simulated and loads no file, never the
+        # main grid's chunk there nor another choice's
+        page = _cl_page(monkeypatch, tmp_path, _cl_sweep())
+        data = TestFilterPage._data(page)
+        pb, pk, pc = data["primary"]
+        ci = data["close"].index(14)
+        bi, ki, capi = next(
+            (b, k, c) for b in range(len(data["bands"])) for k in range(len(data["ks"]))
+            for c in range(len(data["caps"]))
+            if (b, k, c) != (pb, pk, pc) and (data["grid"][b][k][c] or 0) >= data["inline_chunks"])
+
+        def no_cell(changed):
+            changed["grid_close"][ci][bi][ki][capi] = None
+        page = _cl_repacked(page, no_cell)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["snap", "ready"],
+            ["set", "flt-close", "14"], ["fire", "flt-close"], ["settle"], ["snap", "fourteen"],
+            ["set", "flt-band", str(bi)], ["set", "flt-k", str(ki)],
+            ["set", "flt-cap", str(capi)], ["fire", "flt-cap"], ["settle"], ["snap", "empty"]],
+            strict=True, keep=0)
+        loaded = _cl_new_files(snaps, ["ready", "fourteen", "empty"])
+        assert loaded["fourteen"] == _cl_shown(page, data["grid_close"][ci][pb][pk][pc]) != []
+        assert loaded["empty"] == []
+        empty = snaps["empty"]
+        assert empty["text"]["flt-summary"] == data["text"]["missing"].format(
+            scenario=_phrase(data, bi, ki, capi) + data["close_text"]["phrases"][ci]) \
+            + data["text"]["unfiltered"]
+        assert empty["text"]["hdr-trades"] == "0"
+
+    def test_at_another_choice_the_rebalance_and_sell_selects_shut_and_keep_their_values(
+            self, monkeypatch, tmp_path):
+        page = _cl_page(monkeypatch, tmp_path, _cl_views_sweep())
+        data = TestFilterPage._data(page)
+        assert data["close_state"] == "shown" and data["grid_maturity"] and data["sell_blocks"]
+        pb, pk, pc = data["primary"]
+        greyed = ("flt-rebalance", "flt-move", "flt-until", "flt-sell", "flt-days")
+        # 5c and 7 days before at the primary cell: a rebalancing run of its own
+        choose = TestUntilScript._choose
+        steps = [["wait"], *TestRebalanceScript.ON, *choose("flt-move", 1), ["snap", "moved"],
+                 *choose("flt-until", 2), ["snap", "rebalancing"],
+                 *choose("flt-close", 14), ["snap", "other"],
+                 *choose("flt-close", 7), ["snap", "back"],
+                 *TestRebalanceScript.OFF, *choose("flt-sell", 0), ["snap", "level"],
+                 *choose("flt-days", TestSellScript._di(3)), ["snap", "selling"],
+                 *choose("flt-close", 0), ["snap", "off"],
+                 *choose("flt-close", 7), ["snap", "sold again"]]
+        names = ["moved", "rebalancing", "other", "back", "level", "selling", "off",
+                 "sold again"]
+        snaps = TestSellScript._run(tmp_path, page, steps, strict=True,
+                                    js=TestRebalanceScript.WAIT, keep=0)
+        loaded = _cl_new_files(snaps, names)
+        values = {name: {s: snaps[name]["selects"][s]["value"] for s in greyed}
+                  for name in names}
+        # At 14 days: every one shut, each keeping its value; the grey note
+        # says why; the chunk is that choice's own at the primary cell
+        other = snaps["other"]
+        assert all(other["selects"][s]["disabled"] for s in greyed)
+        assert values["other"] == values["rebalancing"] == {
+            "flt-rebalance": "yes", "flt-move": "1", "flt-until": "2", "flt-sell": "none",
+            "flt-days": "0"}
+        assert other["text"]["flt-close-note"] == dashboard._CLOSE_OTHER_NOTE
+        ci = data["close"].index(14)
+        assert loaded["other"] == _cl_shown(page, data["grid_close"][ci][pb][pk][pc])
+        summary = other["text"]["flt-summary"]
+        assert data["close_text"]["phrases"][ci] in summary
+        assert data["text"]["rebalance"] not in summary
+        assert dashboard._REBALANCE_SUMMARY_NOTE not in summary
+        # Back at the run's own: open as before (Sell shut beside rebalancing),
+        # the note cleared, and the very scenario drawn before drawn again
+        back = snaps["back"]
+        assert {s: back["selects"][s]["disabled"] for s in greyed} == {
+            "flt-rebalance": False, "flt-move": False, "flt-until": False, "flt-sell": True,
+            "flt-days": True}
+        assert values["back"] == values["rebalancing"]
+        assert back["text"].get("flt-close-note", "") == ""
+        assert loaded["back"] == loaded["rebalancing"] != []
+        assert back["text"]["flt-summary"] == snaps["rebalancing"]["text"]["flt-summary"]
+        # The same with a sell level: kept shut at off, open again at 7 days
+        assert values["off"] == values["selling"] == {
+            "flt-rebalance": "no", "flt-move": "1", "flt-until": "2", "flt-sell": "0",
+            "flt-days": TestSellScript._di(3)}
+        assert all(snaps["off"]["selects"][s]["disabled"] for s in greyed)
+        assert {s: snaps["sold again"]["selects"][s]["disabled"] for s in greyed} == {
+            "flt-rebalance": False, "flt-move": True, "flt-until": True, "flt-sell": False,
+            "flt-days": False}
+        assert values["sold again"] == values["selling"]
+        assert loaded["sold again"] == loaded["selling"] != []
+        # A change event on a shut select draws nothing and opens nothing
+        snap = TestSellScript._run(tmp_path, page, [
+            ["wait"], *choose("flt-close", 3), ["snap", "three"],
+            *TestRebalanceScript.ON, ["snap", "fired"]],
+            strict=True, js=TestRebalanceScript.WAIT)["fired"]
+        assert snap["reacts"] == [] and all(snap["selects"][s]["disabled"] for s in greyed)
+
+    def test_a_choice_whose_file_cannot_be_loaded_puts_the_bar_back(self, monkeypatch, tmp_path):
+        # 14 days at the primary cell, whose chunk file is missing: the select
+        # goes back to the run's own choice, the Rebalance select shown before
+        # opens again on its value, and the line names what could not be shown
+        page = _cl_page(monkeypatch, tmp_path, _cl_views_sweep())
+        data = TestFilterPage._data(page)
+        pb, pk, pc = data["primary"]
+        ci = data["close"].index(14)
+        cid = data["grid_close"][ci][pb][pk][pc]
+        assert cid >= data["inline_chunks"]
+        choose = TestUntilScript._choose
+        snaps = TestSellScript._run(tmp_path, page, [
+            ["wait"], *TestRebalanceScript.ON, ["snap", "rebalancing"],
+            *choose("flt-close", 14), ["snap", "failed"]],
+            strict=True, js=TestRebalanceScript.WAIT, files_missing=(_chunk_src(page, cid),))
+        failed, before = snaps["failed"], snaps["rebalancing"]
+        assert failed["selects"]["flt-close"]["value"] == "7"
+        assert failed["selects"]["flt-rebalance"] == before["selects"]["flt-rebalance"]
+        assert failed["selects"]["flt-rebalance"]["value"] == "yes"
+        assert failed["selects"]["flt-rebalance"]["disabled"] is False
+        assert failed["text"].get("flt-close-note", "") == ""
+        tried = _phrase(data, pb, pk, pc) + data["close_text"]["phrases"][ci]
+        still = _phrase(data, pb, pk, pc) + data["text"]["rebalance"]
+        reason = data["text"]["sidecar_missing"].format(file=_chunk_src(page, cid))
+        assert failed["text"]["flt-summary"] == data["text"]["unavailable"].format(
+            failed=tried, reason=f"Error: {reason}", scenario=still)
+
+    def _framed(self, monkeypatch, tmp_path) -> tuple:
+        """(the page with every view, its base block, the Trading tab's proposal there:
+        rebalancing with a minimum and a days limit, a sell level with a minimum of
+        days, the run's own 7 days)."""
+        page = _cl_page(monkeypatch, tmp_path, _cl_views_sweep())
+        data = TestFilterPage._data(page)
+        pb, pk, pc = data["primary"]
+        proposal = _proposed(
+            tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
+            interval_discount=data["ks"][pk]["value"], size_cap=data["caps"][pc]["value"],
+            rebalance=True, min_price_move=data["moves"][1]["value"],
+            rebalance_min_days_to_maturity=data["maturity"][1]["value"],
+            sell_at=data["sell_levels"][0]["value"], sell_min_days=3,
+            buy_min_days_to_close=7)
+        return page, data, proposal
+
+    def test_a_choice_never_sends_the_shut_selects(self, monkeypatch, tmp_path):
+        # The Trading tab rebalances (with a minimum and a days limit) and
+        # sells: picking 3 days tells 3 days and exactly the Trading tab's
+        # rebalancing and selling, never "off" from what the bar cannot show
+        page, data, proposal = self._framed(monkeypatch, tmp_path)
+        choose = TestUntilScript._choose
+        snaps = TestSellScript._run(tmp_path, page, [
+            ["wait"], *_apply(defaults_server._settings_query(proposal)), ["snap", "applied"],
+            *choose("flt-close", 3), ["snap", "three"],
+            *choose("flt-close", 7), ["snap", "own"]],
+            strict=True, js=TestRebalanceScript.WAIT, framed=True)
+        assert snaps["applied"]["selects"]["flt-rebalance"]["value"] == "yes"
+        for name, days in (("three", 3), ("own", 7)):
+            [raw] = _told(snaps[name])
+            assert TestTradingSync._query(raw)["buy_min_days_to_close"] == str(days)
+            read, _ = defaults_server._proposal(defaults_server._params(raw), None)
+            assert read == dataclasses.replace(proposal, buy_min_days_to_close=days), name
+        # At 3 days the red note names the Trading tab's rebalancing beside
+        # that choice, and its sell level beside rebalancing
+        text, fields = data["text"], data["text"]["sync_fields"]
+        beside = dashboard._CLOSE_SYNC_NOT_WITH.replace("{own}", _cl_words(data["close_own"]))
+        assert _note(snaps["three"]) == text["sync_not_here"].format(items=text["sync_join"].join([
+            beside.format(field=fields["rebalance"], value=text["sync_on"]),
+            beside.format(field=fields["move"],
+                          value=config.live_setting_text("min_price_move",
+                                                         proposal.min_price_move)),
+            beside.format(field=fields["until"],
+                          value=config.live_setting_text("rebalance_min_days_to_maturity",
+                                                         proposal.rebalance_min_days_to_maturity)),
+            text["sync_not_with"].format(field=fields["sell"],
+                                         value=config.live_setting_text("sell_at",
+                                                                        proposal.sell_at)),
+            text["sync_not_with"].format(field=fields["days"], value="3")]))
+        # Back at the run's own, the rebalancing is shown again: only the sell
+        # level beside it is named
+        assert _note(snaps["own"]) == text["sync_not_here"].format(items=text["sync_join"].join([
+            text["sync_not_with"].format(field=fields["sell"],
+                                         value=config.live_setting_text("sell_at",
+                                                                        proposal.sell_at)),
+            text["sync_not_with"].format(field=fields["days"], value="3")]))
+        # A Min. price movement the reader picks, still loading when 3 days is
+        # picked, is never told (so it still counts as picked at 3 days): the
+        # shut select's new minimum stays out all the same, and the Trading
+        # tab's goes, which the shut select then shows again
+        query = defaults_server._settings_query(proposal)
+        probe = TestSellScript._run(tmp_path, page, [
+            ["wait"], *_apply(query), ["snap", "applied"], *choose("flt-move", 1),
+            ["snap", "moved"]], strict=True, js=TestRebalanceScript.WAIT, framed=True)
+        [moved] = _cl_new_files(probe, ["applied", "moved"])["moved"]
+        snaps = TestSellScript._run(tmp_path, page, [
+            ["wait"], *_apply(query), *choose("flt-move", 1), ["snap", "loading"],
+            *choose("flt-close", 3), ["snap", "three"]],
+            strict=True, js=TestRebalanceScript.WAIT, framed=True, files_deferred=(moved,))
+        assert _told(snaps["loading"]) == []
+        assert snaps["loading"]["selects"]["flt-move"]["value"] == "1"
+        [raw] = _told(snaps["three"])
+        read, _ = defaults_server._proposal(defaults_server._params(raw), None)
+        assert read == dataclasses.replace(proposal, buy_min_days_to_close=3)
+        shut = snaps["three"]["selects"]["flt-move"]
+        assert (shut["value"], shut["disabled"]) == ("2", True)
+
+    def test_with_no_proposal_known_the_shut_selects_fields_are_left_out(
+            self, monkeypatch, tmp_path):
+        page, data, _proposal = self._framed(monkeypatch, tmp_path)
+        fields = {"rebalance", "min_price_move", "rebalance_min_days_to_maturity", "sell_at",
+                  "sell_min_days"}
+        other_k = next(i for i in range(len(data["ks"])) if i != data["primary"][1])
+        choose = TestUntilScript._choose
+        axes = TestSellScript._run(tmp_path, page, [
+            ["wait"], *choose("flt-cap", 2), ["snap", "cap"], *choose("flt-k", other_k),
+            ["snap", "k"]], strict=True, js=TestRebalanceScript.WAIT, framed=True)
+        close = TestSellScript._run(tmp_path, page, [
+            ["wait"], *choose("flt-close", 3), ["snap", "three"], *choose("flt-cap", 2),
+            ["snap", "cap"]], strict=True, js=TestRebalanceScript.WAIT, framed=True)
+        # With no proposal known a choice at the run's own tells the bar's
+        # settings, its Rebalance and Sell fields included, but never the
+        # bar's "Skip if closing within", which the reader did not pick (the
+        # defaults server keeps the saved choice): neither that choice nor
+        # the next one names it
+        for name in ("cap", "k"):
+            [raw] = _told(axes[name])
+            query = TestTradingSync._query(raw)
+            assert fields <= set(query) and "buy_min_days_to_close" not in query, name
+        # 3 days, picked, is told with the shut selects' fields left out (the
+        # defaults server keeps the saved ones); the next choice keeps 3 days
+        # and leaves those fields out still
+        for name in ("three", "cap"):
+            [raw] = _told(close[name])
+            query = TestTradingSync._query(raw)
+            assert query["buy_min_days_to_close"] == "3" and not fields & set(query), name
+        read, _ = defaults_server._proposal(defaults_server._params(_told(close["cap"])[0]),
+                                            None)
+        assert read.size_cap == data["caps"][2]["value"]
+
+    def test_a_field_a_told_choice_left_out_is_never_sent_unpicked(self, monkeypatch, tmp_path):
+        # With no proposal known, 3 days is told without the shut selects'
+        # fields, so the Trading tab keeps its saved rebalancing and selling,
+        # which the bar never hears back. At 7 days again (only that picked)
+        # those fields stay out: the bar's own Rebalance no and no selling,
+        # which the reader never picked, are never told over the saved ones
+        page, _data, saved = self._framed(monkeypatch, tmp_path)
+        fields = {"rebalance", "min_price_move", "rebalance_min_days_to_maturity", "sell_at",
+                  "sell_min_days"}
+        choose = TestUntilScript._choose
+        snaps = TestSellScript._run(tmp_path, page, [
+            ["wait"], *choose("flt-close", 3), ["snap", "three"],
+            *choose("flt-close", 7), ["snap", "own"]],
+            strict=True, js=TestRebalanceScript.WAIT, framed=True)
+        assert snaps["own"]["selects"]["flt-rebalance"]["value"] == "no"
+        assert snaps["own"]["selects"]["flt-sell"]["value"] == "none"
+        for name, days in (("three", 3), ("own", 7)):
+            [raw] = _told(snaps[name])
+            query = TestTradingSync._query(raw)
+            assert query["buy_min_days_to_close"] == str(days) and not fields & set(query), name
+            # As the defaults server reads it over the saved settings (the
+            # _framed proposal: rebalancing with a minimum and a days limit,
+            # and a sell level), every saved setting but the choice stays
+            read, _ = defaults_server._proposal(defaults_server._params(raw), saved)
+            assert read == dataclasses.replace(saved, buy_min_days_to_close=days), name
+
+    def test_after_a_proposal_that_cannot_be_drawn_the_shut_selects_still_go_as_proposed(
+            self, monkeypatch, tmp_path):
+        # The Trading tab rebalances and sells, and the reader picks 3 days.
+        # The next proposal (no rebalancing, no selling, 14 days) cannot be
+        # drawn: its file is missing, so the bar stays at 3 days, its shut
+        # selects keep the rebalancing, and every setting counts as picked.
+        # The reader's next choice there (a size cap) tells the bar's axes and
+        # 3 days, but the Rebalance and Sell fields as that proposal has them,
+        # never the shut selects' rebalancing, which then show its values;
+        # back at 7 days the same is told, the selects open on those values
+        page, data, proposal = self._framed(monkeypatch, tmp_path)
+        pb, pk, pc = data["primary"]
+        fourteen = data["grid_close"][data["close"].index(14)][pb][pk][pc]
+        failed = dataclasses.replace(proposal, rebalance=False, min_price_move=None,
+                                     rebalance_min_days_to_maturity=None, sell_at=None,
+                                     sell_min_days=None, buy_min_days_to_close=14)
+        choose = TestUntilScript._choose
+        snaps = TestSellScript._run(tmp_path, page, [
+            ["wait"], *_apply(defaults_server._settings_query(proposal)),
+            *choose("flt-close", 3), ["snap", "three"],
+            *_apply(defaults_server._settings_query(failed)), ["snap", "failed"],
+            *choose("flt-cap", 2), ["snap", "cap"],
+            *choose("flt-close", 7), ["snap", "own"]],
+            strict=True, js=TestRebalanceScript.WAIT, framed=True,
+            files_missing=(_chunk_src(page, fourteen),))
+        stuck = snaps["failed"]
+        assert stuck["selects"]["flt-close"]["value"] == "3" and _told(stuck) == []
+        assert stuck["selects"]["flt-rebalance"]["value"] == "yes"
+        assert _note(stuck).startswith(data["text"]["sync_unshown"])
+        cap = data["caps"][2]["value"]
+        for name, days in (("cap", 3), ("own", 7)):
+            [raw] = _told(snaps[name])
+            read, _ = defaults_server._proposal(defaults_server._params(raw), None)
+            assert read == dataclasses.replace(failed, buy_min_days_to_close=days,
+                                               size_cap=cap), name
+            assert snaps[name]["selects"]["flt-rebalance"]["value"] == "no", name
+            assert snaps[name]["selects"]["flt-sell"]["value"] == "none", name
+        assert snaps["cap"]["selects"]["flt-rebalance"]["disabled"] is True
+        assert snaps["own"]["selects"]["flt-rebalance"]["disabled"] is False
+
+    def test_a_pick_not_yet_told_is_never_sent_from_a_shut_select(self, monkeypatch, tmp_path):
+        # The reader picks Rebalance yes, and 3 days while its chunk still
+        # loads: the choice told carries 3 days and the Trading tab's
+        # Rebalance no, never the shut select's yes, which then shows the
+        # Trading tab's no; back at 7 days the bar shows and tells no
+        page, data, proposal = self._framed(monkeypatch, tmp_path)
+        proposal = dataclasses.replace(proposal, rebalance=False, min_price_move=None,
+                                       rebalance_min_days_to_maturity=None)
+        pb, pk, pc = data["primary"]
+        rebalancing = data["grid_rebalance"][pb][pk][pc]
+        assert rebalancing >= data["inline_chunks"]
+        choose = TestUntilScript._choose
+        snaps = TestSellScript._run(tmp_path, page, [
+            ["wait"], *_apply(defaults_server._settings_query(proposal)),
+            *TestRebalanceScript.ON, ["snap", "loading"],
+            *choose("flt-close", 3), ["snap", "three"],
+            *choose("flt-close", 7), ["snap", "own"]],
+            strict=True, js=TestRebalanceScript.WAIT, framed=True,
+            files_deferred=(_chunk_src(page, rebalancing),))
+        assert _told(snaps["loading"]) == []
+        for name, days in (("three", 3), ("own", 7)):
+            [raw] = _told(snaps[name])
+            read, _ = defaults_server._proposal(defaults_server._params(raw), None)
+            assert read == dataclasses.replace(proposal, buy_min_days_to_close=days), name
+            assert snaps[name]["selects"]["flt-rebalance"]["value"] == "no", name
+        assert snaps["three"]["selects"]["flt-rebalance"]["disabled"] is True
+        assert snaps["own"]["selects"]["flt-rebalance"]["disabled"] is False
+
+    def test_a_proposal_at_another_choice_keeps_its_rebalancing_shut_and_named(
+            self, monkeypatch, tmp_path):
+        page, data, proposal = self._framed(monkeypatch, tmp_path)
+        rebalancing = dataclasses.replace(proposal, sell_at=None, sell_min_days=None)
+        at_three = dataclasses.replace(rebalancing, buy_min_days_to_close=3)
+        plain = dataclasses.replace(at_three, rebalance=False, min_price_move=None,
+                                    rebalance_min_days_to_maturity=None)
+        pb, pk, pc = data["primary"]
+        ci = data["close"].index(3)
+        snaps = TestSellScript._run(tmp_path, page, [
+            ["wait"], *_apply(defaults_server._settings_query(at_three)), ["snap", "three"],
+            *_apply(defaults_server._settings_query(rebalancing)), ["snap", "own"],
+            *_apply(defaults_server._settings_query(plain)), ["snap", "plain"],
+            *_apply(defaults_server._settings_query(at_three)), ["snap", "again"]],
+            strict=True, js=TestRebalanceScript.WAIT, framed=True)
+        text, fields = data["text"], data["text"]["sync_fields"]
+        beside = dashboard._CLOSE_SYNC_NOT_WITH.replace("{own}", _cl_words(data["close_own"]))
+        named = text["sync_not_here"].format(items=text["sync_join"].join([
+            beside.format(field=fields["rebalance"], value=text["sync_on"]),
+            beside.format(field=fields["move"],
+                          value=config.live_setting_text("min_price_move",
+                                                         at_three.min_price_move)),
+            beside.format(field=fields["until"],
+                          value=config.live_setting_text("rebalance_min_days_to_maturity",
+                                                         at_three.rebalance_min_days_to_maturity))]))
+        # At 3 days: shown at 3 days, the rebalancing kept on its shut selects
+        # and named, the choice's own chunk drawn, nothing told back
+        three = snaps["three"]
+        assert three["selects"]["flt-close"]["value"] == "3"
+        assert {s: (three["selects"][s]["value"], three["selects"][s]["disabled"])
+                for s in ("flt-rebalance", "flt-move", "flt-until")} == {
+            "flt-rebalance": ("yes", True), "flt-move": ("2", True), "flt-until": ("2", True)}
+        assert _note(three) == named and _told(three) == []
+        assert three["text"]["hdr-trades"] == str(TestFilterPage._chunks(page)[
+            data["grid_close"][ci][pb][pk][pc]]["list"]["views"]["all"]["n"])
+        # At the run's own: everything applied as before, open, nothing named
+        own = snaps["own"]
+        assert own["selects"]["flt-close"]["value"] == "7"
+        assert {s: (own["selects"][s]["value"], own["selects"][s]["disabled"])
+                for s in ("flt-rebalance", "flt-move", "flt-until")} == {
+            "flt-rebalance": ("yes", False), "flt-move": ("2", False), "flt-until": ("2", False)}
+        assert _note(own) == ""
+        # A proposal that differs from the bar only in a shut select's value
+        # is still set on it (and named), though the scenario is the same
+        assert snaps["plain"]["selects"]["flt-rebalance"]["value"] == "no"
+        assert _note(snaps["plain"]) == ""
+        again = snaps["again"]
+        assert again["selects"]["flt-rebalance"]["value"] == "yes"
+        assert again["selects"]["flt-rebalance"]["disabled"] is True
+        assert again["reacts"] and _note(again) == named
+
+    def test_the_longest_choice_counts_in_the_proposal_s_budget(self, monkeypatch, tmp_path):
+        # "off", the longest spelling of the field, is counted in the posted
+        # form the page budgets: with the form budget set to that query's
+        # length the choice is told, one byte less and it is not
+        steps = [["wait"], *TestUntilScript._choose("flt-close", 0), ["snap", "s"]]
+        page = _cl_page(monkeypatch, tmp_path / "first", _cl_sweep())
+        [query] = _told(_run_script(tmp_path, page, steps, strict=True, framed=True)["s"])
+        assert TestTradingSync._query(query)["buy_min_days_to_close"] == "off"
+        length = len(_browser_form(parse_qsl(query, strict_parsing=True)))
+        for budget, told in ((length, True), (length - 1, False)):
+            monkeypatch.setattr(dashboard, "_sync_max_form_bytes", lambda b=budget: b)
+            monkeypatch.setattr(dashboard, "TRADING_QUERY_MAX_BYTES",
+                                len(query) + 2 * query.count("'"))
+            page = _cl_page(monkeypatch, tmp_path / str(budget), _cl_sweep())
+            snap = _run_script(tmp_path, page, steps, strict=True, framed=True)["s"]
+            assert (_told(snap) == [query]) is told, budget
+            assert _note(snap) == ("" if told else
+                                   TestFilterPage._data(page)["text"]["sync_too_long"]), budget
+
+    def test_a_page_without_the_choices_keeps_the_trading_tab_s_value(
+            self, monkeypatch, tmp_path):
+        page = _kc_page(monkeypatch, tmp_path, _kc_sweep_rebalance())
+        data = TestFilterPage._data(page)
+        assert "close" not in data
+        pb, pk, pc = data["primary"]
+        proposal = _proposed(
+            tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
+            interval_discount=data["ks"][pk]["value"], size_cap=data["caps"][pc]["value"],
+            rebalance=True, buy_min_days_to_close=14)
+        choose = TestUntilScript._choose
+        snaps = TestRebalanceScript._run(tmp_path, page, [
+            ["wait"], ["snap", "ready"], *_apply(defaults_server._settings_query(proposal)),
+            ["snap", "applied"], *choose("flt-cap", 2), ["snap", "cap"]],
+            strict=True, framed=True)
+        # The select stays shut on the run's own, and the proposal's 14 days
+        # is neither shown nor named; the reader's choice keeps it as it is
+        for name in ("ready", "applied", "cap"):
+            assert snaps[name]["selects"]["flt-close"] == {
+                "value": "", "disabled": True, "options": [["", "not recorded (primary)"]]}
+        assert _note(snaps["applied"]) == "" and _note(snaps["cap"]) == ""
+        assert snaps["applied"]["selects"]["flt-rebalance"]["value"] == "yes"
+        [raw] = _told(snaps["cap"])
+        read, _ = defaults_server._proposal(defaults_server._params(raw), None)
+        assert read == dataclasses.replace(proposal, size_cap=data["caps"][2]["value"])
+        # With no proposal known the field is left out (the server keeps the saved one)
+        snap = TestRebalanceScript._run(tmp_path, page, [["wait"], *choose("flt-cap", 2),
+                                                         ["snap", "s"]],
+                                        strict=True, framed=True)["s"]
+        [raw] = _told(snap)
+        assert "buy_min_days_to_close" not in TestTradingSync._query(raw)
+
+    def test_a_page_with_no_results_for_the_choices_never_tells_its_own(
+            self, monkeypatch, tmp_path):
+        # A family none of whose choices can be read: the page knows the run's
+        # own choice (7 days) and shows it alone, shut. What the bar tells
+        # never carries that shut select's value: a cap pick passes the
+        # Trading tab's 14 days through, no proposal known leaves the field
+        # out, and after a proposal the bar could not draw (when every
+        # setting counts as picked) the next choice still passes the Trading
+        # tab's 14 days through
+        class Unreadable(backtester.CloseSweep):
+            def sweep(self, days, **kwargs):
+                """Refuses every choice, as a family none of whose results can be read."""
+                raise RuntimeError("this choice's results cannot be read")
+        page = _cl_page(monkeypatch, tmp_path, _cl_sweep(cls=Unreadable))
+        data = TestFilterPage._data(page)
+        assert (data["close_state"], data["close_own"]) == ("unavailable", 7)
+        assert data["close"] and data["grid_close"] == [None] * len(data["close"])
+        pb, pk, pc = data["primary"]
+        other_k = next(i for i in range(len(data["ks"])) if i != pk)
+        proposal = _proposed(
+            tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
+            interval_discount=data["ks"][pk]["value"], size_cap=data["caps"][pc]["value"],
+            rebalance=False, buy_min_days_to_close=14)
+        # The same at a size cap whose chunk is a file, missing here
+        cap = next(c for c in range(len(data["caps"]))
+                   if (data["grid"][pb][pk][c] or 0) >= data["inline_chunks"])
+        unseen = dataclasses.replace(proposal, size_cap=data["caps"][cap]["value"])
+        choose, query = TestUntilScript._choose, defaults_server._settings_query
+        known = _run_script(tmp_path, page, [
+            ["wait"], *_apply(query(proposal)), ["snap", "applied"], *choose("flt-cap", 2),
+            ["snap", "cap"]], strict=True, framed=True)
+        unknown = _run_script(tmp_path, page, [["wait"], *choose("flt-cap", 2), ["snap", "cap"]],
+                              strict=True, framed=True)
+        failed = _run_script(tmp_path, page, [
+            ["wait"], *_apply(query(unseen)), ["snap", "failed"], *choose("flt-k", other_k),
+            ["snap", "k"]], strict=True, framed=True,
+            files_missing=(_chunk_src(page, data["grid"][pb][pk][cap]),))
+        # The proposal's 14 days is named, the select kept shut on 7 days
+        assert known["applied"]["selects"]["flt-close"]["value"] == "7"
+        assert known["applied"]["selects"]["flt-close"]["disabled"] is True
+        assert _note(known["applied"]) == data["text"]["sync_not_here"].format(
+            items=dashboard._CLOSE_SYNC_UNAVAILABLE.format(field=dashboard._CLOSE_LABEL,
+                                                          value=_cl_words(14)))
+        [raw] = _told(known["cap"])
+        assert TestTradingSync._query(raw)["buy_min_days_to_close"] == "14"
+        [raw] = _told(unknown["cap"])
+        assert "buy_min_days_to_close" not in TestTradingSync._query(raw)
+        assert _told(failed["failed"]) == []
+        assert _note(failed["failed"]).startswith(data["text"]["sync_unshown"])
+        [raw] = _told(failed["k"])
+        assert TestTradingSync._query(raw)["buy_min_days_to_close"] == "14"
+
+    def test_a_page_whose_family_held_no_choice_neither_shows_nor_names_a_proposal_s(
+            self, monkeypatch, tmp_path):
+        # A family with no choice: the base block names no run's own choice,
+        # so the page reads no "Skip if closing within" of a proposal, as a
+        # page without the family: its 14 days is neither shown nor named,
+        # and a cap pick passes it through as the Trading tab has it
+        sweep = dataclasses.replace(_kc_sweep_close(_kc_sweep_tiers(), days=()),
+                                    buy_min_days_to_close=7)
+        page = _cl_page(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        assert (data["close"], data["close_own"], data["close_state"]) == ([], None,
+                                                                           "unavailable")
+        pb, pk, pc = data["primary"]
+        proposal = _proposed(
+            tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
+            interval_discount=data["ks"][pk]["value"], size_cap=data["caps"][pc]["value"],
+            rebalance=False, buy_min_days_to_close=14)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["snap", "ready"], *_apply(defaults_server._settings_query(proposal)),
+            ["snap", "applied"], *TestUntilScript._choose("flt-cap", 2), ["snap", "cap"]],
+            strict=True, framed=True)
+        assert snaps["applied"]["selects"]["flt-close"] == snaps["ready"]["selects"]["flt-close"]
+        assert snaps["applied"]["selects"]["flt-close"]["value"] == "7"
+        assert _note(snaps["applied"]) == "" and _note(snaps["cap"]) == ""
+        [raw] = _told(snaps["cap"])
+        read, _ = defaults_server._proposal(defaults_server._params(raw), None)
+        assert read == dataclasses.replace(proposal, size_cap=data["caps"][2]["value"])
 
 
 class TestSoldTradeRow:
