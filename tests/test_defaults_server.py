@@ -2354,7 +2354,9 @@ class TestTradingBar:
         # The backtest page's bar, read from its own source: its dropdowns'
         # labels in order, then its two menus' labels
         source = inspect.getsource(dashboard._filter_bar_html)
-        expected = re.findall(r"<label>([^<:]+): <select id=\"flt-", source)
+        # The Trading tab's bar still carries "Skip if closing within" as a hidden field
+        expected = [label for label in re.findall(r"<label>([^<:]+): <select id=\"flt-", source)
+                    if label != "Skip if closing within"]
         expected += [dashboard._MENU_CAT_LABEL, dashboard._MENU_TAG_LABEL]
         assert len(expected) == 11
         assert labels == expected == [

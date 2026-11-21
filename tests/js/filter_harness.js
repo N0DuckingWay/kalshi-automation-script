@@ -141,16 +141,20 @@ function Option(text, value) {
   this.text = text;
   this.value = value;
   this.defaultSelected = false;
+  this.disabled = false;
 }
 
-// A <select> with the options (and the "selected" and "disabled" attributes)
-// Python rendered; value and selectedIndex behave as a browser's do.
+// A <select> with the options (and each option's "selected" and "disabled"
+// attributes, and the select's own "disabled") Python rendered; value and
+// selectedIndex behave as a browser's do (a script may still set the value
+// to a disabled option, as a browser lets it).
 function __select(id, spec) {
   var el = __element(id, 'select');
   var index = spec.options.length ? 0 : -1;
   el.options = spec.options.map(function(o, i) {
     var opt = new Option(o.text, o.value);
     opt.defaultSelected = !!o.selected;
+    opt.disabled = !!o.disabled;
     if (opt.defaultSelected) { index = i; }
     return opt;
   });
@@ -487,7 +491,8 @@ function __setup(page) {
 
 // Everything the scripts have drawn, changed and opened since the last
 // snapshot, and the state of every element they have touched: its text,
-// markup, display, heights and colour, a select's value and options, a
+// markup, display, heights and colour, a select's value and options (and,
+// when any option is shut, "disabledOptions": their values), a
 // button's disabled state and hover text, a table body's rows (each cell's text, and each
 // cell's font weight where the script set one), and a chart's layout copied
 // as it stands now, since a later step can still change it
@@ -534,6 +539,10 @@ function __snapshot() {
     if (el.tagName === 'select') {
       snap.selects[id] = {value: el.value, disabled: el.disabled,
                           options: el.options.map(function(o) { return [o.value, o.text]; })};
+      // The values of the options shut, only for a select that has one
+      var shut = el.options.filter(function(o) { return o.disabled; })
+        .map(function(o) { return o.value; });
+      if (shut.length) { snap.selects[id].disabledOptions = shut; }
     }
     if (el.tagName === 'button') { snap.buttons[id] = el.disabled; snap.titles[id] = el.title; }
     if (el.children.length) {

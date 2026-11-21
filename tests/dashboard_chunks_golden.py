@@ -80,6 +80,16 @@ Notes:
     page fixtures must come from <dir>'s tests too. The script records the
     tree it imported and that tree's commit (git's, or --source-sha for a
     copy without git metadata) in the JSON.
+
+    Amend by hand (when a deliberate change moves some digests and the
+    oracle still holds for everything else): first check, case by case,
+    that the change is the intended one and nothing else (for the filter
+    bar's "Skip if closing within" menu: every chunk file byte-identical,
+    the page's base data block decoding equal, and the page different only
+    inside the bar's HTML and its script); then replace each moved digest
+    with the one this module computes for the changed tree, and add to the
+    JSON's "amended" list the cases, why, and each previous digest. main()
+    writes no "amended" list, so a whole re-capture drops those notes.
 """
 import argparse
 import hashlib

@@ -38,13 +38,15 @@ Purpose:
     glossary.py (the Data page renders its own share of the same text).
 
     A sticky filter bar at the top of the page — Spread band, Tier floors, k,
-    Size cap, Rebalance, Min. price movement, Sell, Min. days to maturity,
-    Exclude categories, Tag — re-scopes every
+    Size cap, Skip if closing within, Rebalance, Min. price movement,
+    Rebalance until, Sell, Min. days to maturity, Exclude categories,
+    Exclude tags — re-scopes every
     trade-derived section (performance, decomposition, calibration,
     diagnostics, risk, the benchmark's strategy row) to the run at another
     spread band, with the deadline-gap tier floors on (the run as simulated)
     or off (the band sweep's tier-floors-off run of that band), interval
-    discount k and per-trade size cap, with or without rebalancing the pairs
+    discount k and per-trade size cap, at another "Skip if closing within"
+    choice, with or without rebalancing the pairs
     the run still holds, holding every position to its pay-out or selling it at
     a share of its potential profit (no nearer to maturity than a number of
     days), and/or to the trades left after excluding some Kalshi categories
@@ -166,13 +168,25 @@ Purpose:
     population only). A run of its own is packed as a chunk, a list equal
     to one already packed shares that chunk, and the base block carries the
     choices ("close", "close_own") and each choice's chunk ids per scenario
-    ("grid_close" and its tier-floors-off twin, with "close_state"). The bar
-    has no menu for these choices, and the page's script does not read
-    those keys: the one thing a reader sees of them is the bar's Exclude
-    menus, which list a category or tag only another choice traded (at 0
-    trades), as they do one only a Rebalance, Sell or tier-floors-off run
-    traded. A choice whose results cannot be read or simulated costs that
-    choice alone, with one WARNING naming it.
+    ("grid_close" and its tier-floors-off twin, with "close_state" and the
+    words the script needs, "close_text"). The bar's "Skip if closing
+    within" select, right after Size cap, picks one: the run's own choice
+    (marked primary) or another, whose chunk at the scenario on screen is
+    read from that choice's own grid, never from another choice's or the
+    main grid (a choice that trades the very list another scenario does
+    shares that scenario's chunk, as any two equal lists do). Those runs
+    neither rebalance nor sell, so at any choice but the run's own the
+    Rebalance, Min. price movement, "Rebalance until", Sell and Min. days to
+    maturity selects are shut, keeping their values for the run's own
+    choice, and a grey note says so; the Scenario Explorer, the k-hat
+    section and cards and the Interval Discount section always show the run's
+    own choice. The bar's Exclude menus list a category or tag only another
+    choice traded (at 0 trades), as they do one only a Rebalance, Sell or
+    tier-floors-off run traded. A choice whose results cannot be read or
+    simulated costs that choice alone, with one WARNING naming it: its
+    option is shut and says it is not available. A page whose run worked
+    out no other choice (or none the page could read) offers the run's own
+    alone, shut, with a grey note saying why.
 
     The bar's Sell choice is "no selling" (the page as rendered) or one of the
     sell family's levels (backtester.SellSweep; config.TAKE_PROFIT_LEVELS,
@@ -236,9 +250,12 @@ Purpose:
     never sent with Rebalance no), its "Rebalance until" choice (only from
     a page that carries the choices: the choice's days, or 0, no days
     limit, at maturity and with Rebalance no), its Sell level and Min. days
-    to maturity (only from a page that simulated selling), "Skip if closing
-    within" (which the bar has no menu for: as the Trading tab has it, or
-    left out while no proposal is known), each category
+    to maturity (only from a page that simulated selling), its "Skip if
+    closing within" choice (off, or the choice's days, only from a page
+    that shows the other choices and only once the reader picked it, or
+    after a proposal the page could not draw; otherwise as the Trading tab
+    has it, or left out while the bar knows no proposal that names it),
+    each category
     ticked in the Exclude categories menu as a category live runs exclude
     (and so each kept category every one of whose tags is ticked, with its
     letter-case twins, each ticked or with every tag ticked too), and each
@@ -249,7 +266,15 @@ Purpose:
     the Trading tab has it, so a choice changes there only what the reader
     changed, and never a setting the bar cannot show (a value off its
     grids, a setting of a view it lacks, a category or tag it does not
-    list, a sell level beside rebalancing). The tab page points the Trading
+    list, a sell level beside rebalancing). At a "Skip if closing within"
+    choice other than the run's own, the shut Rebalance and Sell selects
+    are never sent as the reader set them: those fields go as the Trading
+    tab has them, or are left out while the bar knows no proposal that
+    names them (the defaults server then keeps the saved values). Once such
+    a choice is told, the shut selects show the Trading tab's values where
+    the bar knows them, and a field it left out stays out of what the bar
+    tells until the reader picks it or a proposal names it. The tab page
+    points the Trading
     tab at that proposal; the trading page compares it with the live
     defaults in force and acts only when one of its buttons is pressed
     (Confirm and save saves it, Confirm and trade saves it and runs the
@@ -266,10 +291,13 @@ Purpose:
     every setting the page can show is chosen and drawn as a reader's
     choice would be, but not sent back (one the tab page sent before the
     bar's latest choice reached it, which its number says, is set aside), and the note names each setting
-    it cannot show but "Skip if closing within" (a value off its grids, a
+    it cannot show (a value off its grids, a
     category or tag it does not
-    list, rebalancing or selling on a page without that view, or
-    rebalancing together with a sell level). A proposal that arrives while
+    list, rebalancing or selling on a page without that view,
+    rebalancing together with a sell level, a "Skip if closing within"
+    choice the page has no results for, or, at a "Skip if closing within"
+    choice other than the run's own, rebalancing or a sell level, which its
+    shut selects keep for the run's own choice). A proposal that arrives while
     a reader's choice is still loading is shown once that choice settles,
     and one the page cannot draw (a chunk file that cannot be loaded) leaves
     the bar on the scenario before it, which the note says. The page tells
@@ -540,7 +568,8 @@ Notes:
     or a base block that cannot be, costs the bar, never the page: the page
     is written without it, with a notice in its place and a WARNING in the
     log. The page as rendered IS the primary scenario's unfiltered view with
-    the tier floors on, Rebalance no and no selling: the
+    the tier floors on, the run's own "Skip if closing within" choice,
+    Rebalance no and no selling: the
     script inflates the base block and the primary scenario's chunk as the
     page loads, sets the bar back to that view (a browser can restore a stale
     choice on reload) and keeps its selects disabled until both are ready,
@@ -703,6 +732,7 @@ from .config import (
     BACKTEST_FILTER_NAMES_FORMAT,
     BACKTEST_FILTER_NAMES_MAX_BYTES,
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
+    BUY_MIN_DAYS_TO_CLOSE_CHOICES,
     CALENDAR_DAYS_PER_YEAR,
     CONTRACT_PAYOUT_DOLLARS,
     DASHBOARD_BUILD_STALE_SECONDS,
@@ -7392,6 +7422,140 @@ _SIDECAR_MISSING = ("its file {file} could not be loaded: reload the page, since
                     f"{DASHBOARD_FILES_DIRNAME} beside the page")
 _SIDECAR_EMPTY = "its file {file} held no data"
 
+# The filter bar's "Skip if closing within" select, right after Size cap: the
+# setting's name as the bar's label (written out in _filter_bar_html, where
+# the Trading tab's test reads the labels), the summary line and the red note
+# name it; its hover text, the rule on every page (_CLOSE_TITLE) and, on a
+# page that shows the other choices, what those choices show and that the
+# Trading tab follows a choice picked there (_CLOSE_TITLE_CHOICES, added
+# after it); the words an option whose choice the page has no results for
+# adds; the grey note beside the select when the page shows no other choice,
+# by whether the run worked out the other choices at all ("unavailable") or
+# not ("not simulated"); the grey note the page's script shows there at any
+# choice but the run's own; and the summary line's closing sentence on a page
+# that shows the other choices (_NO_EXPLORER: a page with no Scenario
+# Explorer grid)
+_CLOSE_LABEL = "Skip if closing within"
+_CLOSE_TITLE = (
+    "The bot doesn't buy a pair, or add to one, when either contract stops trading within "
+    "this many days of the moment it looks; off buys however soon they close. Sales and "
+    "trims are never held back. This backtest looks at each weekly entry checkpoint and "
+    "judges a contract on its scheduled close or, where none is known, on the start "
+    "(00:00 UTC) of the last day its wording names; a live run reads Kalshi's listed close "
+    "time.")
+_CLOSE_TITLE_CHOICES = (
+    " At any other choice the results have no rebalancing and no selling, and the Scenario "
+    "Explorer, the Empirical k̂ section and cards and the Interval Discount section show "
+    "the run's own choice (the primary). The Trading tab follows a choice picked here: "
+    "saved there, live runs skip contracts that close that soon.")
+_CLOSE_OPTION_UNAVAILABLE = " (no results)"
+_CLOSE_NOTES = {
+    "not simulated": "(the other choices were not simulated in this backtest)",
+    "unavailable": "(this page has no results for the other choices; see the log)",
+}
+_CLOSE_OTHER_NOTE = (
+    "The results at this choice have no rebalancing and no selling (Rebalance and Sell are "
+    "worked out for the run's own choice only, so those menus are shut); the Scenario "
+    "Explorer, the Empirical k̂ section and cards and the Interval Discount section show "
+    "the run's own choice.")
+_CLOSE_REACH = (f'"{_CLOSE_LABEL}" changes the trade sections only; the k̂ figures, the '
+                "Scenario Explorer and the Interval Discount section show the run's own "
+                "choice.")
+_CLOSE_REACH_NO_EXPLORER = (f'"{_CLOSE_LABEL}" changes the trade sections only; the k̂ '
+                            "figures and the Interval Discount section show the run's own "
+                            "choice.")
+# The red note's words for this setting: a proposal's Rebalance or Sell value
+# the bar cannot show beside another choice, which it shows only at the run's
+# own choice ({own}: that choice's words), and a choice
+# config.BUY_MIN_DAYS_TO_CLOSE_CHOICES holds that the page has no results for
+# (its option shut, or not on the page's menu at all; the log says why)
+_CLOSE_SYNC_NOT_WITH = ("{field} {value} (shown only at " + _CLOSE_LABEL
+                        + " {own}, this run's own choice)")
+_CLOSE_SYNC_UNAVAILABLE = "{field} {value} (this page has no results for that choice; see the log)"
+
+
+def _close_option(days: int) -> str:
+    """
+    Name a "Skip if closing within" choice as the bar's select and the Trading tab do.
+
+    The words of the live "Live settings:" line and the Trading tab's table
+    (config.live_setting_text), so the two pages word every choice alike.
+
+    Args:
+        days (int): A choice, whole days, 0 for off.
+
+    Returns:
+        str: "off" for 0, else e.g. "7 days".
+    """
+    return live_setting_text("buy_min_days_to_close", None if days == 0 else days)
+
+
+def _close_phrase(days: int) -> str:
+    """
+    What a scenario's summary phrase gains at a "Skip if closing within" choice other than the run's own.
+
+    Args:
+        days (int): The choice, whole days, 0 for off.
+
+    Returns:
+        str: e.g. ', "Skip if closing within" 3 days' (', "Skip if closing
+            within" off' for 0).
+    """
+    return f', "{_CLOSE_LABEL}" {_close_option(days)}'
+
+
+def _close_text(days: list[int]) -> dict:
+    """
+    The words the page's script needs for the other "Skip if closing within" choices.
+
+    _filter_payload ships them as the base block's "close_text", and only on
+    a page whose run worked out the other choices, so a page without them
+    keeps exactly its base block.
+
+    Args:
+        days (list[int]): The other choices, in the base block's "close"
+            order (ascending, 0 for off).
+
+    Returns:
+        dict: "field" (the setting's name in the red note), "values" (each
+            choice config.BUY_MIN_DAYS_TO_CLOSE_CHOICES holds, by its days
+            as a string, in _close_option's words), "phrases" (each choice's
+            _close_phrase, in "close" order), "note" (_CLOSE_OTHER_NOTE, the
+            grey note at any choice but the run's own), "not_with"
+            (_CLOSE_SYNC_NOT_WITH) and "unavailable" (_CLOSE_SYNC_UNAVAILABLE).
+    """
+    return {"field": _CLOSE_LABEL,
+            "values": {str(d): _close_option(d) for d in BUY_MIN_DAYS_TO_CLOSE_CHOICES},
+            "phrases": [_close_phrase(d) for d in days],
+            "note": _CLOSE_OTHER_NOTE,
+            "not_with": _CLOSE_SYNC_NOT_WITH,
+            "unavailable": _CLOSE_SYNC_UNAVAILABLE}
+
+
+def _close_own_option(value) -> tuple[str, str]:
+    """
+    The value and words of the run's own "Skip if closing within" choice, as recorded.
+
+    Used for the select's one option on a page that shows no other choice:
+    the run's own value as the run recorded it (BacktestSweep.buy_min_days_to_close,
+    or the base block's "close_own").
+
+    Args:
+        value: The recorded value: whole days when the rule was on, 0 or
+            False when it was off, None (or anything else) when not
+            recorded.
+
+    Returns:
+        tuple[str, str]: The option's value (the days, "0" for off; "" when
+            not recorded) and its words (_close_option's, or "not
+            recorded").
+    """
+    if value is False:
+        return "0", _close_option(0)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return str(value), _close_option(value)
+    return "", "not recorded"
+
 # What the filter bar reaches beyond the seven sections it re-scopes whole,
 # said once, for the bar's summary line and its tests: the interval-discount
 # section follows its k and size cap alone, always at the primary spread band
@@ -7881,7 +8045,8 @@ def _sync_target(sweep: BacktestSweep | None, start_date: date, today: date) -> 
 
     The bar tells the live dashboard's tab page its settings as the trading
     page's query (its spread band, Tier floors choice, k, size cap,
-    Rebalance choice, Min. price movement, "Rebalance until" choice, Sell
+    "Skip if closing within" choice, Rebalance choice, Min. price movement,
+    "Rebalance until" choice, Sell
     level and Min. days to maturity, each category ticked in the Exclude
     categories menu as a category live runs must not trade, and each tag
     ticked in the Exclude tags menu as a tag they must not trade); this is
@@ -14071,7 +14236,8 @@ def _filter_payload(
     those (chunks.maturity_grid(), maturity_off_grid()). When the run
     carried other "Skip if closing within" choices (close_state not None),
     each choice's grids too (chunks.close_grids(), close_off_grids()), which
-    the page's script does not read. The lists themselves
+    the bar's "Skip if closing within" select draws, and the words the
+    page's script needs for them (_close_text). The lists themselves
     are the chunks, each packed on its own: the script inflates one only
     when a reader chooses that scenario, and only the first (the page's own
     run) is in the page, the others being files beside it (inline_chunks,
@@ -14180,7 +14346,8 @@ def _filter_payload(
             script works a mix of categories and tags out with), "text" (the templates:
             _SUMMARY_TEMPLATES — its "unfiltered" sentence chosen by kd,
             explorer and explorer_caps (_bar_reach), then closed by one
-            sentence per view the page has: _REBALANCE_REACH, or
+            sentence per view the page has: _CLOSE_REACH when some other
+            "Skip if closing within" choice has a view, then _REBALANCE_REACH, or
             _MOVE_REACH in its place when the page also shows the minimum
             price movements, or _until_reach's when it also shows the
             "Rebalance until" choices, then _SELL_REACH (each one's
@@ -14229,8 +14396,8 @@ def _filter_payload(
             (the same beside "grid_move_off" and "grid_rebalance_off", null
             wherever "grid_rebalance_off" is) and "maturity_state" ("shown",
             else maturity_state); only when close_state is not None, the
-            data of the other "Skip if closing within" choices (the page's
-            script does not read it): "close" (every choice the run worked out
+            data of the other "Skip if closing within" choices, which the
+            bar's select of that name draws: "close" (every choice the run worked out
             besides its own, ascending, in the menu's own values — whole
             days, 0 for off — a choice whose results could not be read
             included; [] when the run worked out no other choice, or its
@@ -14243,8 +14410,11 @@ def _filter_payload(
             tier-floors-off view, else per choice null or [band][k][cap] ->
             chunk id or null: a binding band's own tier-off chunks, every
             other band's that choice's "grid_close" row —
-            chunks.close_off_grids()) and "close_state" ("shown" when some
-            choice has a view, else close_state); and the Sell view's:
+            chunks.close_off_grids()), "close_state" ("shown" when some
+            choice has a view, else close_state) and "close_text"
+            (_close_text: the setting's name, each choice's words and
+            summary phrase, the grey note at any choice but the run's own
+            and the red note's two templates); and the Sell view's:
             "sell_blocks" (null without the view, else [Tier floors 0 on / 1
             off][band] -> the number i of the packed block "dash-sell-<i>"
             holding that band's chunk ids ([k][cap] -> one id per sell level
@@ -14286,8 +14456,10 @@ def _filter_payload(
                          and (move_view or not source.moves)) else None)
     maturity_view = grid_maturity is not None
     # The other "Skip if closing within" choices: each one's grid, null for a
-    # choice the page has no view of, read only when the run carried them
+    # choice the page has no view of, read only when the run carried them;
+    # the bar's select offers them when one has a view
     grid_close = chunks.close_grids() if close_state is not None else []
+    close_view = any(grid is not None for grid in grid_close)
     # Per band, its k-hat population broken down like its trades
     # (_khat_band) — each group with its k-hat − k at every k of the bar,
     # for the performance section's cards
@@ -14351,6 +14523,11 @@ def _filter_payload(
                  "unfiltered": " " + _bar_reach(kd is not None, explorer,
                                                 explorer_caps=explorer_caps,
                                                 explorer_tiers=explorer_tiers)
+                 # "Skip if closing within", where the page shows its other
+                 # choices (no sentence otherwise, so a page whose run
+                 # worked out none keeps its words)
+                 + ("" if not close_view else
+                    " " + (_CLOSE_REACH if explorer else _CLOSE_REACH_NO_EXPLORER))
                  # Rebalance alone, or with Min. price movement where the
                  # page shows the minimums too, and with "Rebalance until"
                  # where it shows the choices
@@ -14425,15 +14602,16 @@ def _filter_payload(
         # The other "Skip if closing within" choices, only when the run
         # carried them (no key at all otherwise): the choices in
         # the menu's own values, the run's own, each choice's grid and its
-        # tier-floors-off twin (null without that view), and why a page has
-        # none. The page's script does not read them
+        # tier-floors-off twin (null without that view), why a page has
+        # none, and the words the page's script needs for them (its summary
+        # phrases, the grey note at another choice and the red note's)
         **({} if close_state is None else {
             "close": list(source.close_days),
             "close_own": source.close_own,
             "grid_close": grid_close,
             "grid_close_off": chunks.close_off_grids() if off_view else None,
-            "close_state": ("shown" if any(grid is not None for grid in grid_close)
-                            else close_state),
+            "close_state": "shown" if close_view else close_state,
+            "close_text": _close_text(list(source.close_days)),
         }),
         # The Sell view: which packed block holds each band's chunk ids
         # (null without the view), the levels' and minimums' names, and why a
@@ -14756,12 +14934,13 @@ def _menu_html(menu_id: str, all_label: str, rows: list[str], *, button: str,
         f'{boxes}</div></details>')
 
 
-def _filter_bar_html(payload: dict, primary_views: dict) -> str:
+def _filter_bar_html(payload: dict, primary_views: dict, *, own_close=None) -> str:
     """
-    Render the sticky filter bar: nine <select>s, two check-box menus, its notes and a summary line.
+    Render the sticky filter bar: ten <select>s, two check-box menus, its notes and a summary line.
 
-    Spread band, Tier floors, k, Size cap, Rebalance, Min. price movement,
-    Sell and Min. days to maturity choose the scenario —
+    Spread band, Tier floors, k, Size cap, Skip if closing within,
+    Rebalance, Min. price movement, Rebalance until, Sell and Min. days to
+    maturity choose the scenario —
     each option one of the grid's axes, the run's own marked
     " (primary)" (a band's option text is the payload's "option", which the
     script swaps for its tier-off one when the Tier floors choice changes) —
@@ -14774,6 +14953,24 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     ("off"), its title spelling out both rules (_TIER_SELECT_TITLE); a payload
     with no tier-floors-off view ("grid_off" null) puts a grey "(not
     simulated for this run)" note beside it, and the script never enables it.
+    The "Skip if closing within" select after Size cap offers, on a page
+    whose payload shows the other choices of that setting ("close_state"
+    "shown"), the run's own choice ("close_own", selected and marked
+    " (primary)": the page as rendered) and every other choice the run
+    worked out ("close"), ascending, each option's value its days ("0" for
+    off) and its words _close_option's (the Trading tab's), its title
+    carrying the rule (_CLOSE_TITLE) and what the other choices show
+    (_CLOSE_TITLE_CHOICES); a choice whose grid is null
+    ("grid_close") is rendered disabled, its words closed by
+    _CLOSE_OPTION_UNAVAILABLE, and the script never shows it, and the grey
+    note beside the select (flt-close-note) is rendered empty: the script
+    fills it at any choice but the run's own. Any other page offers the
+    run's own choice alone (_close_own_option: the payload's "close_own",
+    else own_close, as the run recorded it), shut, its title the rule
+    alone (_CLOSE_TITLE), with a grey note beside it by whether the run
+    worked out the other choices (_CLOSE_NOTES: "unavailable" when the
+    payload carries "close", "not simulated" when not), so the script
+    always finds the select.
     The Rebalance select offers the run as simulated ("no", selected) or the
     same scenario with every held pair brought back to its Kelly size at
     each weekly run, topped up and sold down ("yes"), its title carrying the
@@ -14844,6 +15041,11 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
         payload (dict): _filter_payload's base block.
         primary_views (dict): The primary chunk's view key -> {"n": trades}
             (_ChunkVisitor.primary_views).
+        own_close: Keyword-only. The run's own "Skip if closing within"
+            choice as the run recorded it (BacktestSweep.buy_min_days_to_close:
+            whole days when on, False when off, None when not recorded), for
+            a page whose payload names none ("close_own" absent or null).
+            None (default) reads "not recorded".
 
     Returns:
         str: The bar's HTML, every Kalshi-controlled name escaped.
@@ -14891,6 +15093,37 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
                  "(not simulated for this run)</span>")
     # Escaped whole, quotes included, so the attribute can never end early
     tier_title = html.escape(_TIER_SELECT_TITLE)
+    # "Skip if closing within": the run's own choice (the page as rendered)
+    # and, where the page shows them, every other choice the run worked out,
+    # ascending, each option's value its days; a choice the page has no
+    # results for is shut and says so, never drawn from another's file. The
+    # hover text gives the rule on every page, and what the other choices
+    # show only where the page offers them
+    close_title = html.escape(_CLOSE_TITLE)
+    if payload.get("close_state") == "shown":
+        close_title = html.escape(_CLOSE_TITLE + _CLOSE_TITLE_CHOICES)
+        close_own, others = payload["close_own"], payload["close"]
+        close_opts = ""
+        for days in sorted([close_own, *others]):
+            own = days == close_own
+            missing = not own and payload["grid_close"][others.index(days)] is None
+            close_opts += (f'<option value="{days}"{" selected" if own else ""}'
+                           f'{" disabled" if missing else ""}>'
+                           + html.escape(_close_option(days) + (" (primary)" if own else "")
+                                         + (_CLOSE_OPTION_UNAVAILABLE if missing else ""))
+                           + "</option>")
+        # Filled by the script at any choice but the run's own
+        close_note = ('&nbsp;<span id="flt-close-note" style="color:#9E9E9E; '
+                      'font-size:13px;"></span>')
+    else:
+        # No other choice to show: the run's own alone, as recorded, and why
+        recorded = payload.get("close_own")
+        value, words = _close_own_option(own_close if recorded is None else recorded)
+        close_opts = (f'<option value="{value}" selected>'
+                      f'{html.escape(words + " (primary)")}</option>')
+        close_why = _CLOSE_NOTES["unavailable" if "close" in payload else "not simulated"]
+        close_note = ('&nbsp;<span id="flt-close-note" style="color:#9E9E9E; '
+                      f'font-size:13px;">{html.escape(close_why)}</span>')
     # The Rebalance choice: no (the page as rendered) or yes; a page with no
     # Rebalance view says why beside the select it keeps shut
     rebalance_opts = (f'<option value="no" selected>{html.escape(_REBALANCE_OPTION_NO)}'
@@ -15010,6 +15243,8 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
         f'{options(payload["ks"], pk)}</select></label>&nbsp;&nbsp;'
         f'<label>Size cap: <select id="flt-cap" disabled autocomplete="off">'
         f'{options(payload["caps"], pc)}</select></label>&nbsp;&nbsp;'
+        f'<label>Skip if closing within: <select id="flt-close" disabled autocomplete="off" '
+        f'title="{close_title}">{close_opts}</select></label>{close_note}&nbsp;&nbsp;'
         f'<label>Rebalance: <select id="flt-rebalance" disabled autocomplete="off" '
         f'title="{rebalance_title}">{rebalance_opts}</select></label>'
         f'{rebalance_note}&nbsp;&nbsp;'
@@ -15220,7 +15455,32 @@ def _pack_text(raw: str) -> str:
 # the bar tells the Trading tab as rebalance_min_days_to_maturity (its days, or 0
 # for maturity or with Rebalance no), only from a page with that view, and
 # like Rebalance it reaches neither the k-hat figures, the interval-discount
-# section nor the scenario explorer. Only the page's first
+# section nor the scenario explorer. The "Skip if closing within" select
+# (SHOWN[11]) picks the run's own choice (D.close_own's days: the page as
+# rendered) or another the run worked out (its days, naming D.close[i]:
+# closeAt); it is open only on a page whose base block shows some other
+# choice (closeShown: D.close_state "shown"). At another choice a scenario's
+# chunk is that choice's own, in D.grid_close[i] (D.grid_close_off[i] with
+# the tier floors off: closeGridAt), whatever the Rebalance and Sell selects
+# say — those runs neither rebalance nor sell — and a choice or cell the
+# page has no chunk for is a scenario the run never simulated, never
+# another choice's chunk (chunkAt); an option whose choice has no grid
+# under the Tier floors choice shown is shut (markCloseOptions). There the
+# Rebalance, Min. price movement, "Rebalance until", Sell and Min. days
+# selects are shut and keep their values (GREYED, refreshClose), so the
+# run's own choice shows them again as they were, and a grey note
+# (flt-close-note) says what those runs leave out, in Python's words
+# (D.close_text.note); the scenario's phrase names the choice
+# (D.close_text.phrases). The choice goes into what the bar tells the
+# Trading tab as buy_min_days_to_close (off, or its days), only from a page
+# that shows other choices and only once the reader picked it (or a
+# proposal could not be drawn: applyFailed); at another choice the
+# Rebalance and Sell fields are left out of the bar's values (barValues),
+# so they go as the Trading tab has them (or are left out when the bar
+# knows no proposal that names them), and once told the shut selects show
+# the values the bar knows (keepShut). Like Rebalance it reaches neither
+# the k-hat figures, the interval-discount section nor the scenario
+# explorer. Only the page's first
 # chunk (the run's own scenario) is a block in the page; a chunk at or past
 # D.inline_chunks, every other scenario's and the Sell select's, is a file in
 # D.sidecar_dir, loaded through a <script src> element whose one call to
@@ -15285,16 +15545,23 @@ def _pack_text(raw: str) -> str:
 # D.sync.dashboard_origins (refreshSync, syncQuery; seq numbers the choices
 # told, from 1: TOLD). Each setting the reader
 # picked since the Trading tab's proposal was last known goes as the bar
-# shows it: the axes' values, the Rebalance choice with its minimum price
+# shows it: the axes' values, the "Skip if closing within" choice on a page
+# that shows other choices, the Rebalance choice with its minimum price
 # movement and "Rebalance until" days on a page with those views, the Sell
 # level and minimum on a page with that view, each category excluded — a
 # category with every tag ticked included — as exclude_category and each
 # other tag ticked as exclude_tag (syncLists). Every other setting goes as
 # the Trading tab has it (TRADING: the last proposal shown, or the last
-# query told), so the Trading tab changes only what the reader changed and
-# keeps every setting the bar cannot show: a value off the page's choices, a
+# query told), or is left out when TRADING does not name it (the defaults
+# server then keeps the saved value); only while no proposal is known at
+# all (TRADING null) does every setting but "Skip if closing within" go as
+# the bar shows it. So the Trading tab changes only what the reader
+# changed and keeps every setting the bar cannot show: a value off the
+# page's choices, a
 # setting of a view the page lacks, a category or tag the menus do not list,
-# a sell level beside rebalancing (syncPairs). A choice it cannot tell is not
+# a sell level beside rebalancing, the Rebalance and Sell fields at a "Skip
+# if closing within" choice other than the run's own, whose selects are shut
+# there and are never sent as picked (syncPairs). A choice it cannot tell is not
 # told, and the red note (flt-sync-note) says why in Python's words: a band,
 # k or cap the run did not record (D.text.sync_unrecorded), ticks that keep
 # none of the scenario's trades (sync_all_excluded), every tag of a category
@@ -15308,8 +15575,10 @@ def _pack_text(raw: str) -> str:
 # when its seq (the last choice the tab page had heard) is below TOLD: applyQuery
 # chooses every setting of it the bar can show, ticks every category and tag
 # it excludes, and draws that scenario as a reader's choice would, but tells
-# nothing back; the note names each setting the bar cannot show but "Skip if
-# closing within", which has no menu here (D.text.sync_not_here), and nothing
+# nothing back; the note names each setting the bar cannot show
+# (D.text.sync_not_here, wanted) — at a "Skip if closing within" choice other
+# than the run's own, the proposal's rebalancing and sell level too
+# (D.close_text.not_with), which the shut selects still take — and nothing
 # more is done when the selects and ticks
 # already name that scenario. A proposal that arrives while a reader's own
 # choice is still loading (SETTLING) is kept and shown once that choice
@@ -15364,8 +15633,14 @@ _FILTER_JS = r"""
   // held back once the position's later market is that near its close (i:
   // D.maturity[i - 1]); it counts only while Rebalance is yes
   var untilSel = document.getElementById('flt-until');
-  if (!dataEl || !bandSel || !tierSel || !kSel || !capSel || !rebalanceSel || !moveSel
-      || !untilSel || !sellSel || !daysSel || !catMenu || !tagMenu || !catAll || !tagAll) {
+  // "Skip if closing within": the run's own choice (the page as rendered:
+  // D.close_own's days, "0" for off) or another choice the run worked out
+  // (a value naming D.close[i]); open only on a page whose base block shows
+  // some other choice (closeShown)
+  var closeSel = document.getElementById('flt-close');
+  if (!dataEl || !bandSel || !tierSel || !kSel || !capSel || !closeSel || !rebalanceSel
+      || !moveSel || !untilSel || !sellSel || !daysSel || !catMenu || !tagMenu || !catAll
+      || !tagAll) {
     return;
   }
   // FRAMED: the page is shown in the live dashboard's Backtest frame, so
@@ -15373,8 +15648,11 @@ _FILTER_JS = r"""
   // choice the reader makes and takes the Trading tab's proposal from. A page
   // opened on its own is its own parent, and tells and takes nothing
   var FRAMED = !!window.parent && window.parent !== window;
-  var SELECTS = [bandSel, tierSel, kSel, capSel, rebalanceSel, moveSel, untilSel, sellSel,
-                 daysSel];
+  var SELECTS = [bandSel, tierSel, kSel, capSel, closeSel, rebalanceSel, moveSel, untilSel,
+                 sellSel, daysSel];
+  // The selects whose results exist for the run's own "Skip if closing
+  // within" choice only: shut, keeping their values, at any other (refreshClose)
+  var GREYED = [rebalanceSel, moveSel, untilSel, sellSel, daysSel];
   // The k-hat chart's own "Group by" select follows the bar's rules
   var khatGroup = document.getElementById('khat-group');
   if (khatGroup) { SELECTS.push(khatGroup); }
@@ -15388,8 +15666,9 @@ _FILTER_JS = r"""
   // ("on" / "off"), the Rebalance choice ("no" / "yes"), the Sell choice
   // ("none", or a level's index), the Min. days to maturity choice (an index
   // into D.sell_days), the Min. price movement choice ("0" for any, or a
-  // minimum's place in D.moves plus one) and the "Rebalance until" choice
-  // ("0" for maturity, or a choice's place in D.maturity plus one).
+  // minimum's place in D.moves plus one), the "Rebalance until" choice
+  // ("0" for maturity, or a choice's place in D.maturity plus one) and the
+  // "Skip if closing within" choice (its days, as the select's value).
   // SELL: every Sell block ("dash-sell-<i>")
   // inflated or inflating, by i — one band's chunk ids under one Tier floors
   // setting at every sell level and minimum of days, inflated the first time
@@ -15416,8 +15695,8 @@ _FILTER_JS = r"""
   // (applyQuery), or the last query the bar told it (refreshSync), which the
   // Trading tab then shows — or null before either. PICKED: the settings the
   // reader has chosen on the bar since then, by name ("tier", "band", "k",
-  // "cap", "rebalance", "move", "until", "sell", "days", and "names" for the
-  // two menus); PENDING: those of a choice not drawn yet, added to PICKED
+  // "cap", "close", "rebalance", "move", "until", "sell", "days", and
+  // "names" for the two menus); PENDING: those of a choice not drawn yet, added to PICKED
   // once it is and dropped when it is put back. A choice tells each setting
   // the reader picked as the bar shows it and every other one as the Trading
   // tab has it (syncPairs), so the Trading tab changes only what the reader
@@ -15432,13 +15711,15 @@ _FILTER_JS = r"""
   // page then takes that choice, or sends the Trading tab's proposal back
   // with its number
   var TOLD = 0;
-  var SETTINGS = ['tier', 'band', 'k', 'cap', 'rebalance', 'move', 'until', 'sell', 'days',
-                  'names'];
+  var SETTINGS = ['tier', 'band', 'k', 'cap', 'close', 'rebalance', 'move', 'until', 'sell',
+                  'days', 'names'];
   // The trading page's single-valued fields in its query's order, each with
   // the setting a reader picks it by. "Skip if closing within"
-  // (buy_min_days_to_close, setting "close") has no menu on this page, so a
-  // reader never picks it: a choice passes it on as the Trading tab has it,
-  // or leaves it out while no proposal is known
+  // (buy_min_days_to_close, setting "close") goes as the bar shows it only
+  // from a page that shows its other choices (barValues), and only once the
+  // reader picked it or a proposal could not be drawn (syncPairs,
+  // applyFailed); otherwise it goes as the Trading tab has it, or is left
+  // out when the bar knows no proposal that names it
   var SYNC_FIELDS = [['tier_floors', 'tier'], ['spread_min', 'band'], ['spread_max', 'band'],
                      ['k', 'k'], ['size_cap', 'cap'], ['rebalance', 'rebalance'],
                      ['min_price_move', 'move'], ['rebalance_min_days_to_maturity', 'until'],
@@ -15533,9 +15814,38 @@ _FILTER_JS = r"""
   // (every choice shows the movement cell) or [choice][0 for no minimum, i
   // for D.moves[i - 1]] -> id; null when the page holds none
   function untilGridAt(t) { return offAt(t) ? D.grid_maturity_off : D.grid_maturity; }
+  // Whether the page shows other "Skip if closing within" choices: its base
+  // block carries them (D.close, only on a page whose run worked them out)
+  // and some choice has a grid. On any other page the select stays shut on
+  // the run's own choice
+  function closeShown() { return !!(D && D.close && D.close_state === 'shown'); }
+  // Whether the page knows the run's own choice beside the others (D.close_own),
+  // so a proposal's "Skip if closing within" can be read against them
+  function closeKnown() {
+    return !!(D && D.close && typeof D.close_own === 'number' && D.close_text);
+  }
+  // The "Skip if closing within" choice x (a select value: whole days) as its
+  // place in D.close, or null for the run's own choice, for anything else,
+  // and on a page that shows no other choice
+  function closeAt(x) {
+    if (!closeShown() || typeof x !== 'string' || !/^[0-9]+$/.test(x)) { return null; }
+    var i = D.close.indexOf(parseInt(x, 10));
+    return i >= 0 ? i : null;
+  }
+  // The grid of chunk ids of the choice at place i of D.close under a Tier
+  // floors choice t ([band][k][cap] -> id or null), or null when the page
+  // holds none for it
+  function closeGridAt(t, i) {
+    var grids = offAt(t) ? D.grid_close_off : D.grid_close;
+    return (grids && grids[i]) || null;
+  }
   // The chunk id of a scenario: band b, k, cap c, Tier floors choice t, Sell
   // choice s, Min. days choice d, Rebalance choice r, Min. price movement
-  // choice m and "Rebalance until" choice u. Three results: an id; null for
+  // choice m, "Rebalance until" choice u and "Skip if closing within" choice
+  // x. At a choice x other than the run's own the id is that choice's own, in
+  // its grid under t (closeGridAt), and r, m, u, s and d are not read: its
+  // runs neither rebalance nor sell, and a missing grid or cell is null —
+  // never another choice's chunk, nor the main grid's. Three results: an id; null for
   // a scenario the run never simulated (a whole grid missing included, and
   // any sell level of a run that rebalances, which the page never builds);
   // or undefined while a sell level's band block is not yet inflated
@@ -15548,7 +15858,13 @@ _FILTER_JS = r"""
   // minimum's in the scenario's cell of moveGridAt's grid (null when the
   // page holds no such grid), or the rebalancing cell's own where that cell
   // is null.
-  function chunkAt(b, k, c, t, s, d, r, m, u) {
+  function chunkAt(b, k, c, t, s, d, r, m, u, x) {
+    var xi = closeAt(x);
+    if (xi !== null) {
+      var cg = closeGridAt(t, xi);
+      var own = cg && cg[b] && cg[b][k] ? cg[b][k][c] : null;
+      return typeof own === 'number' ? own : null;
+    }
     var g = gridAt(t, r), level = sellAt(s);
     if (level === null) {
       if (!g) { return null; }
@@ -15588,8 +15904,12 @@ _FILTER_JS = r"""
   }
   function cellChunk() {
     return chunkAt(bandIndex(), kIndex(), capIndex(), tierSel.value, sellSel.value,
-                   daysSel.value, rebalanceSel.value, moveSel.value, untilSel.value);
+                   daysSel.value, rebalanceSel.value, moveSel.value, untilSel.value,
+                   closeSel.value);
   }
+  // The select names a "Skip if closing within" choice other than the run's
+  // own, whose runs neither rebalance nor sell
+  function closeOther() { return closeAt(closeSel.value) !== null; }
   // The page as rendered: the primary scenario with the tier floors on and
   // Rebalance no
   function primaryChunk() { var p = D.primary; return D.grid[p[0]][p[1]][p[2]]; }
@@ -15609,14 +15929,25 @@ _FILTER_JS = r"""
   // (its dollars, or off for any, on a page with no minimums and whenever
   // Rebalance is no — a shut select can still name one); from a page that
   // also carries the "Rebalance until" choices, the days of the choice shown
-  // (0, no days limit, for maturity and whenever Rebalance is no); and from
-  // a page with the Sell view, the level and the minimum of days shown (off
-  // for both when Sell shows no level). A field of a view the page lacks is
-  // left out, as is "Skip if closing within", which has no menu here. Each
-  // number as the base block holds it.
+  // (0, no days limit, for maturity and whenever Rebalance is no); from a
+  // page with the Sell view, the level and the minimum of days shown (off
+  // for both when Sell shows no level); and from a page that shows the other
+  // "Skip if closing within" choices, the choice shown (off for 0, else its
+  // whole days, as the Trading tab spells it). A field of a view the page
+  // lacks is left out. So are the Rebalance and Sell fields at a "Skip if
+  // closing within" choice other than the run's own, whose shut selects
+  // the bar shows but whose runs neither rebalance nor sell: those fields
+  // then go as the Trading tab has them, never as the shut selects read.
+  // Each number as the base block holds it.
   function barValues(band, k, cap) {
     var out = {tier_floors: offAt(SHOWN[5]) ? 'off' : 'on', spread_min: band[0],
                spread_max: band[1], k: k, size_cap: cap};
+    var xi = closeAt(SHOWN[11]);
+    if (closeShown()) {
+      var days = xi === null ? D.close_own : D.close[xi];
+      if (typeof days === 'number') { out.buy_min_days_to_close = days === 0 ? 'off' : days; }
+    }
+    if (xi !== null) { return out; }
     if (D.grid_rebalance) {
       var mi = moveAt(SHOWN[6], SHOWN[9]);
       out.rebalance = rebalanceOn(SHOWN[6]) ? 'on' : 'off';
@@ -15644,19 +15975,29 @@ _FILTER_JS = r"""
   // page (D.sync), nothing drawn yet, a band the run did not record, or a k
   // or size cap the run did not record or that is not above zero. A field
   // goes as the bar shows it (barValues) when the reader picked its setting
-  // since the Trading tab's proposal was last known (PICKED), or when no
-  // proposal is known (TRADING null) or it names no such field; else as the
-  // Trading tab has it. So a choice changes on the Trading tab only what the
-  // reader changed, and never a setting the bar cannot show: a value off the
+  // since the Trading tab's proposal was last known (PICKED; after a
+  // proposal the bar could not draw, every setting counts as picked:
+  // applyFailed), or, for every field but "Skip if closing within"
+  // (buy_min_days_to_close), when no proposal is known at all (TRADING
+  // null). Otherwise it goes as the Trading tab has it when TRADING names
+  // it, and is left out when TRADING does not (the server then keeps the
+  // saved value). So "Skip if closing within" goes from the bar only when
+  // the reader picked it, a field a told query left out stays out until the
+  // reader picks it or a proposal names it, and a choice changes on the
+  // Trading tab only what the reader changed, and never a setting the bar
+  // cannot show: a value off the
   // page's choices, a sell level beside rebalancing, or a setting of a view
   // the page lacks, which goes as the Trading tab has it even when picked
   // (a choice can open or shut its select without showing it) and is left
   // out with no proposal known (the server then keeps the saved one). A
   // minimum price movement on a page with no minimums is such a setting
-  // while Rebalance is yes. Then, as the trading page settles its own form,
+  // while Rebalance is yes, and so is every Rebalance and Sell field at a
+  // "Skip if closing within" choice other than the run's own (barValues
+  // leaves them out). Then, as the trading page settles its own form,
   // the minimum goes as off and the days limit as 0 with rebalancing off,
   // and the minimum of days as off with no sell level: the server refuses
-  // either without its switch. The categories and the tags: those syncLists
+  // either without its switch (a Trading tab proposal already holds them
+  // so: its live settings refuse a minimum without its switch). The categories and the tags: those syncLists
   // sends — each category ticked, by its name on the bar, as
   // exclude_category, and each tag, as "Category · Tag", as exclude_tag —
   // with every one the Trading tab excludes that the menus do not list, once
@@ -15676,9 +16017,9 @@ _FILTER_JS = r"""
     SYNC_FIELDS.forEach(function(f) {
       var name = f[0], theirs = TRADING === null ? undefined : TRADING[name];
       var mine = PICKED[f[1]] && !unseen[name] ? bar[name] : undefined;
-      if (theirs === undefined || mine !== undefined) {
+      if ((TRADING === null && name !== 'buy_min_days_to_close') || mine !== undefined) {
         if (bar[name] !== undefined) { out[name] = bar[name]; }
-      } else {
+      } else if (theirs !== undefined) {
         out[name] = theirs[0];
       }
     });
@@ -15852,7 +16193,9 @@ _FILTER_JS = r"""
   // (TRADING, with nothing picked since), or, when it cannot follow it, told
   // nothing; the red note says why (syncBlocked), or else names what the bar
   // cannot show of what the Trading tab now shows (proposalNote, empty when
-  // nothing). Then a proposal kept while the choice loaded is shown
+  // nothing). Told at a "Skip if closing within" choice other than the run's
+  // own, the shut Rebalance and Sell selects are set to what the Trading tab
+  // now has (keepShut). Then a proposal kept while the choice loaded is shown
   // (settled). Nothing is told for a choice put back or for a proposal shown
   // (reader false), and nothing on a page opened on its own.
   function refreshSync(reader) {
@@ -15868,9 +16211,35 @@ _FILTER_JS = r"""
       TRADING = parseQuery(told);
       PICKED = {};
       UNSHOWN = false;
+      if (closeAt(SHOWN[11]) !== null) { keepShut(); }
     }
     setText('flt-sync-note', why === null ? proposalNote(wanted(TRADING).missing) : why);
     settled(told);
+  }
+  // At a "Skip if closing within" choice other than the run's own, the shut
+  // Rebalance, Min. price movement, "Rebalance until", Sell and Min. days
+  // selects show the Trading tab's settings as the bar knows them (TRADING,
+  // as wanted reads them), since the bar told it those and not what the
+  // shut selects read, so back at the run's own choice the bar shows them.
+  // A field TRADING leaves out (a choice told while no proposal was known
+  // leaves all five out) keeps what its select shows, and stays out of what
+  // the bar tells until the reader picks it or a proposal names it
+  // (syncPairs), so the Trading tab keeps its own. Nothing is drawn again:
+  // the scenario on screen reads none of them
+  function keepShut() {
+    if (TRADING === null) { return; }
+    var w = wanted(TRADING);
+    rebalanceSel.value = w.r;
+    moveSel.value = w.m;
+    untilSel.value = w.u;
+    sellSel.value = w.s;
+    daysSel.value = w.d;
+    SHOWN[6] = w.r;
+    SHOWN[7] = w.s;
+    SHOWN[8] = w.d;
+    SHOWN[9] = w.m;
+    SHOWN[10] = w.u;
+    refreshSell();
   }
   // A reader's choice has settled: told (told, its query) or not (null,
   // when it could not be told or was put back). A proposal kept while it
@@ -15912,10 +16281,11 @@ _FILTER_JS = r"""
   }
   // The run's own scenario: its cell, with the tiers on — or off at a band
   // the tiers do not reach (D.tier_binds false), whose off view IS that run —
-  // Rebalance no and no sell level (a run that rebalances or sells is never
-  // the run as rendered)
+  // Rebalance no, no sell level and the run's own "Skip if closing within"
+  // choice (a run that rebalances or sells, or applies another choice, is
+  // never the run as rendered)
   function isPrimary() {
-    return isPrimaryCell() && !rebalanceOn(rebalanceSel.value)
+    return isPrimaryCell() && !closeOther() && !rebalanceOn(rebalanceSel.value)
       && sellAt(sellSel.value) === null && (!tiersOff() || !D.tier_binds[bandIndex()]);
   }
   function list() { return C ? C.list : null; }
@@ -16536,11 +16906,17 @@ _FILTER_JS = r"""
   // — followed by the phrase of the minimum the Min. price movement choice m
   // names, if any, and then by the phrase of the days the "Rebalance until"
   // choice u names, if any — and, when the Sell choice s names a level, by
-  // that level's phrase and the phrase of the Min. days choice d
-  function scenarioAt(b, k, c, t, s, d, r, m, u) {
+  // that level's phrase and the phrase of the Min. days choice d. At a "Skip
+  // if closing within" choice x other than the run's own (left out: the
+  // run's own), whose runs neither rebalance nor sell, it is closed by that
+  // choice's phrase instead (D.close_text.phrases)
+  function scenarioAt(b, k, c, t, s, d, r, m, u, x) {
+    var xi = closeAt(x);
+    if (xi !== null) { r = 'no'; s = 'none'; }
     var level = sellAt(s), mi = moveAt(r, m), ui = untilAt(r, u);
     return fill(D.text.scenario, {where: bandsAt(t)[b].where, k: D.ks[k].text,
                                   cap: D.caps[c].text})
+      + (xi !== null ? D.close_text.phrases[xi] : '')
       + (rebalanceOn(r) ? D.text.rebalance + (mi > 0 ? D.moves[mi - 1].phrase : '')
                           + (ui > 0 ? D.maturity[ui - 1].phrase : '') : '')
       + (level !== null ? D.sell_levels[level].phrase
@@ -16548,7 +16924,8 @@ _FILTER_JS = r"""
   }
   function scenario() {
     return scenarioAt(bandIndex(), kIndex(), capIndex(), tierSel.value, sellSel.value,
-                      daysSel.value, rebalanceSel.value, moveSel.value, untilSel.value);
+                      daysSel.value, rebalanceSel.value, moveSel.value, untilSel.value,
+                      closeSel.value);
   }
   // The summary line: the templates _filter_summary_text fills for the view
   // Python rendered, filled here for every other one. With any tick it
@@ -16579,10 +16956,12 @@ _FILTER_JS = r"""
     }
     // While Rebalance is yes, Python's note on what an added purchase and a
     // part sold count as; and while a sell level is chosen its note on what a
-    // sale is
-    setText('flt-summary', text + (rebalanceOn(rebalanceSel.value) && shown ? T.rebalance_note
-                                   : '')
-            + (sellAt(sellSel.value) !== null && shown ? T.sell_note : '') + T.unfiltered);
+    // sale is — neither at a "Skip if closing within" choice other than the
+    // run's own, whose runs neither rebalance nor sell
+    var own = !closeOther();
+    setText('flt-summary', text + (own && rebalanceOn(rebalanceSel.value) && shown
+                                   ? T.rebalance_note : '')
+            + (own && sellAt(sellSel.value) !== null && shown ? T.sell_note : '') + T.unfiltered);
   }
 
   // Trace i of a figure Python drew, with new data: its styling (colours,
@@ -17027,6 +17406,16 @@ _FILTER_JS = r"""
       bandSel.options[i].text = B[parseInt(bandSel.options[i].value, 10)].option;
     }
   }
+  // Each "Skip if closing within" option but the run's own shut where its
+  // choice has no grid under the Tier floors choice shown, as Python renders
+  // one that has none at all: such a choice is never drawn from another's file
+  function markCloseOptions() {
+    if (!closeShown()) { return; }
+    for (var i = 0; i < closeSel.options.length; i++) {
+      var at = closeAt(closeSel.options[i].value);
+      if (at !== null) { closeSel.options[i].disabled = !closeGridAt(tierSel.value, at); }
+    }
+  }
 
   function render(v, excluded, tags) {
     var L = list(), has = v.n > 0;
@@ -17180,7 +17569,8 @@ _FILTER_JS = r"""
   // Sell is set to no level and shut, and it opens again when Rebalance goes
   // back to no. A page without the Sell view keeps Sell shut. The Min. days,
   // Min. price movement and "Rebalance until" selects are opened or shut to
-  // match.
+  // match, and then all five as the "Skip if closing within" choice says
+  // (refreshClose).
   function refreshSell() {
     if (D && D.sell_blocks) {
       var shut = rebalanceOn(rebalanceSel.value);
@@ -17190,6 +17580,28 @@ _FILTER_JS = r"""
     refreshDays();
     refreshMove();
     refreshUntil();
+    refreshClose();
+  }
+  // At a "Skip if closing within" choice other than the run's own, the
+  // Rebalance, Min. price movement, "Rebalance until", Sell and Min. days
+  // selects (GREYED) are shut and keep their values — their results exist
+  // for the run's own choice only, so they reach nothing there — and the grey
+  // note beside the select says what that choice's results leave out
+  // (D.close_text.note). Back at the run's own choice the note is cleared
+  // and they open as refreshSell leaves them: Rebalance whenever the page
+  // has its view, the others as its choice says. On a page that shows no
+  // other choice nothing changes
+  function refreshClose() {
+    if (!D) { return; }
+    var other = closeOther();
+    if (other) {
+      GREYED.forEach(function(s) { s.disabled = true; });
+    } else {
+      rebalanceSel.disabled = !D.grid_rebalance;
+    }
+    if (D.close_text && closeShown()) {
+      setText('flt-close-note', other ? D.close_text.note : '');
+    }
   }
   // Draw the scenario the selects and the menus' ticks name, from a chunk
   // (null for a scenario the run never simulated), and record it as SHOWN
@@ -17202,7 +17614,8 @@ _FILTER_JS = r"""
     C = chunk;
     refreshMenus();
     SHOWN = [bandIndex(), kIndex(), capIndex(), excluded, tags, tierSel.value,
-             rebalanceSel.value, sellSel.value, daysSel.value, moveSel.value, untilSel.value];
+             rebalanceSel.value, sellSel.value, daysSel.value, moveSel.value, untilSel.value,
+             closeSel.value];
     render(v, excluded, tags);
     refreshSell();
     return true;
@@ -17214,21 +17627,25 @@ _FILTER_JS = r"""
   // ticks too, since ticks made while the chunk was loading were never
   // drawn either — the menus rebuilt for the ticks shown — and the line
   // says what could not be shown, in Python's words; the Tier floors,
-  // Rebalance, Min. price movement, "Rebalance until", Sell and Min. days
-  // choices go back too, with the band options named for the first, Sell
-  // shut again while a rebalancing scenario is shown, the Min. price
-  // movement and "Rebalance until" selects shut again when one is not, and
-  // the Min. days select shut again when Sell names none
+  // "Skip if closing within", Rebalance, Min. price movement, "Rebalance
+  // until", Sell and Min. days choices go back too, with the band options
+  // named and the closing options marked for the first, Sell shut again
+  // while a rebalancing scenario is shown, the Min. price movement and
+  // "Rebalance until" selects shut again when one is not, the Min. days
+  // select shut again when Sell names none, and all five shut again at a
+  // "Skip if closing within" choice other than the run's own
   function putBack(err) {
     var tried = scenario(), ticks = selectionName(excludedCats(), tagTicks());
     bandSel.value = String(SHOWN[0]);
     tierSel.value = SHOWN[5];
+    closeSel.value = SHOWN[11];
     rebalanceSel.value = SHOWN[6];
     moveSel.value = SHOWN[9];
     untilSel.value = SHOWN[10];
     sellSel.value = SHOWN[7];
     daysSel.value = SHOWN[8];
     relabelBands();
+    markCloseOptions();
     kSel.value = String(SHOWN[1]);
     capSel.value = String(SHOWN[2]);
     setTicks(SHOWN[3], SHOWN[4]);
@@ -17236,7 +17653,7 @@ _FILTER_JS = r"""
     PICK = pickKey();
     refreshSell();
     var still = scenarioAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[7], SHOWN[8],
-                           SHOWN[6], SHOWN[9], SHOWN[10]);
+                           SHOWN[6], SHOWN[9], SHOWN[10], SHOWN[11]);
     // A mix that could not be shown: the ticks tried and the scenario they
     // were tried at, then what is ticked again now — and at which scenario,
     // when the selects went back to another one too
@@ -17329,6 +17746,7 @@ _FILTER_JS = r"""
     menusDisabled(true);
     if (D) {
       var p = D.primary;
+      // The page as rendered (no "Skip if closing within" choice named: the run's own)
       var here = scenarioAt(p[0], p[1], p[2], 'on', 'none', '0', 'no', '0', '0');
       setText('flt-summary', fill(D.text.unavailable,
                                   {failed: here, reason: reason, scenario: here}));
@@ -17339,8 +17757,9 @@ _FILTER_JS = r"""
   }
   // A browser can restore a <select>'s last choice, or a box's tick, on a
   // reload, or on going back; the page as rendered is the primary scenario's
-  // unfiltered view with the tier floors on, Rebalance no, no minimum price
-  // movement, "Rebalance until" at maturity and no sell level, so the bar is
+  // unfiltered view with the tier floors on, the run's own "Skip if closing
+  // within" choice, Rebalance no, no minimum price movement, "Rebalance
+  // until" at maturity and no sell level, so the bar is
   // set back to it: every select to its rendered
   // option, both menus to nothing ticked. Python renders the selects and the
   // menus' boxes disabled: they are enabled once the
@@ -17377,18 +17796,21 @@ _FILTER_JS = r"""
       C = chunk;
       // Nothing ticked: no category left out (SHOWN[3]) and no tag (SHOWN[4])
       SHOWN = D.primary.concat([[], [], tierSel.value, rebalanceSel.value, sellSel.value,
-                                daysSel.value, moveSel.value, untilSel.value]);
+                                daysSel.value, moveSel.value, untilSel.value,
+                                closeSel.value]);
     }
     // A run with no tier-off (or Rebalance, or Sell) view keeps that select
-    // disabled; the Min. days select opens only while Sell names a level,
-    // the Min. price movement and "Rebalance until" selects only while
-    // Rebalance is yes, and Sell is shut while a rebalancing scenario is
-    // chosen (refreshSell, just below, shuts what this loop opened)
+    // disabled, and a page that shows no other "Skip if closing within"
+    // choice keeps that one shut; the Min. days select opens only while Sell
+    // names a level, the Min. price movement and "Rebalance until" selects
+    // only while Rebalance is yes, and Sell is shut while a rebalancing
+    // scenario is chosen (refreshSell, just below, shuts what this loop opened)
     SELECTS.forEach(function(s) {
       s.disabled = (s === tierSel && !D.grid_off) || (s === rebalanceSel && !D.grid_rebalance)
-        || (s === sellSel && !D.sell_blocks);
+        || (s === sellSel && !D.sell_blocks) || (s === closeSel && !closeShown());
     });
     menusDisabled(false);
+    markCloseOptions();
     refreshSell();
     // Ready: the tab page, on a page shown in its frame, is told so once, and
     // answers with the Trading tab's proposal (applyQuery)
@@ -17412,7 +17834,18 @@ _FILTER_JS = r"""
     // Nothing to switch to without a tier-off view (the select stays shut)
     if (!D || !D.grid_off) { return; }
     relabelBands();
+    markCloseOptions();
     readerChose(['tier']);
+  });
+  closeSel.addEventListener('change', function() {
+    // Nothing to switch to on a page that shows no other choice (the select
+    // stays shut). At another choice the Rebalance and Sell selects shut,
+    // keeping their values, and open again at the run's own (refreshClose);
+    // only the choice itself counts as picked, so those go to the Trading
+    // tab as it has them
+    if (!closeShown()) { return; }
+    refreshSell();
+    readerChose(['close']);
   });
   // Rebalance back to no on a page with the Sell view: Sell and Min. days
   // go to the Trading tab's sell level and minimum of days (TRADING), as the
@@ -17430,8 +17863,10 @@ _FILTER_JS = r"""
     daysSel.value = w.d;
   }
   rebalanceSel.addEventListener('change', function() {
-    // Nothing to switch to without the Rebalance view (the select stays shut)
-    if (!D || !D.grid_rebalance) { return; }
+    // Nothing to switch to without the Rebalance view, nor at a "Skip if
+    // closing within" choice other than the run's own (the select stays shut;
+    // so do the four after it)
+    if (!D || !D.grid_rebalance || closeOther()) { return; }
     // Sell goes to no level and shuts while Rebalance is yes, and opens again
     // on the Trading tab's sell level when it goes back to no (sellBack); the
     // Min. price movement and "Rebalance until" selects open with yes. Those
@@ -17448,18 +17883,20 @@ _FILTER_JS = r"""
   moveSel.addEventListener('change', function() {
     // The minimum counts only while Rebalance is yes, on a page that carries
     // the minimums (the select is shut otherwise)
-    if (!D || !D.grid_move || !rebalanceOn(rebalanceSel.value)) { return; }
+    if (!D || !D.grid_move || !rebalanceOn(rebalanceSel.value) || closeOther()) { return; }
     readerChose(['move']);
   });
   untilSel.addEventListener('change', function() {
     // The days count only while Rebalance is yes, on a page that carries the
     // choices (the select is shut otherwise)
-    if (!D || !D.grid_maturity || !rebalanceOn(rebalanceSel.value)) { return; }
+    if (!D || !D.grid_maturity || !rebalanceOn(rebalanceSel.value) || closeOther()) {
+      return;
+    }
     readerChose(['until']);
   });
   sellSel.addEventListener('change', function() {
     // Nothing to switch to without the Sell view (the select stays shut)
-    if (!D || !D.sell_blocks) { return; }
+    if (!D || !D.sell_blocks || closeOther()) { return; }
     // The Min. days select opens with a level and shuts when Sell names none.
     // It counts as picked only when the level opens it (the bar shows the
     // minimum the level opens it on); from one level to another it goes as
@@ -17471,7 +17908,7 @@ _FILTER_JS = r"""
   });
   daysSel.addEventListener('change', function() {
     // The days count only while Sell names a level (the select is shut otherwise)
-    if (!D || !D.sell_blocks || sellAt(sellSel.value) === null) { return; }
+    if (!D || !D.sell_blocks || sellAt(sellSel.value) === null || closeOther()) { return; }
     readerChose(['days']);
   });
   // A box of a menu was ticked or unticked (the event names the box). The
@@ -17598,6 +18035,13 @@ _FILTER_JS = r"""
     if (lo === 0 && hi === 1) { return D.text.sync_band_none; }
     return fill(D.text.sync_band_value, {low: end(lo, low), high: end(hi, high)});
   }
+  // A "Skip if closing within" value as the query writes it: off as 0, a
+  // whole number of days (one to six digits, as the defaults server reads
+  // one) as that number, or null for anything else
+  function closeDays(text) {
+    if (text === 'off') { return 0; }
+    return /^[0-9]{1,6}$/.test(text) ? parseInt(text, 10) : null;
+  }
   // A number as the query writes it (Python's repr of the float, or a whole
   // number of days), or null for anything else
   function queryNumber(text) {
@@ -17639,11 +18083,18 @@ _FILTER_JS = r"""
   // a tag of a category excluded left out as the menus leave it out), each
   // setting the proposal leaves out, or the bar cannot show, kept as it
   // stands; and, in the bar's order, the words naming each setting the bar
-  // cannot show but "Skip if closing within", which has no menu here
-  // (missing): a value off the page's choices, a choice of a
-  // view the page lacks, a category or tag its menus do not list, or a sell
+  // cannot show (missing): a value off the page's choices, a choice of a
+  // view the page lacks, a category or tag its menus do not list, a sell
   // level beside rebalancing, which the bar never shows together (it shows
-  // the rebalancing)
+  // the rebalancing), a "Skip if closing within" choice whose results the
+  // page could not show (D.close_text.unavailable), and, at a "Skip if
+  // closing within" choice other than the run's own, the rebalancing (with
+  // its minimum price movement and days limit) and the sell level (with its
+  // minimum of days) the bar would show at the run's own choice
+  // (D.close_text.not_with) — which the shut selects still show, kept for
+  // the run's own choice. "Skip if closing within" is read only on a page
+  // that knows the run's own choice beside the others (closeKnown); on any
+  // other the Trading tab's value is kept and not named
   function wanted(q) {
     var T = D.text, F = T.sync_fields, missing = [];
     function one(name) { var v = q[name]; return v && v.length ? v[0] : null; }
@@ -17652,7 +18103,8 @@ _FILTER_JS = r"""
     }
     var w = {b: bandIndex(), k: kIndex(), c: capIndex(), t: tierSel.value,
              r: rebalanceSel.value, m: moveSel.value, u: untilSel.value,
-             s: sellSel.value, d: daysSel.value, ex: [], tags: [], missing: missing};
+             s: sellSel.value, d: daysSel.value, x: closeSel.value, ex: [], tags: [],
+             missing: missing};
     var low = one('spread_min'), high = one('spread_max');
     if (low !== null && high !== null) {
       var b = placeOf(D.bands, queryNumber(low), queryNumber(high));
@@ -17674,9 +18126,35 @@ _FILTER_JS = r"""
       var ci = placeOf(D.caps, queryNumber(cap));
       if (ci >= 0) { w.c = ci; } else { miss(T.sync_off_grid, 'cap', capText(cap)); }
     }
+    // "Skip if closing within": the run's own choice, or another whose grid
+    // the page holds under the Tier floors choice shown; a choice the run
+    // worked out (one of config's) that the page cannot show, or any other
+    // value, is named and the select keeps its choice
+    var notWith = null;
+    if (closeKnown()) {
+      var CT = D.close_text, close = one('buy_min_days_to_close');
+      if (close !== null) {
+        var within = closeDays(close), at = within === null ? -1 : D.close.indexOf(within);
+        var words = within !== null && CT.values[String(within)] !== undefined
+          ? CT.values[String(within)] : null;
+        if (within !== null && within === D.close_own) { w.x = String(within); }
+        else if (at >= 0 && closeShown() && closeGridAt(w.t, at)) { w.x = String(within); }
+        else {
+          missing.push(fill(words === null ? T.sync_off_grid : CT.unavailable,
+                            {field: CT.field, value: words === null ? close : words}));
+        }
+      }
+      // At another choice, what the bar would show at the run's own is
+      // named, with the run's own choice, where the bar shows it
+      if (closeAt(w.x) !== null) {
+        var own = CT.values[String(D.close_own)];
+        notWith = fill(CT.not_with, {own: own === undefined ? String(D.close_own) : own});
+      }
+    }
     // Rebalance with its minimum price movement and "Rebalance until" days,
     // each shown only on a page with its view; with Rebalance no both are
-    // shut and keep their values
+    // shut and keep their values. At another "Skip if closing within" choice
+    // each one shown is named too (notWith), and kept on its shut select
     var rebalance = one('rebalance'), move = one('min_price_move');
     var until = one('rebalance_min_days_to_maturity');
     var moving = move !== null && move !== 'off', limited = until !== null && until !== '0';
@@ -17688,11 +18166,16 @@ _FILTER_JS = r"""
       if (limited) { miss(T.sync_no_view, 'until', untilText(until)); }
     } else if (rebalance === 'on') {
       w.r = 'yes';
+      if (notWith !== null) { miss(notWith, 'rebalance', T.sync_on); }
       if (!moving) { w.m = '0'; }
       else {
         var mi = D.grid_move ? placeOf(D.moves, queryNumber(move)) : -1;
-        if (mi >= 0) { w.m = String(mi + 1); }
-        else {
+        if (mi >= 0) {
+          w.m = String(mi + 1);
+          if (notWith !== null) {
+            miss(notWith, 'move', fill(T.sync_cents, {n: hundredths(move)}));
+          }
+        } else {
           miss(D.grid_move ? T.sync_off_grid : T.sync_no_view, 'move',
                fill(T.sync_cents, {n: hundredths(move)}));
         }
@@ -17700,15 +18183,19 @@ _FILTER_JS = r"""
       if (!limited) { w.u = '0'; }
       else {
         var ui = D.grid_maturity ? placeOf(D.maturity, queryNumber(until)) : -1;
-        if (ui >= 0) { w.u = String(ui + 1); }
-        else {
+        if (ui >= 0) {
+          w.u = String(ui + 1);
+          if (notWith !== null) { miss(notWith, 'until', untilText(until)); }
+        } else {
           miss(D.grid_maturity ? T.sync_off_grid : T.sync_no_view, 'until',
                untilText(until));
         }
       }
     }
     // Sell with its minimum of days, shown only on a page with the Sell view
-    // and only with Rebalance no; with no sell level the days are shut
+    // and only with Rebalance no; with no sell level the days are shut. At
+    // another "Skip if closing within" choice a level and a minimum of days
+    // shown are named too (notWith), and kept on their shut selects
     var sell = one('sell_at'), days = one('sell_min_days');
     var dated = days !== null && days !== 'off';
     if (sell === 'off') {
@@ -17721,8 +18208,8 @@ _FILTER_JS = r"""
         var li = placeOf(D.sell_levels, queryNumber(sell));
         if (li >= 0) { w.s = String(li); } else { why = T.sync_off_grid; }
       }
-      if (why !== null) {
-        miss(why, 'sell', fill(T.sync_sell_value, {n: hundredths(sell)}));
+      if (why !== null || notWith !== null) {
+        miss(why !== null ? why : notWith, 'sell', fill(T.sync_sell_value, {n: hundredths(sell)}));
       }
       if (why !== null && why !== T.sync_off_grid) {
         // Not shown at all (beside rebalancing, or on a page without the
@@ -17737,7 +18224,12 @@ _FILTER_JS = r"""
         miss(T.sync_off_grid, 'days', T.sync_any);
       } else {
         var di = placeOf(D.sell_days, queryNumber(days));
-        if (di >= 0) { w.d = String(di); } else { miss(T.sync_off_grid, 'days', days); }
+        if (di >= 0) {
+          w.d = String(di);
+          if (notWith !== null) { miss(notWith, 'days', days); }
+        } else {
+          miss(T.sync_off_grid, 'days', days);
+        }
       }
     }
     if (rebalanceOn(w.r)) { w.s = 'none'; }
@@ -17762,19 +18254,24 @@ _FILTER_JS = r"""
   // minimum, days limit or minimum of days, and the choice of a view the
   // page lacks, count as nothing, and the ticks as what they exclude
   // (syncLists: a kept category with every tag ticked is that category), so
-  // two states showing the same scenario read alike
-  function stateKey(b, k, c, ex, tags, t, r, s, d, m, u) {
-    var level = sellAt(s), lists = syncLists(ex, tags);
+  // two states showing the same scenario read alike. The "Skip if closing
+  // within" choice x counts as its place in D.close ('' for the run's own);
+  // at another choice the Rebalance and Sell selects count as they read
+  // although that scenario reads none of them, so a proposal that differs
+  // only there is still set on them, for the run's own choice
+  function stateKey(b, k, c, ex, tags, t, r, s, d, m, u, x) {
+    var level = sellAt(s), lists = syncLists(ex, tags), xi = closeAt(x);
     return [b, k, c, lists.cats.join(','), lists.tags.join(','), lists.split ? 'split' : '',
             offAt(t) ? 'off' : 'on', rebalanceOn(r) ? 'yes' : 'no', moveAt(r, m),
-            untilAt(r, u), level === null ? '' : level, level === null ? '' : d].join('|');
+            untilAt(r, u), level === null ? '' : level, level === null ? '' : d,
+            xi === null ? '' : xi].join('|');
   }
   // The bar's selects and ticks as they stand: the scenario on screen, or
   // the one a proposal still loading will draw
   function barKey() {
     return stateKey(bandIndex(), kIndex(), capIndex(), excludedCats(), tagTicks(),
                     tierSel.value, rebalanceSel.value, sellSel.value, daysSel.value,
-                    moveSel.value, untilSel.value);
+                    moveSel.value, untilSel.value, closeSel.value);
   }
   // Show the Trading tab's proposal on the bar: every setting the bar can
   // show is chosen, every category and tag it excludes ticked with its
@@ -17782,8 +18279,9 @@ _FILTER_JS = r"""
   // be, but the Trading tab is told nothing back (choose with reader false).
   // The proposal becomes what the bar keeps for every setting the reader
   // has not picked since (TRADING, PICKED), and the red note names each
-  // setting the bar cannot show but "Skip if closing within"
-  // (D.text.sync_not_here), or is cleared.
+  // setting the bar cannot show (D.text.sync_not_here, wanted), or is
+  // cleared; at a "Skip if closing within" choice other than the run's own
+  // the Rebalance and Sell selects still take the proposal's values, shut.
   // Nothing more is done when the selects and ticks already name that
   // scenario (on screen, or a proposal's still loading). While a choice the
   // reader made is still loading (SETTLING), the proposal is only kept
@@ -17803,14 +18301,17 @@ _FILTER_JS = r"""
     PENDING = {};
     UNSHOWN = false;
     setText('flt-sync-note', proposalNote(w.missing));
-    if (stateKey(w.b, w.k, w.c, w.ex, w.tags, w.t, w.r, w.s, w.d, w.m, w.u) === barKey()) {
+    if (stateKey(w.b, w.k, w.c, w.ex, w.tags, w.t, w.r, w.s, w.d, w.m, w.u, w.x)
+        === barKey()) {
       return;
     }
     bandSel.value = String(w.b);
     tierSel.value = w.t;
     relabelBands();
+    markCloseOptions();
     kSel.value = String(w.k);
     capSel.value = String(w.c);
+    closeSel.value = w.x;
     rebalanceSel.value = w.r;
     moveSel.value = w.m;
     untilSel.value = w.u;
@@ -17867,7 +18368,9 @@ def generate_dashboard(
     fragments into a full page with an embedded Plotly CDN script tag — plus
     the page-wide filter: the sticky bar under the header lines
     (_filter_bar_html, which the live dashboard's Trading tab follows, with
-    the tab page's addresses and the source note of _sync_target), one
+    the tab page's addresses and the source note of _sync_target, and the
+    run's own "Skip if closing within" value as the sweep recorded it, which
+    its select shows alone when the page shows no other choice), one
     packed chunk per distinct scenario trade list
     (tier-floors-off scenarios included, when the run carries that family),
     the first of them (the run's own scenario) written into the page after
@@ -18305,7 +18808,11 @@ def generate_dashboard(
                 # within" choices: None ships no key for them at all
                 close_state=("unavailable" if getattr(sweep, "close_sweep", None) is not None
                              else None))
-            filter_bar = _filter_bar_html(filter_data, chunker.primary_views or {})
+            # The run's own "Skip if closing within" choice as it recorded it,
+            # for a bar that shows no other choice (no family, or none read)
+            filter_bar = _filter_bar_html(
+                filter_data, chunker.primary_views or {},
+                own_close=getattr(sweep, "buy_min_days_to_close", None))
             base_block = _packed_json_script("dash-data", filter_data)
             chunks = chunker.chunks
             sell_blocks = list(sell_grid.blocks) if sell_grid is not None else []

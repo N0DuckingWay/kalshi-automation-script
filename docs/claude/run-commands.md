@@ -304,7 +304,8 @@ python3 -m kalshi_betting.backtest --no-maturity-sweep
 # config.BUY_MIN_DAYS_TO_CLOSE_CHOICES but the run's own the pairs it would buy, found during
 # the run in a few more entry passes, and simulates each band x k x cap cell at it, tier floors
 # on and off, the "all" population only, never adding, trimming or selling, only when a report
-# reads it). No page shows them yet, so skipping them changes no page. Backtest only — a live
+# reads it). The backtest page's "Skip if closing within" menu shows them; without them it
+# offers the run's own choice alone, shut. Backtest only — a live
 # run applies its own saved buy_min_days_to_close (main.py --buy-min-days-to-close for one run)
 python3 -m kalshi_betting.backtest --no-close-sweep
 

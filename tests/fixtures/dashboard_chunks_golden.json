@@ -12,7 +12,7 @@
   },
   "cases": {
     "size_cap_sweep": {
-      "page": "07286b3b947985af4d0e71eb34260b3b22053719636b03cb380f1675fd6ad98e",
+      "page": "83b08126d6bca5f36ab2328731805847bc90d7f26ced43f4306de22d9610aa73",
       "entries": [
         ".lock",
         "build",
@@ -30,7 +30,7 @@
       }
     },
     "tier_floors_off": {
-      "page": "28c59d910b492b22b65a4bf208ce28b50e7a97bc7fe13c3ca6b53ee0e9625a06",
+      "page": "7c486bb74013dfcfc2b397404efbe0897df8241a0cc5aa04899972f6032dfbb4",
       "entries": [
         ".lock",
         "build",
@@ -52,7 +52,7 @@
       }
     },
     "tier_floors_off_every_cap": {
-      "page": "ae233528aadf816ff14aece85d88c9e36431d414e6fe2abf3054e11903e4e0ce",
+      "page": "219f22f43a521f3540b594830c27fa4c9cf7c6e35620b76ff602402cc7763cbf",
       "entries": [
         ".lock",
         "build",
@@ -78,7 +78,7 @@
       }
     },
     "rebalance": {
-      "page": "4fdd723e33a53accacad5474d5e207c75b05801fcbfc8a55da2f9dedd45a9f19",
+      "page": "2510f150f02d932bc5810216933cd2c6802c4e5cd2d42d087cd7459e3866b3ac",
       "entries": [
         ".lock",
         "build",
@@ -110,7 +110,7 @@
       }
     },
     "price_movement": {
-      "page": "6e49a7e536856df1d03b1d38f73bb45f6ada3a91c468522f2761541a3d18f3a7",
+      "page": "b58ad95a152a9ce2149905e00aeace3b35233b1161f2dbf895f9ad55e8a735da",
       "entries": [
         ".lock",
         "build",
@@ -146,7 +146,7 @@
       }
     },
     "rebalance_until": {
-      "page": "f9be9d9d4c6072b7c25074eafe9da0605376ad4a6250d37d37f2d247765eacfb",
+      "page": "bee1d8713753b01666133b05d907c2aa572277d90756b190fa8b4576d4247630",
       "entries": [
         ".lock",
         "build",
@@ -186,7 +186,7 @@
       }
     },
     "sell": {
-      "page": "bb91da1328c18690ab04d17e55fc9592e3313ce48e760732646322a238a2b3bf",
+      "page": "e37fa8eded8209779619a064cf2ddc2c4d395d9cf2510fa86b01bbf77d57b59a",
       "entries": [
         ".lock",
         "build",
@@ -216,7 +216,7 @@
       }
     },
     "sell_and_every_view": {
-      "page": "fb5c4c5e4eba769b67f2944f12bf39d86d0168d662693b6acadfe93ff8dd2766",
+      "page": "d52aee11812e4b33d6780daa6e19ff479cf1bd8b0794cadb55a699ce4814d9c6",
       "entries": [
         ".lock",
         "build",
@@ -270,7 +270,7 @@
       }
     },
     "rebalance_cell_raises": {
-      "page": "0d59dca3a760849011a201ae715135f06188bc41abddb0416a2c0c179a5e1eb0",
+      "page": "4d8725e70304c802104617d52d85cadbd911bbfd05106d03c073eab6f71e29fb",
       "entries": [
         ".lock",
         "build",
@@ -292,7 +292,7 @@
       }
     },
     "price_movement_cell_raises": {
-      "page": "ee26ec068b9fde63ff8fe939dc2422ea0df4a28bfa66e1f3264ea6c12aa075c3",
+      "page": "0e20085464bf50bfc9ba8daddd5613a88b1587cff16e0089e46134aad73dac5d",
       "entries": [
         ".lock",
         "build",
@@ -324,7 +324,7 @@
       }
     },
     "rebalance_until_cell_raises": {
-      "page": "6bb0cdb7faa2b5ed151f273449a8fe99ba35a274ffb78446707961efff1b3751",
+      "page": "8982cab4c31827bf9581e73452724468a9b310966935129e1c3e4a3227932879",
       "entries": [
         ".lock",
         "build",
@@ -360,7 +360,7 @@
       }
     },
     "tier_floors_off_fallback": {
-      "page": "73ddf32a40b934428ceab683d86e95405e5c526a8fd33a581ed174aaaea40bd8",
+      "page": "458ab7173aa00f40211888eab5b797f159563638823e0f77d06835875cd0683f",
       "entries": [
         ".lock",
         "build",
@@ -382,7 +382,7 @@
       }
     },
     "size_cap_fallback": {
-      "page": "7178c68110661434c41bdc08ffa369da56b5cd83e3824fea96e6b8c2490085f6",
+      "page": "329b6a5ff6b66daaa74911b9fc79aad0556ac190e5fcaecfc92f540e9a32a63f",
       "entries": [
         ".lock",
         "build",
@@ -396,7 +396,7 @@
       }
     },
     "off_cell_fails_without_fallback": {
-      "page": "1b5f58ef67b9f5778e33e90a7243bfdb805cec7df045ee6ac3b11178233b94e5",
+      "page": "918518e0890be0eda520fb02a66ac0c2ce7710b268c3b672af535e66d4c343c2",
       "entries": [
         ".lock",
         "build",
@@ -424,12 +424,12 @@
       "files": {}
     },
     "folder_cannot_be_made": {
-      "page": "f7a55bd1fcae58485c01f4a9e9005098727a6fd71ec5f06273939d3bdcfbd9ca",
+      "page": "82477dc278ef6c3330203697916dccdc04766fd392f6366f64bce1c8e194e515",
       "entries": null,
       "files": {}
     },
     "sell_build_fails": {
-      "page": "329df29aa01bae6e0766fe4fae16dc6e7ecfcac016082856bb8336a1319ddb97",
+      "page": "bb0376fa2e14b9fa3953f64655c441f00c8b0e787244000aa2657811e6456b04",
       "entries": [
         ".lock",
         "build",
@@ -447,7 +447,7 @@
       }
     },
     "sell_view_only": {
-      "page": "3261c5f4d84aa2af1d37a02de9cfd074f0c84c32a31140a6756f4215f718d150",
+      "page": "cec2d4091497be3a348cf637404acf5807a66a6b2b5abb5621b53390eb8d74bd",
       "entries": [
         ".lock",
         "build",
@@ -469,9 +469,54 @@
       }
     },
     "one_chunk": {
-      "page": "16e1424aa9f327ba2af5de3bad8e090d3f9dd4dec9ed4d25642edfedaee30abe",
+      "page": "b4dee576616676005ab06d6bd5e7bbeee374a4e129da665465c8a266edbb6aae",
       "entries": null,
       "files": {}
     }
-  }
+  },
+  "amended": [
+    {
+      "cases": [
+        "folder_cannot_be_made",
+        "off_cell_fails_without_fallback",
+        "one_chunk",
+        "price_movement",
+        "price_movement_cell_raises",
+        "rebalance",
+        "rebalance_cell_raises",
+        "rebalance_until",
+        "rebalance_until_cell_raises",
+        "sell",
+        "sell_and_every_view",
+        "sell_build_fails",
+        "sell_view_only",
+        "size_cap_fallback",
+        "size_cap_sweep",
+        "tier_floors_off",
+        "tier_floors_off_every_cap",
+        "tier_floors_off_fallback"
+      ],
+      "why": "The backtest page's filter bar gained its \"Skip if closing within\" menu and the page script that reads it. In each of these cases only the page's own digest moved (every file digest and the folder's entries are unchanged), and the page differs from the source_sha build only inside the filter bar's HTML and the page script: its base data block decodes equal, checked case by case (a build by the umbrella branch's tip 1cb49df, whose digests matched these, against a build with the menu). The other two cases have no filter bar and did not move. Amended by hand: each page digest replaced by the one the same module computes for the tree with the menu; source_sha, source_tree, rendering_env and everything else are unchanged.",
+      "previous_page": {
+        "folder_cannot_be_made": "f7a55bd1fcae58485c01f4a9e9005098727a6fd71ec5f06273939d3bdcfbd9ca",
+        "off_cell_fails_without_fallback": "1b5f58ef67b9f5778e33e90a7243bfdb805cec7df045ee6ac3b11178233b94e5",
+        "one_chunk": "16e1424aa9f327ba2af5de3bad8e090d3f9dd4dec9ed4d25642edfedaee30abe",
+        "price_movement": "6e49a7e536856df1d03b1d38f73bb45f6ada3a91c468522f2761541a3d18f3a7",
+        "price_movement_cell_raises": "ee26ec068b9fde63ff8fe939dc2422ea0df4a28bfa66e1f3264ea6c12aa075c3",
+        "rebalance": "4fdd723e33a53accacad5474d5e207c75b05801fcbfc8a55da2f9dedd45a9f19",
+        "rebalance_cell_raises": "0d59dca3a760849011a201ae715135f06188bc41abddb0416a2c0c179a5e1eb0",
+        "rebalance_until": "f9be9d9d4c6072b7c25074eafe9da0605376ad4a6250d37d37f2d247765eacfb",
+        "rebalance_until_cell_raises": "6bb0cdb7faa2b5ed151f273449a8fe99ba35a274ffb78446707961efff1b3751",
+        "sell": "bb91da1328c18690ab04d17e55fc9592e3313ce48e760732646322a238a2b3bf",
+        "sell_and_every_view": "fb5c4c5e4eba769b67f2944f12bf39d86d0168d662693b6acadfe93ff8dd2766",
+        "sell_build_fails": "329df29aa01bae6e0766fe4fae16dc6e7ecfcac016082856bb8336a1319ddb97",
+        "sell_view_only": "3261c5f4d84aa2af1d37a02de9cfd074f0c84c32a31140a6756f4215f718d150",
+        "size_cap_fallback": "7178c68110661434c41bdc08ffa369da56b5cd83e3824fea96e6b8c2490085f6",
+        "size_cap_sweep": "07286b3b947985af4d0e71eb34260b3b22053719636b03cb380f1675fd6ad98e",
+        "tier_floors_off": "28c59d910b492b22b65a4bf208ce28b50e7a97bc7fe13c3ca6b53ee0e9625a06",
+        "tier_floors_off_every_cap": "ae233528aadf816ff14aece85d88c9e36431d414e6fe2abf3054e11903e4e0ce",
+        "tier_floors_off_fallback": "73ddf32a40b934428ceab683d86e95405e5c526a8fd33a581ed174aaaea40bd8"
+      }
+    }
+  ]
 }
