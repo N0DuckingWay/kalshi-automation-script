@@ -5357,6 +5357,90 @@ def _rebalance_choice_in_bar(bar: dict | None, band_index: int | None, tier_on: 
             "filter bar to see it")
 
 
+def _live_close_note(sweep: BacktestSweep, bar: dict | None,
+                     shown: tuple[int | None, bool] | None, *, held_back: str) -> str:
+    """
+    Name the saved defaults' "Skip if closing within" choice, and how the filter bar shows it.
+
+    "Skip if closing within" holds back every purchase (a new pair, or an
+    add-on to a held one) when either market stops trading within that many
+    days of the moment the bot looks. The run applied its own choice
+    (BacktestSweep.buy_min_days_to_close) to every figure the page opens on;
+    the bar's Skip if closing within menu shows the other choices the run
+    worked out (the base block's "close" list), each at every band, Tier
+    floors setting, k and size cap its grids hold ("grid_close" and, with
+    the tiers off, "grid_close_off"), but with no rebalancing or selling:
+    the bar shows those at the run's own choice only.
+
+    The note is said only when the run recorded its own choice, as every run
+    of run_backtest_sweep does. A hand-built sweep that recorded neither
+    field gets none, since there a missing saved value
+    (live_buy_min_days_to_close None) cannot be told from "off".
+
+    Args:
+        sweep (BacktestSweep): The run's sweep (live_buy_min_days_to_close,
+            buy_min_days_to_close).
+        bar (dict | None): _filter_payload's base block ("close" and the
+            "grid_close" grids when the run carried the other choices), or
+            None when the page has no filter bar.
+        shown (tuple[int | None, bool] | None): Where the bar holds the live
+            rule: its band's index in the bar (None when there is no bar) and
+            whether the tier-on grid holds it. None when the page does not
+            show the live rule, which the line has already said; then the
+            note names the two choices and nothing more.
+        held_back (str): Keyword-only. What the saved defaults also do that
+            the page shows only at the run's own choice: "rebalancing",
+            "selling", "rebalancing and selling", or "" for neither.
+
+    Returns:
+        str: "; the live defaults' Skip if closing within is 7 days, this
+            run's own choice"; or, at another choice, "; the live defaults'
+            Skip if closing within is 3 days, where this run's own choice is
+            7 days" followed, where the line shows the rule, by ' — choose Skip
+            if closing within "3 days" in the filter bar to see it' (then ",
+            without the rebalancing, which the filter bar never shows at
+            another choice" when held_back names something) or by why the
+            page cannot show it; "" when the run recorded no choice of its own.
+
+    Raises:
+        Nothing. It only reads the sweep and the bar's entries.
+    """
+    own = sweep.buy_min_days_to_close
+    if own is None:
+        return ""
+    # Both as the menu's own values: whole days, 0 for off (the run records
+    # off as False, the saved defaults as None)
+    own_days = 0 if own is False else own
+    live_days = sweep.live_buy_min_days_to_close or 0
+    note = f"; the live defaults' Skip if closing within is {_close_choice_label(live_days)}"
+    if live_days == own_days:
+        return f"{note}, this run's own choice"
+    note += f", where this run's own choice is {_close_choice_label(own_days)}"
+    if shown is None:
+        return note
+    if bar is None:
+        return (f"{note} — this page's filter bar could not be built, so it does not show "
+                "that choice")
+    band, tier_on = shown
+    choices = bar.get("close") or []
+    grid = None
+    if live_days in choices:
+        place = choices.index(live_days)
+        # The choice's [band][k][cap] grid: the tier-floors-off twin is null
+        # without that view, and a choice's grid is null when its results
+        # could not be read or simulated
+        grids = bar.get("grid_close") if tier_on else bar.get("grid_close_off")
+        grid = grids[place] if grids is not None and place < len(grids) else None
+    row = (grid[band] if grid is not None and band is not None and 0 <= band < len(grid)
+           else None)
+    if row is None or not any(cid is not None for cells in row for cid in cells):
+        return f"{note} — this page does not show that choice"
+    without = (f", without the {held_back}, which the filter bar never shows at another "
+               "choice" if held_back else "")
+    return (f'{note} — choose Skip if closing within "{_close_choice_label(live_days)}" in '
+            f"the filter bar to see it{without}")
+
+
 def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     """
     Render the page-header line naming the saved live defaults' rule, and where this page shows it.
@@ -5384,7 +5468,11 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     never shows selling together with rebalancing (Sell is shut while
     Rebalance is yes), so when the defaults do both, the rebalancing clause
     says so (or, on a page with no Rebalance view, that it has none), and
-    the Sell clause offers the selling alone.
+    the Sell clause offers the selling alone. Between the sizing note and
+    the rebalancing one (the filter bar's order: Size cap, then Skip if
+    closing within, then Rebalance) it names the saved "Skip if closing
+    within" choice: whether it is this run's own, and otherwise where the
+    bar shows it, or why the page cannot (_live_close_note).
 
     Args:
         sweep (BacktestSweep | None): The run's sweep payload, or None.
@@ -5394,7 +5482,8 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     Returns:
         str: One <p>, its text escaped: the rule, any live filter and where (or
             whether) the page shows the rule, plus any ladder-departure,
-            sizing, rebalancing and selling notes; "Live rule: not
+            sizing, "Skip if closing within", rebalancing and selling
+            notes; "Live rule: not
             recorded" when sweep is None, and backtester._LIVE_RULE_NONE's words when
             the run recorded no live rule.
     """
@@ -5468,6 +5557,12 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     # shows the rule at all
     rebalance_note = _live_rebalance_note(sweep)
     sell_note = _live_sell_note(sweep)
+    # The saved "Skip if closing within" choice, and where the bar shows it;
+    # at another choice than the run's own the bar shows no rebalancing or
+    # selling, so the note says which of the two it leaves out
+    held_back = " and ".join(name for name, said in (("rebalancing", rebalance_note),
+                                                     ("selling", sell_note)) if said)
+    close_note = _live_close_note(sweep, bar, shown, held_back=held_back)
     if rebalance_note and shown is not None:
         clause = _rebalance_choice_in_bar(
             bar, *shown, sweep.live_min_price_move,
@@ -5486,7 +5581,7 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
         seen = "the selling alone" if rebalance_note else "it"
         sell_note += (f" — choose {choice} in the filter bar to see {seen}" if choice is not None
                       else " — this page cannot show that Sell level and minimum of days")
-    text = (f"Live rule ({_LIVE_RULE_LABEL}): {rule} — {tail}{sizing}"
+    text = (f"Live rule ({_LIVE_RULE_LABEL}): {rule} — {tail}{sizing}{close_note}"
             f"{rebalance_note}{sell_note}")
     return f"{style}{html.escape(text, quote=False)}</p>"
 

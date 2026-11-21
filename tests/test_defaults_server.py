@@ -11,7 +11,7 @@ Purpose:
     highlighted, warnings, escaping, its three scripts and their
     Content-Security-Policy hashes, who may frame it, the buttons in their
     fixed order with placeholders for those that do not apply, and its
-    dropdown bar: its eleven controls in the backtest page's order and
+    dropdown bar: its twelve controls in the backtest page's order and
     words, their choices, the names file its menus read, and a round trip of
     every choice through the server), the page with no address fields (the
     defaults in force, or no buttons when a link cannot carry them as they
@@ -1299,8 +1299,8 @@ class TestConfirmPage:
 
     @pytest.mark.parametrize("saved", [None, 3, 7, 14])
     def test_a_missing_skip_if_closing_within_keeps_the_saved_value(self, saved):
-        # A Trading-tab save that does not name it (the bar has no menu for it,
-        # so only a link built elsewhere can leave it out) keeps it as saved,
+        # A Trading-tab save that does not name it (the bar's dropdown always
+        # names it, so only a link made elsewhere leaves it out) keeps it as saved,
         # shown as no change: a save never turns it off unasked
         _save(replace(_BASE_SETTINGS, buy_min_days_to_close=saved))
         response = _get(_app(), "/confirm?" + _query())
@@ -2296,7 +2296,7 @@ _NARROW_BASE = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_
 
 
 class TestTradingBar:
-    """The trading page's dropdown bar: the backtest page's eleven controls, its choices, the
+    """The trading page's dropdown bar: the backtest page's twelve controls, its choices, the
     names its menus list, and a form of its own that only asks for the page again."""
 
     @staticmethod
@@ -2346,7 +2346,7 @@ class TestTradingBar:
         [option] = [o for o in page.bar_select(key)["options"] if o["selected"]]
         return option["value"], option["text"]
 
-    def test_eleven_controls_in_the_backtest_bar_s_order_and_words(self):
+    def test_twelve_controls_in_the_backtest_bar_s_order_and_words(self):
         from kalshi_betting import dashboard
 
         page = self._page()
@@ -2354,20 +2354,66 @@ class TestTradingBar:
         # The backtest page's bar, read from its own source: its dropdowns'
         # labels in order, then its two menus' labels
         source = inspect.getsource(dashboard._filter_bar_html)
-        # The Trading tab's bar still carries "Skip if closing within" as a hidden field
-        expected = [label for label in re.findall(r"<label>([^<:]+): <select id=\"flt-", source)
-                    if label != "Skip if closing within"]
+        expected = re.findall(r"<label>([^<:]+): <select id=\"flt-", source)
         expected += [dashboard._MENU_CAT_LABEL, dashboard._MENU_TAG_LABEL]
-        assert len(expected) == 11
+        assert len(expected) == 12
         assert labels == expected == [
-            "Spread band", "Tier floors", "k", "Size cap", "Rebalance", "Min. price movement",
-            "Rebalance until", "Sell", "Min. days to maturity", "Exclude categories",
-            "Exclude tags"]
+            "Spread band", "Tier floors", "k", "Size cap", "Skip if closing within",
+            "Rebalance", "Min. price movement", "Rebalance until", "Sell",
+            "Min. days to maturity", "Exclude categories", "Exclude tags"]
         # The dropdowns in that order, the band by its id, the rest by the field they send
         assert [c.get("name") or c.get("id") for c in page.bar_controls
                 if c["tag"] == "select"] == [
-            "tb-band", "tier_floors", "k", "size_cap", "rebalance", "min_price_move",
-            "rebalance_min_days_to_maturity", "sell_at", "sell_min_days"]
+            "tb-band", "tier_floors", "k", "size_cap", "buy_min_days_to_close", "rebalance",
+            "min_price_move", "rebalance_min_days_to_maturity", "sell_at", "sell_min_days"]
+
+    @pytest.mark.parametrize("refused", [None, 3], ids=["every-choice", "one-with-no-results"])
+    def test_skip_if_closing_within_offers_the_backtest_page_s_choices_in_its_words(
+            self, monkeypatch, tmp_path, refused):
+        # The backtest page's menu on a page whose run worked out every other
+        # choice (one refused in the second case), its own 7 days: with its own
+        # " (primary)" mark and a refused choice's " (no results)" mark set
+        # aside, and its "0" read as this bar's "off", it offers exactly this
+        # bar's choices in exactly its words. The page's live-rule line quotes
+        # a choice in those words too, or says the page cannot show it
+        from kalshi_betting import backtester, dashboard
+
+        from .test_dashboard import (
+            _CL_OWN,
+            _KC_B0,
+            _cl_page,
+            _cl_refusing,
+            _cl_sweep,
+            _page_elements,
+        )
+        sweep = dataclasses.replace(
+            _cl_sweep(cls=None if refused is None else _cl_refusing(refused)),
+            live_tier_floors=True, live_spread_band=_KC_B0,
+            buy_min_days_to_close=_CL_OWN, live_buy_min_days_to_close=3)
+        page = _cl_page(monkeypatch, tmp_path / "backtest", sweep)
+        options = _page_elements(page)["selects"]["flt-close"]["options"]
+        primary, missing = " (primary)", dashboard._CLOSE_OPTION_UNAVAILABLE
+        assert missing == " (no results)"
+        # Each mark sits where it should: the run's own, and the refused choice
+        assert [o["value"] for o in options if o["text"].endswith(primary)] == [str(_CL_OWN)]
+        assert [o["value"] for o in options if o["text"].endswith(missing)] == (
+            [] if refused is None else [str(refused)])
+        theirs = [("off" if o["value"] == "0" else o["value"],
+                   o["text"].removesuffix(primary).removesuffix(missing)) for o in options]
+        ours = [(o["value"], o["text"])
+                for o in self._page().bar_select("buy_min_days_to_close")["options"]]
+        assert theirs == ours == self._SKIP
+        # The live-rule line names a choice as both menus word it
+        for value, words in ours:
+            assert backtester._close_choice_label(
+                0 if value == "off" else int(value)) == words
+        [line] = re.findall(r"Live rule \(saved live defaults\): ([^<]*)</p>", page)
+        if refused is None:
+            [quoted] = re.findall(r'choose Skip if closing within "([^"]*)" in the filter bar',
+                                  line)
+            assert (str(3), quoted) in ours
+        else:
+            assert line.endswith("— this page does not show that choice")
 
     def test_it_is_a_form_of_its_own_that_only_asks_for_the_page(self):
         page = self._page(_FULL_BASE)
@@ -2389,39 +2435,91 @@ class TestTradingBar:
         assert ("spread_min", "0.2") in page.hidden and len(
             [n for n, _ in page.hidden if n == "spread_min"]) == 1
 
-    @pytest.mark.parametrize("days, written", [(None, "off"), (3, "3"), (7, "7"), (14, "14")])
-    def test_skip_if_closing_within_rides_on_a_hidden_field(self, days, written):
-        # The bar has no menu for it: a hidden field right after the band's two
-        # carries the proposal's value, so a choice made on the bar asks for a
-        # page that proposes the same days
+    # "Skip if closing within": each choice of config.BUY_MIN_DAYS_TO_CLOSE_CHOICES
+    # as LiveSettings holds it (0 is off, None), as the query spells it, and in
+    # the words of the table under the bar
+    _SKIP_DAYS = [days or None for days in config.BUY_MIN_DAYS_TO_CLOSE_CHOICES]
+    _SKIP = [(defaults_server._query_value("buy_min_days_to_close", days),
+              config.live_setting_text("buy_min_days_to_close", days)) for days in _SKIP_DAYS]
+
+    @pytest.mark.parametrize("days", _SKIP_DAYS)
+    @pytest.mark.parametrize("base", [_FULL_BASE, _NARROW_BASE], ids=["full", "narrowed"])
+    def test_skip_if_closing_within_offers_every_choice_in_the_table_s_words(self, base, days):
+        # A dropdown of its own, whatever the other settings (the rule reads
+        # none of them): every choice in config's order, spelled "off", "3",
+        # "7", "14" and worded "off", "3 days", ..., the proposal's selected
+        page = self._page(replace(base, buy_min_days_to_close=days))
+        assert [value for value, _ in self._SKIP] == ["off", "3", "7", "14"]
+        assert [words for _, words in self._SKIP] == ["off", "3 days", "7 days", "14 days"]
+        select = page.bar_select("buy_min_days_to_close")
+        assert [(o["value"], o["text"]) for o in select["options"]] == self._SKIP
+        assert "disabled" not in select
+        assert self._chosen(page, "buy_min_days_to_close") == (
+            defaults_server._query_value("buy_min_days_to_close", days),
+            page.cells["skip if closing within"][2])
+        # The dropdown is the only control of that name: no hidden field is left
+        assert [c for c in page.bar_controls
+                if c.get("name") == "buy_min_days_to_close"] == [select]
+        assert not any(c.get("type") == "hidden" and c.get("name") == "buy_min_days_to_close"
+                       for c in page.bar_controls)
+
+    @pytest.mark.parametrize("saved", _SKIP_DAYS)
+    def test_each_skip_if_closing_within_choice_proposes_exactly_it(self, saved):
+        # Over each saved value, each choice (off included), sent as a browser
+        # sends the bar, asks for a page proposing exactly that choice and
+        # nothing else new: its table shows it beside the saved value, and its
+        # bar selects it
+        base = replace(_FULL_BASE, buy_min_days_to_close=saved)
+        page = self._page(base)
+        app = _app()
+        for value, words in self._SKIP:
+            query = _bar_query(page, {"buy_min_days_to_close": value})
+            assert defaults_server._params(query)["buy_min_days_to_close"] == [value]
+            days = None if value == "off" else int(value)
+            assert defaults_server._proposal(defaults_server._params(query), base) == (
+                replace(base, buy_min_days_to_close=days), ""), value
+            response = _get(app, "/confirm?" + query)
+            assert response.status == 200, (value, response.body[:400])
+            again = _parse(response.body)
+            assert again.cells["skip if closing within"][1:3] == [
+                config.live_setting_text("buy_min_days_to_close", saved), words], value
+            assert self._chosen(again, "buy_min_days_to_close") == (value, words)
+            changed = [label for label, css in again.rows.items() if css == "changed"]
+            assert changed == ([] if days == saved else ["skip if closing within"]), value
+
+    @pytest.mark.parametrize("days", _SKIP_DAYS)
+    def test_a_choice_elsewhere_on_the_bar_keeps_skip_if_closing_within(self, days):
+        # Every option of every other dropdown, and the menus ticked anew, asks
+        # for a page that keeps the proposal's "Skip if closing within"
         page = self._page(replace(_FULL_BASE, buy_min_days_to_close=days))
-        hidden = [(c["name"], c["value"]) for c in page.bar_controls
-                  if c.get("type") == "hidden"]
-        assert hidden[:3] == [("spread_min", "0.2"), ("spread_max", "0.8"),
-                              ("buy_min_days_to_close", written)]
-        assert not any(c.get("name") == "buy_min_days_to_close" for c in page.bar_controls
-                       if c["tag"] != "input")
-        # Each dropdown changed in turn, and a menu ticked anew, keeps it
-        for choose in ({"k": "0.75"}, {"rebalance": "off"}, {"sell_at": "off"},
-                       {"tb-band": "0.0|0.5"}):
-            query = _bar_query(page, choose=choose)
-            assert ("buy_min_days_to_close", [written]) in defaults_server._params(
-                query).items(), choose
-            settings, _ = defaults_server._proposal(defaults_server._params(query),
-                                                    config.read_saved_live_defaults())
-            assert settings.buy_min_days_to_close == days, choose
-        query = _bar_query(page, ticks={"exclude_category": []})
-        settings, _ = defaults_server._proposal(defaults_server._params(query),
-                                                config.read_saved_live_defaults())
-        assert settings.buy_min_days_to_close == days
-        # A proposal that differs from the saved value keeps its own on the bar too
-        other = 3 if days != 3 else 14
-        page = self._page(query=defaults_server._settings_query(
-            replace(_FULL_BASE, buy_min_days_to_close=other)))
-        query = _bar_query(page, choose={"k": "0.75"})
-        settings, _ = defaults_server._proposal(defaults_server._params(query),
-                                                config.read_saved_live_defaults())
-        assert settings.buy_min_days_to_close == other
+        saved = config.read_saved_live_defaults()
+        sent = [_bar_query(page, ticks={"exclude_category": [], "exclude_tag": []}),
+                _bar_query(page, ticks={"exclude_category": ["Sports"]})]
+        for control in page.bar_controls:
+            key = control.get("name") or control.get("id")
+            if control["tag"] == "select" and key != "buy_min_days_to_close":
+                sent += [_bar_query(page, {key: option["value"]})
+                         for option in control["options"]]
+        assert len(sent) > 100
+        for query in sent:
+            settings, _ = defaults_server._proposal(defaults_server._params(query), saved)
+            assert settings.buy_min_days_to_close == days, query
+        # A proposal whose value is not the saved one keeps its own, shown on
+        # the bar as the change it is, and so does every choice made from it
+        for other in self._SKIP_DAYS:
+            if other == days:
+                continue
+            page = self._page(query=defaults_server._settings_query(
+                replace(_FULL_BASE, buy_min_days_to_close=other)))
+            assert self._chosen(page, "buy_min_days_to_close")[0] == (
+                defaults_server._query_value("buy_min_days_to_close", other))
+            assert page.rows["skip if closing within"] == "changed"
+            for choose in ({"k": "0.75"}, {"rebalance": "off"}, {"sell_at": "off"},
+                           {"tb-band": "0.0|0.5"}, {"size_cap": "1.0"}):
+                query = _bar_query(page, choose=choose)
+                settings, _ = defaults_server._proposal(defaults_server._params(query),
+                                                        saved)
+                assert settings.buy_min_days_to_close == other, (other, choose)
 
     def test_each_menu_says_its_ticks_wait_for_apply(self):
         # A tick turns the buttons off until Apply (the arming script): a grey
@@ -2443,7 +2541,8 @@ class TestTradingBar:
                  "size_cap": "per-trade cap", "rebalance": "rebalance",
                  "min_price_move": "min price movement",
                  "rebalance_min_days_to_maturity": "rebalance until", "sell_at": "sell at",
-                 "sell_min_days": "min days to maturity"}
+                 "sell_min_days": "min days to maturity",
+                 "buy_min_days_to_close": "skip if closing within"}
         for key, row in words.items():
             assert self._chosen(page, key)[1] == page.cells[row][2], key
         # The hidden band fields hold the proposal's band
@@ -2487,6 +2586,8 @@ class TestTradingBar:
             repr(level) for level in config.TAKE_PROFIT_LEVELS]
         assert self._offered(page, "sell_min_days") == ["off"] + [
             str(d) for d in config.TAKE_PROFIT_MIN_DAYS]
+        assert self._offered(page, "buy_min_days_to_close") == [
+            "off" if days == 0 else str(days) for days in config.BUY_MIN_DAYS_TO_CLOSE_CHOICES]
         # Each option's words are config's words for that value
         texts = {o["value"]: o["text"] for o in page.bar_select("min_price_move")["options"]}
         assert texts["off"] == "any" and texts["0.15"] == "15c"
@@ -2502,6 +2603,9 @@ class TestTradingBar:
         assert texts["off"] == "off" and texts["0.8"] == "80% of potential profit"
         texts = {o["value"]: o["text"] for o in page.bar_select("rebalance")["options"]}
         assert texts == {"off": "no", "on": "yes"}
+        texts = {o["value"]: o["text"]
+                 for o in page.bar_select("buy_min_days_to_close")["options"]}
+        assert texts == {"off": "off", "3": "3 days", "7": "7 days", "14": "14 days"}
 
     def test_a_value_off_the_grid_is_offered_once_in_its_place(self):
         off_grid = LiveSettings(tier_floors=False, spread_band=(0.1, 0.45),
@@ -2522,7 +2626,8 @@ class TestTradingBar:
         assert self._offered(page, "tb-band").index("0.1|0.45") == 6
         # On the grid it is offered once, never twice
         page = self._page(_FULL_BASE)
-        for key in ("tb-band", "k", "size_cap", "min_price_move", "sell_at", "sell_min_days"):
+        for key in ("tb-band", "k", "size_cap", "buy_min_days_to_close", "min_price_move",
+                    "sell_at", "sell_min_days"):
             offered = self._offered(page, key)
             assert len(offered) == len(set(offered)), key
 
@@ -2533,6 +2638,9 @@ class TestTradingBar:
         assert [o["text"] for o in page.bar_select("min_price_move")["options"]] == ["any"]
         assert self._offered(page, "rebalance_min_days_to_maturity") == ["0"]
         assert self._offered(page, "sell_min_days") == ["off"]
+        # "Skip if closing within" reads no other setting: every choice stays
+        assert len(self._offered(page, "buy_min_days_to_close")) == len(
+            config.BUY_MIN_DAYS_TO_CLOSE_CHOICES)
         # ... and never by disabling a dropdown
         assert not any("disabled" in c for c in page.bar_controls)
         # Rebalance yes with selling off: the rebalance choices open, the days do not
@@ -2789,6 +2897,8 @@ class TestBarRoundTrip:
         if key == "sell_at":
             return (replace(base, sell_at=None, sell_min_days=None) if off
                     else replace(base, sell_at=float(value)))
+        if key == "buy_min_days_to_close":
+            return replace(base, buy_min_days_to_close=None if off else int(value))
         assert key == "sell_min_days"
         return replace(base, sell_min_days=None if off else int(value))
 
@@ -2801,10 +2911,12 @@ class TestBarRoundTrip:
         response = _get(app, "/confirm?" + _bar_query(page))
         assert response.status == 200 and "0 of 12 settings change." in response.body
         tried = 0
+        walked = []
         for control in page.bar_controls:
             if control["tag"] != "select":
                 continue
             key = control.get("name") or control["id"]
+            walked.append(key)
             for option in control["options"]:
                 query = _bar_query(page, {key: option["value"]})
                 response = _get(app, "/confirm?" + query)
@@ -2819,7 +2931,8 @@ class TestBarRoundTrip:
                 assert [o["value"] for o in again.bar_select(key)["options"]
                         if o["selected"]] == [option["value"]], (key, option["value"])
                 tried += 1
-        # Every option of the nine dropdowns was tried
+        # Every option of the ten dropdowns was tried, "Skip if closing within"'s too
+        assert len(walked) == 10 and "buy_min_days_to_close" in walked
         assert tried == sum(len(c["options"]) for c in page.bar_controls if c["tag"] == "select")
         assert tried > (100 if base is _FULL_BASE else 80)
 
@@ -2965,7 +3078,8 @@ __emit(JSON.stringify(__out));
 """
 
 # The stand-in's dropdowns, in the bar's order, and its two hidden band
-# fields, at a proposal that rebalances and sells
+# fields, at a proposal that skips contracts closing within 7 days, rebalances
+# and sells
 _BAR_CONTROLS = [
     {"key": "tb-band", "value": "0.2|0.8", "select": True},
     {"key": "spread_min", "value": "0.2", "select": False},
@@ -2973,6 +3087,7 @@ _BAR_CONTROLS = [
     {"key": "tier_floors", "value": "on", "select": True},
     {"key": "k", "value": "0.85", "select": True},
     {"key": "size_cap", "value": "0.15", "select": True},
+    {"key": "buy_min_days_to_close", "value": "7", "select": True},
     {"key": "rebalance", "value": "on", "select": True},
     {"key": "min_price_move", "value": "0.1", "select": True},
     {"key": "rebalance_min_days_to_maturity", "value": "7", "select": True},
@@ -3036,11 +3151,21 @@ class TestBarScript:
             ["snap", "sent"]])
         # It listens for each dropdown's change and the form's own submit, nothing else
         assert out["load"]["form"] == ["submit"]
-        assert out["load"]["selects"] == [["change"]] * 9
+        assert out["load"]["selects"] == [["change"]] * 10
         assert out["load"]["submitted"] == []
         [sent] = out["sent"]["submitted"]
         assert sent == {**self._START, "tb-band": "0.25|0.9", "spread_min": "0.25",
                         "spread_max": "0.9"}
+
+    @pytest.mark.parametrize("value", ["off", "3", "14"])
+    def test_a_skip_if_closing_within_change_sends_the_bar_with_it(self, tmp_path, value):
+        # Its dropdown sends the bar as soon as it changes, like every other,
+        # and nothing settle() does touches it (the other tests' sends keep its 7)
+        out = _run_bar_script(tmp_path, [
+            ["set", "buy_min_days_to_close", value], ["change", "buy_min_days_to_close"],
+            ["snap", "s"]])
+        assert out["s"]["submitted"] == [{**self._START, "buy_min_days_to_close": value}]
+        assert out["s"]["inert_at_submit"] == [True]
 
     def test_a_change_elsewhere_keeps_the_rest_as_shown(self, tmp_path):
         out = _run_bar_script(tmp_path, [["set", "k", "0.9"], ["change", "k"], ["snap", "s"]])
@@ -3086,7 +3211,7 @@ class TestBarScript:
 
     def test_a_page_without_the_bar_does_nothing(self, tmp_path):
         out = _run_bar_script(tmp_path, [["snap", "s"]], present=False)
-        assert out["s"]["form"] == [] and out["s"]["selects"] == [[]] * 9
+        assert out["s"]["form"] == [] and out["s"]["selects"] == [[]] * 10
         assert out["s"]["values"] == self._START
         assert out["s"]["inert"] is False
 
@@ -4947,6 +5072,33 @@ class TestSave:
         assert _post(app, form).status == 303
         assert config.read_saved_live_defaults().rebalance_min_days_to_maturity is None
         assert "rebalance_min_days_to_maturity" not in config.LIVE_DEFAULTS_FILE.read_text()
+
+    @pytest.mark.parametrize("saved_first", [True, False], ids=["over-saved", "first-save"])
+    @pytest.mark.parametrize("days", [d or None for d in config.BUY_MIN_DAYS_TO_CLOSE_CHOICES])
+    def test_each_skip_if_closing_within_chosen_on_the_bar_is_saved(self, days, saved_first):
+        # The choice made on the Trading tab's dropdown, sent as the bar's form
+        # sends it, then Confirm and save on the page it opens: the file holds
+        # the key (null for off, since a file without it reads as 7 days) and
+        # reads back as exactly that choice. Over saved defaults, the saved
+        # value is the next choice round, so every save changes it
+        choices = [d or None for d in config.BUY_MIN_DAYS_TO_CLOSE_CHOICES]
+        base = _BASE_SETTINGS if saved_first else config.LIVE_DEFAULTS_SEED
+        if saved_first:
+            _save(replace(base, buy_min_days_to_close=choices[
+                (choices.index(days) + 1) % len(choices)]))
+        app = _app()
+        page = _parse(_get(app, "/confirm").body)
+        value = defaults_server._query_value("buy_min_days_to_close", days)
+        response = _get(app, "/confirm?" + _bar_query(page, {"buy_min_days_to_close": value}))
+        assert response.status == 200, response.body[:400]
+        posted = _post(app, _click(response.body, "confirm"))
+        assert posted.status == 303 and posted.location == "/saved", posted.body[:400]
+        saved = config.read_saved_live_defaults()
+        assert saved.buy_min_days_to_close == days
+        assert saved == replace(base, buy_min_days_to_close=days)
+        record = json.loads(config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8"))
+        assert "buy_min_days_to_close" in record["settings"]
+        assert record["settings"]["buy_min_days_to_close"] == days
 
     def test_it_overwrites_the_defaults_in_force(self):
         _save(LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,

@@ -154,6 +154,14 @@ TERMS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
      "A top-up or sale close to payout has little time left to pay off its fees, so "
      "this shows whether leaving a position alone in its last days does better.",
      _BACKTEST),
+    ("Skip if closing within",
+     "The bot doesn't buy a pair, or add to one, when either contract stops "
+     "trading within this many days of the moment it looks. Off buys however soon "
+     "they close; sales and trims are never held back. Live runs follow the "
+     "saved setting.",
+     "Contracts about to close leave little time to be wrong and recover, so this "
+     "shows whether staying out of them does better.",
+     _BACKTEST),
     ("Fills",
      "Whether a trade was priced by walking a modeled order book, whose depth comes "
      "from saved snapshots, or at the top-of-book price in any size.",

@@ -3258,6 +3258,200 @@ class TestLiveRuleHeader:
         }[page_kind]
 
 
+class TestLiveRuleCloseNote:
+    """The live-rule line's "Skip if closing within" note (dashboard._live_close_note):
+    the saved live defaults' choice (BacktestSweep.live_buy_min_days_to_close, None
+    for off), whether it is this run's own (buy_min_days_to_close: days, False for
+    off), and otherwise where the filter bar's Skip if closing within menu shows it
+    (the base block's "close" list and its grids) or why the page cannot. It sits
+    between the sizing note and the rebalancing one, the filter bar's own order."""
+
+    _HEAD = (f"Live rule (saved live defaults): "
+             f"{config.describe_time_series_rule(True, (0.0, 1.0))} — this run's primary")
+
+    @staticmethod
+    def _sweep(live, own, **fields) -> BacktestSweep:
+        """TestLiveRuleHeader's sweep (a live rule that is this run's primary unless
+        `fields` say otherwise) recording the saved choice `live` (None for off)
+        and the run's own `own` (days, False for off, None for not recorded)."""
+        return dataclasses.replace(TestLiveRuleHeader._sweep(**fields),
+                                   live_buy_min_days_to_close=live, buy_min_days_to_close=own)
+
+    @staticmethod
+    def _bar(choices=(0, 3, 14), own=7, *, grids=None, off_grids=True, **bar) -> dict:
+        """TestLiveRuleHeader's base block plus the other choices' keys as
+        _filter_payload ships them: every choice's grid holds a chunk in every
+        cell unless `grids` gives them ([choice] -> null or [band][k][cap]);
+        the tier-floors-off twin is the same, or null when off_grids is False."""
+        base = TestLiveRuleHeader._bar(**bar)
+
+        def copy() -> list:
+            """A copy of the base grid, every row a list of its own."""
+            return [[list(cells) for cells in row] for row in base["grid"]]
+
+        return {**base, "close": list(choices), "close_own": own,
+                "grid_close": [copy() for _ in choices] if grids is None else grids,
+                "grid_close_off": [copy() for _ in choices] if off_grids else None,
+                "close_state": "shown"}
+
+    @staticmethod
+    def _text(sweep, bar) -> str:
+        """The line's text, without its <p> and </p>."""
+        return TestLiveRuleHeader()._text(sweep, bar)
+
+    def test_the_words_are_the_trading_tab_s(self):
+        # The note names a choice in the words the Trading tab's dropdown and
+        # table use for it, so a reader finds the same words on both pages
+        for days in config.BUY_MIN_DAYS_TO_CLOSE_CHOICES:
+            assert backtester._close_choice_label(days) == config.live_setting_text(
+                "buy_min_days_to_close", days or None)
+
+    @pytest.mark.parametrize("live, own", [(None, False), (3, 3), (7, 7), (14, 14)])
+    def test_the_run_s_own_choice_is_named_as_such(self, live, own):
+        words = config.live_setting_text("buy_min_days_to_close", live)
+        sweep = self._sweep(live, own)
+        for bar in (None, self._bar(), TestLiveRuleHeader._bar()):
+            assert self._text(sweep, bar) == (
+                f"{self._HEAD}; the live defaults' Skip if closing within is {words}, this "
+                "run's own choice"), bar
+
+    @pytest.mark.parametrize("live, own", [(None, 7), (3, 7), (14, 7), (7, False), (3, False)])
+    def test_another_choice_the_bar_offers_is_named_with_its_option(self, live, own):
+        words = config.live_setting_text("buy_min_days_to_close", live)
+        own_words = "off" if own is False else f"{own} days"
+        choices = [d for d in config.BUY_MIN_DAYS_TO_CLOSE_CHOICES if d != (own or 0)]
+        sweep = self._sweep(live, own)
+        assert self._text(sweep, self._bar(choices, own or 0)) == (
+            f"{self._HEAD}; the live defaults' Skip if closing within is {words}, where this "
+            f"run's own choice is {own_words} — choose Skip if closing within \"{words}\" in "
+            "the filter bar to see it")
+
+    def test_a_tier_floors_off_rule_reads_the_tier_off_grids(self):
+        band = (0.0, 0.5)
+        fields = {"live_tier_floors": False, "live_spread_band": band,
+                  "calibrations_by_band": {(0.0, 1.0): None, band: None},
+                  "tier_off_calibrations_by_band": {(0.0, 1.0): None, band: None},
+                  "tier_off_scenarios": [object()]}
+        sweep = self._sweep(3, 7, **fields)
+        bands = [band, (0.0, 1.0)]
+        shown = ' — choose Skip if closing within "3 days" in the filter bar to see it'
+        assert self._text(sweep, self._bar(bands=bands)).endswith(shown)
+        # The tier-on grids alone do not show a tier-off rule
+        assert self._text(sweep, self._bar(bands=bands, off_grids=False)).endswith(
+            " — this page does not show that choice")
+        # ... nor does a tier-off grid with no chunk at that band; one with no
+        # chunk at another band still does
+        bar = self._bar(bands=bands)
+        bar["grid_close_off"][1][0] = [[None]]
+        assert self._text(sweep, bar).endswith(" — this page does not show that choice")
+        bar = self._bar(bands=bands)
+        bar["grid_close_off"][1][1] = [[None]]
+        assert self._text(sweep, bar).endswith(shown)
+
+    def test_a_choice_the_page_cannot_show_says_so(self):
+        sweep = self._sweep(3, 7)
+        cannot = (f"{self._HEAD}; the live defaults' Skip if closing within is 3 days, where "
+                  "this run's own choice is 7 days — this page does not show that choice")
+        for bar in (
+                # no family on the page, or a family without that choice
+                TestLiveRuleHeader._bar(), self._bar(choices=(0, 14)),
+                self._bar(choices=()),
+                # the choice's grid is null (refused, failed, or not read to the end)
+                self._bar(grids=[[[["c"]]], None, [[["c"]]]]),
+                # ... or holds no chunk at the rule's band
+                self._bar(grids=[[[["c"]]], [[[None]]], [[["c"]]]]),
+        ):
+            assert self._text(sweep, bar) == cannot, bar
+        # A page without a filter bar cannot show it either
+        assert self._text(sweep, None) == (
+            f"{self._HEAD}; the live defaults' Skip if closing within is 3 days, where this "
+            "run's own choice is 7 days — this page's filter bar could not be built, so it "
+            "does not show that choice")
+
+    def test_a_rule_the_page_does_not_show_names_the_two_choices_alone(self):
+        # Not simulated: the line already says the page does not show the rule
+        sweep = self._sweep(3, 7, live_spread_band=(0.3, 0.6),
+                            calibrations_by_band={(0.0, 1.0): None})
+        assert self._text(sweep, self._bar()).endswith(
+            "— not simulated by this run; the live defaults' Skip if closing within is 3 "
+            "days, where this run's own choice is 7 days")
+        # Elsewhere on the grid, with no bar
+        sweep = self._sweep(3, 7, live_spread_band=(0.3, 0.6),
+                            calibrations_by_band={(0.0, 1.0): None, (0.3, 0.6): None})
+        assert self._text(sweep, None).endswith(
+            "— not shown: this page's filter bar could not be built; the live defaults' Skip "
+            "if closing within is 3 days, where this run's own choice is 7 days")
+
+    @pytest.mark.parametrize("rebalance, sell, held", [
+        (True, None, "rebalancing"), (None, 0.85, "selling"),
+        (True, 0.85, "rebalancing and selling")])
+    def test_rebalancing_or_selling_saved_is_left_out_at_another_choice(self, rebalance, sell,
+                                                                         held):
+        # The bar shows rebalancing and selling at the run's own choice only, so
+        # the note says the other choice leaves out what the saved defaults do;
+        # the rebalancing and selling notes follow it
+        sweep = dataclasses.replace(self._sweep(3, 7), live_rebalance=rebalance,
+                                    live_sell_at=sell)
+        text = self._text(sweep, self._bar())
+        clause = (' — choose Skip if closing within "3 days" in the filter bar to see it, '
+                  f"without the {held}, which the filter bar never shows at another choice")
+        assert clause in text
+        after = text[text.index(clause) + len(clause):]
+        assert after.startswith("; the live defaults rebalance" if rebalance
+                                else "; the live defaults sell")
+        # At the run's own choice nothing is left out
+        same = dataclasses.replace(sweep, live_buy_min_days_to_close=7)
+        assert "without the" not in self._text(same, self._bar())
+
+    def test_the_note_sits_between_the_sizing_and_rebalancing_notes(self):
+        sweep = dataclasses.replace(self._sweep(3, 7, live_sizing=(0.8, 0.1)),
+                                    live_rebalance=True)
+        text = self._text(sweep, self._bar(ks=(0.75, 0.8), caps=(0.2, 0.1)))
+        sizing = text.index("; the live defaults size at")
+        close = text.index("; the live defaults' Skip if closing within")
+        rebalance = text.index("; the live defaults rebalance")
+        assert sizing < close < rebalance
+
+    @pytest.mark.parametrize("live", [None, 3, 7, 14])
+    def test_no_note_without_the_run_s_own_choice(self, live):
+        # A hand-built sweep that recorded no choice of its own: its saved
+        # value of None could be off or not recorded, so nothing is said
+        sweep = self._sweep(live, None)
+        assert self._text(sweep, self._bar()) == self._HEAD
+        assert "Skip if closing within" not in self._text(sweep, None)
+
+    def test_no_note_when_no_live_rule_was_recorded(self):
+        for sweep in (self._sweep(3, 7, live_tier_floors=None),
+                      self._sweep(None, False, live_spread_band=None)):
+            assert dashboard._live_rule_html(sweep, bar=self._bar()) == (
+                TestLiveRuleHeader._P + "Live rule: none recorded — no usable live defaults "
+                "were saved when this run started, and live runs refuse to start without "
+                "them</p>")
+
+    @pytest.mark.parametrize("saved", ["own", "other"])
+    def test_a_page_with_the_family_names_its_own_menu_choice(self, monkeypatch, tmp_path,
+                                                              saved):
+        # A whole page built from a run that worked out the other choices (its
+        # own is 7 days): the header names the saved choice from the page's
+        # own base block
+        assert _CL_OWN == 7
+        live = _CL_OWN if saved == "own" else 3
+        sweep = dataclasses.replace(
+            _cl_sweep(), live_tier_floors=True, live_spread_band=_KC_B0,
+            buy_min_days_to_close=_CL_OWN, live_buy_min_days_to_close=live)
+        page = _cl_page(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        assert data["close"] == [0, 3, 14] and data["close_own"] == _CL_OWN
+        line = dashboard._live_rule_html(sweep, bar=data)
+        assert line in page
+        assert line.endswith(
+            "; the live defaults' Skip if closing within is 7 days, this run's own choice</p>"
+            if live == _CL_OWN else
+            "; the live defaults' Skip if closing within is 3 days, where this run's own "
+            'choice is 7 days — choose Skip if closing within "3 days" in the filter bar to '
+            "see it</p>"), line
+
+
 class TestEntryCheckpointHeader:
     """The page header names the entry checkpoint (the backtest's weekly
     moment, BacktestSweep.entry_checkpoint) under the run-settings line, says
@@ -18806,8 +19000,9 @@ class TestParkedChunks:
     builds (the digests were captured from the commit before parking, by
     running that module as a script, the recipe in its docstring; the page
     digests of the cases with the filter bar were since amended by hand for
-    the bar's "Skip if closing within" menu, each previous one in the
-    fixture's "amended" notes), and
+    the bar's "Skip if closing within" menu, and every case's for the
+    glossary term of that name in the page's Terms section, each previous
+    one in the fixture's "amended" notes), and
     the parking folder is gone however the build ends but a kill (or a
     Ctrl-C during that folder's own deletion). A files folder that cannot
     take the parking folder stops the build with the mkdir's own error."""

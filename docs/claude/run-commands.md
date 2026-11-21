@@ -394,7 +394,7 @@ python3 -m kalshi_betting.scheduler
 # Data, eda_dashboard.html (what backtest_cache/ holds, rebuilt at the end of each
 # backtest), and Run, the latest run's page, shown once a run starts. The Trading tab opens
 # on the live defaults in force (an outdated file's values in their new form; with none
-# saved, the seed values); its dropdowns, the backtest bar's eleven settings, propose other
+# saved, the seed values); its dropdowns, the backtest bar's twelve settings, propose other
 # values, and the Backtest tab's filter bar and the Trading tab follow each other. The
 # launcher takes only --seed, --no-browser and -h/--help, spelled in full (anything else
 # exits 2 before anything starts), runs from its own folder (so from any directory), checks
