@@ -1796,6 +1796,315 @@ class TestFindEntryHorizon:
         assert entry is None
 
 
+def _skip_market(ticker: str, event: str, deadline: date, close: str | None = None,
+                 title: str | None = None) -> dict:
+    """A cumulative "by <deadline>" market whose recorded close defaults to that day's 00:00 UTC."""
+    if title is None:
+        title = f"Will it happen by {deadline:%B} {deadline.day}, {deadline.year}?"
+    return {"ticker": ticker, "event_ticker": event, "title": title, "subtitle": "",
+            "close_time": close if close is not None else f"{deadline.isoformat()}T00:00:00+00:00"}
+
+
+def _checkpoint_utc(day: date) -> datetime:
+    """The backtest's entry checkpoint on a Monday, in UTC."""
+    return backtester._checkpoint_datetime(day).astimezone(UTC)
+
+
+def _qualifying_mondays(entry) -> list[date]:
+    """Every qualifying Monday of a _find_entry result, earliest first; [] for None."""
+    return [] if entry is None else [m["entry_date"] for m in backtester._entry_mondays(entry)]
+
+
+class TestFindEntrySkipClosing:
+    """"Skip if closing within" in _find_entry (min_days_to_close): a Monday
+    whose checkpoint (Monday 09:00 Los Angeles, 17:00 UTC in winter) falls
+    less than that many 24-hour spans before either leg's close is skipped,
+    and only that Monday. Each leg is judged on its carried scheduled close,
+    else the start (00:00 UTC) of the last day its wording includes, never
+    the close Kalshi recorded.
+
+    The pair is a 13-day cross-event pair, "by February 1" and "by February
+    14", priced to qualify on every Monday from Jan 5 (one candle, which
+    stands for every later Monday). Without the rule it qualifies on Jan 5,
+    12, 19 and 26; Jan 26 17:00 UTC is 5 days 7 hours before Feb 1 00:00 UTC."""
+
+    _START = date(2026, 1, 1)
+    _ALL = [date(2026, 1, 5), date(2026, 1, 12), date(2026, 1, 19), date(2026, 1, 26)]
+
+    @staticmethod
+    def _pair(a_deadline: date = date(2026, 2, 1), a_close: str | None = None,
+              a_title: str | None = None) -> tuple[dict, dict]:
+        return (_skip_market("EARLY", "E1", a_deadline, a_close, a_title),
+                _skip_market("LATE", "E2", date(2026, 2, 14)))
+
+    @staticmethod
+    def _scan(mA, mB, start=_START, prices=((0.20, 0.80), (0.60, 0.40)), **kw):
+        (a_yes, a_no), (b_yes, b_no) = prices
+        return _find_entry([_candle(_MONDAY_TS, a_yes, a_no)], [_candle(_MONDAY_TS, b_yes, b_no)],
+                           mA, mB, "time_series", start, **kw)
+
+    def test_the_last_monday_inside_the_days_is_skipped_and_an_earlier_one_enters(self):
+        mA, mB = self._pair()
+        assert _qualifying_mondays(self._scan(mA, mB)) == self._ALL
+        entry = self._scan(mA, mB, min_days_to_close=7)
+        # The first Monday still enters, and the later list keeps the
+        # Mondays the rule lets through
+        assert entry["entry_date"] == date(2026, 1, 5)
+        assert _qualifying_mondays(entry) == self._ALL[:3]
+        # A window whose only Monday is Jan 26 enters nothing ...
+        assert self._scan(mA, mB, start=date(2026, 1, 20), min_days_to_close=7) is None
+        # ... and one from Jan 13 enters on Jan 19 alone: Jan 26 is skipped,
+        # not taken for the end of the scan
+        assert _qualifying_mondays(self._scan(mA, mB, start=date(2026, 1, 13),
+                                              min_days_to_close=7)) == [date(2026, 1, 19)]
+        # 14 days also skips Jan 19 (12 days 7 hours before); 3 days skips none
+        assert _qualifying_mondays(self._scan(mA, mB, min_days_to_close=14)) == self._ALL[:2]
+        assert _qualifying_mondays(self._scan(mA, mB, min_days_to_close=3)) == self._ALL
+
+    @pytest.mark.parametrize("days", [3, 7, 14])
+    def test_exactly_the_minimum_enters_and_one_second_less_does_not(self, days):
+        # A scheduled close carried on the earlier leg puts its close on the
+        # second: exactly `days` 24-hour spans after Jan 26's checkpoint
+        # enters Jan 26, one second less skips it
+        at = _checkpoint_utc(date(2026, 1, 26)) + timedelta(days=days)
+        for epoch, enters in ((int(at.timestamp()), True), (int(at.timestamp()) - 1, False)):
+            mA, mB = self._pair()
+            mA[backtester._SCHEDULED_CLOSE_KEY] = epoch
+            mondays = _qualifying_mondays(self._scan(mA, mB, min_days_to_close=days))
+            assert (date(2026, 1, 26) in mondays) is enters, (days, enters)
+            # Every earlier Monday is further from the close, so it enters either way
+            assert mondays[:3] == self._ALL[:3]
+
+    def test_a_carried_schedule_decides_over_the_wording_date(self):
+        # Later than the wording: worded "by February 1" (Jan 26 fails at 7
+        # days), scheduled Feb 10, so Jan 26 enters
+        mA, mB = self._pair()
+        _with_scheduled(mA, "2026-02-10T00:00:00+00:00")
+        assert _qualifying_mondays(self._scan(mA, mB, min_days_to_close=7)) == self._ALL
+        # Earlier than the wording, and equal to the recorded close: worded
+        # "by February 5" (Jan 26 passes at 7 days on the wording alone) and
+        # scheduled at its recorded close, Feb 1, so Jan 26 is skipped
+        mA, mB = self._pair(a_deadline=date(2026, 2, 5), a_close="2026-02-01T00:00:00+00:00")
+        assert _qualifying_mondays(self._scan(mA, mB, min_days_to_close=7)) == self._ALL
+        _with_scheduled(mA, "2026-02-01T00:00:00+00:00")
+        assert _qualifying_mondays(self._scan(mA, mB, min_days_to_close=7)) == self._ALL[:3]
+
+    @pytest.mark.parametrize("recorded", [
+        "2026-01-28T00:00:00+00:00",   # closed early: its event happened before the deadline
+        "2026-02-01T00:00:00+00:00",   # on its deadline
+        "2026-02-10T00:00:00+00:00",   # days after it
+        "2026-01-28T00:00:00",         # early, written with no time zone (a hand-edited cache)
+    ])
+    def test_a_market_that_closed_early_is_judged_on_its_wording(self, recorded):
+        # The recorded close moves the scan window (and with it which Mondays
+        # the scan sees) but never the rule's verdict: worded "by February 1",
+        # Jan 26 is skipped at 7 days and kept at 3 whatever the recorded
+        # close. At 3 days a rule that read the recorded close Jan 28 would
+        # skip Jan 26 (Jan 29 17:00 UTC is after it)
+        mA, mB = self._pair(a_close=recorded)
+        assert _qualifying_mondays(self._scan(mA, mB, min_days_to_close=7)) == self._ALL[:3]
+        assert _qualifying_mondays(self._scan(mA, mB, min_days_to_close=3)) == self._ALL
+        if recorded.startswith("2026-02-10"):
+            # Not vacuous: that window reaches Feb 2 and Feb 9, which qualify
+            # without the rule and come after the wording's deadline
+            assert _qualifying_mondays(self._scan(mA, mB))[-2:] == [date(2026, 2, 2),
+                                                                     date(2026, 2, 9)]
+
+    @pytest.mark.parametrize("recorded", ["2026-01-28T00:00:00+00:00",
+                                          "2026-02-01T00:00:00+00:00",
+                                          "2026-02-10T00:00:00+00:00"])
+    def test_no_schedule_and_no_readable_wording_date_is_never_bought(self, recorded):
+        # Worded with no date at all: its close cannot be read, so no Monday
+        # passes, whatever it recorded and whatever the minimum
+        mA, mB = self._pair(a_close=recorded, a_title="Will it happen?")
+        assert backtester._buy_rule_close(mA) is None
+        assert self._scan(mA, mB) is not None
+        for days in (3, 7, 14):
+            assert self._scan(mA, mB, min_days_to_close=days) is None, days
+        # A carried schedule is enough on its own (Feb 10: still before the
+        # later leg's Feb 14, so the legs keep their order)
+        _with_scheduled(mA, "2026-02-10T00:00:00+00:00")
+        assert self._scan(mA, mB, min_days_to_close=7) is not None
+
+    def test_for_a_ladder_the_earlier_close_decides(self):
+        # Two rungs of one event that close at one instant (Mar 20), ordered
+        # on their stated deadlines (DR-73). The earlier rung's wording, "by
+        # March 1", decides: from Feb 23 on (Feb 23 17:00 UTC + 7 days is
+        # after Mar 1 00:00 UTC) every Monday is skipped, though the scan,
+        # on the recorded close, runs to Mar 19. The later rung's "by March
+        # 20" alone would keep every Monday to Mar 9.
+        early = {"ticker": "RUNG-EARLY", "event_ticker": "KXSTARSHIP-14", "event_title": "",
+                 "title": "Will SpaceX launch another Starship by March 1, 2026?",
+                 "subtitle": "", "close_time": "2026-03-20T00:00:00+00:00"}
+        late = dict(early, ticker="RUNG-LATE",
+                    title="Will SpaceX launch another Starship by March 20, 2026?")
+        candles_early = [_candle(_MONDAY_TS, 0.20, 0.80), _candle(_MONDAY2_TS, 0.20, 0.80)]
+        candles_late = [_candle(_MONDAY_TS, 0.45, 0.55), _candle(_MONDAY2_TS, 0.60, 0.40)]
+
+        def scan(first_late: bool, **kw):
+            legs = ((candles_late, candles_early, late, early) if first_late
+                    else (candles_early, candles_late, early, late))
+            return _find_entry(*legs, "time_series", self._START, same_event_ladders=True,
+                               **kw)
+
+        mondays = [date(2026, 1, 12) + timedelta(weeks=w) for w in range(10)]
+        assert _qualifying_mondays(scan(True)) == mondays     # Jan 12 .. Mar 16
+        for first_late in (True, False):
+            entry = scan(first_late, min_days_to_close=7)
+            assert entry["mA"] is early
+            assert _qualifying_mondays(entry) == mondays[:6], first_late   # .. Feb 16
+        # The later rung's own close would let Mar 9 through: it is not the one deciding
+        assert backtester._buy_rule_close(late) == datetime(2026, 3, 20, tzinfo=UTC)
+        assert backtester._buy_rule_close(early) == datetime(2026, 3, 1, tzinfo=UTC)
+
+    def test_the_leg_ordered_second_decides_when_its_close_is_the_earlier(self):
+        # Both legs must pass, so the earlier close decides even when it is
+        # the leg the scan orders second. With no schedule carried, a
+        # cross-event pair is ordered on the closes Kalshi recorded, but the
+        # rule reads each leg's wording, so the two can disagree. The "by
+        # March 31" market closed early, on Jan 30 (its event happened), so it
+        # is ordered first; the "by February 1" market recorded closing Feb
+        # 14, so it is ordered second, yet its wording's Feb 1 is the earlier
+        # of the rule's two closes. Jan 26 17:00 UTC is 5 days 7 hours before
+        # Feb 1 00:00 UTC, so at 7 days Jan 26 is skipped; a rule that judged
+        # the first leg alone (Mar 31) would keep it
+        march = _skip_market("MARCH-31", "E1", date(2026, 3, 31),
+                             close="2026-01-30T00:00:00+00:00")
+        february = _skip_market("FEB-1", "E2", date(2026, 2, 1),
+                                close="2026-02-14T00:00:00+00:00")
+        assert backtester._buy_rule_close(february) < backtester._buy_rule_close(march)
+        cheap, dear = [_candle(_MONDAY_TS, 0.20, 0.80)], [_candle(_MONDAY_TS, 0.60, 0.40)]
+        for legs in ((cheap, dear, march, february), (dear, cheap, february, march)):
+            # Off, every Monday to Jan 26 (the scan ends Jan 29, the day
+            # before the first leg's recorded close) qualifies
+            off = _find_entry(*legs, "time_series", self._START)
+            assert off["mA"] is march and off["mB"] is february
+            assert _qualifying_mondays(off) == self._ALL
+            on = _find_entry(*legs, "time_series", self._START, min_days_to_close=7)
+            assert on["mA"] is march
+            assert _qualifying_mondays(on) == self._ALL[:3]
+            # At 3 days Jan 26 passes (Jan 29 17:00 UTC is before Feb 1)
+            assert _qualifying_mondays(_find_entry(*legs, "time_series", self._START,
+                                                   min_days_to_close=3)) == self._ALL
+
+    @pytest.mark.parametrize("monday, hour", [(date(2026, 3, 2), 17), (date(2026, 3, 9), 16)])
+    def test_a_checkpoint_across_a_clock_change_is_still_24_hour_days(self, monday, hour):
+        # The US clocks change on Mar 8, 2026: the checkpoint is Monday 09:00
+        # Los Angeles, 17:00 UTC on Mar 2 and 16:00 UTC on Mar 9. A week is
+        # 168 hours from the checkpoint either way: Mar 2's 7 days end on Mar
+        # 9 at 17:00 UTC (10:00 in Los Angeles), not at 09:00 local
+        checkpoint = _checkpoint_utc(monday)
+        assert checkpoint.hour == hour
+        at = checkpoint + timedelta(days=7)
+        assert at - checkpoint == timedelta(hours=168)
+        for epoch, enters in ((int(at.timestamp()), True), (int(at.timestamp()) - 1, False)):
+            # The earlier leg's recorded close is the day after the Monday,
+            # so the Monday is the last its scan reaches; its schedule is
+            # later still (its event happened early)
+            mA = _skip_market("EARLY", "E1", monday + timedelta(days=1))
+            mA[backtester._SCHEDULED_CLOSE_KEY] = epoch
+            mB = _skip_market("LATE", "E2", date(2026, 3, 31))
+            entry = _find_entry([_candle(_MONDAY_TS, 0.20, 0.80)],
+                                [_candle(_MONDAY_TS, 0.60, 0.40)], mA, mB, "time_series",
+                                monday, min_days_to_close=7)
+            assert (entry is not None) is enters, (monday, enters)
+            if enters:
+                assert entry["entry_date"] == monday
+
+    def test_off_changes_nothing(self):
+        cases = [self._pair(), self._pair(a_title="Will it happen?"),
+                 self._pair(a_close="2026-02-10T00:00:00+00:00")]
+        for mA, mB in cases:
+            tally = backtester._CloseRuleTally()
+            plain = self._scan(mA, mB)
+            assert self._scan(mA, mB, min_days_to_close=None, _skips=tally) == plain
+            assert plain is not None
+            # Nothing is counted with the rule off
+            assert tally == backtester._CloseRuleTally()
+
+    def test_the_tally_counts_what_the_rule_removed(self):
+        def tally_of(mA, mB, **kw) -> tuple:
+            tally = backtester._CloseRuleTally()
+            with_tally = self._scan(mA, mB, _skips=tally, **kw)
+            # Counting never changes the result
+            assert with_tally == self._scan(mA, mB, **kw)
+            return (tally.mondays, tally.mondays_on_wording, tally.pairs,
+                    tally.pairs_unreadable)
+
+        # One Monday removed, judged on the wording; the pair still entered
+        assert tally_of(*self._pair(), min_days_to_close=7) == (1, 1, 0, 0)
+        # Its only Monday removed: the rule alone kept the pair out
+        assert tally_of(*self._pair(), start=date(2026, 1, 20),
+                        min_days_to_close=7) == (1, 1, 1, 0)
+        # Judged on a carried schedule, not the wording
+        mA, mB = self._pair(a_deadline=date(2026, 2, 5), a_close="2026-02-01T00:00:00+00:00")
+        _with_scheduled(mA, "2026-02-01T00:00:00+00:00")
+        assert tally_of(mA, mB, min_days_to_close=7) == (1, 0, 0, 0)
+        # Both legs fail on Jan 26. Counted "on wording" only when every leg
+        # that failed was judged on its wording: one on a schedule and one on
+        # its wording is not, either way round; both on their wording is
+        worded_a, scheduled_b = self._pair()
+        _with_scheduled(scheduled_b, "2026-02-02T00:00:00+00:00")
+        scheduled_a, _late = self._pair()
+        _with_scheduled(scheduled_a, "2026-02-01T00:00:00+00:00")
+        worded_b = _skip_market("LATE", "E2", date(2026, 2, 2),
+                                close="2026-02-14T00:00:00+00:00")
+        assert tally_of(worded_a, scheduled_b, min_days_to_close=7) == (1, 0, 0, 0)
+        assert tally_of(scheduled_a, worded_b, min_days_to_close=7) == (1, 0, 0, 0)
+        assert tally_of(self._pair()[0], worded_b, min_days_to_close=7) == (1, 1, 0, 0)
+        # Not vacuous: in each case both legs fail Jan 26's checkpoint
+        moment = _checkpoint_utc(date(2026, 1, 26))
+        for leg in (worded_a, scheduled_b, scheduled_a, worded_b):
+            assert not config.closes_far_enough((backtester._buy_rule_close(leg),), moment, 7)
+        # No readable close: every qualifying Monday removed, and counted apart
+        assert tally_of(*self._pair(a_title="Will it happen?"),
+                        min_days_to_close=7) == (4, 0, 1, 1)
+        # A Monday refused by another check first is never counted: a price
+        # that fails the tier on every Monday leaves nothing to remove
+        assert tally_of(*self._pair(), prices=((0.20, 0.80), (0.25, 0.75)),
+                        min_days_to_close=7) == (0, 0, 0, 0)
+
+
+class TestLiveBacktestSkipClosingParity:
+    """For markets whose scheduled close is carried (the close a live run
+    reads), the live filter (scanner.filter_markets_closing_far_enough, the
+    run looking at the checkpoint) and _find_entry give the same verdict on
+    a pair whose earlier close sits a few seconds either side of the
+    minimum, at each of the menu's days."""
+
+    @pytest.mark.parametrize("days", [3, 7, 14])
+    def test_the_live_filter_and_the_backtest_agree(self, days, caplog):
+        monday = date(2026, 1, 26)
+        checkpoint = _checkpoint_utc(monday)
+        settings = dc_replace(config.LIVE_DEFAULTS_SEED, buy_min_days_to_close=days)
+        verdicts = set()
+        for seconds in (-5, -1, 0, 1, 5):
+            close_a = checkpoint + timedelta(days=days, seconds=seconds)
+            close_b = close_a + timedelta(days=10)
+            # Live: the run looks at the checkpoint and keeps the markets that pass
+            live = [SimpleNamespace(ticker="A", close_time=close_a),
+                    SimpleNamespace(ticker="B", close_time=close_b)]
+            with caplog.at_level(logging.INFO):
+                kept = scanner.filter_markets_closing_far_enough(live, settings, now=checkpoint)
+            live_buys = len(kept) == 2
+            # Backtest: the same closes, carried as scheduled closes, and a
+            # window whose only Monday is that checkpoint's
+            mA = {"ticker": "A", "event_ticker": "EA", "title": "Q", "subtitle": "",
+                  "close_time": "2026-01-27T00:00:00+00:00",
+                  backtester._SCHEDULED_CLOSE_KEY: int(close_a.timestamp())}
+            mB = {"ticker": "B", "event_ticker": "EB", "title": "Q", "subtitle": "",
+                  "close_time": "2026-03-20T00:00:00+00:00",
+                  backtester._SCHEDULED_CLOSE_KEY: int(close_b.timestamp())}
+            entry = _find_entry([_candle(_MONDAY_TS, 0.30, 0.70)],
+                                [_candle(_MONDAY_TS, 0.60, 0.40)], mA, mB, "time_series",
+                                monday, min_days_to_close=days)
+            backtest_buys = entry is not None
+            assert live_buys is backtest_buys is (seconds >= 0), (days, seconds)
+            verdicts.add(live_buys)
+        # Not vacuous: both verdicts were seen
+        assert verdicts == {True, False}
+
+
 # Time-series fixture shared by the end-to-end profit test and the sizing-parity
 # tests. SA (earlier deadline, February 1) and SB (later deadline, February 14)
 # are worded as two cumulative "by <date>" deadlines of one question, on two
@@ -8107,9 +8416,23 @@ class TestPrepareEntriesGolden:
 _MONDAY3_TS = _MONDAY2_TS + 7 * 86_400
 
 
-def _random_find_entry_cases(seed: int, count: int) -> list[tuple]:
+def _random_find_entry_cases(seed: int, count: int, *,
+                             skip_closing: bool = False) -> list[tuple]:
     """Seeded random pairs for the restarted-scan check, each (candles_a,
     candles_b, mA, mB, pair_type, start_date, kwargs).
+
+    With skip_closing, every case also carries a "Skip if closing within"
+    minimum (min_days_to_close, 3, 7 or 14) and gives each leg a close for
+    it: a scheduled close, a dated wording, or neither (never bought), each
+    drawn from a second generator, so every other draw is the case without
+    them. A scheduled or worded close sits 21 days before to 21 days after
+    the recorded one, drawn for each leg, so either leg's can be the
+    earlier; where both legs carry a schedule they share one shift, so the
+    legs' order and gap stay those of the plain case there. Each such case
+    then has an eighth element: the close the rule should judge each of its
+    two markets on, in the case's order (the schedule, or 00:00 UTC of the
+    worded day, or None), known from how the leg was built rather than read
+    back through the code under test.
 
     Each Monday of a pair's window is drawn at random as either qualifying
     prices or prices built, from the pair's own threshold and band ceiling,
@@ -8126,6 +8449,8 @@ def _random_find_entry_cases(seed: int, count: int) -> list[tuple]:
     cents (a dead quote is in half cents)."""
     rng = random.Random(seed)
     ri = rng.randint
+    # The "Skip if closing within" draws, apart from every other draw
+    rule_rng = random.Random(f"{seed}-skip-closing")
     cases: list[tuple] = []
 
     def ts_quotes(kind: str, tier: int, ceiling: int) -> list:
@@ -8214,10 +8539,36 @@ def _random_find_entry_cases(seed: int, count: int) -> list[tuple]:
                                          "yes_ask_close": ri(5, 95) / 100,
                                          "no_ask_close": ri(5, 95) / 100})
         start = date(2026, 1, 1) + timedelta(days=ri(0, 20) if rng.random() < 0.2 else 0)
-        if rng.random() < 0.5:
-            cases.append((candles[0], candles[1], mA, mB, "time_series", start, kw))
-        else:
-            cases.append((candles[1], candles[0], mB, mA, "time_series", start, kw))
+        # The close each leg's "Skip if closing within" should judge it on,
+        # known here from how the leg was built (ticker -> close, or None)
+        intended: dict[str, datetime | None] = {}
+        if skip_closing:
+            kw["min_days_to_close"] = rule_rng.choice((3, 7, 14))
+            # How each leg's close is read: both scheduled (shifted alike), both
+            # worded, one of each, or the earlier leg unreadable
+            way = rule_rng.choice(("scheduled", "worded", "worded", "mixed", "unreadable"))
+            # Each leg's judged close sits 21 days before to 21 days after its
+            # recorded one, drawn for each leg; two schedules share one shift
+            shifts = [timedelta(days=rule_rng.randint(-21, 21), hours=rule_rng.randint(0, 23))
+                      for _leg in range(2)]
+            if way == "scheduled":
+                shifts[1] = shifts[0]
+            for leg, close, shift in ((mA, close_a, shifts[0]), (mB, close_b, shifts[1])):
+                if way == "scheduled" or (way == "mixed" and leg is mB):
+                    leg[backtester._SCHEDULED_CLOSE_KEY] = int((close + shift).timestamp())
+                    intended[leg["ticker"]] = close + shift
+                elif way != "unreadable" or leg is mB:
+                    day = (close + shift).date()
+                    leg["title"] = f"Will it happen by {day:%B} {day.day}, {day.year}?"
+                    # The start (00:00 UTC) of the wording's last day
+                    intended[leg["ticker"]] = datetime(day.year, day.month, day.day, tzinfo=UTC)
+                else:
+                    intended[leg["ticker"]] = None
+        first, second = (mA, mB) if rng.random() < 0.5 else (mB, mA)
+        legs = (candles[0], candles[1]) if first is mA else (candles[1], candles[0])
+        case = (*legs, first, second, "time_series", start, kw)
+        cases.append(case + ((intended[first["ticker"]], intended[second["ticker"]]),)
+                     if skip_closing else case)
     return cases
 
 
@@ -8293,6 +8644,30 @@ class TestFindEntryRecordsEveryQualifyingMonday:
                 counts[("RUNG-EARLY", None, False)]) == (10, 11)
         assert counts[("FA", None, True)] == counts[("FA", None, False)] == 0
 
+    def test_later_is_the_restarted_scan_with_skip_closing_on_the_golden_pairs(
+            self, monkeypatch):
+        # The golden pairs at the default band, with "Skip if closing within"
+        # at each of its days: the rule is one more kind of skip, and the
+        # restarted scan still finds exactly what one pass records
+        c = TestBandSweepPhaseOneSubset._fresh(monkeypatch)
+        counts: dict = {}
+        for (mA, mB, _canon, _group_key), pair_type in c.all_pairs:
+            for days in (None, 3, 7, 14):
+                for tier_floors in (True, False):
+                    counts[(mA["ticker"], days, tier_floors)] = \
+                        self._assert_later_is_the_restarted_scan(
+                            c.candles_by_ticker[mA["ticker"]],
+                            c.candles_by_ticker[mB["ticker"]], mA, mB, pair_type,
+                            c.start_date, max_horizon_days=c.max_horizon_days,
+                            same_event_ladders=c.same_event_ladders,
+                            tier_floors=tier_floors, min_days_to_close=days)
+        # Not vacuous. EA/EB ("by February 1"): Jan 26 goes at 7 days, Jan 19
+        # too at 14. The ladder's earlier rung ("by March 1", both rungs
+        # recorded closing Mar 20): Feb 23 to Mar 16 go at 7 days
+        assert [counts[("EA", days, True)] for days in (None, 3, 7, 14)] == [4, 4, 3, 2]
+        assert [counts[("RUNG-EARLY", days, True)] for days in (None, 3, 7, 14)] == [
+            10, 7, 6, 5]
+
     def test_later_is_the_restarted_scan_on_random_pairs(self):
         # The same check over 300 seeded random time-series pairs whose
         # qualifying Mondays are mixed with Mondays each filter refuses, at
@@ -8318,6 +8693,48 @@ class TestFindEntryRecordsEveryQualifyingMonday:
         # pins, since random's integer draws are not promised to repeat
         # across Python versions
         assert entered >= 200 and multi >= 150 and stepped_past >= 100
+
+    def test_later_is_the_restarted_scan_with_skip_closing_on(self):
+        # The same random pairs, each with a "Skip if closing within" minimum
+        # as one more kind of skip: the restarted scan still finds exactly
+        # what one pass records, and what the rule keeps is the plain pass's
+        # Mondays that pass config.closes_far_enough, at their checkpoints, on
+        # the closes each leg was built to be judged on (the generator's, not
+        # _buy_rule_close's reading of them), nothing else
+        removed = kept_some = lost = second_decided = 0
+        for case in _random_find_entry_cases(20260927, 300, skip_closing=True):
+            candles_a, candles_b, mA, mB, pair_type, start, kw, closes = case
+            self._assert_later_is_the_restarted_scan(candles_a, candles_b, mA, mB, pair_type,
+                                                    start, **kw)
+            days = kw["min_days_to_close"]
+            plain_kw = {k: v for k, v in kw.items() if k != "min_days_to_close"}
+            plain = _find_entry(candles_a, candles_b, mA, mB, pair_type, start, **plain_kw)
+            ruled = _find_entry(candles_a, candles_b, mA, mB, pair_type, start, **kw)
+            plain_mondays = [] if plain is None else list(backtester._entry_mondays(plain))
+            wanted = [m for m in plain_mondays if config.closes_far_enough(
+                closes, backtester._checkpoint_datetime(m["entry_date"]), days)]
+            got = [] if ruled is None else list(backtester._entry_mondays(ruled))
+            values = [k for k in self._KEYS if k not in ("mA", "mB")]
+            assert ([{k: m[k] for k in values} for m in got]
+                    == [{k: m[k] for k in values} for m in wanted])
+            removed += len(plain_mondays) - len(got)
+            kept_some += bool(got) and len(got) < len(plain_mondays)
+            lost += bool(plain_mondays) and not got
+            if plain is not None:
+                # A Monday the leg the scan ordered first passes on its own
+                # and the leg ordered second fails: only the second decides it
+                close_of = dict(zip((id(mA), id(mB)), closes, strict=True))
+                first, second = close_of[id(plain["mA"])], close_of[id(plain["mB"])]
+                second_decided += any(
+                    config.closes_far_enough((first,), at, days)
+                    and not config.closes_far_enough((second,), at, days)
+                    for at in (backtester._checkpoint_datetime(m["entry_date"])
+                               for m in plain_mondays))
+        # Not vacuous: the rule removed Mondays, trimmed some pairs' lists
+        # and kept others out entirely, and in some pairs the leg ordered
+        # second alone decided a Monday. This seed gives 296, 68, 72 and 4
+        # (bounds, as above)
+        assert removed >= 100 and kept_some >= 20 and lost >= 20 and second_decided >= 2
 
     # Mondays 1 and 3 of the refusal cases below, ((A yes, A no), (B yes, B
     # no)): a 0.40 spread on legs pA 0.20 + nB 0.40 = 0.60, well clear of the
@@ -11438,12 +11855,22 @@ class TestEntriesForBand:
         # Risk 2 of the plan: a second copy of any of these could disagree
         # with the one extraction and the candle fetch used.
         params = inspect.signature(backtester._entries_for_band).parameters
-        assert list(params) == ["candidates", "spread_band", "tier_floors", "_pairs"]
+        assert list(params) == ["candidates", "spread_band", "tier_floors", "_pairs", "_skips",
+                                "_close_days"]
         assert params["tier_floors"].kind is inspect.Parameter.KEYWORD_ONLY
         # PB7's private subset of pairs to scan: keyword-only, defaulting to
         # the full candidates.all_pairs scan
         assert params["_pairs"].kind is inspect.Parameter.KEYWORD_ONLY
         assert params["_pairs"].default is None
+        # The private tally of what "Skip if closing within" removed, for the
+        # run log: keyword-only, counting nothing by default
+        assert params["_skips"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert params["_skips"].default is None
+        # The private "Skip if closing within" choice of one pass (the other
+        # choices' entries): keyword-only, and by default the run's own
+        # minimum, read from the candidates, applies
+        assert params["_close_days"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert params["_close_days"].default is None
 
     @pytest.mark.parametrize("ladders", [None, True, False])
     def test_find_entry_receives_the_candidates_own_inputs(self, monkeypatch, ladders):
@@ -11460,8 +11887,107 @@ class TestEntriesForBand:
         assert seen == [
             (["ca"], ["cb"], "time_series", date(2026, 3, 2),
              {"max_horizon_days": 21, "same_event_ladders": ladders,
-              "spread_band": (0.3, 0.6), "tier_floors": True})
+              "spread_band": (0.3, 0.6), "tier_floors": True,
+              "min_days_to_close": None, "_skips": None, "_closes": {}})
         ]
+
+    @pytest.mark.parametrize("days", [None, 3, 14])
+    def test_find_entry_receives_the_run_s_skip_closing_minimum_and_tally(self, monkeypatch,
+                                                                          days):
+        # "Skip if closing within": the minimum comes from the candidates (the
+        # run's one resolved value, None for off), the tally from the caller
+        seen: list = []
+
+        def _spy(ca, cb, mA, mB, pair_type, start_date, **kwargs):
+            seen.append((kwargs["min_days_to_close"], kwargs["_skips"]))
+            return None
+
+        monkeypatch.setattr(backtester, "_find_entry", _spy)
+        tally = backtester._CloseRuleTally()
+        backtester._entries_for_band(self._candidates(buy_min_days_to_close=days),
+                                     _skips=tally)
+        assert len(seen) == 1 and seen[0][0] == days and seen[0][1] is tally
+
+    @pytest.mark.parametrize("own", [None, 7])
+    @pytest.mark.parametrize("choice,applied", [(None, "own"), (0, None), (3, 3), (14, 14)])
+    def test_a_pass_s_own_choice_replaces_the_run_s_minimum(self, monkeypatch, own, choice,
+                                                            applied):
+        # _close_days names one "Skip if closing within" choice for this pass
+        # alone (0 is off, handed on as None); left out, the run's own
+        # minimum applies
+        seen: list = []
+
+        def _spy(ca, cb, mA, mB, pair_type, start_date, **kwargs):
+            seen.append(kwargs["min_days_to_close"])
+            return None
+
+        monkeypatch.setattr(backtester, "_find_entry", _spy)
+        candidates = self._candidates(buy_min_days_to_close=own)
+        if choice is None:
+            backtester._entries_for_band(candidates)
+        else:
+            backtester._entries_for_band(candidates, _close_days=choice)
+        assert seen == [own if applied == "own" else applied]
+        # The candidates themselves are never changed
+        assert candidates.buy_min_days_to_close == own
+
+    def test_each_market_s_close_is_worked_out_once_per_pass(self, monkeypatch):
+        # The golden pairs at 7 days, with RUNG-EARLY's market dict also in a
+        # second pair: every pair is scanned, yet each market's close for the
+        # rule is read once in a pass, and again (once) in the next pass
+        golden = TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        candidates = backtester._prepare_candidates(
+            MagicMock(), MagicMock(), golden._START, True, None, same_event_ladders=True,
+            buy_min_days_to_close=7)
+        markets = {m["ticker"]: m for (mA, mB, _c, _g), _t in candidates.all_pairs
+                   for m in (mA, mB)}
+        # A pair whose two market dicts are each in another pair too, 9 days
+        # apart, so its pass reaches the rule
+        shared = ((markets["EA"], markets["TB"], "c", "k"), "time_series")
+        candidates = dc_replace(candidates, all_pairs=[*candidates.all_pairs, shared])
+        real = backtester._buy_rule_close
+        reads: list = []
+
+        def counting(m):
+            reads.append(m["ticker"])
+            return real(m)
+
+        monkeypatch.setattr(backtester, "_buy_rule_close", counting)
+        direct = []
+        for (mA, mB, _c, _g), _t in candidates.all_pairs:
+            direct.append(backtester._find_entry(
+                candidates.candles_by_ticker.get(mA["ticker"], []),
+                candidates.candles_by_ticker.get(mB["ticker"], []), mA, mB, "time_series",
+                candidates.start_date, same_event_ladders=True, min_days_to_close=7))
+        reads.clear()
+        first = backtester._entries_for_band(candidates)
+        tickers = {m["ticker"] for (mA, mB, _c, _g), _t in candidates.all_pairs
+                   for m in (mA, mB)}
+        # Every market read, and none twice, though EA and TB are in two pairs
+        assert sorted(reads) == sorted(tickers)
+        reads.clear()
+        second = backtester._entries_for_band(candidates)
+        assert sorted(reads) == sorted(tickers)
+        # The verdicts are a direct call's, pair by pair, and the rule really
+        # removed Mondays here (not vacuous)
+        assert golden._rows(first) != golden._GOLDEN[True]
+        assert golden._rows(first) == golden._rows(second) == golden._rows(
+            [{"pair_type": "time_series", "canon": c, "group_key": g, "entry": e}
+             for ((_a, _b, c, g), _t), e in zip(candidates.all_pairs, direct, strict=True)
+             if e is not None])
+
+    def test_a_pass_with_the_rule_off_reads_no_close(self, monkeypatch):
+        golden = TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        candidates = backtester._prepare_candidates(
+            MagicMock(), MagicMock(), golden._START, True, None, same_event_ladders=True,
+            buy_min_days_to_close=7)
+        monkeypatch.setattr(backtester, "_buy_rule_close",
+                            lambda m: pytest.fail("no close is read with the rule off"))
+        # Off for this pass (the run's own is 7 days)
+        assert golden._rows(backtester._entries_for_band(candidates, _close_days=0)) == (
+            golden._GOLDEN[True])
 
     _REFUSED_LINE = ("Refused {n} candidate pair(s) that are not time-series pairs before "
                      "their entry pass (the backtest simulates time-series pairs only): ")
@@ -12694,8 +13220,9 @@ class TestBandSweepPhaseOneSubset:
                                           sweep=False, spread_band=(0.3, 0.6),
                                           band_sweep=False)
         # No pre-pass and no subset: one full time-series pass at the
-        # primary band
-        assert seen == [((0.3, 0.6), {})]
+        # primary band, handed no tally ("Skip if closing within" is off for
+        # the suite, so nothing is counted)
+        assert seen == [((0.3, 0.6), {"_skips": None})]
 
     def test_pairs_narrows_the_scan_and_keeps_its_order(self, monkeypatch):
         candidates = self._fresh(monkeypatch)
@@ -12896,6 +13423,641 @@ class TestBandSweepPhaseOneSubset:
         assert fog_bands(off) == _TIER_BOUND_BANDS
         assert fog_bands(on) == []
 
+    # ── "Skip if closing within": the other choices' entries (close_sweep) ──
+    # A fixture where the choices really differ. Every leg is worded "by
+    # <date>" with no scheduled close, so the rule reads 00:00 UTC of that
+    # day: each earlier leg reads 2026-02-01 00:00 UTC. The checkpoints
+    # (Monday 09:00 Los Angeles, 17:00 UTC) fall 26.3, 19.3, 12.3 and 5.3
+    # days before it on Jan 5, 12, 19 and 26. A pair has no quote before its
+    # first candle, so its first possible Monday is set by when it starts:
+    #   * ICE (as above, a 0-day gap at a 0.55 spread, from Jan 5): enters at
+    #     every choice, at the 30 bands whose ceiling is at least 0.60; its
+    #     later Mondays shrink as the minimum grows;
+    #   * DEW (a 9-day gap at a 0.20 spread, from Jan 26 only, 5.3 days
+    #     before its close): enters at off and 3 days, never at 7 or 14;
+    #   * MIST (an 11-day gap at a 0.25 spread, from Jan 19, 12.3 days
+    #     before): enters at off, 3 and 7 days, never at 14;
+    #   * FOG (a 19-day gap at a 0.25 spread, from Jan 19): the 0.30 tier
+    #     refuses it at every band, so it enters only with the tier floors
+    #     off, at off, 3 and 7 days.
+    _WEEK = 7 * 86_400
+
+    # Each market has an outcome (none of A=YES with B=NO), so the pairs
+    # trade when a simulation reads these entries
+    @staticmethod
+    def _close_markets() -> list[dict]:
+        def mk(ticker, event_ticker, event_title, title, result, close):
+            return {"ticker": ticker, "event_ticker": event_ticker,
+                    "event_title": event_title, "title": title, "subtitle": "",
+                    "result": result, "open_time": "2026-01-01T00:00:00+00:00",
+                    "close_time": close, "settlement_ts": close}
+        return [
+            mk("ICE-LATE", "ICEB-1", "ICE", "Ice forms by February 10, 2026", "no",
+               "2026-02-01T18:00:00+00:00"),
+            mk("ICE-EARLY", "ICEA-1", "ICE", "Ice forms by February 1, 2026", "no",
+               "2026-02-01T06:00:00+00:00"),
+            mk("DEW-A", "DEWA-1", "DEW", "Dew forms by February 1, 2026", "yes",
+               "2026-02-01T00:00:00+00:00"),
+            mk("DEW-B", "DEWB-1", "DEW", "Dew forms by February 10, 2026", "yes",
+               "2026-02-10T00:00:00+00:00"),
+            mk("MIST-A", "MISTA-1", "MIST", "Mist rises by February 1, 2026", "no",
+               "2026-02-01T00:00:00+00:00"),
+            mk("MIST-B", "MISTB-1", "MIST", "Mist rises by February 12, 2026", "yes",
+               "2026-02-12T00:00:00+00:00"),
+            mk("FOG-A", "FOGA-1", "FOG", "Fog lifts by February 1, 2026", "no",
+               "2026-02-01T00:00:00+00:00"),
+            mk("FOG-B", "FOGB-1", "FOG", "Fog lifts by February 20, 2026", "no",
+               "2026-02-20T00:00:00+00:00"),
+        ]
+
+    # Every quote's YES bid (1 - its NO ask) is its YES ask, so none is
+    # crossed and each pair passes the simulation's gate
+    _CLOSE_CANDLES = {
+        "ICE-EARLY": [_candle(_MONDAY_TS, 0.20, 0.80)],
+        "ICE-LATE": [_candle(_MONDAY_TS, 0.75, 0.25)],
+        # pA + nB = 0.80, exactly the sum ceiling of the 0.20 floor
+        "DEW-A": [_candle(_MONDAY_TS + 3 * _WEEK, 0.30, 0.70)],
+        "DEW-B": [_candle(_MONDAY_TS + 3 * _WEEK, 0.50, 0.50)],
+        # pA + nB = 0.75, exactly the sum ceiling of the 0.25 floor
+        "MIST-A": [_candle(_MONDAY_TS + 2 * _WEEK, 0.20, 0.80)],
+        "MIST-B": [_candle(_MONDAY_TS + 2 * _WEEK, 0.45, 0.55)],
+        "FOG-A": [_candle(_MONDAY_TS + 2 * _WEEK, 0.20, 0.80)],
+        "FOG-B": [_candle(_MONDAY_TS + 2 * _WEEK, 0.45, 0.55)],
+    }
+
+    def _close_candidates(self, monkeypatch, own: int, candles: dict | None = None):
+        """The fixture's candidates at the run's own choice (0: off), from
+        `candles` (ticker -> candles) instead of _CLOSE_CANDLES when given."""
+        markets = self._close_markets()
+        candles = self._CLOSE_CANDLES if candles is None else candles
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: markets)
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+        return backtester._prepare_candidates(
+            MagicMock(), MagicMock(), date(2026, 1, 1), True, None, same_event_ladders=True,
+            buy_min_days_to_close=own)
+
+    def _close_phase_one(self, monkeypatch, own: int, *, close_sweep: bool = True,
+                         band_sweep: bool = True, spread_band=None,
+                         log: list | None = None, candles: dict | None = None,
+                         level: int = logging.INFO) -> list:
+        """Phase 1 of a real sweep over the close fixture (one k, simulations
+        stubbed), the tier-off family on with the band sweep. Returns every
+        entry pass as (band, tier_floors, _pairs, _close_days, entries); the
+        sweep's own lines at `level` and above go into `log` when one is
+        given. `candles` replaces the fixture's (_close_candidates)."""
+        candidates = self._close_candidates(monkeypatch, own, candles)
+        real = backtester._entries_for_band
+        passes: list = []
+
+        def spy(c, spread_band=None, **kw):
+            out = real(c, spread_band, **kw)
+            passes.append((spread_band, kw.get("tier_floors", True), kw.get("_pairs"),
+                           kw.get("_close_days"), out))
+            return out
+
+        def fake_simulate(raw_entries, start_date, initial_balance, k=None,
+                          spread_band=None, population="all", *, tier_floors=True):
+            return backtester.SweepPoint(
+                k=backtester.TIME_SERIES_INTERVAL_PROB_DISCOUNT if k is None else k, trades=[],
+                equity_df=pd.DataFrame({"portfolio_value": [initial_balance]}),
+                spread_band=spread_band, population=population,
+                tier_floors=tier_floors is not False)
+
+        handler = _LogCapture()
+        handler.setLevel(level)
+        root = logging.getLogger()
+        old_level = root.level
+        root.addHandler(handler)
+        root.setLevel(level)
+        try:
+            with monkeypatch.context() as m:
+                m.setattr(backtester, "_entries_for_band", spy)
+                m.setattr(backtester, "_simulate_at_discount", fake_simulate)
+                m.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
+                backtester._sweep_from_candidates(
+                    candidates, 10_000.0, interval_discount=None, sweep=False,
+                    spread_band=spread_band, band_sweep=band_sweep,
+                    tier_off_sweep=band_sweep, close_sweep=close_sweep)
+        finally:
+            root.removeHandler(handler)
+            root.setLevel(old_level)
+        if log is not None:
+            log.extend(handler.messages)
+        return passes
+
+    @staticmethod
+    def _by_choice(passes) -> dict:
+        """(tier_floors, choice) -> band -> entries, from the passes that
+        named a choice of their own (the run's own passes name none)."""
+        maps: dict = {}
+        for band, tier_floors, _pairs, days, out in passes:
+            if days is not None:
+                maps.setdefault((tier_floors, days), {})[band] = out
+        return maps
+
+    @staticmethod
+    def _entered(entries) -> list:
+        return [r["entry"]["mA"]["ticker"].split("-")[0] for r in entries]
+
+    def test_the_other_choices_are_the_menu_s_less_the_run_s_own(self, monkeypatch):
+        # Keyed by the menu's own values, 0 for off, ascending
+        assert backtester._resolve_close_choices(7) == (0, 3, 14)
+        assert backtester._resolve_close_choices(None) == (3, 7, 14)
+        assert backtester._resolve_close_choices(14) == (0, 3, 7)
+        # Read when called, from this module's own binding: config's is not it
+        with monkeypatch.context() as mp:
+            mp.setattr(backtester, "BUY_MIN_DAYS_TO_CLOSE_CHOICES", (14, 0, 21, 3))
+            mp.setattr(config, "BUY_MIN_DAYS_TO_CLOSE_CHOICES", (0, 5))
+            assert backtester._resolve_close_choices(3) == (0, 14, 21)
+            # A menu with no other choice leaves nothing to find
+            mp.setattr(backtester, "BUY_MIN_DAYS_TO_CLOSE_CHOICES", (7,))
+            assert backtester._resolve_close_choices(7) == ()
+        for bad, words in (((0, 3, True), "whole number of days"),
+                           ((0, 7.0), "whole number of days"),
+                           ((0, np.int64(7)), "whole number of days"),
+                           ((0, "7"), "whole number of days"),
+                           ((0, -3, 7), "whole number of days"),
+                           ((0, 7, 7), "names a value twice"),
+                           ([0, 7], "must be a tuple"), (7, "must be a tuple")):
+            with monkeypatch.context() as mp:
+                mp.setattr(backtester, "BUY_MIN_DAYS_TO_CLOSE_CHOICES", bad)
+                with pytest.raises(ValueError, match=words):
+                    backtester._resolve_close_choices(None)
+
+    def test_a_bad_choice_stops_the_sweep_before_any_entry_pass(self, monkeypatch):
+        candidates = self._close_candidates(monkeypatch, 7)
+        monkeypatch.setattr(backtester, "BUY_MIN_DAYS_TO_CLOSE_CHOICES", (0, 7.0))
+        monkeypatch.setattr(backtester, "_entries_for_band",
+                            lambda *a, **k: pytest.fail("an entry pass ran"))
+        with pytest.raises(ValueError, match="BUY_MIN_DAYS_TO_CLOSE_CHOICES"):
+            backtester._sweep_from_candidates(
+                candidates, 10_000.0, interval_discount=None, sweep=False, spread_band=None,
+                band_sweep=True, tier_off_sweep=True, close_sweep=True)
+
+    @pytest.mark.parametrize("own,others", [(7, (0, 3, 14)), (0, (3, 7, 14))])
+    def test_every_choice_s_entries_equal_a_full_scan_at_that_choice(self, monkeypatch, own,
+                                                                       others):
+        passes = self._close_phase_one(monkeypatch, own)
+        maps = self._by_choice(passes)
+        # Every other choice, at every band tier floors on and every binding
+        # band tier floors off; never the run's own choice
+        assert sorted(maps) == sorted([(True, d) for d in others] + [(False, d) for d in others])
+        rows = TestPrepareEntriesGolden._rows
+        real = backtester._entries_for_band
+        for (tier_floors, days), by_band in maps.items():
+            assert sorted(by_band) == (_GRID_BANDS if tier_floors else _TIER_BOUND_BANDS)
+            # A run whose own choice IS this one, scanning every pair at
+            # every band: what the choice's entries must equal
+            direct = self._close_candidates(monkeypatch, days)
+            for band, out in by_band.items():
+                full = real(direct, band, tier_floors=tier_floors)
+                assert rows(out) == rows(full), (tier_floors, days, band)
+        # Not vacuous: the choices really enter different pairs, and ICE's
+        # later Mondays shrink as the minimum grows
+        no_band = (0.0, 1.0)
+        everything = {**maps, **{(tf, own): {no_band: real(self._close_candidates(
+            monkeypatch, own), no_band, tier_floors=tf)} for tf in (True, False)}}
+        assert self._entered(everything[(True, 0)][no_band]) == ["ICE", "DEW", "MIST"]
+        assert self._entered(everything[(True, 3)][no_band]) == ["ICE", "DEW", "MIST"]
+        assert self._entered(everything[(True, 7)][no_band]) == ["ICE", "MIST"]
+        assert self._entered(everything[(True, 14)][no_band]) == ["ICE"]
+        assert self._entered(everything[(False, 7)][no_band]) == ["ICE", "MIST", "FOG"]
+        assert self._entered(everything[(False, 14)][no_band]) == ["ICE"]
+        later = {d: len(everything[(True, d)][no_band][0]["entry"]["later"])
+                 for d in (0, 3, 7, 14)}
+        assert later == {0: 3, 3: 3, 7: 2, 14: 1}
+
+    @pytest.mark.parametrize("own", [7, 0])
+    def test_each_setting_scans_every_pair_once_with_no_minimum(self, monkeypatch, own):
+        passes = self._close_phase_one(monkeypatch, own)
+        full = [(band, tf, days) for band, tf, pairs, days, _out in passes if pairs is None]
+        if own:
+            # The run's own pre-passes, then ONE no-minimum scan per setting
+            assert full == [((0.0, 1.0), True, None), ((0.0, 1.0), False, None),
+                            ((0.0, 1.0), True, 0), ((0.0, 1.0), False, 0)]
+        else:
+            # The run's own pre-passes had no minimum: they serve, no extra scan
+            assert full == [((0.0, 1.0), True, None), ((0.0, 1.0), False, None)]
+        # Every choice's rescan carries exactly the pairs that entered with no
+        # minimum at that setting: ICE, DEW and MIST, and FOG too tiers off
+        for band, tf, pairs, days, _out in passes:
+            if days is not None and pairs is not None:
+                tickers = sorted(item[0][0]["ticker"].split("-")[0] for item in pairs)
+                assert tickers == (["DEW", "ICE", "MIST"] if tf
+                                   else ["DEW", "FOG", "ICE", "MIST"]), (band, tf, days)
+        # The off choice at the no-band band is the no-minimum scan itself,
+        # never a second pass
+        assert not [p for p in passes if p[3] == 0 and p[0] == (0.0, 1.0)
+                    and p[2] is not None]
+
+    def test_a_single_band_run_scans_every_pair_once_per_choice(self, monkeypatch):
+        passes = self._close_phase_one(monkeypatch, 7, band_sweep=False, spread_band=(0.2, 1.0))
+        # The run's own pass, then one full pass per other choice, all at the
+        # one band, tier floors on
+        assert [(band, tf, pairs, days) for band, tf, pairs, days, _out in passes] == [
+            ((0.2, 1.0), True, None, None), ((0.2, 1.0), True, None, 0),
+            ((0.2, 1.0), True, None, 3), ((0.2, 1.0), True, None, 14)]
+        rows = TestPrepareEntriesGolden._rows
+        for band, _tf, _pairs, days, out in passes[1:]:
+            direct = backtester._entries_for_band(self._close_candidates(monkeypatch, days),
+                                                  band)
+            assert rows(out) == rows(direct), days
+        # Not vacuous: DEW enters at off and 3 days only
+        assert [self._entered(out) for *_rest, out in passes[1:]] == [
+            ["ICE", "DEW", "MIST"], ["ICE", "DEW", "MIST"], ["ICE"]]
+
+    @pytest.mark.parametrize("own", [7, 0])
+    def test_every_choice_s_records_carry_the_run_s_own_quotes(self, monkeypatch, own):
+        passes = self._close_phase_one(monkeypatch, own)
+        own_quotes: dict = {}
+        choice_quotes: dict = {}
+        for _band, _tf, _pairs, days, out in passes:
+            for rec in out:
+                # Every record of every pass got its quotes in the one call
+                assert set(rec["leg_quotes"]) == {rec["entry"]["mA"]["ticker"],
+                                                  rec["entry"]["mB"]["ticker"]}
+                into = own_quotes if days is None else choice_quotes
+                for ticker, quotes in rec["leg_quotes"].items():
+                    into.setdefault(ticker, set()).add(id(quotes))
+        # One LegQuotes per market, shared by the run's own records and every
+        # choice's (DEW enters only at a choice here when the run's own is 7)
+        assert all(len(ids) == 1 for ids in (*own_quotes.values(), *choice_quotes.values()))
+        for ticker in own_quotes.keys() & choice_quotes.keys():
+            assert own_quotes[ticker] == choice_quotes[ticker], ticker
+        assert choice_quotes.keys() >= {"ICE-EARLY", "ICE-LATE", "DEW-A", "DEW-B",
+                                        "MIST-A", "MIST-B"}
+
+    @pytest.mark.parametrize("own", [7, 0])
+    def test_with_the_switch_off_phase_one_runs_exactly_the_run_s_own_passes(
+            self, monkeypatch, own):
+        rows = TestPrepareEntriesGolden._rows
+
+        def shape(passes):
+            return [(band, tf, None if pairs is None else [i[0][0]["ticker"] for i in pairs],
+                     days, rows(out)) for band, tf, pairs, days, out in passes]
+
+        def other_choices(messages):
+            return [m for m in messages if m.startswith("Other \"Skip if closing within\"")]
+
+        off_messages: list = []
+        off = self._close_phase_one(monkeypatch, own, close_sweep=False, log=off_messages)
+        on_messages: list = []
+        on = self._close_phase_one(monkeypatch, own, log=on_messages)
+        # Off: no pass names a choice, and no line names the other choices
+        assert all(days is None for *_rest, days, _out in off)
+        assert other_choices(off_messages) == []
+        # On: the run's own passes come first and are exactly the same, and
+        # every line but the other choices' is the same, in the same order
+        assert shape(on[:len(off)]) == shape(off)
+        assert all(days is not None for *_rest, days, _out in on[len(off):])
+        assert [m for m in on_messages if m not in other_choices(on_messages)] == off_messages
+        # Two lines per extra scan (none when the run's own choice is off),
+        # then one per choice and setting, then the family's one summary line
+        assert len(other_choices(on_messages)) == (2 * 2 if own else 0) + 3 * 2 + 1
+        assert "Other \"Skip if closing within\" choices: 14 days: 30 entries over 36 " \
+               "band(s)" in on_messages
+
+    def test_the_quotes_step_reports_on_the_run_s_own_markets_only(self, monkeypatch):
+        # With the volume cap on, the one quotes step counts the markets with
+        # no readable volume ahead of some checkpoint (INFO) and, at DEBUG,
+        # the legs valued on a stale quote. Both count only the run's own
+        # records' markets, so a market only another choice enters leaves the
+        # run's log lines as a run without the family writes them. The suite
+        # turns the cap off (conftest); this test turns it on
+        monkeypatch.setattr(backtester, "BACKTEST_MAX_VOLUME_SHARE", 0.1)
+        # One more candle with no volume, 18:00 UTC on each pair's first
+        # Monday, an hour after its checkpoint (09:00 Los Angeles): on DEW,
+        # which a 7-day run enters only at off and 3 days, and on MIST, which
+        # the run's own choice enters too. Same prices, so no entry changes
+        candles = {ticker: list(c) for ticker, c in self._CLOSE_CANDLES.items()}
+        for ticker in ("DEW-A", "DEW-B", "MIST-A", "MIST-B"):
+            first = candles[ticker][0]
+            candles[ticker].append({**first, "ts": first["ts"] + 9 * 3_600})
+
+        def own_lines(messages):
+            return [m for m in messages if not m.startswith("Other \"Skip if closing within\"")]
+
+        def report(messages):
+            return [m for m in messages if m.startswith(("Markets with no readable volume",
+                                                         "Legs valued on a quote"))]
+
+        for level in (logging.INFO, logging.DEBUG):
+            off_messages: list = []
+            self._close_phase_one(monkeypatch, 7, close_sweep=False, candles=candles,
+                                  log=off_messages, level=level)
+            on_messages: list = []
+            on = self._close_phase_one(monkeypatch, 7, candles=candles, log=on_messages,
+                                       level=level)
+            # Not vacuous: DEW's records, which only the other choices hold,
+            # got quotes whose volume ahead cannot be read
+            dew = [rec for *_rest, days, out in on if days is not None for rec in out
+                   if rec["entry"]["mA"]["ticker"] == "DEW-A"]
+            assert dew and all(np.isnan(rec["leg_quotes"][t].volume_ahead_checkpoints).any()
+                               for rec in dew for t in ("DEW-A", "DEW-B"))
+            # The run's own counts: MIST's two markets, not DEW's
+            assert "Markets with no readable volume ahead, not capped: 2" in report(off_messages)
+            assert report(on_messages) == report(off_messages), level
+            if level == logging.INFO:
+                # Every other line of the run's own is the same too
+                assert own_lines(on_messages) == off_messages
+            else:
+                assert any(m.startswith("Legs valued on a quote") for m in off_messages)
+
+
+@pytest.fixture(scope="class")
+def close_run():
+    """The close fixture of TestBandSweepPhaseOneSubset (ICE, DEW, MIST and
+    FOG, whose first possible Mondays fall 26.3, 5.3, 12.3 and 12.3 days
+    before their closes) through run_backtest_sweep on a narrowed grid:
+    floors 0 and 0.25 x ceilings 0.6 and 1 (all four bands bind, so each
+    has a tier-floors-off twin) x k 0.5 and the primary 0.75. The size-cap
+    sweep, the tier-floors-off family and the close family are on, and Sell
+    and Rebalance are OFF, so the end-date maps come from the close family
+    alone. Runs: the run's own choice at 7 days with the close family on
+    ("on") and off ("off"), at off with it on ("own_off"), and at 7 days
+    without the size-cap sweep ("no_cap"). The clock is pinned, so every
+    curve ends on one known day. "direct" holds, for every choice, Tier
+    floors setting and band, the entries a run whose own choice it is finds
+    by a full scan, with their quotes, as a run gives them."""
+    toggles = pytest.MonkeyPatch()
+    mp = pytest.MonkeyPatch()
+    try:
+        apply_pre_toggle_defaults(toggles)
+        fixture = TestBandSweepPhaseOneSubset()
+        markets = fixture._close_markets()
+        mp.setattr(backtester, "fetch_all_settled_markets", lambda *a, **k: markets)
+        mp.setattr(backtester, "fetch_candlesticks",
+                   lambda _c, ticker, *a, **k: fixture._CLOSE_CANDLES[ticker])
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.25))
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.6, 1.0))
+        mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
+        mp.setattr(backtester, "datetime", type(
+            "Clock", (TestCapSweepEndDate._Clock,),
+            {"moment": datetime(2026, 9, 26, 12, 0, tzinfo=UTC)}))
+        start = date(2026, 1, 1)
+
+        def run(own, **kw):
+            handler = _LogCapture()
+            root = logging.getLogger()
+            old_level = root.level
+            root.setLevel(logging.INFO)
+            root.addHandler(handler)
+            try:
+                res = run_backtest_sweep(
+                    hist_client=MagicMock(), live_client=MagicMock(), start_date=start,
+                    initial_balance=10_000.0, same_event_ladders=True,
+                    buy_min_days_to_close=own,
+                    **{"band_sweep": True, "tier_off_sweep": True, "cap_sweep": True,
+                       "close_sweep": True, **kw})
+            finally:
+                root.removeHandler(handler)
+                root.setLevel(old_level)
+            return res, list(handler.messages)
+
+        on, msgs_on = run(7)
+        off, msgs_off = run(7, close_sweep=False)
+        own_off, _ = run(0)
+        no_cap, _ = run(7, cap_sweep=False)
+        direct: dict = {}
+        for days in (0, 3, 7, 14):
+            candidates = backtester._prepare_candidates(
+                MagicMock(), MagicMock(), start, True, None, same_event_ladders=True,
+                buy_min_days_to_close=days)
+            for tier_floors, bands in ((True, on.close_sweep.bands),
+                                       (False, on.close_sweep.off_bands)):
+                for band in bands:
+                    entries = backtester._entries_for_band(candidates, band,
+                                                           tier_floors=tier_floors)
+                    backtester._attach_leg_quotes(
+                        entries, candidates.candles_by_ticker, candidates.start_date, None,
+                        stale_max_age=candidates.stale_quote_max_age,
+                        volume_share=candidates.max_volume_share)
+                    direct[(tier_floors, days, band)] = entries
+        mp.undo()
+        yield SimpleNamespace(on=on, off=off, own_off=own_off, no_cap=no_cap,
+                              msgs_on=msgs_on, msgs_off=msgs_off, direct=direct, start=start)
+    finally:
+        mp.undo()
+        toggles.undo()
+
+
+@pytest.mark.usefixtures("close_run")
+class TestCloseSweep:
+    """run_backtest_sweep(close_sweep=True): the other "Skip if closing
+    within" choices, a lazy CloseSweep over every choice of the menu but the
+    run's own, tier floors on and off, the "all" population only, with no
+    adding to held pairs, no trimming and no selling. The run's own results
+    do not change; every cell is simulated when read, equals a direct
+    simulation of that choice's own entries, and ends on the day the run's
+    own eager point of that (band, k) ended."""
+
+    _OTHERS = "Other \"Skip if closing within\" choices"
+
+    @staticmethod
+    def _settings(family):
+        """(tier_floors, bands, end dates) for each Tier floors setting."""
+        return ((True, family.bands, family.end_dates),
+                (False, family.off_bands, family.off_end_dates))
+
+    def test_off_is_the_default_and_builds_nothing(self, close_run):
+        assert inspect.signature(run_backtest_sweep).parameters["close_sweep"].default is False
+        assert inspect.signature(backtester._sweep_from_candidates).parameters[
+            "close_sweep"].default is False
+        assert close_run.off.close_sweep is None
+
+    def test_the_infeasible_window_has_no_close_sweep(self, monkeypatch):
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                 start_date=date(2026, 1, 1), band_sweep=True,
+                                 cap_sweep=True, close_sweep=True)
+        assert res.close_sweep is None
+
+    def test_the_family_holds_every_other_choice_over_the_run_s_grid(self, close_run):
+        on, own_off, no_cap = close_run.on, close_run.own_off, close_run.no_cap
+        family = on.close_sweep
+        assert (family.days, family.own_days) == ((0, 3, 14), 7)
+        assert (own_off.close_sweep.days, own_off.close_sweep.own_days) == ((3, 7, 14), 0)
+        # The size-cap sweep's caps, bands and k grid, tier floors on and off
+        assert family.caps == on.cap_sweep.caps and len(family.caps) > 1
+        assert family.bands == on.cap_sweep.bands and len(family.bands) == 4
+        assert family.off_bands == on.tier_off_cap_sweep.bands == family.bands
+        assert family.ks == on.cap_sweep.ks == (0.5, 0.75)
+        assert (family.primary_cap, family.primary_k) == (on.primary.size_cap, on.primary.k)
+        assert sorted(family.entries_by_days) == sorted(family.off_entries_by_days) == [0, 3, 14]
+        # Without the size-cap sweep, the run's own cap alone
+        assert no_cap.close_sweep.caps == (no_cap.primary.size_cap,)
+        # One summary line, after the lines that say what each choice found
+        summary = [m for m in close_run.msgs_on if m.startswith(self._OTHERS + ": off, ")]
+        assert summary == [
+            f"{self._OTHERS}: off, 3 days, 14 days x {len(family.caps)} size cap(s) x 4 "
+            "band(s) (4 with the tier floors off) x 2 k, each simulated when a report "
+            "reads it"]
+
+    def test_every_choice_s_entries_are_a_full_scan_s_at_that_choice(self, close_run):
+        rows = TestPrepareEntriesGolden._rows
+        for run in (close_run.on, close_run.own_off):
+            family = run.close_sweep
+            for days in family.days:
+                for tier_floors, maps in ((True, family.entries_by_days),
+                                          (False, family.off_entries_by_days)):
+                    for band, entries in maps[days].items():
+                        assert rows(entries) == rows(
+                            close_run.direct[(tier_floors, days, band)]), (days, band)
+                        assert all("leg_quotes" in rec for rec in entries)
+
+    def test_every_cell_equals_a_direct_simulation_and_ends_on_the_main_day(self, close_run):
+        start = close_run.start
+        checked = traded = 0
+        trades_by_choice: dict = {}
+        for run in (close_run.on, close_run.own_off):
+            family = run.close_sweep
+            eagers = {True: run.cap_sweep.eager, False: run.tier_off_cap_sweep.eager}
+            for tier_floors, bands, end_dates in self._settings(family):
+                for days in family.days:
+                    for band in bands:
+                        for k in family.ks:
+                            cell = family.cell(days, band, k, tier_floors=tier_floors)
+                            assert tuple(cell) == family.caps
+                            # The main run's eager twin of this (band, k)
+                            twin = eagers[tier_floors][(band, k, "all")]
+                            end = end_dates[(band, k, "all")]
+                            assert end == backtester._curve_end_date(twin) == date(2026, 9, 26)
+                            for cap, by_pop in cell.items():
+                                assert set(by_pop) == {"all"}
+                                point = by_pop["all"]
+                                assert (point.add_to_held, point.trim_to_kelly, point.sell_at,
+                                        point.tier_floors, point.size_cap, point.halves,
+                                        point.ex_top_event) == (
+                                    False, False, None, tier_floors, cap, None, None)
+                                assert backtester._curve_end_date(point) == end
+                                direct = backtester._simulate_at_discount(
+                                    close_run.direct[(tier_floors, days, band)], start,
+                                    10_000.0, k=k, spread_band=band, size_cap=cap, quiet=True,
+                                    end_date=end,
+                                    **({} if tier_floors else {"tier_floors": False}))
+                                TestSellSweep._same_run(point, direct)
+                                checked += 1
+                                traded += bool(point.trades)
+                                if (run is close_run.on and tier_floors and k == 0.75
+                                        and band == (0.0, 1.0) and cap == family.primary_cap):
+                                    trades_by_choice[days] = sorted(
+                                        t.ticker_a for t in point.trades)
+        assert checked == 2 * 2 * 3 * 4 * 2 * len(close_run.on.close_sweep.caps)
+        # Not vacuous: cells trade, and the choices trade different pairs
+        assert traded > checked // 2
+        assert trades_by_choice[0] == trades_by_choice[3] != trades_by_choice[14]
+        assert "DEW-A" in trades_by_choice[0] and "DEW-A" not in trades_by_choice[14]
+
+    def test_with_the_family_on_the_run_s_own_results_do_not_change(self, close_run):
+        on, off = close_run.on, close_run.off
+        same = TestTierOffSweep._same_point
+        same(on.primary, off.primary)
+        for mine, theirs in ((on.points, off.points), (on.scenarios, off.scenarios),
+                             (on.tier_off_scenarios, off.tier_off_scenarios)):
+            assert len(mine) == len(theirs) > 0
+            for a, b in zip(mine, theirs, strict=True):
+                same(a, b)
+        # Every other field, the lazy size-cap sweeps aside, is equal
+        lazy = {"primary", "points", "scenarios", "tier_off_scenarios", "cap_sweep",
+                "tier_off_cap_sweep", "close_sweep"}
+        for f in fields(backtester.BacktestSweep):
+            if f.name not in lazy:
+                assert getattr(on, f.name) == getattr(off, f.name), f.name
+        # The size-cap sweeps hold the same entries and give the same cells
+        rows = TestPrepareEntriesGolden._rows
+        for name in ("cap_sweep", "tier_off_cap_sweep"):
+            mine, theirs = getattr(on, name), getattr(off, name)
+            assert (mine.caps, mine.bands, mine.ks) == (theirs.caps, theirs.bands, theirs.ks)
+            for band in mine.bands:
+                assert rows(mine.entries_by_band[band]) == rows(theirs.entries_by_band[band])
+            band = mine.bands[0]
+            a, b = mine.cell(band, 0.5), theirs.cell(band, 0.5)
+            for cap in mine.caps:
+                for population in a[cap]:
+                    TestSellSweep._same_run(a[cap][population], b[cap][population])
+        # Every log line but the other choices' is the same, in the same order
+        assert [m for m in close_run.msgs_on if not m.startswith((self._OTHERS, "Peak RSS"))] \
+            == [m for m in close_run.msgs_off if not m.startswith("Peak RSS")]
+        assert not any(m.startswith(self._OTHERS) for m in close_run.msgs_off)
+
+    def test_a_close_run_never_adds_trims_sells_or_checks(self, close_run):
+        family = close_run.on.close_sweep
+        for tier_floors in (True, False):
+            swept = family.sweep(14, tier_floors=tier_floors)
+            assert (swept.add_to_held, swept.trim_to_kelly, swept.sell_at, swept.checks,
+                    swept.eager, swept.split_date, swept.tier_floors) == (
+                False, False, None, False, {}, None, tier_floors)
+            assert swept.entries_by_band is (family.entries_by_days if tier_floors
+                                             else family.off_entries_by_days)[14]
+            assert swept.end_dates is (family.end_dates if tier_floors
+                                       else family.off_end_dates)
+
+    def test_a_choice_or_setting_it_does_not_hold_is_refused(self, close_run):
+        family = close_run.on.close_sweep
+        band = family.bands[0]
+        with pytest.raises(ValueError, match="the run's own choice"):
+            family.sweep(7)
+        for bad in (5, 7.0, 14.0, True, None, "3"):
+            with pytest.raises(ValueError, match="is not one of"):
+                family.sweep(bad)
+        with pytest.raises(ValueError, match="size caps"):
+            family.sweep(3, caps=(0.123,))
+        with pytest.raises(ValueError, match="k 0.6 is not one of"):
+            family.cell(3, band, 0.6)
+        bare = dc_replace(family, off_bands=(), off_entries_by_days={}, off_end_dates={})
+        with pytest.raises(ValueError, match="tier-floors-off"):
+            bare.sweep(3, tier_floors=False)
+        # A cell with no end day is refused in sweep() itself, so no cell of
+        # the CapSweep can be read around the check (it would end on today)
+        for tier_floors, bands, end_dates in self._settings(family):
+            key = (bands[-1], family.ks[0], "all")
+            for gone in ({k: v for k, v in end_dates.items() if k != key},
+                         {**end_dates, key: None}):
+                name = "end_dates" if tier_floors else "off_end_dates"
+                holed = dc_replace(family, **{name: gone})
+                with pytest.raises(ValueError, match="no end day"):
+                    holed.sweep(3, tier_floors=tier_floors)
+                with pytest.raises(ValueError, match="no end day"):
+                    holed.cell(3, band, family.ks[1], tier_floors=tier_floors)
+
+    def test_a_family_s_days_never_name_the_run_s_own(self, close_run):
+        family = close_run.on.close_sweep
+        with pytest.raises(ValueError, match="the run's own choice"):
+            dc_replace(family, days=(0, 3, 7, 14))
+        with pytest.raises(ValueError, match="not its days"):
+            dc_replace(family, days=(0, 3))
+        with pytest.raises(ValueError, match="tier-off entries"):
+            dc_replace(family, off_entries_by_days={0: {}})
+
+    def test_the_family_survives_pickling(self, close_run):
+        family = close_run.on.close_sweep
+        copy = pickle.loads(pickle.dumps(family))
+        assert (copy.days, copy.caps, copy.bands, copy.off_bands, copy.ks) == (
+            family.days, family.caps, family.bands, family.off_bands, family.ks)
+        band, k = (0.0, 1.0), 0.75
+        for days in family.days:
+            a, b = family.cell(days, band, k), copy.cell(days, band, k)
+            for cap in family.caps:
+                TestSellSweep._same_run(a[cap]["all"], b[cap]["all"])
+
+    @pytest.mark.parametrize("bad", [(0, 3, True), (0, 7.0), (0, 7, 7), (0, -3, 7),
+                                     (0, np.int64(7)), [0, 7], 7, (0, "7")])
+    def test_bad_choices_are_refused_before_any_fetch(self, monkeypatch, caplog, bad):
+        monkeypatch.setattr(backtester, "BUY_MIN_DAYS_TO_CLOSE_CHOICES", bad)
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **k: pytest.fail("fetched"))
+        with caplog.at_level(logging.INFO), pytest.raises(
+                ValueError, match="BUY_MIN_DAYS_TO_CLOSE_CHOICES"):
+            run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                               start_date=date(2026, 1, 1), close_sweep=True)
+        # Refused before the run's first line
+        assert not caplog.records
+        # Only a run that asks for them reads them
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        assert run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                  start_date=date(2026, 1, 1)).close_sweep is None
 
 @pytest.mark.usefixtures("golden_band_sweep")
 class TestTimeSeriesPopulation:
@@ -14122,11 +15284,12 @@ class TestLiveRuleLine:
         assert messages[-1].startswith(self._PREFIX)
         assert any(m.startswith("Size-cap sweep:") for m in messages[:-1])
 
-    # The twelve fields a saved-defaults read records, all or none
+    # The thirteen fields a saved-defaults read records, all or none
     _LIVE_FIELDS = ("live_tier_floors", "live_spread_band", "live_exclude_categories", "live_exclude_tags",
                     "live_origin", "live_interval_discount", "live_size_cap",
                     "live_rebalance", "live_min_price_move",
-                    "live_rebalance_min_days_to_maturity", "live_sell_at", "live_sell_min_days")
+                    "live_rebalance_min_days_to_maturity", "live_sell_at", "live_sell_min_days",
+                    "live_buy_min_days_to_close")
 
     @pytest.mark.parametrize("feasible", [False, True])
     def test_a_refused_file_records_none_and_warns_once(self, monkeypatch, caplog, feasible):
@@ -14181,14 +15344,15 @@ class TestLiveRuleLine:
             "when this run started, and live runs refuse to start without them")
         assert bool(res.calibrations_by_band) is feasible
 
-    def test_the_twelve_fields_are_recorded_from_one_read(self, monkeypatch, caplog):
+    def test_the_thirteen_fields_are_recorded_from_one_read(self, monkeypatch, caplog):
         from kalshi_betting import config
         saved = config.save_live_defaults(
             config.LiveSettings(tier_floors=False, spread_band=(0.1, 0.8), interval_discount=0.6,
                                 size_cap=0.35,
                                 exclude_categories=("Economics",), exclude_tags=("Fed",),
                                 rebalance=True, min_price_move=0.10,
-                                rebalance_min_days_to_maturity=7, sell_at=0.85, sell_min_days=3),
+                                rebalance_min_days_to_maturity=7, sell_at=0.85, sell_min_days=3,
+                                buy_min_days_to_close=14),
             source="a note")
         reads: list = []
         real = config.read_saved_live_defaults
@@ -14214,15 +15378,18 @@ class TestLiveRuleLine:
             "live_size_cap": 0.35,
             "live_rebalance": True, "live_min_price_move": 0.10,
             "live_rebalance_min_days_to_maturity": 7,
-            "live_sell_at": 0.85, "live_sell_min_days": 3}
+            "live_sell_at": 0.85, "live_sell_min_days": 3,
+            "live_buy_min_days_to_close": 14}
         # There is no same-title cap to save or record
         assert not hasattr(res, "live_same_title_size_cap")
 
-    def test_the_live_rule_fields_are_twelve_keys_or_none(self):
+    def test_the_live_rule_fields_are_thirteen_keys_or_none(self):
         from kalshi_betting import config
         assert backtester._live_rule_fields(None) == {}
         fields = backtester._live_rule_fields(config.LIVE_DEFAULTS_SEED)
-        assert tuple(fields) == self._LIVE_FIELDS and len(fields) == 12
+        assert tuple(fields) == self._LIVE_FIELDS and len(fields) == 13
+        # One per live toggle, and where the defaults were read
+        assert len(fields) == len(config.LIVE_TOGGLE_FIELDS) + 1
         # Each is a BacktestSweep field, so it can be passed straight to the sweep
         assert set(fields) <= set(backtester.BacktestSweep.__dataclass_fields__)
         assert fields["live_origin"] == config.LIVE_DEFAULTS_SEED.origin
@@ -14250,6 +15417,12 @@ class TestLiveRuleLine:
         level_only = backtester._live_rule_fields(dc_replace(
             config.LIVE_DEFAULTS_SEED, sell_at=0.85))
         assert (level_only["live_sell_at"], level_only["live_sell_min_days"]) == (0.85, None)
+        # The seed skips contracts closing within 7 days; defaults with the
+        # rule off record None, as they do for the other optional toggles
+        assert fields["live_buy_min_days_to_close"] == 7
+        off = backtester._live_rule_fields(dc_replace(config.LIVE_DEFAULTS_SEED,
+                                                      buy_min_days_to_close=None))
+        assert off["live_buy_min_days_to_close"] is None
 
     def test_claude_md_spells_every_backtest_sweep_field(self):
         # The notes (CLAUDE.md and docs/claude/) list BacktestSweep's fields in order,
@@ -14379,8 +15552,13 @@ class TestLiveRuleLine:
                                    cap_sweep=True)
             assert self._line(caplog) == (
                 f"Live time-series rule (saved live defaults): {rule} — not simulated by this run")
+            # The page adds the saved "Skip if closing within" choice, which
+            # the log line does not name: off, as the run's own (the suite
+            # turns the backtest's rule off, and config.py's live value is off)
+            assert (res.live_buy_min_days_to_close, res.buy_min_days_to_close) == (None, False)
             assert dashboard._live_rule_html(res, bar=None).endswith(
-                "— not simulated by this run</p>")
+                "— not simulated by this run; the live defaults' Skip if closing within is "
+                "off, this run's own choice</p>")
 
     @pytest.mark.parametrize("tier_floors, band, page_tail", [
         (True, (0.0, 1.0), "this run's primary"),
@@ -14413,8 +15591,14 @@ class TestLiveRuleLine:
             10_000.0, sweep=res).read_text(encoding="utf-8")
         found = re.findall(r"Live rule \(saved live defaults\): ([^<]*)</p>", page)
         assert len(found) == 1
-        # The rule, then where the page shows it, as the log line words it
-        assert found[0] == html.escape(rule, quote=False) + " — " + page_tail
+        # The rule, then where the page shows it, as the log line words it,
+        # then the saved "Skip if closing within" choice, which only the page
+        # names: off, as the run's own (the suite turns the backtest's rule
+        # off, and config.py's live value is off)
+        assert (res.live_buy_min_days_to_close, res.buy_min_days_to_close) == (None, False)
+        assert found[0] == (html.escape(rule, quote=False) + " — " + page_tail
+                            + "; the live defaults' Skip if closing within is off, this "
+                            "run's own choice")
         # The log's verdict and the page's are the one verdict
         where = backtester._live_rule_view(res).where
         assert line.endswith("— not simulated by this run") == (
@@ -24808,6 +25992,52 @@ class TestMaturityClose:
             m = {"close_time": "2026-02-01T00:00:00+00:00",
                  backtester._SCHEDULED_CLOSE_KEY: bad}
             assert backtester._maturity_close(m, as_date=True) == date(2026, 2, 1)
+            # ... and with scheduled_only there is then no close at all
+            assert backtester._maturity_close(m, scheduled_only=True) is None
+
+    def test_scheduled_only_never_reads_the_recorded_close(self):
+        # What "Skip if closing within" reads (_buy_rule_close): the carried
+        # schedule, or None, whatever close_time says
+        for close in ("2026-02-01T00:00:00+00:00", "2026-02-01T09:00:00", None, "not a date"):
+            m = {"close_time": close}
+            assert backtester._maturity_close(m, scheduled_only=True) is None
+            assert backtester._maturity_close(m, as_date=True, scheduled_only=True) is None
+        m = _with_scheduled({"close_time": "2026-02-01T00:00:00+00:00"},
+                            "2026-02-04T18:35:00+00:00")
+        assert backtester._maturity_close(m, scheduled_only=True) == datetime(
+            2026, 2, 4, 18, 35, tzinfo=UTC)
+        assert backtester._maturity_close(m, as_date=True, scheduled_only=True) == date(
+            2026, 2, 4)
+
+
+class TestBuyRuleClose:
+    """_buy_rule_close: the scheduled close where carried, else the start
+    (00:00 UTC) of the last day the wording includes (_wording_close); never
+    the recorded close."""
+
+    def test_the_wording_s_last_day_at_midnight_utc(self):
+        m = _skip_market("A", "E", date(2026, 11, 22), close="2026-11-20T03:00:00+00:00")
+        assert backtester._wording_close(m) == datetime(2026, 11, 22, tzinfo=UTC)
+        assert backtester._buy_rule_close(m) == datetime(2026, 11, 22, tzinfo=UTC)
+        # A wording with no single day reads none, whatever the recorded close
+        assert backtester._wording_close(_skip_market("A", "E", date(2026, 11, 22),
+                                                      title="Will it happen?")) is None
+
+    def test_a_carried_schedule_comes_first(self):
+        m = _with_scheduled(_skip_market("A", "E", date(2026, 11, 22)),
+                            "2026-11-21T15:00:00+00:00")
+        assert backtester._buy_rule_close(m) == datetime(2026, 11, 21, 15, tzinfo=UTC)
+        # ... and the wording still reads its own day
+        assert backtester._wording_close(m) == datetime(2026, 11, 22, tzinfo=UTC)
+
+    @pytest.mark.parametrize("close", ["2026-11-01T00:00:00+00:00", "2026-12-31T23:00:00+00:00",
+                                       "2026-11-01T00:00:00", None, "not a date"])
+    def test_the_recorded_close_never_moves_it(self, close):
+        dated = _skip_market("A", "E", date(2026, 11, 22))
+        undated = _skip_market("A", "E", date(2026, 11, 22), title="Will it happen?")
+        dated["close_time"] = undated["close_time"] = close
+        assert backtester._buy_rule_close(dated) == datetime(2026, 11, 22, tzinfo=UTC)
+        assert backtester._buy_rule_close(undated) is None
 
 
 class TestScheduledCloseInFindEntry:
@@ -26373,3 +27603,277 @@ class TestExtraDataReport:
         res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
                                  start_date=date(2026, 1, 1))
         assert res.extra_data_report is None
+
+
+# ─── "Skip if closing within" through a run ─────────────────────────────────
+
+class TestSkipClosingSwitch:
+    """"Skip if closing within" through run_backtest_sweep, like the volume
+    cap: buy_min_days_to_close None reads this module's binding of
+    config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT at call time (None for the suite),
+    False or 0 turns it off, 3, 7 or 14 set it; the run logs one setting
+    line, records the days on the result and, with the rule on, logs once
+    what it removed in the run's own entry pass. Off, the golden fixture's
+    run is the run without it but for the setting line."""
+
+    _SETTING = "Skip if closing within (backtest):"
+    _COUNTS = "Skip if closing within 7 days (backtest), at band "
+    _ON = ("Skip if closing within (backtest): 7 days — a pair is bought, or added to, only "
+           "at a Monday checkpoint at least 7 days (24-hour spans) before each of its "
+           "markets closes; a market's close is its scheduled close where one is known, else "
+           "the start (00:00 UTC) of the last day its wording names, never the close Kalshi "
+           "recorded (config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT)")
+
+    def _run(self, monkeypatch, caplog, **kw):
+        return TestStaleQuoteSwitch()._run(monkeypatch, caplog, **kw)
+
+    def test_the_minimum_is_resolved_and_checked(self, monkeypatch):
+        resolve = backtester._resolve_buy_min_days_to_close
+        # None reads backtester's binding at call time (None for the suite)
+        assert backtester.BUY_MIN_DAYS_TO_CLOSE_DEFAULT is None
+        assert resolve() is None
+        monkeypatch.setattr(backtester, "BUY_MIN_DAYS_TO_CLOSE_DEFAULT", 7)
+        assert resolve() == 7 and resolve(None) == 7
+        monkeypatch.setattr(backtester, "BUY_MIN_DAYS_TO_CLOSE_DEFAULT", 0)
+        assert resolve() is None
+        # False and 0 are off; the other choices are kept as they are
+        assert resolve(False) is None and resolve(0) is None
+        for days in (3, 7, 14):
+            assert resolve(days) == days and type(resolve(days)) is int
+        # A bool, a float, a numpy integer and a day count off the menu are refused
+        for bad in (True, 7.0, np.int64(7), 5, -3, 1, 21, "7", Decimal(7)):
+            with pytest.raises(ValueError, match="Skip if closing within"):
+                resolve(bad)
+        # ... and so is a binding off the menu
+        monkeypatch.setattr(backtester, "BUY_MIN_DAYS_TO_CLOSE_DEFAULT", 5)
+        with pytest.raises(ValueError, match="must be 3, 7 or 14 days, 0, None or False"):
+            resolve()
+
+    def test_the_shipped_default_is_the_config_s(self):
+        # conftest moved backtester's binding to None for the suite; the
+        # shipped value is config's, which a run reads when nothing else does
+        assert config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT == 7
+        assert backtester.BUY_MIN_DAYS_TO_CLOSE_CHOICES is config.BUY_MIN_DAYS_TO_CLOSE_CHOICES
+
+    def test_off_is_the_run_without_the_rule_but_for_one_setting_line(self, monkeypatch,
+                                                                       caplog):
+        base, base_lines = self._run(monkeypatch, caplog)
+        assert base.buy_min_days_to_close is False
+        monkeypatch.setattr(backtester, "BUY_MIN_DAYS_TO_CLOSE_DEFAULT", 7)
+        for off_value in (False, 0):
+            off, off_lines = self._run(monkeypatch, caplog, buy_min_days_to_close=off_value)
+            TestStaleQuoteSwitch._same(off, base)
+            assert off.buy_min_days_to_close is False
+            assert [m for m in off_lines if m.startswith(self._SETTING)] == [
+                "Skip if closing within (backtest): off — a pair is bought however soon its "
+                "markets close (run-level override)"]
+            assert ([m for m in off_lines if not m.startswith(self._SETTING)]
+                    == [m for m in base_lines if not m.startswith(self._SETTING)])
+        assert [m for m in base_lines if m.startswith(self._SETTING)] == [
+            "Skip if closing within (backtest): off — a pair is bought however soon its "
+            "markets close (config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT)"]
+        assert not any(m.startswith(self._COUNTS) for m in base_lines)
+
+    def test_on_reads_the_binding_and_skips_the_golden_fixture_s_last_mondays(
+            self, monkeypatch, caplog):
+        base, _lines = self._run(monkeypatch, caplog)
+        monkeypatch.setattr(backtester, "BUY_MIN_DAYS_TO_CLOSE_DEFAULT", 7)
+        on, lines = self._run(monkeypatch, caplog)
+        assert on.buy_min_days_to_close == 7
+        assert [m for m in lines if m.startswith(self._SETTING)] == [self._ON]
+        # The golden pairs are worded "by <date>" and carry no schedule: EA/EB,
+        # TA/TB and WA/WB ("by February 1") lose Jan 26, and the ladder ("by
+        # March 1") Feb 23 to Mar 16. Every pair keeps an earlier Monday
+        assert [m for m in lines if m.startswith(self._COUNTS)] == [
+            "Skip if closing within 7 days (backtest), at band 0-1 with the tier floors on: "
+            "removed 7 qualifying Monday(s), 7 of them on a close read from a market's "
+            "wording (no scheduled close known); 0 pair(s) lost every qualifying Monday to "
+            "it, 0 of them because a market had neither a scheduled close nor a date in its "
+            "wording"]
+        # Logged once, right after the run's own pass and before any simulation
+        messages = lines
+        counted = messages.index(next(m for m in messages if m.startswith(self._COUNTS)))
+        assert messages[counted - 1].startswith("Qualifying Mondays at band 0-1: ")
+        # Every golden pair trades once, on its first Monday, weeks before the
+        # rule's 7 days, so the trades stay; none is within 7 days of a close
+        assert [astuple(t) for t in on.primary.trades] == [astuple(t)
+                                                          for t in base.primary.trades]
+        assert on.primary.trades
+        for trade in on.primary.trades:
+            closes = [backtester._wording_close(m)
+                      for m in TestPrepareEntriesGolden._markets()
+                      if m["ticker"] in (trade.ticker_a, trade.ticker_b)]
+            moment = backtester._checkpoint_datetime(trade.entry_date)
+            assert config.closes_far_enough(closes, moment, 7), trade.ticker_a
+        # A run-level value is named as an override
+        three, lines = self._run(monkeypatch, caplog, buy_min_days_to_close=3)
+        assert three.buy_min_days_to_close == 3
+        assert any(m.startswith("Skip if closing within (backtest): 3 days — ")
+                   and m.endswith("(run-level override)") for m in lines)
+
+    def test_a_band_sweep_logs_the_counts_once(self, monkeypatch, caplog):
+        monkeypatch.setattr(backtester, "BUY_MIN_DAYS_TO_CLOSE_DEFAULT", 7)
+        golden = TestPrepareEntriesGolden()
+
+        def counts(**kw) -> list[str]:
+            with monkeypatch.context() as mp:
+                golden._patch(mp)
+                caplog.clear()
+                with caplog.at_level(logging.INFO):
+                    run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                       start_date=golden._START, initial_balance=10_000.0,
+                                       same_event_ladders=True, sweep=False,
+                                       cap_sweep=False, **kw)
+            return [m for m in caplog.messages if m.startswith("Skip if closing within 7")]
+
+        # Every band and the tier-off family are entered, but the counts are
+        # the run's own pass's, once: the no-band band's, which is the
+        # primary here and the one pass that scans every pair
+        (line,) = counts(band_sweep=True, tier_off_sweep=True)
+        assert line.startswith(self._COUNTS + "0-1 with the tier floors on: removed 7 ")
+        # A narrower primary band, on a band sweep, is only rescanned, so the
+        # line keeps the no-band pre-pass's counts and names that band
+        (line,) = counts(band_sweep=True, spread_band=(0.3, 0.6))
+        assert line.startswith(self._COUNTS + "0-1 with the tier floors on: ")
+        # Without the band sweep the one pass is the primary band's own
+        (line,) = counts(spread_band=(0.3, 0.6))
+        assert line.startswith(self._COUNTS + "0.3-0.6 with the tier floors on: ")
+
+    def test_a_bad_minimum_is_refused_before_anything_is_fetched(self, monkeypatch):
+        def never(*_a, **_k):
+            raise AssertionError("fetched")
+
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets", never)
+        for bad in (True, 5, 7.0, np.int64(7)):
+            with pytest.raises(ValueError, match="Skip if closing within"):
+                run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                   start_date=date(2026, 1, 1), buy_min_days_to_close=bad)
+            with pytest.raises(ValueError, match="Skip if closing within"):
+                run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
+                             start_date=date(2026, 1, 1), buy_min_days_to_close=bad)
+
+    def test_a_horizon_at_or_below_the_minimum_warns_and_the_run_goes_on(self, monkeypatch,
+                                                                         caplog):
+        # As in a live run: a --max-horizon-days at or below "Skip if closing
+        # within" leaves next to nothing to buy, so the run says so in one
+        # WARNING and goes on (a warning, never a refusal)
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+
+        def warnings(**kw) -> list[str]:
+            caplog.clear()
+            with caplog.at_level(logging.INFO):
+                sweep = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                           start_date=date(2026, 1, 1), sweep=False, **kw)
+            assert isinstance(sweep, backtester.BacktestSweep)
+            return [r.getMessage() for r in caplog.records
+                    if r.levelno == logging.WARNING
+                    and r.getMessage().startswith("--max-horizon-days")]
+
+        assert warnings(max_horizon_days=5, buy_min_days_to_close=7) == [
+            "--max-horizon-days 5 is below this run's \"Skip if closing within\" of 7 days: "
+            "a Monday is kept only when its markets close within 5 days of it and also at "
+            "least 7 days after it, which only a market that closed before the date in its "
+            "wording can do, so the backtest buys next to nothing"]
+        assert warnings(max_horizon_days=7, buy_min_days_to_close=7) == [
+            "--max-horizon-days 7 equals this run's \"Skip if closing within\" of 7 days: a "
+            "Monday is kept only when its markets close within 7 days of it and also at "
+            "least 7 days after its checkpoint, so the backtest buys next to nothing"]
+        # Above the minimum, with the rule off, or with no horizon: no warning
+        for kw in ({"max_horizon_days": 8, "buy_min_days_to_close": 7},
+                   {"max_horizon_days": 5, "buy_min_days_to_close": False},
+                   {"max_horizon_days": 5},
+                   {"buy_min_days_to_close": 14}):
+            assert warnings(**kw) == [], kw
+        # The module's default is the run's minimum when none is handed in
+        monkeypatch.setattr(backtester, "BUY_MIN_DAYS_TO_CLOSE_DEFAULT", 14)
+        (line,) = warnings(max_horizon_days=10)
+        assert line.startswith("--max-horizon-days 10 is below this run's \"Skip if closing "
+                               "within\" of 14 days: ")
+
+    def test_the_infeasible_window_records_it(self, monkeypatch):
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        for value, recorded in ((14, 14), (False, False), (0, False), (None, False)):
+            res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                     start_date=date(2026, 1, 1),
+                                     buy_min_days_to_close=value)
+            assert res.buy_min_days_to_close == recorded and (
+                type(res.buy_min_days_to_close) is type(recorded)), value
+
+    def test_a_hand_built_sweep_or_candidates_records_nothing_and_is_off(self):
+        pt = backtester.SweepPoint(k=0.75, trades=[],
+                                   equity_df=pd.DataFrame({"portfolio_value": [1.0]}))
+        sweep = backtester.BacktestSweep(primary=pt, points=[pt], calibration=None)
+        assert sweep.buy_min_days_to_close is None
+        assert sweep.live_buy_min_days_to_close is None
+        candidates = backtester._Candidates(
+            all_pairs=[], candles_by_ticker={}, label_coverage=None,
+            start_date=date(2026, 1, 1), max_horizon_days=None, same_event_ladders=None)
+        assert candidates.buy_min_days_to_close is None
+
+    def test_every_entry_point_takes_it_keyword_only(self):
+        for func in (run_backtest_sweep, backtester.run_backtest, backtester._prepare_entries,
+                     backtester._prepare_candidates):
+            param = inspect.signature(func).parameters["buy_min_days_to_close"]
+            assert param.default is None and param.kind is param.KEYWORD_ONLY
+        param = inspect.signature(_find_entry).parameters["min_days_to_close"]
+        assert param.default is None and param.kind is param.KEYWORD_ONLY
+
+
+class TestRunBacktestSkipClosing:
+    """End to end, with "Skip if closing within" at 7 days: the time-series
+    fixture from Jan 20, whose first Monday checkpoint is Jan 26 (17:00 UTC),
+    makes no trade when its earlier market is worded "by February 1" (5 days
+    7 hours later, and Jan 26 is the window's only Monday), and one when
+    worded "by February 4" (8 days 7 hours; that window also reaches Feb 2,
+    2 days 7 hours before, which the rule removes)."""
+
+    _START = date(2026, 1, 20)
+
+    @staticmethod
+    def _markets(deadline: date) -> list[dict]:
+        sa, sb = _time_series_markets()
+        sa = dict(sa, title=f"Will the launch happen by {deadline:%B} {deadline.day}, "
+                            f"{deadline.year}?",
+                  close_time=f"{deadline.isoformat()}T00:00:00+00:00",
+                  settlement_ts=f"{deadline.isoformat()}T12:00:00+00:00")
+        return [sa, sb]
+
+    def _patch(self, monkeypatch, deadline: date) -> None:
+        markets = self._markets(deadline)
+        candles = _parity_candles()
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets", lambda *a, **k: markets)
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: candles[ticker])
+
+    @pytest.mark.parametrize("deadline, trades", [(date(2026, 2, 1), 0), (date(2026, 2, 4), 1)])
+    def test_run_backtest_buys_only_8_days_out(self, monkeypatch, caplog, deadline, trades):
+        self._patch(monkeypatch, deadline)
+        # Off (the suite's default), the one Monday trades either way
+        plain, _ = run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
+                                start_date=self._START, initial_balance=1000.0)
+        assert len(plain) == 1 and plain[0].entry_date == date(2026, 1, 26)
+        with caplog.at_level(logging.INFO):
+            ruled, _ = run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
+                                    start_date=self._START, initial_balance=1000.0,
+                                    buy_min_days_to_close=7)
+        assert len(ruled) == trades
+        if trades:
+            assert ruled[0].entry_date == date(2026, 1, 26)
+        # One Monday removed either way; at Feb 1 it was the pair's only one
+        lost = 1 - trades
+        assert [m for m in caplog.messages if m.startswith("Skip if closing within 7")] == [
+            "Skip if closing within 7 days (backtest), at band 0-1 with the tier floors on: "
+            "removed 1 qualifying Monday(s), 1 of them on a close read from a market's "
+            f"wording (no scheduled close known); {lost} pair(s) lost every qualifying "
+            "Monday to it, 0 of them because a market had neither a scheduled close nor a "
+            "date in its wording"]
+
+    @pytest.mark.parametrize("deadline, trades", [(date(2026, 2, 1), 0), (date(2026, 2, 4), 1)])
+    def test_the_sweep_buys_only_8_days_out_and_records_the_days(self, monkeypatch, deadline,
+                                                                 trades):
+        self._patch(monkeypatch, deadline)
+        monkeypatch.setattr(backtester, "BUY_MIN_DAYS_TO_CLOSE_DEFAULT", 7)
+        res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                 start_date=self._START, initial_balance=1000.0, sweep=False)
+        assert len(res.primary.trades) == trades
+        assert res.buy_min_days_to_close == 7

@@ -93,6 +93,15 @@ Purpose:
     set, until its price has moved that far, up or down; a pair held back
     stays blocked like any other held market.
 
+    With "Skip if closing within" set (LiveSettings.buy_min_days_to_close),
+    both run modes buy nothing that stops trading (closes) sooner than that
+    many days after the moment the run reads the markets: a held pair or
+    lone leg with a market closing too soon is not added to (and stays
+    blocked), and the time-series finder never sees a market closing too
+    soon (scanner.filter_markets_closing_far_enough). Both decide through
+    config.closes_far_enough, and both sit below every sale and trim, which
+    the rule never holds back.
+
 Dependencies:
     Imports auth.py (the client, and the one balance read, which also checks
     the credentials), config.py (constants, exit codes, the order-path check
@@ -159,6 +168,8 @@ from . import run_lock
 from ._http import api_error_summary
 from .auth import build_client, read_account_balance
 from .config import (
+    BUY_MIN_DAYS_TO_CLOSE_CHOICES,
+    BUY_MIN_DAYS_TO_CLOSE_DEFAULT,
     CATEGORY_FILTER_MAX_NAMED_SERIES,
     CONTRACT_PAYOUT_DOLLARS,
     EXIT_NO_TRADEABLE_SHARDS,
@@ -182,6 +193,7 @@ from .config import (
     LiveDefaultsMissing,
     LiveDefaultsOutdated,
     LiveSettings,
+    closes_far_enough,
     count_text,
     describe_live_settings,
     describe_time_series_rule,
@@ -219,6 +231,7 @@ from .scanner import (
     enrich_with_orderbook_prices,
     fetch_open_events_with_markets,
     fetch_shard_statuses,
+    filter_markets_closing_far_enough,
     filter_markets_within_horizon,
     find_time_series_pairs,
     get_held_positions,
@@ -890,9 +903,11 @@ def _no_pairs_msg(sandbox: bool = False, settings: LiveSettings | None = None, *
 
     Words the time-series rule as the finder's "Time-series entry rule" line
     does, and names the cumulative-deadline requirement so a reader does not
-    blame the price rule for what the wording decided. A set category/tag
-    filter is named too, since it can empty the list on its own, but only
-    after a search: a run that asked no finder had no list for it to empty.
+    blame the price rule for what the wording decided. A set "Skip if closing
+    within" (both markets closing at least that many days after the run
+    looks) and a set category/tag filter are named too, since either can
+    empty the list on its own, but only after a search: a run that asked no
+    finder had no list for them to empty.
 
     Args:
         sandbox (bool): True to phrase the message for a dev/sandbox run
@@ -922,6 +937,11 @@ def _no_pairs_msg(sandbox: bool = False, settings: LiveSettings | None = None, *
         time_series = ("time-series: not searched this run, because a held market "
                        "could not be identified (see the ERROR above)")
     thresholds = time_series
+    if time_series_searched and settings.buy_min_days_to_close is not None:
+        # The run's "Skip if closing within", which held back every market
+        # closing sooner than this
+        thresholds += (f" — and both markets closing at least "
+                       f"{settings.buy_min_days_to_close} days after this run")
     if time_series_searched and (settings.exclude_categories is not None
                                  or settings.exclude_tags is not None):
         # The run's category/tag filter, in the "Live settings:" line's words
@@ -1377,6 +1397,8 @@ _LIVE_FLAGS = (
     ("no_sell", "--no-sell"),
     ("sell_min_days", "--sell-min-days"),
     ("no_sell_min_days", "--no-sell-min-days"),
+    ("buy_min_days_to_close", "--buy-min-days-to-close"),
+    ("no_buy_min_days_to_close", "--no-buy-min-days-to-close"),
     ("exclude_category", "--exclude-category"),
     ("no_exclude_category", "--no-exclude-category"),
     ("exclude_tag", "--exclude-tag"),
@@ -1403,7 +1425,9 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
     pairs only), whatever value it is given.
     --no-sell also clears the minimum of days, and --no-rebalance the minimum
     price move and the days to maturity, since none of them is allowed without
-    its switch. A saved file an older version wrote (holding add_to_held_pairs,
+    its switch. --buy-min-days-to-close N sets the run's "Skip if closing
+    within" days and --no-buy-min-days-to-close turns it off; it needs no
+    switch. A saved file an older version wrote (holding add_to_held_pairs,
     trim_to_kelly, trim_min_rise, categories, tags or same_title_size_cap) is
     refused too, with the remedy: save it again through the defaults server,
     whose pages offer its settings in their new form when they have one. Runs
@@ -1508,6 +1532,12 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
         overrides["sell_min_days"] = None
     if getattr(args, "sell_min_days", None) is not None:
         overrides["sell_min_days"] = args.sell_min_days
+    # "Skip if closing within": --no-buy-min-days-to-close turns it off for this
+    # run, --buy-min-days-to-close N sets it (argparse keeps the two exclusive)
+    if getattr(args, "no_buy_min_days_to_close", None):
+        overrides["buy_min_days_to_close"] = None
+    if getattr(args, "buy_min_days_to_close", None) is not None:
+        overrides["buy_min_days_to_close"] = args.buy_min_days_to_close
     # --exclude-category / --exclude-tag (repeatable) set the filter;
     # --no-exclude-category / --no-exclude-tag clear the saved one (argparse
     # keeps each pair mutually exclusive)
@@ -1602,7 +1632,11 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
 
     Uses real sandbox market data but never sends orders. It holds no
     positions, so the virtual --sandbox-balance counts as both the portfolio
-    value and the cash. Results go to a timestamped Excel file.
+    value and the cash. Results go to a timestamped Excel file. With
+    settings.buy_min_days_to_close set ("Skip if closing within"), the
+    time-series finder sees no market that stops trading sooner than that
+    many days after the moment the run read the markets
+    (scanner.filter_markets_closing_far_enough), as in a production run.
 
     Args:
         client: KalshiClient for the sandbox, from auth.build_client("dev").
@@ -1642,6 +1676,9 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
     # shards are dropped.
     markets = fetch_open_events_with_markets(client, inactive_shards=inactive_shards)
     logging.info("Sandbox markets fetched: %d", len(markets))
+    # The moment "Skip if closing within" counts from: taken once, as the
+    # markets are read, for the market filter below
+    looked_at = datetime.now(UTC)
 
     # Dev mode has one virtual balance, not a real per-shard breakdown, so
     # there is no balance-shard set to compare against — pass empty and let
@@ -1667,6 +1704,10 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
     # Optional opt-in cap so the finder only sees markets closing within the
     # requested window — a no-op (returns markets unchanged) when unset
     markets = filter_markets_within_horizon(markets, args.max_horizon_days)
+    # Cross-module: pair nothing a market of which stops trading within the
+    # run's "Skip if closing within" days (a no-op with the setting off), as a
+    # production run does
+    markets = filter_markets_closing_far_enough(markets, settings, now=looked_at)
 
     # Skip held-positions filter — sandbox requires a separate account and credentials.
     # Pass an empty set so _filter_active_markets does not exclude any tickers.
@@ -1793,6 +1834,19 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     whose fills or prices cannot be read, is not added to and its markets
     stay blocked.
 
+    With settings.buy_min_days_to_close set ("Skip if closing within"), the
+    run buys nothing that stops trading sooner than that many days after
+    the moment it read the markets (looked_at, taken once): right after
+    held_pairs, a held pair or lone leg with a held market closing too soon
+    (or whose close cannot be read) is taken out of the add-ons, before
+    anything is read for it, so its markets stay blocked; and after the
+    horizon cap, scanner.filter_markets_closing_far_enough takes every
+    market closing too soon out of the list the time-series finder reads,
+    which also judges a lone leg's new partner. Both ask
+    config.closes_far_enough. Sales, trims, the held-ladder lookup and the
+    add-on planner read the full market list, so the rule never holds back
+    a sale or a trim.
+
     Every run reads Kalshi's /series listing once, right after the market
     fetch (fetched again each run, so it lists the series Kalshi added
     since the last run; the cached copy only when that fetch fails, and
@@ -1904,6 +1958,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     # Fetch all open markets (every shard, tagged — only trading-inactive
     # shards are dropped) and pre-filter held tickers for downstream efficiency
     markets           = fetch_open_events_with_markets(client, inactive_shards=inactive_shards)
+    # The moment "Skip if closing within" counts from: taken once, as the
+    # markets are read, for both the add-on step and the market filter below
+    looked_at         = datetime.now(UTC)
 
     # Verify the exchange's advertised shards were actually covered by this
     # fetch BEFORE any held-ticker/horizon filtering trims the market list —
@@ -2138,6 +2195,26 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
             # partner paid out), valued at today's prices from this run's
             # market list
             add_on_pairs = held_pairs(held_positions, held_labels, markets_by_ticker)
+            # "Skip if closing within": an add-on buys more of every held market
+            # of its pair (or lone leg), so one whose held market closes too
+            # soon, or cannot be found in this run's list, is taken out here,
+            # before anything is read for it; its markets then stay blocked
+            # like any other held market's. A lone leg's new partner is not
+            # held: the market filter below judges it. Cross-module: the
+            # rule's one test, at the run's one moment
+            closing = {key for key in add_on_pairs
+                       if not closes_far_enough(
+                           (getattr(markets_by_ticker.get(ticker), "close_time", None)
+                            for ticker in key),
+                           looked_at, settings.buy_min_days_to_close)}
+            if closing:
+                lone = sum(1 for key in closing if len(key) == 1)
+                logging.info("Not adding to %d held pair(s) and %d lone leg(s) this run: a "
+                             "held market of each closes within %d days, or its close cannot "
+                             "be read (\"Skip if closing within\")", len(closing) - lone, lone,
+                             settings.buy_min_days_to_close)
+                add_on_pairs = {key: pair for key, pair in add_on_pairs.items()
+                                if key not in closing}
             # A pair whose stake (its worth at today's prices plus the fees
             # paid for it) already fills its per-trade cap of the portfolio
             # value can add nothing whatever Kelly says: it would only take
@@ -2184,6 +2261,11 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     # Optional opt-in cap so the finder only sees markets closing within the
     # requested window — a no-op (returns markets unchanged) when unset
     markets           = filter_markets_within_horizon(markets, args.max_horizon_days)
+    # Cross-module: buy and add to nothing a market of which stops trading within
+    # the run's "Skip if closing within" days. Sales, trims, held ladders and
+    # add-on planning above read the full list, so only purchases are held back
+    markets           = filter_markets_closing_far_enough(markets, settings,
+                                                          now=looked_at)
 
     # Find time-series pairs (the run's entry rule, and no pair on a ladder we
     # hold but one adding to an exact held pair or a lone held leg); none at
@@ -2524,6 +2606,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Set no minimum of days to maturity this run, whatever the saved live "
              "defaults say",
     )
+    # "Skip if closing within": LiveSettings holds it to
+    # config.BUY_MIN_DAYS_TO_CLOSE_CHOICES, and the words name those choices
+    skip_off, *skip_days = BUY_MIN_DAYS_TO_CLOSE_CHOICES
+    skip_closing = live.add_mutually_exclusive_group()
+    skip_closing.add_argument(
+        "--buy-min-days-to-close", type=int, default=None, metavar="N",
+        help="Skip if closing within N days: buy a pair, or add to a held one, only "
+             "when every market it would buy stops trading at least N days (24-hour "
+             f"spans) after this run looks: {skip_off} = off, or "
+             f"{', '.join(str(d) for d in skip_days[:-1])} or {skip_days[-1]}. Never "
+             "holds back a sale or a trim (default: the saved live defaults; a saved "
+             f"file that leaves it out reads {BUY_MIN_DAYS_TO_CLOSE_DEFAULT})",
+    )
+    skip_closing.add_argument(
+        "--no-buy-min-days-to-close", action="store_true", default=None,
+        help="Buy this run however soon a market stops trading, whatever the saved live "
+             "defaults say",
+    )
     # Filed as the backtest dashboard files a trade (_filter_by_category)
     categories = live.add_mutually_exclusive_group()
     categories.add_argument(
@@ -2623,9 +2723,11 @@ def main() -> None:
     saved, a refused file or a bad flag it exits 2) — all before logging is
     configured or any request is made — then configures logging, builds the
     Kalshi client and runs _run_dev (sandbox simulation) or _run_prod (real
-    trading). Ends with sys.exit() and the run's return code (the EXIT_*
-    constants in config.py), which the scheduler reads. An unhandled exception
-    propagates and exits 1.
+    trading). Once logging is configured it WARNs when --max-horizon-days is
+    at or below the run's "Skip if closing within" days (below, no market can
+    pass both; at equal, next to none can), and runs on. Ends with sys.exit()
+    and the run's return code (the EXIT_* constants in config.py), which the
+    scheduler reads. An unhandled exception propagates and exits 1.
 
     A production run that sends orders (--mode prod without --dry-run) first
     takes the machine-wide live-run lock (run_lock.acquire), before it builds
@@ -2718,6 +2820,28 @@ def main() -> None:
                 "portfolio value (its cash plus its open positions' value) and spends "
                 "only its cash; use --dry-run to avoid submitting orders",
             )
+
+        horizon, min_days = args.max_horizon_days, settings.buy_min_days_to_close
+        if horizon is not None and min_days is not None and horizon <= min_days:
+            # The horizon keeps the markets closing within its days of the
+            # moment it is applied; "Skip if closing within" keeps those
+            # closing at least its days after the run's moment, taken a little
+            # earlier, as the markets are read. Below, no market passes both;
+            # at equal, only one closing in that short gap does. A warning,
+            # not a refusal: a refusal would also stop a production run's
+            # sales and trims, which a dev run never makes
+            if horizon < min_days:
+                why = (f"is below this run's \"Skip if closing within\" of {min_days} days: no "
+                       f"market closes within {horizon} days and also at least {min_days} days "
+                       "after this run, so it buys nothing")
+            else:
+                why = (f"equals this run's \"Skip if closing within\" of {min_days} days: a "
+                       f"market must close at least {min_days} days after this run reads the "
+                       f"markets and at most {horizon} days after it applies the horizon, a "
+                       "little later, so it buys next to nothing")
+            logging.warning("--max-horizon-days %d %s%s", horizon, why,
+                            " (its sales and trims are not held back)"
+                            if args.mode == "prod" else "")
 
         if args.mode == "prod" and not args.dry_run:
             # The machine-wide lock every real-money run shares; None when

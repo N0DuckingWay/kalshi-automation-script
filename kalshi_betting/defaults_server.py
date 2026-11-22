@@ -29,7 +29,7 @@ Purpose:
         the seed values, config.LIVE_DEFAULTS_SEED); with fields in its
         address (from a link, --seed, or its own dropdown bar) it proposes
         those. At its top, a bar of dropdowns (the backtest page's filter
-        bar's eleven controls, in that bar's order and words) shows the
+        bar's twelve controls, in that bar's order and words) shows the
         proposal; choosing another value shows the page again proposing it,
         and nothing is written on the way. Under the bar it shows the live
         defaults in force beside the proposed ones with every change
@@ -73,7 +73,7 @@ Purpose:
     or press its buttons.
 
     Each run is its own `python -m kalshi_betting.main --mode prod` process,
-    started with all eleven toggles as explicit flags (config.live_settings_argv)
+    started with all twelve toggles as explicit flags (config.live_settings_argv)
     so it trades exactly what its page showed, in a new session (so Ctrl-C on
     this server, or closing its terminal, never reaches it), from
     config.PROJECT_ROOT, writing everything it prints to its own folder under
@@ -81,7 +81,7 @@ Purpose:
 
 Dependencies:
     Imports config and run_lock only (besides the standard library). From
-    config: LiveSettings, LIVE_TOGGLE_FIELDS (the eleven toggle names the
+    config: LiveSettings, LIVE_TOGGLE_FIELDS (the twelve toggle names the
     fingerprint reads), LiveDefaultsError (a refused saved file),
     LiveDefaultsOutdated (a file an older version saved, which carries what
     it reads as now, offered here for one more save), _RETIREMENTS (the old
@@ -96,8 +96,9 @@ Dependencies:
     their source note, the source-note pattern, the exit codes, the run
     result's format tag, the DEFAULTS_SERVER_* and SCHEDULER_* constants,
     the dropdown bar's choices (DEFAULTS_SERVER_SPREAD_BANDS,
-    DEFAULTS_SERVER_SIZE_CAPS, INTERVAL_DISCOUNT_SWEEP, MIN_PRICE_MOVES,
-    REBALANCE_MATURITY_DAYS, TAKE_PROFIT_LEVELS, TAKE_PROFIT_MIN_DAYS), the
+    DEFAULTS_SERVER_SIZE_CAPS, INTERVAL_DISCOUNT_SWEEP,
+    BUY_MIN_DAYS_TO_CLOSE_CHOICES, MIN_PRICE_MOVES, REBALANCE_MATURITY_DAYS,
+    TAKE_PROFIT_LEVELS, TAKE_PROFIT_MIN_DAYS), the
     backtest page's names file (BACKTEST_FILTER_NAMES_*),
     LIVE_DASHBOARD_ORIGINS (the only pages that may frame this server's),
     count_text (a run page writes an add-on's held count exactly) and
@@ -244,6 +245,7 @@ from .config import (
     BACKTEST_FILTER_NAMES_FILENAME,
     BACKTEST_FILTER_NAMES_FORMAT,
     BACKTEST_FILTER_NAMES_MAX_BYTES,
+    BUY_MIN_DAYS_TO_CLOSE_CHOICES,
     DEFAULTS_SERVER_CHECKOUT_MAX_BYTES,
     DEFAULTS_SERVER_CHECKOUT_TIMEOUT_SECONDS,
     DEFAULTS_SERVER_CONFIRM_ARM_MS,
@@ -300,7 +302,7 @@ from .config import (
 # the POST body; the signed text is built from exactly these, as raw strings
 _FIELDS = ("tier_floors", "spread_min", "spread_max", "k", "size_cap", "rebalance",
            "min_price_move", "rebalance_min_days_to_maturity", "sell_at", "sell_min_days",
-           "exclude_category", "exclude_tag", "source")
+           "buy_min_days_to_close", "exclude_category", "exclude_tag", "source")
 # The fields a link built by an older version could carry, in the order the
 # changes came: add_to_held_pairs, trim_to_kelly and trim_min_rise, which
 # rebalance and min_price_move replaced; category (a category to trade), which
@@ -314,7 +316,7 @@ _RETIRED_FIELDS = ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise", "categ
 _REQUIRED = ("tier_floors", "spread_min", "spread_max", "k", "size_cap")
 # The fields a request may give more than once: one per excluded category or tag named
 _REPEATABLE = ("exclude_category", "exclude_tag")
-# The largest number of fields a query or form may hold: its thirteen fields, the
+# The largest number of fields a query or form may hold: its fourteen fields, the
 # fingerprint, nonce, token, action and acknowledgement (with room to spare),
 # plus the most categories and tags a link may name; more is refused unread
 _MAX_FIELDS = 20 + 2 * DEFAULTS_SERVER_MAX_FILTER_NAMES
@@ -584,6 +586,7 @@ _SAVE_FIRST = "A dry run needs saved defaults — save these first"
 # check-box menus' labels (dashboard._MENU_CAT_LABEL and _MENU_TAG_LABEL)
 _BAR_BAND_LABEL = "Spread band"
 _BAR_SELECT_LABELS = (("tier_floors", "Tier floors"), ("k", "k"), ("size_cap", "Size cap"),
+                      ("buy_min_days_to_close", "Skip if closing within"),
                       ("rebalance", "Rebalance"), ("min_price_move", "Min. price movement"),
                       ("rebalance_min_days_to_maturity", "Rebalance until"),
                       ("sell_at", "Sell"), ("sell_min_days", "Min. days to maturity"))
@@ -1146,12 +1149,14 @@ def _proposal(params: dict[str, list[str]],
     size_cap (a fraction, e.g. 0.2). Optional: rebalance ("on"/"off"),
     min_price_move ("off" or dollars, e.g. 0.1 for 10c),
     rebalance_min_days_to_maturity (0, 1 or 7 days; 0 is "maturity", always
-    rebalance), sell_at ("off" or a share in (0, 1]) and sell_min_days ("off"
-    or whole days). One left out keeps the saved value (for a file an older
-    version saved, its value in the new form), or takes the seed's when none
-    is saved or when the link carries the seed's note, so a link with the
-    seed's note that leaves some out still proposes exactly the seed,
-    whatever is saved. The one exception: a link that names rebalance=off and
+    rebalance), sell_at ("off" or a share in (0, 1]), sell_min_days ("off"
+    or whole days) and buy_min_days_to_close ("Skip if closing within":
+    "off" or 0 for off, else 3, 7 or 14 days). One left out keeps the saved
+    value (for a file an older version saved, its value in the new form; a
+    saved file that leaves buy_min_days_to_close out reads it as 7 days), or
+    takes the seed's when none is saved or when the link carries the seed's
+    note, so a link with the seed's note that leaves some out still proposes
+    exactly the seed, whatever is saved. The one exception: a link that names rebalance=off and
     leaves rebalance_min_days_to_maturity out clears it, so a link that turns
     rebalancing off without naming the limit (what the filter bar of a
     backtest page without the "Rebalance until" choices passes the Trading
@@ -1278,6 +1283,16 @@ def _proposal(params: dict[str, list[str]],
                          else _whole_number(value["sell_min_days"], "sell_min_days"))
     else:
         sell_min_days = _kept("sell_min_days", current, source)
+    # "Skip if closing within": "off" or 0 means off (LiveSettings stores 0 as
+    # None and refuses anything but config.BUY_MIN_DAYS_TO_CLOSE_CHOICES). The
+    # bar's dropdown always names it; a link that leaves it out (one made by
+    # hand, or by a backtest page) keeps the saved value
+    if "buy_min_days_to_close" in value:
+        buy_min_days_to_close = (
+            None if value["buy_min_days_to_close"] == "off"
+            else _whole_number(value["buy_min_days_to_close"], "buy_min_days_to_close"))
+    else:
+        buy_min_days_to_close = _kept("buy_min_days_to_close", current, source)
     exclude_categories = _name_list(params, "exclude_category")
     exclude_tags = _name_list(params, "exclude_tag")
     # re.ASCII: the pattern's digits are 0-9 only, never a digit of another
@@ -1305,6 +1320,7 @@ def _proposal(params: dict[str, list[str]],
         rebalance_min_days_to_maturity=rebalance_until,
         sell_at=sell_at,
         sell_min_days=sell_min_days,
+        buy_min_days_to_close=buy_min_days_to_close,
     )
     # The seed's note names the seed values, so it may label nothing else
     if source == LIVE_DEFAULTS_SEED_SOURCE and settings != LIVE_DEFAULTS_SEED:
@@ -1320,8 +1336,9 @@ def _query_value(name: str, value: object) -> str:
     The one spelling, which _settings_query and the dropdown bar's choices
     share, and which _proposal reads back as the same value: a switch as on or
     off, a days-to-maturity limit as its days with "maturity" (None) as 0, an
-    unset minimum price movement, sell level or minimum of days as off, a
-    minimum of days as its digits and every other number as its repr (the
+    unset minimum price movement, sell level, minimum of days or "Skip if
+    closing within" days as off, a minimum of days and "Skip if closing
+    within" days as their digits, and every other number as its repr (the
     exact float).
 
     Args:
@@ -1339,7 +1356,7 @@ def _query_value(name: str, value: object) -> str:
         return str(value or 0)
     if value is None:
         return "off"
-    if name == "sell_min_days":
+    if name in ("sell_min_days", "buy_min_days_to_close"):
         return str(value)
     return repr(value)
 
@@ -1350,10 +1367,10 @@ def _settings_query(values: LiveSettings, *, source: str = "") -> str:
 
     The fields come in _FIELDS order. Numbers are written as their repr (the
     exact float, which _proposal reads back as the same number), switches as
-    on or off, an unset minimum price movement, sell level or minimum of days
-    as off, an unset days-to-maturity limit ("maturity") as 0, and each
-    excluded category and each excluded tag as a field of its own, in the
-    values' order. Every field is named, so the page proposes these
+    on or off, an unset minimum price movement, sell level, minimum of days or
+    "Skip if closing within" days as off, an unset days-to-maturity limit
+    ("maturity") as 0, and each excluded category and each excluded tag as a
+    field of its own, in the values' order. Every field is named, so the page proposes these
     settings whatever is saved.
 
     Args:
@@ -1375,6 +1392,7 @@ def _settings_query(values: LiveSettings, *, source: str = "") -> str:
         ("rebalance_min_days_to_maturity", values.rebalance_min_days_to_maturity),
         ("sell_at", values.sell_at),
         ("sell_min_days", values.sell_min_days),
+        ("buy_min_days_to_close", values.buy_min_days_to_close),
     )]
     pairs += [("exclude_category", name) for name in values.exclude_categories or ()]
     pairs += [("exclude_tag", name) for name in values.exclude_tags or ()]
@@ -1478,7 +1496,7 @@ def _fingerprint(current: LiveSettings | None,
 
     Returns:
         str: The SHA-256 hex digest of "none", of the outdated file's
-            refusal, or of the origin and the eleven toggles as JSON.
+            refusal, or of the origin and the twelve toggles as JSON.
     """
     if outdated is not None:
         proposal = outdated.proposal
@@ -2295,25 +2313,30 @@ def _bar_html(settings: LiveSettings, source: str, names: _FilterNames) -> str:
     """
     Build the trading page's dropdown bar: a GET form back to /confirm showing the proposal.
 
-    The eleven controls, in the backtest page's filter bar's order and words:
-    Spread band, Tier floors, k, Size cap, Rebalance, Min. price movement,
-    Rebalance until, Sell, Min. days to maturity, then the Exclude categories
-    and Exclude tags menus. Each dropdown offers config's grid
-    (DEFAULTS_SERVER_SPREAD_BANDS, INTERVAL_DISCOUNT_SWEEP,
-    DEFAULTS_SERVER_SIZE_CAPS, MIN_PRICE_MOVES, REBALANCE_MATURITY_DAYS,
+    The twelve controls, in the backtest page's filter bar's order and words:
+    Spread band, Tier floors, k, Size cap, Skip if closing within,
+    Rebalance, Min. price movement, Rebalance until, Sell, Min. days to
+    maturity, then the Exclude categories and Exclude tags menus. Each
+    dropdown offers config's grid (DEFAULTS_SERVER_SPREAD_BANDS,
+    INTERVAL_DISCOUNT_SWEEP, DEFAULTS_SERVER_SIZE_CAPS,
+    BUY_MIN_DAYS_TO_CLOSE_CHOICES, MIN_PRICE_MOVES, REBALANCE_MATURITY_DAYS,
     TAKE_PROFIT_LEVELS, TAKE_PROFIT_MIN_DAYS) plus the proposal's own value
     when it is off the grid, that value selected. Choices that do not apply
     are not offered: with Rebalance no, Min. price movement offers only "any"
     and Rebalance until only "maturity"; with Sell off, Min. days to
-    maturity offers only "any". The spread band dropdown has no name: two
-    hidden fields, spread_min and spread_max, carry it (the bar script
-    copies a choice into them). Each menu lists the names the proposal
-    excludes, ticked, then the names file's others (_listed), and a grey note
-    says when that file could not be used. A hidden source field keeps the
-    page's source note, but never the seed's, which may label only the seed
-    values. So the form, sent as a browser sends a GET form, names every
-    field, and asks for exactly the proposal the bar shows when it is sent
-    (the page's own, with the choices made on the bar since).
+    maturity offers only "any". "Skip if closing within" (the bot buys no
+    pair, and adds to none, whose markets stop trading within that many
+    days) depends on no other setting, so it always offers every choice of
+    BUY_MIN_DAYS_TO_CLOSE_CHOICES, its 0 as "off". The spread band dropdown
+    has no name: two hidden fields, spread_min and spread_max, carry it (the
+    bar script copies a choice into them). Each menu lists the names the
+    proposal excludes, ticked, then the names
+    file's others (_listed), and a grey note says when that file could not
+    be used. A hidden source field keeps the page's source note, but never
+    the seed's, which may label only the seed values. So the form, sent as a
+    browser sends a GET form, names every field, and asks for exactly the
+    proposal the bar shows when it is sent (the page's own, with the choices
+    made on the bar since).
 
     It is a form of its own, outside the form that posts: it only asks for
     the page again, never saves or runs anything, and has no button named
@@ -2338,7 +2361,9 @@ def _bar_html(settings: LiveSettings, source: str, names: _FilterNames) -> str:
              f"<input type=\"hidden\" name=\"spread_max\" "
              f"value=\"{_query_value('spread_max', band[1])}\">"]
     # Each dropdown's values, as LiveSettings holds them; "maturity" (0 days)
-    # is None there, and a choice that does not apply is not offered
+    # and "Skip if closing within" off (0 days) are None there, and a choice
+    # that does not apply is not offered
+    skip_days = settings.buy_min_days_to_close
     values = {
         "tier_floors": (_bar_choices((True, False), settings.tier_floors, ordered=False),
                         settings.tier_floors, "tier_floors"),
@@ -2346,6 +2371,11 @@ def _bar_html(settings: LiveSettings, source: str, names: _FilterNames) -> str:
               settings.interval_discount, "interval_discount"),
         "size_cap": (_bar_choices(DEFAULTS_SERVER_SIZE_CAPS, settings.size_cap),
                      settings.size_cap, "size_cap"),
+        # Every choice always applies: the rule reads no other setting
+        "buy_min_days_to_close": (
+            _bar_choices(tuple(days or None for days in BUY_MIN_DAYS_TO_CLOSE_CHOICES),
+                         skip_days),
+            skip_days, "buy_min_days_to_close"),
         "rebalance": (_bar_choices((False, True), settings.rebalance, ordered=False),
                       settings.rebalance, "rebalance"),
         "min_price_move": (_bar_choices((None, *MIN_PRICE_MOVES) if settings.rebalance
@@ -4269,7 +4299,7 @@ class _App:
         The one place the server starts a process. It makes the run's folder
         under config.LIVE_RUNS_DIR, writes run.json (what the run is) before
         anything starts, locks output.log and starts
-        `python -m kalshi_betting.main --mode prod` with all eleven toggles as
+        `python -m kalshi_betting.main --mode prod` with all twelve toggles as
         flags (config.live_settings_argv), --result-file in the folder and,
         for a dry run, --dry-run, from config.PROJECT_ROOT, its output going
         to output.log. The process inherits the lock through its output, so
@@ -4299,7 +4329,7 @@ class _App:
         started = datetime.now(UTC)
         folder = config.LIVE_RUNS_DIR / f"{started.strftime(_FOLDER_TIME)}-{run_id}"
         folder.mkdir(parents=True)
-        # All eleven toggles as flags, so the run trades exactly these settings
+        # All twelve toggles as flags, so the run trades exactly these settings
         argv = [sys.executable, "-m", "kalshi_betting.main", "--mode", "prod",
                 *live_settings_argv(settings), "--result-file", str(folder / _RESULT_NAME)]
         if dry_run:

@@ -2949,7 +2949,10 @@ class TestTimeSeriesKellyParity:
                      if isinstance(node, ast.FunctionDef)}
         readers = {name for name, node in functions.items()
                    if name != "_maturity_close" and _calls_to(node, "_maturity_close")}
-        assert readers == {"_find_entry", "_simulate_at_discount", "_apply_scheduled_closes"}
+        # _buy_rule_close ("Skip if closing within") reads the scheduled
+        # close only, never the realized one: see the pin below
+        assert readers == {"_find_entry", "_simulate_at_discount", "_apply_scheduled_closes",
+                           "_buy_rule_close"}
         for name in ("_can_ever_enter", "_checkpoint_floor", "_fetch_candles_parallel",
                      "_candle_window_open", "_extract_pairs", "_attach_leg_quotes",
                      "_leg_quotes", "_prepare_candidates"):
@@ -2974,6 +2977,52 @@ class TestTimeSeriesKellyParity:
         # The rule is the one market_details defines
         assert _function_calls(backtester, "_write_scheduled_close", "scheduled_close")
         assert _function_calls(backtester, "_prepare_candidates", "load_close_rules")
+
+    def test_ast_the_buy_rule_never_reads_the_recorded_close(self):
+        # "Skip if closing within" judges a settled market on its scheduled
+        # close where carried, else the start of the last day its wording
+        # includes, and NEVER on the close Kalshi recorded (close_time): a
+        # market whose event happened early closed early, so reading that
+        # close would read the outcome. Neither of the two functions that
+        # work the close out names "close_time", parses a time
+        # (_parse_iso_*), or reads _maturity_close without scheduled_only=True
+        tree = ast.parse(inspect.getsource(backtester))
+        functions = {node.name: node for node in ast.walk(tree)
+                     if isinstance(node, ast.FunctionDef)}
+        for name in ("_buy_rule_close", "_wording_close"):
+            func = functions[name]
+            strings = {n.value for n in ast.walk(func)
+                       if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+            assert "close_time" not in strings, name
+            names = {n.id for n in ast.walk(func) if isinstance(n, ast.Name)} | {
+                n.attr for n in ast.walk(func) if isinstance(n, ast.Attribute)}
+            assert not {n for n in names if n.startswith("_parse_iso")}, name
+            for call in _calls_to(func, "_maturity_close"):
+                keywords = {k.arg: ast.unparse(k.value) for k in call.keywords}
+                assert keywords == {"scheduled_only": "True"}, (name, keywords)
+        # _buy_rule_close reads the schedule, then the wording, and nothing else
+        assert len(_calls_to(functions["_buy_rule_close"], "_maturity_close")) == 1
+        assert _function_calls(backtester, "_buy_rule_close", "_wording_close")
+        assert not _calls_to(functions["_wording_close"], "_maturity_close")
+        # The wording's day comes from the one definition the ladder rule
+        # shares with the live finder (scanner.stated_deadline)
+        assert _function_calls(backtester, "_wording_close", "_stated_deadline_dict")
+        assert _function_calls(backtester, "_stated_deadline_dict", "stated_deadline")
+        # _find_entry reads the rule's closes only through _buy_rule_close, and
+        # its own other _maturity_close read is for the run log's count alone,
+        # with scheduled_only=True too
+        find = functions["_find_entry"]
+        [buy_closes] = [n for n in ast.walk(find) if isinstance(n, ast.Assign)
+                        and [ast.unparse(t) for t in n.targets] == ["buy_closes"]]
+        assert [ast.unparse(c) for c in _calls_to(buy_closes, "_buy_rule_close")] == [
+            "_buy_rule_close(mA)", "_buy_rule_close(mB)"]
+        scheduled_only = [c for c in _calls_to(find, "_maturity_close")
+                          if any(k.arg == "scheduled_only" for k in c.keywords)]
+        assert [ast.unparse(c) for c in scheduled_only] == [
+            "_maturity_close(m, scheduled_only=True)"]
+        [counted] = [n for n in ast.walk(find) if isinstance(n, ast.Assign)
+                     and [ast.unparse(t) for t in n.targets] == ["from_wording"]]
+        assert _calls_to(counted, "_maturity_close") == scheduled_only
 
     def test_ast_the_backtest_looks_for_time_series_pairs_only(self):
         # The backtest finds no same-title pairs: _prepare_candidates groups
@@ -3284,6 +3333,7 @@ class TestTimeSeriesKellyParity:
             "REBALANCE_MIN_DAYS_TO_MATURITY",
             "SELL_AT",
             "SELL_MIN_DAYS",
+            "BUY_MIN_DAYS_TO_CLOSE",
         } | self._SAVED_FILE_INTERNALS
         # Every toggle constant config.live_settings() builds the toggles from is
         # forbidden, one per toggle, so a toggle added there cannot slip past
@@ -3361,7 +3411,8 @@ class TestTimeSeriesKellyParity:
                 "_evaluate_size", "_solve_marginal_size", "_kelly_p",
                 "_compute_trade_specs", "_no_pairs_msg", "_log_live_settings",
                 "describe_live_settings", "live_rule_warnings", "_filter_by_category",
-                "describe_trade_filter"} <= set(takes_settings)
+                "describe_trade_filter", "filter_markets_closing_far_enough"} <= set(
+                    takes_settings)
         # _kelly_p_at's k is required: a default would price at config's k
         kelly_p_at = next(n for n in ast.walk(trees["strategy"])
                           if isinstance(n, ast.FunctionDef) and n.name == "_kelly_p_at")
@@ -5528,6 +5579,220 @@ class TestTimeSeriesKellyParity:
         callers = {func.name for func in ast.walk(tree) if isinstance(func, ast.FunctionDef)
                    and _calls_to(func, "_too_near_maturity")}
         assert callers == {"plan_trims", "plan_add_ons"}
+
+    def test_ast_skip_if_closing_within_decides_through_one_definition(self):
+        # "Skip if closing within": the market filter both run modes hand the
+        # time-series finder, and _run_prod's add-on step, decide through
+        # config.closes_far_enough, the one definition of the rule, with the
+        # run's own value of the setting and the run's one moment. The filter
+        # sits below every sale, trim, ladder and add-on read of the full
+        # market list, after the held-market drop and the horizon cap and
+        # before the finder, which reads the filtered list itself, so it holds
+        # back purchases only
+        assert scanner.closes_far_enough is config.closes_far_enough
+        assert main.closes_far_enough is config.closes_far_enough
+        assert main.filter_markets_closing_far_enough is scanner.filter_markets_closing_far_enough
+        assert _function_calls(scanner, "filter_markets_closing_far_enough",
+                               "closes_far_enough")
+        tree = ast.parse(inspect.getsource(main))
+        funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                 and n.name in ("_run_prod", "_run_dev")}
+        for name, func in funcs.items():
+            # The moment, taken once, right after the market fetch
+            moments = [n for n in ast.walk(func) if isinstance(n, ast.Assign)
+                       and [ast.unparse(t) for t in n.targets] == ["looked_at"]]
+            assert [ast.unparse(n.value) for n in moments] == ["datetime.now(UTC)"], name
+            [fetch] = _calls_to(func, "fetch_open_events_with_markets")
+            assert fetch.lineno < moments[0].lineno, name
+            # The filter: once, with the run's bare `settings` and that moment,
+            # after the horizon cap and before the finder
+            [filt] = _calls_to(func, "filter_markets_closing_far_enough")
+            assert [ast.unparse(a) for a in filt.args] == ["markets", "settings"], name
+            assert {k.arg: ast.unparse(k.value) for k in filt.keywords} == {
+                "now": "looked_at"}, name
+            [horizon] = _calls_to(func, "filter_markets_within_horizon")
+            [finder] = _calls_to(func, "find_time_series_pairs")
+            assert moments[0].lineno < horizon.lineno < filt.lineno < finder.lineno, name
+            # ... and its result is the list the finder reads: assigned to
+            # `markets`, handed to the finder as that bare name (prod: its
+            # third positional argument; dev: its `markets` keyword), and
+            # assigned nowhere in between
+            [assigned] = [n for n in ast.walk(func) if isinstance(n, ast.Assign)
+                          and n.value is filt]
+            assert [ast.unparse(t) for t in assigned.targets] == ["markets"], name
+            if name == "_run_dev":
+                handed = {k.arg: k.value for k in finder.keywords}.get("markets")
+            else:
+                handed = finder.args[2] if len(finder.args) > 2 else None
+            assert isinstance(handed, ast.Name) and handed.id == "markets", name
+            rebound = [n.lineno for n in ast.walk(func) if isinstance(n, ast.Name)
+                       and n.id == "markets" and isinstance(n.ctx, (ast.Store, ast.Del))
+                       and assigned.end_lineno < n.lineno < finder.lineno]
+            assert rebound == [], name
+        prod = funcs["_run_prod"]
+        [filt] = _calls_to(prod, "filter_markets_closing_far_enough")
+        # Below the held-market drop, and every read of the full list
+        [drop] = [n for n in ast.walk(prod) if isinstance(n, ast.Assign)
+                  and [ast.unparse(t) for t in n.targets] == ["markets"]
+                  and "blocked_tickers" in ast.unparse(n.value)]
+        assert drop.lineno < filt.lineno
+        for callee in ("resolve_held_ladders", "plan_sales", "plan_trims", "sell_positions",
+                       "held_pairs", "plan_add_ons"):
+            assert all(call.lineno < filt.lineno for call in _calls_to(prod, callee)), callee
+        # The add-on step: once, after held_pairs builds what the run may add to
+        # and before the at-cap drop, the sale drops and plan_add_ons, with
+        # each held market's close from the full list, the run's moment and
+        # the run's own value of the setting
+        [step] = _calls_to(prod, "closes_far_enough")
+        [pairs] = _calls_to(prod, "held_pairs")
+        [add_ons] = _calls_to(prod, "plan_add_ons")
+        [cap] = _calls_to(prod, "held_pair_fraction")
+        assert pairs.lineno < step.lineno < cap.lineno < add_ons.lineno
+        assert [ast.unparse(a) for a in step.args[1:]] == [
+            "looked_at", "settings.buy_min_days_to_close"]
+        assert "markets_by_ticker" in ast.unparse(step.args[0])
+        assert not step.keywords
+        # ... whose verdict takes pairs out of add_on_pairs before the planner reads it
+        drops = [n for n in ast.walk(prod) if isinstance(n, ast.Assign)
+                 and [ast.unparse(t) for t in n.targets] == ["add_on_pairs"]
+                 and "closing" in {x.id for x in ast.walk(n.value) if isinstance(x, ast.Name)}]
+        assert len(drops) == 1 and step.lineno < drops[0].lineno < add_ons.lineno
+        # The setting's value comes only from the run's settings: no rule site
+        # names a constant of it (its default or its choices), so off can never
+        # read as 7. main names them only in the flag help (_build_parser)
+        for module, allowed in ((main, {"_build_parser"}), (scanner, set())):
+            module_tree = ast.parse(inspect.getsource(module))
+            for func in ast.walk(module_tree):
+                if not isinstance(func, ast.FunctionDef):
+                    continue
+                named = {n.id for n in ast.walk(func) if isinstance(n, ast.Name)
+                         and n.id.startswith("BUY_MIN_DAYS_TO_CLOSE")}
+                if func.name not in allowed:
+                    assert not named, (module.__name__, func.name, named)
+        for func_name in ("_run_prod", "_run_dev", "_no_pairs_msg", "main"):
+            reads = {ast.unparse(n) for n in ast.walk(_def_named(inspect.getsource(main),
+                                                                func_name))
+                     if isinstance(n, ast.Attribute) and n.attr == "buy_min_days_to_close"}
+            assert reads <= {"settings.buy_min_days_to_close"}, (func_name, reads)
+
+        # The backtest's half: _find_entry decides through the same function,
+        # once per Monday, as the LAST test before a Monday is recorded, with
+        # each leg's _buy_rule_close, the Monday's checkpoint and the run's
+        # minimum, skipping only that Monday (`continue`)
+        assert backtester.closes_far_enough is config.closes_far_enough
+        find = _def_named(inspect.getsource(backtester), "_find_entry")
+        deciding = [c for c in _calls_to(find, "closes_far_enough")
+                    if [ast.unparse(a) for a in c.args]
+                    == ["buy_closes", "moment", "min_days_to_close"]]
+        assert len(deciding) == 1 and not deciding[0].keywords
+        [loop] = [n for n in ast.walk(find) if isinstance(n, ast.For)
+                  and ast.unparse(n.target) == "(ts, ca, cb)"]
+        [moment] = [n for n in loop.body if isinstance(n, ast.Assign)
+                    and [ast.unparse(t) for t in n.targets] == ["moment"]]
+        assert ast.unparse(moment.value) == "datetime.fromtimestamp(ts, tz=UTC)"
+        [append] = [i for i, n in enumerate(loop.body) if isinstance(n, ast.Expr)
+                    and ast.unparse(n.value).startswith("mondays.append(")]
+        rule = loop.body[append - 1]
+        assert isinstance(rule, ast.If) and ast.unparse(rule.test) == (
+            "not closes_far_enough(buy_closes, moment, min_days_to_close)")
+        assert isinstance(rule.body[-1], ast.Continue) and not rule.orelse
+        # Every other closes_far_enough call in _find_entry is inside that
+        # branch (the run log's per-leg count), never a second decision
+        inside = {id(c) for c in _calls_to(rule, "closes_far_enough")}
+        assert all(id(c) in inside for c in _calls_to(find, "closes_far_enough"))
+        assert not [n for n in ast.walk(find) if isinstance(n, ast.Return)
+                    and n.lineno > rule.lineno and n.lineno <= rule.end_lineno]
+        # The minimum is the run's one resolved value, read from the
+        # candidates by the one caller and resolved once per run, or the one
+        # choice a pass names for itself (the other choices' entries, where
+        # 0 is off)
+        (value,) = _keyword_values(backtester, "_entries_for_band", "_find_entry",
+                                   "min_days_to_close")
+        assert ast.unparse(value) == "min_days"
+        passes = _def_named(inspect.getsource(backtester), "_entries_for_band")
+        [chosen] = [n for n in ast.walk(passes) if isinstance(n, ast.Assign)
+                    and [ast.unparse(t) for t in n.targets] == ["min_days"]]
+        assert ast.unparse(chosen.value) == (
+            "candidates.buy_min_days_to_close if _close_days is None else _close_days or None")
+        assert _function_calls(backtester, "_prepare_candidates",
+                               "_resolve_buy_min_days_to_close")
+        assert _function_calls(backtester, "run_backtest_sweep",
+                               "_resolve_buy_min_days_to_close")
+        # ... and the default is read nowhere but the resolver (and the
+        # setting line's source clause names it only as text)
+        backtester_tree = ast.parse(inspect.getsource(backtester))
+        named = {func.name for func in ast.walk(backtester_tree)
+                 if isinstance(func, ast.FunctionDef)
+                 and any(isinstance(n, ast.Name) and n.id == "BUY_MIN_DAYS_TO_CLOSE_DEFAULT"
+                         for n in ast.walk(func))}
+        assert named == {"_resolve_buy_min_days_to_close"}
+        # ... and _find_entry is the only place the backtest applies it: no
+        # other backtester code names closes_far_enough or _buy_rule_close
+        # (as a call or as a value), and only _buy_rule_close names
+        # _wording_close, so the rule cannot be applied a second time
+        # elsewhere, on some other close
+        parents = {id(child): node for node in ast.walk(backtester_tree)
+                   for child in ast.iter_child_nodes(node)}
+
+        def users(name: str) -> set[str]:
+            found = set()
+            for node in ast.walk(backtester_tree):
+                if ((isinstance(node, ast.Name) and node.id == name)
+                        or (isinstance(node, ast.Attribute) and node.attr == name)):
+                    owner = parents.get(id(node))
+                    while owner is not None and not isinstance(
+                            owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        owner = parents.get(id(owner))
+                    found.add("<module>" if owner is None else owner.name)
+            return found
+
+        assert users("closes_far_enough") == {"_find_entry"}
+        assert users("_buy_rule_close") == {"_find_entry"}
+        assert users("_wording_close") == {"_buy_rule_close"}
+
+    def test_ast_only_the_other_choices_passes_name_a_close_choice(self):
+        # _entries_for_band's private _close_days makes one pass apply a
+        # "Skip if closing within" choice other than the run's own. Only the
+        # code that finds the other choices' entries names it:
+        # _close_choice_entries (a band sweep's, once per Tier floors
+        # setting) and _sweep_from_candidates' branch for a run without a
+        # band sweep. Every other pass, the run's own included, leaves it
+        # out and applies the run's minimum
+        functions = {node.name: node for node in ast.walk(ast.parse(inspect.getsource(backtester)))
+                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        naming: dict[str, list] = {}
+        for name, func in functions.items():
+            for call in _calls_to(func, "_entries_for_band"):
+                if any(k.arg == "_close_days" for k in call.keywords):
+                    naming.setdefault(name, []).append(call)
+        assert set(naming) == {"_close_choice_entries", "_sweep_from_candidates"}
+
+        def chosen(call: ast.Call) -> str:
+            return next(ast.unparse(k.value) for k in call.keywords if k.arg == "_close_days")
+
+        # _close_choice_entries: its one scan with no minimum (0 is off), and
+        # each choice's rescans, looping over the choices it was handed
+        assert sorted(chosen(c) for c in naming["_close_choice_entries"]) == ["0", "days"]
+        choices = functions["_close_choice_entries"]
+        [loop] = [n for n in ast.walk(choices) if isinstance(n, ast.For)
+                  and ast.unparse(n.target) == "days"]
+        assert ast.unparse(loop.iter) == "close_days"
+        # _sweep_from_candidates: one call, inside the branch a run without a
+        # band sweep takes for the other choices, once per choice
+        sweep = functions["_sweep_from_candidates"]
+        [branch] = [n for n in ast.walk(sweep) if isinstance(n, ast.If)
+                    and ast.unparse(n.test) == "close_days and (not band_sweep)"]
+        [loop] = [n for n in branch.body if isinstance(n, ast.For)]
+        assert (ast.unparse(loop.target), ast.unparse(loop.iter)) == ("days", "close_days")
+        [call] = naming["_sweep_from_candidates"]
+        assert call in [c for stmt in loop.body for c in _calls_to(stmt, "_entries_for_band")]
+        assert chosen(call) == "days"
+        # ... and the choices it loops over are the resolver's, with the
+        # family on only
+        [assigned] = [n for n in ast.walk(sweep) if isinstance(n, ast.Assign)
+                      and [ast.unparse(t) for t in n.targets] == ["close_days"]]
+        assert ast.unparse(assigned.value) == (
+            "_resolve_close_choices(candidates.buy_min_days_to_close) if close_sweep else ()")
 
     def test_ast_the_backtest_reads_ladders_through_the_one_definition(self):
         # The backtest's one-open-trade-per-ladder rule labels each market

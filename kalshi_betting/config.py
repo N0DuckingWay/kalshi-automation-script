@@ -562,12 +562,12 @@ KELLY_TRIM_MAX_BID_DROP = 0.20
 
 # ── Live trading toggles ──────────────────────────────────────────────────────
 #
-# Eleven live toggles (TIME_SERIES_TIER_FLOORS, TIME_SERIES_SPREAD_BAND,
+# Twelve live toggles (TIME_SERIES_TIER_FLOORS, TIME_SERIES_SPREAD_BAND,
 # TRADE_EXCLUDE_CATEGORIES, TRADE_EXCLUDE_TAGS, REBALANCE, MIN_PRICE_MOVE,
-# REBALANCE_MIN_DAYS_TO_MATURITY, SELL_AT and SELL_MIN_DAYS below; k and
-# BUDGET_FRACTION above). They are NOT the live defaults: a live run starts
-# only from the saved ones (LIVE_DEFAULTS_FILE, below) and
-# never falls back to these. k and BUDGET_FRACTION are also the backtest's k and
+# REBALANCE_MIN_DAYS_TO_MATURITY, SELL_AT, SELL_MIN_DAYS and
+# BUY_MIN_DAYS_TO_CLOSE below; k and BUDGET_FRACTION above). They are NOT the
+# live defaults: a live run starts only from the saved ones (LIVE_DEFAULTS_FILE,
+# below) and never falls back to these. k and BUDGET_FRACTION are also the backtest's k and
 # per-trade cap (backtester binds both by value, backtest binds k). All of them
 # are what live_settings() returns: the settings a live entry point
 # falls back to when a caller hands it none, which only tests and direct
@@ -674,6 +674,25 @@ REBALANCE_MATURITY_DAYS = (0, 1, 7)
 # N / --no-rebalance-min-days-to-maturity for one run).
 REBALANCE_MIN_DAYS_TO_MATURITY: int | None = None
 
+# "Skip if closing within": the fewest days (24-hour spans) from the moment
+# the bot looks to the close (when trading stops) of every market a purchase
+# would buy, a new pair or an add-on to a held one. Sales and trims never read
+# it. A live run applies it through closes_far_enough, and so does the
+# backtest, at each Monday entry checkpoint (backtester._find_entry). The
+# choices LiveSettings.buy_min_days_to_close accepts, and backtest.py's
+# --buy-min-days-to-close too; 0 is "Off", stored as None.
+BUY_MIN_DAYS_TO_CLOSE_CHOICES = (0, 3, 7, 14)
+# The one-week default: what a saved live defaults file that leaves the
+# setting out (one saved before it existed) reads as, what the seed proposes
+# for a first save (LIVE_DEFAULTS_SEED), and the backtest's main value: a
+# backtest run applies it unless backtest.py says otherwise for that run
+# (backtester binds it by value, so a test patches backtester's binding).
+BUY_MIN_DAYS_TO_CLOSE_DEFAULT = 7
+# config.py's own value of the toggle, read only by live_settings() (tests and
+# direct library calls); a live run reads the saved live defaults instead
+# (main.py --buy-min-days-to-close N / --no-buy-min-days-to-close for one run).
+BUY_MIN_DAYS_TO_CLOSE: int | None = None
+
 # The share of its potential profit at which a held position is sold, on the
 # 1% grid (SELL_AT_STEP) in (0, 1], or None to never sell. A live run reads the
 # saved live defaults' sell_at instead (main.py --sell-at / --no-sell for one run).
@@ -744,8 +763,10 @@ LIVE_EXPOSURE_WARN_FRACTION = 0.20
 
 # ── Saved live defaults ───────────────────────────────────────────────────────
 
-# The live defaults every live run starts from: one JSON record of the eleven
-# live toggles (any of _OPTIONAL_TOGGLES may be left out, and then reads as off),
+# The live defaults every live run starts from: one JSON record of the twelve
+# live toggles (any of _OPTIONAL_TOGGLES may be left out, and then reads as off,
+# except buy_min_days_to_close, which then reads as BUY_MIN_DAYS_TO_CLOSE_DEFAULT,
+# 7 days: _UNSAVED_TOGGLE_VALUES),
 # saved through defaults_server's confirmation page
 # (python3 -m kalshi_betting.defaults_server; its --seed proposes
 # LIVE_DEFAULTS_SEED for a first save). save_live_defaults writes it, on that
@@ -994,13 +1015,12 @@ BACKTEST_SWEEP_FILENAME = "backtest_sweep.pkl.gz"
 # A rebuild refuses a file with any other tag; change it whenever the line's
 # keys, the pickled inputs' keys or the fields of the classes pickled in them
 # (BacktestSweep and the lazy families it holds) change, so an older file is
-# refused rather than misread. v7: the backtest simulates time-series pairs
-# only, so BacktestSweep lost same_title_point, same_title_size_cap and
-# live_same_title_size_cap, CapSweep lost st_entries and same_title_eager,
-# and ExtraDataReport lost its four same-title counts (strikes_differ,
-# strikes_checked, sources_differ, sources_checked); v6 files, from before,
-# are refused.
-BACKTEST_SWEEP_FORMAT = "backtest-sweep-v7"
+# refused rather than misread. v9: BacktestSweep gained close_sweep, the
+# lazy family holding the other "Skip if closing within" choices' entries
+# and results (backtester.CloseSweep); v8 files, from before, are refused.
+# (v8 added buy_min_days_to_close, the run's own value, and
+# live_buy_min_days_to_close, the saved live defaults' value.)
+BACKTEST_SWEEP_FORMAT = "backtest-sweep-v9"
 
 # The most bytes a rebuild reads for the saved sweep file's first line (the
 # JSON one): the real line is a few hundred bytes, so a file that runs past
@@ -3548,6 +3568,18 @@ class LiveSettings:
         sell_min_days (int | None): The fewest whole days (an int, 1 or more)
             a position must have left before its last market stops trading to
             be sold; None (default) is no minimum. Refused without sell_at.
+        buy_min_days_to_close (int | None): "Skip if closing within": the
+            fewest days (24-hour spans) from the moment a run looks to the
+            close of every market a purchase would buy, a new pair or an
+            add-on to a held one; sales and trims never read it. 3, 7 or 14
+            (BUY_MIN_DAYS_TO_CLOSE_CHOICES); a 0 given in is stored as None.
+            None (default) is "Off": no minimum. A real int: a bool, a float
+            such as 7.0 or a numpy integer is refused. A saved file that
+            leaves it out (one saved before the setting existed) reads it as
+            BUY_MIN_DAYS_TO_CLOSE_DEFAULT, 7 days, not as off. A live run
+            applies it through closes_far_enough; the backtest applies the
+            same test at each Monday checkpoint, at its own value of the
+            setting (backtester._find_entry), never this field.
         origin (str): Where these toggles' defaults were read: the saved defaults
             file with when (and from what) it was saved, or LIVE_DEFAULTS_FROM_CONFIG
             for toggles built from this module's constants (the default).
@@ -3571,6 +3603,7 @@ class LiveSettings:
     rebalance_min_days_to_maturity: int | None = None
     sell_at: float | None = None
     sell_min_days: int | None = None
+    buy_min_days_to_close: int | None = None
     origin: str = field(default=LIVE_DEFAULTS_FROM_CONFIG, compare=False)
 
     def __post_init__(self) -> None:
@@ -3642,6 +3675,17 @@ class LiveSettings:
             if self.sell_at is None:
                 raise ValueError("sell_min_days needs a sell level (sell_at), got "
                                  f"sell_min_days {self.sell_min_days!r} with sell_at None")
+        days = self.buy_min_days_to_close
+        # type() is int refuses a bool, a float such as 7.0 and a numpy integer
+        if type(days) is int and days == 0:
+            # 0 days is "Off": no minimum, which is None
+            object.__setattr__(self, "buy_min_days_to_close", None)
+        elif days is not None and (type(days) is not int
+                                   or days not in BUY_MIN_DAYS_TO_CLOSE_CHOICES):
+            off, *choices = BUY_MIN_DAYS_TO_CLOSE_CHOICES
+            raise ValueError("buy_min_days_to_close must be "
+                             f"{', '.join(str(d) for d in choices[:-1])} or {choices[-1]} "
+                             f"days, or {off} for off, got {days!r}")
         # One printable line: no newline, control, zero-width or text-direction
         # character, so it prints on one log line and cannot pass for other
         # text. Printable is not HTML-safe: a web page must still escape it
@@ -3650,15 +3694,21 @@ class LiveSettings:
             raise ValueError(f"origin must be a printable description, got {self.origin!r}")
 
 
-# The eleven toggles by field name: every LiveSettings field except origin
+# The twelve toggles by field name: every LiveSettings field except origin
 LIVE_TOGGLE_FIELDS = tuple(f.name for f in fields(LiveSettings) if f.compare)
 
 # Toggles a saved file may leave out. A missing one reads as its LiveSettings
 # default (all off, whatever config.py ships), since nobody confirmed a value
-# for it in that file. save_live_defaults leaves one out while it is at its
-# default.
+# for it in that file, except a toggle in _UNSAVED_TOGGLE_VALUES.
+# save_live_defaults leaves one out while it is at its default, except those.
 _OPTIONAL_TOGGLES = ("rebalance", "min_price_move", "rebalance_min_days_to_maturity",
-                     "sell_at", "sell_min_days")
+                     "sell_at", "sell_min_days", "buy_min_days_to_close")
+# The optional toggles a file that leaves them out reads as something other
+# than off, and what each then reads as: "Skip if closing within" reads as
+# 7 days in a file saved before the setting existed. save_live_defaults always
+# writes these keys (null for off), so a file saved with one off reads back
+# off, and only a file saved before the setting leaves one out.
+_UNSAVED_TOGGLE_VALUES = {"buy_min_days_to_close": BUY_MIN_DAYS_TO_CLOSE_DEFAULT}
 # Each of those toggles' LiveSettings default
 _TOGGLE_DEFAULTS = {f.name: f.default for f in fields(LiveSettings)
                     if f.name in _OPTIONAL_TOGGLES}
@@ -3705,7 +3755,10 @@ _RETIRED_FILTER_COMPANIONS = {
 # first save of the live defaults: tier floors off, spread band 0-0.5, k 0.80,
 # a 10% per-trade cap, no category or tag excluded, rebalancing
 # on with no minimum price movement and no limit on how close to maturity (the
-# days to maturity read "maturity"), and no selling. One pair stakes at most
+# days to maturity read "maturity"), no selling, and "Skip if closing within"
+# at 7 days (BUY_MIN_DAYS_TO_CLOSE_DEFAULT: a pair is bought or added to only
+# when each of its markets stops trading at least 7 days after the run looks).
+# One pair stakes at most
 # 10% of the portfolio value; an add-on to a held pair stakes no more than a
 # new pair would, and keeps the held pair (at today's prices, plus the fees
 # paid for it) and the add-on together within 10% of the portfolio value, and
@@ -3715,7 +3768,8 @@ _RETIRED_FILTER_COMPANIONS = {
 # until they are confirmed and saved to LIVE_DEFAULTS_FILE.
 LIVE_DEFAULTS_SEED = LiveSettings(
     tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.80,
-    size_cap=0.10, exclude_categories=None, exclude_tags=None, rebalance=True)
+    size_cap=0.10, exclude_categories=None, exclude_tags=None, rebalance=True,
+    buy_min_days_to_close=BUY_MIN_DAYS_TO_CLOSE_DEFAULT)
 
 
 class LiveDefaultsError(ValueError):
@@ -3757,8 +3811,11 @@ class LiveDefaultsOutdated(LiveDefaultsError):
             on only when both old switches were on, min_price_move the old
             minimum then (otherwise none), no category excluded in place of
             old categories, no tag excluded in place of old tags, no
-            same-title cap, every other setting as saved. None when the old
-            values break the older version's own rules (_old_categories,
+            same-title cap, every other setting as saved; a setting the
+            file leaves out reads as any saved file's does, so "Skip if
+            closing within" (buy_min_days_to_close, which no older version
+            saved) reads as BUY_MIN_DAYS_TO_CLOSE_DEFAULT, 7 days. None
+            when the old values break the older version's own rules (_old_categories,
             _old_tags and the old same-title cap's grid among them), when the
             file holds another retired setting but no same-title cap (every
             older version saved one), or when the rest of the file is refused
@@ -3844,7 +3901,7 @@ class _RetiredSettings(ValueError):
 
 def live_settings() -> LiveSettings:
     """
-    Return config.py's own eleven toggle constants as LiveSettings, validated.
+    Return config.py's own twelve toggle constants as LiveSettings, validated.
 
     Read at call time, so a test that monkeypatches a constant here takes
     effect. It is NOT the live defaults: a live run starts only from the saved
@@ -3872,6 +3929,7 @@ def live_settings() -> LiveSettings:
         rebalance_min_days_to_maturity=REBALANCE_MIN_DAYS_TO_MATURITY,
         sell_at=SELL_AT,
         sell_min_days=SELL_MIN_DAYS,
+        buy_min_days_to_close=BUY_MIN_DAYS_TO_CLOSE,
     )
 
 
@@ -3975,13 +4033,16 @@ def _settings_from_toggles(raw, origin: str) -> LiveSettings:
     """
     Turn a saved file's "settings" object into LiveSettings, or refuse it.
 
-    Checks what LiveSettings cannot see in JSON: exactly the eleven toggle
+    Checks what LiveSettings cannot see in JSON: exactly the twelve toggle
     names (a toggle in _OPTIONAL_TOGGLES may be left out, and then takes its
-    LiveSettings default, off), a spread band of two real numbers
-    (LiveSettings would read a JSON true as 1), no JSON true or false as a
-    sell level, minimum of days, minimum price move or rebalance-until days
-    (refused here so the error names the field), and printable filter names.
-    LiveSettings then validates every value.
+    LiveSettings default, off, except buy_min_days_to_close, which a file
+    saved before it existed leaves out and which then reads as
+    BUY_MIN_DAYS_TO_CLOSE_DEFAULT, 7 days: _UNSAVED_TOGGLE_VALUES), a spread
+    band of two real numbers (LiveSettings would read a JSON true as 1), no
+    JSON true or false as a sell level, minimum of days, minimum price move,
+    rebalance-until days or skip-if-closing-within days (refused here so the
+    error names the field), and printable filter names. LiveSettings then
+    validates every value.
 
     Args:
         raw: The file's "settings" value, as json.loads returned it.
@@ -3996,21 +4057,28 @@ def _settings_from_toggles(raw, origin: str) -> LiveSettings:
     # Every toggle but the optional ones is required; nothing else is allowed
     required = set(LIVE_TOGGLE_FIELDS) - set(_OPTIONAL_TOGGLES)
     if not isinstance(raw, dict) or not required <= set(raw) <= set(LIVE_TOGGLE_FIELDS):
+        # The optional toggles a missing key does not read as off, by name
+        exceptions = ", ".join(f"{name}, which reads as {value}"
+                               for name, value in _UNSAVED_TOGGLE_VALUES.items())
         raise ValueError(f'"settings" must hold exactly {", ".join(LIVE_TOGGLE_FIELDS)} '
                          f'({", ".join(_OPTIONAL_TOGGLES)} may be left out, and then '
-                         "each reads as off)")
+                         f"each reads as off, except {exceptions})")
     band = raw["spread_band"]
     if not (isinstance(band, list) and len(band) == 2 and all(
             isinstance(x, (int, float)) and not isinstance(x, bool) for x in band)):
         raise ValueError(f'"spread_band" must be [floor, ceiling], got {band!r}')
     # LiveSettings refuses a JSON true or false too; refusing it here names the field
     for name in ("sell_at", "sell_min_days", "min_price_move",
-                 "rebalance_min_days_to_maturity"):
+                 "rebalance_min_days_to_maturity", "buy_min_days_to_close"):
         if isinstance(raw.get(name), bool):
             raise ValueError(f'"{name}" must be a number or null, got {raw[name]!r}')
     for name in ("exclude_categories", "exclude_tags"):
         _filter_names(raw[name], name)
-    return LiveSettings(**{**raw, "spread_band": tuple(band)}, origin=origin)
+    # A toggle left out by a file saved before it existed reads as the value
+    # chosen for such files, not as off
+    unsaved = {name: value for name, value in _UNSAVED_TOGGLE_VALUES.items()
+               if name not in raw}
+    return LiveSettings(**{**unsaved, **raw, "spread_band": tuple(band)}, origin=origin)
 
 
 def _old_categories(raw: dict) -> tuple[str, ...] | None:
@@ -4154,8 +4222,11 @@ def _retired_proposal(raw: dict, origin: str
     grid in (0, 1], never a JSON true or false), so the file must hold one
     beside any other retired setting, and it must pass that rule. Every other
     setting is as saved, and the result must pass every check a saved file
-    does (_settings_from_toggles). Those checks come before the old cap's, so
-    when another setting is broken too, that setting is the one named.
+    does (_settings_from_toggles), which also reads a setting the file leaves
+    out as a saved file's: buy_min_days_to_close, which no older version
+    saved, as BUY_MIN_DAYS_TO_CLOSE_DEFAULT (7 days). Those checks come
+    before the old cap's, so when another setting is broken too, that
+    setting is the one named.
 
     Args:
         raw (dict): The file's "settings" object, holding one or more of
@@ -4430,7 +4501,7 @@ def read_saved_live_defaults() -> LiveSettings | None:
     - "format": LIVE_DEFAULTS_FORMAT;
     - "saved_at": UTC, e.g. 2026-09-27T21:05:13Z;
     - "source": a note (live_defaults_source's rules);
-    - "settings": the eleven toggles by LiveSettings field name. tier_floors is
+    - "settings": the twelve toggles by LiveSettings field name. tier_floors is
       true/false, spread_band is [floor, ceiling], interval_discount and
       size_cap are numbers (the cap as a fraction),
       exclude_categories is null (none excluded) or a list of names,
@@ -4440,6 +4511,9 @@ def read_saved_live_defaults() -> LiveSettings | None:
       rebalance_min_days_to_maturity is 1 or 7 (days), or null or left out for
       "maturity" (always rebalance). sell_at (a share, e.g. 0.85) and
       sell_min_days (whole days) are numbers, or null or left out for off.
+      buy_min_days_to_close is 3, 7 or 14 (days), or null for off; left out
+      (a file saved before the setting existed) it reads as 7
+      (BUY_MIN_DAYS_TO_CLOSE_DEFAULT).
 
     Refused on top of that: a repeated key, NaN or Infinity, a file over
     LIVE_DEFAULTS_MAX_BYTES, any value LiveSettings rejects, and anything at
@@ -4600,13 +4674,20 @@ def save_live_defaults(settings: LiveSettings, *, source: str) -> LiveSettings:
     this process id, flushed, and renamed over the file, so a reader at the
     same moment sees the old file or the new one, never part of one. The
     directory is flushed too, so the rename survives a power cut. The file is
-    then read back from disk and must equal settings (the eleven toggles;
+    then read back from disk and must equal settings (the twelve toggles;
     origin is not compared). A toggle in _OPTIONAL_TOGGLES is written only
-    when it is not at its default, so a file with all five off holds only the
-    six other toggles. Only the eleven toggles' names are written, never one
+    when it is not at its default, except one in _UNSAVED_TOGGLE_VALUES
+    (buy_min_days_to_close), which is always written, as null for off, since
+    a file that leaves it out reads as BUY_MIN_DAYS_TO_CLOSE_DEFAULT (7 days);
+    if the text ever left that null out, the check of the text above would
+    read it back as 7 and refuse the save. So a file with the other five
+    optional toggles off holds the six required toggles and
+    buy_min_days_to_close. Only the twelve toggles' names are written, never one
     of _RETIRED_TOGGLES, so a save replaces a file an older version saved
     with one every live run reads. No older version reads a file this one
-    writes: each of them requires same_title_size_cap.
+    writes: each of them refuses the always-written buy_min_days_to_close as
+    an extra key, and those from before same-title pairs were removed also
+    require same_title_size_cap.
 
     Args:
         settings (LiveSettings): The new defaults.
@@ -4628,9 +4709,10 @@ def save_live_defaults(settings: LiveSettings, *, source: str) -> LiveSettings:
         raise LiveDefaultsError(f"{path}: not saved: {exc}") from exc
     values = {name: getattr(settings, name) for name in LIVE_TOGGLE_FIELDS}
     # An optional toggle is written only when it differs from its default; a
-    # read gives a missing one back as that default (_OPTIONAL_TOGGLES)
+    # read gives a missing one back as that default (_OPTIONAL_TOGGLES). A key
+    # that reads as something else when missing is always written
     for name in _OPTIONAL_TOGGLES:
-        if values[name] == _TOGGLE_DEFAULTS[name]:
+        if name not in _UNSAVED_TOGGLE_VALUES and values[name] == _TOGGLE_DEFAULTS[name]:
             del values[name]
     record = {
         "format": LIVE_DEFAULTS_FORMAT,
@@ -4962,6 +5044,50 @@ def days_left_reached(left: int | None, min_days: int | None) -> bool:
         bool: True when there is no minimum, or `left` is known and at least `min_days`.
     """
     return min_days is None or (left is not None and left >= min_days)
+
+
+def closes_far_enough(closes, now: datetime, min_days: int | None) -> bool:
+    """
+    Whether every market a purchase would buy closes at least `min_days` days after `now`.
+
+    The test behind "Skip if closing within" (LiveSettings.buy_min_days_to_close):
+    a pair, new or an add-on, is bought only when each of its markets stops
+    trading (its close) at least `min_days` whole 24-hour spans after the
+    moment the bot looks, which a live run takes once, when it reads the
+    markets. Exactly `min_days` passes. Always True with no minimum; False
+    when there is no close or any close is unknown or has no time zone, so a
+    purchase whose close cannot be read is not made. Because every close
+    must pass, the earliest one decides. Live runs ask it through
+    scanner.filter_markets_closing_far_enough (the markets the time-series
+    finder may pair) and through main._run_prod's add-on step (the held
+    pairs and lone legs a run may add to). The backtest asks it in
+    backtester._find_entry, at each Monday entry checkpoint (the moment the
+    backtest looks), on each leg's backtester._buy_rule_close: the scheduled
+    close a live run would have read where one is carried, else the start
+    of the last day the market's wording includes, never the close Kalshi
+    recorded. Sales and trims never ask it.
+
+    Args:
+        closes: Each market's close (a tz-aware datetime), or None when unknown, in any iterable.
+        now (datetime): The moment the bot looks (tz-aware, any zone).
+        min_days (int | None): The fewest days, or None for no minimum.
+
+    Returns:
+        bool: True when there is no minimum, or every close is known and on or after now + min_days.
+
+    Raises:
+        ValueError: When `now` has no time zone (a caller's mistake).
+    """
+    if min_days is None:
+        return True
+    if now.tzinfo is None:
+        raise ValueError("closes_far_enough needs a tz-aware now")
+    # In UTC, so a day is always 24 hours, even across a clock change
+    cutoff = now.astimezone(UTC) + timedelta(days=min_days)
+    moments = list(closes)
+    return bool(moments) and all(
+        isinstance(close, datetime) and close.tzinfo is not None and close >= cutoff
+        for close in moments)
 
 
 # ── Trimming a held pair to its Kelly size ────────────────────────────────────
@@ -5612,6 +5738,8 @@ _LIVE_SETTING_FIELDS = (
     ("rebalance until", "rebalance_min_days_to_maturity", _rebalance_until_text),
     ("sell at", "sell_at", _sell_at_text),
     ("min days to maturity", "sell_min_days", lambda v: "any" if v is None else str(v)),
+    ("skip if closing within", "buy_min_days_to_close",
+     lambda v: "off" if v is None else f"{v} days"),
 )
 
 
@@ -5726,7 +5854,8 @@ def describe_live_settings(settings: LiveSettings, reference: LiveSettings | Non
         str: e.g. "tier floors off | spread band 0-0.5 | k 0.8 | per-trade cap
             100% (no cap) | exclude categories none | exclude tags none |
             rebalance yes | min price movement any | rebalance until maturity |
-            sell at off | min days to maturity any",
+            sell at off | min days to maturity any | skip if closing within
+            off",
             with " (default: X)" after each field that differs from reference's
             when reference is the saved live defaults (its origin is anything
             but LIVE_DEFAULTS_FROM_CONFIG), " (config: X)" when it was built
@@ -5801,7 +5930,7 @@ def live_setting_text(field: str, value: object) -> str:
 
 def live_settings_argv(settings: LiveSettings) -> list[str]:
     """
-    Spell a run's settings as main.py's toggle flags, all eleven toggles.
+    Spell a run's settings as main.py's toggle flags, all twelve toggles.
 
     A program that starts main.py with these flags gets a run that trades
     exactly these settings, whatever the saved live defaults say:
@@ -5818,7 +5947,8 @@ def live_settings_argv(settings: LiveSettings) -> list[str]:
     / --no-min-price-move), how close to maturity it still rebalances
     (--rebalance-min-days-to-maturity=7 / --no-rebalance-min-days-to-maturity),
     the sell level and its minimum (--sell-at=85 / --no-sell,
-    --sell-min-days=7 / --no-sell-min-days).
+    --sell-min-days=7 / --no-sell-min-days), and "Skip if closing within"
+    (--buy-min-days-to-close=7 / --no-buy-min-days-to-close).
 
     Args:
         settings (LiveSettings): The settings to spell.
@@ -5827,8 +5957,8 @@ def live_settings_argv(settings: LiveSettings) -> list[str]:
         list[str]: The flags, in the order main.py lists them: the tier-floor
             switch, --spread-min, --spread-max, --interval-discount,
             --size-cap, the rebalance switch, its minimum and its days to
-            maturity, the two sell flags, then the excluded-category flags
-            and the excluded-tag flags.
+            maturity, the two sell flags, the skip-if-closing-within flag,
+            then the excluded-category flags and the excluded-tag flags.
     """
     argv = ["--tier-floors" if settings.tier_floors else "--no-tier-floors",
             f"--spread-min={settings.spread_band[0]!r}",
@@ -5847,6 +5977,9 @@ def live_settings_argv(settings: LiveSettings) -> list[str]:
              else ["--no-sell"])
     argv += ([f"--sell-min-days={settings.sell_min_days}"]
              if settings.sell_min_days is not None else ["--no-sell-min-days"])
+    argv += ([f"--buy-min-days-to-close={settings.buy_min_days_to_close}"]
+             if settings.buy_min_days_to_close is not None
+             else ["--no-buy-min-days-to-close"])
     argv += ([f"--exclude-category={name}" for name in settings.exclude_categories]
              if settings.exclude_categories is not None else ["--no-exclude-category"])
     argv += ([f"--exclude-tag={name}" for name in settings.exclude_tags]

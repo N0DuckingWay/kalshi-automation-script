@@ -10,9 +10,11 @@ Purpose:
     --no-same-event-ladders, --scheduled-close / --no-scheduled-close,
     --stale-quote-hours / --no-stale-quote-check,
     --max-volume-share / --no-volume-cap,
+    --buy-min-days-to-close / --no-buy-min-days-to-close,
     --spread-min, --spread-max, --no-band-sweep,
     --no-cap-sweep, --no-sell-sweep, --sell-workers, --no-rebalance-sweep,
-    --no-move-sweep, --no-maturity-sweep, --no-eda, --dashboard-only,
+    --no-move-sweep, --no-maturity-sweep, --no-close-sweep, --no-eda,
+    --dashboard-only,
     --accept-changed-simulator), configures logging to kalshi_backtest.log, constructs the necessary API
     clients, works out the starting balance (--balance, or else what the Kalshi
     account is worth when the run starts), fits the depth model from the saved
@@ -64,6 +66,8 @@ Dependencies:
     BACKTEST_SWEEP_HEADER_MAX_BYTES (the saved sweep file: where it goes, the
     format tag it is written in, the most of its first line a rebuild reads),
     MIN_BALANCE_CENTS (the low starting-balance WARNING),
+    BUY_MIN_DAYS_TO_CLOSE_DEFAULT and BUY_MIN_DAYS_TO_CLOSE_CHOICES (the
+    "Skip if closing within" flags' check, help text and pre-fetch echo),
     TIME_SERIES_INTERVAL_PROB_DISCOUNT and TIME_SERIES_SAME_EVENT_LADDERS
     (the pre-fetch echo and the flag's help text), the deadline-gap tier constants
     MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS,
@@ -144,6 +148,15 @@ Notes:
     next-day traded contracts a backtest buy or sale may take. It reads hours
     a live run cannot see, only ever makes a trade smaller, and never reaches
     a live run.
+
+    --buy-min-days-to-close N / --no-buy-min-days-to-close is the one-run
+    override for the backtest's "Skip if closing within" (the live setting
+    the backtest applies too; config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT, 7 days,
+    by default): a pair is bought, or added to, only at a Monday checkpoint
+    at least N days before both its markets close, N one of
+    config.BUY_MIN_DAYS_TO_CLOSE_CHOICES (0 is off). An N outside those
+    choices exits 2 before anything is fetched. It never reaches a live
+    run, which reads the saved live defaults (or main.py's own flag).
 
     That setting reaches kalshi_backtest.log (the pre-fetch echo below and
     run_backtest_sweep's resolved line) AND the HTML dashboard's own page
@@ -258,6 +271,16 @@ Notes:
     --no-maturity-sweep skips them (that select then stays shut) and still
     builds Rebalance itself; --no-rebalance-sweep skips them too.
 
+    The other "Skip if closing within" choices are ON by default too
+    (close_sweep=True): the result carries a lazy CloseSweep
+    (BacktestSweep.close_sweep) holding, for every choice of
+    config.BUY_MIN_DAYS_TO_CLOSE_CHOICES besides the run's own, the pairs
+    that choice would buy (found during the run, after the run's own, in a
+    few more entry passes) and every scenario of the grid at it, simulated
+    only when a report reads it. No page reads them yet. --no-close-sweep
+    skips them. A live run applies its own saved "Skip if closing within"
+    choice (main.py --buy-min-days-to-close for one run).
+
     Every full run saves what it hands generate_dashboard, right after the
     sweep and before the page is built, in config.BACKTEST_SWEEP_FILENAME in
     PROJECT_ROOT (gitignored): the BacktestSweep with every lazy family, the
@@ -335,6 +358,8 @@ from .config import (
     BACKTEST_SWEEP_FILENAME,
     BACKTEST_SWEEP_FORMAT,
     BACKTEST_SWEEP_HEADER_MAX_BYTES,
+    BUY_MIN_DAYS_TO_CLOSE_CHOICES,
+    BUY_MIN_DAYS_TO_CLOSE_DEFAULT,
     DASHBOARD_SELL_MAX_WORKERS,
     EDA_MAX_WORKERS,
     MAX_DEADLINE_GAP_DAYS,
@@ -500,6 +525,21 @@ def _volume_cap_text(share: float | None) -> str:
     return "off" if share is None else f"{share * 100:g}%"
 
 
+def _skip_closing_text(days: int | None) -> str:
+    """
+    A "Skip if closing within" minimum as the pre-fetch echo and --help name it: "7 days", or "off".
+
+    Args:
+        days (int | None): The days; None or 0 for the rule off.
+
+    Returns:
+        str: The days with " days" (" day" for one), or "off".
+    """
+    if not days:
+        return "off"
+    return f"{days} day{'' if days == 1 else 's'}"
+
+
 def _fills_echo(depth_model: DepthModel | None) -> str:
     """
     Say how the run's trades will fill, for the pre-fetch config line.
@@ -629,6 +669,8 @@ _RUN_ONLY_FLAGS = (
     ("no_stale_quote_check", "--no-stale-quote-check"),
     ("max_volume_share", "--max-volume-share"),
     ("no_volume_cap", "--no-volume-cap"),
+    ("buy_min_days_to_close", "--buy-min-days-to-close"),
+    ("no_buy_min_days_to_close", "--no-buy-min-days-to-close"),
     ("spread_min", "--spread-min"), ("spread_max", "--spread-max"),
     ("no_band_sweep", "--no-band-sweep"),
 )
@@ -1103,21 +1145,22 @@ def _load_saved_inputs(path: Path) -> dict[str, Any]:
 
 def _without_families(sweep: BacktestSweep, *, cap_sweep: bool, sell_sweep: bool,
                       rebalance_sweep: bool, move_sweep: bool,
-                      maturity_sweep: bool) -> tuple[BacktestSweep, list[str]]:
+                      maturity_sweep: bool,
+                      close_sweep: bool) -> tuple[BacktestSweep, list[str]]:
     """
     Drop lazy families from a loaded sweep, as a run given the matching --no-*-sweep flags builds it.
 
     Each flag that is False drops its family, so the rebuilt page leaves its
     select disabled and skips its simulations: a quick page for checking a
-    change. Without the size-cap sweep, a run builds the Sell and Rebalance
-    families at its own cap alone, so those that stay are narrowed to it
-    too. Without the minimum price movements, the Rebalance family stays and
-    carries none; without the "Rebalance until" choices, likewise.
+    change. Without the size-cap sweep, a run builds the Sell, Rebalance
+    and close families at its own cap alone, so those that stay are narrowed
+    to it too. Without the minimum price movements, the Rebalance family
+    stays and carries none; without the "Rebalance until" choices, likewise.
 
     Args:
         sweep (BacktestSweep): The loaded sweep; left as it is.
-        cap_sweep, sell_sweep, rebalance_sweep, move_sweep, maturity_sweep
-            (bool): Whether each family stays.
+        cap_sweep, sell_sweep, rebalance_sweep, move_sweep, maturity_sweep,
+            close_sweep (bool): Whether each family stays.
 
     Returns:
         tuple[BacktestSweep, list[str]]: The sweep the page is built from
@@ -1132,7 +1175,7 @@ def _without_families(sweep: BacktestSweep, *, cap_sweep: bool, sell_sweep: bool
             dropped.append("the size caps (--no-cap-sweep)")
         # The other lazy families at the run's own cap, as a run without the
         # size-cap sweep builds them
-        for name in ("sell_sweep", "rebalance_sweep"):
+        for name in ("sell_sweep", "rebalance_sweep", "close_sweep"):
             family = getattr(sweep, name)
             if family is not None and family.caps != (family.primary_cap,):
                 changes[name] = replace(family, caps=(family.primary_cap,))
@@ -1152,6 +1195,9 @@ def _without_families(sweep: BacktestSweep, *, cap_sweep: bool, sell_sweep: bool
         if not maturity_sweep and family.maturity_days:
             changes["rebalance_sweep"] = replace(family, maturity_days=())
             dropped.append("Rebalance until (--no-maturity-sweep)")
+    if not close_sweep and sweep.close_sweep is not None:
+        changes["close_sweep"] = None
+        dropped.append("the other \"Skip if closing within\" choices (--no-close-sweep)")
     return (replace(sweep, **changes) if changes else sweep), dropped
 
 
@@ -1302,7 +1348,7 @@ def _rebuild_dashboard(parser: argparse.ArgumentParser, args: argparse.Namespace
     sweep, dropped = _without_families(
         inputs["sweep"], cap_sweep=not args.no_cap_sweep, sell_sweep=not args.no_sell_sweep,
         rebalance_sweep=not args.no_rebalance_sweep, move_sweep=not args.no_move_sweep,
-        maturity_sweep=not args.no_maturity_sweep)
+        maturity_sweep=not args.no_maturity_sweep, close_sweep=not args.no_close_sweep)
     if dropped:
         logging.info("Dashboard rebuilt without: %s", "; ".join(dropped))
     # The T-bill yields, read again: never raises (see the full run's read)
@@ -1416,6 +1462,27 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-volume-cap", action="store_true",
         help="Hold a trade only to the modeled book, for this run. Backtest only.",
     )
+    # "Skip if closing within": days for this run, or off; neither given reads
+    # config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT at call time. The words name
+    # config.BUY_MIN_DAYS_TO_CLOSE_CHOICES, the only days main() accepts
+    skip_off, *skip_days = BUY_MIN_DAYS_TO_CLOSE_CHOICES
+    skip_closing = parser.add_mutually_exclusive_group()
+    skip_closing.add_argument(
+        "--buy-min-days-to-close", type=int, default=None, metavar="N",
+        help="Skip if closing within N days: buy a pair, or add to a held one, only at "
+             "a Monday checkpoint at least N days (24-hour spans) before each of its "
+             f"markets closes: {skip_off} = off, or "
+             f"{', '.join(str(d) for d in skip_days[:-1])} or {skip_days[-1]}. A market's "
+             "close is its scheduled close where one is known, else the start of the last "
+             "day its wording names, never the close Kalshi recorded (default: "
+             "config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT, currently "
+             f"{_skip_closing_text(BUY_MIN_DAYS_TO_CLOSE_DEFAULT)}). Backtest only: a live "
+             "run reads the saved live defaults, or main.py's own --buy-min-days-to-close.",
+    )
+    skip_closing.add_argument(
+        "--no-buy-min-days-to-close", action="store_true",
+        help="Buy however soon a market closes, for this run. Backtest only.",
+    )
     # Each side is independently optional; the omitted one resolves from
     # config's own default band (see the validation block below), not from a
     # literal (0.0, 1.0) here — which is why the help names the constant
@@ -1500,6 +1567,15 @@ def _build_parser() -> argparse.ArgumentParser:
              "--rebalance-min-days-to-maturity for one run)",
     )
     parser.add_argument(
+        "--no-close-sweep", action="store_true",
+        help="Skip the other \"Skip if closing within\" choices (every one of "
+             "config.BUY_MIN_DAYS_TO_CLOSE_CHOICES but this run's own): which pairs each "
+             "would buy is found during the run, in a few more entry passes, and each "
+             "scenario at it is simulated only when a report reads it. No page shows them "
+             "yet. Backtest only — a live run applies its own saved buy_min_days_to_close "
+             "(main.py --buy-min-days-to-close for one run)",
+    )
+    parser.add_argument(
         "--sell-workers", type=int, default=None, metavar="N",
         help="Worker processes the dashboard simulates its Sell select in "
              "(default: one less than this machine's CPU count, at most "
@@ -1543,10 +1619,12 @@ def main() -> None:
     --max-horizon-days, --interval-discount, --no-sweep,
     --same-event-ladders / --no-same-event-ladders, --scheduled-close /
     --no-scheduled-close, --stale-quote-hours / --no-stale-quote-check,
-    --max-volume-share / --no-volume-cap, --spread-min,
+    --max-volume-share / --no-volume-cap, --buy-min-days-to-close /
+    --no-buy-min-days-to-close, --spread-min,
     --spread-max, --no-band-sweep, --no-cap-sweep, --no-sell-sweep,
-    --no-rebalance-sweep, --no-move-sweep, --no-maturity-sweep, --sell-workers,
-    --no-eda, --dashboard-only, --accept-changed-simulator); with --dashboard-only it
+    --no-rebalance-sweep, --no-move-sweep, --no-maturity-sweep, --no-close-sweep,
+    --sell-workers, --no-eda, --dashboard-only, --accept-changed-simulator); with
+    --dashboard-only it
     hands over to _rebuild_dashboard, which rebuilds the page from the saved
     inputs and runs nothing below. Otherwise it configures
     logging, constructs historical and live
@@ -1577,7 +1655,9 @@ def main() -> None:
     bar, Interval Discount section and scenario explorer); the lazily
     simulated sell family (result.sell_sweep) and Rebalance family
     (result.rebalance_sweep, with its minimum price movements and its
-    "Rebalance until" choices) are read the same way.
+    "Rebalance until" choices) are read the same way. The lazily simulated
+    other "Skip if closing within" choices (result.close_sweep) are saved
+    with the rest, and no page reads them yet.
     """
     parser = _build_parser()
     args = parser.parse_args()
@@ -1609,6 +1689,12 @@ def main() -> None:
     if args.max_volume_share is not None and not (
             math.isfinite(args.max_volume_share) and 0 < args.max_volume_share <= 100):
         parser.error("--max-volume-share must be a percent above 0 and at most 100")
+    if (args.buy_min_days_to_close is not None
+            and args.buy_min_days_to_close not in BUY_MIN_DAYS_TO_CLOSE_CHOICES):
+        skip_off, *skip_days = BUY_MIN_DAYS_TO_CLOSE_CHOICES
+        parser.error(f"--buy-min-days-to-close must be "
+                     f"{', '.join(str(d) for d in skip_days[:-1])} or {skip_days[-1]} days, "
+                     f"or {skip_off} for off")
 
     # Resolved here, BEFORE logging is configured (TS-20 — see the comment
     # below). The configured default is read and validated on EVERY run,
@@ -1706,6 +1792,15 @@ def main() -> None:
     volume_echo = _volume_cap_text(effective_volume)
     if volume_echo != _volume_cap_text(BACKTEST_MAX_VOLUME_SHARE):
         volume_echo += f" (config: {_volume_cap_text(BACKTEST_MAX_VOLUME_SHARE)})"
+    # ... and for "Skip if closing within" (days for the sweep; None: config's
+    # default; False: off)
+    buy_min_days_to_close = (False if args.no_buy_min_days_to_close
+                             else args.buy_min_days_to_close)
+    effective_skip = (BUY_MIN_DAYS_TO_CLOSE_DEFAULT if buy_min_days_to_close is None
+                      else None if buy_min_days_to_close is False else buy_min_days_to_close)
+    skip_echo = _skip_closing_text(effective_skip)
+    if skip_echo != _skip_closing_text(BUY_MIN_DAYS_TO_CLOSE_DEFAULT):
+        skip_echo += f" (config: {_skip_closing_text(BUY_MIN_DAYS_TO_CLOSE_DEFAULT)})"
     # Same pre-fetch echo, same reason, for the spread band: the VALUE is
     # resolved through the same config function run_backtest_sweep calls
     # (never a by-value copy of BACKTEST_DEFAULT_SPREAD_BAND), so it cannot
@@ -1733,6 +1828,9 @@ def main() -> None:
     move_sweep = rebalance_sweep and not args.no_move_sweep
     # ... and its "Rebalance until" choices, the same way
     maturity_sweep = rebalance_sweep and not args.no_maturity_sweep
+    # ... and the other "Skip if closing within" choices: a few more entry
+    # passes during the run, and nothing simulated until a report reads them
+    close_sweep = not args.no_close_sweep
     # The dashboard simulates the Sell select in worker processes: one less
     # than the CPUs (the main process waits on them), within the config bound
     sell_workers = _sell_workers(args.sell_workers)
@@ -1788,11 +1886,11 @@ def main() -> None:
     logging.info(
         "Backtest config: start=%s | balance=$%.2f | cache=%s | scheduled close=%s "
         "| k=%.3f | stale quotes=%s | volume cap=%s | ladders=%s | spread band=%g-%g "
-        "| band sweep=%s | cap sweep=%s "
+        "| skip if closing within=%s | band sweep=%s | cap sweep=%s "
         "| sell sweep=%s | rebalance sweep=%s | live rule=%s | fills=%s",
         start_date, start.dollars, "on" if use_cache else "off", scheduled_echo,
         effective_k, stale_echo, volume_echo, ladders_echo, echo_floor, echo_ceiling,
-        "on" if band_sweep else "off", "on" if cap_sweep else "off",
+        skip_echo, "on" if band_sweep else "off", "on" if cap_sweep else "off",
         f"on ({sell_workers} worker process{'' if sell_workers == 1 else 'es'})"
         if sell_sweep else "off",
         # A default run reads "on"; the family without its minimum price
@@ -1874,6 +1972,9 @@ def main() -> None:
         stale_quote_max_age=stale_quote_max_age,
         # The share of the next day's volume a buy or sale may take (None: config; False: off)
         max_volume_share=max_volume_share,
+        # "Skip if closing within": the fewest days from a checkpoint to both
+        # markets' close for a purchase (None: config; False: off)
+        buy_min_days_to_close=buy_min_days_to_close,
         spread_band=spread_band,
         band_sweep=band_sweep,
         # The dashboard's "Tier floors: off" view: the band sweep's
@@ -1889,11 +1990,13 @@ def main() -> None:
         move_sweep=move_sweep,
         # ... and its "Rebalance until" choices (simulated only when read)
         maturity_sweep=maturity_sweep,
+        # The other "Skip if closing within" choices (simulated only when read)
+        close_sweep=close_sweep,
         # Every trade's order book is built from this table (None: top of book)
         depth_model=depth_model,
         # Each series' fee multiplier (carried only)
         fee_multipliers=fee_multipliers,
-    )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep, and the lazy sell and Rebalance families (sell_sweep, rebalance_sweep) unless --no-sell-sweep / --no-rebalance-sweep
+    )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep, the lazy sell and Rebalance families (sell_sweep, rebalance_sweep) unless --no-sell-sweep / --no-rebalance-sweep, and the lazy other "Skip if closing within" choices (close_sweep) unless --no-close-sweep
     # What the dashboard is handed, saved before the page is built, so
     # --dashboard-only can rebuild the page (or finish a build that stopped)
     # without running the backtest again. period_end is the window's last day,
@@ -1914,7 +2017,9 @@ def main() -> None:
     # a cell is read) only by the dashboard, whose one grid walk reads
     # every cell as the page is built (filter bar, Interval Discount section
     # and scenario explorer). The sell and Rebalance families
-    # (result.sell_sweep and result.rebalance_sweep) are lazy the same way.
+    # (result.sell_sweep and result.rebalance_sweep) are lazy the same way,
+    # and so are the other "Skip if closing within" choices
+    # (result.close_sweep), which no page reads yet.
     trades, equity_df = result.primary.trades, result.primary.equity_df
 
     if not trades:
@@ -1951,7 +2056,8 @@ def main() -> None:
     # cell of them is simulated here, in the page's one grid walk), the lazy
     # sell and Rebalance families (sell_sweep and rebalance_sweep, None under
     # --no-sell-sweep and --no-rebalance-sweep) and the header's run-settings
-    # line;
+    # line (it also carries close_sweep, the other "Skip if closing within"
+    # choices, None under --no-close-sweep, which the page does not read yet);
     # interval_discount is the resolved k these trades were sized at, which
     # the Risk section's Kelly scatter must price on
     #

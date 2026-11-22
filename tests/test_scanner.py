@@ -11,6 +11,7 @@ from decimal import Decimal, localcontext
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 from kalshi_python_sync.exceptions import ApiException
@@ -58,6 +59,7 @@ from kalshi_betting.scanner import (
     enrich_with_orderbook_prices,
     fetch_open_events_with_markets,
     fetch_shard_statuses,
+    filter_markets_closing_far_enough,
     filter_markets_within_horizon,
     find_time_series_pairs,
     get_held_positions,
@@ -10616,6 +10618,158 @@ class TestFilterMarketsWithinHorizon:
         m = _mock_market(ticker="T1", event_ticker="E1", close_time=datetime(2026, 12, 1))
         result = filter_markets_within_horizon([m], 7)
         assert result == []
+
+
+class TestFilterMarketsClosingFarEnough:
+    """filter_markets_closing_far_enough: "Skip if closing within" on the market
+    list the time-series finder reads. Off, the list comes back as it was and
+    nothing is logged; on, a market is kept only when config.closes_far_enough
+    passes its close (exactly the minimum passes, a second less fails; a
+    missing or naive close fails), in its order, with one INFO line, and one
+    WARNING counting the markets left out because their close could not be read."""
+
+    # The moment the run looks, in UTC
+    _NOW = datetime(2026, 11, 14, 15, 30, tzinfo=UTC)
+    # The WARNING for the two markets of _markets() with no readable close
+    _UNREADABLE = ("Left out 2 market(s) because their close time could not be read, so "
+                   "this run buys nothing on them (\"Skip if closing within\" needs each "
+                   "market's close)")
+
+    @staticmethod
+    def _settings(days):
+        """The shipped live settings with "Skip if closing within" set to `days`."""
+        return dc_replace(config.live_settings(), buy_min_days_to_close=days)
+
+    @classmethod
+    def _markets(cls) -> list:
+        """Markets closing 6, 8, 30 and exactly 7 days after _NOW, one second
+        short of 7, with no close, and with a naive close a year off, in that order."""
+        def at(ticker, close):
+            m = _mock_market(ticker=ticker, event_ticker=f"E-{ticker}")
+            m.close_time = close
+            return m
+        return [at("SIX", cls._NOW + timedelta(days=6)),
+                at("EIGHT", cls._NOW + timedelta(days=8)),
+                at("THIRTY", cls._NOW + timedelta(days=30)),
+                at("SEVEN", cls._NOW + timedelta(days=7)),
+                at("SHORT", cls._NOW + timedelta(days=7) - timedelta(seconds=1)),
+                at("NONE", None),
+                at("NAIVE", datetime(2027, 11, 14))]
+
+    @staticmethod
+    def _tickers(markets) -> list:
+        return [m.ticker for m in markets]
+
+    def test_off_returns_the_list_itself_and_logs_nothing(self, caplog):
+        markets = self._markets()
+        with caplog.at_level(logging.INFO):
+            out = filter_markets_closing_far_enough(markets, self._settings(None), now=self._NOW)
+        assert out is markets
+        assert caplog.records == []
+
+    def test_on_it_keeps_what_closes_far_enough_passes_in_order(self, caplog):
+        markets = self._markets()
+        with caplog.at_level(logging.INFO):
+            out = filter_markets_closing_far_enough(markets, self._settings(7), now=self._NOW)
+        # Exactly 7 days is kept; a second less, 6 days, no close and a naive close are not
+        assert self._tickers(out) == ["EIGHT", "THIRTY", "SEVEN"]
+        assert [m for m in markets if config.closes_far_enough(
+            [m.close_time], self._NOW, 7)] == out
+        assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
+            (logging.INFO, "Skip if closing within 7 days: kept 3 of 7 markets closing on or "
+                           "after 2026-11-21T15:30:00+00:00 (2 with no readable close)"),
+            (logging.WARNING, self._UNREADABLE)]
+
+    @pytest.mark.parametrize("days, kept", [
+        (3, ["SIX", "EIGHT", "THIRTY", "SEVEN", "SHORT"]),
+        (14, ["THIRTY"]),
+    ])
+    def test_each_choice_moves_the_cutoff(self, caplog, days, kept):
+        with caplog.at_level(logging.INFO):
+            out = filter_markets_closing_far_enough(self._markets(), self._settings(days),
+                                                    now=self._NOW)
+        assert self._tickers(out) == kept
+        cutoff = (self._NOW + timedelta(days=days)).isoformat(timespec="seconds")
+        assert caplog.messages == [
+            f"Skip if closing within {days} days: kept {len(kept)} of 7 markets closing on "
+            f"or after {cutoff} (2 with no readable close)", self._UNREADABLE]
+
+    @pytest.mark.parametrize("closes, unread", [
+        ((None,), 1),
+        ((datetime(2027, 11, 14),), 1),
+        (("2026-12-01T00:00:00Z", None, datetime(2027, 11, 14)), 3),
+        ((datetime(2026, 11, 15, tzinfo=UTC),), 0),
+        ((datetime(2026, 12, 15, tzinfo=UTC), datetime(2027, 1, 1, tzinfo=UTC)), 0),
+        ((), 0),
+    ], ids=["no close", "naive close", "text, none and naive", "too soon but readable",
+            "far enough", "no markets"])
+    def test_a_close_that_cannot_be_read_draws_one_warning_with_the_count(self, caplog,
+                                                                          closes, unread):
+        # A market whose close cannot be read (none, no time zone, not a time
+        # at all) is left out, so it never reaches the finder and its
+        # missing-close WARNING: this filter says so itself, at WARNING level,
+        # so the run result's warnings carry it. A readable close that is too
+        # soon is left out with no warning, and nothing left out draws none
+        markets = []
+        for i, close in enumerate(closes):
+            market = _mock_market(ticker=f"M{i}", event_ticker=f"E{i}")
+            market.close_time = close
+            markets.append(market)
+        with caplog.at_level(logging.INFO):
+            filter_markets_closing_far_enough(markets, self._settings(7), now=self._NOW)
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        if unread:
+            assert warnings == [
+                f"Left out {unread} market(s) because their close time could not be read, so "
+                "this run buys nothing on them (\"Skip if closing within\" needs each "
+                "market's close)"]
+        else:
+            assert warnings == []
+        # The INFO line is logged either way, and counts the same markets
+        [info] = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert info.endswith(f"({unread} with no readable close)")
+
+    def test_the_earlier_close_of_a_pair_decides(self):
+        # A pair is bought only when both its markets pass, so one closing
+        # too soon keeps the pair from forming whatever its partner's close
+        early, late = self._markets()[0], self._markets()[2]
+        out = filter_markets_closing_far_enough([early, late], self._settings(7), now=self._NOW)
+        assert self._tickers(out) == ["THIRTY"]
+
+    def test_a_los_angeles_moment_is_counted_in_utc(self, caplog):
+        # 12:00 PDT on 2026-10-29, three days before Los Angeles clocks go
+        # back: the cutoff is 168 hours on (19:00 UTC on 2026-11-05), not
+        # seven wall-clock days (20:00 UTC)
+        now = datetime(2026, 10, 29, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
+        week = datetime(2026, 11, 5, 19, tzinfo=UTC)
+        markets = [_mock_market(ticker="WEEK", event_ticker="E1", close_time=week),
+                   _mock_market(ticker="SHORT", event_ticker="E2",
+                                close_time=week - timedelta(seconds=1))]
+        with caplog.at_level(logging.INFO):
+            out = filter_markets_closing_far_enough(markets, self._settings(7), now=now)
+        assert self._tickers(out) == ["WEEK"]
+        assert "closing on or after 2026-11-05T19:00:00+00:00" in caplog.text
+
+    def test_an_empty_list_logs_its_line(self, caplog):
+        with caplog.at_level(logging.INFO):
+            out = filter_markets_closing_far_enough([], self._settings(7), now=self._NOW)
+        assert out == []
+        assert caplog.messages == [
+            "Skip if closing within 7 days: kept 0 of 0 markets closing on or after "
+            "2026-11-21T15:30:00+00:00 (0 with no readable close)"]
+
+    def test_a_naive_moment_is_refused_when_a_market_is_judged(self):
+        with pytest.raises(ValueError, match="tz-aware now"):
+            filter_markets_closing_far_enough(self._markets(), self._settings(7),
+                                              now=datetime(2026, 11, 14, 15, 30))
+
+    def test_settings_have_no_default(self):
+        # Every caller hands the run's own settings
+        import inspect
+        params = inspect.signature(filter_markets_closing_far_enough).parameters
+        assert params["settings"].default is inspect.Parameter.empty
+        assert params["now"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert params["now"].default is inspect.Parameter.empty
 
 
 class TestParsePriceRanges:

@@ -17,8 +17,9 @@ python3 -m kalshi_betting.main --mode dev --dry-run
 # Production live trading, from the saved live defaults (live_defaults.json in the
 # repo root: tier floors, spread band, k, per-trade cap, category/tag
 # filter, rebalancing with its minimum price movement and "rebalance until" days (with it
-# on, a production run trims held pairs before it buys and may add to them), and the sell
-# level and its minimum of days — each overridable for one run by the flags below, which
+# on, a production run trims held pairs before it buys and may add to them), the sell
+# level and its minimum of days, and "Skip if closing within" (a saved file that leaves
+# it out reads 7 days) — each overridable for one run by the flags below, which
 # the run marks
 # "(default: X)" on its "Live settings:" line and, when it submits orders under one,
 # names in a WARNING). With no saved file, a refused one, or one an older version saved
@@ -56,13 +57,13 @@ python3 -m kalshi_betting.main --mode prod --dry-run --result-file /tmp/run_resu
 
 # Production dry run replaying the live rule as it stood before the 2026-09-27
 # decision, for this run only (for time-series pairs, the only kind the bot trades).
-# It gives all eleven toggles, because a toggle no flag gives keeps its saved value (--no-rebalance and --no-sell too, so a saved "yes" or a
-# saved sell level does not leak into a replay of a rule that never rebalanced or sold;
-# --no-rebalance clears the saved minimum price movement and "rebalance until" setting as
+# It gives all twelve toggles, because a toggle no flag gives keeps its saved value (--no-rebalance, --no-sell and --no-buy-min-days-to-close too, so a saved "yes", a
+# saved sell level or a saved "Skip if closing within" does not leak into a replay of a rule that never rebalanced, sold or
+# skipped a market for closing soon; --no-rebalance clears the saved minimum price movement and "rebalance until" setting as
 # well); each flag that
 # departs from the saved live defaults is marked "(default: X)" on the "Live
 # settings:" line
-python3 -m kalshi_betting.main --mode prod --dry-run --tier-floors --spread-min 0 --spread-max 1 --interval-discount 0.75 --size-cap 20 --no-rebalance --no-sell --no-exclude-category --no-exclude-tag
+python3 -m kalshi_betting.main --mode prod --dry-run --tier-floors --spread-min 0 --spread-max 1 --interval-discount 0.75 --size-cap 20 --no-rebalance --no-sell --no-buy-min-days-to-close --no-exclude-category --no-exclude-tag
 
 # Production dry run that rebalances (no orders, nothing saved): before buying, sell part of each
 # exact held time-series pair, and of each lone leg whose earlier market paid out $0 (the later
@@ -132,6 +133,23 @@ python3 -m kalshi_betting.main --mode prod --dry-run --no-rebalance
 python3 -m kalshi_betting.main --mode prod --dry-run --sell-at 80 --sell-min-days 7
 python3 -m kalshi_betting.main --mode prod --dry-run --no-sell
 
+# "Skip if closing within" for this run only: 3, 7 or 14 days (0 is off;
+# --no-buy-min-days-to-close turns it off whatever is saved; the two are mutually
+# exclusive, and any other number exits 2 naming the flag). It needs no other setting.
+# The "Live settings:" line ends `skip if closing within 14 days`, marked "(default: X)"
+# when the saved value differs; a saved file that leaves the setting out reads 7 days,
+# and the Run tab's runs always pass one of the two flags. With it set, a run (prod or
+# dev) buys and adds to nothing closing sooner than that many 24-hour spans after the
+# moment it reads the markets, and logs `Skip if closing within 14 days: kept X of Y
+# markets closing on or after <time> (Z with no readable close)`, with Z above 0 also one
+# WARNING `Left out Z market(s) because their close time could not be read, …` (a held
+# pair held back from an add-on logs `Not adding to N held pair(s) and M lone leg(s)
+# this run: …`); a run left with nothing to buy ends as any run that finds no pairs,
+# its "No qualifying pairs found" line adding "and both markets closing at least 14
+# days after this run". Sales and trims are never held back
+python3 -m kalshi_betting.main --mode prod --dry-run --buy-min-days-to-close 14
+python3 -m kalshi_betting.main --mode prod --dry-run --no-buy-min-days-to-close
+
 # Exclude one Kalshi category this run: every other category trades, one never seen
 # included (named as the backtest dashboard's Exclude categories menu names its categories;
 # repeatable, and --exclude-tag NAME excludes a series' first tag, a plain name under every
@@ -150,7 +168,14 @@ python3 -m kalshi_betting.main --mode prod --dry-run --exclude-category Politics
 # tags menu (the page's Live rule line names these boxes)
 python3 -m kalshi_betting.main --mode prod --dry-run --exclude-category Politics --exclude-tag "Sports · Hockey"
 
-# Live trading (either mode), only consider markets closing within 14 days from now
+# Live trading (either mode), only consider markets closing within 14 days from now.
+# Below the run's "Skip if closing within" days (say --max-horizon-days 5 under 7) no
+# market can pass both, and at exactly that many (--max-horizon-days 7 with 7) only one
+# closing in the short time between the run reading the markets and applying the
+# horizon can, so the run logs one WARNING once logging starts and goes on: it buys
+# nothing, or next to nothing. A production run's warning adds that its sales and
+# trims are not held back (a dev run makes none). With --result-file (prod only) the
+# warning is among the result's warnings
 python3 -m kalshi_betting.main --mode dev --max-horizon-days 14
 
 # Backtest from 2024-01-01, starting from what the account is worth now: its cash on
@@ -207,6 +232,20 @@ python3 -m kalshi_betting.backtest --no-stale-quote-check
 python3 -m kalshi_betting.backtest --max-volume-share 5
 python3 -m kalshi_betting.backtest --no-volume-cap
 
+# Backtest with "Skip if closing within" at 3 days, or off, for THIS run only (default:
+# config.BUY_MIN_DAYS_TO_CLOSE_DEFAULT, 7 days — a pair is bought, or added to, only at a
+# Monday checkpoint at least that many days (24-hour spans) before each of its markets
+# closes, judged on its scheduled close where one is known, else the start (00:00 UTC) of
+# the last day its wording names, never the close Kalshi recorded; N is 0 (off), 3, 7 or
+# 14, any other N exits 2 before anything is fetched; run-only, so --dashboard-only
+# refuses both; backtest only: a live run reads the saved live defaults). The log names
+# it on a "Skip if closing within (backtest): ..." line and, with it on, counts what it
+# removed once: "Skip if closing within 3 days (backtest), at band 0-1 with the tier
+# floors on: removed M qualifying Monday(s), ...". A --max-horizon-days at or below the
+# run's days logs one WARNING (the backtest then buys next to nothing) and the run goes on
+python3 -m kalshi_betting.backtest --buy-min-days-to-close 3
+python3 -m kalshi_betting.backtest --no-buy-min-days-to-close
+
 # Backtest at a specific PRIMARY-scenario time-series spread band on pB - pA
 # (backtest only; the live band is the saved live defaults', or main.py's own
 #  --spread-min/--spread-max for one live run, read only through config.LiveSettings — no module outside config/backtester/backtest/dashboard calls
@@ -260,6 +299,16 @@ python3 -m kalshi_betting.backtest --no-move-sweep
 # Rebalance itself is still built, and --no-rebalance-sweep skips them too. Backtest only
 python3 -m kalshi_betting.backtest --no-maturity-sweep
 
+# Backtest without the other "Skip if closing within" choices (ON by default in the CLI:
+# BacktestSweep.close_sweep, a lazy backtester.CloseSweep, holds for every choice of
+# config.BUY_MIN_DAYS_TO_CLOSE_CHOICES but the run's own the pairs it would buy, found during
+# the run in a few more entry passes, and simulates each band x k x cap cell at it, tier floors
+# on and off, the "all" population only, never adding, trimming or selling, only when a report
+# reads it). The backtest page's "Skip if closing within" menu shows them; without them it
+# offers the run's own choice alone, shut. Backtest only — a live
+# run applies its own saved buy_min_days_to_close (main.py --buy-min-days-to-close for one run)
+python3 -m kalshi_betting.backtest --no-close-sweep
+
 # Backtest without the dashboard's "Sell" family (ON by default in the CLI, and lazy like the
 # cap sweep: the run simulates nothing — the dashboard step then reads every sell level and
 # minimum of days to maturity of every scenario the filter bar shows that does not rebalance
@@ -289,10 +338,9 @@ python3 -m kalshi_betting.backtest --sell-workers 4
 python3 -m kalshi_betting.backtest --dashboard-only
 
 # The same, quickly, to check a small dashboard change: each of --no-sell-sweep,
-# --no-rebalance-sweep, --no-move-sweep, --no-maturity-sweep and --no-cap-sweep drops that family
-# (or that part of it) from the saved run,
-# giving the page a run with that flag would have built (the Sell select alone took 1.4 to 4.6 h on
-# the last 365-day runs)
+# --no-rebalance-sweep, --no-move-sweep, --no-maturity-sweep, --no-close-sweep and --no-cap-sweep
+# drops that family (or that part of it) from the saved run, giving the page a run with that flag
+# would have built (the Sell select alone took 1.4 to 4.6 h on the last 365-day runs)
 python3 -m kalshi_betting.backtest --dashboard-only --no-sell-sweep --no-rebalance-sweep
 
 # A rebuild is refused (exit 2) when the simulator's code (backtester, strategy, scanner,
@@ -346,7 +394,7 @@ python3 -m kalshi_betting.scheduler
 # Data, eda_dashboard.html (what backtest_cache/ holds, rebuilt at the end of each
 # backtest), and Run, the latest run's page, shown once a run starts. The Trading tab opens
 # on the live defaults in force (an outdated file's values in their new form; with none
-# saved, the seed values); its dropdowns, the backtest bar's eleven settings, propose other
+# saved, the seed values); its dropdowns, the backtest bar's twelve settings, propose other
 # values, and the Backtest tab's filter bar and the Trading tab follow each other. The
 # launcher takes only --seed, --no-browser and -h/--help, spelled in full (anything else
 # exits 2 before anything starts), runs from its own folder (so from any directory), checks
@@ -365,7 +413,7 @@ python3 -m kalshi_betting.scheduler
 # saved file, or one an older version saved (every file saved before the same-title cap was
 # removed), every live run exits 2. Confirm and trade (it saves first when the settings
 # change anything; with nothing changed it trades the saved defaults) and Dry run (no
-# orders, nothing saved) start `python -m kalshi_betting.main --mode prod` with all eleven
+# orders, nothing saved) start `python -m kalshi_betting.main --mode prod` with all twelve
 # toggles as flags, in its own session; each run's folder is under live_runs/, and its page,
 # /runs/<id>, opens in the Run tab. Confirm and save with nothing changed writes nothing
 # (/saved?unchanged=1), and /trade answers with a redirect to /confirm. Run it again
