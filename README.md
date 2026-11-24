@@ -1058,7 +1058,10 @@ the bot's first live trade (Sep 28, 2026):
   seventh keeps its own name, in gray), and "Other bets" (anything the bot did
   not buy — your own trades).
 - The return of each category over the period.
-- The holdings now, with Cash and the totals, and notes and warnings.
+- The holdings now, with Cash and the totals, and each holding's dollar and
+  percent return over the period chosen. The period buttons appear again just
+  above this table, and the two rows always show the same choice.
+- Notes and warnings.
 
 How the figures are worked out:
 
@@ -1091,6 +1094,14 @@ How the figures are worked out:
   today's value). A category's return is its profit over what it put in (its
   value at the start plus the most cash it had out since), so a sale counts as
   cash back, never as a loss.
+- **A holding's return** over a period splits its contracts into groups: those
+  already held when the period starts (at that day's price) and each purchase
+  inside it (at what it cost, fees included). A sale takes the oldest contracts
+  first; what is left ends at today's price. Return $ adds up each group's
+  gain. Return % weights each group by its dollars and by the days it was held
+  in the period: the sum of days × contracts × gain per contract over the sum
+  of days × contracts × start price. The Holdings total row pools every
+  holding's sums the same way.
 - **Colors** stay the same from one load to the next: each category keeps the
   color it got when the bot first bought in it, as long as the bot's purchases
   and their categories stay the same (Kalshi filing a series under another

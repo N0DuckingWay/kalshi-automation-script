@@ -158,6 +158,20 @@ def _view(groups: dict[str, float] | None = None, *, holdings=None, warnings=(),
     return dataclasses.replace(view, **changes)
 
 
+def _with_returns(view: LiveView) -> LiveView:
+    """
+    The view with a return for its first holding in every period: period i gained $(i + 1).
+
+    Each period's weights are set so its return is (i + 1) / 10, so the
+    holdings table differs from one period to the next.
+    """
+    h = view.holdings[0]
+    periods = tuple(dataclasses.replace(p, holdings=(live_portfolio.HoldingReturn(
+        h.ticker, h.group, h.side, D(i + 1), D(i + 1), D(10)),))
+        for i, p in enumerate(view.periods))
+    return dataclasses.replace(view, periods=periods)
+
+
 def _stats(**changes) -> PeriodStats:
     """One period's figures, set by hand."""
     stats = PeriodStats("All", START, READ, 0.123, 4.56, 1.234, 2.5, 9, 0.05, -0.02,
@@ -364,7 +378,7 @@ class TestArea:
         rows = out["periods"][0]["group_rows"]
         assert [r["cells"][0] for r in rows] == [f"Cat{i}" for i in range(7)]
         assert rows[6]["swatch"] == [0, live_dashboard._MORE_COLOR] and rows[6]["tip"] is None
-        swatches = {r["cells"][6]: r["swatch"][1] for r in out["holdings"]["rows"]}
+        swatches = {r["cells"][-1]: r["swatch"][1] for r in out["holdings"]["rows"]}
         assert swatches["Cat6"] == live_dashboard._MORE_COLOR
         assert swatches["Cat0"] == live_dashboard._PALETTE[0]
 
@@ -405,7 +419,7 @@ class TestArea:
         assert colors[0] == {"Crypto": "#2a78d6", "Climate": "#eb6834", OTHER_BETS: "#4a3aa7"}
         area = {t["name"]: t["fillcolor"] for t in out["area"]["data"] if "fillcolor" in t}
         assert all(area[name] == color for name, color in colors[0].items())
-        swatches = {row["cells"][6]: row["swatch"][1] for row in out["holdings"]["rows"]}
+        swatches = {row["cells"][-1]: row["swatch"][1] for row in out["holdings"]["rows"]}
         assert swatches == colors[0]
 
     def test_a_later_bigger_category_does_not_take_an_earlier_ones_color(self):
@@ -434,7 +448,7 @@ class TestArea:
         out = payload(view)
         assert "Newcomer" in view.group_order
         assert "Newcomer" not in [t["name"] for t in out["area"]["data"]]
-        row = next(r for r in out["holdings"]["rows"] if r["cells"][6] == "Newcomer")
+        row = next(r for r in out["holdings"]["rows"] if r["cells"][-1] == "Newcomer")
         assert row["swatch"][1] in live_dashboard._PALETTE
 
 
@@ -446,16 +460,62 @@ class TestHoldings:
         view = _view(holdings=held)
         table = payload(view)["holdings"]
         assert [r["cells"] for r in table["rows"]] == [
-            ["Will A1?", "YES", "13", "$0.45", "$5.85", "$3.90", "Crypto"],
-            ["Will B1?", "NO", "13", "$0.40", "$5.20", "$5.20", "Crypto"],
-            ["Will X?", "YES", "5", "—", "$1.00", "$1.00", OTHER_BETS]]
+            ["Will A1?", "YES", "13", "$0.45", "$5.85", "$3.90", "—", "—", "Crypto"],
+            ["Will B1?", "NO", "13", "$0.40", "$5.20", "$5.20", "—", "—", "Crypto"],
+            ["Will X?", "YES", "5", "—", "$1.00", "$1.00", "—", "—", OTHER_BETS]]
         assert [r["tip"] for r in table["rows"]] == ["A1", "B1", "X"]
-        # The holdings' value beside their cost; cash and the total have no cost
+        # The holdings' value beside their cost; cash and the total have no cost.
+        # With no period's returns, both return columns show "—"
         assert [r["cells"] for r in table["foot"]] == [
-            ["Holdings", "", "", "", "$12.05", "$10.10", ""],
-            [CASH, "", "", "", "$90.91", "", ""],
-            ["Total", "", "", "", "$102.96", "", ""]]
+            ["Holdings", "", "", "", "$12.05", "$10.10", "—", "—", ""],
+            [CASH, "", "", "", "$90.91", "", "", "", ""],
+            ["Total", "", "", "", "$102.96", "", "", "", ""]]
+        assert table["rows"][0]["swatch"][0] == len(live_dashboard.HOLDINGS_COLUMNS) - 1
         assert table["empty"] is None
+
+    def test_each_period_shows_its_own_returns(self):
+        held = (_holding("A1", "Crypto", "yes", "13", "0.45", "3.90"),
+                _holding("B1", "Crypto", "no", "13", "0.40", "5.20"),
+                _holding("X", OTHER_BETS, "yes", "5", None, "1.00"))
+        view = _view(holdings=held)
+        a1 = live_portfolio.HoldingReturn("A1", "Crypto", "yes", D("1.95"), D("39"), D("78"))
+        b1 = live_portfolio.HoldingReturn("B1", "Crypto", "no", D("-0.40"), D("-2"), D("52"))
+        stats = dataclasses.replace(view.periods[0], holdings=(b1, a1))
+        view = dataclasses.replace(view, periods=(stats, *view.periods[1:]))
+        table = payload(view)["periods"][0]["holdings"]
+        # Matched by market, side and category, whatever the order; X has none: "—"
+        assert [r["cells"][6:8] for r in table["rows"]] == [
+            ["+$1.95", "+50.0%"], ["-$0.40", "-3.8%"], ["—", "—"]]
+        # The total pools the weights: (39 - 2) / (78 + 52)
+        assert table["foot"][0]["cells"] == ["Holdings", "", "", "", "$12.05", "$10.10",
+                                             "+$1.55", "+28.5%", ""]
+        assert [r["cells"][6:8] for r in table["foot"][1:]] == [["", ""], ["", ""]]
+
+    def test_every_period_lists_every_holding(self):
+        out = payload(_with_returns(_view()))
+        markets = [r["cells"][0] for r in out["holdings"]["rows"]]
+        assert len(markets) == 3
+        for i, period in enumerate(out["periods"]):
+            assert [r["cells"][0] for r in period["holdings"]["rows"]] == markets
+            assert [r["cells"][0] for r in period["holdings"]["foot"]] == [
+                "Holdings", CASH, "Total"]
+            assert period["holdings"]["rows"][0]["cells"][6] == f"+${i + 1}.00"
+            assert [r["cells"][6] for r in period["holdings"]["rows"][1:]] == ["—", "—"]
+
+    def test_the_headings_and_the_second_row_of_buttons(self):
+        page = live_dashboard._SHELL
+        head = page.split('<table id="holdings-table"><thead><tr>', 1)[1].split("</tr>", 1)[0]
+        assert re.findall(r">([^<]+)</th>", head) == [name for name, _
+                                                      in live_dashboard.HOLDINGS_COLUMNS]
+        assert head.count('title="') == 2
+        assert ('<th title="Dollars gained or lost on this holding over the period chosen, '
+                'sales and fees included">Return $</th>') in head
+        # The buttons sit between the heading and the table, labelled as the top row
+        between = page.split("<h2>Holdings now</h2>", 1)[1].split('<table id="holdings-table">')[0]
+        assert 'id="live-holdings-periods"' in between and 'id="live-holdings-range"' in between
+        for i, (label, _) in enumerate(config.LIVE_DASHBOARD_PERIODS):
+            pressed = "true" if i == 0 else "false"
+            assert f'id="holdings-period-{i}" aria-pressed="{pressed}">{label}</button>' in between
 
     def test_the_outcome_label_tells_two_rungs_apart(self):
         held = (_holding("Q-26NOV01", "Tech", "yes", subtitle="Before Nov 1, 2026"),
@@ -1789,11 +1849,16 @@ class TestPageScript:
         assert snap["plots"][1]["data"] == first["groups"]["data"]
         assert snap["plots"][2]["update"] == {"xaxis.range": first["range"]}
         assert snap["plots"][0]["config"] == {"responsive": True, "displaylogo": False}
-        assert _cells(snap, "live-holdings") == [r["cells"] for r in data["holdings"]["rows"]]
-        assert _cells(snap, "live-holdings-foot") == [r["cells"] for r in data["holdings"]["foot"]]
+        assert _cells(snap, "live-holdings") == [r["cells"] for r in first["holdings"]["rows"]]
+        assert _cells(snap, "live-holdings-foot") == [r["cells"] for r in first["holdings"]["foot"]]
         first_row = el["live-holdings"]["rows"][0]["cells"]
-        assert first_row[0]["title"] == data["holdings"]["rows"][0]["tip"]
-        assert first_row[6]["border"] == f"4px solid {data['holdings']['rows'][0]['swatch'][1]}"
+        assert first_row[0]["title"] == first["holdings"]["rows"][0]["tip"]
+        assert first_row[8]["border"] == f"4px solid {first['holdings']['rows'][0]['swatch'][1]}"
+        assert el["live-holdings-range"]["text"] == first["note"]
+        assert el["live-holdings-periods"]["hidden"] is False
+        assert [el[f"holdings-period-{i}"]["attrs"]["aria-pressed"]
+                for i in range(len(data["periods"]))] == ["true", "false", "false", "false",
+                                                          "false"]
         assert _cells(snap, "live-group-rows") == [r["cells"] for r in first["group_rows"]]
         assert [r["text"] for r in el["live-notes"]["rows"]] == data["notes"]
         assert [r["text"] for r in el["live-warnings"]["rows"]] == data["warnings"]
@@ -1851,6 +1916,45 @@ class TestPageScript:
             ("react", "live-groups"), ("relayout", "live-area")]
         assert snap["plots"][1]["update"] == {"xaxis.range": chosen["range"]}
         assert snap["fetches"] == []
+
+    def test_the_two_rows_of_period_buttons_stay_in_step(self, tmp_path):
+        data = payload(_with_returns(_view()))
+        n = len(data["periods"])
+        steps = [["settle"], ["click", "holdings-period-1"], ["snap", "lower"],
+                 ["click", "period-0"], ["snap", "upper"]]
+        for i in range(n):
+            steps += [["click", f"holdings-period-{i}"], ["snap", f"lower-{i}"],
+                      ["click", f"period-{i}"], ["snap", f"upper-{i}"]]
+        snaps = _run_live_script(tmp_path, [{"status": 200, "body": data}], steps)
+
+        def check(snap, i):
+            el, period = snap["el"], data["periods"][i]
+            pressed = ["true" if k == i else "false" for k in range(n)]
+            assert [el[f"period-{k}"]["attrs"]["aria-pressed"] for k in range(n)] == pressed
+            assert [el[f"holdings-period-{k}"]["attrs"]["aria-pressed"]
+                    for k in range(n)] == pressed
+            assert el["live-range"]["text"] == el["live-holdings-range"]["text"] == period["note"]
+            assert el["card-return"]["text"] == period["cards"]["return"]["text"]
+            # The heading's table is redrawn for the period, every holding in it
+            assert _cells(snap, "live-holdings") == [r["cells"] for r in period["holdings"]["rows"]]
+            assert _cells(snap, "live-holdings-foot") == [
+                r["cells"] for r in period["holdings"]["foot"]]
+            assert len(el["live-holdings"]["rows"]) == len(data["holdings"]["rows"])
+            assert el["live-holdings-periods"]["hidden"] is False
+
+        # A lower button presses the top one too, and the reverse
+        check(snaps["lower"], 1)
+        check(snaps["upper"], 0)
+        for i in range(n):
+            check(snaps[f"lower-{i}"], i)
+            check(snaps[f"upper-{i}"], i)
+
+    def test_no_period_hides_the_second_row_and_keeps_the_table(self, tmp_path):
+        data = payload(_view({OTHER_BETS: 5.0}, history=False))
+        snap = _run_live_script(tmp_path, [{"status": 200, "body": data}],
+                                [["settle"], ["snap", "shown"]])["shown"]
+        assert snap["el"]["live-holdings-periods"]["hidden"] is True
+        assert _cells(snap, "live-holdings") == [r["cells"] for r in data["holdings"]["rows"]]
 
     def test_the_backtest_tab_loads_its_page_once(self, tmp_path):
         data = payload(_view())

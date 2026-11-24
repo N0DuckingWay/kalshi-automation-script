@@ -221,6 +221,18 @@ _CARD_HINTS = {
     "median": "Middle return of the bot's purchases in the period",
 }
 
+# The holdings table's columns, in page order, each with what it says when
+# pointed at (None: no hover text)
+HOLDINGS_COLUMNS = (
+    ("Market", None), ("Side", None), ("Contracts", None), ("Price", None), ("Value", None),
+    ("Cost", None),
+    ("Return $", "Dollars gained or lost on this holding over the period chosen, sales and "
+                 "fees included"),
+    ("Return %", "Its return over the period, each group of contracts weighted by its dollars "
+                 "and by the days it was held in the period"),
+    ("Category", None),
+)
+
 # Kalshi's days close at midnight here; the chart's times are in this zone
 _DAY_ZONE = ZoneInfo(config.LIVE_CANDLE_DAY_ZONE)
 
@@ -852,11 +864,13 @@ def _trades_note(stats: live_portfolio.PeriodStats) -> str:
             f"{days}")
 
 
-def _period(stats: live_portfolio.PeriodStats, bands: _Bands) -> dict:
+def _period(view: live_portfolio.LiveView, stats: live_portfolio.PeriodStats,
+            bands: _Bands) -> dict:
     """
     Everything one period button shows.
 
     Args:
+        view (live_portfolio.LiveView): The view (its holdings, for the holdings table).
         stats (live_portfolio.PeriodStats): The period's figures.
         bands (_Bands): The bands.
 
@@ -866,7 +880,8 @@ def _period(stats: live_portfolio.PeriodStats, bands: _Bands) -> dict:
             chart's x values), "groups" (the bar chart) and "group_rows" (the
             table under it: band, return, profit, put in, each row with its
             band's color as a swatch on the first cell, and MORE_CATEGORIES
-            naming its categories as that cell's tooltip).
+            naming its categories as that cell's tooltip) and "holdings" (the
+            holdings table with this period's returns, see _holdings).
     """
     rows = _group_rows(stats.groups, bands)
     return {
@@ -879,6 +894,7 @@ def _period(stats: live_portfolio.PeriodStats, bands: _Bands) -> dict:
         "group_rows": [{"cells": [r.label, _pct(r.ret), _signed_money(r.pnl), _money(r.put_in)],
                         "tip": _members_text(r.members) or None, "swatch": [0, r.color]}
                        for r in rows],
+        "holdings": _holdings(view, bands, stats),
     }
 
 
@@ -901,36 +917,58 @@ def _market_label(holding: live_portfolio.Holding) -> str:
     return holding.title
 
 
-def _holdings(view: live_portfolio.LiveView, bands: _Bands) -> dict:
+def _holdings(view: live_portfolio.LiveView, bands: _Bands,
+              stats: live_portfolio.PeriodStats | None = None) -> dict:
     """
     The holdings table: one row per holding, then the holdings' totals, the cash and the account's total.
 
-    The holdings' row sets their value beside their cost; the Cash row and
-    the Total row (holdings and cash) give a value only, since cash has no
-    cost to compare it with.
+    Every holding held now has a row, whatever the period: one with nothing
+    to measure in the period shows "—" in its two return cells, as every
+    holding does with no period (before the bot's first trade). The
+    Holdings row adds up the values, the costs and the dollar returns, and
+    its return % pools every holding's dollar-and-day weights (the sum of
+    their tops over the sum of their bottoms), so it is weighted the same
+    way as each row. The Cash row and the Total row (holdings and cash)
+    give a value only, since cash has no cost or return to show.
 
     Args:
         view (live_portfolio.LiveView): The view.
         bands (_Bands): The bands (each row's category swatch).
+        stats (live_portfolio.PeriodStats | None): The period whose returns
+            the two return columns show; None for none.
 
     Returns:
         dict: "rows" and "foot" (each row {"cells", "tip", "swatch"}: the
-            cells Market, Side, Contracts, Price, Value, Cost and Category,
-            the market's ticker as the first cell's tooltip, and the
-            category's color on the last cell), and "empty" (a sentence for
-            when nothing is held, else None).
+            cells of HOLDINGS_COLUMNS, the market's ticker as the first
+            cell's tooltip, and the category's color on the last cell), and
+            "empty" (a sentence for when nothing is held, else None).
     """
-    rows = [{"cells": [_market_label(h), h.side.upper(), config.count_text(float(h.contracts)),
-                       _price(h.price), _money(h.value), _money(h.cost), h.group],
-             "tip": h.ticker, "swatch": [6, bands.colors.get(h.group, _MORE_COLOR)]}
-            for h in view.holdings]
+    returns = {} if stats is None else {(r.ticker, r.group, r.side): r for r in stats.holdings}
+    swatch = len(HOLDINGS_COLUMNS) - 1
+    rows = []
+    for h in view.holdings:
+        r = returns.get((h.ticker, h.group, h.side))
+        rows.append({"cells": [_market_label(h), h.side.upper(),
+                               config.count_text(float(h.contracts)), _price(h.price),
+                               _money(h.value), _money(h.cost),
+                               _signed_money(None if r is None else r.pnl),
+                               _pct(None if r is None else r.ret), h.group],
+                     "tip": h.ticker, "swatch": [swatch, bands.colors.get(h.group, _MORE_COLOR)]})
     cost = sum((h.cost for h in view.holdings), Decimal(0))
+    pnl = ret = None
+    mine = [r for r in (returns.get((h.ticker, h.group, h.side)) for h in view.holdings)
+            if r is not None]
+    if mine:
+        pnl = sum((r.pnl for r in mine), Decimal(0))
+        bottom = sum((r.cost_days for r in mine), Decimal(0))
+        ret = float(sum((r.gain_days for r in mine), Decimal(0)) / bottom) if bottom > 0 else None
     foot = [
-        {"cells": ["Holdings", "", "", "", _money(view.holdings_value), _money(cost), ""],
+        {"cells": ["Holdings", "", "", "", _money(view.holdings_value), _money(cost),
+                   _signed_money(pnl), _pct(ret), ""],
          "tip": None, "swatch": None},
-        {"cells": [CASH, "", "", "", _money(view.cash), "", ""], "tip": None,
-         "swatch": [6, _CASH_COLOR]},
-        {"cells": ["Total", "", "", "", _money(view.cash + view.holdings_value), "", ""],
+        {"cells": [CASH, "", "", "", _money(view.cash), "", "", "", ""], "tip": None,
+         "swatch": [swatch, _CASH_COLOR]},
+        {"cells": ["Total", "", "", "", _money(view.cash + view.holdings_value), "", "", "", ""],
          "tip": None, "swatch": None},
     ]
     return {"rows": rows, "foot": foot,
@@ -1031,11 +1069,13 @@ def payload(view: live_portfolio.LiveView) -> dict:
             "empty" (a sentence, or None), "periods" (one per
             config.LIVE_DASHBOARD_PERIODS, see _period; [] without a
             history), "area" (the stacked chart, or None), "area_table" (its
-            figures, see _area_table, or None), "holdings" (see _holdings),
+            figures, see _area_table, or None), "holdings" (see _holdings:
+            the table with no period's returns, shown only when there is no
+            period; each period carries its own),
             "notes" and "warnings" (sentences).
     """
     bands = _bands(view)
-    periods = [_period(stats, bands) for stats in view.periods or ()]
+    periods = [_period(view, stats, bands) for stats in view.periods or ()]
     empty = None
     if view.history is None or not periods:
         empty = ("The bot has made no live trade yet. The holdings below are read from Kalshi; "
@@ -1780,8 +1820,12 @@ _SCRIPT_TEMPLATE = """
     CHOSEN = i;
     for (var k = 0; k < PERIODS; k++) {
       byId('period-' + k).setAttribute('aria-pressed', k === i ? 'true' : 'false');
+      byId('holdings-period-' + k).setAttribute('aria-pressed', k === i ? 'true' : 'false');
     }
     byId('live-range').textContent = period.note;
+    byId('live-holdings-range').textContent = period.note;
+    rows('live-holdings', period.holdings.rows);
+    rows('live-holdings-foot', period.holdings.foot);
     CARDS.forEach(function (key) {
       var card = period.cards[key];
       var value = byId('card-' + key);
@@ -1807,6 +1851,7 @@ _SCRIPT_TEMPLATE = """
     empty.textContent = data.empty || '';
     empty.hidden = !data.empty;
     byId('live-stats').hidden = !data.periods.length;
+    byId('live-holdings-periods').hidden = !data.periods.length;
     rows('live-holdings', data.holdings.rows);
     rows('live-holdings-foot', data.holdings.foot);
     var none = byId('live-holdings-empty');
@@ -2037,6 +2082,7 @@ _SCRIPT_TEMPLATE = """
   for (var k = 0; k < PERIODS; k++) {
     (function (i) {
       byId('period-' + i).addEventListener('click', function () { choose(i); });
+      byId('holdings-period-' + i).addEventListener('click', function () { choose(i); });
     })(k);
   }
   // Loaded at once, so the trading page and the bar of the backtest page
@@ -2147,7 +2193,7 @@ table {{ border-collapse: collapse; width: 100%; background: var(--surface);
 th, td {{ text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--grid); }}
 th {{ color: var(--ink-2); font-weight: 600; }}
 tfoot td {{ font-weight: 600; }}
-#holdings-table td:nth-child(n+3):nth-child(-n+6), #holdings-table th:nth-child(n+3):nth-child(-n+6),
+#holdings-table td:nth-child(n+3):nth-child(-n+8), #holdings-table th:nth-child(n+3):nth-child(-n+8),
 #group-table td:nth-child(n+2), #group-table th:nth-child(n+2),
 #area-table td:nth-child(n+2), #area-table th:nth-child(n+2) {{ text-align: right; }}
 #holdings-table td:nth-child(n+2), #holdings-table th:nth-child(n+2),
@@ -2205,7 +2251,8 @@ def _shell() -> str:
     The frames are the Backtest, Trading, Data and Run tabs' (the Trading
     frame under a one-line note with a Reload button); none is given an
     address here, the script sets each. Built once, from config: the period
-    buttons from config.LIVE_DASHBOARD_PERIODS, the cards from CARD_LABELS,
+    buttons from config.LIVE_DASHBOARD_PERIODS (twice: at the top, and again
+    just above the holdings table, the script keeping the two rows in step), the cards from CARD_LABELS,
     the Plotly file with its integrity hash, the live-defaults server's
     address in the Trading tab's note.
 
@@ -2220,8 +2267,14 @@ def _shell() -> str:
         f'<div class="card"><div class="card-label" title="{escape(_CARD_HINTS[key])}">'
         f'{escape(label)}</div><div class="card-value flat" id="card-{key}">—</div></div>'
         for key, label in CARD_LABELS)
-    holdings_head = "".join(f"<th>{name}</th>" for name in (
-        "Market", "Side", "Contracts", "Price", "Value", "Cost", "Category"))
+    holdings_head = "".join(
+        f'<th title="{escape(hint)}">{escape(name)}</th>' if hint else f"<th>{escape(name)}</th>"
+        for name, hint in HOLDINGS_COLUMNS)
+    # The same period buttons again, just above the holdings table
+    holdings_periods = "".join(
+        f'<button type="button" id="holdings-period-{i}" '
+        f'aria-pressed="{"true" if i == 0 else "false"}">{escape(label)}</button>'
+        for i, (label, _) in enumerate(config.LIVE_DASHBOARD_PERIODS))
     group_head = "".join(f"<th>{name}</th>" for name in ("Category", "Return", "Profit", "Put in"))
     # The Trading tab's one line: whose page it shows, and what starts that server
     trading_note = (f"Trading uses the live-defaults server ({config.DEFAULTS_SERVER_HOST}:"
@@ -2261,6 +2314,7 @@ def _shell() -> str:
 <table id="group-table"><thead><tr>{group_head}</tr></thead><tbody id="live-group-rows"></tbody></table>
 </div>
 <h2>Holdings now</h2>
+<div id="live-holdings-periods" class="periods" role="group" aria-label="Period">{holdings_periods}<span id="live-holdings-range" class="range"></span></div>
 <table id="holdings-table"><thead><tr>{holdings_head}</tr></thead><tbody id="live-holdings"></tbody><tfoot id="live-holdings-foot"></tfoot></table>
 <p id="live-holdings-empty" class="empty" hidden></p>
 <h2>Notes</h2>
