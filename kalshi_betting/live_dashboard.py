@@ -956,6 +956,7 @@ def _holdings(view: live_portfolio.LiveView, bands: _Bands,
                      "tip": h.ticker, "swatch": [swatch, bands.colors.get(h.group, _MORE_COLOR)]})
     cost = sum((h.cost for h in view.holdings), Decimal(0))
     pnl = ret = None
+    # "mine": the period's return figures for the holdings held now (holdings with none are skipped)
     mine = [r for r in (returns.get((h.ticker, h.group, h.side)) for h in view.holdings)
             if r is not None]
     if mine:
