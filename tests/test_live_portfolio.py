@@ -2326,6 +2326,108 @@ class TestGroupReturns:
         assert (group.pnl, group.put_in, group.ret) == (1.0, 0.0, None)
 
 
+class TestHoldingReturns:
+    """Each holding's return over a period, weighted by dollars and by days held."""
+
+    FIRST = _utc(2026, 9, 1, 4)              # the period's first moment
+    LAST = FIRST + timedelta(days=30)        # the read
+
+    def _day(self, n: float) -> datetime:
+        """The moment n days into the period."""
+        return self.FIRST + timedelta(days=n)
+
+    @staticmethod
+    def _buy(when, contracts, spent, ticker="M", side="yes", owner="o"):
+        """A purchase: contracts opened for `spent` dollars, fees included."""
+        return live_portfolio.LedgerEvent(when, ticker, owner, side, D(contracts), -D(spent),
+                                          D(spent), D(spent))
+
+    @staticmethod
+    def _sell(when, contracts, cash, basis, ticker="M", side="yes", owner="o"):
+        """A sale: contracts closed for `cash` dollars after fees, taking `basis` of their cost."""
+        return live_portfolio.LedgerEvent(when, ticker, owner, side, -D(contracts), D(cash),
+                                          D(0), -D(basis))
+
+    def _returns(self, events, daily, now, group_of=lambda owner: "G"):
+        """holding_returns over FIRST to LAST, by ticker."""
+        ledger = live_portfolio.Ledger(tuple(sorted(events, key=lambda e: e.time)), {}, ())
+        marks = Marks(daily, now, self.LAST)
+        return {r.ticker: r for r in live_portfolio.holding_returns(
+            ledger, marks, group_of, self.FIRST, self.LAST)}
+
+    def test_the_worked_example(self):
+        # 110 contracts held at the start of a 30-day period at $0.50; 10 sold a day
+        # later $0.10 up; the other 100 end $0.50 up:
+        # (30·100·0.5 + 1·10·0.1) / (30·100·0.5 + 1·10·0.5) = 1501 / 1505
+        events = [self._buy(self.FIRST - timedelta(days=5), 110, "44"),
+                  self._sell(self._day(1), 10, "6", "4")]
+        r = self._returns(events, {"M": ((self.FIRST, D("0.50")),)}, {"M": D("1.00")})["M"]
+        assert (r.ticker, r.group, r.side) == ("M", "G", "yes")
+        assert r.gain_days == D(1501) and r.cost_days == D(1505)
+        assert r.pnl == D(51)
+        assert r.ret == pytest.approx(1501 / 1505)
+
+    def test_held_all_period_is_its_price_change(self):
+        events = [self._buy(self.FIRST - timedelta(days=1), 10, "3.50")]
+        r = self._returns(events, {"M": ((self.FIRST, D("0.40")),)}, {"M": D("0.50")})["M"]
+        assert r.pnl == D("1.00")
+        assert r.ret == pytest.approx(0.25)
+
+    def test_a_purchase_inside_the_period_starts_at_its_cost_with_fees(self):
+        events = [self._buy(self._day(10), 10, "4.10")]
+        r = self._returns(events, {}, {"M": D("0.50")})["M"]
+        assert r.pnl == D("0.90")
+        assert r.cost_days == 20 * D("4.10")
+        assert r.ret == pytest.approx(0.90 / 4.10)
+
+    def test_a_sale_takes_the_oldest_contracts_first(self):
+        # 10 held at the start ($0.40 then), 10 bought on day 5 at $0.50, 15 sold on
+        # day 10 at $0.60: the 10 oldest (10 days, +$0.20) then 5 of the newer (5 days,
+        # +$0.10); the 5 left end at $0.55 (25 days, +$0.05)
+        events = [self._buy(self.FIRST - timedelta(days=1), 10, "4"),
+                  self._buy(self._day(5), 10, "5"),
+                  self._sell(self._day(10), 15, "9", "6.5")]
+        r = self._returns(events, {"M": ((self.FIRST, D("0.40")),)}, {"M": D("0.55")})["M"]
+        assert r.pnl == 10 * D("0.20") + 5 * D("0.10") + 5 * D("0.05")
+        assert r.gain_days == (10 * 10 * D("0.20") + 5 * 5 * D("0.10")
+                               + 25 * 5 * D("0.05"))
+        assert r.cost_days == 10 * 10 * D("0.40") + 5 * 5 * D("0.50") + 25 * 5 * D("0.50")
+
+    def test_a_market_never_priced_shows_no_gain(self):
+        events = [self._buy(self.FIRST - timedelta(days=1), 10, "4"),
+                  self._buy(self._day(10), 10, "6")]
+        r = self._returns(events, {}, {})["M"]
+        assert r.pnl == 0 and r.gain_days == 0
+        assert r.ret == 0.0
+
+    def test_a_no_holding_is_priced_at_one_less_the_yes_price(self):
+        events = [self._buy(self.FIRST - timedelta(days=1), 10, "2.50", side="no")]
+        r = self._returns(events, {"M": ((self.FIRST, D("0.70")),)}, {"M": D("0.60")})["M"]
+        assert r.side == "no"
+        assert r.pnl == D("1.00")                       # $0.30 to $0.40 a contract
+        assert r.ret == pytest.approx(1 / 3)
+
+    def test_only_holdings_held_now_are_listed(self):
+        events = [self._buy(self._day(1), 10, "4", ticker="GONE"),
+                  self._sell(self._day(2), 10, "5", "4", ticker="GONE"),
+                  self._buy(self._day(1), 10, "4", ticker="KEPT")]
+        assert set(self._returns(events, {}, {"KEPT": D("0.50")})) == {"KEPT"}
+
+    def test_nothing_held_for_any_time_has_no_return(self):
+        r = self._returns([self._buy(self.LAST, 10, "4")], {}, {"M": D("0.50")})["M"]
+        assert r.cost_days == 0 and r.ret is None
+
+    def test_each_group_is_its_own_holding(self):
+        events = [self._buy(self._day(1), 10, "4", owner="bot"),
+                  self._buy(self._day(1), 10, "4", owner="me")]
+        ledger = live_portfolio.Ledger(tuple(events), {}, ())
+        out = live_portfolio.holding_returns(
+            ledger, Marks({}, {"M": D("0.50")}, self.LAST),
+            lambda owner: "Crypto" if owner == "bot" else OTHER_BETS, self.FIRST, self.LAST)
+        assert sorted((r.group, r.pnl) for r in out) == [("Crypto", D("1.00")),
+                                                         (OTHER_BETS, D("1.00"))]
+
+
 class TestTradeReturns:
     TRADE = _bot("T1", [("A", "yes", 10), ("B", "no", 10)], T0 + timedelta(minutes=1))
 
@@ -2728,6 +2830,14 @@ class TestBuildLiveView:
         [trade] = view.trades
         assert trade.ret == pytest.approx((-9.10 + 5.85 + 5.20) / 9.10)
         assert view.periods[0].purchases == 1
+        # Every period lists every holding held now with its return; the bot's A1 leg,
+        # bought inside every period, gained its value now less what it cost
+        for period in view.periods:
+            assert sorted((r.ticker, r.group, r.side) for r in period.holdings) == sorted(
+                (h.ticker, h.group, h.side) for h in view.holdings)
+        a1 = next(r for r in view.periods[0].holdings if r.ticker == "A1")
+        assert a1.pnl == D("5.85") - D("3.9000")
+        assert a1.ret == pytest.approx(1.95 / 3.90)
         # The history's last moment is the read, valued as the holdings are
         assert view.history.total(-1) == pytest.approx(90.905 + 12.30)
         assert {t for p in fake.batches() for t in p["market_tickers"].split(",")} == {

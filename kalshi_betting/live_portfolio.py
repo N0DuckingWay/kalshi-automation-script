@@ -26,7 +26,8 @@ Purpose:
     else is Other bets). Each credit is in the cash from the moment Kalshi
     made it and counts as money the account earned, never as a deposit. From
     those values it works out each period's statistics (total return,
-    profit, Sharpe and Sortino, each category's return), each bot purchase's
+    profit, Sharpe and Sortino, each category's return, and each holding's
+    return weighted by dollars and by days held), each bot purchase's
     return, the holdings now, and whether the cash each run logged before it
     traded matches the cash rebuilt from Kalshi's records. build_live_view
     puts it all together for the page, and append_snapshot writes one JSON
@@ -2397,6 +2398,43 @@ class GroupReturn:
 
 
 @dataclass(frozen=True)
+class HoldingReturn:
+    """
+    How one holding held now did over a period, weighted by dollars and by days held.
+
+    The holding's contracts are split into groups: those already held when
+    the period starts, and each purchase inside it. Each group has a start
+    price per contract, an end price per contract (what a sale inside the
+    period paid, or the price now) and the days it was held inside the
+    period. The return is the sum, over the groups, of days × contracts ×
+    gain per contract, over the sum of days × contracts × start price, so a
+    group counts for more the more money it held and the longer it held it.
+
+    Attributes:
+        ticker (str): The market.
+        group (str): A Kalshi category, or OTHER_BETS.
+        side (str): "yes" or "no".
+        pnl (Decimal): Dollars gained or lost over the period: contracts ×
+            (end price − start price), added up over the groups.
+        gain_days (Decimal): The top of the return: days × contracts × gain
+            per contract, added up.
+        cost_days (Decimal): The bottom: days × contracts × start price per
+            contract, added up.
+    """
+    ticker: str
+    group: str
+    side: str
+    pnl: Decimal
+    gain_days: Decimal
+    cost_days: Decimal
+
+    @property
+    def ret(self) -> float | None:
+        """The return: gain_days over cost_days; None when nothing was held for any time."""
+        return float(self.gain_days / self.cost_days) if self.cost_days > 0 else None
+
+
+@dataclass(frozen=True)
 class PeriodStats:
     """
     The Live trading tab's figures for one period.
@@ -2424,6 +2462,9 @@ class PeriodStats:
         purchases (int): How many purchases.
         open_pairs (Decimal): Their pairs still held.
         groups (tuple[GroupReturn, ...]): Each group's return over the period.
+        holdings (tuple[HoldingReturn, ...]): Each holding held now and its
+            return over the period (holding_returns); empty until
+            build_live_view fills it in.
     """
     label: str
     first: datetime
@@ -2439,6 +2480,7 @@ class PeriodStats:
     purchases: int
     open_pairs: Decimal
     groups: tuple[GroupReturn, ...]
+    holdings: tuple[HoldingReturn, ...] = ()
 
 
 def _group_returns(history: History, a: int) -> tuple[GroupReturn, ...]:
@@ -2468,6 +2510,115 @@ def _group_returns(history: History, a: int) -> tuple[GroupReturn, ...]:
                                 if times[a] < when <= times[end]])
         put_in = history.value[group][a] + out_most
         out.append(GroupReturn(group, gain, put_in, gain / put_in if put_in > 0 else None))
+    return tuple(out)
+
+
+def _days_between(start: datetime, end: datetime) -> Decimal:
+    """
+    The days from one moment to another, with the part of a day kept (12 hours is 0.5).
+
+    Args:
+        start (datetime): The earlier moment.
+        end (datetime): The later moment.
+
+    Returns:
+        Decimal: The days.
+    """
+    return Decimal(repr((end - start) / timedelta(days=1)))
+
+
+def _close_oldest(portions: list[list], count: Decimal, price: Decimal,
+                  when: datetime) -> tuple[Decimal, Decimal, Decimal]:
+    """
+    Close contracts from the oldest groups first, at one price, and give what they add to a return.
+
+    Each group is [when it started, contracts still open, start price per
+    contract]; a group closed in part keeps the rest open, and one closed in
+    full is taken off the list. Contracts beyond what the groups hold are
+    left out.
+
+    Args:
+        portions (list[list]): The open groups, oldest first; changed in place.
+        count (Decimal): Contracts closed.
+        price (Decimal): What each one ended at, per contract.
+        when (datetime): When they were closed.
+
+    Returns:
+        tuple[Decimal, Decimal, Decimal]: The dollars gained, days ×
+            contracts × gain, and days × contracts × start price.
+    """
+    pnl = gain_days = cost_days = _ZERO
+    while count > 0 and portions:
+        started, open_count, start_price = portions[0]
+        take = min(count, open_count)
+        days = _days_between(started, when)
+        gain = price - start_price
+        pnl += take * gain
+        gain_days += days * take * gain
+        cost_days += days * take * start_price
+        count -= take
+        if take == open_count:
+            portions.pop(0)
+        else:
+            portions[0][1] = open_count - take
+    return pnl, gain_days, cost_days
+
+
+def holding_returns(ledger: Ledger, marks: Marks, group_of: Callable[[str], str],
+                    first: datetime, last: datetime) -> tuple[HoldingReturn, ...]:
+    """
+    Each holding held now and its return from `first` to `last`, weighted by dollars and by days held.
+
+    A holding is one market, side and group, as _holdings counts it. Its
+    contracts already held at `first` form the first group, at their value
+    then (the market's YES value at `first`, Marks.at, or what they cost when
+    the market had no price yet) per contract. Each purchase after `first`
+    starts a new group at what it cost per contract, fees included. Each
+    sale or payout after `first` closes contracts from the oldest group
+    first, at the cash it paid per contract, fees taken out. What is left at
+    `last` closes at the value then; a market with no value then leaves each
+    group at its own start price, so it shows no gain.
+
+    Args:
+        ledger (Ledger): The ledger, from build_ledger.
+        marks (Marks): The markets' values over time, from read_marks.
+        group_of (Callable[[str], str]): A ledger owner's group.
+        first (datetime): The period's first moment.
+        last (datetime): The period's last moment (the read).
+
+    Returns:
+        tuple[HoldingReturn, ...]: One per holding held now, in no particular order.
+    """
+    events_of: dict[tuple[str, str, str], list[LedgerEvent]] = defaultdict(list)
+    for e in ledger.events:
+        events_of[(e.ticker, group_of(e.owner), e.side)].append(e)
+    out: list[HoldingReturn] = []
+    for (ticker, group, side), events in events_of.items():
+        if not sum((e.contracts for e in events), _ZERO):
+            continue                                  # not held now
+        before = [e for e in events if e.time <= first]
+        held_then = sum((e.contracts for e in before), _ZERO)
+        portions: list[list] = []
+        if held_then > 0:
+            worth = _value(side, held_then, sum((e.basis for e in before), _ZERO),
+                           marks.at(ticker, first))
+            portions.append([first, held_then, worth / held_then])
+        totals = [_ZERO, _ZERO, _ZERO]
+        for e in events:
+            if not first < e.time <= last:
+                continue
+            if e.contracts > 0:                       # a purchase: a new group
+                portions.append([e.time, e.contracts, e.spent / e.contracts])
+            elif e.contracts < 0:                     # a sale or a payout
+                closed = -e.contracts
+                adds = _close_oldest(portions, closed, e.cash / closed, e.time)
+                totals = [t + a for t, a in zip(totals, adds, strict=True)]
+        mark = marks.at(ticker, last)
+        for portion in list(portions):                # what is left, at the value now
+            end_price = portion[2] if mark is None else (mark if side == "yes" else _ONE - mark)
+            adds = _close_oldest(portions, portion[1], end_price, last)
+            totals = [t + a for t, a in zip(totals, adds, strict=True)]
+        out.append(HoldingReturn(ticker, group, side, *totals))
     return tuple(out)
 
 
@@ -2898,9 +3049,9 @@ def build_live_view(client: Any, *, risk_free: treasury.RiskFreeRates | None,
     at the start that are still missing); rebuild the payouts and build the
     ledger; compare what it holds with Kalshi's positions (a warning per
     market that differs); read the daily prices; then the history, the
-    purchases' returns, each period of config.LIVE_DASHBOARD_PERIODS, the
-    holdings now, the cash check and Kalshi's credits since the history's
-    start. A bot purchase's group is its market A's Kalshi category
+    purchases' returns, each period of config.LIVE_DASHBOARD_PERIODS (with
+    every holding's return over it, holding_returns), the holdings now,
+    the cash check and Kalshi's credits since the history's start. A bot purchase's group is its market A's Kalshi category
     (historical.series_labels, the backtest page's filing rule, with
     historical.infer_category for a series Kalshi's listing lacks);
     everything else is OTHER_BETS. Before the bot's first fill there is no
@@ -2970,6 +3121,11 @@ def build_live_view(client: Any, *, risk_free: treasury.RiskFreeRates | None,
     holdings = _holdings(ledger, marks, markets, group_of)
     group_order = _group_order(history, holdings)
     holdings = _sorted_holdings(holdings, group_order)
+    if periods is not None:
+        # Each period's return for every holding held now, for the holdings table
+        periods = tuple(dataclasses.replace(
+            p, holdings=holding_returns(ledger, marks, group_of, p.first, p.last))
+            for p in periods)
 
     run_of = {trade.trade_id: trade.logged_at for trade in trades}
     first_bot_fill: dict[datetime, datetime] = {}
