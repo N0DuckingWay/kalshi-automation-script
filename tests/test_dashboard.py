@@ -12008,7 +12008,7 @@ class _ExplorerCapSweep(_FakeCapSweep):
                 for p in pops.values() for t in p.trades}
 
 
-def _ex_sweep(*, raise_on=None) -> BacktestSweep:
+def _ex_sweep(*, raise_on=None, end_date: date | None = None) -> BacktestSweep:
     """
     A band sweep with a size-cap sweep over 2 bands x 2 ks x 3 caps (5%, 20%
     — the run's own — and no cap), primary (0-1, k 0.75, 20%).
@@ -12019,6 +12019,9 @@ def _ex_sweep(*, raise_on=None) -> BacktestSweep:
     on the trades alone would be the 20% row. Band 0.3-0.6 traded nothing at
     k 0.60 (a flat curve: Sharpe 0.0, which the heatmap must not show) and
     the same winning list at every cap at k 0.75.
+
+    Every curve runs from _FLT_START to `end_date`, or to today (UTC) when
+    it is None.
     """
     def resized(t, n):
         return _kc_resized(t, n)
@@ -12037,7 +12040,8 @@ def _ex_sweep(*, raise_on=None) -> BacktestSweep:
 
     def curve(trades):
         if id(trades) not in curves:
-            curves[id(trades)] = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+            curves[id(trades)] = backtester._build_equity_curve(trades, _FLT_START, 1000.0,
+                                                                  end_date=end_date)
         return curves[id(trades)]
 
     def pops(band, k, cap, trades, eq=None, ladder=False):
@@ -12050,7 +12054,7 @@ def _ex_sweep(*, raise_on=None) -> BacktestSweep:
                                                 ex_top_event=None)
         return out
 
-    rich = backtester._build_equity_curve(full, _FLT_START, 1100.0)
+    rich = backtester._build_equity_curve(full, _FLT_START, 1100.0, end_date=end_date)
     points = {}
     for k in (0.6, 0.75):
         points[(_KC_B0, k, 0.05)] = pops(_KC_B0, k, 0.05, losing, ladder=True)
@@ -23016,12 +23020,21 @@ def _rf_page(monkeypatch, tmp_path, sweep: BacktestSweep,
     return _read_page(out)
 
 
+# The day rf_pages' curves end on: the day _steep_rates() was read
+_RF_CURVE_END = date(2026, 9, 27)
+
+
 @pytest.fixture(scope="class")
 def rf_pages(tmp_path_factory):
     """(sweep, rates, {"rf": page with the rates, "zero": page without}) —
     one _ex_sweep (a band sweep with a size-cap sweep: every section that
-    shows a ratio has data) rendered both ways, at _steep_rates()."""
-    sweep, rates = _ex_sweep(), _steep_rates()
+    shows a ratio has data) rendered both ways, at _steep_rates().
+
+    The curves end on a fixed day (_RF_CURVE_END). Ending them today, as
+    the other page tests do, adds a day with nothing held on every day the
+    suite runs, and from 2026-11-26 the 5%-cap curve's ratios round to the
+    same two decimals with the rates and without them."""
+    sweep, rates = _ex_sweep(end_date=_RF_CURVE_END), _steep_rates()
     pages = {}
     with pytest.MonkeyPatch.context() as mp:
         for name, rf in (("rf", rates), ("zero", None)):
